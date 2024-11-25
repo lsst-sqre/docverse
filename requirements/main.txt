@@ -14,14 +14,14 @@ billiard==3.6.4.0
     # via celery
 boto3==1.24.7
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   ltd-conveyor
 botocore==1.27.7
     # via
     #   boto3
     #   s3transfer
 celery[redis]==5.2.7
-    # via -r requirements/main.in
+    # via -r main.in
 certifi==2022.5.18.1
     # via requests
 cffi==1.15.0
@@ -43,25 +43,25 @@ click-plugins==1.1.1
 click-repl==0.2.0
     # via celery
 cryptography==37.0.2
-    # via -r requirements/main.in
+    # via -r main.in
 deprecated==1.2.13
     # via redis
 flask==2.1.2
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   flask-accept
     #   flask-httpauth
     #   flask-migrate
     #   flask-sqlalchemy
 flask-accept==0.0.6
-    # via -r requirements/main.in
+    # via -r main.in
 flask-httpauth==4.7.0
-    # via -r requirements/main.in
+    # via -r main.in
 flask-migrate==3.1.0
-    # via -r requirements/main.in
+    # via -r main.in
 flask-sqlalchemy==2.5.1
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   flask-migrate
 greenlet==1.1.2
     # via sqlalchemy
@@ -69,11 +69,11 @@ idna==3.3
     # via requests
 itsdangerous==2.0.1
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   flask
 jinja2==3.1.2
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   flask
 jmespath==1.0.0
     # via
@@ -82,30 +82,31 @@ jmespath==1.0.0
 kombu==5.2.4
     # via celery
 ltd-conveyor==0.8.1
-    # via -r requirements/main.in
+    # via -r main.in
 mako==1.2.0
     # via alembic
 markupsafe==2.1.1
     # via
     #   jinja2
     #   mako
+    #   werkzeug
 packaging==21.3
     # via redis
 prompt-toolkit==3.0.29
     # via click-repl
 psycopg2-binary==2.9.3
-    # via -r requirements/main.in
+    # via -r main.in
 pycparser==2.21
     # via cffi
 pydantic==1.9.1
-    # via -r requirements/main.in
+    # via -r main.in
 pymysql==1.0.2
-    # via -r requirements/main.in
+    # via -r main.in
 pyparsing==3.0.9
     # via packaging
 python-dateutil==2.8.2
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   botocore
 pytz==2022.1
     # via celery
@@ -113,7 +114,7 @@ redis==4.3.3
     # via celery
 requests==2.28.0
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   ltd-conveyor
 s3transfer==0.6.0
     # via boto3
@@ -123,11 +124,11 @@ six==1.16.0
     #   python-dateutil
 sqlalchemy==1.4.37
     # via
-    #   -r requirements/main.in
+    #   -r main.in
     #   alembic
     #   flask-sqlalchemy
 structlog==21.5.0
-    # via -r requirements/main.in
+    # via -r main.in
 typing-extensions==4.2.0
     # via pydantic
 uritemplate==4.1.1
@@ -137,7 +138,7 @@ urllib3==1.26.9
     #   botocore
     #   requests
 uwsgi==2.0.20
-    # via -r requirements/main.in
+    # via -r main.in
 vine==5.0.0
     # via
     #   amqp
@@ -145,7 +146,7 @@ vine==5.0.0
     #   kombu
 wcwidth==0.2.5
     # via prompt-toolkit
-werkzeug==2.1.2
+werkzeug==2.2.3
     # via flask
 wrapt==1.14.1
     # via deprecated
