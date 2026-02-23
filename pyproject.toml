@@ -1,25 +1,134 @@
+[project]
+name = "docverse"
+description = "Docverse documentation hosting platform server."
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.13"
+dynamic = ["version"]
+dependencies = [
+    "docverse-client",
+    "fastapi>=0.115",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "safir[db]>=13",
+    "uvicorn[standard]>=0.34",
+]
+
 [build-system]
 requires = [
-    "setuptools>=42",
-    "wheel",
-    "setuptools_scm[toml]>=3.4"
+    "setuptools>=75",
+    "setuptools_scm[toml]>=8",
 ]
-build-backend = 'setuptools.build_meta'
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "asgi-lifespan",
+    "coverage[toml]",
+    "httpx",
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+]
+lint = [
+    "pre-commit",
+    "pre-commit-uv",
+    "ruff>=0.12",
+]
+typing = [
+    "mypy>=1.15",
+]
+nox = [
+    "nox[uv]",
+    "nox-uv",
+]
+
+[tool.uv.workspace]
+members = ["client"]
+
+[tool.uv.sources]
+docverse-client = { workspace = true }
 
 [tool.setuptools_scm]
+# Match server release tags (e.g. "3.0.0")
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "[0-9]*",
+]
+fallback_version = "0.0.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+extend = "ruff-shared.toml"
+
+[tool.ruff.lint]
+ignore = [
+    "INP001",  # Implicit namespace package (intentional for docverse).
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/docverse/handlers/**" = [
+    "D103",  # Missing docstring in public function (handlers).
+]
+"tests/**" = [
+    "D100",    # Missing docstring in public module.
+    "D103",    # Missing docstring in public function.
+    "PLR0913", # Too many arguments to function call.
+    "PLR2004", # Magic value used in comparison.
+    "S106",    # Possible hardcoded password.
+    "SLF001",  # Private member accessed.
+]
+"*/tests/**" = [
+    "D100",
+    "D103",
+    "PLR0913",
+    "PLR2004",
+    "S106",
+    "SLF001",
+]
+"noxfile.py" = [
+    "D100",
+    "D103",
+]
+
+[tool.mypy]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+ignore_missing_imports = true
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "noxfile"
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_decorators = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+warn_uninitialized = true
 
 [tool.pytest.ini_options]
-minversion = "6.0"
-norecursedirs = ["venv", ".eggs"]
-mock_use_standalone_module = true
+asyncio_mode = "strict"
 
 [tool.coverage.run]
 parallel = true
 branch = true
-source = ["keeper"]
+source = ["docverse"]
 
 [tool.coverage.paths]
-source = ["keeper", ".tox/*/site-packages"]
+source = ["src"]
 
 [tool.coverage.report]
 show_missing = true
@@ -32,30 +141,5 @@ exclude_lines = [
     "raise NotImplementedError",
     "if 0:",
     "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:"
+    "if TYPE_CHECKING:",
 ]
-
-[tool.black]
-line-length = 79
-target-version = ['py37']
-exclude = '''
-/(
-    \.eggs
-  | \.git
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | build
-  | dist
-)/
-'''
-# Use single-quoted strings so TOML treats the string like a Python r-string
-# Multi-line strings are implicitly treated by black as regular expressions
-
-[tool.isort]
-include_trailing_comma = true
-multi_line_output = 3
-known_first_party = ["keeper", "tests"]
-known_third_party = ["alembic", "boto3", "botocore", "celery", "click", "dateutil", "flask", "flask_accept", "flask_httpauth", "flask_migrate", "flask_sqlalchemy", "itsdangerous", "mock", "pkg_resources", "pytest", "requests", "responses", "setuptools", "sqlalchemy", "structlog", "werkzeug"]
-skip = ["docs/conf.py"]

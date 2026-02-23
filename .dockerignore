@@ -1,6 +1,36 @@
+# Python artifacts
 **/*.pyc
 **/*.pyd
 **/*.pyo
 **/__pycache__
-/__pycache__
+*.egg-info/
 *.sqlite
+
+# Development and CI directories
+.claude/
+.github/
+.mypy_cache/
+.nox/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.coverage*
+htmlcov/
+
+# Legacy code
+keeper/
+
+# Tests
+tests/
+client/tests/
+
+# Development config files
+.pre-commit-config.yaml
+.python-version
+noxfile.py
+ruff-shared.toml
+scriv-client.ini
+scriv-server.ini
+server-changelog.d/
+client/changelog.d/
+Makefile
