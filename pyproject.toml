@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dynamic = ["version"]
 dependencies = [
+    "click>=8",
     "docverse-client",
     "fastapi>=0.115",
     "pydantic>=2",
@@ -13,6 +14,9 @@ dependencies = [
     "safir[db]>=13",
     "uvicorn[standard]>=0.34",
 ]
+
+[project.scripts]
+docverse = "docverse.cli:main"
 
 [build-system]
 requires = [
@@ -41,6 +45,8 @@ typing = [
 nox = [
     "nox[uv]",
     "nox-uv",
+    "structlog",
+    "testcontainers[postgres]",
 ]
 
 [tool.uv.workspace]
@@ -74,6 +80,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/docverse/cli.py" = [
+    "A001",   # Shadowing builtin (help command).
+    "ARG001", # Unused function argument (Click pattern).
+    "D103",   # Missing docstring in public function (Click commands).
+    "S607",   # Partial executable path (alembic CLI).
+]
 "src/docverse/handlers/**" = [
     "D103",  # Missing docstring in public function (handlers).
 ]
@@ -97,11 +109,18 @@ ignore = [
     "D100",
     "D103",
 ]
+"alembic/**" = [
+    "INP001",  # Alembic versions directory has no __init__.py.
+    "D103",    # Missing docstring in public function.
+]
 
 [tool.mypy]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 ignore_missing_imports = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["src", "client/src"]
 strict = true
 plugins = ["pydantic.mypy"]
 
