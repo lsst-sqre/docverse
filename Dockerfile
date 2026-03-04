@@ -75,5 +75,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 # via Kubernetes.
 ENV DOCVERSE_ALEMBIC_CONFIG_PATH="/app/alembic.ini"
 
+# Set a sensible default working directory.
+WORKDIR /app
+
 # Run the application.
 CMD ["/app/scripts/start-service.sh"]
