@@ -1,0 +1,62 @@
+"""arq worker configuration for Docverse.
+
+Launch with: ``arq docverse.worker.main.WorkerSettings``
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import structlog
+from safir.database import create_database_engine, is_database_current
+from safir.dependencies.db_session import db_session_dependency
+from safir.logging import configure_logging
+
+from docverse.config import Configuration
+
+from .functions import ping
+
+config = Configuration()
+
+
+async def startup(ctx: dict[str, Any]) -> None:
+    """Initialize resources for the arq worker process."""
+    configure_logging(
+        profile=config.log_profile,
+        log_level=config.log_level,
+        name="docverse.worker",
+    )
+    logger = structlog.get_logger("docverse.worker")
+
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    if not await is_database_current(
+        engine, logger, config.alembic_config_path
+    ):
+        msg = "Database schema is not current."
+        raise RuntimeError(msg)
+    await engine.dispose()
+
+    await db_session_dependency.initialize(
+        config.database_url,
+        config.database_password,
+    )
+    logger.info("Worker startup complete")
+
+
+async def shutdown(ctx: dict[str, Any]) -> None:
+    """Clean up resources for the arq worker process."""
+    await db_session_dependency.aclose()
+    logger = structlog.get_logger("docverse.worker")
+    logger.info("Worker shutdown complete")
+
+
+class WorkerSettings:
+    """arq WorkerSettings for Docverse."""
+
+    functions = [ping]
+    redis_settings = config.arq_redis_settings
+    queue_name = config.arq_queue_name
+    on_startup = startup
+    on_shutdown = shutdown
