@@ -9,6 +9,7 @@ from importlib.metadata import metadata, version
 import structlog
 from fastapi import FastAPI
 from safir.database import create_database_engine, is_database_current
+from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 from safir.fastapi import ClientRequestError, client_request_error_handler
 from safir.logging import configure_logging, configure_uvicorn_logging
@@ -48,6 +49,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
     await db_session_dependency.initialize(
         config.database_url,
         config.database_password,
+    )
+    await arq_dependency.initialize(
+        mode=config.arq_mode,
+        redis_settings=config.arq_redis_settings,
     )
     await context_dependency.initialize()
     yield
