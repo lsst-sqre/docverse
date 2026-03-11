@@ -1,5 +1,6 @@
 import nox
 from nox_uv import session
+from testcontainers.postgres import PostgresContainer
 
 nox.needs_version = ">=2024.4.15"
 nox.options.default_venv_backend = "uv"
@@ -26,14 +27,21 @@ def typing(session: nox.Session) -> None:
 
 @session(uv_groups=["dev"])
 def test(session: nox.Session) -> None:
-    session.run(
-        "pytest",
-        "tests/",
-        *session.posargs,
-        env={
-            "REPERTOIRE_BASE_URL": "https://roundtable.lsst.cloud/repertoire"
-        },
-    )
+    with PostgresContainer("postgres:17") as postgres:
+        url = postgres.get_connection_url(driver="asyncpg")
+        session.run(
+            "pytest",
+            "tests/",
+            *session.posargs,
+            env={
+                "DOCVERSE_DATABASE_URL": url,
+                "DOCVERSE_DATABASE_PASSWORD": postgres.password,
+                "DOCVERSE_ALEMBIC_CONFIG_PATH": "alembic.ini",
+                "REPERTOIRE_BASE_URL": (
+                    "https://roundtable.lsst.cloud/repertoire"
+                ),
+            },
+        )
 
 
 @session(uv_groups=["dev"])
@@ -88,3 +96,37 @@ def scriv_create(session: nox.Session) -> None:
     if session.posargs and session.posargs[0] == "client":
         config = "scriv-client.ini"
     session.run("scriv", "create", "--config", config)
+
+
+@session(uv_groups=["dev"])
+def create_migration(session: nox.Session) -> None:
+    """Create an Alembic migration.
+
+    Pass the migration message as a positional argument:
+        nox -s create-migration -- "Add organization table"
+    """
+    if not session.posargs:
+        session.error(
+            'Provide a migration message: nox -s create-migration -- "message"'
+        )
+
+    message = session.posargs[0]
+
+    with PostgresContainer("postgres:17") as postgres:
+        url = postgres.get_connection_url(driver=None)
+        env = {
+            "DOCVERSE_DATABASE_URL": url,
+            "DOCVERSE_DATABASE_PASSWORD": postgres.password,
+            "REPERTOIRE_BASE_URL": (
+                "https://roundtable.lsst.cloud/repertoire"
+            ),
+        }
+        session.run("alembic", "upgrade", "head", env=env)
+        session.run(
+            "alembic",
+            "revision",
+            "--autogenerate",
+            "-m",
+            message,
+            env=env,
+        )

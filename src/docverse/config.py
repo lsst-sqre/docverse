@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from safir.logging import LogLevel, Profile
@@ -32,6 +34,23 @@ class Configuration(BaseSettings):
         None,
         title="Slack webhook for alerts",
         description="If set, alerts will be posted to this Slack webhook",
+    )
+
+    database_url: str = Field(
+        title="URL of the PostgreSQL database",
+        description=(
+            "Database URL without the password. The password is provided"
+            " separately via ``database_password``."
+        ),
+    )
+
+    database_password: SecretStr = Field(
+        title="Password for the PostgreSQL database"
+    )
+
+    alembic_config_path: Path = Field(
+        Path("/app/alembic.ini"),
+        title="Path to the Alembic configuration file",
     )
 
     repertoire_base_url: HttpUrl = Field(

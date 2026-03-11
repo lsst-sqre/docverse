@@ -56,8 +56,11 @@ FROM base-image AS runtime-image
 # Create a non-root user.
 RUN useradd --create-home appuser
 
-# Copy the virtualenv.
+# Copy the virtualenv, alembic config, and scripts.
 COPY --from=install-image /app/.venv /app/.venv
+COPY --from=install-image /app/alembic.ini /app/alembic.ini
+COPY --from=install-image /app/alembic /app/alembic
+COPY --from=install-image /app/scripts/start-service.sh /app/scripts/start-service.sh
 
 # Switch to the non-root user.
 USER appuser
@@ -68,5 +71,12 @@ EXPOSE 8080
 # Make sure we use the virtualenv.
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Set environment variable for Alembic config; other variables are set
+# via Kubernetes.
+ENV DOCVERSE_ALEMBIC_CONFIG_PATH="/app/alembic.ini"
+
+# Set a sensible default working directory.
+WORKDIR /app
+
 # Run the application.
-CMD ["uvicorn", "docverse.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["/app/scripts/start-service.sh"]
