@@ -1,0 +1,54 @@
+# Ruff shared configuration for LSST SQuaRE projects.
+# This is shared between the server and client packages.
+# Individual packages can extend this with:
+#   [tool.ruff]
+#   extend = "ruff-shared.toml"
+
+line-length = 79
+target-version = "py313"
+exclude = ["keeper"]
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "ANN401",  # Dynamically typed expressions (typing.Any) are disallowed.
+    "COM812",  # Missing trailing comma (conflicts with formatter).
+    "D101",    # Missing docstring in public class.
+    "D104",    # Missing docstring in public package.
+    "D106",    # Missing docstring in public nested class.
+    "D107",    # Missing docstring in __init__.
+    "ISC001",  # Implicit string concatenation (conflicts with formatter).
+    "PYI048",  # Function body should contain exactly one statement.
+    "S101",    # Use of assert detected.
+    "TC001",   # Move application import into TYPE_CHECKING block.
+    "TC002",   # Move third-party import into TYPE_CHECKING block.
+    "TC003",   # Move standard library import into TYPE_CHECKING block.
+    "TID252",  # Relative imports from parent modules are banned.
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+    "D100",    # Missing docstring in public module.
+    "D103",    # Missing docstring in public function.
+    "PLR0913", # Too many arguments to function call.
+    "S106",    # Possible hardcoded password.
+    "SLF001",  # Private member accessed.
+]
+"*/tests/**" = [
+    "D100",
+    "D103",
+    "PLR0913",
+    "S106",
+    "SLF001",
+]
+"noxfile.py" = [
+    "D100",
+    "D103",
+]
+
+[lint.isort]
+known-first-party = ["docverse"]
+split-on-trailing-comma = false
+
+[lint.pydocstyle]
+convention = "numpy"

@@ -1,0 +1,56 @@
+[project]
+name = "docverse-client"
+description = "Python client for the Docverse documentation hosting platform."
+license = "MIT"
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = [
+    "click>=8",
+    "httpx>=0.25",
+    "pydantic>=2.5",
+]
+
+[build-system]
+requires = [
+    "setuptools>=75",
+    "setuptools_scm[toml]>=8",
+]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "coverage[toml]",
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+]
+
+[tool.setuptools_scm]
+root = ".."
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "client/[0-9]*",
+]
+fallback_version = "0.0.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+extend = "../ruff-shared.toml"
+
+[tool.coverage.run]
+parallel = true
+branch = true
+source = ["docverse.client"]
+
+[tool.coverage.paths]
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true

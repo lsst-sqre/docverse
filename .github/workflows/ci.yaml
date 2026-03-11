@@ -1,165 +1,134 @@
 name: CI
 
-'on':
+"on":
+  merge_group: {}
+  pull_request: {}
   push:
     branches-ignore:
-      # These should always correspond to pull requests, so ignore them for
-      # the push trigger and let them be triggered by the pull_request
-      # trigger, avoiding running the workflow twice.  This is a minor
-      # optimization so there's no need to ensure this is comprehensive.
-      - 'dependabot/**'
-      - 'renovate/**'
-      - 'tickets/**'
-      - 'u/**'
-    tags:
-      - '*'
-  pull_request: {}
+      - "dependabot/**"
+      - "renovate/**"
+      - "u/**"
+  release:
+    types: [published]
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version-file: ".python-version"
 
-      - name: Run pre-commit
-        uses: pre-commit/action@v3.0.0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run linters
+        run: uv run --only-group=lint pre-commit run --all-files
 
   test:
     runs-on: ubuntu-latest
-    needs: [lint]
-
-    strategy:
-      matrix:
-        python:
-          - "3.10"
-        db:
-          - sqlite
-          - postgres
-          # - mysql
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Install build tools
-        run: sudo apt-get install build-essential
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install tox
-        run: |
-          pip install 'requests<2.32.0'
-          pip install tox
-          pip install --pre tox-docker
-
-      - name: Cache tox environments
-        id: cache-tox
-        uses: actions/cache@v3
-        with:
-          path: .tox
-          # requirements/*.txt and pyproject.toml have versioning info
-          # that would impact the tox environment.
-          key: tox-${{ matrix.python }}--${{ matrix.db }}-${{ hashFiles('requirements/*.txt') }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: |
-            tox-${{ matrix.python }}-${{ matrix.db }}-${{ hashFiles('requirements/*.txt') }}-
-
-      - name: Run tox with external services
-        if: ${{ matrix.python == '3.10' && matrix.db == 'postgres' }}
-        env:
-          LTD_KEEPER_TEST_AWS_ID: ${{ secrets.LTD_KEEPER_TEST_AWS_ID }}
-          LTD_KEEPER_TEST_AWS_SECRET: ${{ secrets.LTD_KEEPER_TEST_AWS_SECRET }}
-          LTD_KEEPER_TEST_BUCKET: ${{ secrets.LTD_KEEPER_TEST_BUCKET }}
-        # run: tox -e typing,${{matrix.db}},coverage-report # run tox using Python in path
-        run: tox -e ${{matrix.db}},coverage-report # run tox using Python in path
-
-      - name: Run tox without external services
-        if: ${{ !(matrix.python != '3.10' && matrix.db != 'postgres') }}
-        # run: tox -e typing,${{matrix.db}},coverage-report # run tox using Python in path
-        run: tox -e ${{matrix.db}},coverage-report # run tox using Python in path
-
-  docs:
-    runs-on: ubuntu-latest
-    needs: [lint]
-
-    steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version-file: ".python-version"
 
-      - name: Install Python dependencies
-        run: pip install tox ltd-conveyor
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Cache tox environment for docs
-        id: cache-tox
-        uses: actions/cache@v3
+      - name: Run typing
+        run: uv run --only-group=nox nox -s typing
+
+      - name: Run tests
+        run: uv run --only-group=nox nox -s test
+
+  client-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
         with:
-          path: .tox
-          # requirements/*.txt, pyproject.toml, and .pre-commit-config.yaml
-          # have versioning info that would impact the tox environment.
-          key: tox-docs-${{ hashFiles('requirements/*.txt') }}-${{ hashFiles('pyproject.toml') }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          fetch-depth: 0
 
-      - name: Run tox
-        run: tox -e docs
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.13
 
-      - name: Upload documentation
-        if: ${{ github.event_name == 'push' }}
-        env:
-          LTD_PASSWORD: ${{ secrets.LTD_PASSWORD }}
-          LTD_USERNAME: ${{ secrets.LTD_USERNAME }}
-        run: |
-          ltd upload --gh --dir docs/_build/html --product ltd-keeper
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run client tests
+        run: >-
+          uv run --only-group=nox nox -s
+          client_test
+          client_test_compat
+          client_test_oldest
 
   build:
-    runs-on: ubuntu-latest
-    needs: [test]
+    needs: [test, client-test]
+    uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v3
+    with:
+      images: ghcr.io/${{ github.repository }}
+    # Build on server releases and ticket branch PRs (exclude client releases)
+    if: >
+      (github.event_name == 'release'
+       && !startsWith(github.event.release.tag_name, 'client/'))
+      || (github.event_name != 'merge_group'
+          && (startsWith(github.head_ref, 'tickets/')
+              || startsWith(github.head_ref, 't/')))
 
-    # Only do Docker builds of ticket branches and tagged releases, as well
-    # as J.Sick Codes branches.
-    # if: >
-    #  (startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/tickets/')) || startsWith(github.ref, 'refs/heads/u/jsickcodes/')
+  client-test-packaging:
+    name: Test client packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [lint, test, client-test]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # full history for setuptools_scm
 
-      - name: Define the Docker tag
-        id: vars
-        run: echo ::set-output name=tag::$(bin/docker-tag.sh)
-
-      - name: Print the tag
-        id: print
-        run: echo ${{ steps.vars.outputs.tag }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
+      - name: Build and publish
+        uses: lsst-sqre/build-and-publish-to-pypi@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: client
+          upload: false
 
-      - name: Build and push
-        uses: docker/build-push-action@v3
+  client-pypi:
+    name: Upload client to PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint, test, client-test, client-test-packaging]
+    environment:
+      name: pypi
+      url: https://pypi.org/p/docverse-client
+    permissions:
+      id-token: write
+    if: >
+      github.event_name == 'release'
+      && startsWith(github.event.release.tag_name, 'client/')
+
+    steps:
+      - uses: actions/checkout@v4
         with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/lsst-sqre/ltd-keeper:${{ steps.vars.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          fetch-depth: 0 # full history for setuptools_scm
+
+      - name: Build and publish
+        uses: lsst-sqre/build-and-publish-to-pypi@v3
+        with:
+          working-directory: client
