@@ -25,7 +25,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Run linters
         run: uv run --only-group=lint pre-commit run --all-files
@@ -45,7 +45,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Run typing
         run: uv run --only-group=nox nox -s typing
@@ -70,7 +70,7 @@ jobs:
             3.13
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Run client tests
         run: >-
