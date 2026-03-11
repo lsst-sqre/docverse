@@ -24,7 +24,7 @@ async def test_create_organization(client: AsyncClient) -> None:
     assert data["url_scheme"] == "subdomain"
     assert data["root_path_prefix"] == "/"
     assert data["purgatory_retention"] == 2592000
-    assert data["id"] is not None
+    assert "id" not in data
     assert data["date_created"] is not None
     assert data["date_updated"] is not None
     assert data["self_url"].endswith("/admin/orgs/test-org")

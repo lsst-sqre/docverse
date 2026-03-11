@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,7 +15,7 @@ class Organization(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: UUID = Field(description="Unique identifier for the organization.")
+    id: int = Field(description="Unique identifier for the organization.")
 
     slug: str = Field(description="URL-safe identifier for the organization.")
 

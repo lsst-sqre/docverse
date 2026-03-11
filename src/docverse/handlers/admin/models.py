@@ -20,7 +20,6 @@ class Organization(_OrganizationBase):
             self_url=str(
                 request.url_for("get_organization", org_slug=domain.slug)
             ),
-            id=domain.id,
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,

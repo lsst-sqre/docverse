@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, Index, Integer, String, Text, Uuid
+from sqlalchemy import DateTime, Enum, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -21,8 +20,8 @@ class SqlOrganization(Base):
 
     __tablename__ = "organizations"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, primary_key=True, default=uuid.uuid4
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
     )
 
     slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -90,8 +89,6 @@ class Organization(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     self_url: str = Field(description="URL to this organization resource.")
-
-    id: UUID = Field(description="Unique identifier for the organization.")
 
     slug: str = Field(description="URL-safe identifier for the organization.")
 
