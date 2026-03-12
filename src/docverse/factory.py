@@ -7,8 +7,9 @@ from safir.arq import ArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from .services.organization import OrganizationService
-from .services.queue import ArqQueueBackend
 from .storage.organization_store import OrganizationStore
+from .storage.queue_backend import ArqQueueBackend
+from .storage.queue_job_store import QueueJobStore
 
 
 class Factory:
@@ -36,3 +37,7 @@ class Factory:
     def create_queue_backend(self) -> ArqQueueBackend:
         """Create an ArqQueueBackend."""
         return ArqQueueBackend(arq_queue=self._arq_queue)
+
+    def create_queue_job_store(self) -> QueueJobStore:
+        """Create a QueueJobStore."""
+        return QueueJobStore(session=self._session, logger=self._logger)

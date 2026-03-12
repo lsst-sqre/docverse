@@ -1,9 +1,9 @@
-"""Tests for the ArqQueueBackend service."""
+"""Tests for the ArqQueueBackend."""
 
 import pytest
 from safir.arq import MockArqQueue
 
-from docverse.services.queue import ArqQueueBackend
+from docverse.storage.queue_backend import ArqQueueBackend
 
 
 @pytest.fixture

@@ -7,6 +7,7 @@ from safir.fastapi import ClientRequestError
 
 __all__ = [
     "ConflictError",
+    "InvalidJobStateError",
     "NotFoundError",
 ]
 
@@ -23,3 +24,11 @@ class ConflictError(ClientRequestError):
 
     error = "conflict"
     status_code = status.HTTP_409_CONFLICT
+
+
+class InvalidJobStateError(Exception):
+    """A queue job state transition is invalid.
+
+    This is a non-HTTP exception because it may be raised from worker
+    code outside of a request context.
+    """
