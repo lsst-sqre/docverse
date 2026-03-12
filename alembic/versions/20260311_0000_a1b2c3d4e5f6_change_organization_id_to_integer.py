@@ -1,7 +1,7 @@
 """Change organization id from UUID to auto-incrementing integer.
 
 Revision ID: a1b2c3d4e5f6
-Revises: cf3b3f99916b
+Revises: e5e3e3a7c63a
 Create Date: 2026-03-11 00:00:00.000000+00:00
 """
 
@@ -11,7 +11,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "a1b2c3d4e5f6"
-down_revision: str | None = "cf3b3f99916b"
+down_revision: str | None = "e5e3e3a7c63a"
 branch_labels: str | None = None
 depends_on: str | None = None
 
