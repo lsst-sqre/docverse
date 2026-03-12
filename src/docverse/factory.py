@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from .services.organization import OrganizationService
 from .services.queue import ArqQueueBackend
+from .storage.organization_store import OrganizationStore
 
 
 class Factory:
@@ -29,10 +30,8 @@ class Factory:
 
     def create_organization_service(self) -> OrganizationService:
         """Create an OrganizationService."""
-        return OrganizationService(
-            session=self._session,
-            logger=self._logger,
-        )
+        store = OrganizationStore(session=self._session, logger=self._logger)
+        return OrganizationService(store=store, logger=self._logger)
 
     def create_queue_backend(self) -> ArqQueueBackend:
         """Create an ArqQueueBackend."""
