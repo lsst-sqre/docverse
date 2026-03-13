@@ -37,6 +37,7 @@ def test(session: nox.Session) -> None:
                 "DOCVERSE_DATABASE_URL": url,
                 "DOCVERSE_DATABASE_PASSWORD": postgres.password,
                 "DOCVERSE_ALEMBIC_CONFIG_PATH": "alembic.ini",
+                "DOCVERSE_ARQ_MODE": "test",
                 "REPERTOIRE_BASE_URL": (
                     "https://roundtable.lsst.cloud/repertoire"
                 ),
@@ -117,6 +118,7 @@ def create_migration(session: nox.Session) -> None:
         env = {
             "DOCVERSE_DATABASE_URL": url,
             "DOCVERSE_DATABASE_PASSWORD": postgres.password,
+            "DOCVERSE_ARQ_MODE": "test",
             "REPERTOIRE_BASE_URL": (
                 "https://roundtable.lsst.cloud/repertoire"
             ),

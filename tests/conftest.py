@@ -12,6 +12,8 @@ from safir.database import (
     initialize_database,
     stamp_database_async,
 )
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from docverse.config import config
 from docverse.dbschema import Base
@@ -45,3 +47,16 @@ async def client(app: FastAPI) -> AsyncGenerator[AsyncClient]:
         transport=ASGITransport(app=app),
     ) as client:
         yield client
+
+
+@pytest_asyncio.fixture
+async def db_session(
+    app: FastAPI,  # noqa: ARG001
+) -> AsyncGenerator[async_scoped_session[AsyncSession]]:
+    """Provide a database session for direct store tests.
+
+    The ``app`` parameter ensures the application lifespan (and therefore
+    the database engine initialisation) runs before this fixture.
+    """
+    async for session in db_session_dependency():
+        yield session

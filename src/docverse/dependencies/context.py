@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import Depends, Request, Response
+from safir.arq import ArqQueue
+from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 from safir.dependencies.logger import logger_dependency
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
@@ -83,6 +85,7 @@ class ContextDependency:
             Depends(db_session_dependency),
         ],
         logger: Annotated[BoundLogger, Depends(logger_dependency)],
+        arq_queue: Annotated[ArqQueue, Depends(arq_dependency)],
     ) -> RequestContext:
         """Create a per-request context and return it."""
         if not self._initialized:
@@ -96,6 +99,7 @@ class ContextDependency:
             factory=Factory(
                 session=session,
                 logger=logger,
+                arq_queue=arq_queue,
             ),
         )
 

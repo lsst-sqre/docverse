@@ -9,6 +9,7 @@ from importlib.metadata import metadata, version
 import structlog
 from fastapi import FastAPI
 from safir.database import create_database_engine, is_database_current
+from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 from safir.fastapi import ClientRequestError, client_request_error_handler
 from safir.logging import configure_logging, configure_uvicorn_logging
@@ -19,6 +20,7 @@ from .config import config
 from .dependencies.context import context_dependency
 from .handlers.admin import admin_router
 from .handlers.internal import internal_router
+from .handlers.queue import queue_router
 
 __all__ = ["app"]
 
@@ -49,6 +51,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         config.database_url,
         config.database_password,
     )
+    await arq_dependency.initialize(
+        mode=config.arq_mode,
+        redis_settings=config.arq_redis_settings,
+    )
     await context_dependency.initialize()
     yield
     await context_dependency.aclose()
@@ -71,6 +77,7 @@ app = FastAPI(
 app.exception_handler(ClientRequestError)(client_request_error_handler)
 app.include_router(internal_router)
 app.include_router(admin_router, prefix=config.path_prefix)
+app.include_router(queue_router, prefix=config.path_prefix)
 app.add_middleware(XForwardedMiddleware)
 
 if config.slack_webhook:

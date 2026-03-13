@@ -11,7 +11,8 @@ dependencies = [
     "fastapi>=0.115",
     "pydantic>=2",
     "pydantic-settings>=2",
-    "safir[db]>=13",
+    "base32-lib",
+    "safir[db,arq]>=13",
     "uvicorn[standard]>=0.34",
 ]
 
@@ -112,6 +113,10 @@ ignore = [
 "alembic/**" = [
     "INP001",  # Alembic versions directory has no __init__.py.
     "D103",    # Missing docstring in public function.
+]
+"src/docverse/worker/**" = [
+    "ARG001",  # ctx argument required by arq worker signatures.
+    "RUF012", # Mutable class attributes required by arq WorkerSettings.
 ]
 
 [tool.mypy]
