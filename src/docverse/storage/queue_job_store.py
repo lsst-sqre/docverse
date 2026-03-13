@@ -129,6 +129,7 @@ class QueueJobStore:
         row = await self._get_row(job_id)
         if row.progress is None:
             row.progress = progress
+            await self._session.flush()
         else:
             # Use SQLAlchemy JSONB concatenation for atomic merge
             stmt = (
@@ -137,8 +138,6 @@ class QueueJobStore:
                 .values(progress=SqlQueueJob.progress.concat(progress))
             )
             await self._session.execute(stmt)
-            await self._session.refresh(row)
-        await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
 
