@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
-from docverse.exceptions import InvalidJobStateError
+from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 
 __all__ = ["QueueJobStore"]
 
@@ -209,5 +209,5 @@ class QueueJobStore:
         row = result.scalar_one_or_none()
         if row is None:
             msg = f"Queue job {job_id} not found"
-            raise InvalidJobStateError(msg)
+            raise JobNotFoundError(msg)
         return row
