@@ -153,6 +153,47 @@ async def test_fail_job(
 
 
 @pytest.mark.asyncio
+async def test_cancel_queued_job(
+    db_session: async_scoped_session[AsyncSession],
+    store: QueueJobStore,
+) -> None:
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        cancelled = await store.cancel(job.id)
+        await db_session.commit()
+    assert cancelled.status == JobStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_in_progress_job(
+    db_session: async_scoped_session[AsyncSession],
+    store: QueueJobStore,
+) -> None:
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        await store.start(job.id)
+        cancelled = await store.cancel(job.id)
+        await db_session.commit()
+    assert cancelled.status == JobStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_completed_job_raises(
+    db_session: async_scoped_session[AsyncSession],
+    store: QueueJobStore,
+) -> None:
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        await store.start(job.id)
+        await store.complete(job.id)
+        with pytest.raises(InvalidJobStateError):
+            await store.cancel(job.id)
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
 async def test_get_by_public_id(
     db_session: async_scoped_session[AsyncSession],
     store: QueueJobStore,

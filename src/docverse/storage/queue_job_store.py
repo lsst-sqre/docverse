@@ -201,6 +201,29 @@ class QueueJobStore:
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def cancel(self, job_id: int) -> QueueJob:
+        """Mark job cancelled, set date_completed=now().
+
+        Raises
+        ------
+        InvalidJobStateError
+            If the job is not in queued or in_progress status.
+        """
+        row = await self._get_row(job_id)
+        allowed = {JobStatus.queued.value, JobStatus.in_progress.value}
+        if row.status not in allowed:
+            msg = (
+                f"Cannot cancel job {job_id}: "
+                f"expected 'queued'/'in_progress', "
+                f"got '{row.status}'"
+            )
+            raise InvalidJobStateError(msg)
+        row.status = JobStatus.cancelled.value
+        row.date_completed = datetime.now(tz=UTC)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return QueueJob.model_validate(row, from_attributes=True)
+
     async def _get_row(self, job_id: int) -> SqlQueueJob:
         """Fetch a SqlQueueJob row by id, raising if not found."""
         result = await self._session.execute(
