@@ -20,6 +20,7 @@ from .config import config
 from .dependencies.context import context_dependency
 from .handlers.admin import admin_router
 from .handlers.internal import internal_router
+from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
 
 __all__ = ["app"]
@@ -77,6 +78,7 @@ app = FastAPI(
 app.exception_handler(ClientRequestError)(client_request_error_handler)
 app.include_router(internal_router)
 app.include_router(admin_router, prefix=config.path_prefix)
+app.include_router(orgs_router, prefix=config.path_prefix)
 app.include_router(queue_router, prefix=config.path_prefix)
 app.add_middleware(XForwardedMiddleware)
 

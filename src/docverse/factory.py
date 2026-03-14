@@ -6,10 +6,19 @@ import structlog
 from safir.arq import ArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
+from .services.authorization import AuthorizationService
+from .services.build import BuildService
+from .services.edition import EditionService
 from .services.organization import OrganizationService
+from .services.project import ProjectService
+from .storage.build_store import BuildStore
+from .storage.edition_store import EditionStore
+from .storage.membership_store import OrgMembershipStore
 from .storage.organization_store import OrganizationStore
+from .storage.project_store import ProjectStore
 from .storage.queue_backend import ArqQueueBackend
 from .storage.queue_job_store import QueueJobStore
+from .storage.user_info_store import UserInfoStore
 
 
 class Factory:
@@ -20,10 +29,12 @@ class Factory:
         session: async_scoped_session[AsyncSession],
         logger: structlog.stdlib.BoundLogger,
         arq_queue: ArqQueue,
+        user_info_store: UserInfoStore,
     ) -> None:
         self._session = session
         self._logger = logger
         self._arq_queue = arq_queue
+        self._user_info_store = user_info_store
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
@@ -34,6 +45,34 @@ class Factory:
         store = OrganizationStore(session=self._session, logger=self._logger)
         return OrganizationService(store=store, logger=self._logger)
 
+    def create_project_service(self) -> ProjectService:
+        """Create a ProjectService."""
+        store = ProjectStore(session=self._session, logger=self._logger)
+        return ProjectService(store=store, logger=self._logger)
+
+    def create_build_service(self) -> BuildService:
+        """Create a BuildService."""
+        store = BuildStore(session=self._session, logger=self._logger)
+        return BuildService(store=store, logger=self._logger)
+
+    def create_edition_service(self) -> EditionService:
+        """Create an EditionService."""
+        store = EditionStore(session=self._session, logger=self._logger)
+        return EditionService(store=store, logger=self._logger)
+
+    def create_authorization_service(self) -> AuthorizationService:
+        """Create an AuthorizationService."""
+        membership_store = OrgMembershipStore(
+            session=self._session, logger=self._logger
+        )
+        return AuthorizationService(
+            membership_store=membership_store, logger=self._logger
+        )
+
+    def create_membership_store(self) -> OrgMembershipStore:
+        """Create an OrgMembershipStore."""
+        return OrgMembershipStore(session=self._session, logger=self._logger)
+
     def create_queue_backend(self) -> ArqQueueBackend:
         """Create an ArqQueueBackend."""
         return ArqQueueBackend(arq_queue=self._arq_queue)
@@ -41,3 +80,7 @@ class Factory:
     def create_queue_job_store(self) -> QueueJobStore:
         """Create a QueueJobStore."""
         return QueueJobStore(session=self._session, logger=self._logger)
+
+    def get_user_info_store(self) -> UserInfoStore:
+        """Get the UserInfoStore instance."""
+        return self._user_info_store

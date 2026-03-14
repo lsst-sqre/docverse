@@ -20,6 +20,7 @@ router = APIRouter(tags=["admin"])
     response_model=Organization,
     status_code=status.HTTP_201_CREATED,
     summary="Create an organization",
+    name="admin_post_organization",
 )
 async def post_organization(
     data: OrganizationCreate,
@@ -40,6 +41,7 @@ async def post_organization(
     "/admin/orgs",
     response_model=list[Organization],
     summary="List all organizations",
+    name="admin_get_organizations",
 )
 async def get_organizations(
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -54,6 +56,7 @@ async def get_organizations(
     "/admin/orgs/{org_slug}",
     response_model=Organization,
     summary="Get an organization",
+    name="admin_get_organization",
 )
 async def get_organization(
     org_slug: str,
@@ -72,6 +75,7 @@ async def get_organization(
     "/admin/orgs/{org_slug}",
     response_model=Organization,
     summary="Update an organization",
+    name="admin_patch_organization",
 )
 async def patch_organization(
     org_slug: str,
@@ -92,6 +96,7 @@ async def patch_organization(
     "/admin/orgs/{org_slug}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete an organization",
+    name="admin_delete_organization",
 )
 async def delete_organization(
     org_slug: str,
