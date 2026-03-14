@@ -7,9 +7,11 @@ from safir.fastapi import ClientRequestError
 
 __all__ = [
     "ConflictError",
+    "InvalidBuildStateError",
     "InvalidJobStateError",
     "JobNotFoundError",
     "NotFoundError",
+    "PermissionDeniedError",
 ]
 
 
@@ -27,8 +29,23 @@ class ConflictError(ClientRequestError):
     status_code = status.HTTP_409_CONFLICT
 
 
+class PermissionDeniedError(ClientRequestError):
+    """The user does not have permission to perform this action."""
+
+    error = "permission_denied"
+    status_code = status.HTTP_403_FORBIDDEN
+
+
 class InvalidJobStateError(Exception):
     """A queue job state transition is invalid.
+
+    This is a non-HTTP exception because it may be raised from worker
+    code outside of a request context.
+    """
+
+
+class InvalidBuildStateError(Exception):
+    """A build status transition is invalid.
 
     This is a non-HTTP exception because it may be raised from worker
     code outside of a request context.
