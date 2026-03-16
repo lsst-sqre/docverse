@@ -217,3 +217,147 @@ async def test_soft_delete_edition(
         )
         await db_session.commit()
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_find_matching_editions_git_ref(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """A build without alternate_name matches a git_ref edition."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="main",
+                title="Latest",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id,
+            git_ref="main",
+        )
+        await db_session.commit()
+    assert len(matched) == 1
+    assert matched[0].slug == "main"
+
+
+@pytest.mark.asyncio
+async def test_find_matching_editions_git_ref_excludes_alternate(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """A build with alternate_name must NOT match a git_ref edition."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="main",
+                title="Latest",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id,
+            git_ref="main",
+            alternate_name="usdf-dev",
+        )
+        await db_session.commit()
+    assert len(matched) == 0
+
+
+@pytest.mark.asyncio
+async def test_find_matching_editions_alternate_git_ref(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """A build with matching git_ref AND alternate_name matches."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="usdf-dev",
+                title="USDF Dev",
+                kind=EditionKind.alternate,
+                tracking_mode=TrackingMode.alternate_git_ref,
+                tracking_params={
+                    "git_ref": "main",
+                    "alternate_name": "usdf-dev",
+                },
+            ),
+        )
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id,
+            git_ref="main",
+            alternate_name="usdf-dev",
+        )
+        await db_session.commit()
+    assert len(matched) == 1
+    assert matched[0].slug == "usdf-dev"
+
+
+@pytest.mark.asyncio
+async def test_find_matching_editions_alternate_git_ref_wrong_ref(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """Build with matching alternate_name but wrong git_ref: no match."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="usdf-dev",
+                title="USDF Dev",
+                kind=EditionKind.alternate,
+                tracking_mode=TrackingMode.alternate_git_ref,
+                tracking_params={
+                    "git_ref": "main",
+                    "alternate_name": "usdf-dev",
+                },
+            ),
+        )
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id,
+            git_ref="develop",
+            alternate_name="usdf-dev",
+        )
+        await db_session.commit()
+    assert len(matched) == 0
+
+
+@pytest.mark.asyncio
+async def test_find_matching_editions_no_alternate_vs_alternate_edition(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """A build without alternate_name must NOT match alternate_git_ref."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="usdf-dev",
+                title="USDF Dev",
+                kind=EditionKind.alternate,
+                tracking_mode=TrackingMode.alternate_git_ref,
+                tracking_params={
+                    "git_ref": "main",
+                    "alternate_name": "usdf-dev",
+                },
+            ),
+        )
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id,
+            git_ref="main",
+        )
+        await db_session.commit()
+    assert len(matched) == 0

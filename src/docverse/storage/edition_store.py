@@ -171,12 +171,18 @@ class EditionStore:
         for edition_row, build_public_id in rows:
             edition = self._validate(edition_row, build_public_id)
             if edition.tracking_mode == TrackingMode.git_ref:
-                params = edition.tracking_params or {}
-                if params.get("git_ref") == git_ref:
-                    matching.append(edition)
-            elif edition.tracking_mode == TrackingMode.alternate_git_ref:
-                if alternate_name is not None:
+                if alternate_name is None:
                     params = edition.tracking_params or {}
-                    if params.get("alternate_name") == alternate_name:
+                    if params.get("git_ref") == git_ref:
                         matching.append(edition)
+            elif (
+                edition.tracking_mode == TrackingMode.alternate_git_ref
+                and alternate_name is not None
+            ):
+                params = edition.tracking_params or {}
+                if (
+                    params.get("git_ref") == git_ref
+                    and params.get("alternate_name") == alternate_name
+                ):
+                    matching.append(edition)
         return matching
