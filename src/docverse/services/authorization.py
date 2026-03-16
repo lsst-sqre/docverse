@@ -5,15 +5,9 @@ from __future__ import annotations
 import structlog
 
 from docverse.client.models import OrgRole
+from docverse.domain.membership import ROLE_RANK
 from docverse.exceptions import PermissionDeniedError
 from docverse.storage.membership_store import OrgMembershipStore
-
-# Role hierarchy for comparison
-_ROLE_RANK: dict[OrgRole, int] = {
-    OrgRole.reader: 0,
-    OrgRole.uploader: 1,
-    OrgRole.admin: 2,
-}
 
 
 class AuthorizationService:
@@ -62,7 +56,7 @@ class AuthorizationService:
         role = await self.resolve_role(
             org_id=org_id, username=username, groups=groups
         )
-        if role is None or _ROLE_RANK[role] < _ROLE_RANK[minimum_role]:
+        if role is None or ROLE_RANK[role] < ROLE_RANK[minimum_role]:
             self._logger.warning(
                 "Permission denied",
                 username=username,

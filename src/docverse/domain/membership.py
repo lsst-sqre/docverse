@@ -6,6 +6,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from docverse.client.models import OrgRole, PrincipalType
 
+# Role hierarchy for comparison (higher value = more permissions)
+ROLE_RANK: dict[OrgRole, int] = {
+    OrgRole.reader: 0,
+    OrgRole.uploader: 1,
+    OrgRole.admin: 2,
+}
+
 
 class OrgMembership(BaseModel):
     """Domain representation of an organization membership."""

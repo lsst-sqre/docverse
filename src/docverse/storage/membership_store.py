@@ -8,14 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
 from docverse.dbschema.membership import SqlOrgMembership
-from docverse.domain.membership import OrgMembership
-
-# Role hierarchy for comparison (higher value = more permissions)
-_ROLE_RANK: dict[OrgRole, int] = {
-    OrgRole.reader: 0,
-    OrgRole.uploader: 1,
-    OrgRole.admin: 2,
-}
+from docverse.domain.membership import ROLE_RANK, OrgMembership
 
 
 class OrgMembershipStore:
@@ -147,5 +140,5 @@ class OrgMembershipStore:
 
         return max(
             (OrgRole(r.role) for r in rows),
-            key=lambda r: _ROLE_RANK[r],
+            key=lambda r: ROLE_RANK[r],
         )
