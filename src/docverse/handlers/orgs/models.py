@@ -8,13 +8,49 @@ from starlette.requests import Request
 
 from docverse.client.models import Build as _BuildBase
 from docverse.client.models import Edition as _EditionBase
+from docverse.client.models import Organization as _OrganizationBase
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
 from docverse.domain.edition import Edition as EditionDomain
 from docverse.domain.membership import OrgMembership as OrgMembershipDomain
+from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.domain.project import Project as ProjectDomain
+
+
+class Organization(_OrganizationBase):
+    """Organization response model with HATEOAS URLs."""
+
+    projects_url: str
+    members_url: str
+
+    @classmethod
+    def from_domain(cls, domain: OrganizationDomain, request: Request) -> Self:
+        """Create from a domain object, adding HATEOAS URLs."""
+        return cls(
+            self_url=str(
+                request.url_for("get_organization", org_slug=domain.slug)
+            ),
+            projects_url=str(
+                request.url_for("get_projects", org_slug=domain.slug)
+            ),
+            members_url=str(
+                request.url_for("get_members", org_slug=domain.slug)
+            ),
+            slug=domain.slug,
+            title=domain.title,
+            base_domain=domain.base_domain,
+            url_scheme=domain.url_scheme,
+            root_path_prefix=domain.root_path_prefix,
+            slug_rewrite_rules=domain.slug_rewrite_rules,
+            lifecycle_rules=domain.lifecycle_rules,
+            purgatory_retention=int(
+                domain.purgatory_retention.total_seconds()
+            ),
+            date_created=domain.date_created,
+            date_updated=domain.date_updated,
+        )
 
 
 class Project(_ProjectBase):
@@ -37,7 +73,7 @@ class Project(_ProjectBase):
                 )
             ),
             org_url=str(
-                request.url_for("admin_get_organization", org_slug=org_slug)
+                request.url_for("get_organization", org_slug=org_slug)
             ),
             editions_url=str(
                 request.url_for(
@@ -187,7 +223,7 @@ class OrgMembership(_OrgMembershipBase):
                 )
             ),
             org_url=str(
-                request.url_for("admin_get_organization", org_slug=org_slug)
+                request.url_for("get_organization", org_slug=org_slug)
             ),
             id=member_id,
             principal=domain.principal,
