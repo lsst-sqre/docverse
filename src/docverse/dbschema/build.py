@@ -41,7 +41,7 @@ class SqlBuild(Base):
     status: Mapped[BuildStatus] = mapped_column(
         Enum(BuildStatus, native_enum=False, length=32),
         nullable=False,
-        default=BuildStatus.uploading,
+        default=BuildStatus.pending,
     )
 
     staging_key: Mapped[str] = mapped_column(String(512), nullable=False)

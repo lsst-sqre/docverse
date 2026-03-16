@@ -21,7 +21,8 @@ __all__ = [
 class BuildStatus(StrEnum):
     """Status of a documentation build."""
 
-    uploading = "uploading"
+    pending = "pending"
+    uploaded = "uploaded"
     processing = "processing"
     completed = "completed"
     failed = "failed"
@@ -44,7 +45,8 @@ class BuildCreate(BaseModel):
         default=None,
         max_length=128,
         description=(
-            "Alternate identifier for the build (e.g., ticket branch slug)."
+            "Deployment variant scope for the build (e.g., 'usdf-dev'). "
+            "When set, the build is matched only by alternate-aware editions."
         ),
     )
 
@@ -141,13 +143,13 @@ class BuildUpdate(BaseModel):
     """Request model for updating a build (PATCH).
 
     Currently supports only the ``status`` field, used to signal
-    that an upload is complete (set ``status`` to ``"uploading"``).
+    that an upload is complete (set ``status`` to ``"uploaded"``).
     """
 
     status: BuildStatus | None = Field(
         default=None,
         description=(
-            "Signal value. Set to 'uploading' to indicate upload is "
+            "Signal value. Set to 'uploaded' to indicate upload is "
             "complete and trigger processing."
         ),
     )

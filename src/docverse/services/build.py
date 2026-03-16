@@ -23,7 +23,7 @@ class BuildService:
     async def create(
         self, *, project_id: int, data: BuildCreate, uploader: str
     ) -> Build:
-        """Create a new build with status=uploading."""
+        """Create a new build with status=pending."""
         build = await self._store.create(
             project_id=project_id, data=data, uploader=uploader
         )

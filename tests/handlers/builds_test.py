@@ -40,7 +40,7 @@ async def test_create_build(client: AsyncClient) -> None:
     assert response.status_code == 201
     data = response.json()
     assert data["git_ref"] == "main"
-    assert data["status"] == "uploading"
+    assert data["status"] == "pending"
     assert data["upload_url"] is not None
     assert data["uploader"] == "testuser"
 
@@ -89,7 +89,7 @@ async def test_patch_build_upload_complete(client: AsyncClient) -> None:
     build_id = create_resp.json()["id"]
     response = await client.patch(
         f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
-        json={"status": "uploading"},
+        json={"status": "uploaded"},
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 200

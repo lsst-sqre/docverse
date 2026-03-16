@@ -164,7 +164,7 @@ async def patch_build(  # noqa: PLR0913
             raise NotFoundError(msg)
 
         # Signal upload complete → transition to processing
-        if data.status == BuildStatus.uploading:
+        if data.status == BuildStatus.uploaded:
             build = await build_service.signal_upload_complete(
                 build_id=build.id
             )

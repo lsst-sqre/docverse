@@ -70,7 +70,7 @@ async def test_create_build(
             uploader="testuser",
         )
         await db_session.commit()
-    assert build.status == BuildStatus.uploading
+    assert build.status == BuildStatus.pending
     assert build.public_id > 0
     assert build.staging_key.startswith("__staging/")
     assert build.uploader == "testuser"
@@ -78,7 +78,7 @@ async def test_create_build(
 
 
 @pytest.mark.asyncio
-async def test_transition_uploading_to_processing(
+async def test_transition_pending_to_processing(
     db_session: async_scoped_session[AsyncSession],
     build_store: BuildStore,
 ) -> None:
@@ -155,7 +155,7 @@ async def test_invalid_transition_raises(
             data=_build_data(),
             uploader="testuser",
         )
-        # Cannot go directly from uploading to completed
+        # Cannot go directly from pending to completed
         with pytest.raises(InvalidBuildStateError):
             await build_store.transition_status(
                 build_id=build.id, new_status=BuildStatus.completed

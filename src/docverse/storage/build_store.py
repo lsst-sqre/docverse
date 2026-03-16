@@ -21,7 +21,7 @@ from docverse.exceptions import InvalidBuildStateError
 
 # Valid status transitions
 _VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
-    BuildStatus.uploading: {BuildStatus.processing, BuildStatus.failed},
+    BuildStatus.pending: {BuildStatus.processing, BuildStatus.failed},
     BuildStatus.processing: {BuildStatus.completed, BuildStatus.failed},
 }
 
@@ -44,7 +44,7 @@ class BuildStore:
         data: BuildCreate,
         uploader: str,
     ) -> Build:
-        """Insert a new build row with status=uploading."""
+        """Insert a new build row with status=pending."""
         public_id = validate_base32_id(generate_base32_id())
         staging_key = f"__staging/{serialize_base32_id(public_id)}.tar.gz"
         row = SqlBuild(
@@ -53,7 +53,7 @@ class BuildStore:
             git_ref=data.git_ref,
             alternate_name=data.alternate_name,
             content_hash=data.content_hash,
-            status=BuildStatus.uploading,
+            status=BuildStatus.pending,
             staging_key=staging_key,
             uploader=uploader,
             annotations=data.annotations,
