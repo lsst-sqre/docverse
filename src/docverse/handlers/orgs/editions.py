@@ -13,24 +13,10 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.exceptions import ConflictError, NotFoundError
 
 from .models import Edition
 
 router = APIRouter()
-
-
-async def _resolve_project(
-    context: RequestContext, org_id: int, project_slug: str
-) -> int:
-    """Resolve a project slug to its ID."""
-    project = await context.factory.create_project_service().get_by_slug(
-        org_id=org_id, slug=project_slug
-    )
-    if project is None:
-        msg = f"Project {project_slug!r} not found"
-        raise NotFoundError(msg)
-    return project.id
 
 
 @router.get(
@@ -43,12 +29,13 @@ async def get_editions(
     org_slug: str,
     project_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> list[Edition]:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_edition_service()
-        editions = await service.list_by_project(project_id)
+        editions = await service.list_by_project(
+            org_slug=org_slug, project_slug=project_slug
+        )
     return [
         Edition.from_domain(e, context.request, org_slug, project_slug)
         for e in editions
@@ -67,18 +54,13 @@ async def post_edition(
     project_slug: str,
     data: EditionCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> Edition:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_edition_service()
-        existing = await service.get_by_slug(
-            project_id=project_id, slug=data.slug
+        edition = await service.create(
+            org_slug=org_slug, project_slug=project_slug, data=data
         )
-        if existing is not None:
-            msg = f"Edition with slug {data.slug!r} already exists"
-            raise ConflictError(msg)
-        edition = await service.create(project_id=project_id, data=data)
         await context.session.commit()
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
@@ -96,17 +78,15 @@ async def get_edition(
     project_slug: str,
     edition_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> Edition:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_edition_service()
         edition = await service.get_by_slug(
-            project_id=project_id, slug=edition_slug
+            org_slug=org_slug,
+            project_slug=project_slug,
+            slug=edition_slug,
         )
-        if edition is None:
-            msg = f"Edition {edition_slug!r} not found"
-            raise NotFoundError(msg)
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
     )
@@ -124,17 +104,16 @@ async def patch_edition(  # noqa: PLR0913
     edition_slug: str,
     data: EditionUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> Edition:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_edition_service()
         edition = await service.update(
-            project_id=project_id, slug=edition_slug, data=data
+            org_slug=org_slug,
+            project_slug=project_slug,
+            slug=edition_slug,
+            data=data,
         )
-        if edition is None:
-            msg = f"Edition {edition_slug!r} not found"
-            raise NotFoundError(msg)
         await context.session.commit()
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
@@ -148,19 +127,17 @@ async def patch_edition(  # noqa: PLR0913
     name="delete_edition",
 )
 async def delete_edition(
-    org_slug: str,  # noqa: ARG001
+    org_slug: str,
     project_slug: str,
     edition_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_edition_service()
-        deleted = await service.soft_delete(
-            project_id=project_id, slug=edition_slug
+        await service.soft_delete(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            slug=edition_slug,
         )
-        if not deleted:
-            msg = f"Edition {edition_slug!r} not found"
-            raise NotFoundError(msg)
         await context.session.commit()

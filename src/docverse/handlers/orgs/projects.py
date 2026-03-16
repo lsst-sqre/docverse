@@ -13,7 +13,6 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.exceptions import ConflictError, NotFoundError
 
 from .models import Project
 
@@ -29,11 +28,11 @@ router = APIRouter()
 async def get_projects(
     org_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> list[Project]:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        projects = await service.list_by_org(user.org.id)
+        projects = await service.list_by_org(org_slug)
     return [
         Project.from_domain(p, context.request, org_slug) for p in projects
     ]
@@ -50,17 +49,11 @@ async def post_project(
     org_slug: str,
     data: ProjectCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        existing = await service.get_by_slug(
-            org_id=user.org.id, slug=data.slug
-        )
-        if existing is not None:
-            msg = f"Project with slug {data.slug!r} already exists"
-            raise ConflictError(msg)
-        project = await service.create(org_id=user.org.id, data=data)
+        project = await service.create(org_slug=org_slug, data=data)
         await context.session.commit()
     return Project.from_domain(project, context.request, org_slug)
 
@@ -75,16 +68,13 @@ async def get_project(
     org_slug: str,
     project_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
         project = await service.get_by_slug(
-            org_id=user.org.id, slug=project_slug
+            org_slug=org_slug, slug=project_slug
         )
-        if project is None:
-            msg = f"Project {project_slug!r} not found"
-            raise NotFoundError(msg)
     return Project.from_domain(project, context.request, org_slug)
 
 
@@ -99,16 +89,13 @@ async def patch_project(
     project_slug: str,
     data: ProjectUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
         project = await service.update(
-            org_id=user.org.id, slug=project_slug, data=data
+            org_slug=org_slug, slug=project_slug, data=data
         )
-        if project is None:
-            msg = f"Project {project_slug!r} not found"
-            raise NotFoundError(msg)
         await context.session.commit()
     return Project.from_domain(project, context.request, org_slug)
 
@@ -120,17 +107,12 @@ async def patch_project(
     name="delete_project",
 )
 async def delete_project(
-    org_slug: str,  # noqa: ARG001
+    org_slug: str,
     project_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        deleted = await service.soft_delete(
-            org_id=user.org.id, slug=project_slug
-        )
-        if not deleted:
-            msg = f"Project {project_slug!r} not found"
-            raise NotFoundError(msg)
+        await service.soft_delete(org_slug=org_slug, slug=project_slug)
         await context.session.commit()

@@ -6,7 +6,10 @@ import structlog
 
 from docverse.client.models import EditionCreate, EditionUpdate
 from docverse.domain.edition import Edition
+from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 
 
 class EditionService:
@@ -15,13 +18,52 @@ class EditionService:
     def __init__(
         self,
         store: EditionStore,
+        org_store: OrganizationStore,
+        project_store: ProjectStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._store = store
+        self._org_store = org_store
+        self._project_store = project_store
         self._logger = logger
 
-    async def create(self, *, project_id: int, data: EditionCreate) -> Edition:
-        """Create a new edition."""
+    async def _resolve_project_id(
+        self, org_slug: str, project_slug: str
+    ) -> int:
+        """Resolve org slug + project slug to a project internal ID."""
+        org = await self._org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        project = await self._project_store.get_by_slug(
+            org_id=org.id, slug=project_slug
+        )
+        if project is None:
+            msg = f"Project {project_slug!r} not found"
+            raise NotFoundError(msg)
+        return project.id
+
+    async def create(
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        data: EditionCreate,
+    ) -> Edition:
+        """Create a new edition.
+
+        Raises
+        ------
+        ConflictError
+            If an edition with the same slug already exists.
+        """
+        project_id = await self._resolve_project_id(org_slug, project_slug)
+        existing = await self._store.get_by_slug(
+            project_id=project_id, slug=data.slug
+        )
+        if existing is not None:
+            msg = f"Edition with slug {data.slug!r} already exists"
+            raise ConflictError(msg)
         edition = await self._store.create(project_id=project_id, data=data)
         self._logger.info(
             "Created edition",
@@ -31,26 +73,58 @@ class EditionService:
         return edition
 
     async def get_by_slug(
-        self, *, project_id: int, slug: str
-    ) -> Edition | None:
-        """Get an edition by slug within a project."""
-        return await self._store.get_by_slug(project_id=project_id, slug=slug)
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        slug: str,
+    ) -> Edition:
+        """Get an edition by slug within a project.
 
-    async def list_by_project(self, project_id: int) -> list[Edition]:
+        Raises
+        ------
+        NotFoundError
+            If the edition is not found.
+        """
+        project_id = await self._resolve_project_id(org_slug, project_slug)
+        edition = await self._store.get_by_slug(
+            project_id=project_id, slug=slug
+        )
+        if edition is None:
+            msg = f"Edition {slug!r} not found"
+            raise NotFoundError(msg)
+        return edition
+
+    async def list_by_project(
+        self, *, org_slug: str, project_slug: str
+    ) -> list[Edition]:
         """List all editions for a project."""
+        project_id = await self._resolve_project_id(org_slug, project_slug)
         return await self._store.list_by_project(project_id)
 
     async def update(
-        self, *, project_id: int, slug: str, data: EditionUpdate
-    ) -> Edition | None:
-        """Update an edition."""
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        slug: str,
+        data: EditionUpdate,
+    ) -> Edition:
+        """Update an edition.
+
+        Raises
+        ------
+        NotFoundError
+            If the edition is not found.
+        """
+        project_id = await self._resolve_project_id(org_slug, project_slug)
         edition = await self._store.update(
             project_id=project_id, slug=slug, data=data
         )
-        if edition is not None:
-            self._logger.info(
-                "Updated edition", slug=slug, project_id=project_id
-            )
+        if edition is None:
+            msg = f"Edition {slug!r} not found"
+            raise NotFoundError(msg)
+        self._logger.info("Updated edition", slug=slug, project_id=project_id)
         return edition
 
     async def set_current_build(
@@ -67,13 +141,23 @@ class EditionService:
         )
         return edition
 
-    async def soft_delete(self, *, project_id: int, slug: str) -> bool:
-        """Soft-delete an edition."""
+    async def soft_delete(
+        self, *, org_slug: str, project_slug: str, slug: str
+    ) -> None:
+        """Soft-delete an edition.
+
+        Raises
+        ------
+        NotFoundError
+            If the edition is not found.
+        """
+        project_id = await self._resolve_project_id(org_slug, project_slug)
         deleted = await self._store.soft_delete(
             project_id=project_id, slug=slug
         )
-        if deleted:
-            self._logger.info(
-                "Soft-deleted edition", slug=slug, project_id=project_id
-            )
-        return deleted
+        if not deleted:
+            msg = f"Edition {slug!r} not found"
+            raise NotFoundError(msg)
+        self._logger.info(
+            "Soft-deleted edition", slug=slug, project_id=project_id
+        )

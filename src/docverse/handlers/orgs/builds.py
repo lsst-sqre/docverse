@@ -6,12 +6,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
-from docverse.client.models import (
-    BuildCreate,
-    BuildStatus,
-    BuildUpdate,
-    JobKind,
-)
+from docverse.client.models import BuildCreate, BuildStatus, BuildUpdate
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
@@ -19,25 +14,11 @@ from docverse.dependencies.auth import (
     require_uploader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.domain.base32id import serialize_base32_id, validate_base32_id
-from docverse.exceptions import NotFoundError
+from docverse.domain.base32id import serialize_base32_id
 
 from .models import Build
 
 router = APIRouter()
-
-
-async def _resolve_project(
-    context: RequestContext, org_id: int, project_slug: str
-) -> int:
-    """Resolve a project slug to its ID."""
-    project = await context.factory.create_project_service().get_by_slug(
-        org_id=org_id, slug=project_slug
-    )
-    if project is None:
-        msg = f"Project {project_slug!r} not found"
-        raise NotFoundError(msg)
-    return project.id
 
 
 @router.get(
@@ -50,12 +31,13 @@ async def get_builds(
     org_slug: str,
     project_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> list[Build]:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_build_service()
-        builds = await service.list_by_project(project_id)
+        builds = await service.list_by_project(
+            org_slug=org_slug, project_slug=project_slug
+        )
     return [
         Build.from_domain(b, context.request, org_slug, project_slug)
         for b in builds
@@ -77,10 +59,10 @@ async def post_build(
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],
 ) -> Build:
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_build_service()
         build = await service.create(
-            project_id=project_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
             data=data,
             uploader=user.username,
         )
@@ -107,22 +89,15 @@ async def get_build(
     project_slug: str,
     build_id: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> Build:
-    try:
-        public_id = validate_base32_id(build_id)
-    except ValueError as exc:
-        msg = f"Invalid build ID {build_id!r}"
-        raise NotFoundError(msg) from exc
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_build_service()
         build = await service.get_by_public_id(
-            project_id=project_id, public_id=public_id
+            org_slug=org_slug,
+            project_slug=project_slug,
+            build_id=build_id,
         )
-        if build is None:
-            msg = f"Build {build_id!r} not found"
-            raise NotFoundError(msg)
     return Build.from_domain(build, context.request, org_slug, project_slug)
 
 
@@ -138,59 +113,30 @@ async def patch_build(  # noqa: PLR0913
     build_id: str,
     data: BuildUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_uploader)],
+    user: Annotated[AuthenticatedUser, Depends(require_uploader)],  # noqa: ARG001
 ) -> Build:
-    try:
-        public_id = validate_base32_id(build_id)
-    except ValueError as exc:
-        msg = f"Invalid build ID {build_id!r}"
-        raise NotFoundError(msg) from exc
-
     queue_url: str | None = None
     async with context.session.begin():
-        project = await context.factory.create_project_service().get_by_slug(
-            org_id=user.org.id, slug=project_slug
-        )
-        if project is None:
-            msg = f"Project {project_slug!r} not found"
-            raise NotFoundError(msg)
+        service = context.factory.create_build_service()
 
-        build_service = context.factory.create_build_service()
-        build = await build_service.get_by_public_id(
-            project_id=project.id, public_id=public_id
-        )
-        if build is None:
-            msg = f"Build {build_id!r} not found"
-            raise NotFoundError(msg)
-
-        # Signal upload complete → transition to processing
         if data.status == BuildStatus.uploaded:
-            build = await build_service.signal_upload_complete(
-                build_id=build.id
-            )
-            # Enqueue a build_processing job
-            queue_backend = context.factory.create_queue_backend()
-            queue_job_store = context.factory.create_queue_job_store()
-            backend_job_id = await queue_backend.enqueue(
-                "build_processing",
-                {
-                    "org_id": user.org.id,
-                    "project_id": project.id,
-                    "build_id": build.id,
-                },
-            )
-            queue_job = await queue_job_store.create(
-                kind=JobKind.build_processing,
-                org_id=user.org.id,
-                backend_job_id=backend_job_id,
-                project_id=project.id,
-                build_id=build.id,
+            build, queue_job = await service.signal_upload_complete(
+                org_slug=org_slug,
+                project_slug=project_slug,
+                build_id=build_id,
             )
             queue_url = str(
                 context.request.url_for(
                     "get_queue_job",
                     job_id=serialize_base32_id(queue_job.public_id),
                 )
+            )
+        else:
+            # No-op update: just fetch the build
+            build = await service.get_by_public_id(
+                org_slug=org_slug,
+                project_slug=project_slug,
+                build_id=build_id,
             )
 
         await context.session.commit()
@@ -211,28 +157,17 @@ async def patch_build(  # noqa: PLR0913
     name="delete_build",
 )
 async def delete_build(
-    org_slug: str,  # noqa: ARG001
+    org_slug: str,
     project_slug: str,
     build_id: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:
-    try:
-        public_id = validate_base32_id(build_id)
-    except ValueError as exc:
-        msg = f"Invalid build ID {build_id!r}"
-        raise NotFoundError(msg) from exc
     async with context.session.begin():
-        project_id = await _resolve_project(context, user.org.id, project_slug)
         service = context.factory.create_build_service()
-        build = await service.get_by_public_id(
-            project_id=project_id, public_id=public_id
+        await service.soft_delete(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            build_id=build_id,
         )
-        if build is None:
-            msg = f"Build {build_id!r} not found"
-            raise NotFoundError(msg)
-        deleted = await service.soft_delete(build_id=build.id)
-        if not deleted:
-            msg = f"Build {build_id!r} not found"
-            raise NotFoundError(msg)
         await context.session.commit()

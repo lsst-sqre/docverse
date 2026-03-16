@@ -40,25 +40,54 @@ class Factory:
         """Set the logger for the factory."""
         self._logger = logger
 
+    def _create_org_store(self) -> OrganizationStore:
+        return OrganizationStore(session=self._session, logger=self._logger)
+
+    def _create_project_store(self) -> ProjectStore:
+        return ProjectStore(session=self._session, logger=self._logger)
+
     def create_organization_service(self) -> OrganizationService:
         """Create an OrganizationService."""
-        store = OrganizationStore(session=self._session, logger=self._logger)
+        store = self._create_org_store()
         return OrganizationService(store=store, logger=self._logger)
 
     def create_project_service(self) -> ProjectService:
         """Create a ProjectService."""
-        store = ProjectStore(session=self._session, logger=self._logger)
-        return ProjectService(store=store, logger=self._logger)
+        store = self._create_project_store()
+        org_store = self._create_org_store()
+        return ProjectService(
+            store=store, org_store=org_store, logger=self._logger
+        )
 
     def create_build_service(self) -> BuildService:
         """Create a BuildService."""
         store = BuildStore(session=self._session, logger=self._logger)
-        return BuildService(store=store, logger=self._logger)
+        org_store = self._create_org_store()
+        project_store = self._create_project_store()
+        queue_backend = ArqQueueBackend(arq_queue=self._arq_queue)
+        queue_job_store = QueueJobStore(
+            session=self._session, logger=self._logger
+        )
+        return BuildService(
+            store=store,
+            org_store=org_store,
+            project_store=project_store,
+            queue_backend=queue_backend,
+            queue_job_store=queue_job_store,
+            logger=self._logger,
+        )
 
     def create_edition_service(self) -> EditionService:
         """Create an EditionService."""
         store = EditionStore(session=self._session, logger=self._logger)
-        return EditionService(store=store, logger=self._logger)
+        org_store = self._create_org_store()
+        project_store = self._create_project_store()
+        return EditionService(
+            store=store,
+            org_store=org_store,
+            project_store=project_store,
+            logger=self._logger,
+        )
 
     def create_authorization_service(self) -> AuthorizationService:
         """Create an AuthorizationService."""
