@@ -18,6 +18,7 @@ from docverse.client.models import (
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.pagination import EditionSlugCursor
 from docverse.storage.project_store import ProjectStore
 
 
@@ -127,9 +128,13 @@ async def test_list_by_project(
                 tracking_mode=TrackingMode.semver_release,
             ),
         )
-        editions = await edition_store.list_by_project(project_id)
+        result = await edition_store.list_by_project(
+            project_id,
+            cursor_type=EditionSlugCursor,
+            limit=25,
+        )
         await db_session.commit()
-    assert len(editions) == 2
+    assert len(result.entries) == 2
 
 
 @pytest.mark.asyncio

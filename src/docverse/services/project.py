@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import structlog
+from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.domain.project import Project
@@ -64,10 +65,19 @@ class ProjectService:
             raise NotFoundError(msg)
         return project
 
-    async def list_by_org(self, org_slug: str) -> list[Project]:
+    async def list_by_org(
+        self,
+        org_slug: str,
+        *,
+        cursor_type: type[PaginationCursor[Project]],
+        cursor: PaginationCursor[Project] | None = None,
+        limit: int,
+    ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
         """List all projects for an organization."""
         org_id = await self._resolve_org_id(org_slug)
-        return await self._store.list_by_org(org_id)
+        return await self._store.list_by_org(
+            org_id, cursor_type=cursor_type, cursor=cursor, limit=limit
+        )
 
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate

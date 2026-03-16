@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 
 from docverse.client.models import BuildCreate, BuildStatus, BuildUpdate
 from docverse.dependencies.auth import (
@@ -15,6 +15,11 @@ from docverse.dependencies.auth import (
 )
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id
+from docverse.storage.pagination import (
+    BUILD_CURSOR_TYPE,
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+)
 
 from .models import Build
 
@@ -27,20 +32,32 @@ router = APIRouter()
     summary="List builds for a project",
     name="get_builds",
 )
-async def get_builds(
+async def get_builds(  # noqa: PLR0913
     org_slug: str,
     project_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
+    status_filter: Annotated[BuildStatus | None, Query(alias="status")] = None,
 ) -> list[Build]:
+    parsed_cursor = (
+        BUILD_CURSOR_TYPE.from_str(cursor) if cursor is not None else None
+    )
     async with context.session.begin():
         service = context.factory.create_build_service()
-        builds = await service.list_by_project(
-            org_slug=org_slug, project_slug=project_slug
+        result = await service.list_by_project(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            cursor=parsed_cursor,
+            limit=limit,
+            status=status_filter,
         )
+    context.response.headers["Link"] = result.link_header(context.request.url)
+    context.response.headers["X-Total-Count"] = str(result.count)
     return [
         Build.from_domain(b, context.request, org_slug, project_slug)
-        for b in builds
+        for b in result.entries
     ]
 
 

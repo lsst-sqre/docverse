@@ -183,9 +183,9 @@ async def test_list_by_project(
             ),
             uploader="user2",
         )
-        builds = await build_store.list_by_project(project_id)
+        result = await build_store.list_by_project(project_id, limit=25)
         await db_session.commit()
-    assert len(builds) == 2
+    assert len(result.entries) == 2
 
 
 @pytest.mark.asyncio

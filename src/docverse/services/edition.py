@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import structlog
+from safir.database import CountedPaginatedList, PaginationCursor
 
-from docverse.client.models import EditionCreate, EditionUpdate
+from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
 from docverse.domain.edition import Edition
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.edition_store import EditionStore
@@ -95,12 +96,25 @@ class EditionService:
             raise NotFoundError(msg)
         return edition
 
-    async def list_by_project(
-        self, *, org_slug: str, project_slug: str
-    ) -> list[Edition]:
+    async def list_by_project(  # noqa: PLR0913
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        cursor_type: type[PaginationCursor[Edition]],
+        cursor: PaginationCursor[Edition] | None = None,
+        limit: int,
+        kind: EditionKind | None = None,
+    ) -> CountedPaginatedList[Edition, PaginationCursor[Edition]]:
         """List all editions for a project."""
         project_id = await self._resolve_project_id(org_slug, project_slug)
-        return await self._store.list_by_project(project_id)
+        return await self._store.list_by_project(
+            project_id,
+            cursor_type=cursor_type,
+            cursor=cursor,
+            limit=limit,
+            kind=kind,
+        )
 
     async def update(
         self,

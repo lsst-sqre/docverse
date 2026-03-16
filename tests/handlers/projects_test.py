@@ -53,6 +53,8 @@ async def test_list_projects(client: AsyncClient) -> None:
     data = response.json()
     slugs = [p["slug"] for p in data]
     assert "proj-aa" in slugs
+    assert "Link" in response.headers
+    assert "X-Total-Count" in response.headers
 
 
 @pytest.mark.asyncio

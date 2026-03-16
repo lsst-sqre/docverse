@@ -12,6 +12,7 @@ from docverse.client.models import (
     ProjectUpdate,
 )
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.pagination import ProjectSlugCursor
 from docverse.storage.project_store import ProjectStore
 
 
@@ -126,11 +127,15 @@ async def test_list_by_org(
                 doc_repo="https://github.com/example/b",
             ),
         )
-        projects = await store.list_by_org(org_id)
+        result = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectSlugCursor,
+            limit=25,
+        )
         await db_session.commit()
-    assert len(projects) == 2
-    assert projects[0].slug == "proj-aa"
-    assert projects[1].slug == "proj-bb"
+    assert len(result.entries) == 2
+    assert result.entries[0].slug == "proj-aa"
+    assert result.entries[1].slug == "proj-bb"
 
 
 @pytest.mark.asyncio

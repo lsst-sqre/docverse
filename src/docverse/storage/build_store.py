@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from sqlalchemy.sql import func
@@ -18,6 +19,7 @@ from docverse.domain.base32id import (
 )
 from docverse.domain.build import Build
 from docverse.exceptions import InvalidBuildStateError
+from docverse.storage.pagination import BuildDateCreatedCursor
 
 # Valid status transitions
 _VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
@@ -79,18 +81,27 @@ class BuildStore:
             return None
         return Build.model_validate(row)
 
-    async def list_by_project(self, project_id: int) -> list[Build]:
-        """List all non-deleted builds for a project."""
-        result = await self._session.execute(
-            select(SqlBuild)
-            .where(
-                SqlBuild.project_id == project_id,
-                SqlBuild.date_deleted.is_(None),
-            )
-            .order_by(SqlBuild.date_created.desc())
+    async def list_by_project(
+        self,
+        project_id: int,
+        *,
+        cursor: BuildDateCreatedCursor | None = None,
+        limit: int,
+        status: BuildStatus | None = None,
+    ) -> CountedPaginatedList[Build, BuildDateCreatedCursor]:
+        """List non-deleted builds for a project with pagination."""
+        stmt = select(SqlBuild).where(
+            SqlBuild.project_id == project_id,
+            SqlBuild.date_deleted.is_(None),
         )
-        rows = result.scalars().all()
-        return [Build.model_validate(r) for r in rows]
+        if status is not None:
+            stmt = stmt.where(SqlBuild.status == status)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=Build, cursor_type=BuildDateCreatedCursor
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
 
     async def transition_status(
         self, *, build_id: int, new_status: BuildStatus

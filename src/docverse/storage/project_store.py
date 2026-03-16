@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import structlog
+from safir.database import (
+    CountedPaginatedList,
+    CountedPaginatedQueryRunner,
+    PaginationCursor,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from sqlalchemy.sql import func
@@ -50,18 +55,25 @@ class ProjectStore:
             return None
         return Project.model_validate(row)
 
-    async def list_by_org(self, org_id: int) -> list[Project]:
-        """List all non-deleted projects for an organization."""
-        result = await self._session.execute(
-            select(SqlProject)
-            .where(
-                SqlProject.org_id == org_id,
-                SqlProject.date_deleted.is_(None),
-            )
-            .order_by(SqlProject.slug)
+    async def list_by_org(
+        self,
+        org_id: int,
+        *,
+        cursor_type: type[PaginationCursor[Project]],
+        cursor: PaginationCursor[Project] | None = None,
+        limit: int,
+    ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
+        """List non-deleted projects for an organization with pagination."""
+        stmt = select(SqlProject).where(
+            SqlProject.org_id == org_id,
+            SqlProject.date_deleted.is_(None),
         )
-        rows = result.scalars().all()
-        return [Project.model_validate(r) for r in rows]
+        runner = CountedPaginatedQueryRunner(
+            entry_type=Project, cursor_type=cursor_type
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
 
     async def update(
         self, *, org_id: int, slug: str, data: ProjectUpdate

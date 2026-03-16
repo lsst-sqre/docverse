@@ -66,6 +66,8 @@ async def test_list_editions(client: AsyncClient) -> None:
     )
     assert response.status_code == 200
     assert len(response.json()) >= 1
+    assert "Link" in response.headers
+    assert "X-Total-Count" in response.headers
 
 
 @pytest.mark.asyncio

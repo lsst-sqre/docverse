@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import structlog
+from safir.database import CountedPaginatedList
 
 from docverse.client.models import BuildCreate, BuildStatus, JobKind
 from docverse.domain.base32id import validate_base32_id
@@ -12,6 +13,7 @@ from docverse.domain.queue import QueueJob
 from docverse.exceptions import NotFoundError
 from docverse.storage.build_store import BuildStore
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.pagination import BuildDateCreatedCursor
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_backend import QueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
@@ -157,11 +159,19 @@ class BuildService:
         return await self._resolve_build(project.id, build_id)
 
     async def list_by_project(
-        self, *, org_slug: str, project_slug: str
-    ) -> list[Build]:
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        cursor: BuildDateCreatedCursor | None = None,
+        limit: int,
+        status: BuildStatus | None = None,
+    ) -> CountedPaginatedList[Build, BuildDateCreatedCursor]:
         """List all builds for a project."""
         project = await self._resolve_project(org_slug, project_slug)
-        return await self._store.list_by_project(project.id)
+        return await self._store.list_by_project(
+            project.id, cursor=cursor, limit=limit, status=status
+        )
 
     async def complete(self, *, build_id: int) -> Build:
         """Mark a build as completed."""

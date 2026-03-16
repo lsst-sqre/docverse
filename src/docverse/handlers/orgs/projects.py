@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.dependencies.auth import (
@@ -13,6 +13,12 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.storage.pagination import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    PROJECT_CURSOR_TYPES,
+    ProjectSortOrder,
+)
 
 from .models import Project
 
@@ -25,16 +31,31 @@ router = APIRouter()
     summary="List projects in an organization",
     name="get_projects",
 )
-async def get_projects(
+async def get_projects(  # noqa: PLR0913
     org_slug: str,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    order: ProjectSortOrder = ProjectSortOrder.slug,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
 ) -> list[Project]:
+    cursor_type = PROJECT_CURSOR_TYPES[order]
+    parsed_cursor = (
+        cursor_type.from_str(cursor) if cursor is not None else None
+    )
     async with context.session.begin():
         service = context.factory.create_project_service()
-        projects = await service.list_by_org(org_slug)
+        result = await service.list_by_org(
+            org_slug,
+            cursor_type=cursor_type,
+            cursor=parsed_cursor,
+            limit=limit,
+        )
+    context.response.headers["Link"] = result.link_header(context.request.url)
+    context.response.headers["X-Total-Count"] = str(result.count)
     return [
-        Project.from_domain(p, context.request, org_slug) for p in projects
+        Project.from_domain(p, context.request, org_slug)
+        for p in result.entries
     ]
 
 

@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
+from safir.database import (
+    CountedPaginatedList,
+    CountedPaginatedQueryRunner,
+    PaginationCursor,
+)
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from sqlalchemy.sql import func
 
-from docverse.client.models import EditionCreate, EditionUpdate, TrackingMode
+from docverse.client.models import (
+    EditionCreate,
+    EditionKind,
+    EditionUpdate,
+    TrackingMode,
+)
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.domain.edition import Edition
@@ -29,6 +41,29 @@ class EditionStore:
         return select(
             SqlEdition,
             SqlBuild.public_id.label("current_build_public_id"),
+        ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+
+    def _column_query(self) -> Select[tuple[Any, ...]]:
+        """Build a column-based query for paginated results.
+
+        Returns all Edition domain fields as flat columns, including
+        the joined build public_id. Suitable for use with
+        ``query_row`` so the flat row validates directly into Edition.
+        """
+        return select(
+            SqlEdition.id,
+            SqlEdition.slug,
+            SqlEdition.title,
+            SqlEdition.project_id,
+            SqlEdition.kind,
+            SqlEdition.tracking_mode,
+            SqlEdition.tracking_params,
+            SqlEdition.current_build_id,
+            SqlBuild.public_id.label("current_build_public_id"),
+            SqlEdition.lifecycle_exempt,
+            SqlEdition.date_created,
+            SqlEdition.date_updated,
+            SqlEdition.date_deleted,
         ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
 
     def _validate(
@@ -71,19 +106,28 @@ class EditionStore:
         edition_row, build_public_id = row_tuple
         return self._validate(edition_row, build_public_id)
 
-    async def list_by_project(self, project_id: int) -> list[Edition]:
-        """List all non-deleted editions for a project."""
-        stmt = (
-            self._base_query()
-            .where(
-                SqlEdition.project_id == project_id,
-                SqlEdition.date_deleted.is_(None),
-            )
-            .order_by(SqlEdition.slug)
+    async def list_by_project(
+        self,
+        project_id: int,
+        *,
+        cursor_type: type[PaginationCursor[Edition]],
+        cursor: PaginationCursor[Edition] | None = None,
+        limit: int,
+        kind: EditionKind | None = None,
+    ) -> CountedPaginatedList[Edition, PaginationCursor[Edition]]:
+        """List non-deleted editions for a project with pagination."""
+        stmt = self._column_query().where(
+            SqlEdition.project_id == project_id,
+            SqlEdition.date_deleted.is_(None),
         )
-        result = await self._session.execute(stmt)
-        rows = result.all()
-        return [self._validate(r, bp) for r, bp in rows]
+        if kind is not None:
+            stmt = stmt.where(SqlEdition.kind == kind)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=Edition, cursor_type=cursor_type
+        )
+        return await runner.query_row(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
 
     async def update(
         self, *, project_id: int, slug: str, data: EditionUpdate
