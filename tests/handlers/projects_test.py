@@ -287,6 +287,28 @@ async def test_search_excludes_soft_deleted(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_project_duplicate_slug(client: AsyncClient) -> None:
+    await _setup(client)
+    payload = {
+        "slug": "dup-proj",
+        "title": "First",
+        "doc_repo": "https://github.com/example/dup",
+    }
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json=payload,
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json=payload,
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_permission_denied_no_auth(client: AsyncClient) -> None:
     await _setup(client)
     response = await client.get(
