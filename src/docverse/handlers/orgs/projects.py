@@ -90,7 +90,9 @@ async def get_projects(  # noqa: PLR0913
                 cursor=parsed_cursor,
                 limit=limit,
             )
-    context.response.headers["Link"] = result.link_header(context.request.url)
+    link = result.link_header(context.request.url)
+    if link:
+        context.response.headers["Link"] = link
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
         Project.from_domain(p, context.request, org_slug)

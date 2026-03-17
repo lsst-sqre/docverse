@@ -164,6 +164,7 @@ async def test_search_by_slug(client: AsyncClient) -> None:
     assert "pipeline-tutorial" in slugs
     assert "admin-manual" not in slugs
     assert int(response.headers["X-Total-Count"]) == len(data)
+    assert "Link" not in response.headers
 
 
 @pytest.mark.asyncio
