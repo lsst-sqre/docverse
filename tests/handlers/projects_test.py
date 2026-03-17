@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import parse_qs, urlparse
+
 import pytest
 from httpx import AsyncClient
 
@@ -164,7 +166,7 @@ async def test_search_by_slug(client: AsyncClient) -> None:
     assert "pipeline-tutorial" in slugs
     assert "admin-manual" not in slugs
     assert int(response.headers["X-Total-Count"]) == len(data)
-    assert "Link" not in response.headers
+    assert 'rel="next"' not in response.headers.get("Link", "")
 
 
 @pytest.mark.asyncio
@@ -212,15 +214,64 @@ async def test_search_no_results(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_cursor_mutual_exclusion(client: AsyncClient) -> None:
+async def test_search_pagination(client: AsyncClient) -> None:
+    """Search results can be paginated via cursor."""
     await _setup(client)
     headers = {"X-Auth-Request-User": "testuser"}
+    # Create 4 projects that all match "pipeline" to exceed a limit of 2
+    for i in range(4):
+        await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={
+                "slug": f"pipeline-{i}",
+                "title": f"Pipeline Project {i}",
+                "doc_repo": f"https://github.com/example/pipeline-{i}",
+            },
+            headers=headers,
+        )
+
+    # First page
     response = await client.get(
         "/docverse/orgs/proj-org/projects",
-        params={"q": "test", "cursor": "abc"},
+        params={"q": "pipeline", "limit": 2},
         headers=headers,
     )
-    assert response.status_code == 422
+    assert response.status_code == 200
+    first_page = response.json()
+    assert len(first_page) == 2
+    total = int(response.headers["X-Total-Count"])
+    assert total == 4
+    assert "Link" in response.headers
+    link_header = response.headers["Link"]
+    assert 'rel="next"' in link_header
+
+    # Extract next cursor from Link header
+    next_cursor = None
+    for link_part in link_header.split(","):
+        stripped = link_part.strip()
+        if 'rel="next"' in stripped:
+            url_part = stripped.split(";")[0].strip().strip("<>")
+            parsed = urlparse(url_part)
+            qs = parse_qs(parsed.query)
+            next_cursor = qs["cursor"][0]
+            break
+    assert next_cursor is not None
+
+    # Second page
+    response2 = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "pipeline", "limit": 2, "cursor": next_cursor},
+        headers=headers,
+    )
+    assert response2.status_code == 200
+    second_page = response2.json()
+    assert len(second_page) == 2
+    assert int(response2.headers["X-Total-Count"]) == total
+
+    # No duplicates across pages
+    first_slugs = {p["slug"] for p in first_page}
+    second_slugs = {p["slug"] for p in second_page}
+    assert first_slugs.isdisjoint(second_slugs)
 
 
 @pytest.mark.asyncio

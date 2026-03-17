@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.dependencies.auth import (
@@ -18,6 +18,7 @@ from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
     PROJECT_CURSOR_TYPES,
+    ProjectSearchCursor,
     ProjectSortOrder,
 )
 
@@ -64,21 +65,23 @@ async def get_projects(  # noqa: PLR0913
             max_length=256,
             description=(
                 "Fuzzy search query matched against project slugs and"
-                " titles. Cannot be combined with cursor pagination."
+                " titles. Results are ordered by relevance and support"
+                " cursor pagination via the ``Link`` header."
             ),
         ),
     ] = None,
 ) -> list[Project]:
-    if q is not None and cursor is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Cannot combine 'q' search with 'cursor' pagination.",
-        )
-
     async with context.session.begin():
         service = context.factory.create_project_service()
         if q is not None:
-            result = await service.list_by_org(org_slug, query=q, limit=limit)
+            search_cursor = (
+                ProjectSearchCursor.from_str(cursor)
+                if cursor is not None
+                else None
+            )
+            result = await service.list_by_org(
+                org_slug, query=q, limit=limit, cursor=search_cursor
+            )
         else:
             cursor_type = PROJECT_CURSOR_TYPES[order]
             parsed_cursor = (

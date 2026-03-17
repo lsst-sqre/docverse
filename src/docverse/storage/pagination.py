@@ -30,6 +30,7 @@ __all__ = [
     "EditionSlugCursor",
     "EditionSortOrder",
     "ProjectDateCreatedCursor",
+    "ProjectSearchCursor",
     "ProjectSlugCursor",
     "ProjectSortOrder",
 ]
@@ -237,6 +238,63 @@ class BuildDateCreatedCursor(DatetimeIdCursor[Build]):
     @classmethod
     def from_entry(cls, entry: Build, *, reverse: bool = False) -> Self:
         return cls(time=entry.date_created, id=entry.id, previous=reverse)
+
+
+# ---------------------------------------------------------------------------
+# Search cursor (score+id compound keyset)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ProjectSearchCursor(PaginationCursor[Project]):
+    """Keyset cursor for search results ordered by score DESC, id DESC.
+
+    Encodes a ``(score, id)`` pair so pagination over relevance-ranked
+    results is stable even when two projects share the same trigram
+    similarity score.
+    """
+
+    score: float
+    id: int
+
+    @override
+    @classmethod
+    def from_entry(cls, entry: Project, *, reverse: bool = False) -> Self:
+        # Only called by CountedPaginatedQueryRunner, which is not used here.
+        raise NotImplementedError
+
+    @override
+    @classmethod
+    def from_str(cls, cursor: str) -> Self:
+        previous = cursor.startswith("p__")
+        raw = cursor[3:] if previous else cursor
+        score_str, id_str = raw.split(":", 1)
+        return cls(score=float(score_str), id=int(id_str), previous=previous)
+
+    @override
+    @classmethod
+    def apply_order(
+        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[tuple[Any, ...]]:
+        # Ordering is applied manually in search_by_org.
+        return stmt
+
+    @override
+    def apply_cursor(
+        self, stmt: Select[tuple[Any, ...]]
+    ) -> Select[tuple[Any, ...]]:
+        # Filtering is applied manually in search_by_org.
+        return stmt
+
+    @override
+    def invert(self) -> Self:
+        return type(self)(
+            score=self.score, id=self.id, previous=not self.previous
+        )
+
+    def __str__(self) -> str:  # noqa: D105
+        prefix = "p__" if self.previous else ""
+        return f"{prefix}{self.score:.8f}:{self.id}"
 
 
 # ---------------------------------------------------------------------------

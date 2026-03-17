@@ -8,13 +8,14 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import select
+from sqlalchemy import REAL, cast, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from sqlalchemy.sql import expression, func
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.dbschema.project import SqlProject
 from docverse.domain.project import Project
+from docverse.storage.pagination import ProjectSearchCursor
 
 _TRGM_SIMILARITY_THRESHOLD = 0.1
 """Minimum trigram similarity score for fuzzy search results."""
@@ -84,6 +85,7 @@ class ProjectStore:
         *,
         query: str,
         limit: int,
+        cursor: ProjectSearchCursor | None = None,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
         """Search non-deleted projects by trigram similarity on slug/title."""
         relevance = func.greatest(
@@ -97,30 +99,102 @@ class ProjectStore:
             relevance > _TRGM_SIMILARITY_THRESHOLD,
         )
 
-        # Count total matches
+        # Count total matches (no cursor so count is stable across pages)
         count_stmt = (
             select(func.count()).select_from(SqlProject).where(base_filter)
         )
         count_result = await self._session.execute(count_stmt)
         total = count_result.scalar_one()
 
-        # Fetch ranked results
-        stmt = (
-            select(SqlProject)
-            .where(base_filter)
-            .order_by(relevance.desc(), SqlProject.id.desc())
-            .limit(limit)
-        )
-        result = await self._session.execute(stmt)
-        entries = [
-            Project.model_validate(row) for row in result.scalars().all()
-        ]
+        # Build fetch query with compound keyset cursor
+        fetch_stmt = select(SqlProject, relevance).where(base_filter)
+
+        if cursor is None:
+            fetch_stmt = fetch_stmt.order_by(
+                relevance.desc(), SqlProject.id.desc()
+            )
+        elif not cursor.previous:
+            # Forward pagination: rows after the cursor.
+            # Cast cursor.score to REAL (float4) to match the precision of
+            # PostgreSQL's similarity() return type and avoid float8 vs float4
+            # comparison mismatches.
+            score = cast(cursor.score, REAL)
+            fetch_stmt = fetch_stmt.where(
+                expression.or_(
+                    relevance < score,
+                    expression.and_(
+                        relevance == score,
+                        SqlProject.id < cursor.id,
+                    ),
+                )
+            ).order_by(relevance.desc(), SqlProject.id.desc())
+        else:
+            # Backward pagination: rows before the cursor (reversed order)
+            score = cast(cursor.score, REAL)
+            fetch_stmt = fetch_stmt.where(
+                expression.or_(
+                    relevance > score,
+                    expression.and_(
+                        relevance == score,
+                        SqlProject.id > cursor.id,
+                    ),
+                )
+            ).order_by(relevance.asc(), SqlProject.id.asc())
+
+        fetch_stmt = fetch_stmt.limit(limit + 1)
+        result = await self._session.execute(fetch_stmt)
+        rows = result.all()
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+
+        if cursor is not None and cursor.previous:
+            rows = list(reversed(rows))
+
+        entries = [Project.model_validate(row.SqlProject) for row in rows]
+
+        # Build next/prev cursors
+        next_cursor: ProjectSearchCursor | None = None
+        prev_cursor: ProjectSearchCursor | None = None
+
+        if cursor is None or not cursor.previous:
+            # Forward traversal
+            if has_more and entries:
+                last = rows[-1]
+                next_cursor = ProjectSearchCursor(
+                    score=float(last.relevance),
+                    id=last.SqlProject.id,
+                    previous=False,
+                )
+            if cursor is not None and entries:
+                first = rows[0]
+                prev_cursor = ProjectSearchCursor(
+                    score=float(first.relevance),
+                    id=first.SqlProject.id,
+                    previous=True,
+                )
+        else:
+            # Backward traversal
+            if has_more and entries:
+                first = rows[0]
+                prev_cursor = ProjectSearchCursor(
+                    score=float(first.relevance),
+                    id=first.SqlProject.id,
+                    previous=True,
+                )
+            if cursor is not None and entries:
+                last = rows[-1]
+                next_cursor = ProjectSearchCursor(
+                    score=float(last.relevance),
+                    id=last.SqlProject.id,
+                    previous=False,
+                )
 
         return CountedPaginatedList[Project, PaginationCursor[Project]](
             entries=entries,
             count=total,
-            next_cursor=None,
-            prev_cursor=None,
+            next_cursor=next_cursor,
+            prev_cursor=prev_cursor,
         )
 
     async def update(

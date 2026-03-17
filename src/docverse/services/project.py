@@ -9,6 +9,7 @@ from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.domain.project import Project
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.pagination import ProjectSearchCursor
 from docverse.storage.project_store import ProjectStore
 
 
@@ -77,8 +78,11 @@ class ProjectService:
         """List all projects for an organization."""
         org_id = await self._resolve_org_id(org_slug)
         if query is not None:
+            search_cursor = (
+                cursor if isinstance(cursor, ProjectSearchCursor) else None
+            )
             return await self._store.search_by_org(
-                org_id, query=query, limit=limit
+                org_id, query=query, limit=limit, cursor=search_cursor
             )
         if cursor_type is None:
             msg = "cursor_type is required when query is not set"
