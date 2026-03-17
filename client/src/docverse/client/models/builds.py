@@ -86,7 +86,9 @@ class Build(BaseModel):
 
     alternate_name: str | None = Field(
         default=None,
-        description="Alternate identifier for the build.",
+        description=(
+            "Deployment variant scope for the build (e.g., 'usdf-dev')."
+        ),
     )
 
     content_hash: str = Field(
