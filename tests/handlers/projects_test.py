@@ -135,6 +135,158 @@ async def test_delete_project(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_by_slug(client: AsyncClient) -> None:
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    for slug, title in [
+        ("pipelines-guide", "Pipelines Guide"),
+        ("pipeline-tutorial", "Pipeline Tutorial"),
+        ("admin-manual", "Admin Manual"),
+    ]:
+        await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={
+                "slug": slug,
+                "title": title,
+                "doc_repo": f"https://github.com/example/{slug}",
+            },
+            headers=headers,
+        )
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "pipeline"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    slugs = [p["slug"] for p in data]
+    assert "pipelines-guide" in slugs
+    assert "pipeline-tutorial" in slugs
+    assert "admin-manual" not in slugs
+    assert int(response.headers["X-Total-Count"]) == len(data)
+
+
+@pytest.mark.asyncio
+async def test_search_by_title(client: AsyncClient) -> None:
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    for slug, title in [
+        ("proj-a", "Deployment Guide"),
+        ("proj-b", "Developer Handbook"),
+        ("proj-c", "API Reference"),
+    ]:
+        await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={
+                "slug": slug,
+                "title": title,
+                "doc_repo": f"https://github.com/example/{slug}",
+            },
+            headers=headers,
+        )
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "guide"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    slugs = [p["slug"] for p in data]
+    assert "proj-a" in slugs
+    assert "proj-c" not in slugs
+
+
+@pytest.mark.asyncio
+async def test_search_no_results(client: AsyncClient) -> None:
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "zzzznonexistent"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+    assert response.headers["X-Total-Count"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_search_cursor_mutual_exclusion(client: AsyncClient) -> None:
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "test", "cursor": "abc"},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_search_org_scoping(client: AsyncClient) -> None:
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    # Create a project in proj-org
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "scoped-proj",
+            "title": "Scoped Project",
+            "doc_repo": "https://github.com/example/scoped",
+        },
+        headers=headers,
+    )
+    # Create a second org with a similarly-named project
+    await seed_org_with_admin(client, "other-org", "testuser")
+    await client.post(
+        "/docverse/orgs/other-org/projects",
+        json={
+            "slug": "scoped-proj",
+            "title": "Scoped Project Other",
+            "doc_repo": "https://github.com/example/scoped-other",
+        },
+        headers=headers,
+    )
+    # Search in proj-org should not return other-org projects
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "scoped"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    assert data[0]["slug"] == "scoped-proj"
+    assert data[0]["self_url"].endswith("/orgs/proj-org/projects/scoped-proj")
+
+
+@pytest.mark.asyncio
+async def test_search_excludes_soft_deleted(client: AsyncClient) -> None:
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "deleted-proj",
+            "title": "Deleted Project",
+            "doc_repo": "https://github.com/example/deleted",
+        },
+        headers=headers,
+    )
+    await client.delete(
+        "/docverse/orgs/proj-org/projects/deleted-proj",
+        headers=headers,
+    )
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "deleted"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.asyncio
 async def test_permission_denied_no_auth(client: AsyncClient) -> None:
     await _setup(client)
     response = await client.get(

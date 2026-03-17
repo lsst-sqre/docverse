@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.dependencies.auth import (
@@ -39,19 +39,29 @@ async def get_projects(  # noqa: PLR0913
     order: ProjectSortOrder = ProjectSortOrder.slug,
     cursor: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
+    q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
 ) -> list[Project]:
-    cursor_type = PROJECT_CURSOR_TYPES[order]
-    parsed_cursor = (
-        cursor_type.from_str(cursor) if cursor is not None else None
-    )
+    if q is not None and cursor is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Cannot combine 'q' search with 'cursor' pagination.",
+        )
+
     async with context.session.begin():
         service = context.factory.create_project_service()
-        result = await service.list_by_org(
-            org_slug,
-            cursor_type=cursor_type,
-            cursor=parsed_cursor,
-            limit=limit,
-        )
+        if q is not None:
+            result = await service.list_by_org(org_slug, query=q, limit=limit)
+        else:
+            cursor_type = PROJECT_CURSOR_TYPES[order]
+            parsed_cursor = (
+                cursor_type.from_str(cursor) if cursor is not None else None
+            )
+            result = await service.list_by_org(
+                org_slug,
+                cursor_type=cursor_type,
+                cursor=parsed_cursor,
+                limit=limit,
+            )
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
     return [

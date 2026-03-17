@@ -69,12 +69,20 @@ class ProjectService:
         self,
         org_slug: str,
         *,
-        cursor_type: type[PaginationCursor[Project]],
+        query: str | None = None,
+        cursor_type: type[PaginationCursor[Project]] | None = None,
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
         """List all projects for an organization."""
         org_id = await self._resolve_org_id(org_slug)
+        if query is not None:
+            return await self._store.search_by_org(
+                org_id, query=query, limit=limit
+            )
+        if cursor_type is None:
+            msg = "cursor_type is required when query is not set"
+            raise RuntimeError(msg)
         return await self._store.list_by_org(
             org_id, cursor_type=cursor_type, cursor=cursor, limit=limit
         )

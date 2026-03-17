@@ -58,4 +58,16 @@ class SqlProject(Base):
     __table_args__ = (
         UniqueConstraint("org_id", "slug", name="uq_projects_org_slug"),
         Index("idx_projects_org_id", "org_id"),
+        Index(
+            "idx_projects_slug_trgm",
+            "slug",
+            postgresql_using="gin",
+            postgresql_ops={"slug": "gin_trgm_ops"},
+        ),
+        Index(
+            "idx_projects_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
     )
