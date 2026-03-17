@@ -10,6 +10,7 @@ from docverse.client.models import OrgMembershipCreate, PrincipalType
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
+from docverse.handlers.params import MemberIdParam, OrgSlugParam
 
 from .models import OrgMembership
 
@@ -34,13 +35,13 @@ def _parse_member_id(member_id: str) -> tuple[PrincipalType, str]:
 
 
 @router.get(
-    "/orgs/{org_slug}/members",
+    "/orgs/{org}/members",
     response_model=list[OrgMembership],
     summary="List organization members",
     name="get_members",
 )
 async def get_members(
-    org_slug: str,
+    org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> list[OrgMembership]:
@@ -54,14 +55,14 @@ async def get_members(
 
 
 @router.post(
-    "/orgs/{org_slug}/members",
+    "/orgs/{org}/members",
     response_model=OrgMembership,
     status_code=status.HTTP_201_CREATED,
     summary="Add an organization member",
     name="post_member",
 )
 async def post_member(
-    org_slug: str,
+    org_slug: OrgSlugParam,
     data: OrgMembershipCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -85,14 +86,14 @@ async def post_member(
 
 
 @router.get(
-    "/orgs/{org_slug}/members/{member_id}",
+    "/orgs/{org}/members/{member}",
     response_model=OrgMembership,
     summary="Get an organization member",
     name="get_member",
 )
 async def get_member(
-    org_slug: str,
-    member_id: str,
+    org_slug: OrgSlugParam,
+    member_id: MemberIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> OrgMembership:
@@ -111,14 +112,14 @@ async def get_member(
 
 
 @router.delete(
-    "/orgs/{org_slug}/members/{member_id}",
+    "/orgs/{org}/members/{member}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Remove an organization member",
     name="delete_member",
 )
 async def delete_member(
-    org_slug: str,  # noqa: ARG001
-    member_id: str,
+    org_slug: OrgSlugParam,  # noqa: ARG001
+    member_id: MemberIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:

@@ -19,7 +19,7 @@ class QueueJob(_QueueJobBase):
         """Create from a domain object, adding the self_url."""
         job_id_str = serialize_base32_id(domain.public_id)
         return cls(
-            self_url=str(request.url_for("get_queue_job", job_id=job_id_str)),
+            self_url=str(request.url_for("get_queue_job", job=job_id_str)),
             id=domain.public_id,
             kind=domain.kind,
             status=domain.status,

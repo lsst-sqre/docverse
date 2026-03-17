@@ -11,6 +11,7 @@ from docverse.client.models import OrgRole
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.organization import Organization
 from docverse.exceptions import NotFoundError, PermissionDeniedError
+from docverse.handlers.params import OrgSlugParam
 
 __all__ = [
     "AuthenticatedUser",
@@ -53,7 +54,7 @@ class OrgRoleDependency:
 
     async def __call__(  # noqa: D102
         self,
-        org_slug: str,
+        org_slug: OrgSlugParam,
         request: Request,
         context: Annotated[RequestContext, Depends(context_dependency)],
     ) -> AuthenticatedUser:

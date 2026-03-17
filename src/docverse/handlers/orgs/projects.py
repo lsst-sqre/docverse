@@ -13,6 +13,7 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -26,13 +27,13 @@ router = APIRouter()
 
 
 @router.get(
-    "/orgs/{org_slug}/projects",
+    "/orgs/{org}/projects",
     response_model=list[Project],
     summary="List projects in an organization",
     name="get_projects",
 )
 async def get_projects(  # noqa: PLR0913
-    org_slug: str,
+    org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
     order: ProjectSortOrder = ProjectSortOrder.slug,
@@ -60,14 +61,14 @@ async def get_projects(  # noqa: PLR0913
 
 
 @router.post(
-    "/orgs/{org_slug}/projects",
+    "/orgs/{org}/projects",
     response_model=Project,
     status_code=status.HTTP_201_CREATED,
     summary="Create a project",
     name="post_project",
 )
 async def post_project(
-    org_slug: str,
+    org_slug: OrgSlugParam,
     data: ProjectCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
@@ -80,14 +81,14 @@ async def post_project(
 
 
 @router.get(
-    "/orgs/{org_slug}/projects/{project_slug}",
+    "/orgs/{org}/projects/{project}",
     response_model=Project,
     summary="Get a project",
     name="get_project",
 )
 async def get_project(
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> Project:
@@ -100,14 +101,14 @@ async def get_project(
 
 
 @router.patch(
-    "/orgs/{org_slug}/projects/{project_slug}",
+    "/orgs/{org}/projects/{project}",
     response_model=Project,
     summary="Update a project",
     name="patch_project",
 )
 async def patch_project(
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     data: ProjectUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
@@ -122,14 +123,14 @@ async def patch_project(
 
 
 @router.delete(
-    "/orgs/{org_slug}/projects/{project_slug}",
+    "/orgs/{org}/projects/{project}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a project",
     name="delete_project",
 )
 async def delete_project(
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:

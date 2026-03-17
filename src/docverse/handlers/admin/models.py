@@ -18,7 +18,7 @@ class Organization(_OrganizationBase):
         """Create from a domain object, adding the self_url."""
         return cls(
             self_url=str(
-                request.url_for("admin_get_organization", org_slug=domain.slug)
+                request.url_for("admin_get_organization", org=domain.slug)
             ),
             slug=domain.slug,
             title=domain.title,

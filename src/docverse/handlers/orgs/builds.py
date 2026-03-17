@@ -15,6 +15,11 @@ from docverse.dependencies.auth import (
 )
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id
+from docverse.handlers.params import (
+    BuildIdParam,
+    OrgSlugParam,
+    ProjectSlugParam,
+)
 from docverse.storage.pagination import (
     BUILD_CURSOR_TYPE,
     DEFAULT_PAGE_LIMIT,
@@ -27,14 +32,14 @@ router = APIRouter()
 
 
 @router.get(
-    "/orgs/{org_slug}/projects/{project_slug}/builds",
+    "/orgs/{org}/projects/{project}/builds",
     response_model=list[Build],
     summary="List builds for a project",
     name="get_builds",
 )
 async def get_builds(  # noqa: PLR0913
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
     cursor: Annotated[str | None, Query()] = None,
@@ -62,15 +67,15 @@ async def get_builds(  # noqa: PLR0913
 
 
 @router.post(
-    "/orgs/{org_slug}/projects/{project_slug}/builds",
+    "/orgs/{org}/projects/{project}/builds",
     response_model=Build,
     status_code=status.HTTP_201_CREATED,
     summary="Create a build",
     name="post_build",
 )
 async def post_build(
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     data: BuildCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],
@@ -96,15 +101,15 @@ async def post_build(
 
 
 @router.get(
-    "/orgs/{org_slug}/projects/{project_slug}/builds/{build_id}",
+    "/orgs/{org}/projects/{project}/builds/{build}",
     response_model=Build,
     summary="Get a build",
     name="get_build",
 )
 async def get_build(
-    org_slug: str,
-    project_slug: str,
-    build_id: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    build_id: BuildIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> Build:
@@ -119,15 +124,15 @@ async def get_build(
 
 
 @router.patch(
-    "/orgs/{org_slug}/projects/{project_slug}/builds/{build_id}",
+    "/orgs/{org}/projects/{project}/builds/{build}",
     response_model=Build,
     summary="Update a build (signal upload complete)",
     name="patch_build",
 )
 async def patch_build(  # noqa: PLR0913
-    org_slug: str,
-    project_slug: str,
-    build_id: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    build_id: BuildIdParam,
     data: BuildUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],  # noqa: ARG001
@@ -145,7 +150,7 @@ async def patch_build(  # noqa: PLR0913
             queue_url = str(
                 context.request.url_for(
                     "get_queue_job",
-                    job_id=serialize_base32_id(queue_job.public_id),
+                    job=serialize_base32_id(queue_job.public_id),
                 )
             )
         else:
@@ -168,15 +173,15 @@ async def patch_build(  # noqa: PLR0913
 
 
 @router.delete(
-    "/orgs/{org_slug}/projects/{project_slug}/builds/{build_id}",
+    "/orgs/{org}/projects/{project}/builds/{build}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a build",
     name="delete_build",
 )
 async def delete_build(
-    org_slug: str,
-    project_slug: str,
-    build_id: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    build_id: BuildIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:

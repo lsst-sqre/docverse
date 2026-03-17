@@ -13,6 +13,11 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.handlers.params import (
+    EditionSlugParam,
+    OrgSlugParam,
+    ProjectSlugParam,
+)
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     EDITION_CURSOR_TYPES,
@@ -26,14 +31,14 @@ router = APIRouter()
 
 
 @router.get(
-    "/orgs/{org_slug}/projects/{project_slug}/editions",
+    "/orgs/{org}/projects/{project}/editions",
     response_model=list[Edition],
     summary="List editions for a project",
     name="get_editions",
 )
 async def get_editions(  # noqa: PLR0913
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
     order: EditionSortOrder = EditionSortOrder.slug,
@@ -64,15 +69,15 @@ async def get_editions(  # noqa: PLR0913
 
 
 @router.post(
-    "/orgs/{org_slug}/projects/{project_slug}/editions",
+    "/orgs/{org}/projects/{project}/editions",
     response_model=Edition,
     status_code=status.HTTP_201_CREATED,
     summary="Create an edition",
     name="post_edition",
 )
 async def post_edition(
-    org_slug: str,
-    project_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
     data: EditionCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
@@ -89,15 +94,15 @@ async def post_edition(
 
 
 @router.get(
-    "/orgs/{org_slug}/projects/{project_slug}/editions/{edition_slug}",
+    "/orgs/{org}/projects/{project}/editions/{edition}",
     response_model=Edition,
     summary="Get an edition",
     name="get_edition",
 )
 async def get_edition(
-    org_slug: str,
-    project_slug: str,
-    edition_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    edition_slug: EditionSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
 ) -> Edition:
@@ -114,15 +119,15 @@ async def get_edition(
 
 
 @router.patch(
-    "/orgs/{org_slug}/projects/{project_slug}/editions/{edition_slug}",
+    "/orgs/{org}/projects/{project}/editions/{edition}",
     response_model=Edition,
     summary="Update an edition",
     name="patch_edition",
 )
 async def patch_edition(  # noqa: PLR0913
-    org_slug: str,
-    project_slug: str,
-    edition_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    edition_slug: EditionSlugParam,
     data: EditionUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
@@ -142,15 +147,15 @@ async def patch_edition(  # noqa: PLR0913
 
 
 @router.delete(
-    "/orgs/{org_slug}/projects/{project_slug}/editions/{edition_slug}",
+    "/orgs/{org}/projects/{project}/editions/{edition}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete an edition",
     name="delete_edition",
 )
 async def delete_edition(
-    org_slug: str,
-    project_slug: str,
-    edition_slug: str,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    edition_slug: EditionSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:

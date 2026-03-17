@@ -29,15 +29,9 @@ class Organization(_OrganizationBase):
     def from_domain(cls, domain: OrganizationDomain, request: Request) -> Self:
         """Create from a domain object, adding HATEOAS URLs."""
         return cls(
-            self_url=str(
-                request.url_for("get_organization", org_slug=domain.slug)
-            ),
-            projects_url=str(
-                request.url_for("get_projects", org_slug=domain.slug)
-            ),
-            members_url=str(
-                request.url_for("get_members", org_slug=domain.slug)
-            ),
+            self_url=str(request.url_for("get_organization", org=domain.slug)),
+            projects_url=str(request.url_for("get_projects", org=domain.slug)),
+            members_url=str(request.url_for("get_members", org=domain.slug)),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,
@@ -68,25 +62,23 @@ class Project(_ProjectBase):
             self_url=str(
                 request.url_for(
                     "get_project",
-                    org_slug=org_slug,
-                    project_slug=domain.slug,
+                    org=org_slug,
+                    project=domain.slug,
                 )
             ),
-            org_url=str(
-                request.url_for("get_organization", org_slug=org_slug)
-            ),
+            org_url=str(request.url_for("get_organization", org=org_slug)),
             editions_url=str(
                 request.url_for(
                     "get_editions",
-                    org_slug=org_slug,
-                    project_slug=domain.slug,
+                    org=org_slug,
+                    project=domain.slug,
                 )
             ),
             builds_url=str(
                 request.url_for(
                     "get_builds",
-                    org_slug=org_slug,
-                    project_slug=domain.slug,
+                    org=org_slug,
+                    project=domain.slug,
                 )
             ),
             slug=domain.slug,
@@ -119,16 +111,16 @@ class Build(_BuildBase):
             self_url=str(
                 request.url_for(
                     "get_build",
-                    org_slug=org_slug,
-                    project_slug=project_slug,
-                    build_id=build_id_str,
+                    org=org_slug,
+                    project=project_slug,
+                    build=build_id_str,
                 )
             ),
             project_url=str(
                 request.url_for(
                     "get_project",
-                    org_slug=org_slug,
-                    project_slug=project_slug,
+                    org=org_slug,
+                    project=project_slug,
                 )
             ),
             id=domain.public_id,
@@ -168,25 +160,25 @@ class Edition(_EditionBase):
             build_url = str(
                 request.url_for(
                     "get_build",
-                    org_slug=org_slug,
-                    project_slug=project_slug,
-                    build_id=build_id_str,
+                    org=org_slug,
+                    project=project_slug,
+                    build=build_id_str,
                 )
             )
         return cls(
             self_url=str(
                 request.url_for(
                     "get_edition",
-                    org_slug=org_slug,
-                    project_slug=project_slug,
-                    edition_slug=domain.slug,
+                    org=org_slug,
+                    project=project_slug,
+                    edition=domain.slug,
                 )
             ),
             project_url=str(
                 request.url_for(
                     "get_project",
-                    org_slug=org_slug,
-                    project_slug=project_slug,
+                    org=org_slug,
+                    project=project_slug,
                 )
             ),
             build_url=build_url,
@@ -218,13 +210,11 @@ class OrgMembership(_OrgMembershipBase):
             self_url=str(
                 request.url_for(
                     "get_member",
-                    org_slug=org_slug,
-                    member_id=member_id,
+                    org=org_slug,
+                    member=member_id,
                 )
             ),
-            org_url=str(
-                request.url_for("get_organization", org_slug=org_slug)
-            ),
+            org_url=str(request.url_for("get_organization", org=org_slug)),
             id=member_id,
             principal=domain.principal,
             principal_type=domain.principal_type,
