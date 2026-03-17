@@ -36,10 +36,38 @@ async def get_projects(  # noqa: PLR0913
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
-    order: ProjectSortOrder = ProjectSortOrder.slug,
-    cursor: Annotated[str | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
-    q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+    order: Annotated[
+        ProjectSortOrder,
+        Query(description="Sort order for results."),
+    ] = ProjectSortOrder.slug,
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    q: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Fuzzy search query matched against project slugs and"
+                " titles. Cannot be combined with cursor pagination."
+            ),
+        ),
+    ] = None,
 ) -> list[Project]:
     if q is not None and cursor is not None:
         raise HTTPException(

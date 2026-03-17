@@ -42,9 +42,27 @@ async def get_builds(  # noqa: PLR0913
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
-    cursor: Annotated[str | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
-    status_filter: Annotated[BuildStatus | None, Query(alias="status")] = None,
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    status_filter: Annotated[
+        BuildStatus | None,
+        Query(alias="status", description="Filter builds by status."),
+    ] = None,
 ) -> list[Build]:
     parsed_cursor = (
         BUILD_CURSOR_TYPE.from_str(cursor) if cursor is not None else None

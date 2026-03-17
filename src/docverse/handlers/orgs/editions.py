@@ -41,10 +41,31 @@ async def get_editions(  # noqa: PLR0913
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
-    order: EditionSortOrder = EditionSortOrder.slug,
-    cursor: Annotated[str | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
-    kind: Annotated[EditionKind | None, Query()] = None,
+    order: Annotated[
+        EditionSortOrder,
+        Query(description="Sort order for results."),
+    ] = EditionSortOrder.slug,
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    kind: Annotated[
+        EditionKind | None,
+        Query(description="Filter editions by kind."),
+    ] = None,
 ) -> list[Edition]:
     cursor_type = EDITION_CURSOR_TYPES[order]
     parsed_cursor = (

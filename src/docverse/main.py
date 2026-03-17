@@ -71,6 +71,21 @@ app = FastAPI(
     openapi_url=f"{config.path_prefix}/openapi.json",
     docs_url=f"{config.path_prefix}/docs",
     redoc_url=f"{config.path_prefix}/redoc",
+    openapi_tags=[
+        {
+            "name": "orgs",
+            "description": "Organization and membership management.",
+        },
+        {
+            "name": "projects",
+            "description": "Projects, builds, and editions.",
+        },
+        {"name": "queue", "description": "Background job status."},
+        {
+            "name": "admin",
+            "description": "Superuser organization administration.",
+        },
+    ],
     lifespan=lifespan,
 )
 """The main FastAPI application."""
