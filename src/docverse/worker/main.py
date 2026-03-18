@@ -13,8 +13,9 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.logging import configure_logging
 
 from docverse.config import Configuration
+from docverse.services.credential_encryptor import CredentialEncryptor
 
-from .functions import ping
+from .functions import build_processing, ping
 
 config = Configuration()
 
@@ -42,6 +43,17 @@ async def startup(ctx: dict[str, Any]) -> None:
         config.database_url,
         config.database_password,
     )
+
+    retired_key = (
+        config.credential_encryption_key_retired.get_secret_value()
+        if config.credential_encryption_key_retired
+        else None
+    )
+    ctx["encryptor"] = CredentialEncryptor(
+        current_key=config.credential_encryption_key.get_secret_value(),
+        retired_key=retired_key,
+    )
+
     logger.info("Worker startup complete")
 
 
@@ -55,7 +67,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """arq WorkerSettings for Docverse."""
 
-    functions = [ping]
+    functions = [build_processing, ping]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
     on_startup = startup

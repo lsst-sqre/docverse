@@ -38,6 +38,16 @@ class OrganizationStore:
         await self._session.flush()
         return Organization.model_validate(row)
 
+    async def get_by_id(self, org_id: int) -> Organization | None:
+        """Fetch an organization by ID."""
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.id == org_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Organization.model_validate(row)
+
     async def get_by_slug(self, slug: str) -> Organization | None:
         """Fetch an organization by slug."""
         result = await self._session.execute(
