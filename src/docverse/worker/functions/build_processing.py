@@ -18,18 +18,10 @@ from safir.dependencies.db_session import db_session_dependency
 from docverse.client.models import BuildStatus
 from docverse.domain.build import Build
 from docverse.exceptions import NotFoundError
-from docverse.services.build import BuildService
-from docverse.services.credential import CredentialService
+from docverse.factory import WorkerFactory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
-from docverse.storage.objectstore_factory import create_objectstore
-from docverse.storage.organization_credential_store import (
-    OrganizationCredentialStore,
-)
 from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_backend import NullQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
@@ -66,18 +58,13 @@ async def build_processing(
 
     async for session in db_session_dependency():
         async with session.begin():
+            factory = WorkerFactory(
+                session=session,
+                logger=logger,
+                credential_encryptor=encryptor,
+            )
             build_store = BuildStore(session=session, logger=logger)
             org_store = OrganizationStore(session=session, logger=logger)
-            project_store = ProjectStore(session=session, logger=logger)
-            cred_store = OrganizationCredentialStore(
-                session=session, logger=logger
-            )
-            cred_service = CredentialService(
-                store=cred_store,
-                org_store=org_store,
-                encryptor=encryptor,
-                logger=logger,
-            )
 
             build = await build_store.get_by_id(build_id)
             if build is None:
@@ -96,14 +83,9 @@ async def build_processing(
                 msg = f"No object store credential configured for org {org_id}"
                 raise RuntimeError(msg)
 
-            cred, cred_payload = await cred_service.get_decrypted(
-                org_id=org_id, label=credential_label
-            )
-
             try:
-                object_store = create_objectstore(
-                    service_type=cred.service_type,
-                    credential=cred_payload,
+                object_store = await factory.create_objectstore_for_org(
+                    org_id=org_id, credential_label=credential_label
                 )
                 async with object_store:
                     await _process_build(
@@ -118,17 +100,7 @@ async def build_processing(
                 logger.exception("Build processing failed")
                 await session.rollback()
                 async with session.begin():
-                    build_service = BuildService(
-                        store=build_store,
-                        org_store=org_store,
-                        project_store=project_store,
-                        queue_backend=NullQueueBackend(),
-                        queue_job_store=QueueJobStore(
-                            session=session,
-                            logger=logger,
-                        ),
-                        logger=logger,
-                    )
+                    build_service = factory.create_build_service()
                     await build_service.fail(build_id=build_id)
                     await session.commit()
                 return "failed"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import structlog
 from safir.arq import ArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
@@ -20,32 +22,35 @@ from .storage.objectstore_factory import create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
 from .storage.organization_store import OrganizationStore
 from .storage.project_store import ProjectStore
-from .storage.queue_backend import ArqQueueBackend
+from .storage.queue_backend import (
+    ArqQueueBackend,
+    NullQueueBackend,
+    QueueBackend,
+)
 from .storage.queue_job_store import QueueJobStore
 from .storage.s3_objectstore import S3ObjectStore
 from .storage.user_info_store import UserInfoStore
 
 
-class Factory:
+class Factory(ABC):
     """Build Docverse service objects."""
 
     def __init__(
         self,
         session: async_scoped_session[AsyncSession],
         logger: structlog.stdlib.BoundLogger,
-        arq_queue: ArqQueue,
-        user_info_store: UserInfoStore,
         credential_encryptor: CredentialEncryptor | None = None,
     ) -> None:
         self._session = session
         self._logger = logger
-        self._arq_queue = arq_queue
-        self._user_info_store = user_info_store
         self._credential_encryptor = credential_encryptor
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
         self._logger = logger
+
+    @abstractmethod
+    def _create_queue_backend(self) -> QueueBackend: ...
 
     def _create_org_store(self) -> OrganizationStore:
         return OrganizationStore(session=self._session, logger=self._logger)
@@ -71,7 +76,7 @@ class Factory:
         store = BuildStore(session=self._session, logger=self._logger)
         org_store = self._create_org_store()
         project_store = self._create_project_store()
-        queue_backend = ArqQueueBackend(arq_queue=self._arq_queue)
+        queue_backend = self._create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
         )
@@ -108,10 +113,6 @@ class Factory:
     def create_membership_store(self) -> OrgMembershipStore:
         """Create an OrgMembershipStore."""
         return OrgMembershipStore(session=self._session, logger=self._logger)
-
-    def create_queue_backend(self) -> ArqQueueBackend:
-        """Create an ArqQueueBackend."""
-        return ArqQueueBackend(arq_queue=self._arq_queue)
 
     def create_queue_job_store(self) -> QueueJobStore:
         """Create a QueueJobStore."""
@@ -167,6 +168,40 @@ class Factory:
             service_type=cred.service_type, credential=payload
         )
 
+
+class HandlerFactory(Factory):
+    """Factory for request handlers with arq queue and user info."""
+
+    def __init__(
+        self,
+        session: async_scoped_session[AsyncSession],
+        logger: structlog.stdlib.BoundLogger,
+        arq_queue: ArqQueue,
+        user_info_store: UserInfoStore,
+        credential_encryptor: CredentialEncryptor | None = None,
+    ) -> None:
+        super().__init__(
+            session=session,
+            logger=logger,
+            credential_encryptor=credential_encryptor,
+        )
+        self._arq_queue = arq_queue
+        self._user_info_store = user_info_store
+
+    def _create_queue_backend(self) -> ArqQueueBackend:
+        return ArqQueueBackend(arq_queue=self._arq_queue)
+
+    def create_queue_backend(self) -> ArqQueueBackend:
+        """Create an ArqQueueBackend."""
+        return ArqQueueBackend(arq_queue=self._arq_queue)
+
     def get_user_info_store(self) -> UserInfoStore:
         """Get the UserInfoStore instance."""
         return self._user_info_store
+
+
+class WorkerFactory(Factory):
+    """Factory for worker functions using a null queue backend."""
+
+    def _create_queue_backend(self) -> NullQueueBackend:
+        return NullQueueBackend()

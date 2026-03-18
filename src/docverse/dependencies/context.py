@@ -19,7 +19,7 @@ from safir.dependencies.logger import logger_dependency
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from structlog.stdlib import BoundLogger
 
-from ..factory import Factory
+from ..factory import HandlerFactory
 from ..services.credential_encryptor import CredentialEncryptor
 from ..storage.user_info_store import StubUserInfoStore, UserInfoStore
 
@@ -52,7 +52,7 @@ class RequestContext:
     session: async_scoped_session[AsyncSession]
     """The database session."""
 
-    factory: Factory
+    factory: HandlerFactory
     """The component factory."""
 
     def rebind_logger(self, **values: Any) -> None:
@@ -100,7 +100,7 @@ class ContextDependency:
             response=response,
             logger=logger,
             session=session,
-            factory=Factory(
+            factory=HandlerFactory(
                 session=session,
                 logger=logger,
                 arq_queue=arq_queue,
