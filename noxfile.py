@@ -4,7 +4,7 @@ from testcontainers.postgres import PostgresContainer
 
 nox.needs_version = ">=2024.4.15"
 nox.options.default_venv_backend = "uv"
-nox.options.sessions = ["lint", "typing", "test"]
+nox.options.sessions = ["lint", "typing", "test", "client_test"]
 
 
 def _install_pg_extensions(postgres: PostgresContainer) -> None:

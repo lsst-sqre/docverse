@@ -11,6 +11,9 @@ dependencies = [
     "pydantic>=2.5",
 ]
 
+[project.scripts]
+docverse = "docverse.client._cli:main"
+
 [build-system]
 requires = [
     "setuptools>=75",
