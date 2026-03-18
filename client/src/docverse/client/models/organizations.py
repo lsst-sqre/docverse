@@ -82,6 +82,16 @@ class OrganizationCreate(BaseModel):
         ),
     )
 
+    publishing_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the publishing store.",
+    )
+
+    staging_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the staging store.",
+    )
+
 
 class Organization(BaseModel):
     """Response model for an organization."""
@@ -127,6 +137,16 @@ class Organization(BaseModel):
         if isinstance(v, timedelta):
             return int(v.total_seconds())
         return v
+
+    publishing_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the publishing store.",
+    )
+
+    staging_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the staging store.",
+    )
 
     date_created: datetime = Field(
         description="Timestamp when the organization was created."
@@ -176,4 +196,14 @@ class OrganizationUpdate(BaseModel):
             "Duration in seconds to retain inactive builds in purgatory"
             " before deletion."
         ),
+    )
+
+    publishing_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the publishing store.",
+    )
+
+    staging_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the staging store.",
     )

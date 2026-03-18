@@ -5,6 +5,7 @@ from .build import SqlBuild
 from .edition import SqlEdition
 from .membership import SqlOrgMembership
 from .organization import SqlOrganization
+from .organization_credential import SqlOrganizationCredential
 from .project import SqlProject
 from .queue_job import SqlQueueJob
 
@@ -14,6 +15,7 @@ __all__ = [
     "SqlEdition",
     "SqlOrgMembership",
     "SqlOrganization",
+    "SqlOrganizationCredential",
     "SqlProject",
     "SqlQueueJob",
 ]

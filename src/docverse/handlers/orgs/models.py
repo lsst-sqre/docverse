@@ -9,6 +9,9 @@ from starlette.requests import Request
 from docverse.client.models import Build as _BuildBase
 from docverse.client.models import Edition as _EditionBase
 from docverse.client.models import Organization as _OrganizationBase
+from docverse.client.models import (
+    OrganizationCredential as _OrganizationCredentialBase,
+)
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
 from docverse.domain.base32id import serialize_base32_id
@@ -16,6 +19,9 @@ from docverse.domain.build import Build as BuildDomain
 from docverse.domain.edition import Edition as EditionDomain
 from docverse.domain.membership import OrgMembership as OrgMembershipDomain
 from docverse.domain.organization import Organization as OrganizationDomain
+from docverse.domain.organization_credential import (
+    OrganizationCredential as OrganizationCredentialDomain,
+)
 from docverse.domain.project import Project as ProjectDomain
 
 
@@ -42,6 +48,8 @@ class Organization(_OrganizationBase):
             purgatory_retention=int(
                 domain.purgatory_retention.total_seconds()
             ),
+            publishing_credential_label=domain.publishing_credential_label,
+            staging_credential_label=domain.staging_credential_label,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )
@@ -219,4 +227,31 @@ class OrgMembership(_OrgMembershipBase):
             principal=domain.principal,
             principal_type=domain.principal_type,
             role=domain.role,
+        )
+
+
+class OrganizationCredentialResponse(_OrganizationCredentialBase):
+    """Organization credential response model with HATEOAS URLs."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        domain: OrganizationCredentialDomain,
+        request: Request,
+        org_slug: str,
+    ) -> Self:
+        """Create from a domain object, adding HATEOAS URLs."""
+        return cls(
+            self_url=str(
+                request.url_for(
+                    "get_credential",
+                    org=org_slug,
+                    credential=domain.label,
+                )
+            ),
+            org_url=str(request.url_for("get_organization", org=org_slug)),
+            label=domain.label,
+            service_type=domain.service_type,
+            date_created=domain.date_created,
+            date_updated=domain.date_updated,
         )

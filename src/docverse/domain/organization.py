@@ -41,6 +41,16 @@ class Organization(BaseModel):
         description="Rules governing build lifecycle."
     )
 
+    publishing_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the publishing store.",
+    )
+
+    staging_credential_label: str | None = Field(
+        default=None,
+        description="Label of the credential used for the staging store.",
+    )
+
     purgatory_retention: timedelta = Field(
         description=(
             "Duration to retain inactive builds in purgatory before deletion."

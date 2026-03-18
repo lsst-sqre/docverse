@@ -22,6 +22,7 @@ from .handlers.admin import admin_router
 from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
+from .services.credential_encryptor import CredentialEncryptor
 
 __all__ = ["app"]
 
@@ -56,7 +57,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         mode=config.arq_mode,
         redis_settings=config.arq_redis_settings,
     )
-    await context_dependency.initialize()
+
+    retired_key = (
+        config.credential_encryption_key_retired.get_secret_value()
+        if config.credential_encryption_key_retired
+        else None
+    )
+    encryptor = CredentialEncryptor(
+        current_key=config.credential_encryption_key.get_secret_value(),
+        retired_key=retired_key,
+    )
+    await context_dependency.initialize(credential_encryptor=encryptor)
     yield
     await context_dependency.aclose()
     await db_session_dependency.aclose()

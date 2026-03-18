@@ -8,11 +8,17 @@ from fastapi import Path
 
 __all__ = [
     "BuildIdParam",
+    "CredentialLabelParam",
     "EditionSlugParam",
     "JobIdParam",
     "MemberIdParam",
     "OrgSlugParam",
     "ProjectSlugParam",
+]
+
+CredentialLabelParam = Annotated[
+    str,
+    Path(alias="credential", description="Credential label."),
 ]
 
 OrgSlugParam = Annotated[

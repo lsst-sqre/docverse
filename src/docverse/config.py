@@ -62,6 +62,25 @@ class Configuration(BaseSettings):
         validation_alias="REPERTOIRE_BASE_URL",
     )
 
+    credential_encryption_key: SecretStr = Field(
+        title="Fernet key for encrypting organization credentials",
+        description=(
+            "A base64url-encoded 32-byte Fernet key. Generate with"
+            " ``python -c 'from cryptography.fernet import Fernet;"
+            " print(Fernet.generate_key().decode())'``."
+        ),
+    )
+
+    credential_encryption_key_retired: SecretStr | None = Field(
+        None,
+        title="Retired Fernet key for credential rotation",
+        description=(
+            "When rotating keys, set the old key here so existing"
+            " credentials can still be decrypted. Remove after all"
+            " credentials have been re-encrypted."
+        ),
+    )
+
     arq_mode: ArqMode = Field(
         ArqMode.production,
         title="arq queue mode",

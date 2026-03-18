@@ -9,6 +9,7 @@ from .base32id import (
     validate_base32_id,
 )
 from .builds import Build, BuildCreate, BuildStatus, BuildUpdate
+from .credentials import OrganizationCredential, OrganizationCredentialCreate
 from .editions import (
     Edition,
     EditionCreate,
@@ -51,6 +52,8 @@ __all__ = [
     "OrgRole",
     "Organization",
     "OrganizationCreate",
+    "OrganizationCredential",
+    "OrganizationCredentialCreate",
     "OrganizationUpdate",
     "PrincipalType",
     "Project",
