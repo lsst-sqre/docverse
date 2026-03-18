@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from docverse.storage.mock_objectstore import MockObjectStore
+from docverse.storage.objectstore import MockObjectStore
 
 
 @pytest.mark.asyncio

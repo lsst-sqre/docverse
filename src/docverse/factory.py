@@ -18,7 +18,7 @@ from .services.project import ProjectService
 from .storage.build_store import BuildStore
 from .storage.edition_store import EditionStore
 from .storage.membership_store import OrgMembershipStore
-from .storage.objectstore_factory import create_objectstore
+from .storage.objectstore import S3ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
 from .storage.organization_store import OrganizationStore
 from .storage.project_store import ProjectStore
@@ -28,7 +28,6 @@ from .storage.queue_backend import (
     QueueBackend,
 )
 from .storage.queue_job_store import QueueJobStore
-from .storage.s3_objectstore import S3ObjectStore
 from .storage.user_info_store import UserInfoStore
 
 

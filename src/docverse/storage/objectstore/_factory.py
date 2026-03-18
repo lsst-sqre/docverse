@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .s3_objectstore import S3ObjectStore
+from ._s3 import S3ObjectStore
 
 __all__ = ["create_objectstore"]
 
