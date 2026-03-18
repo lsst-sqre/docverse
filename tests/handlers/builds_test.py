@@ -41,7 +41,8 @@ async def test_create_build(client: AsyncClient) -> None:
     data = response.json()
     assert data["git_ref"] == "main"
     assert data["status"] == "pending"
-    assert data["upload_url"] is not None
+    # No credential configured for this org, so upload_url is None
+    assert data["upload_url"] is None
     assert data["uploader"] == "testuser"
 
 

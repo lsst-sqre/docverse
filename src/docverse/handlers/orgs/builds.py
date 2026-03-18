@@ -98,6 +98,7 @@ async def post_build(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],
 ) -> Build:
+    upload_url: str | None = None
     async with context.session.begin():
         service = context.factory.create_build_service()
         build = await service.create(
@@ -106,9 +107,24 @@ async def post_build(
             data=data,
             uploader=user.username,
         )
+
+        # Generate a presigned upload URL if the org has a credential
+        credential_label = (
+            user.org.staging_credential_label
+            or user.org.publishing_credential_label
+        )
+        if credential_label is not None:
+            object_store = await context.factory.create_objectstore_for_org(
+                org_id=user.org.id,
+                credential_label=credential_label,
+            )
+            async with object_store:
+                upload_url = await object_store.generate_presigned_upload_url(
+                    key=build.staging_key,
+                    content_type="application/gzip",
+                )
+
         await context.session.commit()
-    # Placeholder upload_url until ObjectStore is implemented
-    upload_url = f"https://placeholder.example.com/upload/{build.staging_key}"
     return Build.from_domain(
         build,
         context.request,
