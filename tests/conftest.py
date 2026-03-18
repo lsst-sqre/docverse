@@ -15,9 +15,12 @@ from safir.database import (
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
+from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
 from docverse.config import config
 from docverse.dbschema import Base
 from docverse.main import app as docverse_app
+from docverse.storage.membership_store import OrgMembershipStore
+from docverse.storage.organization_store import OrganizationStore
 
 
 @pytest_asyncio.fixture
@@ -60,3 +63,69 @@ async def db_session(
     """
     async for session in db_session_dependency():
         yield session
+
+
+async def seed_org_with_admin(
+    client: AsyncClient,
+    org_slug: str,
+    admin_username: str,
+) -> None:
+    """Create an org via admin API and seed an admin membership via DB.
+
+    This solves the bootstrap problem: the membership API requires
+    an existing admin, but we need to create the first admin.
+    """
+    # Create the org via the admin API (no auth required)
+    await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": org_slug,
+            "title": f"Test Org {org_slug}",
+            "base_domain": f"{org_slug}.example.com",
+        },
+    )
+    # Seed the admin membership directly via DB
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            membership_store = OrgMembershipStore(
+                session=session, logger=logger
+            )
+            await membership_store.create(
+                org_id=org.id,
+                data=OrgMembershipCreate(
+                    principal=admin_username,
+                    principal_type=PrincipalType.user,
+                    role=OrgRole.admin,
+                ),
+            )
+            await session.commit()
+
+
+async def seed_member(
+    org_slug: str,
+    username: str,
+    role: OrgRole,
+) -> None:
+    """Seed a membership with a given role directly via the DB."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            membership_store = OrgMembershipStore(
+                session=session, logger=logger
+            )
+            await membership_store.create(
+                org_id=org.id,
+                data=OrgMembershipCreate(
+                    principal=username,
+                    principal_type=PrincipalType.user,
+                    role=role,
+                ),
+            )
+            await session.commit()

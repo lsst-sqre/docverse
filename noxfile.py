@@ -7,6 +7,18 @@ nox.options.default_venv_backend = "uv"
 nox.options.sessions = ["lint", "typing", "test"]
 
 
+def _install_pg_extensions(postgres: PostgresContainer) -> None:
+    """Install PostgreSQL extensions in the container via docker exec."""
+    cmd = (
+        f"psql -U {postgres.username} -d {postgres.dbname}"
+        " -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'"
+    )
+    result = postgres.exec(cmd)
+    if result.exit_code != 0:
+        msg = f"Failed to install pg_trgm: {result.output.decode()}"
+        raise RuntimeError(msg)
+
+
 @session(uv_only_groups=["lint"], uv_no_install_project=True)
 def lint(session: nox.Session) -> None:
     """Run pre-commit hooks."""
@@ -28,6 +40,7 @@ def typing(session: nox.Session) -> None:
 @session(uv_groups=["dev"])
 def test(session: nox.Session) -> None:
     with PostgresContainer("postgres:17") as postgres:
+        _install_pg_extensions(postgres)
         url = postgres.get_connection_url(driver="asyncpg")
         session.run(
             "pytest",
@@ -114,6 +127,7 @@ def create_migration(session: nox.Session) -> None:
     message = session.posargs[0]
 
     with PostgresContainer("postgres:17") as postgres:
+        _install_pg_extensions(postgres)
         url = postgres.get_connection_url(driver=None)
         env = {
             "DOCVERSE_DATABASE_URL": url,

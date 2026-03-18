@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from structlog.stdlib import BoundLogger
 
 from ..factory import Factory
+from ..storage.user_info_store import StubUserInfoStore, UserInfoStore
 
 __all__ = [
     "ContextDependency",
@@ -75,6 +76,7 @@ class ContextDependency:
 
     def __init__(self) -> None:
         self._initialized = False
+        self._user_info_store: UserInfoStore = StubUserInfoStore()
 
     async def __call__(
         self,
@@ -100,12 +102,18 @@ class ContextDependency:
                 session=session,
                 logger=logger,
                 arq_queue=arq_queue,
+                user_info_store=self._user_info_store,
             ),
         )
 
-    async def initialize(self) -> None:
+    async def initialize(
+        self,
+        user_info_store: UserInfoStore | None = None,
+    ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
+        if user_info_store is not None:
+            self._user_info_store = user_info_store
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""

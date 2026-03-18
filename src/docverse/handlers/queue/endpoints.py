@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import validate_base32_id
 from docverse.exceptions import NotFoundError
+from docverse.handlers.params import JobIdParam
 
 from .models import QueueJob
 
@@ -16,12 +17,12 @@ router = APIRouter(tags=["queue"])
 
 
 @router.get(
-    "/queue/jobs/{job_id}",
+    "/queue/jobs/{job}",
     response_model=QueueJob,
     summary="Get a queue job",
 )
 async def get_queue_job(
-    job_id: str,
+    job_id: JobIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> QueueJob:
     try:
