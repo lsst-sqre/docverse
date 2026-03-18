@@ -81,6 +81,21 @@ class ObjectStore(Protocol):
         """
         ...
 
+    async def download_object(self, *, key: str) -> bytes:
+        """Download an object from the store.
+
+        Parameters
+        ----------
+        key
+            Object store key.
+
+        Returns
+        -------
+        bytes
+            The object contents.
+        """
+        ...
+
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
     ) -> None:
