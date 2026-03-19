@@ -7,7 +7,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .base32id import Base32Id
 from .queue_enums import JobKind, JobStatus
 
 
@@ -18,7 +17,7 @@ class QueueJob(BaseModel):
 
     self_url: str = Field(description="URL to this queue job resource.")
 
-    id: Base32Id = Field(
+    id: str = Field(
         description="Public Crockford Base32 identifier for the job."
     )
 

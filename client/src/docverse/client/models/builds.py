@@ -8,8 +8,6 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .base32id import Base32Id
-
 __all__ = [
     "Build",
     "BuildCreate",
@@ -83,7 +81,7 @@ class Build(BaseModel):
 
     project_url: str = Field(description="URL to the parent project.")
 
-    id: Base32Id = Field(
+    id: str = Field(
         description="Public Crockford Base32 identifier for the build."
     )
 

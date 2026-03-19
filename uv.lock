@@ -648,7 +648,6 @@ typing = [{ name = "mypy", specifier = ">=1.15" }]
 name = "docverse-client"
 source = { editable = "client" }
 dependencies = [
-    { name = "base32-lib" },
     { name = "click" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -664,7 +663,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "base32-lib", specifier = ">=1" },
     { name = "click", specifier = ">=8" },
     { name = "httpx", specifier = ">=0.25" },
     { name = "pydantic", specifier = ">=2.5" },

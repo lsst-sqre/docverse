@@ -131,7 +131,7 @@ class Build(_BuildBase):
                     project=project_slug,
                 )
             ),
-            id=domain.public_id,
+            id=build_id_str,
             git_ref=domain.git_ref,
             alternate_name=domain.alternate_name,
             content_hash=domain.content_hash,

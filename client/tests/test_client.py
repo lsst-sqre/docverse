@@ -87,7 +87,7 @@ async def test_create_build() -> None:
         assert route.called
         request = route.calls[0].request
         assert request.headers["authorization"] == f"Bearer {TOKEN}"
-        assert build.id == 1
+        assert build.id == BUILD_ID
         assert build.status == BuildStatus.pending
 
 
@@ -148,7 +148,7 @@ async def test_get_queue_job() -> None:
         async with DocverseClient(BASE_URL, TOKEN) as client:
             job = await client.get_queue_job(queue_url)
 
-    assert job.id == 2  # noqa: PLR2004
+    assert job.id == JOB_ID
     assert job.status == JobStatus.completed
     assert job.kind == JobKind.build_processing
 
