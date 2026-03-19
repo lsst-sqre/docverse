@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._protocol import ObjectStore
 from ._s3 import S3ObjectStore
 
 __all__ = ["create_objectstore"]
@@ -14,7 +15,7 @@ _S3_COMPATIBLE_TYPES = {"s3", "r2", "minio"}
 
 def create_objectstore(
     *, service_type: str, credential: dict[str, Any]
-) -> S3ObjectStore:
+) -> ObjectStore:
     """Create an ObjectStore from a service type and decrypted credential.
 
     Parameters
@@ -28,8 +29,8 @@ def create_objectstore(
 
     Returns
     -------
-    S3ObjectStore
-        An unopened S3ObjectStore. The caller must use it as an async
+    ObjectStore
+        An unopened ObjectStore. The caller must use it as an async
         context manager or call ``open()`` before use.
 
     Raises

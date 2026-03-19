@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import TracebackType
+from typing import Self
 from urllib.parse import quote
 
 __all__ = ["MockObjectStore"]
@@ -27,6 +29,17 @@ class MockObjectStore:
     def __init__(self, *, base_url: str = _DEFAULT_BASE_URL) -> None:
         self._base_url = base_url
         self._objects: dict[str, _StoredObject] = {}
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        pass
 
     @property
     def objects(self) -> dict[str, _StoredObject]:
