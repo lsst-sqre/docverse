@@ -29,7 +29,6 @@ class CredentialEncryptor:
         if retired_key is not None:
             keys.append(Fernet(retired_key))
         self._fernet = MultiFernet(keys)
-        self._current = keys[0]
 
     def encrypt(self, plaintext: bytes) -> bytes:
         """Encrypt plaintext and return a Fernet token.
@@ -44,7 +43,7 @@ class CredentialEncryptor:
         bytes
             The Fernet token (URL-safe base64-encoded).
         """
-        return self._current.encrypt(plaintext)
+        return self._fernet.encrypt(plaintext)
 
     def decrypt(self, token: bytes) -> bytes:
         """Decrypt a Fernet token.
