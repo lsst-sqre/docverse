@@ -23,6 +23,13 @@ class BuildStatus(StrEnum):
 
     pending = "pending"
     uploaded = "uploaded"
+    """Signal value used in PATCH requests to indicate upload completion.
+
+    This status is never persisted to the database. The server transitions
+    the build directly from ``pending`` to ``processing`` when it receives
+    this signal.
+    """
+
     processing = "processing"
     completed = "completed"
     failed = "failed"
