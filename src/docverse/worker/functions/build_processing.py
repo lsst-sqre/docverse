@@ -16,11 +16,13 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.client.models import BuildStatus
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.exceptions import NotFoundError
 from docverse.factory import WorkerFactory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
+from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
 
 #: Maximum number of concurrent upload tasks.
@@ -113,7 +115,7 @@ async def build_processing(
 
 async def _process_build(
     *,
-    object_store: Any,
+    object_store: ObjectStore,
     build: Build,
     build_store: BuildStore,
     logger: structlog.stdlib.BoundLogger,
@@ -125,7 +127,7 @@ async def _process_build(
     )
     tarball_data = await object_store.download_object(key=build.staging_key)
 
-    build_prefix = f"__builds/{build.id}/"
+    build_prefix = f"__builds/{serialize_base32_id(build.public_id)}/"
     semaphore = asyncio.Semaphore(_UPLOAD_CONCURRENCY)
 
     async def _upload_file(name: str, data: bytes) -> int:
@@ -171,8 +173,12 @@ async def _process_build(
         build_id=build.id, new_status=BuildStatus.completed
     )
 
-    await object_store.delete_object(key=build.staging_key)
-    logger.info(
-        "Deleted staging tarball",
-        staging_key=build.staging_key,
-    )
+    try:
+        await object_store.delete_object(key=build.staging_key)
+        logger.info("Deleted staging tarball", staging_key=build.staging_key)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to delete staging tarball",
+            staging_key=build.staging_key,
+            exc_info=True,
+        )
