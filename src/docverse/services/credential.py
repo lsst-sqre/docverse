@@ -103,6 +103,40 @@ class CredentialService:
             label=label,
         )
 
+    async def get_by_label(
+        self, *, org_slug: str, label: str
+    ) -> OrganizationCredential:
+        """Fetch a credential by label (without decrypting).
+
+        Parameters
+        ----------
+        org_slug
+            Organization slug.
+        label
+            Credential label.
+
+        Returns
+        -------
+        OrganizationCredential
+            The credential domain model.
+
+        Raises
+        ------
+        NotFoundError
+            If the credential does not exist.
+        """
+        org_id = await self._resolve_org_id(org_slug)
+        result = await self._store.get_by_label(
+            organization_id=org_id, label=label
+        )
+        if result is None:
+            msg = (
+                f"Credential {label!r} not found for organization {org_slug!r}"
+            )
+            raise NotFoundError(msg)
+        cred, _encrypted = result
+        return cred
+
     async def get_decrypted(
         self, *, org_id: int, label: str
     ) -> tuple[OrganizationCredential, dict[str, Any]]:

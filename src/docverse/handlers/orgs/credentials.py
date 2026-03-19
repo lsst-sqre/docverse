@@ -9,7 +9,6 @@ from fastapi import APIRouter, Depends, status
 from docverse.client.models import OrganizationCredentialCreate
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.exceptions import NotFoundError
 from docverse.handlers.params import CredentialLabelParam, OrgSlugParam
 
 from .models import OrganizationCredentialResponse
@@ -76,17 +75,13 @@ async def get_credential(
     org_slug: OrgSlugParam,
     credential_label: CredentialLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> OrganizationCredentialResponse:
     async with context.session.begin():
-        store = context.factory.create_credential_store()
-        result = await store.get_by_label(
-            organization_id=user.org.id, label=credential_label
+        service = context.factory.create_credential_service()
+        cred = await service.get_by_label(
+            org_slug=org_slug, label=credential_label
         )
-    if result is None:
-        msg = f"Credential {credential_label!r} not found"
-        raise NotFoundError(msg)
-    cred, _encrypted = result
     return OrganizationCredentialResponse.from_domain(
         cred, context.request, org_slug
     )
