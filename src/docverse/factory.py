@@ -18,7 +18,7 @@ from .services.project import ProjectService
 from .storage.build_store import BuildStore
 from .storage.edition_store import EditionStore
 from .storage.membership_store import OrgMembershipStore
-from .storage.objectstore import S3ObjectStore, create_objectstore
+from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
 from .storage.organization_store import OrganizationStore
 from .storage.project_store import ProjectStore
@@ -143,7 +143,7 @@ class Factory(ABC):
 
     async def create_objectstore_for_org(
         self, *, org_id: int, credential_label: str
-    ) -> S3ObjectStore:
+    ) -> ObjectStore:
         """Resolve an org's ObjectStore from its credential.
 
         Parameters
@@ -155,8 +155,8 @@ class Factory(ABC):
 
         Returns
         -------
-        S3ObjectStore
-            An unopened S3ObjectStore. Caller must use as async context
+        ObjectStore
+            An unopened ObjectStore. Caller must use as async context
             manager.
         """
         credential_service = self.create_credential_service()
@@ -188,10 +188,6 @@ class HandlerFactory(Factory):
         self._user_info_store = user_info_store
 
     def _create_queue_backend(self) -> ArqQueueBackend:
-        return ArqQueueBackend(arq_queue=self._arq_queue)
-
-    def create_queue_backend(self) -> ArqQueueBackend:
-        """Create an ArqQueueBackend."""
         return ArqQueueBackend(arq_queue=self._arq_queue)
 
     def get_user_info_store(self) -> UserInfoStore:
