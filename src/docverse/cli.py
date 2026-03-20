@@ -21,7 +21,7 @@ from safir.logging import configure_logging
 from sqlalchemy import Connection
 
 from .config import config
-from .database import init_database
+from .database import check_database_state, init_database
 
 __all__ = ["help", "main"]
 
@@ -74,10 +74,36 @@ def help(ctx: click.Context, /, topic: None | str, **kw: Any) -> None:
 def init(*, alembic_config_path: Path, reset: bool) -> None:
     """Initialize the SQL database storage."""
     logger = structlog.get_logger("docverse")
+
+    if reset:
+        logger.debug("Reinitializing database (reset)")
+        asyncio.run(init_database(config, logger, reset=True))
+        stamp_database(alembic_config_path)
+        logger.debug("Finished reinitializing database")
+        return
+
+    db_state = asyncio.run(check_database_state(config))
+
+    if db_state.has_orm_tables and db_state.has_alembic_version:
+        msg = (
+            "Database already initialized and tracked by Alembic. "
+            "Use 'docverse update-db-schema' to apply migrations, "
+            "or 'docverse init --reset' to reinitialize."
+        )
+        raise click.ClickException(msg)
+
+    if db_state.has_orm_tables and not db_state.has_alembic_version:
+        msg = (
+            "Database has existing tables but no Alembic tracking. "
+            "Use 'docverse init --reset' to reinitialize."
+        )
+        raise click.ClickException(msg)
+
+    # Fresh database — create tables and stamp
     logger.debug("Initializing database")
-    asyncio.run(init_database(config, logger, reset=reset))
+    asyncio.run(init_database(config, logger, reset=False))
     stamp_database(alembic_config_path)
-    logger.debug("Finished initializing data stores")
+    logger.debug("Finished initializing database")
 
 
 @main.command()
