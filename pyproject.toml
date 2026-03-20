@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dynamic = ["version"]
 dependencies = [
+    "aiobotocore>=2.18",
     "click>=8",
+    "cryptography>=44",
     "docverse-client",
     "fastapi>=0.115",
     "pydantic>=2",

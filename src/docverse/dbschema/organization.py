@@ -48,6 +48,22 @@ class SqlOrganization(Base):
         JSONB, nullable=True
     )
 
+    publishing_store_label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    staging_store_label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    cdn_service_label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    dns_service_label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
     purgatory_retention: Mapped[int] = mapped_column(
         Integer,
         name="purgatory_retention_seconds",

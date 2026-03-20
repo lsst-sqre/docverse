@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from types import TracebackType
+from typing import Protocol, Self, runtime_checkable
 
 __all__ = ["ObjectStore"]
 
@@ -14,7 +15,18 @@ class ObjectStore(Protocol):
     This protocol defines the interface for storing and retrieving
     documentation build artifacts. Concrete implementations will use
     S3-compatible object stores.
+
+    Implementations must be usable as async context managers.
     """
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
 
     async def generate_presigned_upload_url(
         self, *, key: str, content_type: str, expires_in: int = 3600
@@ -78,6 +90,21 @@ class ObjectStore(Protocol):
         -------
         list of str
             List of matching object keys.
+        """
+        ...
+
+    async def download_object(self, *, key: str) -> bytes:
+        """Download an object from the store.
+
+        Parameters
+        ----------
+        key
+            Object store key.
+
+        Returns
+        -------
+        bytes
+            The object contents.
         """
         ...
 

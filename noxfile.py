@@ -4,7 +4,7 @@ from testcontainers.postgres import PostgresContainer
 
 nox.needs_version = ">=2024.4.15"
 nox.options.default_venv_backend = "uv"
-nox.options.sessions = ["lint", "typing", "test"]
+nox.options.sessions = ["lint", "typing", "test", "client_test"]
 
 
 def _install_pg_extensions(postgres: PostgresContainer) -> None:
@@ -51,6 +51,9 @@ def test(session: nox.Session) -> None:
                 "DOCVERSE_DATABASE_PASSWORD": postgres.password,
                 "DOCVERSE_ALEMBIC_CONFIG_PATH": "alembic.ini",
                 "DOCVERSE_ARQ_MODE": "test",
+                "DOCVERSE_CREDENTIAL_ENCRYPTION_KEY": (
+                    "nz4oCndEIQhi-PlZBzYzmK_jlacf05Hz3VnrRrZhq-k="
+                ),
                 "REPERTOIRE_BASE_URL": (
                     "https://roundtable.lsst.cloud/repertoire"
                 ),
@@ -133,6 +136,9 @@ def create_migration(session: nox.Session) -> None:
             "DOCVERSE_DATABASE_URL": url,
             "DOCVERSE_DATABASE_PASSWORD": postgres.password,
             "DOCVERSE_ARQ_MODE": "test",
+            "DOCVERSE_CREDENTIAL_ENCRYPTION_KEY": (
+                "nz4oCndEIQhi-PlZBzYzmK_jlacf05Hz3VnrRrZhq-k="
+            ),
             "REPERTOIRE_BASE_URL": (
                 "https://roundtable.lsst.cloud/repertoire"
             ),

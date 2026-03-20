@@ -9,12 +9,16 @@ from typing import Any
 
 import click
 import structlog
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from safir.database import (
     create_database_engine,
     is_database_current,
     stamp_database,
 )
 from safir.logging import configure_logging
+from sqlalchemy import Connection
 
 from .config import config
 from .database import init_database
@@ -85,10 +89,31 @@ def init(*, alembic_config_path: Path, reset: bool) -> None:
 )
 def update_db_schema(*, alembic_config_path: Path) -> None:
     """Update the SQL database schema."""
+    logger = structlog.get_logger("docverse")
+
+    alembic_config = Config(str(alembic_config_path))
+    alembic_scripts = ScriptDirectory.from_config(alembic_config)
+    head_rev = alembic_scripts.get_current_head()
+    current_rev = asyncio.run(_get_current_revision())
+
+    logger.info(
+        "Starting database schema update",
+        current_revision=current_rev,
+        target_revision=head_rev,
+    )
+
     subprocess.run(
         ["alembic", "upgrade", "head"],
         check=True,
         cwd=str(alembic_config_path.parent),
+    )
+
+    new_rev = asyncio.run(_get_current_revision())
+
+    logger.info(
+        "Database schema update complete",
+        previous_revision=current_rev,
+        current_revision=new_rev,
     )
 
 
@@ -110,3 +135,24 @@ def validate_db_schema(*, alembic_config_path: Path) -> None:
     ):
         msg = "Database schema is not current"
         raise click.ClickException(msg)
+
+
+async def _get_current_revision() -> str | None:
+    """Get the current Alembic revision from the database."""
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+
+    def _get_heads(connection: Connection) -> set[str]:
+        context = MigrationContext.configure(connection)
+        return set(context.get_current_heads())
+
+    try:
+        async with engine.begin() as connection:
+            heads = await connection.run_sync(_get_heads)
+    finally:
+        await engine.dispose()
+
+    if not heads:
+        return None
+    return ",".join(sorted(heads))

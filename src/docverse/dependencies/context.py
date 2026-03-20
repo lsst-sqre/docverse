@@ -19,7 +19,8 @@ from safir.dependencies.logger import logger_dependency
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from structlog.stdlib import BoundLogger
 
-from ..factory import Factory
+from ..factory import HandlerFactory
+from ..services.credential_encryptor import CredentialEncryptor
 from ..storage.user_info_store import StubUserInfoStore, UserInfoStore
 
 __all__ = [
@@ -51,7 +52,7 @@ class RequestContext:
     session: async_scoped_session[AsyncSession]
     """The database session."""
 
-    factory: Factory
+    factory: HandlerFactory
     """The component factory."""
 
     def rebind_logger(self, **values: Any) -> None:
@@ -77,6 +78,7 @@ class ContextDependency:
     def __init__(self) -> None:
         self._initialized = False
         self._user_info_store: UserInfoStore = StubUserInfoStore()
+        self._credential_encryptor: CredentialEncryptor | None = None
 
     async def __call__(
         self,
@@ -98,22 +100,26 @@ class ContextDependency:
             response=response,
             logger=logger,
             session=session,
-            factory=Factory(
+            factory=HandlerFactory(
                 session=session,
                 logger=logger,
                 arq_queue=arq_queue,
                 user_info_store=self._user_info_store,
+                credential_encryptor=self._credential_encryptor,
             ),
         )
 
     async def initialize(
         self,
         user_info_store: UserInfoStore | None = None,
+        credential_encryptor: CredentialEncryptor | None = None,
     ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
         if user_info_store is not None:
             self._user_info_store = user_info_store
+        if credential_encryptor is not None:
+            self._credential_encryptor = credential_encryptor
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""

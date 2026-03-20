@@ -8,6 +8,8 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .services import OrganizationServiceSummary
+
 
 class UrlScheme(StrEnum):
     """URL scheme for serving documentation within an organization."""
@@ -82,6 +84,26 @@ class OrganizationCreate(BaseModel):
         ),
     )
 
+    publishing_store_label: str | None = Field(
+        default=None,
+        description="Label of the object_storage service for publishing.",
+    )
+
+    staging_store_label: str | None = Field(
+        default=None,
+        description="Label of the object_storage service for staging.",
+    )
+
+    cdn_service_label: str | None = Field(
+        default=None,
+        description="Label of the cdn service.",
+    )
+
+    dns_service_label: str | None = Field(
+        default=None,
+        description="Label of the dns service.",
+    )
+
 
 class Organization(BaseModel):
     """Response model for an organization."""
@@ -127,6 +149,26 @@ class Organization(BaseModel):
         if isinstance(v, timedelta):
             return int(v.total_seconds())
         return v
+
+    publishing_store: OrganizationServiceSummary | None = Field(
+        default=None,
+        description="Object storage service used for publishing.",
+    )
+
+    staging_store: OrganizationServiceSummary | None = Field(
+        default=None,
+        description="Object storage service used for staging uploads.",
+    )
+
+    cdn_service: OrganizationServiceSummary | None = Field(
+        default=None,
+        description="CDN service for cache purging and edge data.",
+    )
+
+    dns_service: OrganizationServiceSummary | None = Field(
+        default=None,
+        description="DNS service for subdomain registration.",
+    )
 
     date_created: datetime = Field(
         description="Timestamp when the organization was created."
@@ -176,4 +218,24 @@ class OrganizationUpdate(BaseModel):
             "Duration in seconds to retain inactive builds in purgatory"
             " before deletion."
         ),
+    )
+
+    publishing_store_label: str | None = Field(
+        default=None,
+        description="Label of the object_storage service for publishing.",
+    )
+
+    staging_store_label: str | None = Field(
+        default=None,
+        description="Label of the object_storage service for staging.",
+    )
+
+    cdn_service_label: str | None = Field(
+        default=None,
+        description="Label of the cdn service.",
+    )
+
+    dns_service_label: str | None = Field(
+        default=None,
+        description="Label of the dns service.",
     )

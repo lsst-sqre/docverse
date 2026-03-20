@@ -41,6 +41,26 @@ class Organization(BaseModel):
         description="Rules governing build lifecycle."
     )
 
+    publishing_store_label: str | None = Field(
+        default=None,
+        description="Label of the object_storage service for publishing.",
+    )
+
+    staging_store_label: str | None = Field(
+        default=None,
+        description="Label of the object_storage service for staging.",
+    )
+
+    cdn_service_label: str | None = Field(
+        default=None,
+        description="Label of the cdn service.",
+    )
+
+    dns_service_label: str | None = Field(
+        default=None,
+        description="Label of the dns service.",
+    )
+
     purgatory_retention: timedelta = Field(
         description=(
             "Duration to retain inactive builds in purgatory before deletion."
