@@ -39,11 +39,11 @@ async def test_create_and_get(
         cred = await store.create(
             organization_id=org_id,
             label="my-cred",
-            service_type="s3",
-            encrypted_credential=b"encrypted-data",
+            provider="aws",
+            encrypted_credentials=b"encrypted-data",
         )
         assert cred.label == "my-cred"
-        assert cred.service_type == "s3"
+        assert cred.provider == "aws"
 
         result = await store.get_by_label(
             organization_id=org_id, label="my-cred"
@@ -66,14 +66,14 @@ async def test_list_by_org(
         await store.create(
             organization_id=org_id,
             label="alpha",
-            service_type="s3",
-            encrypted_credential=b"a",
+            provider="aws",
+            encrypted_credentials=b"a",
         )
         await store.create(
             organization_id=org_id,
             label="beta",
-            service_type="r2",
-            encrypted_credential=b"b",
+            provider="cloudflare",
+            encrypted_credentials=b"b",
         )
         creds = await store.list_by_org(org_id)
         assert len(creds) == 2
@@ -93,8 +93,8 @@ async def test_delete(
         await store.create(
             organization_id=org_id,
             label="to-delete",
-            service_type="s3",
-            encrypted_credential=b"x",
+            provider="aws",
+            encrypted_credentials=b"x",
         )
         deleted = await store.delete(organization_id=org_id, label="to-delete")
         assert deleted is True

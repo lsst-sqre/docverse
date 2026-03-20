@@ -48,11 +48,19 @@ class SqlOrganization(Base):
         JSONB, nullable=True
     )
 
-    publishing_credential_label: Mapped[str | None] = mapped_column(
+    publishing_store_label: Mapped[str | None] = mapped_column(
         String(128), nullable=True
     )
 
-    staging_credential_label: Mapped[str | None] = mapped_column(
+    staging_store_label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    cdn_service_label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
+    dns_service_label: Mapped[str | None] = mapped_column(
         String(128), nullable=True
     )
 

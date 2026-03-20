@@ -1,27 +1,22 @@
-"""SQLAlchemy ORM model for the ``organization_credentials`` table."""
+"""SQLAlchemy ORM model for the ``organization_services`` table."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import (
-    DateTime,
-    ForeignKey,
-    Integer,
-    LargeBinary,
-    String,
-    UniqueConstraint,
-)
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from .base import Base
 
 
-class SqlOrganizationCredential(Base):
-    """ORM model for the ``organization_credentials`` table."""
+class SqlOrganizationService(Base):
+    """ORM model for the ``organization_services`` table."""
 
-    __tablename__ = "organization_credentials"
+    __tablename__ = "organization_services"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
@@ -35,11 +30,15 @@ class SqlOrganizationCredential(Base):
 
     label: Mapped[str] = mapped_column(String(128), nullable=False)
 
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
 
-    encrypted_credentials: Mapped[bytes] = mapped_column(
-        LargeBinary, nullable=False
+    config: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
     )
+
+    credential_label: Mapped[str] = mapped_column(String(128), nullable=False)
 
     date_created: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -56,6 +55,6 @@ class SqlOrganizationCredential(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "organization_id", "label", name="uq_org_credential_label"
+            "organization_id", "label", name="uq_org_service_label"
         ),
     )

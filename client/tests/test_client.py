@@ -20,7 +20,7 @@ from docverse.client.models.builds import BuildStatus
 from docverse.client.models.queue_enums import JobKind, JobStatus
 
 BASE_URL = "https://docverse.example.com"
-TOKEN = "test-token"  # noqa: S105
+TOKEN = "test-token"
 
 # Valid Crockford Base32 IDs with checksum (base32_lib.encode(N, ...))
 BUILD_ID = "000000000195"

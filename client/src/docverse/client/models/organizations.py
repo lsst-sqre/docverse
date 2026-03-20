@@ -8,6 +8,8 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .services import OrganizationServiceSummary
+
 
 class UrlScheme(StrEnum):
     """URL scheme for serving documentation within an organization."""
@@ -82,14 +84,24 @@ class OrganizationCreate(BaseModel):
         ),
     )
 
-    publishing_credential_label: str | None = Field(
+    publishing_store_label: str | None = Field(
         default=None,
-        description="Label of the credential used for the publishing store.",
+        description="Label of the object_storage service for publishing.",
     )
 
-    staging_credential_label: str | None = Field(
+    staging_store_label: str | None = Field(
         default=None,
-        description="Label of the credential used for the staging store.",
+        description="Label of the object_storage service for staging.",
+    )
+
+    cdn_service_label: str | None = Field(
+        default=None,
+        description="Label of the cdn service.",
+    )
+
+    dns_service_label: str | None = Field(
+        default=None,
+        description="Label of the dns service.",
     )
 
 
@@ -138,14 +150,24 @@ class Organization(BaseModel):
             return int(v.total_seconds())
         return v
 
-    publishing_credential_label: str | None = Field(
+    publishing_store: OrganizationServiceSummary | None = Field(
         default=None,
-        description="Label of the credential used for the publishing store.",
+        description="Object storage service used for publishing.",
     )
 
-    staging_credential_label: str | None = Field(
+    staging_store: OrganizationServiceSummary | None = Field(
         default=None,
-        description="Label of the credential used for the staging store.",
+        description="Object storage service used for staging uploads.",
+    )
+
+    cdn_service: OrganizationServiceSummary | None = Field(
+        default=None,
+        description="CDN service for cache purging and edge data.",
+    )
+
+    dns_service: OrganizationServiceSummary | None = Field(
+        default=None,
+        description="DNS service for subdomain registration.",
     )
 
     date_created: datetime = Field(
@@ -198,12 +220,22 @@ class OrganizationUpdate(BaseModel):
         ),
     )
 
-    publishing_credential_label: str | None = Field(
+    publishing_store_label: str | None = Field(
         default=None,
-        description="Label of the credential used for the publishing store.",
+        description="Label of the object_storage service for publishing.",
     )
 
-    staging_credential_label: str | None = Field(
+    staging_store_label: str | None = Field(
         default=None,
-        description="Label of the credential used for the staging store.",
+        description="Label of the object_storage service for staging.",
+    )
+
+    cdn_service_label: str | None = Field(
+        default=None,
+        description="Label of the cdn service.",
+    )
+
+    dns_service_label: str | None = Field(
+        default=None,
+        description="Label of the dns service.",
     )

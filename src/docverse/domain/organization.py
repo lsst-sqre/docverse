@@ -41,14 +41,24 @@ class Organization(BaseModel):
         description="Rules governing build lifecycle."
     )
 
-    publishing_credential_label: str | None = Field(
+    publishing_store_label: str | None = Field(
         default=None,
-        description="Label of the credential used for the publishing store.",
+        description="Label of the object_storage service for publishing.",
     )
 
-    staging_credential_label: str | None = Field(
+    staging_store_label: str | None = Field(
         default=None,
-        description="Label of the credential used for the staging store.",
+        description="Label of the object_storage service for staging.",
+    )
+
+    cdn_service_label: str | None = Field(
+        default=None,
+        description="Label of the cdn service.",
+    )
+
+    dns_service_label: str | None = Field(
+        default=None,
+        description="Label of the dns service.",
     )
 
     purgatory_retention: timedelta = Field(

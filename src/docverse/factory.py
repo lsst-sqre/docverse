@@ -13,6 +13,7 @@ from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.edition import EditionService
+from .services.infrastructure import InfrastructureService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .storage.build_store import BuildStore
@@ -20,6 +21,7 @@ from .storage.edition_store import EditionStore
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
+from .storage.organization_service_store import OrganizationServiceStore
 from .storage.organization_store import OrganizationStore
 from .storage.project_store import ProjectStore
 from .storage.queue_backend import (
@@ -60,7 +62,11 @@ class Factory(ABC):
     def create_organization_service(self) -> OrganizationService:
         """Create an OrganizationService."""
         store = self._create_org_store()
-        return OrganizationService(store=store, logger=self._logger)
+        return OrganizationService(
+            store=store,
+            service_store=self.create_service_store(),
+            logger=self._logger,
+        )
 
     def create_project_service(self) -> ProjectService:
         """Create a ProjectService."""
@@ -123,6 +129,12 @@ class Factory(ABC):
             session=self._session, logger=self._logger
         )
 
+    def create_service_store(self) -> OrganizationServiceStore:
+        """Create an OrganizationServiceStore."""
+        return OrganizationServiceStore(
+            session=self._session, logger=self._logger
+        )
+
     def create_credential_service(self) -> CredentialService:
         """Create a CredentialService.
 
@@ -137,21 +149,35 @@ class Factory(ABC):
         return CredentialService(
             store=self.create_credential_store(),
             org_store=self._create_org_store(),
+            service_store=self.create_service_store(),
             encryptor=self._credential_encryptor,
             logger=self._logger,
         )
 
+    def create_infrastructure_service(self) -> InfrastructureService:
+        """Create an InfrastructureService."""
+        return InfrastructureService(
+            store=self.create_service_store(),
+            credential_store=self.create_credential_store(),
+            org_store=self._create_org_store(),
+            logger=self._logger,
+        )
+
     async def create_objectstore_for_org(
-        self, *, org_id: int, credential_label: str
+        self, *, org_id: int, service_label: str
     ) -> ObjectStore:
-        """Resolve an org's ObjectStore from its credential.
+        """Resolve an org's ObjectStore from its service configuration.
+
+        Uses the two-step resolution: service label -> config +
+        credential_label -> decrypt credential -> build ObjectStore.
 
         Parameters
         ----------
         org_id
             Organization ID.
-        credential_label
-            Credential label to use.
+        service_label
+            Service label to use (e.g., the org's
+            ``publishing_store_label``).
 
         Returns
         -------
@@ -159,12 +185,26 @@ class Factory(ABC):
             An unopened ObjectStore. Caller must use as async context
             manager.
         """
-        credential_service = self.create_credential_service()
-        cred, payload = await credential_service.get_decrypted(
-            org_id=org_id, label=credential_label
+        # Step 1: Load the service config
+        service_store = self.create_service_store()
+        svc = await service_store.get_by_label(
+            organization_id=org_id, label=service_label
         )
+        if svc is None:
+            msg = f"Service {service_label!r} not found"
+            raise RuntimeError(msg)
+
+        # Step 2: Decrypt the credential
+        credential_service = self.create_credential_service()
+        _cred, cred_payload = await credential_service.get_decrypted(
+            org_id=org_id, label=svc.credential_label
+        )
+
+        # Step 3: Build the ObjectStore from config + credentials
         return create_objectstore(
-            service_type=cred.service_type, credential=payload
+            provider=svc.provider,
+            config=svc.config,
+            credentials=cred_payload,
         )
 
 

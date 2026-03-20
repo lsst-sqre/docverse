@@ -3,14 +3,68 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
+
+from .infrastructure import CredentialProvider
 
 __all__ = [
+    "AwsCredentials",
+    "CloudflareCredentials",
+    "CredentialPayload",
+    "FastlyCredentials",
+    "GcpCredentials",
     "OrganizationCredential",
     "OrganizationCredentialCreate",
 ]
+
+
+# --- Typed credential payloads per provider ---
+
+
+class AwsCredentials(BaseModel):
+    """AWS credential payload."""
+
+    provider: Literal["aws"] = "aws"
+    access_key_id: str = Field(description="AWS access key ID.")
+    secret_access_key: str = Field(description="AWS secret access key.")
+
+
+class CloudflareCredentials(BaseModel):
+    """Cloudflare credential payload."""
+
+    provider: Literal["cloudflare"] = "cloudflare"
+    api_token: str = Field(description="Cloudflare API token.")
+
+
+class FastlyCredentials(BaseModel):
+    """Fastly credential payload."""
+
+    provider: Literal["fastly"] = "fastly"
+    api_token: str = Field(description="Fastly API token.")
+
+
+class GcpCredentials(BaseModel):
+    """Google Cloud Platform credential payload."""
+
+    provider: Literal["gcp"] = "gcp"
+    service_account_json: str = Field(
+        description="GCP service account key JSON."
+    )
+
+
+CredentialPayload = Annotated[
+    Annotated[AwsCredentials, Tag("aws")]
+    | Annotated[CloudflareCredentials, Tag("cloudflare")]
+    | Annotated[FastlyCredentials, Tag("fastly")]
+    | Annotated[GcpCredentials, Tag("gcp")],
+    Discriminator("provider"),
+]
+"""Discriminated union of all credential payload types."""
+
+
+# --- API models ---
 
 
 class OrganizationCredentialCreate(BaseModel):
@@ -19,32 +73,21 @@ class OrganizationCredentialCreate(BaseModel):
     label: Annotated[
         str,
         Field(
-            min_length=1,
+            min_length=2,
             max_length=128,
             pattern=r"^[a-z0-9][a-z0-9._-]*[a-z0-9]$",
             description=(
                 "Human-readable label for the credential, unique per"
                 " organization."
             ),
-            examples=["primary-s3", "staging-r2"],
+            examples=["aws", "cloudflare", "fastly"],
         ),
     ]
 
-    service_type: Annotated[
-        str,
-        Field(
-            min_length=1,
-            max_length=32,
-            description="Object store service type.",
-            examples=["s3", "r2", "gcs"],
-        ),
-    ]
-
-    credential: dict[str, Any] = Field(
+    credentials: CredentialPayload = Field(
         description=(
-            "Service-specific credential payload. For S3-compatible"
-            " stores: ``endpoint_url``, ``bucket``, ``access_key_id``,"
-            " ``secret_access_key``, and optionally ``region``."
+            "Provider-specific credential payload. The ``provider``"
+            " field determines the schema."
         ),
     )
 
@@ -67,7 +110,9 @@ class OrganizationCredential(BaseModel):
         ),
     )
 
-    service_type: str = Field(description="Object store service type.")
+    provider: CredentialProvider = Field(
+        description="Cloud provider for this credential."
+    )
 
     date_created: datetime = Field(
         description="Timestamp when the credential was created."

@@ -31,6 +31,7 @@ ignore = [
     "D100",    # Missing docstring in public module.
     "D103",    # Missing docstring in public function.
     "PLR0913", # Too many arguments to function call.
+    "S105",    # Possible hardcoded password assigned to variable.
     "S106",    # Possible hardcoded password.
     "SLF001",  # Private member accessed.
 ]
@@ -38,7 +39,8 @@ ignore = [
     "D100",
     "D103",
     "PLR0913",
-    "S106",
+    "S105",    # Possible hardcoded password assigned to variable.
+    "S106",    # Possible hardcoded password.
     "SLF001",
 ]
 "noxfile.py" = [

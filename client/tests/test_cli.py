@@ -15,7 +15,7 @@ from docverse.client._cli import main
 from docverse.client.models.queue_enums import JobStatus
 
 BASE_URL = "https://docverse.example.com"
-TOKEN = "test-token"  # noqa: S105
+TOKEN = "test-token"
 ORG = "testorg"
 PROJECT = "testproj"
 

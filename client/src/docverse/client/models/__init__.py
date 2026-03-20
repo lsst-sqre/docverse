@@ -1,13 +1,26 @@
 """Pydantic models for the Docverse API."""
 
 from .builds import Build, BuildCreate, BuildStatus, BuildUpdate
-from .credentials import OrganizationCredential, OrganizationCredentialCreate
+from .credentials import (
+    AwsCredentials,
+    CloudflareCredentials,
+    CredentialPayload,
+    FastlyCredentials,
+    GcpCredentials,
+    OrganizationCredential,
+    OrganizationCredentialCreate,
+)
 from .editions import (
     Edition,
     EditionCreate,
     EditionKind,
     EditionUpdate,
     TrackingMode,
+)
+from .infrastructure import (
+    CredentialProvider,
+    ServiceCategory,
+    ServiceProvider,
 )
 from .memberships import (
     OrgMembership,
@@ -24,16 +37,28 @@ from .organizations import (
 from .projects import Project, ProjectCreate, ProjectUpdate
 from .queue import QueueJob
 from .queue_enums import JobKind, JobStatus
+from .services import (
+    OrganizationService,
+    OrganizationServiceCreate,
+    OrganizationServiceSummary,
+    ServiceConfig,
+)
 
 __all__ = [
+    "AwsCredentials",
     "Build",
     "BuildCreate",
     "BuildStatus",
     "BuildUpdate",
+    "CloudflareCredentials",
+    "CredentialPayload",
+    "CredentialProvider",
     "Edition",
     "EditionCreate",
     "EditionKind",
     "EditionUpdate",
+    "FastlyCredentials",
+    "GcpCredentials",
     "JobKind",
     "JobStatus",
     "OrgMembership",
@@ -43,12 +68,18 @@ __all__ = [
     "OrganizationCreate",
     "OrganizationCredential",
     "OrganizationCredentialCreate",
+    "OrganizationService",
+    "OrganizationServiceCreate",
+    "OrganizationServiceSummary",
     "OrganizationUpdate",
     "PrincipalType",
     "Project",
     "ProjectCreate",
     "ProjectUpdate",
     "QueueJob",
+    "ServiceCategory",
+    "ServiceConfig",
+    "ServiceProvider",
     "TrackingMode",
     "UrlScheme",
 ]

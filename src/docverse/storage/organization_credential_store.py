@@ -26,15 +26,15 @@ class OrganizationCredentialStore:
         *,
         organization_id: int,
         label: str,
-        service_type: str,
-        encrypted_credential: bytes,
+        provider: str,
+        encrypted_credentials: bytes,
     ) -> OrganizationCredential:
         """Insert a new credential row."""
         row = SqlOrganizationCredential(
             organization_id=organization_id,
             label=label,
-            service_type=service_type,
-            encrypted_credential=encrypted_credential,
+            provider=provider,
+            encrypted_credentials=encrypted_credentials,
         )
         self._session.add(row)
         await self._session.flush()
@@ -60,7 +60,7 @@ class OrganizationCredentialStore:
             return None
         return (
             OrganizationCredential.model_validate(row),
-            row.encrypted_credential,
+            row.encrypted_credentials,
         )
 
     async def list_by_org(

@@ -108,15 +108,14 @@ async def post_build(
             uploader=user.username,
         )
 
-        # Generate a presigned upload URL if the org has a credential
-        credential_label = (
-            user.org.staging_credential_label
-            or user.org.publishing_credential_label
+        # Generate a presigned upload URL if the org has a store
+        service_label = (
+            user.org.staging_store_label or user.org.publishing_store_label
         )
-        if credential_label is not None:
+        if service_label is not None:
             object_store = await context.factory.create_objectstore_for_org(
                 org_id=user.org.id,
-                credential_label=credential_label,
+                service_label=service_label,
             )
             async with object_store:
                 upload_url = await object_store.generate_presigned_upload_url(

@@ -35,6 +35,7 @@ async def post_organization(
             raise ConflictError(msg)
         org = await service.create(data)
         await context.session.commit()
+    # New org has no services yet, so no need to load them
     return Organization.from_domain(org, context.request)
 
 
@@ -50,7 +51,14 @@ async def get_organizations(
     async with context.session.begin():
         service = context.factory.create_organization_service()
         orgs = await service.list_all()
-    return [Organization.from_domain(o, context.request) for o in orgs]
+        service_store = context.factory.create_service_store()
+        results: list[Organization] = []
+        for o in orgs:
+            services = await service_store.list_by_org(o.id)
+            results.append(
+                Organization.from_domain(o, context.request, services=services)
+            )
+    return results
 
 
 @router.get(
@@ -69,7 +77,9 @@ async def get_organization(
         if org is None:
             msg = f"Organization {org_slug!r} not found"
             raise NotFoundError(msg)
-    return Organization.from_domain(org, context.request)
+        service_store = context.factory.create_service_store()
+        services = await service_store.list_by_org(org.id)
+    return Organization.from_domain(org, context.request, services=services)
 
 
 @router.patch(
@@ -89,8 +99,10 @@ async def patch_organization(
         if org is None:
             msg = f"Organization {org_slug!r} not found"
             raise NotFoundError(msg)
+        service_store = context.factory.create_service_store()
+        services = await service_store.list_by_org(org.id)
         await context.session.commit()
-    return Organization.from_domain(org, context.request)
+    return Organization.from_domain(org, context.request, services=services)
 
 
 @router.delete(

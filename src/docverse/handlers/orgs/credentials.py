@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 
 from docverse.client.models import OrganizationCredentialCreate
+from docverse.client.models.infrastructure import CredentialProvider
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import CredentialLabelParam, OrgSlugParam
@@ -56,8 +57,8 @@ async def post_credential(
         credential = await service.create(
             org_slug=org_slug,
             label=data.label,
-            service_type=data.service_type,
-            credential=data.credential,
+            provider=CredentialProvider(data.credentials.provider),
+            credentials=data.credentials.model_dump(exclude={"provider"}),
         )
         await context.session.commit()
     return OrganizationCredentialResponse.from_domain(

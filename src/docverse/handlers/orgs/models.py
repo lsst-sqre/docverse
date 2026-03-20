@@ -12,6 +12,10 @@ from docverse.client.models import Organization as _OrganizationBase
 from docverse.client.models import (
     OrganizationCredential as _OrganizationCredentialBase,
 )
+from docverse.client.models import (
+    OrganizationService as _OrganizationServiceBase,
+)
+from docverse.client.models import OrganizationServiceSummary
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
 from docverse.domain.base32id import serialize_base32_id
@@ -22,20 +26,68 @@ from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.domain.organization_credential import (
     OrganizationCredential as OrganizationCredentialDomain,
 )
+from docverse.domain.organization_service import (
+    OrganizationService as OrganizationServiceDomain,
+)
 from docverse.domain.project import Project as ProjectDomain
 
 
 class Organization(_OrganizationBase):
     """Organization response model with HATEOAS URLs."""
 
+    services_url: str
+    credentials_url: str
     projects_url: str
     members_url: str
 
     @classmethod
-    def from_domain(cls, domain: OrganizationDomain, request: Request) -> Self:
-        """Create from a domain object, adding HATEOAS URLs."""
+    def from_domain(
+        cls,
+        domain: OrganizationDomain,
+        request: Request,
+        *,
+        services: list[OrganizationServiceDomain] | None = None,
+    ) -> Self:
+        """Create from a domain object, adding HATEOAS URLs.
+
+        Parameters
+        ----------
+        domain
+            The organization domain model.
+        request
+            The current request (for URL generation).
+        services
+            All services for this org, used to build embedded
+            service summaries for the slot assignments.
+        """
+        # Build a lookup of services by label
+        svc_by_label: dict[str, OrganizationServiceDomain] = {}
+        if services:
+            svc_by_label = {s.label: s for s in services}
+
+        def _make_summary(
+            label: str | None,
+        ) -> OrganizationServiceSummary | None:
+            if label is None or label not in svc_by_label:
+                return None
+            svc = svc_by_label[label]
+            return OrganizationServiceSummary(
+                self_url=str(
+                    request.url_for(
+                        "get_service", org=domain.slug, service=svc.label
+                    )
+                ),
+                label=svc.label,
+                category=svc.category,
+                provider=svc.provider,
+            )
+
         return cls(
             self_url=str(request.url_for("get_organization", org=domain.slug)),
+            services_url=str(request.url_for("get_services", org=domain.slug)),
+            credentials_url=str(
+                request.url_for("get_credentials", org=domain.slug)
+            ),
             projects_url=str(request.url_for("get_projects", org=domain.slug)),
             members_url=str(request.url_for("get_members", org=domain.slug)),
             slug=domain.slug,
@@ -48,8 +100,10 @@ class Organization(_OrganizationBase):
             purgatory_retention=int(
                 domain.purgatory_retention.total_seconds()
             ),
-            publishing_credential_label=domain.publishing_credential_label,
-            staging_credential_label=domain.staging_credential_label,
+            publishing_store=_make_summary(domain.publishing_store_label),
+            staging_store=_make_summary(domain.staging_store_label),
+            cdn_service=_make_summary(domain.cdn_service_label),
+            dns_service=_make_summary(domain.dns_service_label),
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )
@@ -251,7 +305,44 @@ class OrganizationCredentialResponse(_OrganizationCredentialBase):
             ),
             org_url=str(request.url_for("get_organization", org=org_slug)),
             label=domain.label,
-            service_type=domain.service_type,
+            provider=domain.provider,
+            date_created=domain.date_created,
+            date_updated=domain.date_updated,
+        )
+
+
+class OrganizationServiceResponse(_OrganizationServiceBase):
+    """Organization service response model with HATEOAS URLs."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        domain: OrganizationServiceDomain,
+        request: Request,
+        org_slug: str,
+    ) -> Self:
+        """Create from a domain object, adding HATEOAS URLs."""
+        return cls(
+            self_url=str(
+                request.url_for(
+                    "get_service",
+                    org=org_slug,
+                    service=domain.label,
+                )
+            ),
+            org_url=str(request.url_for("get_organization", org=org_slug)),
+            credential_url=str(
+                request.url_for(
+                    "get_credential",
+                    org=org_slug,
+                    credential=domain.credential_label,
+                )
+            ),
+            label=domain.label,
+            category=domain.category,
+            provider=domain.provider,
+            config=domain.config,
+            credential_label=domain.credential_label,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )

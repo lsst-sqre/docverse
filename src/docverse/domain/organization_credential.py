@@ -6,6 +6,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from docverse.client.models import CredentialProvider
+
 
 class OrganizationCredential(BaseModel):
     """Domain representation of an organization credential.
@@ -23,8 +25,8 @@ class OrganizationCredential(BaseModel):
         description="Human-readable label, unique per organization."
     )
 
-    service_type: str = Field(
-        description="Object store service type (e.g. s3, r2, gcs)."
+    provider: CredentialProvider = Field(
+        description="Cloud provider (e.g. aws, cloudflare, fastly, gcp)."
     )
 
     date_created: datetime = Field(

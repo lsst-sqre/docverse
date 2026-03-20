@@ -23,7 +23,8 @@ class S3ObjectStore:
     Parameters
     ----------
     endpoint_url
-        S3-compatible endpoint URL.
+        S3-compatible endpoint URL, or ``None`` to use the default
+        AWS endpoint.
     bucket
         Bucket name.
     access_key_id
@@ -37,7 +38,7 @@ class S3ObjectStore:
     def __init__(
         self,
         *,
-        endpoint_url: str,
+        endpoint_url: str | None,
         bucket: str,
         access_key_id: str,
         secret_access_key: str,
@@ -70,7 +71,7 @@ class S3ObjectStore:
         """Create the underlying S3 client."""
         self._client_cm = self._session.create_client(
             "s3",
-            endpoint_url=self._endpoint_url,
+            endpoint_url=self._endpoint_url or None,
             aws_access_key_id=self._access_key_id,
             aws_secret_access_key=self._secret_access_key,
             region_name=self._region or None,

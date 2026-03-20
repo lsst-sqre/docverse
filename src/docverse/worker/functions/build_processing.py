@@ -78,16 +78,16 @@ async def build_processing(
                 msg = f"Organization {org_id} not found"
                 raise NotFoundError(msg)
 
-            credential_label = (
-                org.staging_credential_label or org.publishing_credential_label
+            service_label = (
+                org.staging_store_label or org.publishing_store_label
             )
-            if credential_label is None:
-                msg = f"No object store credential configured for org {org_id}"
+            if service_label is None:
+                msg = f"No object store service configured for org {org_id}"
                 raise RuntimeError(msg)
 
             try:
                 object_store = await factory.create_objectstore_for_org(
-                    org_id=org_id, credential_label=credential_label
+                    org_id=org_id, service_label=service_label
                 )
                 async with object_store:
                     await _process_build(

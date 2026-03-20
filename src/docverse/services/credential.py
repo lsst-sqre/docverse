@@ -7,11 +7,15 @@ from typing import Any
 
 import structlog
 
+from docverse.client.models import CredentialProvider
 from docverse.domain.organization_credential import OrganizationCredential
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.organization_credential_store import (
     OrganizationCredentialStore,
+)
+from docverse.storage.organization_service_store import (
+    OrganizationServiceStore,
 )
 from docverse.storage.organization_store import OrganizationStore
 
@@ -27,11 +31,13 @@ class CredentialService:
         self,
         store: OrganizationCredentialStore,
         org_store: OrganizationStore,
+        service_store: OrganizationServiceStore,
         encryptor: CredentialEncryptor,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._store = store
         self._org_store = org_store
+        self._service_store = service_store
         self._encryptor = encryptor
         self._logger = logger
 
@@ -47,8 +53,8 @@ class CredentialService:
         *,
         org_slug: str,
         label: str,
-        service_type: str,
-        credential: dict[str, Any],
+        provider: CredentialProvider,
+        credentials: dict[str, Any],
     ) -> OrganizationCredential:
         """Create a new credential, encrypting the payload."""
         org_id = await self._resolve_org_id(org_slug)
@@ -64,20 +70,20 @@ class CredentialService:
             )
             raise ConflictError(msg)
 
-        plaintext = json.dumps(credential).encode()
+        plaintext = json.dumps(credentials).encode()
         encrypted = self._encryptor.encrypt(plaintext)
 
         cred = await self._store.create(
             organization_id=org_id,
             label=label,
-            service_type=service_type,
-            encrypted_credential=encrypted,
+            provider=provider,
+            encrypted_credentials=encrypted,
         )
         self._logger.info(
             "Created organization credential",
             org_slug=org_slug,
             label=label,
-            service_type=service_type,
+            provider=provider,
         )
         return cred
 
@@ -89,8 +95,27 @@ class CredentialService:
         return await self._store.list_by_org(org_id)
 
     async def delete(self, *, org_slug: str, label: str) -> None:
-        """Delete a credential."""
+        """Delete a credential.
+
+        Raises
+        ------
+        NotFoundError
+            If the credential does not exist.
+        ConflictError
+            If the credential is referenced by a service.
+        """
         org_id = await self._resolve_org_id(org_slug)
+
+        # Check if any service references this credential
+        services = await self._service_store.list_by_org(org_id)
+        for svc in services:
+            if svc.credential_label == label:
+                msg = (
+                    f"Cannot delete credential {label!r}: it is"
+                    f" referenced by service {svc.label!r}"
+                )
+                raise ConflictError(msg)
+
         deleted = await self._store.delete(organization_id=org_id, label=label)
         if not deleted:
             msg = (
