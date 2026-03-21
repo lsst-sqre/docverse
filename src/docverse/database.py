@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 from safir.database import create_database_engine, initialize_database
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.stdlib import BoundLogger
 
@@ -90,6 +91,9 @@ async def init_database(
             config.database_url, config.database_password
         )
         engine_created = True
+    # Ensure required PostgreSQL extensions exist before creating tables
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
     await initialize_database(
         engine, logger, schema=Base.metadata, reset=reset
     )

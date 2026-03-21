@@ -13,6 +13,7 @@ from safir.database import (
     stamp_database_async,
 )
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
@@ -34,6 +35,8 @@ async def app() -> AsyncGenerator[FastAPI]:
     engine = create_database_engine(
         config.database_url, config.database_password
     )
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
     await initialize_database(engine, logger, schema=Base.metadata, reset=True)
     await stamp_database_async(engine)
     await engine.dispose()
