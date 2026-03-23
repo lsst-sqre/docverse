@@ -34,6 +34,15 @@ async def post_organization(
             msg = f"Organization with slug {data.slug!r} already exists"
             raise ConflictError(msg)
         org = await service.create(data)
+        if data.members:
+            membership_store = context.factory.create_membership_store()
+            seen: set[tuple[str, str]] = set()
+            for member in data.members:
+                key = (member.principal_type, member.principal)
+                if key in seen:
+                    continue
+                seen.add(key)
+                await membership_store.create(org_id=org.id, data=member)
         await context.session.commit()
     # New org has no services yet, so no need to load them
     return Organization.from_domain(org, context.request)

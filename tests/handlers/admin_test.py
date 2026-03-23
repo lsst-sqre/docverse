@@ -173,3 +173,96 @@ async def test_delete_organization_not_found(
 ) -> None:
     response = await client.delete("/docverse/admin/orgs/nonexistent")
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_organization_with_members(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": "mem-org",
+            "title": "Members Org",
+            "base_domain": "mem.example.com",
+            "members": [
+                {
+                    "principal": "alice",
+                    "principal_type": "user",
+                    "role": "admin",
+                },
+                {
+                    "principal": "bob",
+                    "principal_type": "user",
+                    "role": "reader",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    # Verify memberships exist by listing them as alice (admin)
+    response = await client.get(
+        "/docverse/orgs/mem-org/members",
+        headers={"X-Auth-Request-User": "alice"},
+    )
+    assert response.status_code == 200
+    members = response.json()
+    principals = {m["principal"] for m in members}
+    assert "alice" in principals
+    assert "bob" in principals
+
+
+@pytest.mark.asyncio
+async def test_create_organization_without_members(
+    client: AsyncClient,
+) -> None:
+    """Creating an org without members is backward compatible."""
+    response = await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": "no-mem-org",
+            "title": "No Members Org",
+            "base_domain": "nomem.example.com",
+        },
+    )
+    assert response.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_create_organization_with_duplicate_members(
+    client: AsyncClient,
+) -> None:
+    """Duplicate members are silently deduplicated (first wins)."""
+    response = await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": "dup-mem-org",
+            "title": "Dup Members Org",
+            "base_domain": "dupmem.example.com",
+            "members": [
+                {
+                    "principal": "alice",
+                    "principal_type": "user",
+                    "role": "admin",
+                },
+                {
+                    "principal": "alice",
+                    "principal_type": "user",
+                    "role": "reader",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    # Verify only one membership for alice (first one, admin)
+    response = await client.get(
+        "/docverse/orgs/dup-mem-org/members",
+        headers={"X-Auth-Request-User": "alice"},
+    )
+    assert response.status_code == 200
+    members = response.json()
+    alice_members = [m for m in members if m["principal"] == "alice"]
+    assert len(alice_members) == 1
+    assert alice_members[0]["role"] == "admin"

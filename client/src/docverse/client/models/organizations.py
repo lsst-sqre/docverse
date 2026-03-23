@@ -8,6 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .memberships import OrgMembershipCreate
 from .services import OrganizationServiceSummary
 
 
@@ -102,6 +103,11 @@ class OrganizationCreate(BaseModel):
     dns_service_label: str | None = Field(
         default=None,
         description="Label of the dns service.",
+    )
+
+    members: list[OrgMembershipCreate] = Field(
+        default_factory=list,
+        description="Initial members to add to the organization.",
     )
 
 

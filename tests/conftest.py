@@ -23,6 +23,11 @@ from docverse.main import app as docverse_app
 from docverse.storage.membership_store import OrgMembershipStore
 from docverse.storage.organization_store import OrganizationStore
 
+__all__ = [
+    "seed_member",
+    "seed_org_with_admin",
+]
+
 
 @pytest_asyncio.fixture
 async def app() -> AsyncGenerator[FastAPI]:
@@ -73,39 +78,23 @@ async def seed_org_with_admin(
     org_slug: str,
     admin_username: str,
 ) -> None:
-    """Create an org via admin API and seed an admin membership via DB.
-
-    This solves the bootstrap problem: the membership API requires
-    an existing admin, but we need to create the first admin.
-    """
-    # Create the org via the admin API (no auth required)
-    await client.post(
+    """Create an org via admin API with an initial admin member."""
+    response = await client.post(
         "/docverse/admin/orgs",
         json={
             "slug": org_slug,
             "title": f"Test Org {org_slug}",
             "base_domain": f"{org_slug}.example.com",
+            "members": [
+                {
+                    "principal": admin_username,
+                    "principal_type": "user",
+                    "role": "admin",
+                }
+            ],
         },
     )
-    # Seed the admin membership directly via DB
-    logger = structlog.get_logger("docverse")
-    async for session in db_session_dependency():
-        async with session.begin():
-            org_store = OrganizationStore(session=session, logger=logger)
-            org = await org_store.get_by_slug(org_slug)
-            assert org is not None
-            membership_store = OrgMembershipStore(
-                session=session, logger=logger
-            )
-            await membership_store.create(
-                org_id=org.id,
-                data=OrgMembershipCreate(
-                    principal=admin_username,
-                    principal_type=PrincipalType.user,
-                    role=OrgRole.admin,
-                ),
-            )
-            await session.commit()
+    assert response.status_code == 201
 
 
 async def seed_member(
