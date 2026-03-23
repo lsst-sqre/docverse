@@ -19,9 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
 from docverse.config import config
 from docverse.dbschema import Base
+from docverse.dependencies.context import context_dependency
 from docverse.main import app as docverse_app
 from docverse.storage.membership_store import OrgMembershipStore
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.user_info_store import StubUserInfoStore
 
 __all__ = [
     "seed_member",
@@ -47,6 +49,7 @@ async def app() -> AsyncGenerator[FastAPI]:
     await engine.dispose()
 
     async with LifespanManager(docverse_app):
+        context_dependency._user_info_store = StubUserInfoStore()
         yield docverse_app
 
 

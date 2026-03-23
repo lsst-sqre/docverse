@@ -8,9 +8,11 @@ from importlib.metadata import metadata, version
 
 import structlog
 from fastapi import FastAPI
+from rubin.gafaelfawr import GafaelfawrClient
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
+from safir.dependencies.http_client import http_client_dependency
 from safir.fastapi import ClientRequestError, client_request_error_handler
 from safir.logging import configure_logging, configure_uvicorn_logging
 from safir.middleware.x_forwarded import XForwardedMiddleware
@@ -24,6 +26,7 @@ from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
 from .services.credential_encryptor import CredentialEncryptor
+from .storage.user_info_store import GafaelfawrUserInfoStore
 
 __all__ = ["app"]
 
@@ -74,12 +77,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         current_key=config.credential_encryption_key.get_secret_value(),
         retired_key=retired_key,
     )
+
+    http_client = await http_client_dependency()
+    gafaelfawr_client = GafaelfawrClient(http_client)
+    user_info_store = GafaelfawrUserInfoStore(gafaelfawr_client)
+
     await context_dependency.initialize(
         credential_encryptor=encryptor,
         superadmin_usernames=config.superadmin_usernames,
+        user_info_store=user_info_store,
     )
     yield
     await context_dependency.aclose()
+    await http_client_dependency.aclose()
     await db_session_dependency.aclose()
 
 
