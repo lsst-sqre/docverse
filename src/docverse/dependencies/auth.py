@@ -71,10 +71,11 @@ class OrgRoleDependency:
                 msg = f"Organization {org_slug!r} not found"
                 raise NotFoundError(msg)
 
-            # Get user's groups
+            # Get user's groups and scopes
             token = request.headers.get("X-Auth-Request-Token", "")
             user_info_store = context.factory.get_user_info_store()
             groups = await user_info_store.get_groups(token)
+            scopes = await user_info_store.get_scopes(token)
 
             # Check authorization
             auth_service = context.factory.create_authorization_service()
@@ -82,6 +83,7 @@ class OrgRoleDependency:
                 org_id=org.id,
                 username=username,
                 groups=groups,
+                scopes=scopes,
                 minimum_role=self._min_role,
             )
 

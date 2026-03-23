@@ -102,3 +102,51 @@ async def test_require_role_no_membership(
                 minimum_role=OrgRole.reader,
             )
         await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_superadmin_scope_grants_admin(
+    db_session: async_scoped_session[AsyncSession],
+) -> None:
+    """Super admin scope grants admin without membership."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, store = await _setup(db_session)
+        service = AuthorizationService(membership_store=store, logger=logger)
+        role = await service.require_role(
+            org_id=org_id,
+            username="superadmin",
+            groups=[],
+            scopes=["admin:docverse"],
+            minimum_role=OrgRole.admin,
+        )
+        await db_session.commit()
+    assert role == OrgRole.admin
+
+
+@pytest.mark.asyncio
+async def test_superadmin_scope_overrides_lower_role(
+    db_session: async_scoped_session[AsyncSession],
+) -> None:
+    """Super admin scope overrides an existing lower role."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, store = await _setup(db_session)
+        await store.create(
+            org_id=org_id,
+            data=OrgMembershipCreate(
+                principal="sa-reader",
+                principal_type=PrincipalType.user,
+                role=OrgRole.reader,
+            ),
+        )
+        service = AuthorizationService(membership_store=store, logger=logger)
+        role = await service.require_role(
+            org_id=org_id,
+            username="sa-reader",
+            groups=[],
+            scopes=["admin:docverse"],
+            minimum_role=OrgRole.admin,
+        )
+        await db_session.commit()
+    assert role == OrgRole.admin
