@@ -74,7 +74,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         current_key=config.credential_encryption_key.get_secret_value(),
         retired_key=retired_key,
     )
-    await context_dependency.initialize(credential_encryptor=encryptor)
+    await context_dependency.initialize(
+        credential_encryptor=encryptor,
+        superadmin_usernames=config.superadmin_usernames,
+    )
     yield
     await context_dependency.aclose()
     await db_session_dependency.aclose()

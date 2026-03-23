@@ -41,10 +41,12 @@ class Factory(ABC):
         session: async_scoped_session[AsyncSession],
         logger: structlog.stdlib.BoundLogger,
         credential_encryptor: CredentialEncryptor | None = None,
+        superadmin_usernames: list[str] | None = None,
     ) -> None:
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
+        self._superadmin_usernames = superadmin_usernames or []
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
@@ -112,7 +114,9 @@ class Factory(ABC):
             session=self._session, logger=self._logger
         )
         return AuthorizationService(
-            membership_store=membership_store, logger=self._logger
+            membership_store=membership_store,
+            logger=self._logger,
+            superadmin_usernames=self._superadmin_usernames,
         )
 
     def create_membership_store(self) -> OrgMembershipStore:
@@ -211,18 +215,20 @@ class Factory(ABC):
 class HandlerFactory(Factory):
     """Factory for request handlers with arq queue and user info."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         session: async_scoped_session[AsyncSession],
         logger: structlog.stdlib.BoundLogger,
         arq_queue: ArqQueue,
         user_info_store: UserInfoStore,
         credential_encryptor: CredentialEncryptor | None = None,
+        superadmin_usernames: list[str] | None = None,
     ) -> None:
         super().__init__(
             session=session,
             logger=logger,
             credential_encryptor=credential_encryptor,
+            superadmin_usernames=superadmin_usernames,
         )
         self._arq_queue = arq_queue
         self._user_info_store = user_info_store

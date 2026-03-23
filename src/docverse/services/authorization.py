@@ -5,7 +5,6 @@ from __future__ import annotations
 import structlog
 
 from docverse.client.models import OrgRole
-from docverse.constants import SUPERADMIN_SCOPE
 from docverse.domain.membership import ROLE_RANK
 from docverse.exceptions import PermissionDeniedError
 from docverse.storage.membership_store import OrgMembershipStore
@@ -18,9 +17,11 @@ class AuthorizationService:
         self,
         membership_store: OrgMembershipStore,
         logger: structlog.stdlib.BoundLogger,
+        superadmin_usernames: list[str] | None = None,
     ) -> None:
         self._membership_store = membership_store
         self._logger = logger
+        self._superadmin_usernames = superadmin_usernames or []
 
     async def resolve_role(
         self,
@@ -28,16 +29,20 @@ class AuthorizationService:
         org_id: int,
         username: str,
         groups: list[str],
-        scopes: list[str] | None = None,
     ) -> OrgRole | None:
         """Resolve the effective role for a user in an organization."""
-        if scopes and SUPERADMIN_SCOPE in scopes:
-            self._logger.info(
-                "Super admin access granted",
+        if username in self._superadmin_usernames:
+            self._logger.debug(
+                "Super admin access granted via config",
                 username=username,
                 org_id=org_id,
             )
             return OrgRole.admin
+        self._logger.debug(
+            "User is not a super admin",
+            username=username,
+            org_id=org_id,
+        )
         return await self._membership_store.resolve_role(
             org_id=org_id, username=username, groups=groups
         )
@@ -48,7 +53,6 @@ class AuthorizationService:
         org_id: int,
         username: str,
         groups: list[str],
-        scopes: list[str] | None = None,
         minimum_role: OrgRole,
     ) -> OrgRole:
         """Require at least the given role, raising on failure.
@@ -64,7 +68,7 @@ class AuthorizationService:
             If the user does not have the required role.
         """
         role = await self.resolve_role(
-            org_id=org_id, username=username, groups=groups, scopes=scopes
+            org_id=org_id, username=username, groups=groups
         )
         if role is None or ROLE_RANK[role] < ROLE_RANK[minimum_role]:
             self._logger.warning(

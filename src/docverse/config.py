@@ -105,6 +105,15 @@ class Configuration(BaseSettings):
         title="Name of the arq queue",
     )
 
+    superadmin_usernames: list[str] = Field(
+        default_factory=list,
+        title="Usernames with super admin access",
+        description=(
+            "Users in this list have de facto admin access to all"
+            " organizations. Comma-separated when set via env var."
+        ),
+    )
+
     @property
     def arq_redis_settings(self) -> RedisSettings | None:
         """Build Redis settings for arq from config fields."""

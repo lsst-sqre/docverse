@@ -105,19 +105,22 @@ async def test_require_role_no_membership(
 
 
 @pytest.mark.asyncio
-async def test_superadmin_scope_grants_admin(
+async def test_superadmin_username_grants_admin(
     db_session: async_scoped_session[AsyncSession],
 ) -> None:
-    """Super admin scope grants admin without membership."""
+    """Super admin username grants admin without membership."""
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
         org_id, store = await _setup(db_session)
-        service = AuthorizationService(membership_store=store, logger=logger)
+        service = AuthorizationService(
+            membership_store=store,
+            logger=logger,
+            superadmin_usernames=["superadmin"],
+        )
         role = await service.require_role(
             org_id=org_id,
             username="superadmin",
             groups=[],
-            scopes=["admin:docverse"],
             minimum_role=OrgRole.admin,
         )
         await db_session.commit()
@@ -125,10 +128,10 @@ async def test_superadmin_scope_grants_admin(
 
 
 @pytest.mark.asyncio
-async def test_superadmin_scope_overrides_lower_role(
+async def test_superadmin_username_overrides_lower_role(
     db_session: async_scoped_session[AsyncSession],
 ) -> None:
-    """Super admin scope overrides an existing lower role."""
+    """Super admin username overrides an existing lower role."""
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
         org_id, store = await _setup(db_session)
@@ -140,12 +143,15 @@ async def test_superadmin_scope_overrides_lower_role(
                 role=OrgRole.reader,
             ),
         )
-        service = AuthorizationService(membership_store=store, logger=logger)
+        service = AuthorizationService(
+            membership_store=store,
+            logger=logger,
+            superadmin_usernames=["sa-reader"],
+        )
         role = await service.require_role(
             org_id=org_id,
             username="sa-reader",
             groups=[],
-            scopes=["admin:docverse"],
             minimum_role=OrgRole.admin,
         )
         await db_session.commit()

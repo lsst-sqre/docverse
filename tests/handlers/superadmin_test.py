@@ -1,4 +1,4 @@
-"""Tests for super admin (admin:docverse scope) access to org endpoints."""
+"""Tests for super admin (config-based username) access to org endpoints."""
 
 from __future__ import annotations
 
@@ -7,16 +7,13 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 
 from docverse.dependencies.context import context_dependency
-from docverse.storage.user_info_store import StubUserInfoStore
 from tests.conftest import seed_org_with_admin
 
 
 @pytest.fixture(autouse=True)
-def _enable_superadmin_scope(app: FastAPI) -> None:  # noqa: ARG001
-    """Configure the stub user info store with the super admin scope."""
-    context_dependency._user_info_store = StubUserInfoStore(
-        scopes=["admin:docverse"]
-    )
+def _enable_superadmin_username(app: FastAPI) -> None:  # noqa: ARG001
+    """Configure the context dependency with a super admin username."""
+    context_dependency._superadmin_usernames = ["superadmin"]
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,7 @@ __all__ = [
 
 @runtime_checkable
 class UserInfoStore(Protocol):
-    """Protocol for resolving user group memberships and token scopes.
+    """Protocol for resolving user group memberships.
 
     The production implementation will use the Gafaelfawr client
     (https://gafaelfawr.lsst.io/user-guide/client.html).
@@ -33,21 +33,6 @@ class UserInfoStore(Protocol):
         """
         ...
 
-    async def get_scopes(self, token: str) -> list[str]:
-        """Get the scopes associated with a token.
-
-        Parameters
-        ----------
-        token
-            Authentication token for the user.
-
-        Returns
-        -------
-        list of str
-            Scope names associated with the token.
-        """
-        ...
-
 
 class StubUserInfoStore:
     """Stub implementation for development and testing."""
@@ -55,15 +40,9 @@ class StubUserInfoStore:
     def __init__(
         self,
         groups: list[str] | None = None,
-        scopes: list[str] | None = None,
     ) -> None:
         self._groups = groups or []
-        self._scopes = scopes or []
 
     async def get_groups(self, token: str) -> list[str]:  # noqa: ARG002
         """Return pre-configured groups."""
         return self._groups
-
-    async def get_scopes(self, token: str) -> list[str]:  # noqa: ARG002
-        """Return pre-configured scopes."""
-        return self._scopes
