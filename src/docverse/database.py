@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+from alembic.runtime.migration import MigrationContext
 from safir.database import create_database_engine, initialize_database
+from sqlalchemy import Connection, text
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.stdlib import BoundLogger
 
@@ -16,6 +17,7 @@ from .dbschema import Base
 __all__ = [
     "DatabaseState",
     "check_database_state",
+    "get_current_revision",
     "init_database",
 ]
 
@@ -28,6 +30,32 @@ class DatabaseState(NamedTuple):
 
     has_alembic_version: bool
     """Whether the database has an ``alembic_version`` table."""
+
+
+async def get_current_revision(engine: AsyncEngine) -> str | None:
+    """Get the current Alembic revision from the database.
+
+    Parameters
+    ----------
+    engine
+        Database engine.
+
+    Returns
+    -------
+    str or None
+        The current revision string, or `None` if no revision is stamped.
+    """
+
+    def _get_heads(connection: Connection) -> set[str]:
+        context = MigrationContext.configure(connection)
+        return set(context.get_current_heads())
+
+    async with engine.begin() as connection:
+        heads = await connection.run_sync(_get_heads)
+
+    if not heads:
+        return None
+    return ",".join(sorted(heads))
 
 
 async def check_database_state(config: Configuration) -> DatabaseState:

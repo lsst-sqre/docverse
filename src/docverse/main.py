@@ -17,6 +17,7 @@ from safir.middleware.x_forwarded import XForwardedMiddleware
 from safir.slack.webhook import SlackRouteErrorHandler
 
 from .config import config
+from .database import get_current_revision
 from .dependencies.context import context_dependency
 from .handlers.admin import admin_router
 from .handlers.internal import internal_router
@@ -47,7 +48,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
     ):
         msg = "Database schema is not current."
         raise RuntimeError(msg)
+    db_revision = await get_current_revision(engine)
     await engine.dispose()
+    logger.info(
+        "Docverse startup",
+        app_version=version("docverse"),
+        db_revision=db_revision,
+    )
 
     await db_session_dependency.initialize(
         config.database_url,

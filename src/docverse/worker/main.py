@@ -5,6 +5,7 @@ Launch with: ``arq docverse.worker.main.WorkerSettings``
 
 from __future__ import annotations
 
+from importlib.metadata import version
 from typing import Any
 
 import structlog
@@ -13,6 +14,7 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.logging import configure_logging
 
 from docverse.config import Configuration
+from docverse.database import get_current_revision
 from docverse.services.credential_encryptor import CredentialEncryptor
 
 from .functions import build_processing, ping
@@ -37,7 +39,13 @@ async def startup(ctx: dict[str, Any]) -> None:
     ):
         msg = "Database schema is not current."
         raise RuntimeError(msg)
+    db_revision = await get_current_revision(engine)
     await engine.dispose()
+    logger.info(
+        "Docverse worker startup",
+        app_version=version("docverse"),
+        db_revision=db_revision,
+    )
 
     await db_session_dependency.initialize(
         config.database_url,
