@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated, Any
 
 from arq.connections import RedisSettings
-from pydantic import Field, HttpUrl, SecretStr
+from pydantic import BeforeValidator, Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from safir.arq import ArqMode, build_arq_redis_settings
 from safir.logging import LogLevel, Profile
 from safir.pydantic import EnvRedisDsn
 
 __all__ = ["Configuration", "config"]
+
+
+def _parse_comma_separated(v: Any) -> Any:
+    """Parse a comma-separated string into a list of strings."""
+    if isinstance(v, str):
+        return [item.strip() for item in v.split(",") if item.strip()]
+    return v
 
 
 class Configuration(BaseSettings):
@@ -105,7 +113,9 @@ class Configuration(BaseSettings):
         title="Name of the arq queue",
     )
 
-    superadmin_usernames: list[str] = Field(
+    superadmin_usernames: Annotated[
+        list[str], BeforeValidator(_parse_comma_separated)
+    ] = Field(
         default_factory=list,
         title="Usernames with super admin access",
         description=(
