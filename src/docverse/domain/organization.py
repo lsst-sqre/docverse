@@ -67,6 +67,11 @@ class Organization(BaseModel):
         ),
     )
 
+    @property
+    def resolved_staging_store_label(self) -> str | None:
+        """Staging store label, falling back to the publishing store."""
+        return self.staging_store_label or self.publishing_store_label
+
     date_created: datetime = Field(
         description="Timestamp when the organization was created."
     )

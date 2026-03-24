@@ -109,9 +109,7 @@ async def post_build(
         )
 
         # Generate a presigned upload URL if the org has a store
-        service_label = (
-            user.org.staging_store_label or user.org.publishing_store_label
-        )
+        service_label = user.org.resolved_staging_store_label
         if service_label is not None:
             object_store = await context.factory.create_objectstore_for_org(
                 org_id=user.org.id,

@@ -78,9 +78,7 @@ async def build_processing(
                 msg = f"Organization {org_id} not found"
                 raise NotFoundError(msg)
 
-            service_label = (
-                org.staging_store_label or org.publishing_store_label
-            )
+            service_label = org.resolved_staging_store_label
             if service_label is None:
                 msg = f"No object store service configured for org {org_id}"
                 raise RuntimeError(msg)
