@@ -12,6 +12,7 @@ from docverse.client.models import (
     OrgRole,
     PrincipalType,
 )
+from docverse.domain.authorization import AuthBasis
 from docverse.exceptions import PermissionDeniedError
 from docverse.services.authorization import AuthorizationService
 from docverse.storage.membership_store import OrgMembershipStore
@@ -50,14 +51,15 @@ async def test_require_role_sufficient(
             ),
         )
         service = AuthorizationService(membership_store=store, logger=logger)
-        role = await service.require_role(
+        result = await service.require_role(
             org_id=org_id,
             username="alice",
             groups=[],
             minimum_role=OrgRole.reader,
         )
         await db_session.commit()
-    assert role == OrgRole.admin
+    assert result.role == OrgRole.admin
+    assert result.basis == AuthBasis.user_membership
 
 
 @pytest.mark.asyncio
@@ -117,14 +119,15 @@ async def test_superadmin_username_grants_admin(
             logger=logger,
             superadmin_usernames=["superadmin"],
         )
-        role = await service.require_role(
+        result = await service.require_role(
             org_id=org_id,
             username="superadmin",
             groups=[],
             minimum_role=OrgRole.admin,
         )
         await db_session.commit()
-    assert role == OrgRole.admin
+    assert result.role == OrgRole.admin
+    assert result.basis == AuthBasis.super_admin
 
 
 @pytest.mark.asyncio
@@ -148,11 +151,12 @@ async def test_superadmin_username_overrides_lower_role(
             logger=logger,
             superadmin_usernames=["sa-reader"],
         )
-        role = await service.require_role(
+        result = await service.require_role(
             org_id=org_id,
             username="sa-reader",
             groups=[],
             minimum_role=OrgRole.admin,
         )
         await db_session.commit()
-    assert role == OrgRole.admin
+    assert result.role == OrgRole.admin
+    assert result.basis == AuthBasis.super_admin

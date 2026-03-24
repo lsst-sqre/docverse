@@ -1,7 +1,11 @@
 """Test fixtures for docverse tests."""
 
-from collections.abc import AsyncGenerator
+from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from typing import Any
+
+import pytest
 import pytest_asyncio
 import structlog
 from asgi_lifespan import LifespanManager
@@ -19,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
 from docverse.config import config
 from docverse.dbschema import Base
-from docverse.dependencies.context import context_dependency
+from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.main import app as docverse_app
 from docverse.storage.membership_store import OrgMembershipStore
 from docverse.storage.organization_store import OrganizationStore
@@ -151,3 +155,17 @@ async def seed_group_member(
                 ),
             )
             await session.commit()
+
+
+@pytest.fixture
+def rebind_spy(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Capture all calls to ``RequestContext.rebind_logger``."""
+    calls: list[dict[str, Any]] = []
+    original = RequestContext.rebind_logger
+
+    def spy(self: RequestContext, **values: Any) -> None:
+        calls.append(values)
+        original(self, **values)
+
+    monkeypatch.setattr(RequestContext, "rebind_logger", spy)
+    return calls

@@ -103,16 +103,20 @@ class OrgMembershipStore:
         org_id: int,
         username: str,
         groups: list[str],
-    ) -> OrgRole | None:
+    ) -> tuple[OrgRole, PrincipalType, str | None] | None:
         """Resolve the effective role for a user in an organization.
 
         Queries all matching memberships (user by username OR group by
-        any group name) and returns the highest role.
+        any group name) and returns the highest role along with how it
+        was determined.
 
         Returns
         -------
-        OrgRole or None
-            The highest role, or None if no matching memberships.
+        tuple or None
+            ``(role, principal_type, group_name)`` for the winning
+            membership, or None if no matching memberships.
+            ``group_name`` is the principal value when the winning
+            membership is a group, otherwise None.
         """
         conditions = [
             # Direct user membership
@@ -138,7 +142,11 @@ class OrgMembershipStore:
         if not rows:
             return None
 
-        return max(
-            (OrgRole(r.role) for r in rows),
-            key=lambda r: ROLE_RANK[r],
+        best = max(rows, key=lambda r: ROLE_RANK[OrgRole(r.role)])
+        return (
+            OrgRole(best.role),
+            PrincipalType(best.principal_type),
+            best.principal
+            if best.principal_type == PrincipalType.group
+            else None,
         )
