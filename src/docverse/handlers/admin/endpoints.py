@@ -7,14 +7,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 
 from docverse.client.models import OrganizationCreate
-from docverse.dependencies.auth import bind_username
+from docverse.dependencies.auth import require_superadmin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import OrgSlugParam
 
 from .models import Organization
 
-router = APIRouter(tags=["admin"], dependencies=[Depends(bind_username)])
+router = APIRouter(tags=["admin"], dependencies=[Depends(require_superadmin)])
 
 
 @router.post(

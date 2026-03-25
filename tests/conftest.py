@@ -55,6 +55,7 @@ async def app() -> AsyncGenerator[FastAPI]:
 
     async with LifespanManager(docverse_app):
         context_dependency._user_info_store = StubUserInfoStore()
+        context_dependency._superadmin_usernames = ["superadmin"]
         yield docverse_app
 
 
@@ -101,6 +102,7 @@ async def seed_org_with_admin(
                 }
             ],
         },
+        headers={"X-Auth-Request-User": "superadmin"},
     )
     assert response.status_code == 201
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
+SUPERADMIN_HEADERS = {"X-Auth-Request-User": "superadmin"}
+
 
 @pytest.mark.asyncio
 async def test_create_organization(client: AsyncClient) -> None:
@@ -15,6 +17,7 @@ async def test_create_organization(client: AsyncClient) -> None:
             "title": "Test Organization",
             "base_domain": "test.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 201
     data = response.json()
@@ -42,6 +45,7 @@ async def test_create_duplicate_organization(
             "title": "Dup Org",
             "base_domain": "dup.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     response = await client.post(
         "/docverse/admin/orgs",
@@ -50,6 +54,7 @@ async def test_create_duplicate_organization(
             "title": "Dup Org 2",
             "base_domain": "dup2.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 409
 
@@ -63,6 +68,7 @@ async def test_list_organizations(client: AsyncClient) -> None:
             "title": "Org A",
             "base_domain": "a.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     await client.post(
         "/docverse/admin/orgs",
@@ -71,8 +77,12 @@ async def test_list_organizations(client: AsyncClient) -> None:
             "title": "Org B",
             "base_domain": "b.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
-    response = await client.get("/docverse/admin/orgs")
+    response = await client.get(
+        "/docverse/admin/orgs",
+        headers=SUPERADMIN_HEADERS,
+    )
     assert response.status_code == 200
     data = response.json()
     slugs = [o["slug"] for o in data]
@@ -92,8 +102,12 @@ async def test_get_organization(client: AsyncClient) -> None:
             "title": "Get Org",
             "base_domain": "get.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
-    response = await client.get("/docverse/admin/orgs/get-org")
+    response = await client.get(
+        "/docverse/admin/orgs/get-org",
+        headers=SUPERADMIN_HEADERS,
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["slug"] == "get-org"
@@ -106,7 +120,10 @@ async def test_get_organization(client: AsyncClient) -> None:
 async def test_get_organization_not_found(
     client: AsyncClient,
 ) -> None:
-    response = await client.get("/docverse/admin/orgs/nonexistent")
+    response = await client.get(
+        "/docverse/admin/orgs/nonexistent",
+        headers=SUPERADMIN_HEADERS,
+    )
     assert response.status_code == 404
 
 
@@ -121,12 +138,19 @@ async def test_delete_organization(
             "title": "Del Org",
             "base_domain": "del.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
-    response = await client.delete("/docverse/admin/orgs/del-org")
+    response = await client.delete(
+        "/docverse/admin/orgs/del-org",
+        headers=SUPERADMIN_HEADERS,
+    )
     assert response.status_code == 204
 
     # Verify it's gone
-    response = await client.get("/docverse/admin/orgs/del-org")
+    response = await client.get(
+        "/docverse/admin/orgs/del-org",
+        headers=SUPERADMIN_HEADERS,
+    )
     assert response.status_code == 404
 
 
@@ -134,7 +158,10 @@ async def test_delete_organization(
 async def test_delete_organization_not_found(
     client: AsyncClient,
 ) -> None:
-    response = await client.delete("/docverse/admin/orgs/nonexistent")
+    response = await client.delete(
+        "/docverse/admin/orgs/nonexistent",
+        headers=SUPERADMIN_HEADERS,
+    )
     assert response.status_code == 404
 
 
@@ -161,6 +188,7 @@ async def test_create_organization_with_members(
                 },
             ],
         },
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 201
 
@@ -188,6 +216,7 @@ async def test_create_organization_without_members(
             "title": "No Members Org",
             "base_domain": "nomem.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 201
 
@@ -216,6 +245,7 @@ async def test_create_organization_with_duplicate_members(
                 },
             ],
         },
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 201
 
@@ -229,3 +259,18 @@ async def test_create_organization_with_duplicate_members(
     alice_members = [m for m in members if m["principal"] == "alice"]
     assert len(alice_members) == 1
     assert alice_members[0]["role"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_admin_requires_superadmin(client: AsyncClient) -> None:
+    """Admin endpoints reject non-superadmin users with 403."""
+    # No auth header
+    response = await client.get("/docverse/admin/orgs")
+    assert response.status_code == 403
+
+    # Non-superadmin user
+    response = await client.get(
+        "/docverse/admin/orgs",
+        headers={"X-Auth-Request-User": "regular-user"},
+    )
+    assert response.status_code == 403

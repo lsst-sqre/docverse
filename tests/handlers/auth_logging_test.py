@@ -1,6 +1,6 @@
 """Tests for auth context binding to the structlog request logger.
 
-Verifies that ``bind_username`` (admin endpoints) and
+Verifies that ``require_superadmin`` (admin endpoints) and
 ``OrgRoleDependency`` (org-scoped endpoints) call
 ``RequestContext.rebind_logger`` with the expected keys.
 """
@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
 from httpx import AsyncClient
 
 from docverse.client.models import OrgRole
@@ -19,7 +18,7 @@ from docverse.storage.user_info_store import StubUserInfoStore
 from tests.conftest import seed_group_member, seed_org_with_admin
 
 # ------------------------------------------------------------------
-# Admin endpoints — bind_username
+# Admin endpoints — require_superadmin
 # ------------------------------------------------------------------
 
 
@@ -36,26 +35,9 @@ async def test_admin_endpoint_binds_username(
             "title": "Log Org",
             "base_domain": "log.example.com",
         },
-        headers={"X-Auth-Request-User": "admin-user"},
+        headers={"X-Auth-Request-User": "superadmin"},
     )
-    assert any(call.get("username") == "admin-user" for call in rebind_spy)
-
-
-@pytest.mark.asyncio
-async def test_admin_endpoint_no_auth_header(
-    client: AsyncClient,
-    rebind_spy: list[dict[str, Any]],
-) -> None:
-    """Admin endpoints without auth header do not bind username."""
-    await client.post(
-        "/docverse/admin/orgs",
-        json={
-            "slug": "no-auth-org",
-            "title": "No Auth Org",
-            "base_domain": "noauth.example.com",
-        },
-    )
-    assert not any("username" in call for call in rebind_spy)
+    assert any(call.get("username") == "superadmin" for call in rebind_spy)
 
 
 # ------------------------------------------------------------------
@@ -112,14 +94,7 @@ async def test_org_endpoint_group_membership_binds_auth_group(
     assert call["auth_group"] == "g_devs"
 
 
-@pytest.fixture(autouse=False)
-def _enable_superadmin(app: FastAPI) -> None:  # noqa: ARG001
-    """Configure a super admin username for the test."""
-    context_dependency._superadmin_usernames = ["superadmin"]
-
-
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("_enable_superadmin")
 async def test_org_endpoint_superadmin_binds_super_admin_basis(
     client: AsyncClient,
     rebind_spy: list[dict[str, Any]],
@@ -132,6 +107,7 @@ async def test_org_endpoint_superadmin_binds_super_admin_basis(
             "title": "Log SA Org",
             "base_domain": "logsa.example.com",
         },
+        headers={"X-Auth-Request-User": "superadmin"},
     )
 
     response = await client.get(

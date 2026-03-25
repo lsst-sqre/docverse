@@ -247,10 +247,11 @@ async def test_delete_service_referenced_by_slot(
     )
     assert response.status_code == 201
 
-    # Assign the service to an org slot via admin PATCH
+    # Assign the service to an org slot via org PATCH
     response = await client.patch(
-        "/docverse/admin/orgs/svc-org",
+        "/docverse/orgs/svc-org",
         json={"publishing_store_label": "slot-svc"},
+        headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 200
 

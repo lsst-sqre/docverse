@@ -20,6 +20,7 @@ __all__ = [
     "bind_username",
     "require_admin",
     "require_reader",
+    "require_superadmin",
     "require_uploader",
 ]
 
@@ -126,6 +127,30 @@ require_uploader = OrgRoleDependency(OrgRole.uploader)
 
 require_admin = OrgRoleDependency(OrgRole.admin)
 """Dependency that requires admin role."""
+
+
+async def require_superadmin(
+    request: Request,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+) -> None:
+    """Require that the authenticated user is a configured super admin.
+
+    Raises
+    ------
+    PermissionDeniedError
+        If the header is missing or the user is not a super admin.
+    """
+    username = request.headers.get("X-Auth-Request-User")
+    if not username:
+        msg = "Authentication required"
+        raise PermissionDeniedError(msg)
+
+    auth_service = context.factory.create_authorization_service()
+    if not auth_service.is_superadmin(username):
+        msg = f"User {username!r} is not a super admin"
+        raise PermissionDeniedError(msg)
+
+    context.rebind_logger(username=username)
 
 
 async def bind_username(

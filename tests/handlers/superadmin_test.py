@@ -3,17 +3,11 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import FastAPI
 from httpx import AsyncClient
 
-from docverse.dependencies.context import context_dependency
 from tests.conftest import seed_org_with_admin
 
-
-@pytest.fixture(autouse=True)
-def _enable_superadmin_username(app: FastAPI) -> None:  # noqa: ARG001
-    """Configure the context dependency with a super admin username."""
-    context_dependency._superadmin_usernames = ["superadmin"]
+SUPERADMIN_HEADERS = {"X-Auth-Request-User": "superadmin"}
 
 
 @pytest.mark.asyncio
@@ -28,11 +22,12 @@ async def test_superadmin_access_without_membership(
             "title": "Super Admin Org",
             "base_domain": "sa.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     # Super admin should be able to list projects (reader endpoint)
     response = await client.get(
         "/docverse/orgs/sa-org/projects",
-        headers={"X-Auth-Request-User": "superadmin"},
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 200
 
@@ -49,6 +44,7 @@ async def test_superadmin_can_create_project(
             "title": "SA Project Org",
             "base_domain": "sa-proj.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     response = await client.post(
         "/docverse/orgs/sa-proj-org/projects",
@@ -57,7 +53,7 @@ async def test_superadmin_can_create_project(
             "title": "My Project",
             "doc_repo": "https://github.com/example/proj",
         },
-        headers={"X-Auth-Request-User": "superadmin"},
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 201
 
@@ -86,7 +82,7 @@ async def test_superadmin_overrides_reader_membership(
             "title": "Override Project",
             "doc_repo": "https://github.com/example/override",
         },
-        headers={"X-Auth-Request-User": "superadmin"},
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 201
 
@@ -103,9 +99,10 @@ async def test_superadmin_can_manage_members(
             "title": "SA Members Org",
             "base_domain": "sa-mem.example.com",
         },
+        headers=SUPERADMIN_HEADERS,
     )
     response = await client.get(
         "/docverse/orgs/sa-mem-org/members",
-        headers={"X-Auth-Request-User": "superadmin"},
+        headers=SUPERADMIN_HEADERS,
     )
     assert response.status_code == 200

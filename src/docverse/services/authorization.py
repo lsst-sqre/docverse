@@ -24,6 +24,10 @@ class AuthorizationService:
         self._logger = logger
         self._superadmin_usernames = superadmin_usernames or []
 
+    def is_superadmin(self, username: str) -> bool:
+        """Check whether the given username is a configured super admin."""
+        return username in self._superadmin_usernames
+
     async def resolve_role(
         self,
         *,
