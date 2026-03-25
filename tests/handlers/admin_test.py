@@ -111,46 +111,6 @@ async def test_get_organization_not_found(
 
 
 @pytest.mark.asyncio
-async def test_update_organization(
-    client: AsyncClient,
-) -> None:
-    await client.post(
-        "/docverse/admin/orgs",
-        json={
-            "slug": "patch-org",
-            "title": "Patch Org",
-            "base_domain": "patch.example.com",
-        },
-    )
-    response = await client.patch(
-        "/docverse/admin/orgs/patch-org",
-        json={
-            "title": "Updated Org",
-            "purgatory_retention": 5184000,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["title"] == "Updated Org"
-    assert data["purgatory_retention"] == 5184000
-    # Unchanged fields should remain
-    assert data["base_domain"] == "patch.example.com"
-    assert data["slug"] == "patch-org"
-    assert "/admin/orgs/patch-org" in data["self_url"]
-
-
-@pytest.mark.asyncio
-async def test_update_organization_not_found(
-    client: AsyncClient,
-) -> None:
-    response = await client.patch(
-        "/docverse/admin/orgs/nonexistent",
-        json={"title": "Nope"},
-    )
-    assert response.status_code == 404
-
-
-@pytest.mark.asyncio
 async def test_delete_organization(
     client: AsyncClient,
 ) -> None:

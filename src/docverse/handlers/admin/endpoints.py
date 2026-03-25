@@ -6,7 +6,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
-from docverse.client.models import OrganizationCreate, OrganizationUpdate
+from docverse.client.models import OrganizationCreate
 from docverse.dependencies.auth import bind_username
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
@@ -89,29 +89,6 @@ async def get_organization(
             raise NotFoundError(msg)
         service_store = context.factory.create_service_store()
         services = await service_store.list_by_org(org.id)
-    return Organization.from_domain(org, context.request, services=services)
-
-
-@router.patch(
-    "/admin/orgs/{org}",
-    response_model=Organization,
-    summary="Update an organization",
-    name="admin_patch_organization",
-)
-async def patch_organization(
-    org_slug: OrgSlugParam,
-    data: OrganizationUpdate,
-    context: Annotated[RequestContext, Depends(context_dependency)],
-) -> Organization:
-    async with context.session.begin():
-        service = context.factory.create_organization_service()
-        org = await service.update(org_slug, data)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        service_store = context.factory.create_service_store()
-        services = await service_store.list_by_org(org.id)
-        await context.session.commit()
     return Organization.from_domain(org, context.request, services=services)
 
 
