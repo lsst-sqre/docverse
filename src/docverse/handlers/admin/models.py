@@ -50,7 +50,9 @@ class Organization(_OrganizationBase):
             svc = svc_by_label[label]
             return OrganizationServiceSummary(
                 self_url=str(
-                    request.url_for("admin_get_organization", org=domain.slug)
+                    request.url_for(
+                        "get_service", org=domain.slug, service=svc.label
+                    )
                 ),
                 label=svc.label,
                 category=svc.category,
