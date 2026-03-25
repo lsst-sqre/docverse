@@ -94,6 +94,7 @@ class OrgRoleDependency:
             auth_service = context.factory.create_authorization_service()
             auth_result = await auth_service.require_role(
                 org_id=org.id,
+                org_slug=org_slug,
                 username=username,
                 groups=groups,
                 minimum_role=self._min_role,

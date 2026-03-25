@@ -53,6 +53,7 @@ async def test_require_role_sufficient(
         service = AuthorizationService(membership_store=store, logger=logger)
         result = await service.require_role(
             org_id=org_id,
+            org_slug="auth-org",
             username="alice",
             groups=[],
             minimum_role=OrgRole.reader,
@@ -81,6 +82,7 @@ async def test_require_role_insufficient(
         with pytest.raises(PermissionDeniedError):
             await service.require_role(
                 org_id=org_id,
+                org_slug="auth-org",
                 username="bob",
                 groups=[],
                 minimum_role=OrgRole.admin,
@@ -99,6 +101,7 @@ async def test_require_role_no_membership(
         with pytest.raises(PermissionDeniedError):
             await service.require_role(
                 org_id=org_id,
+                org_slug="auth-org",
                 username="nobody",
                 groups=[],
                 minimum_role=OrgRole.reader,
@@ -121,6 +124,7 @@ async def test_superadmin_username_grants_admin(
         )
         result = await service.require_role(
             org_id=org_id,
+            org_slug="auth-org",
             username="superadmin",
             groups=[],
             minimum_role=OrgRole.admin,
@@ -153,6 +157,7 @@ async def test_superadmin_username_overrides_lower_role(
         )
         result = await service.require_role(
             org_id=org_id,
+            org_slug="auth-org",
             username="sa-reader",
             groups=[],
             minimum_role=OrgRole.admin,

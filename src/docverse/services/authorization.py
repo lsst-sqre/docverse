@@ -32,6 +32,7 @@ class AuthorizationService:
         self,
         *,
         org_id: int,
+        org_slug: str,
         username: str,
         groups: list[str],
     ) -> AuthorizationResult | None:
@@ -40,7 +41,7 @@ class AuthorizationService:
             self._logger.debug(
                 "Super admin access granted via config",
                 username=username,
-                org_id=org_id,
+                org=org_slug,
             )
             return AuthorizationResult(
                 role=OrgRole.admin, basis=AuthBasis.super_admin
@@ -48,7 +49,7 @@ class AuthorizationService:
         self._logger.debug(
             "User is not a super admin",
             username=username,
-            org_id=org_id,
+            org=org_slug,
         )
         result = await self._membership_store.resolve_role(
             org_id=org_id, username=username, groups=groups
@@ -66,6 +67,7 @@ class AuthorizationService:
         self,
         *,
         org_id: int,
+        org_slug: str,
         username: str,
         groups: list[str],
         minimum_role: OrgRole,
@@ -83,7 +85,10 @@ class AuthorizationService:
             If the user does not have the required role.
         """
         auth_result = await self.resolve_role(
-            org_id=org_id, username=username, groups=groups
+            org_id=org_id,
+            org_slug=org_slug,
+            username=username,
+            groups=groups,
         )
         if auth_result is None or (
             ROLE_RANK[auth_result.role] < ROLE_RANK[minimum_role]
@@ -91,7 +96,7 @@ class AuthorizationService:
             self._logger.warning(
                 "Permission denied",
                 username=username,
-                org_id=org_id,
+                org=org_slug,
                 required=minimum_role.value,
                 actual=auth_result.role.value if auth_result else None,
             )

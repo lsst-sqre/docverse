@@ -48,12 +48,14 @@ async def build_processing(
     """
     logger = structlog.get_logger("docverse.worker.build_processing")
     org_id: int = payload["org_id"]
-    project_id: int = payload["project_id"]
+    org_slug: str = payload["org_slug"]
+    project_slug: str = payload["project_slug"]
     build_id: int = payload["build_id"]
+    build_public_id: str = payload["build_public_id"]
     logger = logger.bind(
-        org_id=org_id,
-        project_id=project_id,
-        build_id=build_id,
+        org=org_slug,
+        project=project_slug,
+        build=build_public_id,
     )
 
     encryptor: CredentialEncryptor = ctx["encryptor"]

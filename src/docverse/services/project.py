@@ -48,7 +48,7 @@ class ProjectService:
             msg = f"Project with slug {data.slug!r} already exists"
             raise ConflictError(msg)
         project = await self._store.create(org_id=org_id, data=data)
-        self._logger.info("Created project", slug=data.slug, org_id=org_id)
+        self._logger.info("Created project", slug=data.slug, org=org_slug)
         return project
 
     async def get_by_slug(self, *, org_slug: str, slug: str) -> Project:
@@ -106,7 +106,7 @@ class ProjectService:
         if project is None:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
-        self._logger.info("Updated project", slug=slug, org_id=org_id)
+        self._logger.info("Updated project", slug=slug, org=org_slug)
         return project
 
     async def soft_delete(self, *, org_slug: str, slug: str) -> None:
@@ -122,4 +122,4 @@ class ProjectService:
         if not deleted:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
-        self._logger.info("Soft-deleted project", slug=slug, org_id=org_id)
+        self._logger.info("Soft-deleted project", slug=slug, org=org_slug)
