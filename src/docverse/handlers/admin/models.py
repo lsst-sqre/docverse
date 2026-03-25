@@ -17,6 +17,9 @@ from docverse.domain.organization_service import (
 class Organization(_OrganizationBase):
     """Organization response model with HATEOAS self_url."""
 
+    org_url: str
+    """URL to the org-scoped API endpoint."""
+
     @classmethod
     def from_domain(
         cls,
@@ -63,6 +66,7 @@ class Organization(_OrganizationBase):
             self_url=str(
                 request.url_for("admin_get_organization", org=domain.slug)
             ),
+            org_url=str(request.url_for("get_organization", org=domain.slug)),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,

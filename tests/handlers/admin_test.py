@@ -28,6 +28,7 @@ async def test_create_organization(client: AsyncClient) -> None:
     assert data["date_created"] is not None
     assert data["date_updated"] is not None
     assert "/admin/orgs/test-org" in data["self_url"]
+    assert "/orgs/test-org" in data["org_url"]
 
 
 @pytest.mark.asyncio
@@ -79,6 +80,7 @@ async def test_list_organizations(client: AsyncClient) -> None:
     assert "list-org-b" in slugs
     for org in data:
         assert f"/admin/orgs/{org['slug']}" in org["self_url"]
+        assert f"/orgs/{org['slug']}" in org["org_url"]
 
 
 @pytest.mark.asyncio
@@ -97,6 +99,7 @@ async def test_get_organization(client: AsyncClient) -> None:
     assert data["slug"] == "get-org"
     assert data["title"] == "Get Org"
     assert "/admin/orgs/get-org" in data["self_url"]
+    assert "/orgs/get-org" in data["org_url"]
 
 
 @pytest.mark.asyncio
