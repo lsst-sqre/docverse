@@ -93,15 +93,15 @@ def init(*, alembic_config_path: Path, reset: bool) -> None:
     if db_state.has_orm_tables and db_state.has_alembic_version:
         msg = (
             "Database already initialized and tracked by Alembic. "
-            "Use 'docverse update-db-schema' to apply migrations, "
-            "or 'docverse init --reset' to reinitialize."
+            "Use 'docverse-admin update-db-schema' to apply migrations, "
+            "or 'docverse-admin init --reset' to reinitialize."
         )
         raise click.ClickException(msg)
 
     if db_state.has_orm_tables and not db_state.has_alembic_version:
         msg = (
             "Database has existing tables but no Alembic tracking. "
-            "Use 'docverse init --reset' to reinitialize."
+            "Use 'docverse-admin init --reset' to reinitialize."
         )
         raise click.ClickException(msg)
 

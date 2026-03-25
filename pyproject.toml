@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-docverse = "docverse.cli:main"
+docverse-admin = "docverse.cli:main"
 
 [build-system]
 requires = [
