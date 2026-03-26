@@ -61,15 +61,16 @@ async def build_processing(
     encryptor: CredentialEncryptor = ctx["encryptor"]
 
     async for session in db_session_dependency():
-        async with session.begin():
-            factory = WorkerFactory(
-                session=session,
-                logger=logger,
-                credential_encryptor=encryptor,
-            )
-            build_store = BuildStore(session=session, logger=logger)
-            org_store = OrganizationStore(session=session, logger=logger)
+        factory = WorkerFactory(
+            session=session,
+            logger=logger,
+            credential_encryptor=encryptor,
+        )
+        build_store = BuildStore(session=session, logger=logger)
+        org_store = OrganizationStore(session=session, logger=logger)
 
+        # Phase 1: Read-only transaction to load metadata
+        async with session.begin():
             build = await build_store.get_by_id(build_id)
             if build is None:
                 msg = f"Build {build_id} not found"
@@ -85,29 +86,29 @@ async def build_processing(
                 msg = f"No object store service configured for org {org_id}"
                 raise RuntimeError(msg)
 
-            try:
-                object_store = await factory.create_objectstore_for_org(
-                    org_id=org_id, service_label=service_label
+            object_store = await factory.create_objectstore_for_org(
+                org_id=org_id, service_label=service_label
+            )
+
+        # Phase 2: Upload files and mark build complete
+        try:
+            async with object_store, session.begin():
+                await _process_build(
+                    object_store=object_store,
+                    build=build,
+                    build_store=build_store,
+                    logger=logger,
                 )
-                async with object_store:
-                    await _process_build(
-                        object_store=object_store,
-                        build=build,
-                        build_store=build_store,
-                        logger=logger,
-                    )
-                await session.commit()
-                logger.info("Build processing completed")
-            except Exception:
-                logger.exception("Build processing failed")
-                await session.rollback()
-                async with session.begin():
-                    build_service = factory.create_build_service()
-                    await build_service.fail(build_id=build_id)
-                    await session.commit()
-                return "failed"
-            else:
-                return "completed"
+        except Exception:
+            # Phase 3: Mark build as failed in a separate transaction
+            logger.exception("Build processing failed")
+            async with session.begin():
+                build_service = factory.create_build_service()
+                await build_service.fail(build_id=build_id)
+            return "failed"
+        else:
+            logger.info("Build processing completed")
+            return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
