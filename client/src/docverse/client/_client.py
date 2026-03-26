@@ -7,6 +7,7 @@ import random
 from pathlib import Path
 from typing import Any
 
+import click
 import httpx
 
 from ._exceptions import BuildProcessingError, DocverseClientError
@@ -18,6 +19,8 @@ __all__ = ["DocverseClient"]
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 15.0
 _BACKOFF_FACTOR = 2.0
+_VERBOSE_BODY_MAX = 2000
+_TOKEN_SUFFIX_LEN = 4
 
 
 class DocverseClient:
@@ -36,6 +39,8 @@ class DocverseClient:
         Bearer token for authentication.
     timeout
         HTTP request timeout in seconds.
+    verbose
+        If `True`, log detailed HTTP request/response information.
     """
 
     def __init__(
@@ -44,10 +49,12 @@ class DocverseClient:
         token: str,
         *,
         timeout: float = 30.0,
+        verbose: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._timeout = timeout
+        self._verbose = verbose
         self._http: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> DocverseClient:  # noqa: PYI034
@@ -55,6 +62,7 @@ class DocverseClient:
             base_url=self._base_url,
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=self._timeout,
+            event_hooks=self._build_event_hooks(),
         )
         return self
 
@@ -67,6 +75,45 @@ class DocverseClient:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+
+    def _build_event_hooks(
+        self,
+    ) -> dict[str, list[Any]]:
+        """Build httpx event hooks for verbose logging."""
+        if not self._verbose:
+            return {"request": [], "response": []}
+        return {
+            "request": [self._log_request],
+            "response": [self._log_response],
+        }
+
+    async def _log_request(self, request: httpx.Request) -> None:
+        """Log request details when verbose mode is enabled."""
+        click.echo(f">> {request.method} {request.url}", err=True)
+        for name, value in request.headers.items():
+            display_value = (
+                _mask_token(value)
+                if name.lower() == "authorization"
+                else value
+            )
+            click.echo(f">> {name}: {display_value}", err=True)
+        click.echo(">>", err=True)
+
+    async def _log_response(self, response: httpx.Response) -> None:
+        """Log response details when verbose mode is enabled."""
+        await response.aread()
+        click.echo(
+            f"<< {response.status_code} {response.reason_phrase}",
+            err=True,
+        )
+        for name, value in response.headers.items():
+            click.echo(f"<< {name}: {value}", err=True)
+        body = response.text
+        if len(body) > _VERBOSE_BODY_MAX:
+            body = body[:_VERBOSE_BODY_MAX] + "... (truncated)"
+        if body:
+            click.echo(f"<< {body}", err=True)
+        click.echo("<<", err=True)
 
     @property
     def _client(self) -> httpx.AsyncClient:
@@ -136,7 +183,10 @@ class DocverseClient:
         tarball_path
             Path to the tarball file.
         """
-        async with httpx.AsyncClient(timeout=self._timeout) as upload_client:
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            event_hooks=self._build_event_hooks(),
+        ) as upload_client:
             with tarball_path.open("rb") as f:
                 response = await upload_client.put(
                     upload_url,
@@ -218,6 +268,19 @@ class DocverseClient:
             jitter = random.uniform(0, delay * 0.5)  # noqa: S311
             await asyncio.sleep(delay + jitter)
             delay = min(delay * _BACKOFF_FACTOR, _BACKOFF_MAX)
+
+
+def _mask_token(value: str) -> str:
+    """Mask a bearer token for safe display.
+
+    Shows only the last 4 characters of the token value.
+    """
+    scheme, _, token = value.partition(" ")
+    if not token:
+        return "****"
+    if len(token) > _TOKEN_SUFFIX_LEN:
+        return f"{scheme} ****...{token[-_TOKEN_SUFFIX_LEN:]}"
+    return f"{scheme} ****"
 
 
 def _raise_for_status(response: httpx.Response) -> None:

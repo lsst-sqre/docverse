@@ -82,6 +82,13 @@ def main() -> None:
     default=False,
     help="Exit after upload without waiting for processing.",
 )
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Show detailed HTTP request/response information.",
+)
 def upload(  # noqa: PLR0913
     org: str,
     project: str,
@@ -91,6 +98,7 @@ def upload(  # noqa: PLR0913
     base_url: str,
     alternate_name: str | None,
     no_wait: bool,  # noqa: FBT001
+    verbose: bool,  # noqa: FBT001
 ) -> None:
     """Upload a documentation build."""
     if git_ref is None:
@@ -105,6 +113,7 @@ def upload(  # noqa: PLR0913
             base_url=base_url,
             alternate_name=alternate_name,
             no_wait=no_wait,
+            verbose=verbose,
         )
     )
 
@@ -137,6 +146,7 @@ async def _upload_async(  # noqa: PLR0913
     base_url: str,
     alternate_name: str | None,
     no_wait: bool,
+    verbose: bool,
 ) -> None:
     """Run the upload workflow."""
     tarball_path: Path | None = None
@@ -145,7 +155,7 @@ async def _upload_async(  # noqa: PLR0913
         tarball_path, content_hash = create_tarball(source_dir)
         click.echo(f"Content hash: {content_hash}")
 
-        async with DocverseClient(base_url, token) as client:
+        async with DocverseClient(base_url, token, verbose=verbose) as client:
             click.echo(f"Creating build for {org}/{project} @ {git_ref}")
             build = await client.create_build(
                 org,
