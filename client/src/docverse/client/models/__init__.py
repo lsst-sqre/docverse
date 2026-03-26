@@ -9,6 +9,7 @@ from .credentials import (
     GcpCredentials,
     OrganizationCredential,
     OrganizationCredentialCreate,
+    S3Credentials,
 )
 from .editions import (
     Edition,
@@ -77,6 +78,7 @@ __all__ = [
     "ProjectCreate",
     "ProjectUpdate",
     "QueueJob",
+    "S3Credentials",
     "ServiceCategory",
     "ServiceConfig",
     "ServiceProvider",

@@ -152,6 +152,30 @@ async def test_duplicate_credential_label(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_s3_credential(client: AsyncClient) -> None:
+    """Test creating an s3 credential for generic S3-compatible providers."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/cred-org/credentials",
+        json={
+            "label": "s3-compat",
+            "credentials": {
+                "provider": "s3",
+                "access_key_id": "S3ACCESSKEY",
+                "secret_access_key": "s3secret",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["label"] == "s3-compat"
+    assert data["provider"] == "s3"
+    assert "credentials" not in data
+    assert "encrypted_credentials" not in data
+
+
+@pytest.mark.asyncio
 async def test_delete_credential_referenced_by_service(
     client: AsyncClient,
 ) -> None:

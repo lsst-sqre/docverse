@@ -9,9 +9,10 @@ from tests.conftest import seed_org_with_admin
 
 
 async def _setup(client: AsyncClient) -> None:
-    """Create org, seed admin, and create a credential."""
+    """Create org, seed admin, and create credentials."""
     await seed_org_with_admin(client, "svc-org", "testuser")
-    # Create a credential that services can reference
+    headers = {"X-Auth-Request-User": "testuser"}
+    # Create an AWS credential for AWS services
     await client.post(
         "/docverse/orgs/svc-org/credentials",
         json={
@@ -22,7 +23,20 @@ async def _setup(client: AsyncClient) -> None:
                 "secret_access_key": "secret",
             },
         },
-        headers={"X-Auth-Request-User": "testuser"},
+        headers=headers,
+    )
+    # Create an S3 credential for generic S3-compatible services (R2, minio)
+    await client.post(
+        "/docverse/orgs/svc-org/credentials",
+        json={
+            "label": "primary-s3",
+            "credentials": {
+                "provider": "s3",
+                "access_key_id": "S3ACCESSKEY",
+                "secret_access_key": "s3secret",
+            },
+        },
+        headers=headers,
     )
 
 
@@ -207,7 +221,7 @@ async def test_service_with_incompatible_credential(
     """Test creating a service with a credential of incompatible provider."""
     await _setup(client)
     headers = {"X-Auth-Request-User": "testuser"}
-    # primary-aws is an "aws" credential; cloudflare_r2 requires "cloudflare"
+    # primary-aws is an "aws" credential; cloudflare_r2 requires "s3"
     response = await client.post(
         "/docverse/orgs/svc-org/services",
         json={
@@ -261,3 +275,51 @@ async def test_delete_service_referenced_by_slot(
         headers=headers,
     )
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_create_cloudflare_r2_service(client: AsyncClient) -> None:
+    """Test creating a Cloudflare R2 service with an s3 credential."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/svc-org/services",
+        json={
+            "label": "my-r2",
+            "credential_label": "primary-s3",
+            "config": {
+                "provider": "cloudflare_r2",
+                "account_id": "abc123",
+                "bucket": "my-bucket",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["label"] == "my-r2"
+    assert data["provider"] == "cloudflare_r2"
+    assert data["credential_label"] == "primary-s3"
+
+
+@pytest.mark.asyncio
+async def test_create_minio_service(client: AsyncClient) -> None:
+    """Test creating a MinIO service with an s3 credential."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/svc-org/services",
+        json={
+            "label": "my-minio",
+            "credential_label": "primary-s3",
+            "config": {
+                "provider": "minio",
+                "endpoint_url": "http://minio:9000",
+                "bucket": "docs",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["label"] == "my-minio"
+    assert data["provider"] == "minio"
+    assert data["credential_label"] == "primary-s3"

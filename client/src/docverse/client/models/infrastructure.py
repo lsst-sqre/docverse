@@ -28,6 +28,9 @@ class CredentialProvider(StrEnum):
     gcp = "gcp"
     """Google Cloud Platform (GCS, Cloud CDN)."""
 
+    s3 = "s3"
+    """Generic S3-compatible (access key ID + secret access key)."""
+
 
 class ServiceCategory(StrEnum):
     """Category of infrastructure service."""
@@ -85,8 +88,8 @@ SERVICE_PROVIDER_CREDENTIAL: dict[
 ] = {
     # Object storage
     ServiceProvider.aws_s3: [CredentialProvider.aws],
-    ServiceProvider.cloudflare_r2: [CredentialProvider.cloudflare],
-    ServiceProvider.minio: [CredentialProvider.aws],
+    ServiceProvider.cloudflare_r2: [CredentialProvider.s3],
+    ServiceProvider.minio: [CredentialProvider.s3],
     ServiceProvider.gcs: [CredentialProvider.gcp],
     # CDN
     ServiceProvider.fastly: [CredentialProvider.fastly],

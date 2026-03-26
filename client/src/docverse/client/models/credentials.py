@@ -17,6 +17,7 @@ __all__ = [
     "GcpCredentials",
     "OrganizationCredential",
     "OrganizationCredentialCreate",
+    "S3Credentials",
 ]
 
 
@@ -54,11 +55,20 @@ class GcpCredentials(BaseModel):
     )
 
 
+class S3Credentials(BaseModel):
+    """Generic S3-compatible credential payload."""
+
+    provider: Literal["s3"] = "s3"
+    access_key_id: str = Field(description="S3 access key ID.")
+    secret_access_key: str = Field(description="S3 secret access key.")
+
+
 CredentialPayload = Annotated[
     Annotated[AwsCredentials, Tag("aws")]
     | Annotated[CloudflareCredentials, Tag("cloudflare")]
     | Annotated[FastlyCredentials, Tag("fastly")]
-    | Annotated[GcpCredentials, Tag("gcp")],
+    | Annotated[GcpCredentials, Tag("gcp")]
+    | Annotated[S3Credentials, Tag("s3")],
     Discriminator("provider"),
 ]
 """Discriminated union of all credential payload types."""
