@@ -7,6 +7,7 @@ from typing import Self
 
 from aiobotocore.client import AioBaseClient
 from aiobotocore.session import AioSession, ClientCreatorContext, get_session
+from botocore.config import Config
 
 __all__ = ["S3ObjectStore"]
 
@@ -75,6 +76,7 @@ class S3ObjectStore:
             aws_access_key_id=self._access_key_id,
             aws_secret_access_key=self._secret_access_key,
             region_name=self._region or None,
+            config=Config(signature_version="s3v4"),
         )
         self._client = await self._client_cm.__aenter__()
 
