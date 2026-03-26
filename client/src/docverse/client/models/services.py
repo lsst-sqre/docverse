@@ -22,6 +22,7 @@ __all__ = [
     "OrganizationService",
     "OrganizationServiceCreate",
     "OrganizationServiceSummary",
+    "OrganizationServiceUpdate",
     "Route53Config",
     "ServiceConfig",
 ]
@@ -168,6 +169,21 @@ class OrganizationServiceCreate(BaseModel):
             ),
         ),
     ]
+
+
+class OrganizationServiceUpdate(BaseModel):
+    """Request model for updating an organization service (PATCH)."""
+
+    credential_label: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Label of the credential to use for authentication."
+            " Must reference an existing credential with a compatible"
+            " provider."
+        ),
+    )
 
 
 class OrganizationServiceSummary(BaseModel):

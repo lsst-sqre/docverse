@@ -323,3 +323,144 @@ async def test_create_minio_service(client: AsyncClient) -> None:
     assert data["label"] == "my-minio"
     assert data["provider"] == "minio"
     assert data["credential_label"] == "primary-s3"
+
+
+@pytest.mark.asyncio
+async def test_patch_service_credential(client: AsyncClient) -> None:
+    """Test updating a service's credential_label via PATCH."""
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    # Create service with primary-aws
+    await client.post(
+        "/docverse/orgs/svc-org/services",
+        json={
+            "label": "patch-me",
+            "credential_label": "primary-aws",
+            "config": {
+                "provider": "aws_s3",
+                "bucket": "b",
+                "region": "us-east-1",
+            },
+        },
+        headers=headers,
+    )
+    # Create a second AWS credential
+    await client.post(
+        "/docverse/orgs/svc-org/credentials",
+        json={
+            "label": "secondary-aws",
+            "credentials": {
+                "provider": "aws",
+                "access_key_id": "AKIAEXAMPLE2",
+                "secret_access_key": "secret2",
+            },
+        },
+        headers=headers,
+    )
+    # PATCH to the new credential
+    response = await client.patch(
+        "/docverse/orgs/svc-org/services/patch-me",
+        json={"credential_label": "secondary-aws"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["credential_label"] == "secondary-aws"
+    assert data["label"] == "patch-me"
+
+
+@pytest.mark.asyncio
+async def test_patch_service_nonexistent_credential(
+    client: AsyncClient,
+) -> None:
+    """Test PATCH with a credential that doesn't exist returns 404."""
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/svc-org/services",
+        json={
+            "label": "patch-404",
+            "credential_label": "primary-aws",
+            "config": {
+                "provider": "aws_s3",
+                "bucket": "b",
+                "region": "us-east-1",
+            },
+        },
+        headers=headers,
+    )
+    response = await client.patch(
+        "/docverse/orgs/svc-org/services/patch-404",
+        json={"credential_label": "nonexistent"},
+        headers=headers,
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_patch_service_incompatible_credential(
+    client: AsyncClient,
+) -> None:
+    """Test PATCH with an incompatible credential returns 409."""
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    # Create a Cloudflare R2 service (requires s3 credential)
+    await client.post(
+        "/docverse/orgs/svc-org/services",
+        json={
+            "label": "patch-409",
+            "credential_label": "primary-s3",
+            "config": {
+                "provider": "cloudflare_r2",
+                "account_id": "abc123",
+                "bucket": "b",
+            },
+        },
+        headers=headers,
+    )
+    # Try to PATCH to an aws credential (incompatible with cloudflare_r2)
+    response = await client.patch(
+        "/docverse/orgs/svc-org/services/patch-409",
+        json={"credential_label": "primary-aws"},
+        headers=headers,
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_patch_service_noop(client: AsyncClient) -> None:
+    """Test that an empty PATCH body returns the service unchanged."""
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/svc-org/services",
+        json={
+            "label": "patch-noop",
+            "credential_label": "primary-aws",
+            "config": {
+                "provider": "aws_s3",
+                "bucket": "b",
+                "region": "us-east-1",
+            },
+        },
+        headers=headers,
+    )
+    response = await client.patch(
+        "/docverse/orgs/svc-org/services/patch-noop",
+        json={},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["credential_label"] == "primary-aws"
+
+
+@pytest.mark.asyncio
+async def test_patch_nonexistent_service(client: AsyncClient) -> None:
+    """Test PATCH on a non-existent service returns 404."""
+    await _setup(client)
+    response = await client.patch(
+        "/docverse/orgs/svc-org/services/no-such-service",
+        json={"credential_label": "primary-aws"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 404

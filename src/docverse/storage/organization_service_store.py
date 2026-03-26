@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
+from docverse.client.models import OrganizationServiceUpdate
 from docverse.dbschema.organization_service import SqlOrganizationService
 from docverse.domain.organization_service import OrganizationService
 
@@ -90,6 +91,30 @@ class OrganizationServiceStore:
         )
         rows = result.scalars().all()
         return [OrganizationService.model_validate(r) for r in rows]
+
+    async def update(
+        self,
+        *,
+        organization_id: int,
+        label: str,
+        data: OrganizationServiceUpdate,
+    ) -> OrganizationService | None:
+        """Update a service by org ID and label."""
+        result = await self._session.execute(
+            select(SqlOrganizationService).where(
+                SqlOrganizationService.organization_id == organization_id,
+                SqlOrganizationService.label == label,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        updates = data.model_dump(exclude_unset=True)
+        for key, value in updates.items():
+            setattr(row, key, value)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return OrganizationService.model_validate(row)
 
     async def delete(self, *, organization_id: int, label: str) -> bool:
         """Delete a service by org ID and label.

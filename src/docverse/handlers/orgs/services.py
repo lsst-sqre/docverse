@@ -6,7 +6,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
-from docverse.client.models import OrganizationServiceCreate
+from docverse.client.models import (
+    OrganizationServiceCreate,
+    OrganizationServiceUpdate,
+)
 from docverse.client.models.infrastructure import ServiceProvider
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
@@ -82,6 +85,30 @@ async def get_service(
         svc = await infra_service.get_by_label(
             org_slug=org_slug, label=service_label
         )
+    return OrganizationServiceResponse.from_domain(
+        svc, context.request, org_slug
+    )
+
+
+@router.patch(
+    "/orgs/{org}/services/{service}",
+    response_model=OrganizationServiceResponse,
+    summary="Update an organization service",
+    name="patch_service",
+)
+async def patch_service(
+    org_slug: OrgSlugParam,
+    service_label: ServiceLabelParam,
+    data: OrganizationServiceUpdate,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+) -> OrganizationServiceResponse:
+    async with context.session.begin():
+        infra_service = context.factory.create_infrastructure_service()
+        svc = await infra_service.update(
+            org_slug=org_slug, label=service_label, data=data
+        )
+        await context.session.commit()
     return OrganizationServiceResponse.from_domain(
         svc, context.request, org_slug
     )

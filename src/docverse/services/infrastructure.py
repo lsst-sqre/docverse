@@ -11,6 +11,7 @@ from docverse.client.models.infrastructure import (
     SERVICE_PROVIDER_CREDENTIAL,
     ServiceProvider,
 )
+from docverse.client.models.services import OrganizationServiceUpdate
 from docverse.domain.organization_service import OrganizationService
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.organization_credential_store import (
@@ -116,6 +117,70 @@ class InfrastructureService:
             provider=provider,
         )
         return svc
+
+    async def update(
+        self,
+        *,
+        org_slug: str,
+        label: str,
+        data: OrganizationServiceUpdate,
+    ) -> OrganizationService:
+        """Update an infrastructure service.
+
+        Validates that the new credential (if provided) exists and is
+        compatible with the service's provider.
+        """
+        org_id = await self._resolve_org_id(org_slug)
+
+        # Validate credential if being updated
+        updates = data.model_dump(exclude_unset=True)
+        if "credential_label" in updates:
+            # Need the current service to know the provider
+            svc = await self._store.get_by_label(
+                organization_id=org_id, label=label
+            )
+            if svc is None:
+                msg = (
+                    f"Service {label!r} not found"
+                    f" for organization {org_slug!r}"
+                )
+                raise NotFoundError(msg)
+
+            new_cred_label = updates["credential_label"]
+            cred_result = await self._credential_store.get_by_label(
+                organization_id=org_id, label=new_cred_label
+            )
+            if cred_result is None:
+                msg = (
+                    f"Credential {new_cred_label!r} not found"
+                    f" for organization {org_slug!r}"
+                )
+                raise NotFoundError(msg)
+
+            cred, _ = cred_result
+            provider = ServiceProvider(svc.provider)
+            compatible = SERVICE_PROVIDER_CREDENTIAL[provider]
+            if cred.provider not in compatible:
+                expected = ", ".join(str(p) for p in compatible)
+                msg = (
+                    f"Service provider {provider!r} requires a credential"
+                    f" with provider {expected}, but credential"
+                    f" {new_cred_label!r} has provider {cred.provider!r}"
+                )
+                raise ConflictError(msg)
+
+        result = await self._store.update(
+            organization_id=org_id, label=label, data=data
+        )
+        if result is None:
+            msg = f"Service {label!r} not found for organization {org_slug!r}"
+            raise NotFoundError(msg)
+        self._logger.info(
+            "Updated organization service",
+            org_slug=org_slug,
+            label=label,
+        )
+        return result
 
     async def get_by_label(
         self, *, org_slug: str, label: str

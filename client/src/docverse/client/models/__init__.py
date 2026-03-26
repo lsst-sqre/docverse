@@ -42,6 +42,7 @@ from .services import (
     OrganizationService,
     OrganizationServiceCreate,
     OrganizationServiceSummary,
+    OrganizationServiceUpdate,
     ServiceConfig,
 )
 
@@ -72,6 +73,7 @@ __all__ = [
     "OrganizationService",
     "OrganizationServiceCreate",
     "OrganizationServiceSummary",
+    "OrganizationServiceUpdate",
     "OrganizationUpdate",
     "PrincipalType",
     "Project",
