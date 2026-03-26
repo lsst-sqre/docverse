@@ -80,6 +80,7 @@ class ContextDependency:
         self._user_info_store: UserInfoStore = StubUserInfoStore()
         self._credential_encryptor: CredentialEncryptor | None = None
         self._superadmin_usernames: list[str] = []
+        self._arq_queue_name: str = "arq:queue"
 
     async def __call__(
         self,
@@ -108,6 +109,7 @@ class ContextDependency:
                 user_info_store=self._user_info_store,
                 credential_encryptor=self._credential_encryptor,
                 superadmin_usernames=self._superadmin_usernames,
+                default_queue_name=self._arq_queue_name,
             ),
         )
 
@@ -116,6 +118,7 @@ class ContextDependency:
         user_info_store: UserInfoStore | None = None,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
+        arq_queue_name: str | None = None,
     ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
@@ -125,6 +128,8 @@ class ContextDependency:
             self._credential_encryptor = credential_encryptor
         if superadmin_usernames is not None:
             self._superadmin_usernames = superadmin_usernames
+        if arq_queue_name is not None:
+            self._arq_queue_name = arq_queue_name
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""

@@ -117,8 +117,14 @@ class ArqQueueBackend:
     Works with both RedisArqQueue and MockArqQueue.
     """
 
-    def __init__(self, arq_queue: ArqQueue) -> None:
+    def __init__(
+        self,
+        arq_queue: ArqQueue,
+        *,
+        default_queue_name: str = "arq:queue",
+    ) -> None:
         self._arq_queue = arq_queue
+        self._default_queue_name = default_queue_name
 
     async def enqueue(
         self,
@@ -129,7 +135,9 @@ class ArqQueueBackend:
     ) -> str:
         """Enqueue a job via arq."""
         metadata: JobMetadata = await self._arq_queue.enqueue(
-            job_type, _queue_name=queue_name, payload=payload
+            job_type,
+            _queue_name=queue_name or self._default_queue_name,
+            payload=payload,
         )
         return metadata.id
 

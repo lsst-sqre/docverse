@@ -11,11 +11,13 @@ import structlog
 from asgi_lifespan import LifespanManager
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from safir.arq import MockArqQueue
 from safir.database import (
     create_database_engine,
     initialize_database,
     stamp_database_async,
 )
+from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
@@ -56,6 +58,11 @@ async def app() -> AsyncGenerator[FastAPI]:
     async with LifespanManager(docverse_app):
         context_dependency._user_info_store = StubUserInfoStore()
         context_dependency._superadmin_usernames = ["superadmin"]
+        # Replace the MockArqQueue with one that uses the configured
+        # queue name so ArqQueueBackend can enqueue to the right queue.
+        arq_dependency._arq_queue = MockArqQueue(
+            default_queue_name=config.arq_queue_name
+        )
         yield docverse_app
 
 

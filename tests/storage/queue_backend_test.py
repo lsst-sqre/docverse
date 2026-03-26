@@ -8,7 +8,10 @@ from docverse.storage.queue_backend import ArqQueueBackend
 
 @pytest.fixture
 def queue_backend() -> ArqQueueBackend:
-    return ArqQueueBackend(arq_queue=MockArqQueue())
+    return ArqQueueBackend(
+        arq_queue=MockArqQueue(default_queue_name="docverse:queue"),
+        default_queue_name="docverse:queue",
+    )
 
 
 @pytest.mark.asyncio
@@ -28,10 +31,37 @@ async def test_enqueue_passes_payload_as_single_kwarg(
     job_id = await queue_backend.enqueue("test_task", payload)
     # Inspect the stored job metadata to verify the payload was passed
     # as a single kwarg rather than spread as individual kwargs.
-    default_queue = mock_queue.default_queue_name
-    queue_jobs = mock_queue._job_metadata[default_queue]
+    queue_jobs = mock_queue._job_metadata["docverse:queue"]
     stored_job = queue_jobs[job_id]
     assert stored_job.kwargs == {"payload": payload}
+
+
+@pytest.mark.asyncio
+async def test_enqueue_uses_default_queue_name() -> None:
+    """Verify enqueue uses the configured default queue name."""
+    mock_queue = MockArqQueue(default_queue_name="docverse:queue")
+    backend = ArqQueueBackend(
+        arq_queue=mock_queue, default_queue_name="docverse:queue"
+    )
+    job_id = await backend.enqueue("test_task", {"key": "value"})
+    metadata = await backend.get_job_metadata(job_id)
+    assert metadata is not None
+    assert metadata["queue_name"] == "docverse:queue"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_override_queue_name() -> None:
+    """Verify queue_name parameter overrides the default."""
+    mock_queue = MockArqQueue(default_queue_name="custom:queue")
+    backend = ArqQueueBackend(
+        arq_queue=mock_queue, default_queue_name="docverse:queue"
+    )
+    job_id = await backend.enqueue(
+        "test_task", {"key": "value"}, queue_name="custom:queue"
+    )
+    metadata = await backend.get_job_metadata(job_id)
+    assert metadata is not None
+    assert metadata["queue_name"] == "custom:queue"
 
 
 @pytest.mark.asyncio

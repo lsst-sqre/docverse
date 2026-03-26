@@ -223,6 +223,7 @@ class HandlerFactory(Factory):
         user_info_store: UserInfoStore,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
+        default_queue_name: str = "arq:queue",
     ) -> None:
         super().__init__(
             session=session,
@@ -232,9 +233,13 @@ class HandlerFactory(Factory):
         )
         self._arq_queue = arq_queue
         self._user_info_store = user_info_store
+        self._default_queue_name = default_queue_name
 
     def _create_queue_backend(self) -> ArqQueueBackend:
-        return ArqQueueBackend(arq_queue=self._arq_queue)
+        return ArqQueueBackend(
+            arq_queue=self._arq_queue,
+            default_queue_name=self._default_queue_name,
+        )
 
     def get_user_info_store(self) -> UserInfoStore:
         """Get the UserInfoStore instance."""

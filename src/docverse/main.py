@@ -86,6 +86,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         credential_encryptor=encryptor,
         superadmin_usernames=config.superadmin_usernames,
         user_info_store=user_info_store,
+        arq_queue_name=config.arq_queue_name,
     )
     yield
     await context_dependency.aclose()
