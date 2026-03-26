@@ -89,8 +89,8 @@ class S3ObjectStore:
         # STREAMING-UNSIGNED-PAYLOAD-TRAILER signing protocol that
         # botocore 1.36+ uses by default for PutObject.
         self._client.meta.events.register(
-            "before-parameter-build.s3.PutObject",
-            self._strip_checksum_algorithm,
+            "before-call.s3.PutObject",
+            self._suppress_trailing_checksum,
         )
 
     async def close(self) -> None:
@@ -107,16 +107,35 @@ class S3ObjectStore:
         return self._client
 
     @staticmethod
-    def _strip_checksum_algorithm(
-        params: dict[str, object], **_kwargs: object
+    def _suppress_trailing_checksum(
+        _params: dict[str, object],
+        context: dict[str, object],
+        **_kwargs: object,
     ) -> None:
-        """Remove ChecksumAlgorithm to prevent aws-chunked trailers.
+        """Clear trailing checksum context for R2 compatibility.
 
-        Cloudflare R2 does not support the STREAMING-UNSIGNED-PAYLOAD-TRAILER
-        signing protocol. Stripping ChecksumAlgorithm from PutObject
-        parameters prevents botocore from activating this code path.
+        botocore 1.36+ marks PutObject as ``requestChecksumRequired``
+        in the service model.  ``resolve_request_checksum_algorithm``
+        therefore adds a CRC32 trailing checksum to
+        ``context["checksum"]`` even when
+        ``request_checksum_calculation`` is ``"when_required"``.  This
+        causes ``apply_request_checksum`` to wrap the body in
+        ``AwsChunkedWrapper`` and set ``x-amz-content-sha256`` to
+        ``STREAMING-UNSIGNED-PAYLOAD-TRAILER``, which R2 does not
+        support.
+
+        This hook fires after ``resolve_checksum_context`` but before
+        ``apply_request_checksum``, so clearing the request algorithm
+        here prevents the chunked-trailer code path entirely.
         """
-        params.pop("ChecksumAlgorithm", None)
+        checksum_context = context.get("checksum", {})
+        if isinstance(checksum_context, dict):
+            algorithm = checksum_context.get("request_algorithm")
+            if (
+                isinstance(algorithm, dict)
+                and algorithm.get("in") == "trailer"
+            ):
+                checksum_context.pop("request_algorithm", None)
 
     async def generate_presigned_upload_url(
         self, *, key: str, content_type: str, expires_in: int = 3600
