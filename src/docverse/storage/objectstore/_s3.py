@@ -79,6 +79,8 @@ class S3ObjectStore:
             config=Config(
                 signature_version="s3v4",
                 request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+                s3={"payload_signing_enabled": False},
             ),
         )
         self._client = await self._client_cm.__aenter__()
