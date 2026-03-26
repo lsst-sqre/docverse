@@ -80,10 +80,18 @@ class S3ObjectStore:
                 signature_version="s3v4",
                 request_checksum_calculation="when_required",
                 response_checksum_validation="when_required",
-                s3={"payload_signing_enabled": False},
             ),
         )
         self._client = await self._client_cm.__aenter__()
+
+        # Prevent botocore from adding aws-chunked transfer encoding
+        # with checksum trailers on PutObject. R2 does not support the
+        # STREAMING-UNSIGNED-PAYLOAD-TRAILER signing protocol that
+        # botocore 1.36+ uses by default for PutObject.
+        self._client.meta.events.register(
+            "before-parameter-build.s3.PutObject",
+            self._strip_checksum_algorithm,
+        )
 
     async def close(self) -> None:
         """Close the underlying S3 client."""
@@ -97,6 +105,18 @@ class S3ObjectStore:
             msg = "S3ObjectStore is not open; use as async context manager"
             raise RuntimeError(msg)
         return self._client
+
+    @staticmethod
+    def _strip_checksum_algorithm(
+        params: dict[str, object], **_kwargs: object
+    ) -> None:
+        """Remove ChecksumAlgorithm to prevent aws-chunked trailers.
+
+        Cloudflare R2 does not support the STREAMING-UNSIGNED-PAYLOAD-TRAILER
+        signing protocol. Stripping ChecksumAlgorithm from PutObject
+        parameters prevents botocore from activating this code path.
+        """
+        params.pop("ChecksumAlgorithm", None)
 
     async def generate_presigned_upload_url(
         self, *, key: str, content_type: str, expires_in: int = 3600
