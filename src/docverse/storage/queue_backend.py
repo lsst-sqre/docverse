@@ -129,7 +129,7 @@ class ArqQueueBackend:
     ) -> str:
         """Enqueue a job via arq."""
         metadata: JobMetadata = await self._arq_queue.enqueue(
-            job_type, _queue_name=queue_name, **payload
+            job_type, _queue_name=queue_name, payload=payload
         )
         return metadata.id
 
