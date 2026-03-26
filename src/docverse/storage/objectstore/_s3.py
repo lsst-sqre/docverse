@@ -107,11 +107,7 @@ class S3ObjectStore:
         return self._client
 
     @staticmethod
-    def _suppress_trailing_checksum(
-        _params: dict[str, object],
-        context: dict[str, object],
-        **_kwargs: object,
-    ) -> None:
+    def _suppress_trailing_checksum(**kwargs: object) -> None:
         """Clear trailing checksum context for R2 compatibility.
 
         botocore 1.36+ marks PutObject as ``requestChecksumRequired``
@@ -128,14 +124,15 @@ class S3ObjectStore:
         ``apply_request_checksum``, so clearing the request algorithm
         here prevents the chunked-trailer code path entirely.
         """
-        checksum_context = context.get("checksum", {})
-        if isinstance(checksum_context, dict):
-            algorithm = checksum_context.get("request_algorithm")
-            if (
-                isinstance(algorithm, dict)
-                and algorithm.get("in") == "trailer"
-            ):
-                checksum_context.pop("request_algorithm", None)
+        context = kwargs.get("context")
+        if not isinstance(context, dict):
+            return
+        checksum_context = context.get("checksum")
+        if not isinstance(checksum_context, dict):
+            return
+        algorithm = checksum_context.get("request_algorithm")
+        if isinstance(algorithm, dict) and algorithm.get("in") == "trailer":
+            checksum_context.pop("request_algorithm", None)
 
     async def generate_presigned_upload_url(
         self, *, key: str, content_type: str, expires_in: int = 3600
