@@ -24,6 +24,7 @@ from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.queue_job_store import QueueJobStore
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
@@ -68,8 +69,9 @@ async def build_processing(
         )
         build_store = BuildStore(session=session, logger=logger)
         org_store = OrganizationStore(session=session, logger=logger)
+        queue_job_store = QueueJobStore(session=session, logger=logger)
 
-        # Phase 1: Read-only transaction to load metadata
+        # Phase 1: Load metadata and mark QueueJob as in_progress
         async with session.begin():
             build = await build_store.get_by_id(build_id)
             if build is None:
@@ -90,6 +92,8 @@ async def build_processing(
                 org_id=org_id, service_label=service_label
             )
 
+            queue_job_id = await _start_queue_job(ctx, queue_job_store)
+
         # Phase 2: Upload files and mark build complete
         try:
             async with object_store, session.begin():
@@ -100,18 +104,43 @@ async def build_processing(
                     logger=logger,
                 )
         except Exception:
-            # Phase 3: Mark build as failed in a separate transaction
+            # Phase 3a: Mark build and queue job as failed
             logger.exception("Build processing failed")
             async with session.begin():
                 build_service = factory.create_build_service()
                 await build_service.fail(build_id=build_id)
+                if queue_job_id is not None:
+                    await queue_job_store.fail(queue_job_id)
             return "failed"
         else:
+            # Phase 3b: Mark queue job as complete
+            if queue_job_id is not None:
+                async with session.begin():
+                    await queue_job_store.complete(queue_job_id)
             logger.info("Build processing completed")
             return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _start_queue_job(
+    ctx: dict[str, Any],
+    queue_job_store: QueueJobStore,
+) -> int | None:
+    """Look up and start the QueueJob for this arq job.
+
+    Returns the queue job's internal ID, or ``None`` if no matching
+    QueueJob exists.
+    """
+    arq_job_id: str | None = ctx.get("job_id")
+    if arq_job_id is None:
+        return None
+    queue_job = await queue_job_store.get_by_backend_job_id(arq_job_id)
+    if queue_job is None:
+        return None
+    await queue_job_store.start(queue_job.id)
+    return queue_job.id
 
 
 async def _process_build(
