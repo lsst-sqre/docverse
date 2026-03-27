@@ -96,11 +96,19 @@ async def build_processing(
             )
 
             queue_job_id = await _start_queue_job(ctx, queue_job_store)
+            if queue_job_id is not None:
+                await queue_job_store.update_phase(
+                    queue_job_id,
+                    "unpacking",
+                    progress={
+                        "message": "Unpacking build into object store",
+                    },
+                )
 
         # Phase 2: Upload files and mark build complete
         try:
             async with object_store, session.begin():
-                await _process_build(
+                object_count, total_size_bytes = await _process_build(
                     object_store=object_store,
                     build=build,
                     build_store=build_store,
@@ -119,6 +127,15 @@ async def build_processing(
             # Phase 3b: Mark queue job as complete
             if queue_job_id is not None:
                 async with session.begin():
+                    await queue_job_store.update_phase(
+                        queue_job_id,
+                        "unpacking",
+                        progress={
+                            "message": "Unpacking complete",
+                            "object_count": object_count,
+                            "total_size_bytes": total_size_bytes,
+                        },
+                    )
                     await queue_job_store.complete(queue_job_id)
             logger.info("Build processing completed")
             return "completed"
@@ -152,8 +169,14 @@ async def _process_build(
     build: Build,
     build_store: BuildStore,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
-    """Download, unpack, and upload build files."""
+) -> tuple[int, int]:
+    """Download, unpack, and upload build files.
+
+    Returns
+    -------
+    tuple of int, int
+        The number of objects uploaded and the total size in bytes.
+    """
     logger.info(
         "Downloading staging tarball",
         staging_key=build.staging_key,
@@ -216,3 +239,5 @@ async def _process_build(
             staging_key=build.staging_key,
             exc_info=True,
         )
+
+    return object_count, total_size
