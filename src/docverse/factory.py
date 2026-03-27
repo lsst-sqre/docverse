@@ -14,6 +14,7 @@ from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.edition import EditionService
+from .services.edition_tracking import EditionTrackingService
 from .services.infrastructure import InfrastructureService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
@@ -106,6 +107,20 @@ class Factory(ABC):
         """Create an EditionBuildHistoryStore."""
         return EditionBuildHistoryStore(
             session=self._session, logger=self._logger
+        )
+
+    def create_edition_tracking_service(self) -> EditionTrackingService:
+        """Create an EditionTrackingService."""
+        return EditionTrackingService(
+            edition_store=EditionStore(
+                session=self._session, logger=self._logger
+            ),
+            history_store=EditionBuildHistoryStore(
+                session=self._session, logger=self._logger
+            ),
+            project_store=self._create_project_store(),
+            org_store=self._create_org_store(),
+            logger=self._logger,
         )
 
     def create_edition_service(self) -> EditionService:

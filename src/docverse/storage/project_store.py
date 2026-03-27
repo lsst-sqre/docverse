@@ -45,6 +45,19 @@ class ProjectStore:
         await self._session.refresh(row)
         return Project.model_validate(row)
 
+    async def get_by_id(self, project_id: int) -> Project | None:
+        """Fetch a project by internal ID."""
+        result = await self._session.execute(
+            select(SqlProject).where(
+                SqlProject.id == project_id,
+                SqlProject.date_deleted.is_(None),
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Project.model_validate(row)
+
     async def get_by_slug(self, *, org_id: int, slug: str) -> Project | None:
         """Fetch a project by org_id and slug."""
         result = await self._session.execute(
