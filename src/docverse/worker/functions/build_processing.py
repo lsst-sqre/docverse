@@ -183,7 +183,8 @@ async def _process_build(
             if f is None:
                 continue
             file_data = f.read()
-            task = asyncio.create_task(_upload_file(member.name, file_data))
+            name = member.name.removeprefix("./")
+            task = asyncio.create_task(_upload_file(name, file_data))
             tasks.append(task)
 
     results = await asyncio.gather(*tasks)
