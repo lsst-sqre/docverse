@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from ._protocol import ObjectStore
 from ._s3 import S3ObjectStore
 
@@ -22,6 +24,7 @@ def create_objectstore(
     provider: str,
     config: dict[str, Any],
     credentials: dict[str, Any],
+    http_client: httpx.AsyncClient | None = None,
 ) -> ObjectStore:
     """Create an ObjectStore from service config and decrypted credentials.
 
@@ -64,6 +67,7 @@ def create_objectstore(
             access_key_id=credentials["access_key_id"],
             secret_access_key=credentials["secret_access_key"],
             region=config.get("region", ""),
+            http_client=http_client,
         )
     msg = f"Unsupported object store provider: {provider!r}"
     raise ValueError(msg)

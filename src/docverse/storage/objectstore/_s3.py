@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Self
 
+import httpx
 from aiobotocore.client import AioBaseClient
 from aiobotocore.session import AioSession, ClientCreatorContext, get_session
 from botocore.config import Config
@@ -36,7 +37,7 @@ class S3ObjectStore:
         AWS region name (optional for non-AWS services).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         endpoint_url: str | None,
@@ -44,12 +45,14 @@ class S3ObjectStore:
         access_key_id: str,
         secret_access_key: str,
         region: str = "",
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._bucket = bucket
         self._access_key_id = access_key_id
         self._secret_access_key = secret_access_key
         self._region = region
+        self._http_client = http_client
         self._session: AioSession = get_session()
         self._client_cm: ClientCreatorContext | None = None
         self._client: AioBaseClient | None = None
@@ -84,15 +87,6 @@ class S3ObjectStore:
         )
         self._client = await self._client_cm.__aenter__()
 
-        # Prevent botocore from adding aws-chunked transfer encoding
-        # with checksum trailers on PutObject. R2 does not support the
-        # STREAMING-UNSIGNED-PAYLOAD-TRAILER signing protocol that
-        # botocore 1.36+ uses by default for PutObject.
-        self._client.meta.events.register(
-            "before-call.s3.PutObject",
-            self._suppress_trailing_checksum,
-        )
-
     async def close(self) -> None:
         """Close the underlying S3 client."""
         if self._client_cm is not None:
@@ -105,34 +99,6 @@ class S3ObjectStore:
             msg = "S3ObjectStore is not open; use as async context manager"
             raise RuntimeError(msg)
         return self._client
-
-    @staticmethod
-    def _suppress_trailing_checksum(**kwargs: object) -> None:
-        """Clear trailing checksum context for R2 compatibility.
-
-        botocore 1.36+ marks PutObject as ``requestChecksumRequired``
-        in the service model.  ``resolve_request_checksum_algorithm``
-        therefore adds a CRC32 trailing checksum to
-        ``context["checksum"]`` even when
-        ``request_checksum_calculation`` is ``"when_required"``.  This
-        causes ``apply_request_checksum`` to wrap the body in
-        ``AwsChunkedWrapper`` and set ``x-amz-content-sha256`` to
-        ``STREAMING-UNSIGNED-PAYLOAD-TRAILER``, which R2 does not
-        support.
-
-        This hook fires after ``resolve_checksum_context`` but before
-        ``apply_request_checksum``, so clearing the request algorithm
-        here prevents the chunked-trailer code path entirely.
-        """
-        context = kwargs.get("context")
-        if not isinstance(context, dict):
-            return
-        checksum_context = context.get("checksum")
-        if not isinstance(checksum_context, dict):
-            return
-        algorithm = checksum_context.get("request_algorithm")
-        if isinstance(algorithm, dict) and algorithm.get("in") == "trailer":
-            checksum_context.pop("request_algorithm", None)
 
     async def generate_presigned_upload_url(
         self, *, key: str, content_type: str, expires_in: int = 3600
@@ -192,11 +158,25 @@ class S3ObjectStore:
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
     ) -> None:
-        """Upload an object to S3."""
-        client = self._get_client()
-        await client.put_object(
-            Bucket=self._bucket,
-            Key=key,
-            Body=data,
-            ContentType=content_type,
-        )
+        """Upload an object via presigned URL if http_client is available.
+
+        Falls back to direct put_object when no http_client is set.
+        """
+        if self._http_client is not None:
+            url = await self.generate_presigned_upload_url(
+                key=key, content_type=content_type, expires_in=900
+            )
+            response = await self._http_client.put(
+                url,
+                content=data,
+                headers={"Content-Type": content_type},
+            )
+            response.raise_for_status()
+        else:
+            client = self._get_client()
+            await client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )

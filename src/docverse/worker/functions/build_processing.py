@@ -12,6 +12,7 @@ import mimetypes
 import tarfile
 from typing import Any
 
+import httpx
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
@@ -60,12 +61,14 @@ async def build_processing(
     )
 
     encryptor: CredentialEncryptor = ctx["encryptor"]
+    http_client: httpx.AsyncClient = ctx["http_client"]
 
     async for session in db_session_dependency():
         factory = WorkerFactory(
             session=session,
             logger=logger,
             credential_encryptor=encryptor,
+            http_client=http_client,
         )
         build_store = BuildStore(session=session, logger=logger)
         org_store = OrganizationStore(session=session, logger=logger)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+import httpx
 import structlog
 from safir.arq import ArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
@@ -42,11 +43,13 @@ class Factory(ABC):
         logger: structlog.stdlib.BoundLogger,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
         self._superadmin_usernames = superadmin_usernames or []
+        self._http_client = http_client
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
@@ -209,6 +212,7 @@ class Factory(ABC):
             provider=svc.provider,
             config=svc.config,
             credentials=cred_payload,
+            http_client=self._http_client,
         )
 
 

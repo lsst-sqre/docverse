@@ -8,6 +8,7 @@ from __future__ import annotations
 from importlib.metadata import version
 from typing import Any
 
+import httpx
 import structlog
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.db_session import db_session_dependency
@@ -62,11 +63,14 @@ async def startup(ctx: dict[str, Any]) -> None:
         retired_key=retired_key,
     )
 
+    ctx["http_client"] = httpx.AsyncClient()
+
     logger.info("Worker startup complete")
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     """Clean up resources for the arq worker process."""
+    await ctx["http_client"].aclose()
     await db_session_dependency.aclose()
     logger = structlog.get_logger("docverse.worker")
     logger.info("Worker shutdown complete")
