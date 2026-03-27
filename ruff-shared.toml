@@ -29,6 +29,7 @@ ignore = [
 [lint.per-file-ignores]
 "tests/**" = [
     "D100",    # Missing docstring in public module.
+    "D102",    # Missing docstring in public method.
     "D103",    # Missing docstring in public function.
     "PLR0913", # Too many arguments to function call.
     "S105",    # Possible hardcoded password assigned to variable.
@@ -37,6 +38,7 @@ ignore = [
 ]
 "*/tests/**" = [
     "D100",
+    "D102",
     "D103",
     "PLR0913",
     "S105",    # Possible hardcoded password assigned to variable.
