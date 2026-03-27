@@ -212,6 +212,7 @@ class Factory(ABC):
             provider=svc.provider,
             config=svc.config,
             credentials=cred_payload,
+            logger=self._logger,
             http_client=self._http_client,
         )
 

@@ -7,6 +7,8 @@ from types import TracebackType
 from typing import Self
 from urllib.parse import quote
 
+import structlog
+
 __all__ = ["MockObjectStore"]
 
 _DEFAULT_BASE_URL = "https://mock-s3.example.com"
@@ -26,7 +28,12 @@ class MockObjectStore:
     assertions in tests.
     """
 
-    def __init__(self, *, base_url: str = _DEFAULT_BASE_URL) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str = _DEFAULT_BASE_URL,
+        logger: structlog.stdlib.BoundLogger | None = None,  # noqa: ARG002
+    ) -> None:
         self._base_url = base_url
         self._objects: dict[str, _StoredObject] = {}
 

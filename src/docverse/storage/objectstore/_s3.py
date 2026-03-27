@@ -36,6 +36,8 @@ class S3ObjectStore:
         AWS secret access key (or equivalent).
     region
         AWS region name (optional for non-AWS services).
+    logger
+        Bound logger for contextual logging.
     """
 
     def __init__(  # noqa: PLR0913
@@ -46,6 +48,7 @@ class S3ObjectStore:
         access_key_id: str,
         secret_access_key: str,
         region: str = "",
+        logger: structlog.stdlib.BoundLogger,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._endpoint_url = endpoint_url
@@ -53,6 +56,7 @@ class S3ObjectStore:
         self._access_key_id = access_key_id
         self._secret_access_key = secret_access_key
         self._region = region
+        self._logger = logger
         self._http_client = http_client
         self._session: AioSession = get_session()
         self._client_cm: ClientCreatorContext | None = None
@@ -176,8 +180,7 @@ class S3ObjectStore:
                 headers={"Content-Type": content_type},
             )
             if response.is_error:
-                logger = structlog.get_logger("docverse.storage.objectstore")
-                logger.error(
+                self._logger.error(
                     "Presigned upload failed",
                     status_code=response.status_code,
                     response_body=response.text,

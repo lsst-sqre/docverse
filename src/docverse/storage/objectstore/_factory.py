@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import structlog
 
 from ._protocol import ObjectStore
 from ._s3 import S3ObjectStore
@@ -52,6 +53,7 @@ def create_objectstore(
     provider: str,
     config: dict[str, Any],
     credentials: dict[str, Any],
+    logger: structlog.stdlib.BoundLogger,
     http_client: httpx.AsyncClient | None = None,
 ) -> ObjectStore:
     """Create an ObjectStore from service config and decrypted credentials.
@@ -65,6 +67,8 @@ def create_objectstore(
         Non-secret service configuration (bucket, region, account_id, etc.).
     credentials
         Decrypted credential payload (access keys, tokens, etc.).
+    logger
+        Bound logger for contextual logging.
 
     Returns
     -------
@@ -97,6 +101,7 @@ def create_objectstore(
             access_key_id=credentials["access_key_id"],
             secret_access_key=credentials["secret_access_key"],
             region=config.get("region", ""),
+            logger=logger,
             http_client=http_client,
         )
     msg = f"Unsupported object store provider: {provider!r}"
