@@ -6,6 +6,7 @@ from types import TracebackType
 from typing import Self
 
 import httpx
+import structlog
 from aiobotocore.client import AioBaseClient
 from aiobotocore.session import AioSession, ClientCreatorContext, get_session
 from botocore.config import Config
@@ -163,14 +164,25 @@ class S3ObjectStore:
         Falls back to direct put_object when no http_client is set.
         """
         if self._http_client is not None:
-            url = await self.generate_presigned_upload_url(
-                key=key, content_type=content_type, expires_in=900
+            client = self._get_client()
+            url: str = await client.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": self._bucket, "Key": key},
+                ExpiresIn=900,
             )
             response = await self._http_client.put(
                 url,
                 content=data,
                 headers={"Content-Type": content_type},
             )
+            if response.is_error:
+                logger = structlog.get_logger("docverse.storage.objectstore")
+                logger.error(
+                    "Presigned upload failed",
+                    status_code=response.status_code,
+                    response_body=response.text,
+                    key=key,
+                )
             response.raise_for_status()
         else:
             client = self._get_client()
