@@ -153,18 +153,51 @@ class EditionStore:
 
     async def set_current_build(
         self, *, edition_id: int, build_id: int
-    ) -> Edition:
-        """Set the current build for an edition."""
-        result = await self._session.execute(
-            select(SqlEdition).where(SqlEdition.id == edition_id)
+    ) -> Edition | None:
+        """Set the current build for an edition.
+
+        Compares the incoming build's ``date_created`` against the
+        current build's ``date_created``.  If the edition already points
+        to a build that is equally new or newer, the update is skipped
+        and ``None`` is returned (stale-build guard per SQR-112).
+
+        Returns
+        -------
+        Edition or None
+            The updated edition, or ``None`` if the update was skipped
+            because the edition already points to a newer build.
+        """
+        # Fetch incoming build's date_created
+        incoming_result = await self._session.execute(
+            select(SqlBuild.date_created).where(SqlBuild.id == build_id)
         )
-        row = result.scalar_one()
+        incoming_date = incoming_result.scalar_one()
+
+        # Fetch edition joined with current build's date_created
+        stmt = (
+            select(
+                SqlEdition,
+                SqlBuild.date_created.label("current_build_date"),
+            )
+            .outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+            .where(SqlEdition.id == edition_id)
+        )
+        result = await self._session.execute(stmt)
+        row, current_build_date = result.one()
+
+        # Stale-build guard: skip if current build is equally new or newer
+        if (
+            current_build_date is not None
+            and current_build_date >= incoming_date
+        ):
+            return None
+
         row.current_build_id = build_id
         await self._session.flush()
         await self._session.refresh(row)
         # Re-query to get current_build_public_id
-        stmt = self._base_query().where(SqlEdition.id == edition_id)
-        result2 = await self._session.execute(stmt)
+        stmt2 = self._base_query().where(SqlEdition.id == edition_id)
+        result2 = await self._session.execute(stmt2)
         edition_row, build_public_id = result2.one()
         return self._validate(edition_row, build_public_id)
 

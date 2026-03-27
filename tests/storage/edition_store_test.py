@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from docverse.client.models import (
@@ -15,6 +18,7 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse.dbschema.build import SqlBuild
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
@@ -193,8 +197,190 @@ async def test_set_current_build(
             edition_id=edition.id, build_id=build.id
         )
         await db_session.commit()
+    assert updated is not None
     assert updated.current_build_id == build.id
     assert updated.current_build_public_id == build.public_id
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_skips_stale(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """Skip when the edition already has a newer build."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        newer_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:aaaa" + "0" * 60,
+            ),
+            uploader="testuser",
+        )
+        older_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:bbbb" + "0" * 60,
+            ),
+            uploader="testuser",
+        )
+        # Set controlled timestamps
+        for bid, ts in [
+            (newer_build.id, datetime(2025, 6, 1, tzinfo=UTC)),
+            (older_build.id, datetime(2025, 1, 1, tzinfo=UTC)),
+        ]:
+            row = (
+                await db_session.execute(
+                    select(SqlBuild).where(SqlBuild.id == bid)
+                )
+            ).scalar_one()
+            row.date_created = ts
+        await db_session.flush()
+
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-stale",
+                title="Guard Stale",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        # Point edition to the newer build first
+        applied = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=newer_build.id
+        )
+        assert applied is not None
+
+        # Try to set to the older build — should be skipped
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=older_build.id
+        )
+        await db_session.commit()
+    assert skipped is None
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_skips_equal(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """Skip when the incoming build has the same date_created."""
+    logger = structlog.get_logger("docverse")
+    same_time = datetime(2025, 3, 15, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build_a = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:cccc" + "0" * 60,
+            ),
+            uploader="testuser",
+        )
+        build_b = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:dddd" + "0" * 60,
+            ),
+            uploader="testuser",
+        )
+        # Give both builds the same date_created
+        for bid in [build_a.id, build_b.id]:
+            row = (
+                await db_session.execute(
+                    select(SqlBuild).where(SqlBuild.id == bid)
+                )
+            ).scalar_one()
+            row.date_created = same_time
+        await db_session.flush()
+
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-equal",
+                title="Guard Equal",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        applied = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build_a.id
+        )
+        assert applied is not None
+
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build_b.id
+        )
+        await db_session.commit()
+    assert skipped is None
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_applies_when_newer(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """set_current_build applies when the incoming build is newer."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        older_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:eeee" + "0" * 60,
+            ),
+            uploader="testuser",
+        )
+        newer_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:ffff" + "0" * 60,
+            ),
+            uploader="testuser",
+        )
+        for bid, ts in [
+            (older_build.id, datetime(2025, 1, 1, tzinfo=UTC)),
+            (newer_build.id, datetime(2025, 6, 1, tzinfo=UTC)),
+        ]:
+            row = (
+                await db_session.execute(
+                    select(SqlBuild).where(SqlBuild.id == bid)
+                )
+            ).scalar_one()
+            row.date_created = ts
+        await db_session.flush()
+
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-newer",
+                title="Guard Newer",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        # Set to the older build first
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=older_build.id
+        )
+        # Update to the newer build — should succeed
+        updated = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=newer_build.id
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.current_build_id == newer_build.id
+    assert updated.current_build_public_id == newer_build.public_id
 
 
 @pytest.mark.asyncio

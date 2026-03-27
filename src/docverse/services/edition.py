@@ -146,16 +146,30 @@ class EditionService:
 
     async def set_current_build(
         self, *, edition_id: int, build_id: int
-    ) -> Edition:
-        """Set the current build for an edition."""
+    ) -> Edition | None:
+        """Set the current build for an edition.
+
+        Returns
+        -------
+        Edition or None
+            The updated edition, or ``None`` if the update was skipped
+            because the edition already points to a newer build.
+        """
         edition = await self._store.set_current_build(
             edition_id=edition_id, build_id=build_id
         )
-        self._logger.info(
-            "Set current build for edition",
-            edition_id=edition_id,
-            build_id=build_id,
-        )
+        if edition is None:
+            self._logger.info(
+                "Skipped stale build for edition",
+                edition_id=edition_id,
+                build_id=build_id,
+            )
+        else:
+            self._logger.info(
+                "Set current build for edition",
+                edition_id=edition_id,
+                build_id=build_id,
+            )
         return edition
 
     async def soft_delete(
