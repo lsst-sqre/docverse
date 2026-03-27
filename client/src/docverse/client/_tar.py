@@ -57,11 +57,10 @@ def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
         suffix=".tar.gz", delete=False
     )
     try:
-        raw = Path(tmp.name).open("wb", buffering=0)  # noqa: SIM115
-        writer = _HashingWriter(raw)
-        with tarfile.open(mode="w:gz", fileobj=writer) as tar:
-            tar.add(str(source), arcname=".")
-        raw.close()
+        with Path(tmp.name).open("wb", buffering=0) as raw:
+            writer = _HashingWriter(raw)
+            with tarfile.open(mode="w:gz", fileobj=writer) as tar:
+                tar.add(str(source), arcname=".")
     except BaseException:
         Path(tmp.name).unlink(missing_ok=True)
         raise
