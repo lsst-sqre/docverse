@@ -129,7 +129,7 @@ async def build_processing(
                 async with session.begin():
                     await queue_job_store.update_phase(
                         queue_job_id,
-                        "unpacking",
+                        "complete",
                         progress={
                             "message": "Unpacking complete",
                             "object_count": object_count,
