@@ -220,6 +220,12 @@ async def _process_build(
     object_count = len(results)
     total_size = sum(results)
 
+    if object_count == 0:
+        logger.warning(
+            "Tarball contained no extractable files",
+            staging_key=build.staging_key,
+        )
+
     logger.info(
         "Upload complete",
         object_count=object_count,
