@@ -18,6 +18,7 @@ from .services.infrastructure import InfrastructureService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .storage.build_store import BuildStore
+from .storage.edition_build_history_store import EditionBuildHistoryStore
 from .storage.edition_store import EditionStore
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
@@ -97,6 +98,14 @@ class Factory(ABC):
             queue_backend=queue_backend,
             queue_job_store=queue_job_store,
             logger=self._logger,
+        )
+
+    def create_edition_build_history_store(
+        self,
+    ) -> EditionBuildHistoryStore:
+        """Create an EditionBuildHistoryStore."""
+        return EditionBuildHistoryStore(
+            session=self._session, logger=self._logger
         )
 
     def create_edition_service(self) -> EditionService:

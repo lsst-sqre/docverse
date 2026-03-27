@@ -3,6 +3,7 @@
 from .base import Base
 from .build import SqlBuild
 from .edition import SqlEdition
+from .edition_build_history import SqlEditionBuildHistory
 from .membership import SqlOrgMembership
 from .organization import SqlOrganization
 from .organization_credential import SqlOrganizationCredential
@@ -14,6 +15,7 @@ __all__ = [
     "Base",
     "SqlBuild",
     "SqlEdition",
+    "SqlEditionBuildHistory",
     "SqlOrgMembership",
     "SqlOrganization",
     "SqlOrganizationCredential",
