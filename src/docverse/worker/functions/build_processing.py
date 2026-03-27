@@ -181,6 +181,9 @@ async def _process_build(
         "Downloading staging tarball",
         staging_key=build.staging_key,
     )
+    # TODO(DM-54426): Full tarball loaded  # noqa: TD003, FIX002
+    # into memory. Streaming the download would reduce peak memory
+    # usage for large documentation builds.
     tarball_data = await object_store.download_object(key=build.staging_key)
 
     build_prefix = f"__builds/{serialize_base32_id(build.public_id)}/"
@@ -198,6 +201,9 @@ async def _process_build(
             return len(data)
 
     tasks: list[asyncio.Task[int]] = []
+    # TODO(DM-54426): All extracted files  # noqa: TD003, FIX002
+    # held in memory before uploads begin. Streaming extraction with
+    # concurrent upload would lower peak memory for large builds.
     with tarfile.open(fileobj=io.BytesIO(tarball_data), mode="r:gz") as tar:
         for member in tar.getmembers():
             if not member.isfile():
