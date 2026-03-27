@@ -18,6 +18,34 @@ _S3_COMPATIBLE_PROVIDERS = {"aws_s3", "cloudflare_r2", "minio"}
 # Providers not listed here must include endpoint_url in config.
 _R2_ENDPOINT_TEMPLATE = "https://{account_id}.r2.cloudflarestorage.com"
 
+_REQUIRED_CONFIG_KEYS: dict[str, set[str]] = {
+    "aws_s3": {"bucket"},
+    "cloudflare_r2": {"account_id", "bucket"},
+    "minio": {"endpoint_url", "bucket"},
+}
+_REQUIRED_CREDENTIAL_KEYS: set[str] = {"access_key_id", "secret_access_key"}
+
+
+def _validate_s3_keys(
+    provider: str,
+    config: dict[str, Any],
+    credentials: dict[str, Any],
+) -> None:
+    """Raise ``ValueError`` if required keys are missing."""
+    missing_config = _REQUIRED_CONFIG_KEYS[provider] - config.keys()
+    missing_creds = _REQUIRED_CREDENTIAL_KEYS - credentials.keys()
+    errors: list[str] = []
+    if missing_config:
+        errors.append(f"config: {', '.join(sorted(missing_config))}")
+    if missing_creds:
+        errors.append(f"credentials: {', '.join(sorted(missing_creds))}")
+    if errors:
+        msg = (
+            f"Missing required keys for {provider!r} object store — "
+            + "; ".join(errors)
+        )
+        raise ValueError(msg)
+
 
 def create_objectstore(
     *,
@@ -47,9 +75,11 @@ def create_objectstore(
     Raises
     ------
     ValueError
-        If the provider is not supported.
+        If the provider is not supported or required configuration/credential
+        keys are missing.
     """
     if provider in _S3_COMPATIBLE_PROVIDERS:
+        _validate_s3_keys(provider, config, credentials)
         # Derive endpoint_url based on provider
         if provider == "cloudflare_r2":
             endpoint_url = _R2_ENDPOINT_TEMPLATE.format(
