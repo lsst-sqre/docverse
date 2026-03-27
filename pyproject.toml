@@ -6,18 +6,22 @@ readme = "README.md"
 requires-python = ">=3.13"
 dynamic = ["version"]
 dependencies = [
+    "aiobotocore>=2.18",
     "click>=8",
+    "cryptography>=44",
     "docverse-client",
     "fastapi>=0.115",
+    "httpx",
     "pydantic>=2",
     "pydantic-settings>=2",
     "base32-lib",
+    "rubin-gafaelfawr",
     "safir[db,arq]>=13",
     "uvicorn[standard]>=0.34",
 ]
 
 [project.scripts]
-docverse = "docverse.cli:main"
+docverse-admin = "docverse.cli:main"
 
 [build-system]
 requires = [

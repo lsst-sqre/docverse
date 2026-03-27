@@ -65,6 +65,16 @@ class BuildStore:
         await self._session.refresh(row)
         return Build.model_validate(row)
 
+    async def get_by_id(self, build_id: int) -> Build | None:
+        """Fetch a build by internal ID."""
+        result = await self._session.execute(
+            select(SqlBuild).where(SqlBuild.id == build_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
     async def get_by_public_id(
         self, *, project_id: int, public_id: int
     ) -> Build | None:

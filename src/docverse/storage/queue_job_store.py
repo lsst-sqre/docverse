@@ -76,6 +76,20 @@ class QueueJobStore:
             return None
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def get_by_backend_job_id(
+        self, backend_job_id: str
+    ) -> QueueJob | None:
+        """Fetch a QueueJob by its arq backend job ID."""
+        result = await self._session.execute(
+            select(SqlQueueJob).where(
+                SqlQueueJob.backend_job_id == backend_job_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return QueueJob.model_validate(row, from_attributes=True)
+
     async def start(self, job_id: int) -> QueueJob:
         """Mark job as in_progress, set date_started=now().
 

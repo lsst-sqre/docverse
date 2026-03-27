@@ -69,7 +69,8 @@ class EditionService:
         self._logger.info(
             "Created edition",
             slug=data.slug,
-            project_id=project_id,
+            org=org_slug,
+            project=project_slug,
         )
         return edition
 
@@ -138,7 +139,9 @@ class EditionService:
         if edition is None:
             msg = f"Edition {slug!r} not found"
             raise NotFoundError(msg)
-        self._logger.info("Updated edition", slug=slug, project_id=project_id)
+        self._logger.info(
+            "Updated edition", slug=slug, org=org_slug, project=project_slug
+        )
         return edition
 
     async def set_current_build(
@@ -173,5 +176,8 @@ class EditionService:
             msg = f"Edition {slug!r} not found"
             raise NotFoundError(msg)
         self._logger.info(
-            "Soft-deleted edition", slug=slug, project_id=project_id
+            "Soft-deleted edition",
+            slug=slug,
+            org=org_slug,
+            project=project_slug,
         )

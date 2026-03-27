@@ -1,20 +1,27 @@
 """Pydantic models for the Docverse API."""
 
-from .base32id import (
-    BASE32_ID_LENGTH,
-    BASE32_ID_SPLIT_EVERY,
-    Base32Id,
-    generate_base32_id,
-    serialize_base32_id,
-    validate_base32_id,
-)
 from .builds import Build, BuildCreate, BuildStatus, BuildUpdate
+from .credentials import (
+    AwsCredentials,
+    CloudflareCredentials,
+    CredentialPayload,
+    FastlyCredentials,
+    GcpCredentials,
+    OrganizationCredential,
+    OrganizationCredentialCreate,
+    S3Credentials,
+)
 from .editions import (
     Edition,
     EditionCreate,
     EditionKind,
     EditionUpdate,
     TrackingMode,
+)
+from .infrastructure import (
+    CredentialProvider,
+    ServiceCategory,
+    ServiceProvider,
 )
 from .memberships import (
     OrgMembership,
@@ -31,19 +38,29 @@ from .organizations import (
 from .projects import Project, ProjectCreate, ProjectUpdate
 from .queue import QueueJob
 from .queue_enums import JobKind, JobStatus
+from .services import (
+    OrganizationService,
+    OrganizationServiceCreate,
+    OrganizationServiceSummary,
+    OrganizationServiceUpdate,
+    ServiceConfig,
+)
 
 __all__ = [
-    "BASE32_ID_LENGTH",
-    "BASE32_ID_SPLIT_EVERY",
-    "Base32Id",
+    "AwsCredentials",
     "Build",
     "BuildCreate",
     "BuildStatus",
     "BuildUpdate",
+    "CloudflareCredentials",
+    "CredentialPayload",
+    "CredentialProvider",
     "Edition",
     "EditionCreate",
     "EditionKind",
     "EditionUpdate",
+    "FastlyCredentials",
+    "GcpCredentials",
     "JobKind",
     "JobStatus",
     "OrgMembership",
@@ -51,15 +68,22 @@ __all__ = [
     "OrgRole",
     "Organization",
     "OrganizationCreate",
+    "OrganizationCredential",
+    "OrganizationCredentialCreate",
+    "OrganizationService",
+    "OrganizationServiceCreate",
+    "OrganizationServiceSummary",
+    "OrganizationServiceUpdate",
     "OrganizationUpdate",
     "PrincipalType",
     "Project",
     "ProjectCreate",
     "ProjectUpdate",
     "QueueJob",
+    "S3Credentials",
+    "ServiceCategory",
+    "ServiceConfig",
+    "ServiceProvider",
     "TrackingMode",
     "UrlScheme",
-    "generate_base32_id",
-    "serialize_base32_id",
-    "validate_base32_id",
 ]

@@ -9,6 +9,7 @@ from fastapi import Depends, Request
 
 from docverse.client.models import OrgRole
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.domain.authorization import AuthBasis, AuthorizationResult
 from docverse.domain.organization import Organization
 from docverse.exceptions import NotFoundError, PermissionDeniedError
 from docverse.handlers.params import OrgSlugParam
@@ -16,8 +17,10 @@ from docverse.handlers.params import OrgSlugParam
 __all__ = [
     "AuthenticatedUser",
     "OrgRoleDependency",
+    "bind_username",
     "require_admin",
     "require_reader",
+    "require_superadmin",
     "require_uploader",
 ]
 
@@ -34,6 +37,9 @@ class AuthenticatedUser:
 
     org: Organization
     """The resolved organization."""
+
+    auth_result: AuthorizationResult
+    """Full authorization details (role, basis, group)."""
 
 
 class OrgRoleDependency:
@@ -76,16 +82,42 @@ class OrgRoleDependency:
             user_info_store = context.factory.get_user_info_store()
             groups = await user_info_store.get_groups(token)
 
+            context.logger.debug(
+                "Resolving org authorization",
+                username=username,
+                org_slug=org_slug,
+                has_token=bool(token),
+                groups=groups,
+            )
+
             # Check authorization
             auth_service = context.factory.create_authorization_service()
-            role = await auth_service.require_role(
+            auth_result = await auth_service.require_role(
                 org_id=org.id,
+                org_slug=org_slug,
                 username=username,
                 groups=groups,
                 minimum_role=self._min_role,
             )
 
-        return AuthenticatedUser(username=username, role=role, org=org)
+        # Bind auth context to the request logger
+        log_bindings: dict[str, str] = {
+            "username": username,
+            "auth_basis": auth_result.basis.value,
+            "auth_role": "super_admin"
+            if auth_result.basis == AuthBasis.super_admin
+            else auth_result.role.value,
+        }
+        if auth_result.group is not None:
+            log_bindings["auth_group"] = auth_result.group
+        context.rebind_logger(**log_bindings)
+
+        return AuthenticatedUser(
+            username=username,
+            role=auth_result.role,
+            org=org,
+            auth_result=auth_result,
+        )
 
 
 require_reader = OrgRoleDependency(OrgRole.reader)
@@ -96,3 +128,41 @@ require_uploader = OrgRoleDependency(OrgRole.uploader)
 
 require_admin = OrgRoleDependency(OrgRole.admin)
 """Dependency that requires admin role."""
+
+
+async def require_superadmin(
+    request: Request,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+) -> None:
+    """Require that the authenticated user is a configured super admin.
+
+    Raises
+    ------
+    PermissionDeniedError
+        If the header is missing or the user is not a super admin.
+    """
+    username = request.headers.get("X-Auth-Request-User")
+    if not username:
+        msg = "Authentication required"
+        raise PermissionDeniedError(msg)
+
+    auth_service = context.factory.create_authorization_service()
+    if not auth_service.is_superadmin(username):
+        msg = f"User {username!r} is not a super admin"
+        raise PermissionDeniedError(msg)
+
+    context.rebind_logger(username=username)
+
+
+async def bind_username(
+    request: Request,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+) -> None:
+    """Bind the authenticated username to the request logger.
+
+    Lightweight dependency for endpoints (e.g. admin) that don't use
+    OrgRoleDependency but still want username in log lines.
+    """
+    username = request.headers.get("X-Auth-Request-User")
+    if username:
+        context.rebind_logger(username=username)

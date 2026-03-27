@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated, Any
 
 from arq.connections import RedisSettings
-from pydantic import Field, HttpUrl, SecretStr
+from pydantic import BeforeValidator, Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from safir.arq import ArqMode, build_arq_redis_settings
 from safir.logging import LogLevel, Profile
 from safir.pydantic import EnvRedisDsn
 
 __all__ = ["Configuration", "config"]
+
+
+def _parse_comma_separated(v: Any) -> Any:
+    """Parse a comma-separated string into a list of strings."""
+    if isinstance(v, str):
+        return [item.strip() for item in v.split(",") if item.strip()]
+    return v
 
 
 class Configuration(BaseSettings):
@@ -62,6 +70,25 @@ class Configuration(BaseSettings):
         validation_alias="REPERTOIRE_BASE_URL",
     )
 
+    credential_encryption_key: SecretStr = Field(
+        title="Fernet key for encrypting organization credentials",
+        description=(
+            "A base64url-encoded 32-byte Fernet key. Generate with"
+            " ``python -c 'from cryptography.fernet import Fernet;"
+            " print(Fernet.generate_key().decode())'``."
+        ),
+    )
+
+    credential_encryption_key_retired: SecretStr | None = Field(
+        None,
+        title="Retired Fernet key for credential rotation",
+        description=(
+            "When rotating keys, set the old key here so existing"
+            " credentials can still be decrypted. Remove after all"
+            " credentials have been re-encrypted."
+        ),
+    )
+
     arq_mode: ArqMode = Field(
         ArqMode.production,
         title="arq queue mode",
@@ -84,6 +111,17 @@ class Configuration(BaseSettings):
     arq_queue_name: str = Field(
         "docverse:queue",
         title="Name of the arq queue",
+    )
+
+    superadmin_usernames: Annotated[
+        list[str], BeforeValidator(_parse_comma_separated)
+    ] = Field(
+        default_factory=list,
+        title="Usernames with super admin access",
+        description=(
+            "Users in this list have de facto admin access to all"
+            " organizations. Comma-separated when set via env var."
+        ),
     )
 
     @property

@@ -6,14 +6,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
-from docverse.client.models import OrganizationCreate, OrganizationUpdate
+from docverse.client.models import OrganizationCreate
+from docverse.dependencies.auth import require_superadmin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import OrgSlugParam
 
 from .models import Organization
 
-router = APIRouter(tags=["admin"])
+router = APIRouter(tags=["admin"], dependencies=[Depends(require_superadmin)])
 
 
 @router.post(
@@ -34,7 +35,17 @@ async def post_organization(
             msg = f"Organization with slug {data.slug!r} already exists"
             raise ConflictError(msg)
         org = await service.create(data)
+        if data.members:
+            membership_store = context.factory.create_membership_store()
+            seen: set[tuple[str, str]] = set()
+            for member in data.members:
+                key = (member.principal_type, member.principal)
+                if key in seen:
+                    continue
+                seen.add(key)
+                await membership_store.create(org_id=org.id, data=member)
         await context.session.commit()
+    # New org has no services yet, so no need to load them
     return Organization.from_domain(org, context.request)
 
 
@@ -50,7 +61,14 @@ async def get_organizations(
     async with context.session.begin():
         service = context.factory.create_organization_service()
         orgs = await service.list_all()
-    return [Organization.from_domain(o, context.request) for o in orgs]
+        service_store = context.factory.create_service_store()
+        results: list[Organization] = []
+        for o in orgs:
+            services = await service_store.list_by_org(o.id)
+            results.append(
+                Organization.from_domain(o, context.request, services=services)
+            )
+    return results
 
 
 @router.get(
@@ -69,28 +87,9 @@ async def get_organization(
         if org is None:
             msg = f"Organization {org_slug!r} not found"
             raise NotFoundError(msg)
-    return Organization.from_domain(org, context.request)
-
-
-@router.patch(
-    "/admin/orgs/{org}",
-    response_model=Organization,
-    summary="Update an organization",
-    name="admin_patch_organization",
-)
-async def patch_organization(
-    org_slug: OrgSlugParam,
-    data: OrganizationUpdate,
-    context: Annotated[RequestContext, Depends(context_dependency)],
-) -> Organization:
-    async with context.session.begin():
-        service = context.factory.create_organization_service()
-        org = await service.update(org_slug, data)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        await context.session.commit()
-    return Organization.from_domain(org, context.request)
+        service_store = context.factory.create_service_store()
+        services = await service_store.list_by_org(org.id)
+    return Organization.from_domain(org, context.request, services=services)
 
 
 @router.delete(

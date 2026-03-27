@@ -20,7 +20,7 @@ class QueueJob(_QueueJobBase):
         job_id_str = serialize_base32_id(domain.public_id)
         return cls(
             self_url=str(request.url_for("get_queue_job", job=job_id_str)),
-            id=domain.public_id,
+            id=job_id_str,
             kind=domain.kind,
             status=domain.status,
             phase=domain.phase,

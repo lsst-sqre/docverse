@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import click
 import structlog
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from safir.database import (
     create_database_engine,
     is_database_current,
@@ -17,7 +20,7 @@ from safir.database import (
 from safir.logging import configure_logging
 
 from .config import config
-from .database import init_database
+from .database import check_database_state, get_current_revision, init_database
 
 __all__ = ["help", "main"]
 
@@ -70,10 +73,48 @@ def help(ctx: click.Context, /, topic: None | str, **kw: Any) -> None:
 def init(*, alembic_config_path: Path, reset: bool) -> None:
     """Initialize the SQL database storage."""
     logger = structlog.get_logger("docverse")
+
+    app_version = importlib.metadata.version("docverse")
+
+    if reset:
+        logger.debug("Reinitializing database (reset)")
+        asyncio.run(init_database(config, logger, reset=True))
+        stamp_database(alembic_config_path)
+        revision = asyncio.run(_log_version_and_revision(logger, app_version))
+        logger.debug(
+            "Finished reinitializing database",
+            app_version=app_version,
+            db_revision=revision,
+        )
+        return
+
+    db_state = asyncio.run(check_database_state(config))
+
+    if db_state.has_orm_tables and db_state.has_alembic_version:
+        msg = (
+            "Database already initialized and tracked by Alembic. "
+            "Use 'docverse-admin update-db-schema' to apply migrations, "
+            "or 'docverse-admin init --reset' to reinitialize."
+        )
+        raise click.ClickException(msg)
+
+    if db_state.has_orm_tables and not db_state.has_alembic_version:
+        msg = (
+            "Database has existing tables but no Alembic tracking. "
+            "Use 'docverse-admin init --reset' to reinitialize."
+        )
+        raise click.ClickException(msg)
+
+    # Fresh database — create tables and stamp
     logger.debug("Initializing database")
-    asyncio.run(init_database(config, logger, reset=reset))
+    asyncio.run(init_database(config, logger, reset=False))
     stamp_database(alembic_config_path)
-    logger.debug("Finished initializing data stores")
+    revision = asyncio.run(_log_version_and_revision(logger, app_version))
+    logger.debug(
+        "Finished initializing database",
+        app_version=app_version,
+        db_revision=revision,
+    )
 
 
 @main.command()
@@ -85,10 +126,34 @@ def init(*, alembic_config_path: Path, reset: bool) -> None:
 )
 def update_db_schema(*, alembic_config_path: Path) -> None:
     """Update the SQL database schema."""
+    logger = structlog.get_logger("docverse")
+    app_version = importlib.metadata.version("docverse")
+
+    alembic_config = Config(str(alembic_config_path))
+    alembic_scripts = ScriptDirectory.from_config(alembic_config)
+    head_rev = alembic_scripts.get_current_head()
+    current_rev = asyncio.run(_cli_get_current_revision())
+
+    logger.info(
+        "Starting database schema update",
+        app_version=app_version,
+        current_revision=current_rev,
+        target_revision=head_rev,
+    )
+
     subprocess.run(
         ["alembic", "upgrade", "head"],
         check=True,
         cwd=str(alembic_config_path.parent),
+    )
+
+    new_rev = asyncio.run(_cli_get_current_revision())
+
+    logger.info(
+        "Database schema update complete",
+        app_version=app_version,
+        previous_revision=current_rev,
+        current_revision=new_rev,
     )
 
 
@@ -110,3 +175,34 @@ def validate_db_schema(*, alembic_config_path: Path) -> None:
     ):
         msg = "Database schema is not current"
         raise click.ClickException(msg)
+
+
+async def _cli_get_current_revision() -> str | None:
+    """Get the current Alembic revision, creating a temporary engine."""
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        return await get_current_revision(engine)
+    finally:
+        await engine.dispose()
+
+
+async def _log_version_and_revision(
+    logger: structlog.stdlib.BoundLogger,
+    app_version: str,
+) -> str | None:
+    """Log app version and DB schema revision."""
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        revision = await get_current_revision(engine)
+    finally:
+        await engine.dispose()
+    logger.info(
+        "Docverse initialized",
+        app_version=app_version,
+        db_revision=revision,
+    )
+    return revision

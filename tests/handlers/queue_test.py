@@ -28,6 +28,7 @@ async def test_get_queue_job(
             "title": "Test Organization",
             "base_domain": "test.example.com",
         },
+        headers={"X-Auth-Request-User": "superadmin"},
     )
     assert org_response.status_code == 201
 
@@ -89,6 +90,7 @@ async def test_get_queue_job_in_progress(
             "title": "Test Organization 2",
             "base_domain": "test2.example.com",
         },
+        headers={"X-Auth-Request-User": "superadmin"},
     )
 
     # Create and start a queue job.

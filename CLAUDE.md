@@ -14,7 +14,7 @@ This repository was originally created for LTD Keeper. During the codebase migra
 - **Lint a specific file**: `uv run --only-group=lint ruff check path/to/file.py`
 - **Format a specific file**: `uv run --only-group=lint ruff format path/to/file.py`
 - **Type checking**: `uv run --only-group=nox nox -s typing`
-- **Server tests**: `uv run --only-group=nox nox -s test`
+- **Server tests**: `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test`
 - **Client tests**: `uv run --only-group=nox nox -s client_test`
 - **Running specific tests**: pass pytest args after `--`, e.g. `uv run --only-group=nox nox -s test -- tests/path/to/test_file.py`
 

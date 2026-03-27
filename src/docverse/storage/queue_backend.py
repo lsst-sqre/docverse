@@ -8,6 +8,7 @@ from safir.arq import ArqQueue, JobMetadata, JobNotFound, JobResultUnavailable
 
 __all__ = [
     "ArqQueueBackend",
+    "NullQueueBackend",
     "QueueBackend",
 ]
 
@@ -77,14 +78,53 @@ class QueueBackend(Protocol):
         ...
 
 
+class NullQueueBackend:
+    """No-op queue backend for worker contexts.
+
+    Used when constructing a BuildService that only needs
+    status-transition methods, not job enqueueing.
+    """
+
+    async def enqueue(
+        self,
+        job_type: str,  # noqa: ARG002
+        payload: dict[str, Any],  # noqa: ARG002
+        *,
+        queue_name: str | None = None,  # noqa: ARG002
+    ) -> str:
+        """Raise because this backend cannot enqueue."""
+        msg = "NullQueueBackend cannot enqueue jobs"
+        raise RuntimeError(msg)
+
+    async def get_job_metadata(
+        self,
+        backend_job_id: str,  # noqa: ARG002
+    ) -> dict[str, Any] | None:
+        """Return None (no backend)."""
+        return None
+
+    async def get_job_result(
+        self,
+        backend_job_id: str,  # noqa: ARG002
+    ) -> object | None:
+        """Return None (no backend)."""
+        return None
+
+
 class ArqQueueBackend:
     """Queue backend wrapping safir's ArqQueue.
 
     Works with both RedisArqQueue and MockArqQueue.
     """
 
-    def __init__(self, arq_queue: ArqQueue) -> None:
+    def __init__(
+        self,
+        arq_queue: ArqQueue,
+        *,
+        default_queue_name: str = "arq:queue",
+    ) -> None:
         self._arq_queue = arq_queue
+        self._default_queue_name = default_queue_name
 
     async def enqueue(
         self,
@@ -95,7 +135,9 @@ class ArqQueueBackend:
     ) -> str:
         """Enqueue a job via arq."""
         metadata: JobMetadata = await self._arq_queue.enqueue(
-            job_type, _queue_name=queue_name, **payload
+            job_type,
+            _queue_name=queue_name or self._default_queue_name,
+            payload=payload,
         )
         return metadata.id
 

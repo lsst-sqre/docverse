@@ -158,11 +158,15 @@ async def test_resolve_role_user(
                 role=OrgRole.uploader,
             ),
         )
-        role = await membership_store.resolve_role(
+        result = await membership_store.resolve_role(
             org_id=org_id, username="alice", groups=[]
         )
         await db_session.commit()
+    assert result is not None
+    role, principal_type, group_name = result
     assert role == OrgRole.uploader
+    assert principal_type == PrincipalType.user
+    assert group_name is None
 
 
 @pytest.mark.asyncio
@@ -190,11 +194,15 @@ async def test_resolve_role_highest_wins(
                 role=OrgRole.admin,
             ),
         )
-        role = await membership_store.resolve_role(
+        result = await membership_store.resolve_role(
             org_id=org_id, username="alice", groups=["g_admins"]
         )
         await db_session.commit()
+    assert result is not None
+    role, principal_type, group_name = result
     assert role == OrgRole.admin
+    assert principal_type == PrincipalType.group
+    assert group_name == "g_admins"
 
 
 @pytest.mark.asyncio
@@ -204,8 +212,8 @@ async def test_resolve_role_no_membership(
 ) -> None:
     async with db_session.begin():
         org_id = await _create_org(db_session)
-        role = await membership_store.resolve_role(
+        result = await membership_store.resolve_role(
             org_id=org_id, username="nobody", groups=[]
         )
         await db_session.commit()
-    assert role is None
+    assert result is None

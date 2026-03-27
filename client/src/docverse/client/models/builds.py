@@ -8,8 +8,6 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .base32id import Base32Id
-
 __all__ = [
     "Build",
     "BuildCreate",
@@ -23,6 +21,13 @@ class BuildStatus(StrEnum):
 
     pending = "pending"
     uploaded = "uploaded"
+    """Signal value used in PATCH requests to indicate upload completion.
+
+    This status is never persisted to the database. The server transitions
+    the build directly from ``pending`` to ``processing`` when it receives
+    this signal.
+    """
+
     processing = "processing"
     completed = "completed"
     failed = "failed"
@@ -76,7 +81,7 @@ class Build(BaseModel):
 
     project_url: str = Field(description="URL to the parent project.")
 
-    id: Base32Id = Field(
+    id: str = Field(
         description="Public Crockford Base32 identifier for the build."
     )
 

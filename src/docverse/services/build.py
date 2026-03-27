@@ -6,7 +6,7 @@ import structlog
 from safir.database import CountedPaginatedList
 
 from docverse.client.models import BuildCreate, BuildStatus, JobKind
-from docverse.domain.base32id import validate_base32_id
+from docverse.domain.base32id import serialize_base32_id, validate_base32_id
 from docverse.domain.build import Build
 from docverse.domain.project import Project
 from docverse.domain.queue import QueueJob
@@ -88,8 +88,9 @@ class BuildService:
         )
         self._logger.info(
             "Created build",
-            build_id=build.id,
-            project_id=project.id,
+            build=serialize_base32_id(build.public_id),
+            org=org_slug,
+            project=project_slug,
             git_ref=data.git_ref,
         )
         return build
@@ -121,15 +122,20 @@ class BuildService:
         )
         self._logger.info(
             "Build upload complete, transitioning to processing",
-            build_id=build.id,
+            build=build_id,
+            org=org_slug,
+            project=project_slug,
         )
 
         backend_job_id = await self._queue_backend.enqueue(
             "build_processing",
             {
                 "org_id": project.org_id,
+                "org_slug": org_slug,
                 "project_id": project.id,
+                "project_slug": project_slug,
                 "build_id": build.id,
+                "build_public_id": serialize_base32_id(build.public_id),
             },
         )
         queue_job = await self._queue_job_store.create(
@@ -178,7 +184,10 @@ class BuildService:
         build = await self._store.transition_status(
             build_id=build_id, new_status=BuildStatus.completed
         )
-        self._logger.info("Build completed", build_id=build_id)
+        self._logger.info(
+            "Build completed",
+            build=serialize_base32_id(build.public_id),
+        )
         return build
 
     async def fail(self, *, build_id: int) -> Build:
@@ -186,7 +195,9 @@ class BuildService:
         build = await self._store.transition_status(
             build_id=build_id, new_status=BuildStatus.failed
         )
-        self._logger.info("Build failed", build_id=build_id)
+        self._logger.info(
+            "Build failed", build=serialize_base32_id(build.public_id)
+        )
         return build
 
     async def soft_delete(
@@ -214,4 +225,9 @@ class BuildService:
         if not deleted:
             msg = f"Build {build_id!r} not found"
             raise NotFoundError(msg)
-        self._logger.info("Soft-deleted build", build_id=build.id)
+        self._logger.info(
+            "Soft-deleted build",
+            build=build_id,
+            org=org_slug,
+            project=project_slug,
+        )

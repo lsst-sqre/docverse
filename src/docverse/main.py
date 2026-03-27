@@ -8,20 +8,25 @@ from importlib.metadata import metadata, version
 
 import structlog
 from fastapi import FastAPI
+from rubin.gafaelfawr import GafaelfawrClient
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
+from safir.dependencies.http_client import http_client_dependency
 from safir.fastapi import ClientRequestError, client_request_error_handler
 from safir.logging import configure_logging, configure_uvicorn_logging
 from safir.middleware.x_forwarded import XForwardedMiddleware
 from safir.slack.webhook import SlackRouteErrorHandler
 
 from .config import config
+from .database import get_current_revision
 from .dependencies.context import context_dependency
 from .handlers.admin import admin_router
 from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
+from .services.credential_encryptor import CredentialEncryptor
+from .storage.user_info_store import GafaelfawrUserInfoStore
 
 __all__ = ["app"]
 
@@ -46,7 +51,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
     ):
         msg = "Database schema is not current."
         raise RuntimeError(msg)
+    db_revision = await get_current_revision(engine)
     await engine.dispose()
+    logger.info(
+        "Docverse startup",
+        app_version=version("docverse"),
+        db_revision=db_revision,
+    )
 
     await db_session_dependency.initialize(
         config.database_url,
@@ -56,9 +67,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         mode=config.arq_mode,
         redis_settings=config.arq_redis_settings,
     )
-    await context_dependency.initialize()
+
+    retired_key = (
+        config.credential_encryption_key_retired.get_secret_value()
+        if config.credential_encryption_key_retired
+        else None
+    )
+    encryptor = CredentialEncryptor(
+        current_key=config.credential_encryption_key.get_secret_value(),
+        retired_key=retired_key,
+    )
+
+    http_client = await http_client_dependency()
+    gafaelfawr_client = GafaelfawrClient(http_client)
+    user_info_store = GafaelfawrUserInfoStore(gafaelfawr_client)
+
+    await context_dependency.initialize(
+        credential_encryptor=encryptor,
+        superadmin_usernames=config.superadmin_usernames,
+        user_info_store=user_info_store,
+        arq_queue_name=config.arq_queue_name,
+    )
     yield
     await context_dependency.aclose()
+    await http_client_dependency.aclose()
     await db_session_dependency.aclose()
 
 

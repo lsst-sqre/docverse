@@ -1,38 +1,12 @@
-"""Tests for the GET /orgs/:org endpoint."""
+"""Tests for the /orgs/:org endpoint."""
 
 from __future__ import annotations
 
 import pytest
-import structlog
 from httpx import AsyncClient
-from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
-from docverse.storage.membership_store import OrgMembershipStore
-from docverse.storage.organization_store import OrganizationStore
-from tests.conftest import seed_org_with_admin
-
-
-async def _seed_reader(org_slug: str, username: str) -> None:
-    """Seed a reader membership directly via DB."""
-    logger = structlog.get_logger("docverse")
-    async for session in db_session_dependency():
-        async with session.begin():
-            org_store = OrganizationStore(session=session, logger=logger)
-            org = await org_store.get_by_slug(org_slug)
-            assert org is not None
-            membership_store = OrgMembershipStore(
-                session=session, logger=logger
-            )
-            await membership_store.create(
-                org_id=org.id,
-                data=OrgMembershipCreate(
-                    principal=username,
-                    principal_type=PrincipalType.user,
-                    role=OrgRole.reader,
-                ),
-            )
-            await session.commit()
+from docverse.client.models import OrgRole
+from tests.conftest import seed_member, seed_org_with_admin
 
 
 @pytest.mark.asyncio
@@ -56,7 +30,7 @@ async def test_get_organization(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_get_organization_as_reader(client: AsyncClient) -> None:
     await seed_org_with_admin(client, "reader-org", "admin")
-    await _seed_reader("reader-org", "readeruser")
+    await seed_member("reader-org", "readeruser", OrgRole.reader)
     response = await client.get(
         "/docverse/orgs/reader-org",
         headers={"X-Auth-Request-User": "readeruser"},
@@ -92,3 +66,108 @@ async def test_get_organization_no_auth(client: AsyncClient) -> None:
         "/docverse/orgs/noauth-org",
     )
     assert response.status_code == 403
+
+
+# --- PATCH /orgs/{org} tests ---
+
+
+@pytest.mark.asyncio
+async def test_patch_organization(client: AsyncClient) -> None:
+    await seed_org_with_admin(client, "patch-org", "admin")
+    response = await client.patch(
+        "/docverse/orgs/patch-org",
+        json={
+            "title": "Updated Title",
+            "purgatory_retention": 5184000,
+        },
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["title"] == "Updated Title"
+    assert data["purgatory_retention"] == 5184000
+    # Unchanged fields preserved
+    assert data["slug"] == "patch-org"
+    assert data["base_domain"] == "patch-org.example.com"
+    assert data["self_url"].endswith("/orgs/patch-org")
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_not_admin(client: AsyncClient) -> None:
+    await seed_org_with_admin(client, "patch-reader-org", "admin")
+    await seed_member("patch-reader-org", "reader", OrgRole.reader)
+    response = await client.patch(
+        "/docverse/orgs/patch-reader-org",
+        json={"title": "Nope"},
+        headers={"X-Auth-Request-User": "reader"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_unauthorized(client: AsyncClient) -> None:
+    await seed_org_with_admin(client, "patch-unauth-org", "admin")
+    response = await client.patch(
+        "/docverse/orgs/patch-unauth-org",
+        json={"title": "Nope"},
+        headers={"X-Auth-Request-User": "stranger"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_slot_labels(client: AsyncClient) -> None:
+    await seed_org_with_admin(client, "patch-svc-org", "admin")
+    headers = {"X-Auth-Request-User": "admin"}
+    # Create a credential and service
+    await client.post(
+        "/docverse/orgs/patch-svc-org/credentials",
+        json={
+            "label": "aws-cred",
+            "credentials": {
+                "provider": "aws",
+                "access_key_id": "AKIAEXAMPLE",
+                "secret_access_key": "secret",
+            },
+        },
+        headers=headers,
+    )
+    await client.post(
+        "/docverse/orgs/patch-svc-org/services",
+        json={
+            "label": "my-s3",
+            "credential_label": "aws-cred",
+            "config": {
+                "provider": "aws_s3",
+                "bucket": "my-bucket",
+                "region": "us-east-1",
+            },
+        },
+        headers=headers,
+    )
+    # PATCH the slot labels
+    response = await client.patch(
+        "/docverse/orgs/patch-svc-org",
+        json={
+            "publishing_store_label": "my-s3",
+            "staging_store_label": "my-s3",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["publishing_store"]["label"] == "my-s3"
+    assert data["publishing_store"]["category"] == "object_storage"
+    assert "self_url" in data["publishing_store"]
+    assert data["staging_store"]["label"] == "my-s3"
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_not_found(client: AsyncClient) -> None:
+    await seed_org_with_admin(client, "patch-exists-org", "admin")
+    response = await client.patch(
+        "/docverse/orgs/nonexistent",
+        json={"title": "Nope"},
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 404
