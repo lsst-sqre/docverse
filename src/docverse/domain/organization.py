@@ -41,6 +41,13 @@ class Organization(BaseModel):
         description="Rules governing build lifecycle."
     )
 
+    default_edition_config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+        ),
+    )
+
     publishing_store_label: str | None = Field(
         default=None,
         description="Label of the object_storage service for publishing.",

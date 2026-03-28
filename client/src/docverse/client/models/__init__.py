@@ -12,6 +12,7 @@ from .credentials import (
     S3Credentials,
 )
 from .editions import (
+    DefaultEditionConfig,
     Edition,
     EditionCreate,
     EditionKind,
@@ -55,6 +56,7 @@ __all__ = [
     "CloudflareCredentials",
     "CredentialPayload",
     "CredentialProvider",
+    "DefaultEditionConfig",
     "Edition",
     "EditionCreate",
     "EditionKind",

@@ -131,13 +131,13 @@ async def test_edition_kind_filter(
     await _create_edition(client, "ed-filt-proj", "ed-draft-2", "draft")
     await _create_edition(client, "ed-filt-proj", "ed-main", "main")
 
-    # Unfiltered
+    # Unfiltered (3 explicit + 1 auto-created __main)
     resp = await client.get(
         "/docverse/orgs/pag-org/projects/ed-filt-proj/editions",
         headers=AUTH,
     )
     assert resp.status_code == 200
-    assert resp.headers["X-Total-Count"] == "3"
+    assert resp.headers["X-Total-Count"] == "4"
 
     # Filtered to drafts
     resp = await client.get(
@@ -172,7 +172,7 @@ async def test_edition_pagination_forward(
         links = PaginationLinkData.from_header(resp.headers.get("link"))
         url = links.next_url
 
-    assert collected == ["ed-a", "ed-b", "ed-c", "ed-d"]
+    assert collected == ["ed-a", "ed-b", "ed-c", "ed-d", "__main"]
 
 
 # ---------------------------------------------------------------------------

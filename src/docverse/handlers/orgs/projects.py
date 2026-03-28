@@ -118,9 +118,13 @@ async def post_project(
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        project = await service.create(org_slug=org_slug, data=data)
+        project, default_edition = await service.create(
+            org_slug=org_slug, data=data
+        )
         await context.session.commit()
-    return Project.from_domain(project, context.request, org_slug)
+    return Project.from_domain(
+        project, context.request, org_slug, default_edition=default_edition
+    )
 
 
 @router.get(
@@ -140,7 +144,10 @@ async def get_project(
         project = await service.get_by_slug(
             org_slug=org_slug, slug=project_slug
         )
-    return Project.from_domain(project, context.request, org_slug)
+        default_edition = await service.get_default_edition(project.id)
+    return Project.from_domain(
+        project, context.request, org_slug, default_edition=default_edition
+    )
 
 
 @router.patch(
@@ -161,8 +168,11 @@ async def patch_project(
         project = await service.update(
             org_slug=org_slug, slug=project_slug, data=data
         )
+        default_edition = await service.get_default_edition(project.id)
         await context.session.commit()
-    return Project.from_domain(project, context.request, org_slug)
+    return Project.from_domain(
+        project, context.request, org_slug, default_edition=default_edition
+    )
 
 
 @router.delete(

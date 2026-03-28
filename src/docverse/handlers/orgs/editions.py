@@ -13,6 +13,7 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.exceptions import PermissionDeniedError
 from docverse.handlers.params import (
     EditionSlugParam,
     OrgSlugParam,
@@ -153,6 +154,9 @@ async def patch_edition(  # noqa: PLR0913
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> Edition:
+    if edition_slug == "__main" and data.kind is not None:
+        msg = "Cannot change the kind of the default '__main' edition"
+        raise PermissionDeniedError(msg)
     async with context.session.begin():
         service = context.factory.create_edition_service()
         edition = await service.update(
@@ -180,6 +184,9 @@ async def delete_edition(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:
+    if edition_slug == "__main":
+        msg = "The default edition '__main' cannot be deleted"
+        raise PermissionDeniedError(msg)
     async with context.session.begin():
         service = context.factory.create_edition_service()
         await service.soft_delete(

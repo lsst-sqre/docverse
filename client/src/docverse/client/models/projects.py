@@ -7,6 +7,9 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .editions import DefaultEditionConfig
+from .editions import Edition as EditionResponse
+
 
 class ProjectCreate(BaseModel):
     """Request model for creating a project."""
@@ -42,6 +45,14 @@ class ProjectCreate(BaseModel):
         ),
     ]
 
+    default_edition: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Configuration for the default edition. If omitted, the"
+            " organization default or hardcoded default is used."
+        ),
+    )
+
 
 class Project(BaseModel):
     """Response model for a project."""
@@ -74,6 +85,15 @@ class Project(BaseModel):
     lifecycle_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
+    )
+
+    default_edition: EditionResponse | None = Field(
+        default=None,
+        description=(
+            "The default (__main) edition for this project. Populated on"
+            " single-project responses (GET, POST, PATCH) but omitted"
+            " from list responses."
+        ),
     )
 
     date_created: datetime = Field(

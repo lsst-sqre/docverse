@@ -24,6 +24,9 @@ class OrganizationStore:
 
     async def create(self, data: OrganizationCreate) -> Organization:
         """Insert a new organization row."""
+        default_edition_config = None
+        if data.default_edition_config is not None:
+            default_edition_config = data.default_edition_config.model_dump()
         row = SqlOrganization(
             slug=data.slug,
             title=data.title,
@@ -32,6 +35,7 @@ class OrganizationStore:
             root_path_prefix=data.root_path_prefix,
             slug_rewrite_rules=data.slug_rewrite_rules,
             lifecycle_rules=data.lifecycle_rules,
+            default_edition_config=default_edition_config,
             purgatory_retention=data.purgatory_retention,
         )
         self._session.add(row)

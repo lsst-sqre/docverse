@@ -90,6 +90,37 @@ class EditionStore:
         await self._session.refresh(row)
         return self._validate(row, None)
 
+    async def create_internal(  # noqa: PLR0913
+        self,
+        *,
+        project_id: int,
+        slug: str,
+        title: str,
+        kind: EditionKind,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any] | None = None,
+        lifecycle_exempt: bool = False,
+    ) -> Edition:
+        """Insert an edition row, bypassing slug validation.
+
+        Used for system-created editions like ``__main`` where the slug
+        does not conform to the user-facing pattern constraints in
+        ``EditionCreate``.
+        """
+        row = SqlEdition(
+            slug=slug,
+            title=title,
+            project_id=project_id,
+            kind=kind,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+            lifecycle_exempt=lifecycle_exempt,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return self._validate(row, None)
+
     async def get_by_slug(
         self, *, project_id: int, slug: str
     ) -> Edition | None:

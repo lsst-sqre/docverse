@@ -137,3 +137,83 @@ async def test_delete_edition(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_default_edition(client: AsyncClient) -> None:
+    """The __main edition is accessible via GET."""
+    await _setup(client)
+    response = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["slug"] == "__main"
+    assert data["kind"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_delete_default_edition_blocked(client: AsyncClient) -> None:
+    """DELETE __main returns 403."""
+    await _setup(client)
+    response = await client.delete(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_patch_default_edition_kind_blocked(
+    client: AsyncClient,
+) -> None:
+    """PATCH __main with kind returns 403."""
+    await _setup(client)
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        json={"kind": "draft"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_patch_default_edition_allowed_fields(
+    client: AsyncClient,
+) -> None:
+    """PATCH __main with title/tracking_mode succeeds."""
+    await _setup(client)
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        json={
+            "title": "Updated Main",
+            "tracking_mode": "lsst_doc",
+            "lifecycle_exempt": False,
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["title"] == "Updated Main"
+    assert data["tracking_mode"] == "lsst_doc"
+    assert data["lifecycle_exempt"] is False
+
+
+@pytest.mark.asyncio
+async def test_user_cannot_create_dunder_edition(
+    client: AsyncClient,
+) -> None:
+    """POST edition with __main slug returns 422 (Pydantic rejects it)."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "__main",
+            "title": "Sneaky",
+            "kind": "main",
+            "tracking_mode": "git_ref",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422

@@ -8,6 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .editions import DefaultEditionConfig
 from .memberships import OrgMembershipCreate
 from .services import OrganizationServiceSummary
 
@@ -105,6 +106,14 @@ class OrganizationCreate(BaseModel):
         description="Label of the dns service.",
     )
 
+    default_edition_config: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+            " Used when a project creation request omits its own config."
+        ),
+    )
+
     members: list[OrgMembershipCreate] = Field(
         default_factory=list,
         description="Initial members to add to the organization.",
@@ -140,6 +149,13 @@ class Organization(BaseModel):
 
     lifecycle_rules: list[dict[str, Any]] | None = Field(
         description="Rules governing build lifecycle."
+    )
+
+    default_edition_config: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+        ),
     )
 
     purgatory_retention: int = Field(
@@ -244,4 +260,11 @@ class OrganizationUpdate(BaseModel):
     dns_service_label: str | None = Field(
         default=None,
         description="Label of the dns service.",
+    )
+
+    default_edition_config: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+        ),
     )

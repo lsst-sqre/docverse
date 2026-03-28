@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "DefaultEditionConfig",
     "Edition",
     "EditionCreate",
     "EditionKind",
@@ -40,6 +41,46 @@ class TrackingMode(StrEnum):
     semver_major = "semver_major"
     semver_minor = "semver_minor"
     alternate_git_ref = "alternate_git_ref"
+
+
+class DefaultEditionConfig(BaseModel):
+    """Configuration for the default (__main) edition's tracking behavior.
+
+    Used in project creation requests and as an organization-level default.
+    When omitted from a project creation request, the organization's
+    default config is used; when the organization has none, the hardcoded
+    fallback is ``git_ref`` tracking the ``main`` branch.
+    """
+
+    tracking_mode: TrackingMode = Field(
+        default=TrackingMode.git_ref,
+        description="How the default edition tracks builds.",
+    )
+
+    tracking_params: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Parameters for the tracking mode. When None and tracking_mode"
+            " is git_ref, defaults to {'git_ref': 'main'} at the service"
+            " layer."
+        ),
+    )
+
+    title: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=256,
+            description="Display title for the default edition.",
+        ),
+    ] = "Main"
+
+    lifecycle_exempt: bool = Field(
+        default=True,
+        description=(
+            "Whether the default edition is exempt from lifecycle rules."
+        ),
+    )
 
 
 class EditionCreate(BaseModel):

@@ -79,8 +79,14 @@ class Factory(ABC):
         """Create a ProjectService."""
         store = self._create_project_store()
         org_store = self._create_org_store()
+        edition_store = EditionStore(
+            session=self._session, logger=self._logger
+        )
         return ProjectService(
-            store=store, org_store=org_store, logger=self._logger
+            store=store,
+            org_store=org_store,
+            edition_store=edition_store,
+            logger=self._logger,
         )
 
     def create_build_service(self) -> BuildService:
