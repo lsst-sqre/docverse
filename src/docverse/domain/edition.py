@@ -51,6 +51,13 @@ class Edition(BaseModel):
         ),
     )
 
+    current_build_git_ref: str | None = Field(
+        default=None,
+        description=(
+            "Git ref of the currently published build. Populated via join."
+        ),
+    )
+
     lifecycle_exempt: bool = Field(
         default=False,
         description="Whether this edition is exempt from lifecycle rules.",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import structlog
@@ -24,6 +25,8 @@ from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import EditionSlugCursor
 from docverse.storage.project_store import ProjectStore
+
+_HASH = "sha256:" + "a" * 64
 
 
 @pytest.fixture
@@ -552,3 +555,330 @@ async def test_find_matching_editions_no_alternate_vs_alternate_edition(
         )
         await db_session.commit()
     assert len(matched) == 0
+
+
+# ── Version-based matching ─────────────────────────────────────────────────
+
+
+async def _create_edition_internal(
+    edition_store: EditionStore,
+    project_id: int,
+    *,
+    slug: str,
+    kind: EditionKind,
+    tracking_mode: TrackingMode,
+    tracking_params: dict[str, Any] | None = None,
+    build_id: int | None = None,
+) -> int:
+    """Create an edition via create_internal, optionally setting a build."""
+    edition = await edition_store.create_internal(
+        project_id=project_id,
+        slug=slug,
+        title=slug,
+        kind=kind,
+        tracking_mode=tracking_mode,
+        tracking_params=tracking_params,
+    )
+    if build_id is not None:
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build_id
+        )
+    return edition.id
+
+
+@pytest.mark.asyncio
+async def test_find_matching_semver_release(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """semver_release matches stable semver tags, not prereleases."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="latest",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.semver_release,
+        )
+
+        # Stable tag matches
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v1.0.0"
+        )
+        assert len(matched) == 1
+
+        # Prerelease does NOT match
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v1.0.0-rc.1"
+        )
+        assert len(matched) == 0
+
+        # Non-semver does NOT match
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_semver_major(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """semver_major matches stable tags with the correct major version."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="2",
+            kind=EditionKind.major,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 2},
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v2.1.0"
+        )
+        assert len(matched) == 1
+
+        # Wrong major
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v3.0.0"
+        )
+        assert len(matched) == 0
+
+        # Prerelease
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v2.0.0-rc.1"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_semver_minor(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """semver_minor matches stable tags with correct major+minor."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="2.1",
+            kind=EditionKind.minor,
+            tracking_mode=TrackingMode.semver_minor,
+            tracking_params={"major_version": 2, "minor_version": 1},
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v2.1.5"
+        )
+        assert len(matched) == 1
+
+        # Wrong minor
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v2.2.0"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_eups_major(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """eups_major_release matches EUPS major version tags."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="eups-latest",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.eups_major_release,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v12_0"
+        )
+        assert len(matched) == 1
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_eups_weekly(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """eups_weekly_release matches EUPS weekly tags."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="weekly",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.eups_weekly_release,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="w_2024_05"
+        )
+        assert len(matched) == 1
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v12_0"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_eups_daily(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """eups_daily_release matches EUPS daily tags."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="daily",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.eups_daily_release,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="d_2024_01_15"
+        )
+        assert len(matched) == 1
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="w_2024_05"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_version(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc matches document version tags."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="v1.0"
+        )
+        assert len(matched) == 1
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_main_unpublished(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc accepts main when edition is unpublished."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main"
+        )
+        assert len(matched) == 1
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_main_when_showing_main(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc accepts main when currently showing main."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        main_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug="current",
+            title="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=main_build.id
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main"
+        )
+        assert len(matched) == 1
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_main_rejected_when_showing_version(
+    db_session: async_scoped_session[AsyncSession],
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc rejects main when currently showing a version tag."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        version_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="v1.0", content_hash=_HASH),
+            uploader="testuser",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug="current",
+            title="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=version_build.id
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main"
+        )
+        assert len(matched) == 0
+        await db_session.commit()
