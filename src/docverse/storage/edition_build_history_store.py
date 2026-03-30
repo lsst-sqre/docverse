@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import structlog
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
+from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
-from docverse.domain.edition_build_history import EditionBuildHistory
+from docverse.domain.edition_build_history import (
+    EditionBuildHistory,
+    EditionBuildHistoryWithBuild,
+)
+from docverse.storage.pagination import EditionBuildHistoryPositionCursor
 
 
 class EditionBuildHistoryStore:
@@ -64,3 +70,58 @@ class EditionBuildHistoryStore:
         return [
             EditionBuildHistory.model_validate(r) for r in result.scalars()
         ]
+
+    async def list_by_edition_with_build_info(
+        self,
+        edition_id: int,
+        *,
+        cursor: EditionBuildHistoryPositionCursor | None = None,
+        limit: int,
+        include_deleted: bool = False,
+    ) -> CountedPaginatedList[
+        EditionBuildHistoryWithBuild, EditionBuildHistoryPositionCursor
+    ]:
+        """List history entries with joined build metadata.
+
+        Parameters
+        ----------
+        edition_id
+            The edition to list history for.
+        cursor
+            Pagination cursor.
+        limit
+            Maximum number of results.
+        include_deleted
+            When ``False`` (default), history entries whose build has been
+            soft-deleted are excluded.
+
+        Returns paginated results ordered by position ASC (most recent
+        first).
+        """
+        stmt = (
+            select(
+                SqlEditionBuildHistory.id,
+                SqlEditionBuildHistory.edition_id,
+                SqlEditionBuildHistory.build_id,
+                SqlBuild.public_id.label("build_public_id"),
+                SqlBuild.git_ref.label("build_git_ref"),
+                SqlBuild.status.label("build_status"),
+                SqlBuild.date_deleted.label("build_date_deleted"),
+                SqlEditionBuildHistory.position,
+                SqlEditionBuildHistory.date_created,
+            )
+            .join(
+                SqlBuild,
+                SqlEditionBuildHistory.build_id == SqlBuild.id,
+            )
+            .where(SqlEditionBuildHistory.edition_id == edition_id)
+        )
+        if not include_deleted:
+            stmt = stmt.where(SqlBuild.date_deleted.is_(None))
+        runner = CountedPaginatedQueryRunner(
+            entry_type=EditionBuildHistoryWithBuild,
+            cursor_type=EditionBuildHistoryPositionCursor,
+        )
+        return await runner.query_row(
+            self._session, stmt, cursor=cursor, limit=limit
+        )

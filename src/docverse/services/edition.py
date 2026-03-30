@@ -7,9 +7,14 @@ from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
 from docverse.domain.edition import Edition
+from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.exceptions import ConflictError, NotFoundError
+from docverse.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.pagination import EditionBuildHistoryPositionCursor
 from docverse.storage.project_store import ProjectStore
 
 
@@ -22,11 +27,13 @@ class EditionService:
         org_store: OrganizationStore,
         project_store: ProjectStore,
         logger: structlog.stdlib.BoundLogger,
+        history_store: EditionBuildHistoryStore,
     ) -> None:
         self._store = store
         self._org_store = org_store
         self._project_store = project_store
         self._logger = logger
+        self._history_store = history_store
 
     async def _resolve_project_id(
         self, org_slug: str, project_slug: str
@@ -171,6 +178,34 @@ class EditionService:
                 build_id=build_id,
             )
         return edition
+
+    async def list_history(  # noqa: PLR0913
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        edition_slug: str,
+        cursor: EditionBuildHistoryPositionCursor | None = None,
+        limit: int,
+        include_deleted: bool = False,
+    ) -> CountedPaginatedList[
+        EditionBuildHistoryWithBuild,
+        EditionBuildHistoryPositionCursor,
+    ]:
+        """List build history for an edition."""
+        project_id = await self._resolve_project_id(org_slug, project_slug)
+        edition = await self._store.get_by_slug(
+            project_id=project_id, slug=edition_slug
+        )
+        if edition is None:
+            msg = f"Edition {edition_slug!r} not found"
+            raise NotFoundError(msg)
+        return await self._history_store.list_by_edition_with_build_info(
+            edition.id,
+            cursor=cursor,
+            limit=limit,
+            include_deleted=include_deleted,
+        )
 
     async def soft_delete(
         self, *, org_slug: str, project_slug: str, slug: str

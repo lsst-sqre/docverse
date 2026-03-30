@@ -181,3 +181,67 @@ async def test_editions_independent(
     # Edition 2 still has one entry at position 1
     assert len(history_ed2) == 1
     assert history_ed2[0].position == 1
+
+
+@pytest.mark.asyncio
+async def test_list_with_build_info_includes_status(
+    db_session: async_scoped_session[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """list_by_edition_with_build_info returns status fields."""
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="status-org"
+        )
+        await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        result = await history_store.list_by_edition_with_build_info(
+            edition_id, limit=10, include_deleted=True
+        )
+        await db_session.commit()
+
+    assert len(result.entries) == 1
+    entry = result.entries[0]
+    assert entry.build_status == "pending"
+    assert entry.build_date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_list_with_build_info_filters_deleted(
+    db_session: async_scoped_session[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """Soft-deleted builds are excluded by default."""
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=2, org_slug="del-org"
+        )
+        await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        await history_store.record(
+            edition_id=edition_id, build_id=build_ids[1]
+        )
+
+        # Soft-delete the first build
+        logger = structlog.get_logger("docverse")
+        build_store = BuildStore(session=db_session, logger=logger)
+        await build_store.soft_delete(build_id=build_ids[0])
+
+        # Default: exclude deleted
+        result_default = await history_store.list_by_edition_with_build_info(
+            edition_id, limit=10
+        )
+        # Explicit include
+        result_all = await history_store.list_by_edition_with_build_info(
+            edition_id, limit=10, include_deleted=True
+        )
+        await db_session.commit()
+
+    assert result_default.count == 1
+    assert result_all.count == 2
+    deleted_entries = [
+        e for e in result_all.entries if e.build_date_deleted is not None
+    ]
+    assert len(deleted_entries) == 1

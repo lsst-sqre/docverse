@@ -14,6 +14,7 @@ from .credentials import (
 from .editions import (
     DefaultEditionConfig,
     Edition,
+    EditionBuildHistoryEntry,
     EditionCreate,
     EditionKind,
     EditionUpdate,
@@ -58,6 +59,7 @@ __all__ = [
     "CredentialProvider",
     "DefaultEditionConfig",
     "Edition",
+    "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
     "EditionUpdate",

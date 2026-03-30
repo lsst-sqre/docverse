@@ -7,24 +7,32 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Self, override
 
-from safir.database import DatetimeIdCursor, PaginationCursor
+from safir.database import (
+    DatetimeIdCursor,
+    InvalidCursorError,
+    PaginationCursor,
+)
 from sqlalchemy import Select
 from sqlalchemy.orm import InstrumentedAttribute
 
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
+from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.dbschema.project import SqlProject
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
+from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.domain.project import Project
 
 __all__ = [
     "BUILD_CURSOR_TYPE",
     "DEFAULT_PAGE_LIMIT",
     "EDITION_CURSOR_TYPES",
+    "EDITION_HISTORY_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
     "BuildDateCreatedCursor",
+    "EditionBuildHistoryPositionCursor",
     "EditionDateCreatedCursor",
     "EditionDateUpdatedCursor",
     "EditionSlugCursor",
@@ -266,10 +274,16 @@ class ProjectSearchCursor(PaginationCursor[Project]):
     @override
     @classmethod
     def from_str(cls, cursor: str) -> Self:
-        previous = cursor.startswith("p__")
-        raw = cursor[3:] if previous else cursor
-        score_str, id_str = raw.split(":", 1)
-        return cls(score=float(score_str), id=int(id_str), previous=previous)
+        try:
+            previous = cursor.startswith("p__")
+            raw = cursor[3:] if previous else cursor
+            score_str, id_str = raw.split(":", 1)
+            return cls(
+                score=float(score_str), id=int(id_str), previous=previous
+            )
+        except (ValueError, TypeError) as exc:
+            msg = f"Invalid cursor: {cursor!r}"
+            raise InvalidCursorError(msg) from exc
 
     @override
     @classmethod
@@ -317,3 +331,68 @@ EDITION_CURSOR_TYPES: dict[
 }
 
 BUILD_CURSOR_TYPE: type[BuildDateCreatedCursor] = BuildDateCreatedCursor
+
+
+# ---------------------------------------------------------------------------
+# Edition build history cursor (position ASC)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class EditionBuildHistoryPositionCursor(
+    PaginationCursor[EditionBuildHistoryWithBuild]
+):
+    """Keyset cursor for edition history ordered by position ASC."""
+
+    position: int
+
+    @override
+    @classmethod
+    def from_entry(
+        cls,
+        entry: EditionBuildHistoryWithBuild,
+        *,
+        reverse: bool = False,
+    ) -> Self:
+        return cls(position=entry.position, previous=reverse)
+
+    @override
+    @classmethod
+    def from_str(cls, cursor: str) -> Self:
+        try:
+            if cursor.startswith("p__"):
+                return cls(position=int(cursor[3:]), previous=True)
+            return cls(position=int(cursor), previous=False)
+        except ValueError as exc:
+            msg = f"Invalid cursor: {cursor!r}"
+            raise InvalidCursorError(msg) from exc
+
+    @override
+    @classmethod
+    def apply_order(
+        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[tuple[Any, ...]]:
+        if reverse:
+            return stmt.order_by(SqlEditionBuildHistory.position.desc())
+        return stmt.order_by(SqlEditionBuildHistory.position)
+
+    @override
+    def apply_cursor(
+        self, stmt: Select[tuple[Any, ...]]
+    ) -> Select[tuple[Any, ...]]:
+        if self.previous:
+            return stmt.where(SqlEditionBuildHistory.position < self.position)
+        return stmt.where(SqlEditionBuildHistory.position >= self.position)
+
+    @override
+    def invert(self) -> Self:
+        return type(self)(position=self.position, previous=not self.previous)
+
+    def __str__(self) -> str:  # noqa: D105
+        prefix = "p__" if self.previous else ""
+        return f"{prefix}{self.position}"
+
+
+EDITION_HISTORY_CURSOR_TYPE: type[EditionBuildHistoryPositionCursor] = (
+    EditionBuildHistoryPositionCursor
+)

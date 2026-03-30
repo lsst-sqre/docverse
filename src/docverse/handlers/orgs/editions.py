@@ -22,11 +22,12 @@ from docverse.handlers.params import (
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     EDITION_CURSOR_TYPES,
+    EDITION_HISTORY_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
     EditionSortOrder,
 )
 
-from .models import Edition
+from .models import Edition, EditionBuildHistoryResponse
 
 router = APIRouter()
 
@@ -138,6 +139,70 @@ async def get_edition(
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
     )
+
+
+@router.get(
+    "/orgs/{org}/projects/{project}/editions/{edition}/history",
+    response_model=list[EditionBuildHistoryResponse],
+    summary="List build history for an edition",
+    name="get_edition_history",
+)
+async def get_edition_history(  # noqa: PLR0913
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    edition_slug: EditionSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    include_deleted: Annotated[  # noqa: FBT002
+        bool,
+        Query(
+            description=(
+                "Include history entries for soft-deleted builds. "
+                "Defaults to false."
+            ),
+        ),
+    ] = False,
+) -> list[EditionBuildHistoryResponse]:
+    parsed_cursor = (
+        EDITION_HISTORY_CURSOR_TYPE.from_str(cursor)
+        if cursor is not None
+        else None
+    )
+    async with context.session.begin():
+        service = context.factory.create_edition_service()
+        result = await service.list_history(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition_slug,
+            cursor=parsed_cursor,
+            limit=limit,
+            include_deleted=include_deleted,
+        )
+    context.response.headers["Link"] = result.link_header(context.request.url)
+    context.response.headers["X-Total-Count"] = str(result.count)
+    return [
+        EditionBuildHistoryResponse.from_domain(
+            entry, context.request, org_slug, project_slug
+        )
+        for entry in result.entries
+    ]
 
 
 @router.patch(

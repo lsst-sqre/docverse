@@ -8,9 +8,12 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .builds import BuildStatus
+
 __all__ = [
     "DefaultEditionConfig",
     "Edition",
+    "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
     "EditionUpdate",
@@ -168,6 +171,32 @@ class Edition(BaseModel):
 
     date_updated: datetime = Field(
         description="Timestamp of the most recent update."
+    )
+
+
+class EditionBuildHistoryEntry(BaseModel):
+    """Response model for an edition build history entry."""
+
+    build_id: str = Field(description="Base32-encoded public ID of the build.")
+
+    build_url: str = Field(description="URL to the build resource.")
+
+    git_ref: str = Field(description="Git reference of the build.")
+
+    build_status: BuildStatus = Field(
+        description="Status of the build at the time of the query."
+    )
+
+    build_deleted: bool = Field(
+        description="Whether the build has been soft-deleted."
+    )
+
+    position: int = Field(
+        description="Position in history; 1 is the most recent."
+    )
+
+    date_created: datetime = Field(
+        description="Timestamp when this history entry was recorded."
     )
 
 

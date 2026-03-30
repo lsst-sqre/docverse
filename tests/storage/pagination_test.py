@@ -9,10 +9,12 @@ from safir.database import InvalidCursorError
 
 from docverse.storage.pagination import (
     BuildDateCreatedCursor,
+    EditionBuildHistoryPositionCursor,
     EditionDateCreatedCursor,
     EditionDateUpdatedCursor,
     EditionSlugCursor,
     ProjectDateCreatedCursor,
+    ProjectSearchCursor,
     ProjectSlugCursor,
 )
 
@@ -135,3 +137,61 @@ def test_build_date_created_cursor_roundtrip() -> None:
     restored = BuildDateCreatedCursor.from_str(str(cursor))
     assert restored.id == 99
     assert restored.previous is False
+
+
+# ---------------------------------------------------------------------------
+# EditionBuildHistoryPositionCursor tests
+# ---------------------------------------------------------------------------
+
+
+def test_history_position_cursor_roundtrip_forward() -> None:
+    """EditionBuildHistoryPositionCursor forward roundtrip."""
+    cursor = EditionBuildHistoryPositionCursor(position=5, previous=False)
+    serialized = str(cursor)
+    assert serialized == "5"
+    restored = EditionBuildHistoryPositionCursor.from_str(serialized)
+    assert restored.position == 5
+    assert restored.previous is False
+
+
+def test_history_position_cursor_roundtrip_previous() -> None:
+    """EditionBuildHistoryPositionCursor previous roundtrip."""
+    cursor = EditionBuildHistoryPositionCursor(position=5, previous=True)
+    serialized = str(cursor)
+    assert serialized == "p__5"
+    restored = EditionBuildHistoryPositionCursor.from_str(serialized)
+    assert restored.position == 5
+    assert restored.previous is True
+
+
+def test_history_position_cursor_invalid() -> None:
+    """Invalid cursor string raises InvalidCursorError."""
+    with pytest.raises(InvalidCursorError):
+        EditionBuildHistoryPositionCursor.from_str("abc")
+
+
+def test_history_position_cursor_invalid_previous() -> None:
+    """Invalid previous cursor string raises InvalidCursorError."""
+    with pytest.raises(InvalidCursorError):
+        EditionBuildHistoryPositionCursor.from_str("p__abc")
+
+
+# ---------------------------------------------------------------------------
+# ProjectSearchCursor tests
+# ---------------------------------------------------------------------------
+
+
+def test_project_search_cursor_roundtrip() -> None:
+    """ProjectSearchCursor serialization roundtrip."""
+    cursor = ProjectSearchCursor(score=0.75, id=42, previous=False)
+    serialized = str(cursor)
+    restored = ProjectSearchCursor.from_str(serialized)
+    assert abs(restored.score - 0.75) < 0.001
+    assert restored.id == 42
+    assert restored.previous is False
+
+
+def test_project_search_cursor_invalid() -> None:
+    """Invalid cursor string raises InvalidCursorError."""
+    with pytest.raises(InvalidCursorError):
+        ProjectSearchCursor.from_str("not_a_cursor")

@@ -134,11 +134,15 @@ class Factory(ABC):
         store = EditionStore(session=self._session, logger=self._logger)
         org_store = self._create_org_store()
         project_store = self._create_project_store()
+        history_store = EditionBuildHistoryStore(
+            session=self._session, logger=self._logger
+        )
         return EditionService(
             store=store,
             org_store=org_store,
             project_store=project_store,
             logger=self._logger,
+            history_store=history_store,
         )
 
     def create_authorization_service(self) -> AuthorizationService:

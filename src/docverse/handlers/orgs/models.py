@@ -12,6 +12,9 @@ from docverse.client.models import (
     OrganizationServiceSummary,
 )
 from docverse.client.models import Edition as _EditionBase
+from docverse.client.models import (
+    EditionBuildHistoryEntry as _EditionBuildHistoryEntryBase,
+)
 from docverse.client.models import Organization as _OrganizationBase
 from docverse.client.models import (
     OrganizationCredential as _OrganizationCredentialBase,
@@ -24,6 +27,9 @@ from docverse.client.models import Project as _ProjectBase
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
 from docverse.domain.edition import Edition as EditionDomain
+from docverse.domain.edition_build_history import (
+    EditionBuildHistoryWithBuild as EditionBuildHistoryWithBuildDomain,
+)
 from docverse.domain.membership import OrgMembership as OrgMembershipDomain
 from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.domain.organization_credential import (
@@ -271,6 +277,37 @@ class Edition(_EditionBase):
             lifecycle_exempt=domain.lifecycle_exempt,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
+        )
+
+
+class EditionBuildHistoryResponse(_EditionBuildHistoryEntryBase):
+    """Edition build history response model with HATEOAS URLs."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        domain: EditionBuildHistoryWithBuildDomain,
+        request: Request,
+        org_slug: str,
+        project_slug: str,
+    ) -> Self:
+        """Create from a domain object, adding HATEOAS URLs."""
+        build_id_str = serialize_base32_id(domain.build_public_id)
+        return cls(
+            build_id=build_id_str,
+            build_url=str(
+                request.url_for(
+                    "get_build",
+                    org=org_slug,
+                    project=project_slug,
+                    build=build_id_str,
+                )
+            ),
+            git_ref=domain.build_git_ref,
+            build_status=domain.build_status,
+            build_deleted=domain.build_date_deleted is not None,
+            position=domain.position,
+            date_created=domain.date_created,
         )
 
 
