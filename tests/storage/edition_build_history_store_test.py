@@ -184,6 +184,48 @@ async def test_editions_independent(
 
 
 @pytest.mark.asyncio
+async def test_get_by_edition_and_build_found(
+    db_session: async_scoped_session[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """get_by_edition_and_build returns a match when the build is recorded."""
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="lookup-org"
+        )
+        await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        result = await history_store.get_by_edition_and_build(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        await db_session.commit()
+
+    assert result is not None
+    assert result.edition_id == edition_id
+    assert result.build_id == build_ids[0]
+
+
+@pytest.mark.asyncio
+async def test_get_by_edition_and_build_not_found(
+    db_session: async_scoped_session[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """get_by_edition_and_build returns None for nonexistent combo."""
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="nolookup-org"
+        )
+        # Don't record anything — query should return None
+        result = await history_store.get_by_edition_and_build(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        await db_session.commit()
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_list_with_build_info_includes_status(
     db_session: async_scoped_session[AsyncSession],
     history_store: EditionBuildHistoryStore,

@@ -16,6 +16,7 @@ __all__ = [
     "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
+    "EditionRollback",
     "EditionUpdate",
     "TrackingMode",
 ]
@@ -197,6 +198,14 @@ class EditionBuildHistoryEntry(BaseModel):
 
     date_created: datetime = Field(
         description="Timestamp when this history entry was recorded."
+    )
+
+
+class EditionRollback(BaseModel):
+    """Request body for rolling back an edition to a previous build."""
+
+    build: str = Field(
+        description="Base32 public ID of the target build.",
     )
 
 

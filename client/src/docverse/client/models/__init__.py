@@ -17,6 +17,7 @@ from .editions import (
     EditionBuildHistoryEntry,
     EditionCreate,
     EditionKind,
+    EditionRollback,
     EditionUpdate,
     TrackingMode,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
+    "EditionRollback",
     "EditionUpdate",
     "FastlyCredentials",
     "GcpCredentials",

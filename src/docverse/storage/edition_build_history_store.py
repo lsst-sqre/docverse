@@ -54,6 +54,24 @@ class EditionBuildHistoryStore:
         await self._session.refresh(row)
         return EditionBuildHistory.model_validate(row)
 
+    async def get_by_edition_and_build(
+        self, *, edition_id: int, build_id: int
+    ) -> EditionBuildHistory | None:
+        """Look up a history entry for an edition and build combination.
+
+        Returns the first match or ``None`` if the build was never
+        recorded for this edition.
+        """
+        stmt = select(SqlEditionBuildHistory).where(
+            SqlEditionBuildHistory.edition_id == edition_id,
+            SqlEditionBuildHistory.build_id == build_id,
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalars().first()
+        if row is None:
+            return None
+        return EditionBuildHistory.model_validate(row)
+
     async def list_by_edition(
         self, edition_id: int
     ) -> list[EditionBuildHistory]:

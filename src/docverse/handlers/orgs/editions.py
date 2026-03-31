@@ -6,7 +6,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
-from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
+from docverse.client.models import (
+    EditionCreate,
+    EditionKind,
+    EditionRollback,
+    EditionUpdate,
+)
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
@@ -203,6 +208,34 @@ async def get_edition_history(  # noqa: PLR0913
         )
         for entry in result.entries
     ]
+
+
+@router.post(
+    "/orgs/{org}/projects/{project}/editions/{edition}/rollback",
+    response_model=Edition,
+    summary="Roll back an edition to a previous build",
+    name="post_edition_rollback",
+)
+async def post_edition_rollback(  # noqa: PLR0913
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    edition_slug: EditionSlugParam,
+    data: EditionRollback,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+) -> Edition:
+    async with context.session.begin():
+        service = context.factory.create_edition_service()
+        edition = await service.rollback(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition_slug,
+            build_public_id=data.build,
+        )
+        await context.session.commit()
+    return Edition.from_domain(
+        edition, context.request, org_slug, project_slug
+    )
 
 
 @router.patch(
