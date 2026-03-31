@@ -269,6 +269,22 @@ class Edition(_EditionBase):
             ),
             build_url=build_url,
             published_url=published_url,
+            history_url=str(
+                request.url_for(
+                    "get_edition_history",
+                    org=org_slug,
+                    project=project_slug,
+                    edition=domain.slug,
+                )
+            ),
+            rollback_url=str(
+                request.url_for(
+                    "post_edition_rollback",
+                    org=org_slug,
+                    project=project_slug,
+                    edition=domain.slug,
+                )
+            ),
             slug=domain.slug,
             title=domain.title,
             kind=domain.kind,

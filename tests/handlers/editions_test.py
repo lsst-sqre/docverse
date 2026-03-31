@@ -58,6 +58,12 @@ async def test_create_edition(client: AsyncClient) -> None:
     assert data["self_url"].endswith(
         "/orgs/ed-org/projects/ed-proj/editions/main"
     )
+    assert data["history_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/main/history"
+    )
+    assert data["rollback_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/main/rollback"
+    )
 
 
 @pytest.mark.asyncio
@@ -101,7 +107,14 @@ async def test_get_edition(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 200
-    assert response.json()["slug"] == "get-ed"
+    data = response.json()
+    assert data["slug"] == "get-ed"
+    assert data["history_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/get-ed/history"
+    )
+    assert data["rollback_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/get-ed/rollback"
+    )
 
 
 @pytest.mark.asyncio

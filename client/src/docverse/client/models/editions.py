@@ -147,6 +147,14 @@ class Edition(BaseModel):
         description="Public URL where this edition is served.",
     )
 
+    history_url: str = Field(
+        description="URL to the build history for this edition."
+    )
+
+    rollback_url: str = Field(
+        description="URL to roll back this edition to a previous build."
+    )
+
     slug: str = Field(description="URL-safe identifier for the edition.")
 
     title: str = Field(description="Display title for the edition.")
