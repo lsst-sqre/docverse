@@ -12,6 +12,7 @@ import httpx
 
 from ._exceptions import BuildProcessingError, DocverseClientError
 from .models import Build, BuildStatus, BuildUpdate, QueueJob
+from .models.builds import BuildAnnotations
 from .models.queue_enums import JobStatus
 
 __all__ = ["DocverseClient"]
@@ -130,7 +131,7 @@ class DocverseClient:
         git_ref: str,
         content_hash: str,
         alternate_name: str | None = None,
-        annotations: dict[str, Any] | None = None,
+        annotations: BuildAnnotations | None = None,
     ) -> Build:
         """Create a new build.
 
@@ -161,7 +162,7 @@ class DocverseClient:
         if alternate_name is not None:
             payload["alternate_name"] = alternate_name
         if annotations is not None:
-            payload["annotations"] = annotations
+            payload["annotations"] = annotations.model_dump(exclude_none=True)
 
         url = f"/orgs/{org}/projects/{project}/builds"
         response = await self._client.post(url, json=payload)

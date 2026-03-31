@@ -7,6 +7,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from docverse.client.models import BuildStatus
+from docverse.client.models.builds import BuildAnnotations
 
 
 class EditionBuildHistory(BaseModel):
@@ -48,6 +49,7 @@ class EditionBuildHistoryWithBuild(BaseModel):
     build_public_id: int
     build_git_ref: str
     build_status: BuildStatus
+    build_annotations: BuildAnnotations | None = None
     build_date_deleted: datetime | None
     position: int
     date_created: datetime

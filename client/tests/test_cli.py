@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -227,6 +228,111 @@ def test_upload_failed(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "failed" in result.output.lower()
+
+
+def test_upload_with_annotations(tmp_path: Path) -> None:
+    """--annotation KEY=VALUE flags are included in the build creation."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "index.html").write_text("<h1>Hello</h1>")
+
+    with respx.mock() as router:
+        build_url = f"/orgs/{ORG}/projects/{PROJECT}/builds"
+        build_route = router.post(build_url).mock(
+            return_value=httpx.Response(201, json=_build_response())
+        )
+        router.put("https://storage.example.com/presigned-put").mock(
+            return_value=httpx.Response(200)
+        )
+        build_self = f"/orgs/{ORG}/projects/{PROJECT}/builds/{BUILD_ID}"
+        queue_url = "/queue/jobs/" + JOB_ID
+        router.patch(build_self).mock(
+            return_value=httpx.Response(
+                200,
+                json=_build_response(status="uploaded", queue_url=queue_url),
+            )
+        )
+        router.get(queue_url).mock(
+            return_value=httpx.Response(
+                200, json=_job_response(status="completed")
+            )
+        )
+        with patch("docverse.client._client.asyncio.sleep"):
+            result = _invoke(
+                source,
+                extra_args=[
+                    "--no-auto-annotations",
+                    "--annotation",
+                    "commit_sha=abc123",
+                    "--annotation",
+                    "custom=value",
+                ],
+            )
+
+    assert result.exit_code == 0
+    # Verify the POST body included annotations
+    request = build_route.calls[0].request
+    body = json.loads(request.content)
+    assert body["annotations"]["commit_sha"] == "abc123"
+    assert body["annotations"]["custom"] == "value"
+
+
+def test_upload_annotation_bad_format(tmp_path: Path) -> None:
+    """--annotation without = raises an error."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "index.html").write_text("<h1>Hello</h1>")
+
+    result = _invoke(source, extra_args=["--annotation", "bad-format"])
+    assert result.exit_code != 0
+    assert "KEY=VALUE" in result.output
+
+
+def test_upload_no_auto_annotations(tmp_path: Path) -> None:
+    """--no-auto-annotations suppresses CI auto-detection."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "index.html").write_text("<h1>Hello</h1>")
+
+    with respx.mock() as router:
+        build_url = f"/orgs/{ORG}/projects/{PROJECT}/builds"
+        build_route = router.post(build_url).mock(
+            return_value=httpx.Response(201, json=_build_response())
+        )
+        router.put("https://storage.example.com/presigned-put").mock(
+            return_value=httpx.Response(200)
+        )
+        build_self = f"/orgs/{ORG}/projects/{PROJECT}/builds/{BUILD_ID}"
+        queue_url = "/queue/jobs/" + JOB_ID
+        router.patch(build_self).mock(
+            return_value=httpx.Response(
+                200,
+                json=_build_response(status="uploaded", queue_url=queue_url),
+            )
+        )
+        router.get(queue_url).mock(
+            return_value=httpx.Response(
+                200, json=_job_response(status="completed")
+            )
+        )
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_SHA": "envsha",
+                    "GITHUB_REPOSITORY": "owner/repo",
+                },
+            ),
+            patch("docverse.client._client.asyncio.sleep"),
+        ):
+            result = _invoke(source, extra_args=["--no-auto-annotations"])
+
+    assert result.exit_code == 0
+    request = build_route.calls[0].request
+    body = json.loads(request.content)
+    # With --no-auto-annotations and no manual annotations, no annotations
+    assert "annotations" not in body or body["annotations"] is None
 
 
 def test_upload_git_ref_detection(tmp_path: Path) -> None:

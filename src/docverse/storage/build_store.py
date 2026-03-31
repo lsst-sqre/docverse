@@ -58,7 +58,11 @@ class BuildStore:
             status=BuildStatus.pending,
             staging_key=staging_key,
             uploader=uploader,
-            annotations=data.annotations,
+            annotations=(
+                data.annotations.model_dump(exclude_none=True)
+                if data.annotations is not None
+                else None
+            ),
         )
         self._session.add(row)
         await self._session.flush()

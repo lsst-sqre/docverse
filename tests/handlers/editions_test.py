@@ -10,6 +10,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from docverse.client.models import BuildCreate
+from docverse.client.models.builds import BuildAnnotations
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -307,10 +308,68 @@ async def test_get_edition_history(
         assert "date_created" in entry
         assert entry["build_status"] == "pending"
         assert entry["build_deleted"] is False
+        assert entry["annotations"] is None
     # Pagination headers present
     assert "Link" in response.headers
     assert "X-Total-Count" in response.headers
     assert response.headers["X-Total-Count"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_get_edition_history_with_annotations(
+    client: AsyncClient,
+    db_session: async_scoped_session[AsyncSession],
+) -> None:
+    """GET history returns annotations when builds have them."""
+    await _setup(client)
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        proj_store = ProjectStore(session=db_session, logger=logger)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        build_store = BuildStore(session=db_session, logger=logger)
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+
+        org = await org_store.get_by_slug("ed-org")
+        assert org is not None
+        project = await proj_store.get_by_slug(org_id=org.id, slug="ed-proj")
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+
+        build = await build_store.create(
+            project_id=project.id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash=f"sha256:{'a' * 64}",
+                annotations=BuildAnnotations.model_validate(
+                    {
+                        "commit_sha": "deadbeef",
+                        "ci_platform": "github-actions",
+                        "custom": "value",
+                    }
+                ),
+            ),
+            uploader="testuser",
+        )
+        await history_store.record(edition_id=edition.id, build_id=build.id)
+        await db_session.commit()
+
+    response = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main/history",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    annotations = data[0]["annotations"]
+    assert annotations["commit_sha"] == "deadbeef"
+    assert annotations["ci_platform"] == "github-actions"
+    assert annotations["custom"] == "value"
 
 
 @pytest.mark.asyncio

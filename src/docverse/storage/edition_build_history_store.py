@@ -124,6 +124,7 @@ class EditionBuildHistoryStore:
                 SqlBuild.public_id.label("build_public_id"),
                 SqlBuild.git_ref.label("build_git_ref"),
                 SqlBuild.status.label("build_status"),
+                SqlBuild.annotations.label("build_annotations"),
                 SqlBuild.date_deleted.label("build_date_deleted"),
                 SqlEditionBuildHistory.position,
                 SqlEditionBuildHistory.date_created,

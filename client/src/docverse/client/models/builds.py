@@ -4,16 +4,68 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     "Build",
+    "BuildAnnotations",
     "BuildCreate",
     "BuildStatus",
     "BuildUpdate",
 ]
+
+
+class BuildAnnotations(BaseModel):
+    """Well-known provenance fields for build annotations.
+
+    All fields are optional. The model uses ``extra="allow"`` so callers
+    can attach arbitrary additional metadata.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    commit_sha: str | None = Field(
+        default=None, description="Git commit SHA for the build."
+    )
+
+    github_repository: str | None = Field(
+        default=None,
+        description="GitHub repository (owner/repo) that produced the build.",
+    )
+
+    github_run_id: str | None = Field(
+        default=None, description="GitHub Actions run ID."
+    )
+
+    github_run_url: str | None = Field(
+        default=None, description="Full URL to the GitHub Actions run."
+    )
+
+    github_run_attempt: str | None = Field(
+        default=None, description="GitHub Actions run attempt number."
+    )
+
+    github_workflow: str | None = Field(
+        default=None, description="GitHub Actions workflow name."
+    )
+
+    github_actor: str | None = Field(
+        default=None, description="GitHub user or app that triggered the run."
+    )
+
+    github_event_name: str | None = Field(
+        default=None,
+        description="GitHub event that triggered the workflow (e.g. push).",
+    )
+
+    ci_platform: str | None = Field(
+        default=None,
+        description=(
+            "CI platform that produced the build (e.g. github-actions)."
+        ),
+    )
 
 
 class BuildStatus(StrEnum):
@@ -66,7 +118,7 @@ class BuildCreate(BaseModel):
         ),
     ]
 
-    annotations: dict[str, Any] | None = Field(
+    annotations: BuildAnnotations | None = Field(
         default=None,
         description="Arbitrary metadata annotations for the build.",
     )
@@ -126,7 +178,7 @@ class Build(BaseModel):
         description="Username of the person who uploaded the build."
     )
 
-    annotations: dict[str, Any] | None = Field(
+    annotations: BuildAnnotations | None = Field(
         default=None,
         description="Arbitrary metadata annotations for the build.",
     )

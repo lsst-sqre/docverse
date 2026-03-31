@@ -8,7 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .builds import BuildStatus
+from .builds import BuildAnnotations, BuildStatus
 
 __all__ = [
     "DefaultEditionConfig",
@@ -186,6 +186,11 @@ class EditionBuildHistoryEntry(BaseModel):
 
     build_status: BuildStatus = Field(
         description="Status of the build at the time of the query."
+    )
+
+    annotations: BuildAnnotations | None = Field(
+        default=None,
+        description="Build provenance annotations.",
     )
 
     build_deleted: bool = Field(

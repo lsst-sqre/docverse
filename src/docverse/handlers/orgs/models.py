@@ -305,6 +305,7 @@ class EditionBuildHistoryResponse(_EditionBuildHistoryEntryBase):
             ),
             git_ref=domain.build_git_ref,
             build_status=domain.build_status,
+            annotations=domain.build_annotations,
             build_deleted=domain.build_date_deleted is not None,
             position=domain.position,
             date_created=domain.date_created,

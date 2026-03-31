@@ -14,6 +14,7 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse.client.models.builds import BuildAnnotations
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -247,6 +248,69 @@ async def test_list_with_build_info_includes_status(
     entry = result.entries[0]
     assert entry.build_status == "pending"
     assert entry.build_date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_list_with_build_info_includes_annotations(
+    db_session: async_scoped_session[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """list_by_edition_with_build_info returns build annotations."""
+    async with db_session.begin():
+        logger = structlog.get_logger("docverse")
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        proj_store = ProjectStore(session=db_session, logger=logger)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        build_store = BuildStore(session=db_session, logger=logger)
+
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="ann-org",
+                title="Ann Org",
+                base_domain="ann-org.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="ann-proj",
+                title="Ann Project",
+                doc_repo="https://github.com/example/ann",
+            ),
+        )
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="ann-ed",
+                title="Ann Edition",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        build = await build_store.create(
+            project_id=project.id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash=f"sha256:{'b' * 64}",
+                annotations=BuildAnnotations(
+                    commit_sha="abc123",
+                    ci_platform="github-actions",
+                ),
+            ),
+            uploader="testuser",
+        )
+        await history_store.record(edition_id=edition.id, build_id=build.id)
+        result = await history_store.list_by_edition_with_build_info(
+            edition.id, limit=10, include_deleted=True
+        )
+        await db_session.commit()
+
+    assert len(result.entries) == 1
+    entry = result.entries[0]
+    assert entry.build_annotations is not None
+    assert entry.build_annotations.commit_sha == "abc123"
+    assert entry.build_annotations.ci_platform == "github-actions"
 
 
 @pytest.mark.asyncio
