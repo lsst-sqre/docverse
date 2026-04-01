@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from docverse.client.models import BuildStatus
+from docverse.client.models.builds import BuildAnnotations
 
 from .base32id import Base32Id
 
@@ -60,7 +60,7 @@ class Build(BaseModel):
         description="Username of the person who uploaded the build."
     )
 
-    annotations: dict[str, Any] | None = Field(
+    annotations: BuildAnnotations | None = Field(
         default=None,
         description="Arbitrary metadata annotations for the build.",
     )

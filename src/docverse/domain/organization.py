@@ -33,12 +33,19 @@ class Organization(BaseModel):
         description=("Root path prefix when using path_prefix URL scheme."),
     )
 
-    slug_rewrite_rules: dict[str, Any] | None = Field(
+    slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         description="Rules for rewriting project slugs in URLs."
     )
 
-    lifecycle_rules: dict[str, Any] | None = Field(
+    lifecycle_rules: list[dict[str, Any]] | None = Field(
         description="Rules governing build lifecycle."
+    )
+
+    default_edition_config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+        ),
     )
 
     publishing_store_label: str | None = Field(

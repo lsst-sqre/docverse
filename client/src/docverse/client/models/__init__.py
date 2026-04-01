@@ -1,6 +1,12 @@
 """Pydantic models for the Docverse API."""
 
-from .builds import Build, BuildCreate, BuildStatus, BuildUpdate
+from .builds import (
+    Build,
+    BuildAnnotations,
+    BuildCreate,
+    BuildStatus,
+    BuildUpdate,
+)
 from .credentials import (
     AwsCredentials,
     CloudflareCredentials,
@@ -12,9 +18,12 @@ from .credentials import (
     S3Credentials,
 )
 from .editions import (
+    DefaultEditionConfig,
     Edition,
+    EditionBuildHistoryEntry,
     EditionCreate,
     EditionKind,
+    EditionRollback,
     EditionUpdate,
     TrackingMode,
 )
@@ -49,15 +58,19 @@ from .services import (
 __all__ = [
     "AwsCredentials",
     "Build",
+    "BuildAnnotations",
     "BuildCreate",
     "BuildStatus",
     "BuildUpdate",
     "CloudflareCredentials",
     "CredentialPayload",
     "CredentialProvider",
+    "DefaultEditionConfig",
     "Edition",
+    "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
+    "EditionRollback",
     "EditionUpdate",
     "FastlyCredentials",
     "GcpCredentials",

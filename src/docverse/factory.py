@@ -14,10 +14,12 @@ from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.edition import EditionService
+from .services.edition_tracking import EditionTrackingService
 from .services.infrastructure import InfrastructureService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .storage.build_store import BuildStore
+from .storage.edition_build_history_store import EditionBuildHistoryStore
 from .storage.edition_store import EditionStore
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
@@ -77,8 +79,14 @@ class Factory(ABC):
         """Create a ProjectService."""
         store = self._create_project_store()
         org_store = self._create_org_store()
+        edition_store = EditionStore(
+            session=self._session, logger=self._logger
+        )
         return ProjectService(
-            store=store, org_store=org_store, logger=self._logger
+            store=store,
+            org_store=org_store,
+            edition_store=edition_store,
+            logger=self._logger,
         )
 
     def create_build_service(self) -> BuildService:
@@ -99,16 +107,44 @@ class Factory(ABC):
             logger=self._logger,
         )
 
+    def create_edition_build_history_store(
+        self,
+    ) -> EditionBuildHistoryStore:
+        """Create an EditionBuildHistoryStore."""
+        return EditionBuildHistoryStore(
+            session=self._session, logger=self._logger
+        )
+
+    def create_edition_tracking_service(self) -> EditionTrackingService:
+        """Create an EditionTrackingService."""
+        return EditionTrackingService(
+            edition_store=EditionStore(
+                session=self._session, logger=self._logger
+            ),
+            history_store=EditionBuildHistoryStore(
+                session=self._session, logger=self._logger
+            ),
+            project_store=self._create_project_store(),
+            org_store=self._create_org_store(),
+            logger=self._logger,
+        )
+
     def create_edition_service(self) -> EditionService:
         """Create an EditionService."""
         store = EditionStore(session=self._session, logger=self._logger)
         org_store = self._create_org_store()
         project_store = self._create_project_store()
+        history_store = EditionBuildHistoryStore(
+            session=self._session, logger=self._logger
+        )
+        build_store = BuildStore(session=self._session, logger=self._logger)
         return EditionService(
             store=store,
             org_store=org_store,
             project_store=project_store,
             logger=self._logger,
+            history_store=history_store,
+            build_store=build_store,
         )
 
     def create_authorization_service(self) -> AuthorizationService:

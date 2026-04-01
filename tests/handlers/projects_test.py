@@ -361,6 +361,225 @@ async def test_create_project_duplicate_slug(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_project_has_default_edition(
+    client: AsyncClient,
+) -> None:
+    """POST project creates a __main edition with default tracking."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "default-ed",
+            "title": "Default Ed",
+            "doc_repo": "https://github.com/example/default-ed",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    edition = data["default_edition"]
+    assert edition is not None
+    assert edition["slug"] == "__main"
+    assert edition["kind"] == "main"
+    assert edition["tracking_mode"] == "git_ref"
+    assert edition["tracking_params"] == {"git_ref": "main"}
+    assert edition["title"] == "Main"
+    assert edition["lifecycle_exempt"] is True
+    assert edition["self_url"].endswith(
+        "/orgs/proj-org/projects/default-ed/editions/__main"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_project_custom_default_edition(
+    client: AsyncClient,
+) -> None:
+    """POST project with custom default_edition config."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "custom-ed",
+            "title": "Custom Ed",
+            "doc_repo": "https://github.com/example/custom-ed",
+            "default_edition": {
+                "tracking_mode": "lsst_doc",
+                "title": "Custom Main",
+                "lifecycle_exempt": False,
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    edition = response.json()["default_edition"]
+    assert edition["tracking_mode"] == "lsst_doc"
+    assert edition["title"] == "Custom Main"
+    assert edition["lifecycle_exempt"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_project_includes_default_edition(
+    client: AsyncClient,
+) -> None:
+    """GET single project includes the default edition."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "get-ed-proj",
+            "title": "Get Ed Proj",
+            "doc_repo": "https://github.com/example/get-ed",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/get-ed-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    edition = response.json()["default_edition"]
+    assert edition is not None
+    assert edition["slug"] == "__main"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_no_default_edition(
+    client: AsyncClient,
+) -> None:
+    """GET project list omits default_edition (None)."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "list-ed-proj",
+            "title": "List Ed Proj",
+            "doc_repo": "https://github.com/example/list-ed",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    for project in response.json():
+        assert project["default_edition"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_project_includes_default_edition(
+    client: AsyncClient,
+) -> None:
+    """PATCH project response includes the default edition."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "patch-ed-proj",
+            "title": "Patch Ed Proj",
+            "doc_repo": "https://github.com/example/patch-ed",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/patch-ed-proj",
+        json={"title": "Patched"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    edition = response.json()["default_edition"]
+    assert edition is not None
+    assert edition["slug"] == "__main"
+
+
+@pytest.mark.asyncio
+async def test_create_project_org_default_edition_config(
+    client: AsyncClient,
+) -> None:
+    """Org-level default_edition_config is used when project omits it."""
+    await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": "org-dec",
+            "title": "Org With Default Config",
+            "base_domain": "example.io",
+            "default_edition_config": {
+                "tracking_mode": "git_ref",
+                "tracking_params": {"git_ref": "develop"},
+                "title": "Org Default",
+            },
+            "members": [
+                {
+                    "principal": "testuser",
+                    "principal_type": "user",
+                    "role": "admin",
+                }
+            ],
+        },
+        headers={"X-Auth-Request-User": "superadmin"},
+    )
+    response = await client.post(
+        "/docverse/orgs/org-dec/projects",
+        json={
+            "slug": "org-proj",
+            "title": "Org Proj",
+            "doc_repo": "https://github.com/example/org-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    edition = response.json()["default_edition"]
+    assert edition["tracking_params"] == {"git_ref": "develop"}
+    assert edition["title"] == "Org Default"
+
+
+@pytest.mark.asyncio
+async def test_create_project_request_overrides_org_config(
+    client: AsyncClient,
+) -> None:
+    """Explicit default_edition in request overrides org config."""
+    await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": "org-override",
+            "title": "Org Override",
+            "base_domain": "example.io",
+            "default_edition_config": {
+                "tracking_mode": "git_ref",
+                "tracking_params": {"git_ref": "develop"},
+                "title": "Org Default",
+            },
+            "members": [
+                {
+                    "principal": "testuser",
+                    "principal_type": "user",
+                    "role": "admin",
+                }
+            ],
+        },
+        headers={"X-Auth-Request-User": "superadmin"},
+    )
+    response = await client.post(
+        "/docverse/orgs/org-override/projects",
+        json={
+            "slug": "override-proj",
+            "title": "Override Proj",
+            "doc_repo": "https://github.com/example/override",
+            "default_edition": {
+                "tracking_mode": "git_ref",
+                "tracking_params": {"git_ref": "master"},
+                "title": "Request Override",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    edition = response.json()["default_edition"]
+    assert edition["tracking_params"] == {"git_ref": "master"}
+    assert edition["title"] == "Request Override"
+
+
+@pytest.mark.asyncio
 async def test_permission_denied_no_auth(client: AsyncClient) -> None:
     await _setup(client)
     response = await client.get(

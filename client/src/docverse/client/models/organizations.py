@@ -8,6 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .editions import DefaultEditionConfig
 from .memberships import OrgMembershipCreate
 from .services import OrganizationServiceSummary
 
@@ -66,12 +67,12 @@ class OrganizationCreate(BaseModel):
         description="Root path prefix when using path_prefix URL scheme.",
     )
 
-    slug_rewrite_rules: dict[str, Any] | None = Field(
+    slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: dict[str, Any] | None = Field(
+    lifecycle_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )
@@ -105,6 +106,14 @@ class OrganizationCreate(BaseModel):
         description="Label of the dns service.",
     )
 
+    default_edition_config: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+            " Used when a project creation request omits its own config."
+        ),
+    )
+
     members: list[OrgMembershipCreate] = Field(
         default_factory=list,
         description="Initial members to add to the organization.",
@@ -134,12 +143,19 @@ class Organization(BaseModel):
         description="Root path prefix when using path_prefix URL scheme."
     )
 
-    slug_rewrite_rules: dict[str, Any] | None = Field(
+    slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         description="Rules for rewriting project slugs in URLs."
     )
 
-    lifecycle_rules: dict[str, Any] | None = Field(
+    lifecycle_rules: list[dict[str, Any]] | None = Field(
         description="Rules governing build lifecycle."
+    )
+
+    default_edition_config: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+        ),
     )
 
     purgatory_retention: int = Field(
@@ -207,12 +223,12 @@ class OrganizationUpdate(BaseModel):
         description=("Root path prefix when using path_prefix URL scheme."),
     )
 
-    slug_rewrite_rules: dict[str, Any] | None = Field(
+    slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: dict[str, Any] | None = Field(
+    lifecycle_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )
@@ -244,4 +260,11 @@ class OrganizationUpdate(BaseModel):
     dns_service_label: str | None = Field(
         default=None,
         description="Label of the dns service.",
+    )
+
+    default_edition_config: DefaultEditionConfig | None = Field(
+        default=None,
+        description=(
+            "Default configuration for the __main edition on new projects."
+        ),
     )

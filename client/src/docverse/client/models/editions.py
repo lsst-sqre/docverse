@@ -8,10 +8,15 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .builds import BuildAnnotations, BuildStatus
+
 __all__ = [
+    "DefaultEditionConfig",
     "Edition",
+    "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
+    "EditionRollback",
     "EditionUpdate",
     "TrackingMode",
 ]
@@ -40,6 +45,46 @@ class TrackingMode(StrEnum):
     semver_major = "semver_major"
     semver_minor = "semver_minor"
     alternate_git_ref = "alternate_git_ref"
+
+
+class DefaultEditionConfig(BaseModel):
+    """Configuration for the default (__main) edition's tracking behavior.
+
+    Used in project creation requests and as an organization-level default.
+    When omitted from a project creation request, the organization's
+    default config is used; when the organization has none, the hardcoded
+    fallback is ``git_ref`` tracking the ``main`` branch.
+    """
+
+    tracking_mode: TrackingMode = Field(
+        default=TrackingMode.git_ref,
+        description="How the default edition tracks builds.",
+    )
+
+    tracking_params: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Parameters for the tracking mode. When None and tracking_mode"
+            " is git_ref, defaults to {'git_ref': 'main'} at the service"
+            " layer."
+        ),
+    )
+
+    title: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=256,
+            description="Display title for the default edition.",
+        ),
+    ] = "Main"
+
+    lifecycle_exempt: bool = Field(
+        default=True,
+        description=(
+            "Whether the default edition is exempt from lifecycle rules."
+        ),
+    )
 
 
 class EditionCreate(BaseModel):
@@ -102,6 +147,14 @@ class Edition(BaseModel):
         description="Public URL where this edition is served.",
     )
 
+    history_url: str = Field(
+        description="URL to the build history for this edition."
+    )
+
+    rollback_url: str = Field(
+        description="URL to roll back this edition to a previous build."
+    )
+
     slug: str = Field(description="URL-safe identifier for the edition.")
 
     title: str = Field(description="Display title for the edition.")
@@ -127,6 +180,45 @@ class Edition(BaseModel):
 
     date_updated: datetime = Field(
         description="Timestamp of the most recent update."
+    )
+
+
+class EditionBuildHistoryEntry(BaseModel):
+    """Response model for an edition build history entry."""
+
+    build_id: str = Field(description="Base32-encoded public ID of the build.")
+
+    build_url: str = Field(description="URL to the build resource.")
+
+    git_ref: str = Field(description="Git reference of the build.")
+
+    build_status: BuildStatus = Field(
+        description="Status of the build at the time of the query."
+    )
+
+    annotations: BuildAnnotations | None = Field(
+        default=None,
+        description="Build provenance annotations.",
+    )
+
+    build_deleted: bool = Field(
+        description="Whether the build has been soft-deleted."
+    )
+
+    position: int = Field(
+        description="Position in history; 1 is the most recent."
+    )
+
+    date_created: datetime = Field(
+        description="Timestamp when this history entry was recorded."
+    )
+
+
+class EditionRollback(BaseModel):
+    """Request body for rolling back an edition to a previous build."""
+
+    build: str = Field(
+        description="Base32 public ID of the target build.",
     )
 
 

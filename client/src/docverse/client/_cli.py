@@ -9,6 +9,7 @@ from pathlib import Path
 
 import click
 
+from ._annotations import detect_github_actions_annotations, merge_annotations
 from ._client import DocverseClient
 from ._exceptions import BuildProcessingError, DocverseClientError
 from ._tar import create_tarball
@@ -77,6 +78,19 @@ def main() -> None:
     help="Alternate deployment name.",
 )
 @click.option(
+    "--annotation",
+    "-a",
+    "annotations",
+    multiple=True,
+    help="Manual annotation in KEY=VALUE format. Can be repeated.",
+)
+@click.option(
+    "--auto-annotations/--no-auto-annotations",
+    default=True,
+    show_default=True,
+    help="Auto-detect annotations from CI environment variables.",
+)
+@click.option(
     "--no-wait",
     is_flag=True,
     default=False,
@@ -97,12 +111,26 @@ def upload(  # noqa: PLR0913
     token: str,
     base_url: str,
     alternate_name: str | None,
+    annotations: tuple[str, ...],
+    auto_annotations: bool,  # noqa: FBT001
     no_wait: bool,  # noqa: FBT001
     verbose: bool,  # noqa: FBT001
 ) -> None:
     """Upload a documentation build."""
     if git_ref is None:
         git_ref = _detect_git_ref()
+
+    # Parse manual annotations
+    manual: dict[str, str] | None = None
+    if annotations:
+        manual = {}
+        for item in annotations:
+            if "=" not in item:
+                msg = f"Invalid annotation format (expected KEY=VALUE): {item}"
+                raise click.BadParameter(msg, param_hint="'--annotation'")
+            key, value = item.split("=", 1)
+            manual[key] = value
+
     asyncio.run(
         _upload_async(
             org=org,
@@ -112,6 +140,8 @@ def upload(  # noqa: PLR0913
             token=token,
             base_url=base_url,
             alternate_name=alternate_name,
+            auto_annotations=auto_annotations,
+            manual_annotations=manual,
             no_wait=no_wait,
             verbose=verbose,
         )
@@ -145,6 +175,8 @@ async def _upload_async(  # noqa: PLR0913
     token: str,
     base_url: str,
     alternate_name: str | None,
+    auto_annotations: bool,
+    manual_annotations: dict[str, str] | None,
     no_wait: bool,
     verbose: bool,
 ) -> None:
@@ -155,6 +187,12 @@ async def _upload_async(  # noqa: PLR0913
         tarball_path, content_hash = create_tarball(source_dir)
         click.echo(f"Content hash: {content_hash}")
 
+        # Build annotations from auto-detection and manual entries
+        auto = (
+            detect_github_actions_annotations() if auto_annotations else None
+        )
+        merged_annotations = merge_annotations(auto, manual_annotations)
+
         async with DocverseClient(base_url, token, verbose=verbose) as client:
             click.echo(f"Creating build for {org}/{project} @ {git_ref}")
             build = await client.create_build(
@@ -163,6 +201,7 @@ async def _upload_async(  # noqa: PLR0913
                 git_ref=git_ref,
                 content_hash=content_hash,
                 alternate_name=alternate_name,
+                annotations=merged_annotations,
             )
             click.echo(f"Build created: {build.id}")
 

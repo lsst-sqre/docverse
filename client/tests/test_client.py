@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from docverse.client._exceptions import (
     BuildProcessingError,
     DocverseClientError,
 )
-from docverse.client.models.builds import BuildStatus
+from docverse.client.models.builds import BuildAnnotations, BuildStatus
 from docverse.client.models.queue_enums import JobKind, JobStatus
 
 BASE_URL = "https://docverse.example.com"
@@ -89,6 +90,42 @@ async def test_create_build() -> None:
         assert request.headers["authorization"] == f"Bearer {TOKEN}"
         assert build.id == BUILD_ID
         assert build.status == BuildStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_create_build_with_annotations() -> None:
+    """Annotations are included in the POST payload."""
+    annotations = BuildAnnotations(
+        commit_sha="abc123", ci_platform="github-actions"
+    )
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.post("/orgs/myorg/projects/myproj/builds").mock(
+            return_value=httpx.Response(
+                201,
+                json=_build_response(
+                    annotations={
+                        "commit_sha": "abc123",
+                        "ci_platform": "github-actions",
+                    }
+                ),
+            )
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            build = await client.create_build(
+                "myorg",
+                "myproj",
+                git_ref="main",
+                content_hash="sha256:" + "a" * 64,
+                annotations=annotations,
+            )
+
+        assert route.called
+        request = route.calls[0].request
+        body = json.loads(request.content)
+        assert body["annotations"]["commit_sha"] == "abc123"
+        assert body["annotations"]["ci_platform"] == "github-actions"
+        assert build.annotations is not None
+        assert build.annotations.commit_sha == "abc123"
 
 
 @pytest.mark.asyncio

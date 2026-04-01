@@ -7,7 +7,14 @@ from typing import Self
 from starlette.requests import Request
 
 from docverse.client.models import Build as _BuildBase
+from docverse.client.models import (
+    DefaultEditionConfig,
+    OrganizationServiceSummary,
+)
 from docverse.client.models import Edition as _EditionBase
+from docverse.client.models import (
+    EditionBuildHistoryEntry as _EditionBuildHistoryEntryBase,
+)
 from docverse.client.models import Organization as _OrganizationBase
 from docverse.client.models import (
     OrganizationCredential as _OrganizationCredentialBase,
@@ -15,12 +22,14 @@ from docverse.client.models import (
 from docverse.client.models import (
     OrganizationService as _OrganizationServiceBase,
 )
-from docverse.client.models import OrganizationServiceSummary
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
 from docverse.domain.edition import Edition as EditionDomain
+from docverse.domain.edition_build_history import (
+    EditionBuildHistoryWithBuild as EditionBuildHistoryWithBuildDomain,
+)
 from docverse.domain.membership import OrgMembership as OrgMembershipDomain
 from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.domain.organization_credential import (
@@ -97,6 +106,13 @@ class Organization(_OrganizationBase):
             root_path_prefix=domain.root_path_prefix,
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
+            default_edition_config=(
+                DefaultEditionConfig.model_validate(
+                    domain.default_edition_config
+                )
+                if domain.default_edition_config is not None
+                else None
+            ),
             purgatory_retention=int(
                 domain.purgatory_retention.total_seconds()
             ),
@@ -118,8 +134,15 @@ class Project(_ProjectBase):
         domain: ProjectDomain,
         request: Request,
         org_slug: str,
+        *,
+        default_edition: EditionDomain | None = None,
     ) -> Self:
         """Create from a domain object, adding HATEOAS URLs."""
+        edition_response = None
+        if default_edition is not None:
+            edition_response = Edition.from_domain(
+                default_edition, request, org_slug, domain.slug
+            )
         return cls(
             self_url=str(
                 request.url_for(
@@ -148,6 +171,7 @@ class Project(_ProjectBase):
             doc_repo=domain.doc_repo,
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
+            default_edition=edition_response,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )
@@ -245,6 +269,22 @@ class Edition(_EditionBase):
             ),
             build_url=build_url,
             published_url=published_url,
+            history_url=str(
+                request.url_for(
+                    "get_edition_history",
+                    org=org_slug,
+                    project=project_slug,
+                    edition=domain.slug,
+                )
+            ),
+            rollback_url=str(
+                request.url_for(
+                    "post_edition_rollback",
+                    org=org_slug,
+                    project=project_slug,
+                    edition=domain.slug,
+                )
+            ),
             slug=domain.slug,
             title=domain.title,
             kind=domain.kind,
@@ -253,6 +293,38 @@ class Edition(_EditionBase):
             lifecycle_exempt=domain.lifecycle_exempt,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
+        )
+
+
+class EditionBuildHistoryResponse(_EditionBuildHistoryEntryBase):
+    """Edition build history response model with HATEOAS URLs."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        domain: EditionBuildHistoryWithBuildDomain,
+        request: Request,
+        org_slug: str,
+        project_slug: str,
+    ) -> Self:
+        """Create from a domain object, adding HATEOAS URLs."""
+        build_id_str = serialize_base32_id(domain.build_public_id)
+        return cls(
+            build_id=build_id_str,
+            build_url=str(
+                request.url_for(
+                    "get_build",
+                    org=org_slug,
+                    project=project_slug,
+                    build=build_id_str,
+                )
+            ),
+            git_ref=domain.build_git_ref,
+            build_status=domain.build_status,
+            annotations=domain.build_annotations,
+            build_deleted=domain.build_date_deleted is not None,
+            position=domain.position,
+            date_created=domain.date_created,
         )
 
 

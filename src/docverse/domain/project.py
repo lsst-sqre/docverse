@@ -27,12 +27,12 @@ class Project(BaseModel):
         description="URL of the documentation source repository."
     )
 
-    slug_rewrite_rules: dict[str, Any] | None = Field(
+    slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: dict[str, Any] | None = Field(
+    lifecycle_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )

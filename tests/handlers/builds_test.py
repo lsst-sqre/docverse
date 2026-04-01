@@ -44,6 +44,31 @@ async def test_create_build(client: AsyncClient) -> None:
     # No credential configured for this org, so upload_url is None
     assert data["upload_url"] is None
     assert data["uploader"] == "testuser"
+    assert data["annotations"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_build_with_annotations(client: AsyncClient) -> None:
+    await _setup(client)
+    annotations = {
+        "commit_sha": "abc123",
+        "ci_platform": "github-actions",
+        "custom_key": "custom_value",
+    }
+    response = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        json={
+            "git_ref": "main",
+            "content_hash": CONTENT_HASH,
+            "annotations": annotations,
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["annotations"]["commit_sha"] == "abc123"
+    assert data["annotations"]["ci_platform"] == "github-actions"
+    assert data["annotations"]["custom_key"] == "custom_value"
 
 
 @pytest.mark.asyncio

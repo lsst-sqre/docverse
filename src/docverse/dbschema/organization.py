@@ -48,6 +48,10 @@ class SqlOrganization(Base):
         JSONB, nullable=True
     )
 
+    default_edition_config: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+
     publishing_store_label: Mapped[str | None] = mapped_column(
         String(128), nullable=True
     )
