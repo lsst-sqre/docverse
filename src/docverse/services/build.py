@@ -84,7 +84,10 @@ class BuildService:
         """Create a new build with status=pending."""
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._store.create(
-            project_id=project.id, data=data, uploader=uploader
+            project_id=project.id,
+            project_slug=project_slug,
+            data=data,
+            uploader=uploader,
         )
         self._logger.info(
             "Created build",

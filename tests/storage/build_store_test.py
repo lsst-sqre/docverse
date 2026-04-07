@@ -12,6 +12,7 @@ from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
 )
+from docverse.domain.base32id import serialize_base32_id
 from docverse.exceptions import InvalidBuildStateError
 from docverse.storage.build_store import BuildStore
 from docverse.storage.organization_store import OrganizationStore
@@ -66,6 +67,7 @@ async def test_create_build(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -78,6 +80,27 @@ async def test_create_build(
 
 
 @pytest.mark.asyncio
+async def test_create_build_sets_storage_prefix(
+    db_session: async_scoped_session[AsyncSession],
+    build_store: BuildStore,
+) -> None:
+    """storage_prefix is computed as {project_slug}/__builds/{base32_id}/."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await db_session.commit()
+
+    base32_id = serialize_base32_id(build.public_id)
+    expected = f"build-proj/__builds/{base32_id}/"
+    assert build.storage_prefix == expected
+
+
+@pytest.mark.asyncio
 async def test_transition_pending_to_processing(
     db_session: async_scoped_session[AsyncSession],
     build_store: BuildStore,
@@ -86,6 +109,7 @@ async def test_transition_pending_to_processing(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -106,6 +130,7 @@ async def test_transition_processing_to_completed(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -129,6 +154,7 @@ async def test_transition_processing_to_failed(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -152,6 +178,7 @@ async def test_invalid_transition_raises(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -172,11 +199,13 @@ async def test_list_by_project(
         _, project_id = await _create_org_and_project(db_session)
         await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="user1",
         )
         await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=BuildCreate(
                 git_ref="v1.0",
                 content_hash="sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -197,6 +226,7 @@ async def test_get_by_public_id(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -217,6 +247,7 @@ async def test_soft_delete_build(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )
@@ -238,6 +269,7 @@ async def test_update_inventory(
         _, project_id = await _create_org_and_project(db_session)
         build = await build_store.create(
             project_id=project_id,
+            project_slug="build-proj",
             data=_build_data(),
             uploader="testuser",
         )

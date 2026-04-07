@@ -46,6 +46,13 @@ class Build(BaseModel):
         description="Object store key for the staged tarball."
     )
 
+    storage_prefix: str = Field(
+        description=(
+            "Object store prefix for build artifacts, e.g. "
+            "'{project_slug}/__builds/{base32_id}/'."
+        )
+    )
+
     object_count: int | None = Field(
         default=None,
         description="Number of objects in the build.",

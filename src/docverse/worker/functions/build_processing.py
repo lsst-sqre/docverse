@@ -19,7 +19,6 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
 from docverse.client.models import BuildStatus
-from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
@@ -285,7 +284,7 @@ async def _process_build(
     # usage for large documentation builds.
     tarball_data = await object_store.download_object(key=build.staging_key)
 
-    build_prefix = f"__builds/{serialize_base32_id(build.public_id)}/"
+    build_prefix = build.storage_prefix
     semaphore = asyncio.Semaphore(_UPLOAD_CONCURRENCY)
 
     async def _upload_file(name: str, data: bytes) -> int:

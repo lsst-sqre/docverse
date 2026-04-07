@@ -281,6 +281,7 @@ async def _record_builds_in_history(
                 content_hash=f"sha256:{i:064x}",
             ),
             uploader="testuser",
+            project_slug=project_slug,
         )
         build_ids.append(build.id)
         await history_store.record(edition_id=edition.id, build_id=build.id)
@@ -368,6 +369,7 @@ async def test_get_edition_history_with_annotations(
                 ),
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         await history_store.record(edition_id=edition.id, build_id=build.id)
         await db_session.commit()
