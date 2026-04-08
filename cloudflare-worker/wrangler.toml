@@ -3,6 +3,19 @@ main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Top-level bindings used by Miniflare in vitest integration tests.
+# These are simulated locally — the IDs are not real Cloudflare resources.
+kv_namespaces = [
+  { binding = "EDITIONS_KV", id = "TEST_KV_NAMESPACE_ID" }
+]
+
+[[r2_buckets]]
+binding = "BUILDS_R2"
+bucket_name = "docverse-test-builds"
+
+[vars]
+URL_SCHEME = "subdomain"
+
 [env.dev]
 kv_namespaces = [
   { binding = "EDITIONS_KV", id = "PLACEHOLDER_KV_NAMESPACE_ID" }
