@@ -12,6 +12,23 @@ name: CI
     types: [published]
 
 jobs:
+  worker-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: cloudflare-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: cloudflare-worker/package.json
+          cache: npm
+          cache-dependency-path: cloudflare-worker/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -80,7 +97,7 @@ jobs:
           client_test_oldest
 
   build:
-    needs: [test, client-test]
+    needs: [test, client-test, worker-test]
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v3
     with:
       images: ghcr.io/${{ github.repository }}

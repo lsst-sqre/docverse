@@ -63,3 +63,8 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# Node / Cloudflare Worker
+node_modules/
+cloudflare-worker/node_modules/
+cloudflare-worker/dist/

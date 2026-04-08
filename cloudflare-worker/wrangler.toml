@@ -1,0 +1,16 @@
+name = "docverse-worker"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[env.dev]
+kv_namespaces = [
+  { binding = "EDITIONS_KV", id = "PLACEHOLDER_KV_NAMESPACE_ID" }
+]
+
+[[env.dev.r2_buckets]]
+binding = "BUILDS_R2"
+bucket_name = "docverse-dev-builds"
+
+[env.dev.vars]
+URL_SCHEME = "subdomain"
