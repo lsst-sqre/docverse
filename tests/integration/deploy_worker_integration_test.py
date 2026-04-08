@@ -7,7 +7,6 @@ wrangler deploy --dry-run. It requires Node.js and npm on PATH.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import textwrap
 from pathlib import Path
 
@@ -73,19 +72,17 @@ def deployments_repo(tmp_path: Path) -> Path:
     (repo / "wrangler.toml").write_text(WRANGLER_TOML)
     (repo / "package.json").write_text(PACKAGE_JSON)
 
-    # Install wrangler from the monorepo's cloudflare-worker lockfile
-    # so the integration test uses a consistent version.
+    # Copy wrangler from the monorepo's cloudflare-worker install.
+    # In CI the deploy-worker-test job runs ``npm ci`` before pytest;
+    # locally, run ``npm ci`` in cloudflare-worker/ first.
     worker_dir = _repo_root() / "cloudflare-worker"
     node_modules = worker_dir / "node_modules"
-    if node_modules.is_dir():
-        shutil.copytree(node_modules, repo / "node_modules", symlinks=True)
-    else:
-        subprocess.run(
-            ["npm", "install", "wrangler"],
-            check=True,
-            cwd=str(repo),
-            capture_output=True,
+    if not node_modules.is_dir():
+        pytest.skip(
+            "cloudflare-worker/node_modules not found "
+            "— run 'npm ci' in cloudflare-worker/ first"
         )
+    shutil.copytree(node_modules, repo / "node_modules", symlinks=True)
     return repo
 
 
