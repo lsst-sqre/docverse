@@ -118,10 +118,10 @@ def _mock_create_objectstore(
     """  # noqa: D205
 
     async def _create(
-        self: WorkerFactory,  # noqa: ARG001
+        self: WorkerFactory,
         *,
-        org_id: int,  # noqa: ARG001
-        service_label: str,  # noqa: ARG001
+        org_id: int,
+        service_label: str,
     ) -> MockObjectStore:
         return mock_store
 
@@ -130,7 +130,7 @@ def _mock_create_objectstore(
 
 @pytest.mark.asyncio
 async def test_build_processing_updates_edition(
-    app: None,  # noqa: ARG001
+    app: None,
     db_session: async_scoped_session[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -218,7 +218,7 @@ async def test_build_processing_updates_edition(
 
 @pytest.mark.asyncio
 async def test_build_processing_uses_stored_storage_prefix(
-    app: None,  # noqa: ARG001
+    app: None,
     db_session: async_scoped_session[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,7 +278,7 @@ async def test_build_processing_uses_stored_storage_prefix(
 
 @pytest.mark.asyncio
 async def test_build_processing_edition_failure_no_build_fail(
-    app: None,  # noqa: ARG001
+    app: None,
     db_session: async_scoped_session[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -318,8 +318,8 @@ async def test_build_processing_edition_failure_no_build_fail(
 
     # Monkeypatch edition tracking to raise an exception
     async def _broken_track(
-        self: EditionTrackingService,  # noqa: ARG001
-        build: Any,  # noqa: ARG001
+        self: EditionTrackingService,
+        build: Any,
     ) -> None:
         msg = "Simulated edition tracking failure"
         raise RuntimeError(msg)
