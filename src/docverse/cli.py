@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import json
 import re
 import shutil
 import subprocess
@@ -235,7 +236,7 @@ def deploy_worker(
     logger.info("Packing cloudflare worker", worker_dir=str(worker_dir))
     try:
         pack_result = subprocess.run(
-            ["npm", "pack"],
+            ["npm", "pack", "--json"],
             check=True,
             capture_output=True,
             text=True,
@@ -244,7 +245,11 @@ def deploy_worker(
     except subprocess.CalledProcessError as exc:
         msg = f"npm pack failed: {exc.stderr}"
         raise click.ClickException(msg) from exc
-    tarball_name = pack_result.stdout.strip()
+    try:
+        tarball_name = json.loads(pack_result.stdout)[0]["filename"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        msg = f"Failed to parse npm pack output: {pack_result.stdout!r}"
+        raise click.ClickException(msg) from exc
 
     # Phase 2: copy and unpack into deployments repo
     logger.info(

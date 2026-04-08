@@ -58,9 +58,9 @@ def mock_deployments_repo(tmp_path: Path) -> Path:
 def _npm_pack_side_effect(*args: object, **kwargs: object) -> MagicMock:
     cmd = args[0]
     assert isinstance(cmd, list)
-    if cmd == ["npm", "pack"]:
+    if cmd == ["npm", "pack", "--json"]:
         result = MagicMock()
-        result.stdout = "docverse-worker-0.0.0.tgz\n"
+        result.stdout = '[{"filename": "docverse-worker-0.0.0.tgz"}]\n'
         return result
     return MagicMock()
 
@@ -125,7 +125,7 @@ def test_deploy_worker_happy_path(
     mock_run.assert_has_calls(
         [
             call(
-                ["npm", "pack"],
+                ["npm", "pack", "--json"],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -183,6 +183,41 @@ def test_deploy_worker_npm_pack_fails(
 
     assert result.exit_code == 1
     assert "npm pack failed" in result.output
+
+
+@pytest.mark.parametrize(
+    "bad_stdout",
+    ["not json at all\n", "[]\n", '[{"no_filename": true}]\n'],
+)
+@patch("docverse.cli.shutil.copy2")
+@patch("docverse.cli.subprocess.run")
+def test_deploy_worker_npm_pack_bad_json(
+    mock_run: MagicMock,
+    mock_copy: MagicMock,
+    mock_monorepo: Path,
+    mock_deployments_repo: Path,
+    bad_stdout: str,
+) -> None:
+    result_mock = MagicMock()
+    result_mock.stdout = bad_stdout
+    mock_run.return_value = result_mock
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "deploy-worker",
+            "--docverse-repo",
+            str(mock_monorepo),
+            "--deployments-repo",
+            str(mock_deployments_repo),
+            "--env",
+            "dev",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Failed to parse npm pack output" in result.output
 
 
 @patch("docverse.cli.shutil.copy2")
