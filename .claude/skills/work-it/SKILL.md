@@ -52,6 +52,11 @@ TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox 
 uv run --only-group=nox nox -s client_test
 ```
 
+For Cloudflare Worker changes, also build and test the worker:
+```
+cd cloudflare-worker && npm run build && npm test
+```
+
 Fix any failures and re-run until all pass.
 
 ## Phase 5: Commit
