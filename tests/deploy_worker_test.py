@@ -65,6 +65,32 @@ def _npm_pack_side_effect(*args: object, **kwargs: object) -> MagicMock:
     return MagicMock()
 
 
+@pytest.mark.parametrize(
+    "bad_env",
+    ["--config=evil", "foo bar", "dev;rm", "dev\nstaging", ""],
+)
+def test_deploy_worker_invalid_env_name(
+    bad_env: str,
+    mock_monorepo: Path,
+    mock_deployments_repo: Path,
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "deploy-worker",
+            "--docverse-repo",
+            str(mock_monorepo),
+            "--deployments-repo",
+            str(mock_deployments_repo),
+            "--env",
+            bad_env,
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Invalid environment name" in result.output
+
+
 @patch("docverse.cli.shutil.copy2")
 @patch("docverse.cli.subprocess.run")
 def test_deploy_worker_happy_path(

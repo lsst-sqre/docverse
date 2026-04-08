@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -212,6 +213,14 @@ def deploy_worker(
 ) -> None:
     """Pack and deploy the Cloudflare Worker."""
     logger = structlog.get_logger("docverse")
+
+    if not re.match(r"^[a-zA-Z0-9_-]+$", wrangler_env):
+        msg = (
+            f"Invalid environment name {wrangler_env!r}: "
+            "must contain only alphanumeric characters, hyphens, "
+            "and underscores"
+        )
+        raise click.ClickException(msg)
 
     worker_dir = docverse_repo.resolve() / "cloudflare-worker"
     if not worker_dir.is_dir():
