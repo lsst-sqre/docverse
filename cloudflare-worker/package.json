@@ -1,0 +1,21 @@
+{
+  "name": "docverse-worker",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir=dist",
+    "dev": "wrangler dev",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.20250327.0",
+    "typescript": "^5.8.0",
+    "vitest": "~3.1.0",
+    "wrangler": "^4.14.0"
+  },
+  "dependencies": {
+    "mime": "^4.0.0"
+  }
+}
