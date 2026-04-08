@@ -89,12 +89,14 @@ ignore = [
     "A001",   # Shadowing builtin (help command).
     "ARG001", # Unused function argument (Click pattern).
     "D103",   # Missing docstring in public function (Click commands).
+    "S603",   # Subprocess call with variable args (deploy-worker).
     "S607",   # Partial executable path (alembic CLI).
 ]
 "src/docverse/handlers/**" = [
     "D103",  # Missing docstring in public function (handlers).
 ]
 "tests/**" = [
+    "ARG001",  # Unused function argument (mock injection).
     "D100",    # Missing docstring in public module.
     "D102",    # Missing docstring in public method.
     "D103",    # Missing docstring in public function.

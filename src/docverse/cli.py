@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -175,6 +176,94 @@ def validate_db_schema(*, alembic_config_path: Path) -> None:
     ):
         msg = "Database schema is not current"
         raise click.ClickException(msg)
+
+
+@main.command()
+@click.option(
+    "--docverse-repo",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Path to the docverse monorepo root.",
+)
+@click.option(
+    "--deployments-repo",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Path to local docverse-cloudflare-deployments checkout.",
+)
+@click.option(
+    "--env",
+    "wrangler_env",
+    required=True,
+    help="Wrangler environment name (e.g., dev, production).",
+)
+def deploy_worker(
+    *,
+    docverse_repo: Path,
+    deployments_repo: Path,
+    wrangler_env: str,
+) -> None:
+    """Pack and deploy the Cloudflare Worker."""
+    logger = structlog.get_logger("docverse")
+
+    worker_dir = docverse_repo.resolve() / "cloudflare-worker"
+    if not worker_dir.is_dir():
+        msg = f"cloudflare-worker/ not found in {docverse_repo.resolve()}"
+        raise click.ClickException(msg)
+
+    deployments_repo = deployments_repo.resolve()
+    dest_dir = deployments_repo / "worker"
+    dest_dir.mkdir(exist_ok=True)
+
+    # Phase 1: npm pack
+    logger.info("Packing cloudflare worker", worker_dir=str(worker_dir))
+    try:
+        pack_result = subprocess.run(
+            ["npm", "pack"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(worker_dir),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"npm pack failed: {exc.stderr}"
+        raise click.ClickException(msg) from exc
+    tarball_name = pack_result.stdout.strip()
+
+    # Phase 2: copy and unpack into deployments repo
+    logger.info(
+        "Unpacking worker into deployments repo",
+        tarball=tarball_name,
+        dest=str(dest_dir),
+    )
+    shutil.copy2(worker_dir / tarball_name, dest_dir / tarball_name)
+    try:
+        subprocess.run(
+            ["tar", "xzf", tarball_name, "--strip-components=1"],
+            check=True,
+            cwd=str(dest_dir),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"Failed to unpack worker tarball: {exc}"
+        raise click.ClickException(msg) from exc
+    finally:
+        for tgz in dest_dir.glob("*.tgz"):
+            tgz.unlink()
+    (worker_dir / tarball_name).unlink(missing_ok=True)
+
+    # Phase 3: wrangler deploy
+    logger.info("Deploying worker", env=wrangler_env)
+    try:
+        subprocess.run(
+            ["npx", "wrangler", "deploy", "--env", wrangler_env],
+            check=True,
+            cwd=str(deployments_repo),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"wrangler deploy failed: {exc}"
+        raise click.ClickException(msg) from exc
+
+    logger.info("Worker deployed successfully", env=wrangler_env)
 
 
 async def _cli_get_current_revision() -> str | None:
