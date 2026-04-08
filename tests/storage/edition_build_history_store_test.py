@@ -84,6 +84,7 @@ async def _create_edition_and_builds(
                 content_hash=(f"sha256:{i:064x}"),
             ),
             uploader="testuser",
+            project_slug=project_slug,
         )
         build_ids.append(build.id)
     return edition.id, project.id, build_ids
@@ -299,6 +300,7 @@ async def test_list_with_build_info_includes_annotations(
                 ),
             ),
             uploader="testuser",
+            project_slug="ann-proj",
         )
         await history_store.record(edition_id=edition.id, build_id=build.id)
         result = await history_store.list_by_edition_with_build_info(

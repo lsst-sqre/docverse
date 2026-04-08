@@ -186,6 +186,7 @@ async def test_set_current_build(
                 content_hash="sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         edition = await edition_store.create(
             project_id=project_id,
@@ -222,6 +223,7 @@ async def test_set_current_build_skips_stale(
                 content_hash="sha256:aaaa" + "0" * 60,
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         older_build = await build_store.create(
             project_id=project_id,
@@ -230,6 +232,7 @@ async def test_set_current_build_skips_stale(
                 content_hash="sha256:bbbb" + "0" * 60,
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         # Set controlled timestamps
         for bid, ts in [
@@ -285,6 +288,7 @@ async def test_set_current_build_skips_equal(
                 content_hash="sha256:cccc" + "0" * 60,
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         build_b = await build_store.create(
             project_id=project_id,
@@ -293,6 +297,7 @@ async def test_set_current_build_skips_equal(
                 content_hash="sha256:dddd" + "0" * 60,
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         # Give both builds the same date_created
         for bid in [build_a.id, build_b.id]:
@@ -342,6 +347,7 @@ async def test_set_current_build_applies_when_newer(
                 content_hash="sha256:eeee" + "0" * 60,
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         newer_build = await build_store.create(
             project_id=project_id,
@@ -350,6 +356,7 @@ async def test_set_current_build_applies_when_newer(
                 content_hash="sha256:ffff" + "0" * 60,
             ),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         for bid, ts in [
             (older_build.id, datetime(2025, 1, 1, tzinfo=UTC)),
@@ -832,6 +839,7 @@ async def test_find_matching_lsst_doc_main_when_showing_main(
             project_id=project_id,
             data=BuildCreate(git_ref="main", content_hash=_HASH),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         edition = await edition_store.create_internal(
             project_id=project_id,
@@ -865,6 +873,7 @@ async def test_find_matching_lsst_doc_main_rejected_when_showing_version(
             project_id=project_id,
             data=BuildCreate(git_ref="v1.0", content_hash=_HASH),
             uploader="testuser",
+            project_slug="ed-proj",
         )
         edition = await edition_store.create_internal(
             project_id=project_id,

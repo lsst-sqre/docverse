@@ -67,6 +67,7 @@ async def _create_builds_with_history(
                 content_hash=f"sha256:{i:064x}",
             ),
             uploader="testuser",
+            project_slug="rb-proj",
         )
         builds.append((build.id, build.public_id))
         await history_store.record(edition_id=edition.id, build_id=build.id)
@@ -144,6 +145,7 @@ async def test_rollback_build_not_in_history(
                 content_hash="sha256:" + "a" * 64,
             ),
             uploader="testuser",
+            project_slug="rb-proj",
         )
         orphan_public_id = serialize_base32_id(build.public_id)
         await db_session.commit()

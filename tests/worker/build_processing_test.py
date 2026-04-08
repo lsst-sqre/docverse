@@ -99,6 +99,7 @@ async def _create_build_in_processing(
         project_id=project_id,
         data=BuildCreate(git_ref=git_ref, content_hash=_HASH),
         uploader="testuser",
+        project_slug="worker-test-proj",
     )
     await build_store.transition_status(
         build_id=build.id, new_status=BuildStatus.processing
@@ -213,6 +214,66 @@ async def test_build_processing_updates_edition(
             assert len(job.progress["editions_updated"]) == 1
             assert job.progress["editions_updated"][0]["slug"] == "main"
             assert job.progress["editions_updated"][0]["action"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_build_processing_uses_stored_storage_prefix(
+    app: None,  # noqa: ARG001
+    db_session: async_scoped_session[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build processing uploads files under build.storage_prefix."""
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-prefix",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        WorkerFactory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-arq-prefix",
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Verify the uploaded key uses storage_prefix from the build
+    expected_key = f"{build.storage_prefix}index.html"
+    assert expected_key in mock_store.objects
 
 
 @pytest.mark.asyncio

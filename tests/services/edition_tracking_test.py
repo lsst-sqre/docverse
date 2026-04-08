@@ -109,6 +109,7 @@ async def _create_build(
             content_hash=_HASH,
         ),
         uploader="testuser",
+        project_slug="track-proj",
     )
 
 

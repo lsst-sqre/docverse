@@ -46,6 +46,8 @@ class SqlBuild(Base):
 
     staging_key: Mapped[str] = mapped_column(String(512), nullable=False)
 
+    storage_prefix: Mapped[str] = mapped_column(String(512), nullable=False)
+
     object_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     total_size_bytes: Mapped[int | None] = mapped_column(

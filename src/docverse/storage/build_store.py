@@ -43,12 +43,15 @@ class BuildStore:
         self,
         *,
         project_id: int,
+        project_slug: str,
         data: BuildCreate,
         uploader: str,
     ) -> Build:
         """Insert a new build row with status=pending."""
         public_id = validate_base32_id(generate_base32_id())
-        staging_key = f"__staging/{serialize_base32_id(public_id)}.tar.gz"
+        base32_str = serialize_base32_id(public_id)
+        staging_key = f"__staging/{base32_str}.tar.gz"
+        storage_prefix = f"{project_slug}/__builds/{base32_str}/"
         row = SqlBuild(
             public_id=public_id,
             project_id=project_id,
@@ -57,6 +60,7 @@ class BuildStore:
             content_hash=data.content_hash,
             status=BuildStatus.pending,
             staging_key=staging_key,
+            storage_prefix=storage_prefix,
             uploader=uploader,
             annotations=(
                 data.annotations.model_dump(exclude_none=True)
