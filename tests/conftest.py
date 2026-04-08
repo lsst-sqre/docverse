@@ -78,7 +78,7 @@ async def client(app: FastAPI) -> AsyncGenerator[AsyncClient]:
 
 @pytest_asyncio.fixture
 async def db_session(
-    app: FastAPI,  # noqa: ARG001
+    app: FastAPI,
 ) -> AsyncGenerator[async_scoped_session[AsyncSession]]:
     """Provide a database session for direct store tests.
 

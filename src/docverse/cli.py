@@ -197,11 +197,18 @@ def validate_db_schema(*, alembic_config_path: Path) -> None:
     required=True,
     help="Wrangler environment name (e.g., dev, production).",
 )
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Build the worker bundle without deploying.",
+)
 def deploy_worker(
     *,
     docverse_repo: Path,
     deployments_repo: Path,
     wrangler_env: str,
+    dry_run: bool,
 ) -> None:
     """Pack and deploy the Cloudflare Worker."""
     logger = structlog.get_logger("docverse")
@@ -252,10 +259,20 @@ def deploy_worker(
     (worker_dir / tarball_name).unlink(missing_ok=True)
 
     # Phase 3: wrangler deploy
-    logger.info("Deploying worker", env=wrangler_env)
+    wrangler_cmd = [
+        "npx",
+        "wrangler",
+        "deploy",
+        "--env",
+        wrangler_env,
+    ]
+    if dry_run:
+        outdir = deployments_repo / "dist"
+        wrangler_cmd.extend(["--dry-run", f"--outdir={outdir}"])
+    logger.info("Deploying worker", env=wrangler_env, dry_run=dry_run)
     try:
         subprocess.run(
-            ["npx", "wrangler", "deploy", "--env", wrangler_env],
+            wrangler_cmd,
             check=True,
             cwd=str(deployments_repo),
         )
@@ -263,7 +280,11 @@ def deploy_worker(
         msg = f"wrangler deploy failed: {exc}"
         raise click.ClickException(msg) from exc
 
-    logger.info("Worker deployed successfully", env=wrangler_env)
+    logger.info(
+        "Worker deployed successfully",
+        env=wrangler_env,
+        dry_run=dry_run,
+    )
 
 
 async def _cli_get_current_revision() -> str | None:

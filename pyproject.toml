@@ -103,6 +103,7 @@ ignore = [
     "PLR0913", # Too many arguments to function call.
     "PLR2004", # Magic value used in comparison.
     "S106",    # Possible hardcoded password.
+    "S607",    # Partial executable path (npm/npx in tests).
     "SLF001",  # Private member accessed.
 ]
 "*/tests/**" = [

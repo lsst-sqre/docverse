@@ -55,7 +55,7 @@ def mock_deployments_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _npm_pack_side_effect(*args: object) -> MagicMock:
+def _npm_pack_side_effect(*args: object, **kwargs: object) -> MagicMock:
     cmd = args[0]
     assert isinstance(cmd, list)
     if cmd == ["npm", "pack"]:
@@ -169,7 +169,7 @@ def test_deploy_worker_tar_extract_fails(
 ) -> None:
     call_count = 0
 
-    def side_effect(*args: object) -> MagicMock:
+    def side_effect(*args: object, **kwargs: object) -> MagicMock:
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -206,7 +206,7 @@ def test_deploy_worker_wrangler_deploy_fails(
 ) -> None:
     call_count = 0
 
-    def side_effect(*args: object) -> MagicMock:
+    def side_effect(*args: object, **kwargs: object) -> MagicMock:
         nonlocal call_count
         call_count += 1
         if call_count <= 2:
@@ -321,4 +321,49 @@ def test_deploy_worker_env_passed_to_wrangler(
         ["npx", "wrangler", "deploy", "--env", env_name],
         check=True,
         cwd=str(mock_deployments_repo.resolve()),
+    )
+
+
+@patch("docverse.cli.shutil.copy2")
+@patch("docverse.cli.subprocess.run")
+def test_deploy_worker_dry_run(
+    mock_run: MagicMock,
+    mock_copy: MagicMock,
+    mock_monorepo: Path,
+    mock_deployments_repo: Path,
+) -> None:
+    mock_run.side_effect = _npm_pack_side_effect
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "deploy-worker",
+            "--docverse-repo",
+            str(mock_monorepo),
+            "--deployments-repo",
+            str(mock_deployments_repo),
+            "--env",
+            "dev",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+
+    deployments = mock_deployments_repo.resolve()
+    outdir = deployments / "dist"
+    wrangler_call = mock_run.call_args_list[2]
+    assert wrangler_call == call(
+        [
+            "npx",
+            "wrangler",
+            "deploy",
+            "--env",
+            "dev",
+            "--dry-run",
+            f"--outdir={outdir}",
+        ],
+        check=True,
+        cwd=str(deployments),
     )

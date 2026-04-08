@@ -96,8 +96,38 @@ jobs:
           client_test_compat
           client_test_oldest
 
+  deploy-worker-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: cloudflare-worker/package.json
+          cache: npm
+          cache-dependency-path: cloudflare-worker/package-lock.json
+
+      - name: Install worker dependencies
+        run: npm ci
+        working-directory: cloudflare-worker
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run deploy-worker integration test
+        run: uv run --only-group=nox nox -s deploy_worker_test
+
   build:
-    needs: [test, client-test, worker-test]
+    needs: [test, client-test, worker-test, deploy-worker-test]
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v3
     with:
       images: ghcr.io/${{ github.repository }}
