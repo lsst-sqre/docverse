@@ -59,13 +59,20 @@ PACKAGE_JSON = textwrap.dedent("""\
 """)
 
 
-def _repo_root() -> Path:
-    """Return the monorepo root (parent of this test file's repo)."""
-    return Path(__file__).resolve().parent.parent.parent
+@pytest.fixture
+def docverse_repo() -> Path:
+    """Find the monorepo root by walking up from this file."""
+    current = Path(__file__).resolve().parent
+    while current != current.parent:
+        if (current / "pyproject.toml").is_file():
+            return current
+        current = current.parent
+    msg = "Could not find monorepo root (no pyproject.toml found)"
+    raise RuntimeError(msg)
 
 
 @pytest.fixture
-def deployments_repo(tmp_path: Path) -> Path:
+def deployments_repo(tmp_path: Path, docverse_repo: Path) -> Path:
     """Create a mock deployments repo with environment-layered config."""
     repo = tmp_path / "deployments"
     repo.mkdir()
@@ -75,7 +82,7 @@ def deployments_repo(tmp_path: Path) -> Path:
     # Copy wrangler from the monorepo's cloudflare-worker install.
     # In CI the deploy-worker-test job runs ``npm ci`` before pytest;
     # locally, run ``npm ci`` in cloudflare-worker/ first.
-    worker_dir = _repo_root() / "cloudflare-worker"
+    worker_dir = docverse_repo / "cloudflare-worker"
     node_modules = worker_dir / "node_modules"
     if not node_modules.is_dir():
         pytest.skip(
@@ -87,6 +94,7 @@ def deployments_repo(tmp_path: Path) -> Path:
 
 
 def test_deploy_worker_dry_run_integration(
+    docverse_repo: Path,
     deployments_repo: Path,
 ) -> None:
     """Full pipeline: npm pack -> unpack -> wrangler deploy --dry-run."""
@@ -96,7 +104,7 @@ def test_deploy_worker_dry_run_integration(
         [
             "deploy-worker",
             "--docverse-repo",
-            str(_repo_root()),
+            str(docverse_repo),
             "--deployments-repo",
             str(deployments_repo),
             "--env",
