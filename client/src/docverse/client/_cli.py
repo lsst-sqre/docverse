@@ -237,6 +237,20 @@ def deploy_worker(
             tgz.unlink()
     (worker_dir / tarball_name).unlink(missing_ok=True)
 
+    # Phase 2b: install worker runtime dependencies
+    click.echo("Installing worker dependencies")
+    try:
+        subprocess.run(
+            ["npm", "install", "--production"],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(dest_dir),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"npm install failed: {exc.stderr}"
+        raise click.ClickException(msg) from exc
+
     # Phase 3: wrangler deploy
     wrangler_cmd = [
         "npx",
