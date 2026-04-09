@@ -136,6 +136,8 @@ ServiceConfig = Annotated[
 class OrganizationServiceCreate(BaseModel):
     """Request model for creating an organization service."""
 
+    model_config = ConfigDict(extra="forbid")
+
     label: Annotated[
         str,
         Field(
@@ -173,6 +175,8 @@ class OrganizationServiceCreate(BaseModel):
 
 class OrganizationServiceUpdate(BaseModel):
     """Request model for updating an organization service (PATCH)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     credential_label: str | None = Field(
         default=None,

@@ -14,6 +14,8 @@ from .editions import Edition as EditionResponse
 class ProjectCreate(BaseModel):
     """Request model for creating a project."""
 
+    model_config = ConfigDict(extra="forbid")
+
     slug: Annotated[
         str,
         Field(
@@ -107,6 +109,8 @@ class Project(BaseModel):
 
 class ProjectUpdate(BaseModel):
     """Request model for updating a project (PATCH)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     title: str | None = Field(
         default=None, description="Display title for the project."

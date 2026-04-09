@@ -32,6 +32,8 @@ class OrgRole(StrEnum):
 class OrgMembershipCreate(BaseModel):
     """Request model for creating an organization membership."""
 
+    model_config = ConfigDict(extra="forbid")
+
     principal: str = Field(
         min_length=1,
         max_length=256,

@@ -26,6 +26,8 @@ class UrlScheme(StrEnum):
 class OrganizationCreate(BaseModel):
     """Request model for creating an organization."""
 
+    model_config = ConfigDict(extra="forbid")
+
     slug: Annotated[
         str,
         Field(
@@ -203,6 +205,8 @@ class Organization(BaseModel):
 
 class OrganizationUpdate(BaseModel):
     """Request model for updating an organization (PATCH)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     title: str | None = Field(
         default=None, description="Display title for the organization."

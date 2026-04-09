@@ -90,6 +90,8 @@ class DefaultEditionConfig(BaseModel):
 class EditionCreate(BaseModel):
     """Request model for creating an edition."""
 
+    model_config = ConfigDict(extra="forbid")
+
     slug: Annotated[
         str,
         Field(
@@ -224,6 +226,8 @@ class EditionRollback(BaseModel):
 
 class EditionUpdate(BaseModel):
     """Request model for updating an edition (PATCH)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     title: str | None = Field(
         default=None, description="Display title for the edition."

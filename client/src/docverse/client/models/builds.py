@@ -88,6 +88,8 @@ class BuildStatus(StrEnum):
 class BuildCreate(BaseModel):
     """Request model for creating a build."""
 
+    model_config = ConfigDict(extra="forbid")
+
     git_ref: Annotated[
         str,
         Field(
@@ -204,6 +206,8 @@ class BuildUpdate(BaseModel):
     Currently supports only the ``status`` field, used to signal
     that an upload is complete (set ``status`` to ``"uploaded"``).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     status: BuildStatus | None = Field(
         default=None,
