@@ -112,20 +112,8 @@ def deploy_worker_test(session: nox.Session) -> None:
     """Integration test for deploy-worker (requires Node.js/npm)."""
     session.run(
         "pytest",
-        "tests/integration/",
+        "client/tests/deploy_worker_integration_test.py",
         *session.posargs,
-        env={
-            "DOCVERSE_DATABASE_URL": "postgresql://localhost/unused",
-            "DOCVERSE_DATABASE_PASSWORD": "unused",
-            "DOCVERSE_ALEMBIC_CONFIG_PATH": "alembic.ini",
-            "DOCVERSE_ARQ_MODE": "test",
-            "DOCVERSE_CREDENTIAL_ENCRYPTION_KEY": (
-                "nz4oCndEIQhi-PlZBzYzmK_jlacf05Hz3VnrRrZhq-k="
-            ),
-            "REPERTOIRE_BASE_URL": (
-                "https://roundtable.lsst.cloud/repertoire"
-            ),
-        },
     )
 
 

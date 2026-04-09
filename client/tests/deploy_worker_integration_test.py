@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from docverse.cli import main
+from docverse.client._cli import main
 
 WRANGLER_TOML = textwrap.dedent("""\
     # Mock deployments repo wrangler.toml
