@@ -10,6 +10,7 @@ __all__ = [
     "InvalidBuildStateError",
     "InvalidJobStateError",
     "JobNotFoundError",
+    "MissingConfigurationError",
     "NotFoundError",
     "PermissionDeniedError",
 ]
@@ -27,6 +28,13 @@ class ConflictError(ClientRequestError):
 
     error = "conflict"
     status_code = status.HTTP_409_CONFLICT
+
+
+class MissingConfigurationError(ClientRequestError):
+    """The organization is missing required configuration."""
+
+    error = "missing_configuration"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
 class PermissionDeniedError(ClientRequestError):

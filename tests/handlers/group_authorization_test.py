@@ -74,6 +74,7 @@ async def test_group_uploader_can_create_build(
     context_dependency._user_info_store = StubUserInfoStore(
         groups=["g_uploaders"]
     )
+    # Uploader has permission but org has no store → 422
     response = await client.post(
         "/docverse/orgs/grp-up-org/projects/grp-proj/builds",
         json={
@@ -82,7 +83,7 @@ async def test_group_uploader_can_create_build(
         },
         headers={"X-Auth-Request-User": "group-uploader"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

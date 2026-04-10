@@ -334,7 +334,11 @@ async def _upload_async(  # noqa: PLR0913
             click.echo(f"Build created: {build.id}")
 
             if build.upload_url is None:
-                msg = "Server did not return an upload URL"
+                msg = (
+                    "Server did not return an upload URL. "
+                    "The organization may not have an object "
+                    "store configured."
+                )
                 raise DocverseClientError(msg)  # noqa: TRY301
 
             click.echo("Uploading tarball")

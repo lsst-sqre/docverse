@@ -22,16 +22,26 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
 
-from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
+from docverse.client.models import (
+    BuildAnnotations,
+    BuildCreate,
+    OrgMembershipCreate,
+    OrgRole,
+    PrincipalType,
+)
 from docverse.config import config
 from docverse.dbschema import Base
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.domain.base32id import serialize_base32_id
 from docverse.main import app as docverse_app
+from docverse.storage.build_store import BuildStore
 from docverse.storage.membership_store import OrgMembershipStore
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 from docverse.storage.user_info_store import StubUserInfoStore
 
 __all__ = [
+    "seed_build",
     "seed_group_member",
     "seed_member",
     "seed_org_with_admin",
@@ -112,6 +122,47 @@ async def seed_org_with_admin(
         headers={"X-Auth-Request-User": "superadmin"},
     )
     assert response.status_code == 201
+
+
+async def seed_build(
+    org_slug: str,
+    project_slug: str,
+    *,
+    git_ref: str = "main",
+    content_hash: str = (
+        "sha256:abcdef0123456789abcdef0123456789"
+        "abcdef0123456789abcdef0123456789"
+    ),
+    uploader: str = "testuser",
+    annotations: BuildAnnotations | None = None,
+) -> str:
+    """Create a build directly via the DB and return its base32 ID."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            proj_store = ProjectStore(session=session, logger=logger)
+            project = await proj_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            build_store = BuildStore(session=session, logger=logger)
+            build = await build_store.create(
+                project_id=project.id,
+                project_slug=project.slug,
+                data=BuildCreate(
+                    git_ref=git_ref,
+                    content_hash=content_hash,
+                    annotations=annotations,
+                ),
+                uploader=uploader,
+            )
+            await session.commit()
+        return serialize_base32_id(build.public_id)
+    msg = "db_session_dependency yielded nothing"
+    raise AssertionError(msg)
 
 
 async def seed_member(

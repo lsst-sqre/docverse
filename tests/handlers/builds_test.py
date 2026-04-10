@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from tests.conftest import seed_org_with_admin
+from docverse.client.models import BuildAnnotations
+from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (
     "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -37,34 +38,32 @@ async def test_create_build(client: AsyncClient) -> None:
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 422
     data = response.json()
-    assert data["git_ref"] == "main"
-    assert data["status"] == "pending"
-    # No credential configured for this org, so upload_url is None
-    assert data["upload_url"] is None
-    assert data["uploader"] == "testuser"
-    assert data["annotations"] is None
+    assert data["detail"][0]["type"] == "missing_configuration"
+    assert "object store" in data["detail"][0]["msg"].lower()
 
 
 @pytest.mark.asyncio
 async def test_create_build_with_annotations(client: AsyncClient) -> None:
+    """Annotations round-trip via DB seeding + GET (POST needs a store)."""
     await _setup(client)
-    annotations = {
-        "commit_sha": "abc123",
-        "ci_platform": "github-actions",
-        "custom_key": "custom_value",
-    }
-    response = await client.post(
-        "/docverse/orgs/build-org/projects/build-proj/builds",
-        json={
-            "git_ref": "main",
-            "content_hash": CONTENT_HASH,
-            "annotations": annotations,
-        },
+    build_id = await seed_build(
+        "build-org",
+        "build-proj",
+        annotations=BuildAnnotations.model_validate(
+            {
+                "commit_sha": "abc123",
+                "ci_platform": "github-actions",
+                "custom_key": "custom_value",
+            }
+        ),
+    )
+    response = await client.get(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
         headers={"X-Auth-Request-User": "testuser"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 200
     data = response.json()
     assert data["annotations"]["commit_sha"] == "abc123"
     assert data["annotations"]["ci_platform"] == "github-actions"
@@ -74,11 +73,7 @@ async def test_create_build_with_annotations(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_list_builds(client: AsyncClient) -> None:
     await _setup(client)
-    await client.post(
-        "/docverse/orgs/build-org/projects/build-proj/builds",
-        json={"git_ref": "main", "content_hash": CONTENT_HASH},
-        headers={"X-Auth-Request-User": "testuser"},
-    )
+    await seed_build("build-org", "build-proj")
     response = await client.get(
         "/docverse/orgs/build-org/projects/build-proj/builds",
         headers={"X-Auth-Request-User": "testuser"},
@@ -92,12 +87,7 @@ async def test_list_builds(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_get_build(client: AsyncClient) -> None:
     await _setup(client)
-    create_resp = await client.post(
-        "/docverse/orgs/build-org/projects/build-proj/builds",
-        json={"git_ref": "main", "content_hash": CONTENT_HASH},
-        headers={"X-Auth-Request-User": "testuser"},
-    )
-    build_id = create_resp.json()["id"]
+    build_id = await seed_build("build-org", "build-proj")
     response = await client.get(
         f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
         headers={"X-Auth-Request-User": "testuser"},
@@ -109,12 +99,7 @@ async def test_get_build(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_patch_build_upload_complete(client: AsyncClient) -> None:
     await _setup(client)
-    create_resp = await client.post(
-        "/docverse/orgs/build-org/projects/build-proj/builds",
-        json={"git_ref": "main", "content_hash": CONTENT_HASH},
-        headers={"X-Auth-Request-User": "testuser"},
-    )
-    build_id = create_resp.json()["id"]
+    build_id = await seed_build("build-org", "build-proj")
     response = await client.patch(
         f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
         json={"status": "uploaded"},
@@ -129,12 +114,7 @@ async def test_patch_build_upload_complete(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_delete_build(client: AsyncClient) -> None:
     await _setup(client)
-    create_resp = await client.post(
-        "/docverse/orgs/build-org/projects/build-proj/builds",
-        json={"git_ref": "main", "content_hash": CONTENT_HASH},
-        headers={"X-Auth-Request-User": "testuser"},
-    )
-    build_id = create_resp.json()["id"]
+    build_id = await seed_build("build-org", "build-proj")
     response = await client.delete(
         f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
         headers={"X-Auth-Request-User": "testuser"},

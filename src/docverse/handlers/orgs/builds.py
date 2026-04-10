@@ -15,6 +15,7 @@ from docverse.dependencies.auth import (
 )
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id
+from docverse.exceptions import MissingConfigurationError
 from docverse.handlers.params import (
     BuildIdParam,
     OrgSlugParam,
@@ -98,8 +99,16 @@ async def post_build(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],
 ) -> Build:
-    upload_url: str | None = None
     async with context.session.begin():
+        service_label = user.org.resolved_staging_store_label
+        if service_label is None:
+            msg = (
+                "Organization has no object store configured. "
+                "An administrator must add an object_storage service "
+                "before builds can be created."
+            )
+            raise MissingConfigurationError(msg)
+
         service = context.factory.create_build_service()
         build = await service.create(
             org_slug=org_slug,
@@ -108,18 +117,15 @@ async def post_build(
             uploader=user.username,
         )
 
-        # Generate a presigned upload URL if the org has a store
-        service_label = user.org.resolved_staging_store_label
-        if service_label is not None:
-            object_store = await context.factory.create_objectstore_for_org(
-                org_id=user.org.id,
-                service_label=service_label,
+        object_store = await context.factory.create_objectstore_for_org(
+            org_id=user.org.id,
+            service_label=service_label,
+        )
+        async with object_store:
+            upload_url = await object_store.generate_presigned_upload_url(
+                key=build.staging_key,
+                content_type="application/gzip",
             )
-            async with object_store:
-                upload_url = await object_store.generate_presigned_upload_url(
-                    key=build.staging_key,
-                    content_type="application/gzip",
-                )
 
         await context.session.commit()
     return Build.from_domain(
