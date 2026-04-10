@@ -6,7 +6,7 @@ import pytest
 from httpx import AsyncClient
 from safir.database import PaginationLinkData
 
-from tests.conftest import seed_org_with_admin
+from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (
     "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -181,18 +181,10 @@ async def test_edition_pagination_forward(
 
 
 async def _create_build(
-    client: AsyncClient,
     project_slug: str,
 ) -> str:
-    """Create a build and return its ID."""
-    resp = await client.post(
-        f"/docverse/orgs/pag-org/projects/{project_slug}/builds",
-        json={"git_ref": "main", "content_hash": CONTENT_HASH},
-        headers=AUTH,
-    )
-    assert resp.status_code == 201
-    build_id: str = resp.json()["id"]
-    return build_id
+    """Create a build via direct DB seeding and return its ID."""
+    return await seed_build("pag-org", project_slug)
 
 
 @pytest.mark.asyncio
@@ -202,8 +194,8 @@ async def test_build_status_filter(
     """Filter builds by status."""
     await _setup(client)
     await _create_project(client, "bld-filt-proj")
-    await _create_build(client, "bld-filt-proj")
-    build_id = await _create_build(client, "bld-filt-proj")
+    await _create_build("bld-filt-proj")
+    build_id = await _create_build("bld-filt-proj")
 
     # Signal upload on second build → transitions to processing
     await client.patch(
@@ -242,7 +234,7 @@ async def test_build_pagination_forward(
     await _setup(client)
     await _create_project(client, "bld-pag-proj")
     for _ in range(4):
-        await _create_build(client, "bld-pag-proj")
+        await _create_build("bld-pag-proj")
 
     # Verify first page returns exactly limit items and has next link
     resp = await client.get(

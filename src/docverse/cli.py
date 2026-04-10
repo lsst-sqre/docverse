@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import json
-import re
-import shutil
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 import structlog
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -21,9 +21,17 @@ from safir.database import (
     stamp_database,
 )
 from safir.logging import configure_logging
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_scoped_session, async_sessionmaker
 
 from .config import config
 from .database import check_database_state, get_current_revision, init_database
+from .dbschema.build import SqlBuild
+from .dbschema.edition import SqlEdition
+from .dbschema.organization import SqlOrganization
+from .dbschema.project import SqlProject
+from .domain.base32id import validate_base32_id
+from .domain.build import Build
 
 __all__ = ["help", "main"]
 
@@ -182,123 +190,191 @@ def validate_db_schema(*, alembic_config_path: Path) -> None:
 
 @main.command()
 @click.option(
-    "--docverse-repo",
+    "--org",
     required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="Path to the docverse monorepo root.",
+    help="Organization slug.",
 )
 @click.option(
-    "--deployments-repo",
+    "--project",
     required=True,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="Path to local docverse-cloudflare-deployments checkout.",
+    help="Project slug.",
 )
 @click.option(
-    "--env",
-    "wrangler_env",
+    "--edition",
     required=True,
-    help="Wrangler environment name (e.g., dev, production).",
+    help="Edition slug.",
 )
 @click.option(
-    "--dry-run",
-    is_flag=True,
-    default=False,
-    help="Build the worker bundle without deploying.",
+    "--build-id",
+    required=True,
+    help="Base32-encoded public build ID.",
 )
-def deploy_worker(
-    *,
-    docverse_repo: Path,
-    deployments_repo: Path,
-    wrangler_env: str,
-    dry_run: bool,
+def publish_edition(
+    *, org: str, project: str, edition: str, build_id: str
 ) -> None:
-    """Pack and deploy the Cloudflare Worker."""
+    """Publish an edition by writing a KV entry via the Cloudflare API.
+
+    This is a temporary shim command for a proof-of-concept for publishing
+    on Cloudflare workers.
+
+    Required environment variables: CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_KV_NAMESPACE_ID.
+    """
     logger = structlog.get_logger("docverse")
 
-    if not re.match(r"^[a-zA-Z0-9_-]+$", wrangler_env):
-        msg = (
-            f"Invalid environment name {wrangler_env!r}: "
-            "must contain only alphanumeric characters, hyphens, "
-            "and underscores"
-        )
+    cf_api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
+    cf_account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    cf_kv_namespace_id = os.environ.get("CLOUDFLARE_KV_NAMESPACE_ID")
+
+    if not cf_api_token:
+        msg = "CLOUDFLARE_API_TOKEN environment variable is required"
+        raise click.ClickException(msg)
+    if not cf_account_id:
+        msg = "CLOUDFLARE_ACCOUNT_ID environment variable is required"
+        raise click.ClickException(msg)
+    if not cf_kv_namespace_id:
+        msg = "CLOUDFLARE_KV_NAMESPACE_ID environment variable is required"
         raise click.ClickException(msg)
 
-    worker_dir = docverse_repo.resolve() / "cloudflare-worker"
-    if not worker_dir.is_dir():
-        msg = f"cloudflare-worker/ not found in {docverse_repo.resolve()}"
-        raise click.ClickException(msg)
-
-    deployments_repo = deployments_repo.resolve()
-    dest_dir = deployments_repo / "worker"
-    dest_dir.mkdir(exist_ok=True)
-
-    # Phase 1: npm pack
-    logger.info("Packing cloudflare worker", worker_dir=str(worker_dir))
-    try:
-        pack_result = subprocess.run(
-            ["npm", "pack", "--json"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(worker_dir),
+    asyncio.run(
+        _publish_edition(
+            org_slug=org,
+            project_slug=project,
+            edition_slug=edition,
+            build_id=build_id,
+            cf_api_token=cf_api_token,
+            cf_account_id=cf_account_id,
+            cf_kv_namespace_id=cf_kv_namespace_id,
+            logger=logger,
         )
-    except subprocess.CalledProcessError as exc:
-        msg = f"npm pack failed: {exc.stderr}"
-        raise click.ClickException(msg) from exc
-    try:
-        tarball_name = json.loads(pack_result.stdout)[0]["filename"]
-    except (json.JSONDecodeError, KeyError, IndexError) as exc:
-        msg = f"Failed to parse npm pack output: {pack_result.stdout!r}"
-        raise click.ClickException(msg) from exc
-
-    # Phase 2: copy and unpack into deployments repo
-    logger.info(
-        "Unpacking worker into deployments repo",
-        tarball=tarball_name,
-        dest=str(dest_dir),
     )
-    shutil.copy2(worker_dir / tarball_name, dest_dir / tarball_name)
+
+
+async def _publish_edition(  # noqa: PLR0913
+    *,
+    org_slug: str,
+    project_slug: str,
+    edition_slug: str,
+    build_id: str,
+    cf_api_token: str,
+    cf_account_id: str,
+    cf_kv_namespace_id: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Look up the build and write the KV entry."""
+    build = await _lookup_build(
+        org_slug=org_slug,
+        project_slug=project_slug,
+        edition_slug=edition_slug,
+        build_id=build_id,
+    )
+
+    kv_key = f"{project_slug}/{edition_slug}"
+    kv_value = json.dumps(
+        {"build_id": build_id, "r2_prefix": build.storage_prefix}
+    )
+
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}"
+        f"/storage/kv/namespaces/{cf_kv_namespace_id}/values/{kv_key}"
+    )
+
     try:
-        subprocess.run(
-            ["tar", "xzf", tarball_name, "--strip-components=1"],
-            check=True,
-            cwd=str(dest_dir),
-        )
-    except subprocess.CalledProcessError as exc:
-        msg = f"Failed to unpack worker tarball: {exc}"
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                url,
+                content=kv_value,
+                headers={
+                    "Authorization": f"Bearer {cf_api_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        msg = f"Cloudflare KV API error: {exc.response.status_code}"
         raise click.ClickException(msg) from exc
+
+    logger.info(
+        "Published edition",
+        org=org_slug,
+        project=project_slug,
+        edition=edition_slug,
+        build_id=build_id,
+        kv_key=kv_key,
+    )
+
+
+async def _lookup_build(
+    *, org_slug: str, project_slug: str, edition_slug: str, build_id: str
+) -> Build:
+    """Look up a build by org/project/build-id using a temporary engine."""
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        session_factory = async_scoped_session(
+            async_sessionmaker(engine),
+            scopefunc=asyncio.current_task,
+        )
+        session = session_factory()
+        try:
+            # Resolve org
+            result = await session.execute(
+                select(SqlOrganization).where(SqlOrganization.slug == org_slug)
+            )
+            org_row = result.scalar_one_or_none()
+            if org_row is None:
+                msg = f"Organization {org_slug!r} not found"
+                raise click.ClickException(msg)
+
+            # Resolve project
+            result = await session.execute(
+                select(SqlProject).where(
+                    SqlProject.org_id == org_row.id,
+                    SqlProject.slug == project_slug,
+                )
+            )
+            project_row = result.scalar_one_or_none()
+            if project_row is None:
+                msg = f"Project {project_slug!r} not found"
+                raise click.ClickException(msg)
+
+            # Resolve edition
+            result = await session.execute(
+                select(SqlEdition).where(
+                    SqlEdition.project_id == project_row.id,
+                    SqlEdition.slug == edition_slug,
+                    SqlEdition.date_deleted.is_(None),
+                )
+            )
+            edition_row = result.scalar_one_or_none()
+            if edition_row is None:
+                msg = f"Edition {edition_slug!r} not found"
+                raise click.ClickException(msg)
+
+            # Resolve build
+            try:
+                public_id = validate_base32_id(build_id)
+            except ValueError as exc:
+                msg = f"Invalid build ID {build_id!r}: {exc}"
+                raise click.ClickException(msg) from exc
+            result = await session.execute(
+                select(SqlBuild).where(
+                    SqlBuild.project_id == project_row.id,
+                    SqlBuild.public_id == public_id,
+                    SqlBuild.date_deleted.is_(None),
+                )
+            )
+            build_row = result.scalar_one_or_none()
+            if build_row is None:
+                msg = f"Build {build_id!r} not found"
+                raise click.ClickException(msg)
+
+            return Build.model_validate(build_row)
+        finally:
+            await session.close()
     finally:
-        for tgz in dest_dir.glob("*.tgz"):
-            tgz.unlink()
-    (worker_dir / tarball_name).unlink(missing_ok=True)
-
-    # Phase 3: wrangler deploy
-    wrangler_cmd = [
-        "npx",
-        "wrangler",
-        "deploy",
-        "--env",
-        wrangler_env,
-    ]
-    if dry_run:
-        outdir = deployments_repo / "dist"
-        wrangler_cmd.extend(["--dry-run", f"--outdir={outdir}"])
-    logger.info("Deploying worker", env=wrangler_env, dry_run=dry_run)
-    try:
-        subprocess.run(
-            wrangler_cmd,
-            check=True,
-            cwd=str(deployments_repo),
-        )
-    except subprocess.CalledProcessError as exc:
-        msg = f"wrangler deploy failed: {exc}"
-        raise click.ClickException(msg) from exc
-
-    logger.info(
-        "Worker deployed successfully",
-        env=wrangler_env,
-        dry_run=dry_run,
-    )
+        await engine.dispose()
 
 
 async def _cli_get_current_revision() -> str | None:

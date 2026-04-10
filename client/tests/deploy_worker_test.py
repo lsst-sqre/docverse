@@ -1,3 +1,4 @@
+# ruff: noqa: ARG001
 """Tests for the deploy-worker CLI command."""
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from click.testing import CliRunner
 
-from docverse.cli import main
+from docverse.client._cli import main
 
 
 @pytest.fixture
@@ -91,8 +92,8 @@ def test_deploy_worker_invalid_env_name(
     assert "Invalid environment name" in result.output
 
 
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_happy_path(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -121,7 +122,8 @@ def test_deploy_worker_happy_path(
     deployments = mock_deployments_repo.resolve()
     dest_dir = deployments / "worker"
 
-    assert mock_run.call_count == 3
+    expected_call_count = 4
+    assert mock_run.call_count == expected_call_count
     mock_run.assert_has_calls(
         [
             call(
@@ -142,6 +144,13 @@ def test_deploy_worker_happy_path(
                 cwd=str(dest_dir),
             ),
             call(
+                ["npm", "install", "--production"],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(dest_dir),
+            ),
+            call(
                 ["npx", "wrangler", "deploy", "--env", "dev"],
                 check=True,
                 cwd=str(deployments),
@@ -155,8 +164,8 @@ def test_deploy_worker_happy_path(
     )
 
 
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_npm_pack_fails(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -189,8 +198,8 @@ def test_deploy_worker_npm_pack_fails(
     "bad_stdout",
     ["not json at all\n", "[]\n", '[{"no_filename": true}]\n'],
 )
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_npm_pack_bad_json(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -220,8 +229,8 @@ def test_deploy_worker_npm_pack_bad_json(
     assert "Failed to parse npm pack output" in result.output
 
 
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_tar_extract_fails(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -257,8 +266,8 @@ def test_deploy_worker_tar_extract_fails(
     assert "Failed to unpack worker tarball" in result.output
 
 
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_wrangler_deploy_fails(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -266,11 +275,12 @@ def test_deploy_worker_wrangler_deploy_fails(
     mock_deployments_repo: Path,
 ) -> None:
     call_count = 0
+    succeed_count = 3
 
     def side_effect(*args: object, **kwargs: object) -> MagicMock:
         nonlocal call_count
         call_count += 1
-        if call_count <= 2:
+        if call_count <= succeed_count:
             return _npm_pack_side_effect(*args)
         raise subprocess.CalledProcessError(1, "wrangler")
 
@@ -319,8 +329,8 @@ def test_deploy_worker_missing_cloudflare_worker_dir(
     assert "cloudflare-worker/ not found" in result.output
 
 
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_creates_worker_dest_dir(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -350,8 +360,8 @@ def test_deploy_worker_creates_worker_dest_dir(
 
 
 @pytest.mark.parametrize("env_name", ["dev", "production"])
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_env_passed_to_wrangler(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -377,7 +387,7 @@ def test_deploy_worker_env_passed_to_wrangler(
 
     assert result.exit_code == 0, result.output
 
-    wrangler_call = mock_run.call_args_list[2]
+    wrangler_call = mock_run.call_args_list[3]
     assert wrangler_call == call(
         ["npx", "wrangler", "deploy", "--env", env_name],
         check=True,
@@ -385,8 +395,8 @@ def test_deploy_worker_env_passed_to_wrangler(
     )
 
 
-@patch("docverse.cli.shutil.copy2")
-@patch("docverse.cli.subprocess.run")
+@patch("docverse.client._cli.shutil.copy2")
+@patch("docverse.client._cli.subprocess.run")
 def test_deploy_worker_dry_run(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -414,7 +424,7 @@ def test_deploy_worker_dry_run(
 
     deployments = mock_deployments_repo.resolve()
     outdir = deployments / "dist"
-    wrangler_call = mock_run.call_args_list[2]
+    wrangler_call = mock_run.call_args_list[3]
     assert wrangler_call == call(
         [
             "npx",

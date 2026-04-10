@@ -80,6 +80,8 @@ CredentialPayload = Annotated[
 class OrganizationCredentialCreate(BaseModel):
     """Request model for creating an organization credential."""
 
+    model_config = ConfigDict(extra="forbid")
+
     label: Annotated[
         str,
         Field(

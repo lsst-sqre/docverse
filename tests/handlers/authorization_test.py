@@ -10,7 +10,7 @@ import pytest
 from httpx import AsyncClient
 
 from docverse.client.models import OrgRole
-from tests.conftest import seed_member, seed_org_with_admin
+from tests.conftest import seed_build, seed_member, seed_org_with_admin
 
 CONTENT_HASH = (
     "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -35,14 +35,9 @@ async def _setup(client: AsyncClient) -> None:
     )
 
 
-async def _create_build(client: AsyncClient) -> str:
-    """Create a build and return its ID."""
-    resp = await client.post(
-        "/docverse/orgs/auth-org/projects/auth-proj/builds",
-        json={"git_ref": "main", "content_hash": CONTENT_HASH},
-        headers={"X-Auth-Request-User": "admin-user"},
-    )
-    return str(resp.json()["id"])
+async def _create_build() -> str:
+    """Create a build via direct DB seeding and return its ID."""
+    return await seed_build("auth-org", "auth-proj", uploader="admin-user")
 
 
 async def _create_edition(client: AsyncClient) -> str:
@@ -178,18 +173,19 @@ async def test_create_build_as_reader(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_create_build_as_uploader(client: AsyncClient) -> None:
     await _setup(client)
+    # Uploader has permission but org has no store → 422
     response = await client.post(
         "/docverse/orgs/auth-org/projects/auth-proj/builds",
         json={"git_ref": "main", "content_hash": CONTENT_HASH},
         headers={"X-Auth-Request-User": "upload-user"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
 async def test_patch_build_as_reader(client: AsyncClient) -> None:
     await _setup(client)
-    build_id = await _create_build(client)
+    build_id = await _create_build()
     response = await client.patch(
         f"/docverse/orgs/auth-org/projects/auth-proj/builds/{build_id}",
         json={"status": "uploaded"},
@@ -201,7 +197,7 @@ async def test_patch_build_as_reader(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_delete_build_as_uploader(client: AsyncClient) -> None:
     await _setup(client)
-    build_id = await _create_build(client)
+    build_id = await _create_build()
     response = await client.delete(
         f"/docverse/orgs/auth-org/projects/auth-proj/builds/{build_id}",
         headers={"X-Auth-Request-User": "upload-user"},
