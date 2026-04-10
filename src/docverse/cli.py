@@ -212,7 +212,14 @@ def validate_db_schema(*, alembic_config_path: Path) -> None:
 def publish_edition(
     *, org: str, project: str, edition: str, build_id: str
 ) -> None:
-    """Publish an edition by writing a KV entry via the Cloudflare API."""
+    """Publish an edition by writing a KV entry via the Cloudflare API.
+
+    This is a temporary shim command for a proof-of-concept for publishing
+    on Cloudflare workers.
+
+    Required environment variables: CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_KV_NAMESPACE_ID.
+    """
     logger = structlog.get_logger("docverse")
 
     cf_api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
