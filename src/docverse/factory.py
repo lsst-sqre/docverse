@@ -65,6 +65,10 @@ class Factory(ABC):
     @abstractmethod
     def _create_queue_backend(self) -> QueueBackend: ...
 
+    def create_queue_backend(self) -> QueueBackend:
+        """Create a :class:`QueueBackend` for enqueuing jobs."""
+        return self._create_queue_backend()
+
     def _create_org_store(self) -> OrganizationStore:
         return OrganizationStore(session=self._session, logger=self._logger)
 

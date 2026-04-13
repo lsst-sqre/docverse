@@ -10,6 +10,7 @@ import httpx
 import pytest
 import structlog
 from cryptography.fernet import Fernet
+from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,7 @@ from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
 )
+from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
@@ -27,6 +29,9 @@ from docverse.factory import WorkerFactory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.edition_tracking import EditionTrackingService
 from docverse.storage.build_store import BuildStore
+from docverse.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -172,6 +177,7 @@ async def test_build_processing_updates_edition(
         "encryptor": encryptor,
         "http_client": httpx.AsyncClient(),
         "job_id": "test-arq-job-1",
+        "arq_queue": MockArqQueue(),
     }
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -258,6 +264,7 @@ async def test_build_processing_uses_stored_storage_prefix(
         "encryptor": encryptor,
         "http_client": httpx.AsyncClient(),
         "job_id": "test-arq-prefix",
+        "arq_queue": MockArqQueue(),
     }
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -360,3 +367,120 @@ async def test_build_processing_edition_failure_no_build_fail(
             assert job.status == JobStatus.completed_with_errors
             assert job.progress is not None
             assert job.progress.get("edition_tracking_error") is True
+
+
+@pytest.mark.asyncio
+async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build processing spawns a publish_edition child job per updated edition.
+
+    Asserts the enqueued arq job payload, the child QueueJob row, the parent
+    progress ``publish_jobs`` mapping, and ``publish_status = "pending"`` on
+    the affected edition and history entry.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+    mock_arq = MockArqQueue()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-publish-1",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        WorkerFactory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-arq-publish-1",
+        "arq_queue": mock_arq,
+    }
+    build_public_id = serialize_base32_id(build.public_id)
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": build_public_id,
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Inspect enqueued arq jobs for publish_edition
+    enqueued = list(mock_arq._job_metadata["arq:queue"].values())
+    publish_arq_jobs = [j for j in enqueued if j.name == "publish_edition"]
+    assert len(publish_arq_jobs) == 1
+    pj_payload = publish_arq_jobs[0].kwargs["payload"]
+    assert pj_payload["org_id"] == org.id
+    assert pj_payload["project_slug"] == project.slug
+    assert pj_payload["edition_slug"] == "main"
+    assert pj_payload["build_id"] == build.id
+    assert pj_payload["build_public_id"] == build_public_id
+    assert "edition_id" in pj_payload
+    assert "queue_job_id" in pj_payload
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.publish_status == PublishStatus.pending
+            assert pj_payload["edition_id"] == edition.id
+
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            )
+            history = await history_store.get_by_edition_and_build(
+                edition_id=edition.id, build_id=build.id
+            )
+            assert history is not None
+            assert history.publish_status == PublishStatus.pending
+
+            qjs = QueueJobStore(session=session, logger=_logger())
+            child = await qjs.get(pj_payload["queue_job_id"])
+            assert child is not None
+            assert child.kind == JobKind.publish_edition
+            assert child.edition_id == edition.id
+            assert child.build_id == build.id
+            assert child.org_id == org.id
+            assert child.project_id == project.id
+
+            parent = await qjs.get_by_backend_job_id("test-arq-publish-1")
+            assert parent is not None
+            assert parent.progress is not None
+            publish_jobs_progress = parent.progress.get("publish_jobs")
+            assert publish_jobs_progress is not None
+            assert len(publish_jobs_progress) == 1
+            entry = publish_jobs_progress[0]
+            assert entry["edition_slug"] == "main"
+            assert entry["publish_queue_job_public_id"] == serialize_base32_id(
+                child.public_id
+            )

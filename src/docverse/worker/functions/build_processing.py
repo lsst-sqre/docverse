@@ -20,12 +20,18 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildStatus
+from docverse.client.models.queue_enums import JobKind, PublishStatus
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
 from docverse.factory import WorkerFactory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
+from docverse.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
+from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.queue_job_store import QueueJobStore
@@ -134,7 +140,11 @@ async def build_processing(
                 factory=factory,
                 build_store=build_store,
                 queue_job_store=queue_job_store,
+                org_id=org_id,
+                project_id=build.project_id,
+                project_slug=project_slug,
                 build_id=build_id,
+                build_public_id=build_public_id,
                 queue_job_id=queue_job_id,
                 object_count=object_count,
                 total_size_bytes=total_size_bytes,
@@ -171,7 +181,11 @@ async def _finalize_success(  # noqa: PLR0913
     factory: WorkerFactory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
+    org_id: int,
+    project_id: int,
+    project_slug: str,
     build_id: int,
+    build_public_id: str,
     queue_job_id: int | None,
     object_count: int,
     total_size_bytes: int,
@@ -192,6 +206,22 @@ async def _finalize_success(  # noqa: PLR0913
         logger=logger,
     )
 
+    # Phase 3c: Enqueue a publish_edition job for each updated edition.
+    publish_jobs: list[dict[str, str]] = []
+    if tracking_result is not None and tracking_result.updated:
+        publish_jobs = await _enqueue_publish_jobs(
+            session=session,
+            factory=factory,
+            queue_job_store=queue_job_store,
+            tracking_result=tracking_result,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+            logger=logger,
+        )
+
     # Phase 4: Mark queue job as complete
     if queue_job_id is not None:
         progress: dict[str, object] = {
@@ -207,6 +237,8 @@ async def _finalize_success(  # noqa: PLR0913
             progress["editions_skipped"] = [
                 {"slug": o.slug} for o in tracking_result.skipped
             ]
+        if publish_jobs:
+            progress["publish_jobs"] = publish_jobs
         has_errors = tracking_result is None
         if has_errors:
             progress["edition_tracking_error"] = True
@@ -216,6 +248,87 @@ async def _finalize_success(  # noqa: PLR0913
             )
             await queue_job_store.complete(queue_job_id, has_errors=has_errors)
     logger.info("Build processing completed")
+
+
+async def _enqueue_publish_jobs(  # noqa: PLR0913
+    *,
+    session: AsyncSession,
+    factory: WorkerFactory,
+    queue_job_store: QueueJobStore,
+    tracking_result: EditionTrackingResult,
+    org_id: int,
+    project_id: int,
+    project_slug: str,
+    build_id: int,
+    build_public_id: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> list[dict[str, str]]:
+    """Create a publish_edition child job for each updated edition.
+
+    For each outcome in ``tracking_result.updated``: mark the edition and
+    its history entry ``pending``, insert a child ``QueueJob`` row, and
+    enqueue the ``publish_edition`` arq task. Returns a list of
+    ``{edition_slug, publish_queue_job_public_id}`` entries suitable for
+    embedding in the parent build job's progress.
+    """
+    edition_store = EditionStore(session=session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=session, logger=logger)
+    queue_backend = factory.create_queue_backend()
+
+    publish_jobs: list[dict[str, str]] = []
+    for outcome in tracking_result.updated:
+        async with session.begin():
+            await edition_store.set_publish_status(
+                edition_id=outcome.edition_id,
+                status=PublishStatus.pending,
+            )
+            history = await history_store.get_by_edition_and_build(
+                edition_id=outcome.edition_id,
+                build_id=outcome.build_id,
+            )
+            if history is None:
+                msg = (
+                    f"EditionBuildHistory missing for edition "
+                    f"{outcome.edition_id}, build {outcome.build_id}"
+                )
+                raise RuntimeError(msg)
+            await history_store.set_publish_status(
+                history_id=history.id,
+                status=PublishStatus.pending,
+            )
+            child_job = await queue_job_store.create(
+                kind=JobKind.publish_edition,
+                org_id=org_id,
+                project_id=project_id,
+                build_id=build_id,
+                edition_id=outcome.edition_id,
+            )
+
+        await queue_backend.enqueue(
+            "publish_edition",
+            {
+                "org_id": org_id,
+                "project_slug": project_slug,
+                "edition_id": outcome.edition_id,
+                "edition_slug": outcome.slug,
+                "build_id": build_id,
+                "build_public_id": build_public_id,
+                "queue_job_id": child_job.id,
+            },
+        )
+        child_public_id = serialize_base32_id(child_job.public_id)
+        publish_jobs.append(
+            {
+                "edition_slug": outcome.slug,
+                "publish_queue_job_public_id": child_public_id,
+            }
+        )
+        logger.info(
+            "Enqueued publish_edition job",
+            edition_slug=outcome.slug,
+            publish_queue_job_public_id=child_public_id,
+        )
+    return publish_jobs
 
 
 async def _track_editions(  # noqa: PLR0913
