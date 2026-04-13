@@ -19,7 +19,7 @@ from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.services.credential_encryptor import CredentialEncryptor
 
-from .functions import build_processing, ping
+from .functions import build_processing, ping, publish_edition
 
 config = Configuration()
 
@@ -91,7 +91,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """arq WorkerSettings for Docverse."""
 
-    functions = [build_processing, ping]
+    functions = [build_processing, ping, publish_edition]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
     on_startup = startup
