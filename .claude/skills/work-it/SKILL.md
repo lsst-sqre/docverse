@@ -7,6 +7,19 @@ description: Execute a unit of development work end-to-end using red/green/refac
 
 Execute a complete unit of development work using red/green/refactor TDD in tracer-bullet slices.
 
+## Phase 0: Branch safety
+
+**Never do work on the `main` branch.** Before any implementation:
+
+1. Check the current branch with `git branch --show-current`.
+2. If already on a non-main feature branch, proceed to Phase 1.
+3. If on `main`:
+   - If the task or issue specifies a branch name, check it out:
+     - If it exists locally, `git checkout <branch>`.
+     - If it exists on the remote, `git checkout -b <branch> origin/<branch>`.
+     - If it doesn't exist, create it: `git checkout -b <branch> main`.
+   - If no branch name is specified, **ask the user** what branch to create or work from before proceeding.
+
 ## Phase 1: Understand the task
 
 - Read any referenced plan or PRD.
