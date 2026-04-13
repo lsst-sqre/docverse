@@ -20,7 +20,7 @@ jobs:
         working-directory: cloudflare-worker
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version-file: cloudflare-worker/package.json
           cache: npm
@@ -110,7 +110,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version-file: cloudflare-worker/package.json
           cache: npm
