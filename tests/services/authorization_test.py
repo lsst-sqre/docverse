@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     OrganizationCreate,
@@ -20,7 +20,7 @@ from docverse.storage.organization_store import OrganizationStore
 
 
 async def _setup(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> tuple[int, OrgMembershipStore]:
     logger = structlog.get_logger("docverse")
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -37,7 +37,7 @@ async def _setup(
 
 @pytest.mark.asyncio
 async def test_require_role_sufficient(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
@@ -65,7 +65,7 @@ async def test_require_role_sufficient(
 
 @pytest.mark.asyncio
 async def test_require_role_insufficient(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
@@ -92,7 +92,7 @@ async def test_require_role_insufficient(
 
 @pytest.mark.asyncio
 async def test_require_role_no_membership(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
@@ -111,7 +111,7 @@ async def test_require_role_no_membership(
 
 @pytest.mark.asyncio
 async def test_superadmin_username_grants_admin(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Super admin username grants admin without membership."""
     logger = structlog.get_logger("docverse")
@@ -136,7 +136,7 @@ async def test_superadmin_username_grants_admin(
 
 @pytest.mark.asyncio
 async def test_superadmin_username_overrides_lower_role(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Super admin username overrides an existing lower role."""
     logger = structlog.get_logger("docverse")

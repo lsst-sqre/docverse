@@ -5,7 +5,7 @@ from __future__ import annotations
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
@@ -21,7 +21,7 @@ class EditionBuildHistoryStore:
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate
 from docverse.storage.organization_credential_store import (
@@ -14,7 +14,7 @@ from docverse.storage.organization_store import OrganizationStore
 
 
 async def _create_org(
-    session: async_scoped_session[AsyncSession],
+    session: AsyncSession,
 ) -> int:
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -30,7 +30,7 @@ async def _create_org(
 
 @pytest.mark.asyncio
 async def test_create_and_get(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     async with db_session.begin():
         org_id = await _create_org(db_session)
@@ -57,7 +57,7 @@ async def test_create_and_get(
 
 @pytest.mark.asyncio
 async def test_list_by_org(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     async with db_session.begin():
         org_id = await _create_org(db_session)
@@ -84,7 +84,7 @@ async def test_list_by_org(
 
 @pytest.mark.asyncio
 async def test_delete(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     async with db_session.begin():
         org_id = await _create_org(db_session)
@@ -108,7 +108,7 @@ async def test_delete(
 
 @pytest.mark.asyncio
 async def test_delete_nonexistent(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     async with db_session.begin():
         org_id = await _create_org(db_session)

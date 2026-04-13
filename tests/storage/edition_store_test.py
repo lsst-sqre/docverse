@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildCreate,
@@ -31,14 +31,14 @@ _HASH = "sha256:" + "a" * 64
 
 @pytest.fixture
 def edition_store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> EditionStore:
     logger = structlog.get_logger("docverse")
     return EditionStore(session=db_session, logger=logger)
 
 
 async def _create_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> int:
     logger = structlog.get_logger("docverse")
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -63,7 +63,7 @@ async def _create_project(
 
 @pytest.mark.asyncio
 async def test_create_edition(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     async with db_session.begin():
@@ -88,7 +88,7 @@ async def test_create_edition(
 
 @pytest.mark.asyncio
 async def test_get_by_slug(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     async with db_session.begin():
@@ -112,7 +112,7 @@ async def test_get_by_slug(
 
 @pytest.mark.asyncio
 async def test_list_by_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     async with db_session.begin():
@@ -146,7 +146,7 @@ async def test_list_by_project(
 
 @pytest.mark.asyncio
 async def test_update_edition(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     async with db_session.begin():
@@ -172,7 +172,7 @@ async def test_update_edition(
 
 @pytest.mark.asyncio
 async def test_set_current_build(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     logger = structlog.get_logger("docverse")
@@ -208,7 +208,7 @@ async def test_set_current_build(
 
 @pytest.mark.asyncio
 async def test_set_current_build_skips_stale(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """Skip when the edition already has a newer build."""
@@ -272,7 +272,7 @@ async def test_set_current_build_skips_stale(
 
 @pytest.mark.asyncio
 async def test_set_current_build_skips_equal(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """Skip when the incoming build has the same date_created."""
@@ -332,7 +332,7 @@ async def test_set_current_build_skips_equal(
 
 @pytest.mark.asyncio
 async def test_set_current_build_applies_when_newer(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """set_current_build applies when the incoming build is newer."""
@@ -395,7 +395,7 @@ async def test_set_current_build_applies_when_newer(
 
 @pytest.mark.asyncio
 async def test_soft_delete_edition(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     async with db_session.begin():
@@ -422,7 +422,7 @@ async def test_soft_delete_edition(
 
 @pytest.mark.asyncio
 async def test_find_matching_editions_git_ref(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """A build without alternate_name matches a git_ref edition."""
@@ -449,7 +449,7 @@ async def test_find_matching_editions_git_ref(
 
 @pytest.mark.asyncio
 async def test_find_matching_editions_git_ref_excludes_alternate(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """A build with alternate_name must NOT match a git_ref edition."""
@@ -476,7 +476,7 @@ async def test_find_matching_editions_git_ref_excludes_alternate(
 
 @pytest.mark.asyncio
 async def test_find_matching_editions_alternate_git_ref(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """A build with matching git_ref AND alternate_name matches."""
@@ -507,7 +507,7 @@ async def test_find_matching_editions_alternate_git_ref(
 
 @pytest.mark.asyncio
 async def test_find_matching_editions_alternate_git_ref_wrong_ref(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """Build with matching alternate_name but wrong git_ref: no match."""
@@ -537,7 +537,7 @@ async def test_find_matching_editions_alternate_git_ref_wrong_ref(
 
 @pytest.mark.asyncio
 async def test_find_matching_editions_no_alternate_vs_alternate_edition(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """A build without alternate_name must NOT match alternate_git_ref."""
@@ -595,7 +595,7 @@ async def _create_edition_internal(
 
 @pytest.mark.asyncio
 async def test_find_matching_semver_release(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """semver_release matches stable semver tags, not prereleases."""
@@ -631,7 +631,7 @@ async def test_find_matching_semver_release(
 
 @pytest.mark.asyncio
 async def test_find_matching_semver_major(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """semver_major matches stable tags with the correct major version."""
@@ -667,7 +667,7 @@ async def test_find_matching_semver_major(
 
 @pytest.mark.asyncio
 async def test_find_matching_semver_minor(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """semver_minor matches stable tags with correct major+minor."""
@@ -697,7 +697,7 @@ async def test_find_matching_semver_minor(
 
 @pytest.mark.asyncio
 async def test_find_matching_eups_major(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """eups_major_release matches EUPS major version tags."""
@@ -725,7 +725,7 @@ async def test_find_matching_eups_major(
 
 @pytest.mark.asyncio
 async def test_find_matching_eups_weekly(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """eups_weekly_release matches EUPS weekly tags."""
@@ -753,7 +753,7 @@ async def test_find_matching_eups_weekly(
 
 @pytest.mark.asyncio
 async def test_find_matching_eups_daily(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """eups_daily_release matches EUPS daily tags."""
@@ -781,7 +781,7 @@ async def test_find_matching_eups_daily(
 
 @pytest.mark.asyncio
 async def test_find_matching_lsst_doc_version(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """lsst_doc matches document version tags."""
@@ -804,7 +804,7 @@ async def test_find_matching_lsst_doc_version(
 
 @pytest.mark.asyncio
 async def test_find_matching_lsst_doc_main_unpublished(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """lsst_doc accepts main when edition is unpublished."""
@@ -827,7 +827,7 @@ async def test_find_matching_lsst_doc_main_unpublished(
 
 @pytest.mark.asyncio
 async def test_find_matching_lsst_doc_main_when_showing_main(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """lsst_doc accepts main when currently showing main."""
@@ -861,7 +861,7 @@ async def test_find_matching_lsst_doc_main_when_showing_main(
 
 @pytest.mark.asyncio
 async def test_find_matching_lsst_doc_main_rejected_when_showing_version(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
     """lsst_doc rejects main when currently showing a version tag."""

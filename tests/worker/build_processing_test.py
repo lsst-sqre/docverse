@@ -12,7 +12,7 @@ import structlog
 from cryptography.fernet import Fernet
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildCreate,
@@ -53,7 +53,7 @@ def _make_tarball(files: dict[str, bytes]) -> bytes:
 
 
 async def _setup_org_and_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> tuple[Any, Any]:
     """Create an org and project for testing."""
     logger = _logger()
@@ -86,7 +86,7 @@ async def _setup_org_and_project(
 
 
 async def _create_build_in_processing(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     project_id: int,
     *,
     git_ref: str = "main",
@@ -131,7 +131,7 @@ def _mock_create_objectstore(
 @pytest.mark.asyncio
 async def test_build_processing_updates_edition(
     app: None,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Build processing auto-creates and updates an edition."""
@@ -219,7 +219,7 @@ async def test_build_processing_updates_edition(
 @pytest.mark.asyncio
 async def test_build_processing_uses_stored_storage_prefix(
     app: None,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Build processing uploads files under build.storage_prefix."""
@@ -279,7 +279,7 @@ async def test_build_processing_uses_stored_storage_prefix(
 @pytest.mark.asyncio
 async def test_build_processing_edition_failure_no_build_fail(
     app: None,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Edition tracking failure gives completed_with_errors,

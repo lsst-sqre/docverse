@@ -16,7 +16,7 @@ from safir.arq import ArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 from safir.dependencies.logger import logger_dependency
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.stdlib import BoundLogger
 
 from ..factory import HandlerFactory
@@ -49,7 +49,7 @@ class RequestContext:
     logger: BoundLogger
     """The request logger, rebound with discovered context."""
 
-    session: async_scoped_session[AsyncSession]
+    session: AsyncSession
     """The database session."""
 
     factory: HandlerFactory
@@ -87,7 +87,7 @@ class ContextDependency:
         request: Request,
         response: Response,
         session: Annotated[
-            async_scoped_session[AsyncSession],
+            AsyncSession,
             Depends(db_session_dependency),
         ],
         logger: Annotated[BoundLogger, Depends(logger_dependency)],

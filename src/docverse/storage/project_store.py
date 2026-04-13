@@ -9,7 +9,7 @@ from safir.database import (
     PaginationCursor,
 )
 from sqlalchemy import REAL, cast, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
@@ -26,7 +26,7 @@ class ProjectStore:
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from docverse.client.models import BuildCreate, BuildStatus
@@ -33,7 +33,7 @@ class BuildStore:
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session

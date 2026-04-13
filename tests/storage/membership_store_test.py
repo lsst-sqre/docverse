@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     OrganizationCreate,
@@ -18,14 +18,14 @@ from docverse.storage.organization_store import OrganizationStore
 
 @pytest.fixture
 def membership_store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> OrgMembershipStore:
     logger = structlog.get_logger("docverse")
     return OrgMembershipStore(session=db_session, logger=logger)
 
 
 async def _create_org(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> int:
     logger = structlog.get_logger("docverse")
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -41,7 +41,7 @@ async def _create_org(
 
 @pytest.mark.asyncio
 async def test_create_membership(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():
@@ -62,7 +62,7 @@ async def test_create_membership(
 
 @pytest.mark.asyncio
 async def test_get_by_principal(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():
@@ -87,7 +87,7 @@ async def test_get_by_principal(
 
 @pytest.mark.asyncio
 async def test_list_by_org(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():
@@ -115,7 +115,7 @@ async def test_list_by_org(
 
 @pytest.mark.asyncio
 async def test_delete_membership(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():
@@ -145,7 +145,7 @@ async def test_delete_membership(
 
 @pytest.mark.asyncio
 async def test_resolve_role_user(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():
@@ -171,7 +171,7 @@ async def test_resolve_role_user(
 
 @pytest.mark.asyncio
 async def test_resolve_role_highest_wins(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():
@@ -207,7 +207,7 @@ async def test_resolve_role_highest_wins(
 
 @pytest.mark.asyncio
 async def test_resolve_role_no_membership(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     membership_store: OrgMembershipStore,
 ) -> None:
     async with db_session.begin():

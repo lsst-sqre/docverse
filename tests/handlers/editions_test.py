@@ -7,7 +7,7 @@ import re
 import pytest
 import structlog
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildCreate
 from docverse.client.models.builds import BuildAnnotations
@@ -246,7 +246,7 @@ async def test_user_cannot_create_dunder_edition(
 
 
 async def _record_builds_in_history(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     org_slug: str,
     project_slug: str,
     edition_slug: str,
@@ -291,7 +291,7 @@ async def _record_builds_in_history(
 @pytest.mark.asyncio
 async def test_get_edition_history(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """GET history returns entries in position order with build info."""
     await _setup(client)
@@ -332,7 +332,7 @@ async def test_get_edition_history(
 @pytest.mark.asyncio
 async def test_get_edition_history_with_annotations(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """GET history returns annotations when builds have them."""
     await _setup(client)
@@ -403,7 +403,7 @@ async def test_get_edition_history_empty(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_get_edition_history_pagination(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """GET history supports multi-page cursor navigation."""
     await _setup(client)
@@ -447,7 +447,7 @@ async def test_get_edition_history_pagination(
 @pytest.mark.asyncio
 async def test_get_edition_history_single_page(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """When all results fit in one page, no next link is present."""
     await _setup(client)
@@ -498,7 +498,7 @@ async def test_get_edition_history_invalid_cursor(
 @pytest.mark.asyncio
 async def test_get_edition_history_excludes_deleted_by_default(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Soft-deleted builds are excluded from history by default."""
     await _setup(client)
@@ -530,7 +530,7 @@ async def test_get_edition_history_excludes_deleted_by_default(
 @pytest.mark.asyncio
 async def test_get_edition_history_include_deleted(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """include_deleted=true shows soft-deleted builds."""
     await _setup(client)

@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 import structlog
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildStatus
 from docverse.domain.build import Build
@@ -164,7 +164,7 @@ async def _start_queue_job(
 
 async def _finalize_success(  # noqa: PLR0913
     *,
-    session: async_scoped_session[AsyncSession],
+    session: AsyncSession,
     factory: WorkerFactory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
@@ -217,7 +217,7 @@ async def _finalize_success(  # noqa: PLR0913
 
 async def _track_editions(  # noqa: PLR0913
     *,
-    session: async_scoped_session[AsyncSession],
+    session: AsyncSession,
     factory: WorkerFactory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
