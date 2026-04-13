@@ -6,8 +6,19 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import (
+    EditionCreate,
+    EditionKind,
+    OrganizationCreate,
+    ProjectCreate,
+    TrackingMode,
+)
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.exceptions import InvalidJobStateError
+from docverse.storage.edition_store import EditionStore
+from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 
 
@@ -31,9 +42,60 @@ async def test_create_job(
     assert job.public_id > 0
     assert job.kind == JobKind.build_processing
     assert job.org_id == 1
+    assert job.edition_id is None
     assert job.date_created is not None
     assert job.date_started is None
     assert job.date_completed is None
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_job_with_edition_id(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """``edition_id`` can be set on a publish_edition QueueJob row."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        proj_store = ProjectStore(session=db_session, logger=logger)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="qj-org",
+                title="QJ",
+                base_domain="qj.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="qj-proj",
+                title="QJ Project",
+                doc_repo="https://github.com/example/repo",
+            ),
+        )
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="qj-ed",
+                title="QJ Ed",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        job = await store.create(
+            kind=JobKind.publish_edition,
+            org_id=org.id,
+            edition_id=edition.id,
+        )
+        await db_session.commit()
+    assert job.kind == JobKind.publish_edition
+    assert job.edition_id == edition.id
+
+    async with db_session.begin():
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        assert row.edition_id == edition.id
 
 
 @pytest.mark.asyncio

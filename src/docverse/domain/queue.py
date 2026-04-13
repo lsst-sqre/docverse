@@ -30,6 +30,7 @@ class QueueJob(BaseModel):
     org_id: int
     project_id: int | None = None
     build_id: int | None = None
+    edition_id: int | None = None
     progress: dict[str, Any] | None = None
     errors: dict[str, Any] | None = None
     date_created: datetime

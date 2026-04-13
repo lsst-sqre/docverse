@@ -7,6 +7,7 @@ from enum import StrEnum
 __all__ = [
     "JobKind",
     "JobStatus",
+    "PublishStatus",
 ]
 
 
@@ -15,6 +16,7 @@ class JobKind(StrEnum):
 
     build_processing = "build_processing"
     edition_update = "edition_update"
+    publish_edition = "publish_edition"
     dashboard_sync = "dashboard_sync"
     lifecycle_eval = "lifecycle_eval"
     git_ref_audit = "git_ref_audit"
@@ -31,3 +33,12 @@ class JobStatus(StrEnum):
     completed_with_errors = "completed_with_errors"
     failed = "failed"
     cancelled = "cancelled"
+
+
+class PublishStatus(StrEnum):
+    """CDN publish state for an edition or edition build history entry."""
+
+    pending = "pending"
+    publishing = "publishing"
+    published = "published"
+    failed = "failed"

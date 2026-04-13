@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from docverse.client.models import EditionKind, TrackingMode
+from docverse.client.models.queue_enums import PublishStatus
 
 from .base32id import Base32Id
 
@@ -61,6 +62,14 @@ class Edition(BaseModel):
     lifecycle_exempt: bool = Field(
         default=False,
         description="Whether this edition is exempt from lifecycle rules.",
+    )
+
+    publish_status: PublishStatus | None = Field(
+        default=None,
+        description=(
+            "CDN publish state for the edition's current build. ``None``"
+            " indicates the edition has never been published."
+        ),
     )
 
     date_created: datetime = Field(

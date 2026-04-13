@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer
+from sqlalchemy import DateTime, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -29,6 +29,10 @@ class SqlEditionBuildHistory(Base):
     build_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    publish_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
 
     date_created: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from docverse.client.models import BuildStatus
 from docverse.client.models.builds import BuildAnnotations
+from docverse.client.models.queue_enums import PublishStatus
 
 
 class EditionBuildHistory(BaseModel):
@@ -31,6 +32,14 @@ class EditionBuildHistory(BaseModel):
 
     position: int = Field(
         description="Ordering position; 1 is the most recent."
+    )
+
+    publish_status: PublishStatus | None = Field(
+        default=None,
+        description=(
+            "CDN publish state for this historical build. ``None`` means"
+            " the build was never published to the CDN."
+        ),
     )
 
     date_created: datetime = Field(

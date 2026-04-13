@@ -56,6 +56,10 @@ class SqlEdition(Base):
         Integer, nullable=True
     )
 
+    publish_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
     lifecycle_exempt: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )

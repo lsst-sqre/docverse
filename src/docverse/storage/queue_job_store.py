@@ -28,7 +28,7 @@ class QueueJobStore:
         self._session = session
         self._logger = logger
 
-    async def create(
+    async def create(  # noqa: PLR0913
         self,
         *,
         kind: JobKind,
@@ -36,6 +36,7 @@ class QueueJobStore:
         backend_job_id: str | None = None,
         project_id: int | None = None,
         build_id: int | None = None,
+        edition_id: int | None = None,
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
 
@@ -50,6 +51,7 @@ class QueueJobStore:
             org_id=org_id,
             project_id=project_id,
             build_id=build_id,
+            edition_id=edition_id,
         )
         self._session.add(row)
         await self._session.flush()
