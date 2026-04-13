@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import structlog
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
@@ -15,7 +15,7 @@ from docverse.storage.queue_job_store import QueueJobStore
 @pytest.mark.asyncio
 async def test_get_queue_job(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Test retrieving a queue job by its public Base32 ID."""
     logger = structlog.get_logger("docverse")
@@ -77,7 +77,7 @@ async def test_get_queue_job_invalid_id(
 @pytest.mark.asyncio
 async def test_get_queue_job_in_progress(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Test retrieving a job that has been started."""
     logger = structlog.get_logger("docverse")

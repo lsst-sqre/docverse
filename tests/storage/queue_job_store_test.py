@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.exceptions import InvalidJobStateError
@@ -13,7 +13,7 @@ from docverse.storage.queue_job_store import QueueJobStore
 
 @pytest.fixture
 def store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> QueueJobStore:
     logger = structlog.get_logger("docverse")
     return QueueJobStore(session=db_session, logger=logger)
@@ -21,7 +21,7 @@ def store(
 
 @pytest.mark.asyncio
 async def test_create_job(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -38,7 +38,7 @@ async def test_create_job(
 
 @pytest.mark.asyncio
 async def test_start_job(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -51,7 +51,7 @@ async def test_start_job(
 
 @pytest.mark.asyncio
 async def test_start_job_wrong_status(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -64,7 +64,7 @@ async def test_start_job_wrong_status(
 
 @pytest.mark.asyncio
 async def test_update_phase(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -80,7 +80,7 @@ async def test_update_phase(
 
 @pytest.mark.asyncio
 async def test_update_progress_merge(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -97,7 +97,7 @@ async def test_update_progress_merge(
 
 @pytest.mark.asyncio
 async def test_update_progress_from_null(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -109,7 +109,7 @@ async def test_update_progress_from_null(
 
 @pytest.mark.asyncio
 async def test_complete_job(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -123,7 +123,7 @@ async def test_complete_job(
 
 @pytest.mark.asyncio
 async def test_complete_with_errors(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -137,7 +137,7 @@ async def test_complete_with_errors(
 
 @pytest.mark.asyncio
 async def test_fail_job(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -154,7 +154,7 @@ async def test_fail_job(
 
 @pytest.mark.asyncio
 async def test_cancel_queued_job(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -167,7 +167,7 @@ async def test_cancel_queued_job(
 
 @pytest.mark.asyncio
 async def test_cancel_in_progress_job(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -181,7 +181,7 @@ async def test_cancel_in_progress_job(
 
 @pytest.mark.asyncio
 async def test_cancel_completed_job_raises(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():
@@ -195,7 +195,7 @@ async def test_cancel_completed_job_raises(
 
 @pytest.mark.asyncio
 async def test_get_by_public_id(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
     async with db_session.begin():

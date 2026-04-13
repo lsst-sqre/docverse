@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildCreate,
@@ -21,14 +21,14 @@ from docverse.storage.project_store import ProjectStore
 
 @pytest.fixture
 def build_store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> BuildStore:
     logger = structlog.get_logger("docverse")
     return BuildStore(session=db_session, logger=logger)
 
 
 async def _create_org_and_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> tuple[int, int]:
     logger = structlog.get_logger("docverse")
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -60,7 +60,7 @@ def _build_data() -> BuildCreate:
 
 @pytest.mark.asyncio
 async def test_create_build(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -81,7 +81,7 @@ async def test_create_build(
 
 @pytest.mark.asyncio
 async def test_create_build_sets_storage_prefix(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     """storage_prefix is computed as {project_slug}/__builds/{base32_id}/."""
@@ -102,7 +102,7 @@ async def test_create_build_sets_storage_prefix(
 
 @pytest.mark.asyncio
 async def test_transition_pending_to_processing(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -123,7 +123,7 @@ async def test_transition_pending_to_processing(
 
 @pytest.mark.asyncio
 async def test_transition_processing_to_completed(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -147,7 +147,7 @@ async def test_transition_processing_to_completed(
 
 @pytest.mark.asyncio
 async def test_transition_processing_to_failed(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -171,7 +171,7 @@ async def test_transition_processing_to_failed(
 
 @pytest.mark.asyncio
 async def test_invalid_transition_raises(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -192,7 +192,7 @@ async def test_invalid_transition_raises(
 
 @pytest.mark.asyncio
 async def test_list_by_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -219,7 +219,7 @@ async def test_list_by_project(
 
 @pytest.mark.asyncio
 async def test_get_by_public_id(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -240,7 +240,7 @@ async def test_get_by_public_id(
 
 @pytest.mark.asyncio
 async def test_soft_delete_build(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():
@@ -262,7 +262,7 @@ async def test_soft_delete_build(
 
 @pytest.mark.asyncio
 async def test_update_inventory(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
     async with db_session.begin():

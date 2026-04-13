@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import structlog
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildCreate
 from docverse.domain.base32id import serialize_base32_id
@@ -34,7 +34,7 @@ async def _setup(client: AsyncClient) -> None:
 
 
 async def _create_builds_with_history(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     n_builds: int,
 ) -> list[tuple[int, int]]:
     """Create builds and record them in __main edition history.
@@ -77,7 +77,7 @@ async def _create_builds_with_history(
 @pytest.mark.asyncio
 async def test_rollback_success(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """POST rollback with valid build in history returns 200."""
     await _setup(client)
@@ -104,7 +104,7 @@ async def test_rollback_success(
 @pytest.mark.asyncio
 async def test_rollback_unauthorized(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Non-admin gets 403 on rollback."""
     await _setup(client)
@@ -124,7 +124,7 @@ async def test_rollback_unauthorized(
 @pytest.mark.asyncio
 async def test_rollback_build_not_in_history(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Valid build not in this edition's history returns 404."""
     await _setup(client)
@@ -173,7 +173,7 @@ async def test_rollback_build_not_found(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_rollback_records_in_history(
     client: AsyncClient,
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """After rollback, GET history shows the rollback target at position 1."""
     await _setup(client)

@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 import httpx
 import structlog
 from safir.arq import ArqQueue
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
@@ -41,7 +41,7 @@ class Factory(ABC):
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
@@ -258,7 +258,7 @@ class HandlerFactory(Factory):
 
     def __init__(  # noqa: PLR0913
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
         arq_queue: ArqQueue,
         user_info_store: UserInfoStore,

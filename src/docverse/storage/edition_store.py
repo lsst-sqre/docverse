@@ -11,7 +11,7 @@ from safir.database import (
     PaginationCursor,
 )
 from sqlalchemy import Select, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from docverse.client.models import (
@@ -37,7 +37,7 @@ class EditionStore:
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session

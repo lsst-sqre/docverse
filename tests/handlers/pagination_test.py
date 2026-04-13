@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient
-from safir.database import PaginationLinkData
+from safir.http import PaginationLinkData
 
 from tests.conftest import seed_build, seed_org_with_admin
 

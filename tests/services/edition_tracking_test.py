@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import structlog
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildCreate,
@@ -41,7 +41,7 @@ def _logger() -> structlog.stdlib.BoundLogger:
 
 
 def _make_service(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> EditionTrackingService:
     logger = _logger()
     return EditionTrackingService(
@@ -56,7 +56,7 @@ def _make_service(
 
 
 async def _setup(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     *,
     org_slug: str = "track-org",
     org_slug_rewrite_rules: list[dict[str, Any]] | None = None,
@@ -93,7 +93,7 @@ async def _setup(
 
 
 async def _create_build(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     project_id: int,
     *,
     git_ref: str = "main",
@@ -115,7 +115,7 @@ async def _create_build(
 
 @pytest.mark.asyncio
 async def test_track_build_auto_creates_edition(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Auto-create an edition when no match exists."""
     service = _make_service(db_session)
@@ -159,7 +159,7 @@ async def test_track_build_auto_creates_edition(
 
 @pytest.mark.asyncio
 async def test_track_build_updates_existing_edition(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Update an existing edition's pointer."""
     service = _make_service(db_session)
@@ -188,7 +188,7 @@ async def test_track_build_updates_existing_edition(
 
 @pytest.mark.asyncio
 async def test_track_build_stale_skipped(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Stale build is skipped and no history is recorded."""
     service = _make_service(db_session)
@@ -247,7 +247,7 @@ async def test_track_build_stale_skipped(
 
 @pytest.mark.asyncio
 async def test_track_build_ignore_rule(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Ignore rule suppresses edition tracking entirely."""
     service = _make_service(db_session)
@@ -282,7 +282,7 @@ async def test_track_build_ignore_rule(
 
 @pytest.mark.asyncio
 async def test_track_build_alternate_name(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Alternate name produces compound slug and alternate edition."""
     service = _make_service(db_session)
@@ -317,7 +317,7 @@ async def test_track_build_alternate_name(
 
 @pytest.mark.asyncio
 async def test_track_build_invalid_slug(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Invalid slug derivation is handled gracefully."""
     service = _make_service(db_session)
@@ -338,7 +338,7 @@ async def test_track_build_invalid_slug(
 
 @pytest.mark.asyncio
 async def test_track_build_multiple_matches(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Multiple matching editions all get updated."""
     service = _make_service(db_session)
@@ -391,7 +391,7 @@ async def test_track_build_multiple_matches(
 
 @pytest.mark.asyncio
 async def test_track_build_project_rules_override_org(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Project-level rules completely replace org-level rules."""
     service = _make_service(db_session)
@@ -434,7 +434,7 @@ async def test_track_build_project_rules_override_org(
 
 @pytest.mark.asyncio
 async def test_track_build_default_fallback_no_rules(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """No rules configured: default slash-to-hyphen fallback."""
     service = _make_service(db_session)
@@ -455,7 +455,7 @@ async def test_track_build_default_fallback_no_rules(
 
 @pytest.mark.asyncio
 async def test_track_build_auto_create_race_guard(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Use existing edition instead of creating a duplicate."""
     service = _make_service(db_session)
@@ -491,7 +491,7 @@ async def test_track_build_auto_create_race_guard(
 
 @pytest.mark.asyncio
 async def test_track_build_semver_release(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Pre-created semver_release edition updated by stable tag."""
     service = _make_service(db_session)
@@ -517,7 +517,7 @@ async def test_track_build_semver_release(
 
 @pytest.mark.asyncio
 async def test_track_build_semver_prerelease_skipped(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Prerelease tags do NOT match semver_release/major/minor editions."""
     service = _make_service(db_session)
@@ -547,7 +547,7 @@ async def test_track_build_semver_prerelease_skipped(
 
 @pytest.mark.asyncio
 async def test_track_build_semver_major_auto_create(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """v2.0.0 auto-creates slug '2' with kind major."""
     service = _make_service(db_session)
@@ -573,7 +573,7 @@ async def test_track_build_semver_major_auto_create(
 
 @pytest.mark.asyncio
 async def test_track_build_semver_major_update(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Existing major edition updated by newer patch in same stream."""
     service = _make_service(db_session)
@@ -632,7 +632,7 @@ async def test_track_build_semver_major_update(
 
 @pytest.mark.asyncio
 async def test_track_build_semver_minor_auto_create(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """v2.1.0 auto-creates slug '2.1' with kind minor."""
     service = _make_service(db_session)
@@ -660,7 +660,7 @@ async def test_track_build_semver_minor_auto_create(
 
 @pytest.mark.asyncio
 async def test_track_build_eups_major(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """EUPS major: v12_0 updates, v11_0 skipped by version guard."""
     service = _make_service(db_session)
@@ -697,7 +697,7 @@ async def test_track_build_eups_major(
 
 @pytest.mark.asyncio
 async def test_track_build_eups_weekly(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """EUPS weekly: w_2024_05 updates, w_2024_04 skipped."""
     service = _make_service(db_session)
@@ -734,7 +734,7 @@ async def test_track_build_eups_weekly(
 
 @pytest.mark.asyncio
 async def test_track_build_eups_daily(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """EUPS daily: d_2024_01_15 updates, d_2024_01_14 skipped."""
     service = _make_service(db_session)
@@ -771,7 +771,7 @@ async def test_track_build_eups_daily(
 
 @pytest.mark.asyncio
 async def test_track_build_lsst_doc(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """lsst_doc: v1.0 updates, v0.9 skipped by version guard."""
     service = _make_service(db_session)
@@ -804,7 +804,7 @@ async def test_track_build_lsst_doc(
 
 @pytest.mark.asyncio
 async def test_track_build_lsst_doc_main_fallback(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """lsst_doc: main accepted for unpublished, version upgrades from main."""
     service = _make_service(db_session)
@@ -865,7 +865,7 @@ async def test_track_build_lsst_doc_main_fallback(
 
 @pytest.mark.asyncio
 async def test_track_build_lsst_doc_main_stale_skipped(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """lsst_doc main→main: stale build skipped by date guard."""
     service = _make_service(db_session)
@@ -923,7 +923,7 @@ async def test_track_build_lsst_doc_main_stale_skipped(
 
 @pytest.mark.asyncio
 async def test_track_build_multi_mode_match(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """One semver build updates git_ref + semver_release + major + minor."""
     service = _make_service(db_session)
@@ -975,7 +975,7 @@ async def test_track_build_multi_mode_match(
 
 @pytest.mark.asyncio
 async def test_track_build_auto_created_git_ref_with_version_editions(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Auto-created git_ref edition reports 'created' with version editions.
 
@@ -1011,7 +1011,7 @@ async def test_track_build_auto_created_git_ref_with_version_editions(
 
 @pytest.mark.asyncio
 async def test_track_build_equal_version_updates(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Two builds with the same version tag both update (>= equality)."""
     service = _make_service(db_session)
@@ -1054,7 +1054,7 @@ async def test_track_build_equal_version_updates(
 
 @pytest.mark.asyncio
 async def test_track_build_unparseable_ref_no_match(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> None:
     """Build whose git_ref is unparseable for the mode produces no match.
 

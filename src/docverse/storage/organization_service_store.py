@@ -6,7 +6,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationServiceUpdate
 from docverse.dbschema.organization_service import SqlOrganizationService
@@ -18,7 +18,7 @@ class OrganizationServiceStore:
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session

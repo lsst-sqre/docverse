@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildCreate,
@@ -26,14 +26,14 @@ from docverse.storage.project_store import ProjectStore
 
 @pytest.fixture
 def history_store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> EditionBuildHistoryStore:
     logger = structlog.get_logger("docverse")
     return EditionBuildHistoryStore(session=db_session, logger=logger)
 
 
 async def _create_edition_and_builds(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     *,
     n_builds: int = 1,
     edition_slug: str = "main",
@@ -92,7 +92,7 @@ async def _create_edition_and_builds(
 
 @pytest.mark.asyncio
 async def test_first_record(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """First history entry gets position 1."""
@@ -111,7 +111,7 @@ async def test_first_record(
 
 @pytest.mark.asyncio
 async def test_subsequent_records_shift_positions(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """Recording a second build shifts the first to position 2."""
@@ -138,7 +138,7 @@ async def test_subsequent_records_shift_positions(
 
 @pytest.mark.asyncio
 async def test_editions_independent(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """Shifting positions for one edition does not affect another."""
@@ -187,7 +187,7 @@ async def test_editions_independent(
 
 @pytest.mark.asyncio
 async def test_get_by_edition_and_build_found(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """get_by_edition_and_build returns a match when the build is recorded."""
@@ -210,7 +210,7 @@ async def test_get_by_edition_and_build_found(
 
 @pytest.mark.asyncio
 async def test_get_by_edition_and_build_not_found(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """get_by_edition_and_build returns None for nonexistent combo."""
@@ -229,7 +229,7 @@ async def test_get_by_edition_and_build_not_found(
 
 @pytest.mark.asyncio
 async def test_list_with_build_info_includes_status(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """list_by_edition_with_build_info returns status fields."""
@@ -253,7 +253,7 @@ async def test_list_with_build_info_includes_status(
 
 @pytest.mark.asyncio
 async def test_list_with_build_info_includes_annotations(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """list_by_edition_with_build_info returns build annotations."""
@@ -317,7 +317,7 @@ async def test_list_with_build_info_includes_annotations(
 
 @pytest.mark.asyncio
 async def test_list_with_build_info_filters_deleted(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
 ) -> None:
     """Soft-deleted builds are excluded by default."""

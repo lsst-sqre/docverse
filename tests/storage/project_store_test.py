@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     OrganizationCreate,
@@ -18,7 +18,7 @@ from docverse.storage.project_store import ProjectStore
 
 @pytest.fixture
 def store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> ProjectStore:
     logger = structlog.get_logger("docverse")
     return ProjectStore(session=db_session, logger=logger)
@@ -26,7 +26,7 @@ def store(
 
 @pytest.fixture
 def org_store(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
 ) -> OrganizationStore:
     logger = structlog.get_logger("docverse")
     return OrganizationStore(session=db_session, logger=logger)
@@ -46,7 +46,7 @@ async def _create_org(
 
 @pytest.mark.asyncio
 async def test_create_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
@@ -70,7 +70,7 @@ async def test_create_project(
 
 @pytest.mark.asyncio
 async def test_get_by_slug(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
@@ -92,7 +92,7 @@ async def test_get_by_slug(
 
 @pytest.mark.asyncio
 async def test_get_by_slug_not_found(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
@@ -105,7 +105,7 @@ async def test_get_by_slug_not_found(
 
 @pytest.mark.asyncio
 async def test_list_by_org(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
@@ -140,7 +140,7 @@ async def test_list_by_org(
 
 @pytest.mark.asyncio
 async def test_update_project(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
@@ -167,7 +167,7 @@ async def test_update_project(
 
 @pytest.mark.asyncio
 async def test_soft_delete(
-    db_session: async_scoped_session[AsyncSession],
+    db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:

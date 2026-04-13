@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
@@ -22,7 +22,7 @@ class QueueJobStore:
 
     def __init__(
         self,
-        session: async_scoped_session[AsyncSession],
+        session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session

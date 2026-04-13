@@ -20,9 +20,9 @@ from safir.database import (
     is_database_current,
     stamp_database,
 )
+from safir.dependencies.db_session import db_session_dependency
 from safir.logging import configure_logging
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_scoped_session, async_sessionmaker
 
 from .config import config
 from .database import check_database_state, get_current_revision, init_database
@@ -307,74 +307,72 @@ async def _publish_edition(  # noqa: PLR0913
 async def _lookup_build(
     *, org_slug: str, project_slug: str, edition_slug: str, build_id: str
 ) -> Build:
-    """Look up a build by org/project/build-id using a temporary engine."""
-    engine = create_database_engine(
+    """Look up a build by org/project/build-id."""
+    await db_session_dependency.initialize(
         config.database_url, config.database_password
     )
     try:
-        session_factory = async_scoped_session(
-            async_sessionmaker(engine),
-            scopefunc=asyncio.current_task,
-        )
-        session = session_factory()
-        try:
-            # Resolve org
-            result = await session.execute(
-                select(SqlOrganization).where(SqlOrganization.slug == org_slug)
-            )
-            org_row = result.scalar_one_or_none()
-            if org_row is None:
-                msg = f"Organization {org_slug!r} not found"
-                raise click.ClickException(msg)
-
-            # Resolve project
-            result = await session.execute(
-                select(SqlProject).where(
-                    SqlProject.org_id == org_row.id,
-                    SqlProject.slug == project_slug,
+        async for session in db_session_dependency():
+            async with session.begin():
+                # Resolve org
+                result = await session.execute(
+                    select(SqlOrganization).where(
+                        SqlOrganization.slug == org_slug
+                    )
                 )
-            )
-            project_row = result.scalar_one_or_none()
-            if project_row is None:
-                msg = f"Project {project_slug!r} not found"
-                raise click.ClickException(msg)
+                org_row = result.scalar_one_or_none()
+                if org_row is None:
+                    msg = f"Organization {org_slug!r} not found"
+                    raise click.ClickException(msg)
 
-            # Resolve edition
-            result = await session.execute(
-                select(SqlEdition).where(
-                    SqlEdition.project_id == project_row.id,
-                    SqlEdition.slug == edition_slug,
-                    SqlEdition.date_deleted.is_(None),
+                # Resolve project
+                result = await session.execute(
+                    select(SqlProject).where(
+                        SqlProject.org_id == org_row.id,
+                        SqlProject.slug == project_slug,
+                    )
                 )
-            )
-            edition_row = result.scalar_one_or_none()
-            if edition_row is None:
-                msg = f"Edition {edition_slug!r} not found"
-                raise click.ClickException(msg)
+                project_row = result.scalar_one_or_none()
+                if project_row is None:
+                    msg = f"Project {project_slug!r} not found"
+                    raise click.ClickException(msg)
 
-            # Resolve build
-            try:
-                public_id = validate_base32_id(build_id)
-            except ValueError as exc:
-                msg = f"Invalid build ID {build_id!r}: {exc}"
-                raise click.ClickException(msg) from exc
-            result = await session.execute(
-                select(SqlBuild).where(
-                    SqlBuild.project_id == project_row.id,
-                    SqlBuild.public_id == public_id,
-                    SqlBuild.date_deleted.is_(None),
+                # Resolve edition
+                result = await session.execute(
+                    select(SqlEdition).where(
+                        SqlEdition.project_id == project_row.id,
+                        SqlEdition.slug == edition_slug,
+                        SqlEdition.date_deleted.is_(None),
+                    )
                 )
-            )
-            build_row = result.scalar_one_or_none()
-            if build_row is None:
-                msg = f"Build {build_id!r} not found"
-                raise click.ClickException(msg)
+                edition_row = result.scalar_one_or_none()
+                if edition_row is None:
+                    msg = f"Edition {edition_slug!r} not found"
+                    raise click.ClickException(msg)
 
-            return Build.model_validate(build_row)
-        finally:
-            await session.close()
+                # Resolve build
+                try:
+                    public_id = validate_base32_id(build_id)
+                except ValueError as exc:
+                    msg = f"Invalid build ID {build_id!r}: {exc}"
+                    raise click.ClickException(msg) from exc
+                result = await session.execute(
+                    select(SqlBuild).where(
+                        SqlBuild.project_id == project_row.id,
+                        SqlBuild.public_id == public_id,
+                        SqlBuild.date_deleted.is_(None),
+                    )
+                )
+                build_row = result.scalar_one_or_none()
+                if build_row is None:
+                    msg = f"Build {build_id!r} not found"
+                    raise click.ClickException(msg)
+
+                return Build.model_validate(build_row)
+        msg = "db_session_dependency yielded no session"
+        raise RuntimeError(msg)
     finally:
-        await engine.dispose()
+        await db_session_dependency.aclose()
 
 
 async def _cli_get_current_revision() -> str | None:
