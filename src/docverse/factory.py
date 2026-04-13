@@ -147,6 +147,10 @@ class Factory(ABC):
             session=self._session, logger=self._logger
         )
         build_store = BuildStore(session=self._session, logger=self._logger)
+        queue_backend = self._create_queue_backend()
+        queue_job_store = QueueJobStore(
+            session=self._session, logger=self._logger
+        )
         return EditionService(
             store=store,
             org_store=org_store,
@@ -154,6 +158,8 @@ class Factory(ABC):
             logger=self._logger,
             history_store=history_store,
             build_store=build_store,
+            queue_backend=queue_backend,
+            queue_job_store=queue_job_store,
         )
 
     def create_authorization_service(self) -> AuthorizationService:
