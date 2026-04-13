@@ -357,7 +357,38 @@ class HandlerFactory(Factory):
 
 
 class WorkerFactory(Factory):
-    """Factory for worker functions using a null queue backend."""
+    """Factory for worker functions.
 
-    def _create_queue_backend(self) -> NullQueueBackend:
-        return NullQueueBackend()
+    When ``arq_queue`` is provided, ``_create_queue_backend()`` returns an
+    :class:`ArqQueueBackend` so worker functions can enqueue child jobs.
+    Without it, a :class:`NullQueueBackend` is used for worker contexts that
+    only need status-transition methods.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+        credential_encryptor: CredentialEncryptor | None = None,
+        superadmin_usernames: list[str] | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        arq_queue: ArqQueue | None = None,
+        default_queue_name: str = "arq:queue",
+    ) -> None:
+        super().__init__(
+            session=session,
+            logger=logger,
+            credential_encryptor=credential_encryptor,
+            superadmin_usernames=superadmin_usernames,
+            http_client=http_client,
+        )
+        self._arq_queue = arq_queue
+        self._default_queue_name = default_queue_name
+
+    def _create_queue_backend(self) -> QueueBackend:
+        if self._arq_queue is None:
+            return NullQueueBackend()
+        return ArqQueueBackend(
+            arq_queue=self._arq_queue,
+            default_queue_name=self._default_queue_name,
+        )

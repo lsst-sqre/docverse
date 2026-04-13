@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 import structlog
+from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +65,7 @@ async def build_processing(
 
     encryptor: CredentialEncryptor = ctx["encryptor"]
     http_client: httpx.AsyncClient = ctx["http_client"]
+    arq_queue: ArqQueue | None = ctx.get("arq_queue")
 
     async for session in db_session_dependency():
         factory = WorkerFactory(
@@ -71,6 +73,7 @@ async def build_processing(
             logger=logger,
             credential_encryptor=encryptor,
             http_client=http_client,
+            arq_queue=arq_queue,
         )
         build_store = BuildStore(session=session, logger=logger)
         org_store = OrganizationStore(session=session, logger=logger)
