@@ -16,7 +16,7 @@
     "@cloudflare/workers-types": "^4.20250327.0",
     "typescript": "^5.8.0",
     "vitest": "~3.1.0",
-    "wrangler": "^4.14.0"
+    "wrangler": "^4.81.1"
   },
   "dependencies": {
     "mime": "^4.0.0"
