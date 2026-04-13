@@ -131,13 +131,18 @@ jobs:
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v3
     with:
       images: ghcr.io/${{ github.repository }}
-    # Build on server releases and ticket branch PRs (exclude client releases)
-    if: >
-      (github.event_name == 'release'
-       && !startsWith(github.event.release.tag_name, 'client/'))
-      || (github.event_name != 'merge_group'
-          && (startsWith(github.head_ref, 'tickets/')
-              || startsWith(github.head_ref, 't/')))
+      # Only push on server releases and ticket branch PRs (exclude client
+      # releases). Non-matching PRs still build the image as validation but
+      # skip the push + manifest steps — this lets the required
+      # `build / manifest` check report as "Skipped" (which counts as
+      # passing) instead of hanging in "Expected" forever on dependabot
+      # and similar PRs.
+      push: >-
+        ${{ (github.event_name == 'release'
+             && !startsWith(github.event.release.tag_name, 'client/'))
+            || (github.event_name != 'merge_group'
+                && (startsWith(github.head_ref, 'tickets/')
+                    || startsWith(github.head_ref, 't/'))) }}
 
   client-test-packaging:
     name: Test client packaging
