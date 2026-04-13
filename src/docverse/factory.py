@@ -14,6 +14,7 @@ from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.edition import EditionService
+from .services.edition_publishing import EditionPublishingService
 from .services.edition_tracking import EditionTrackingService
 from .services.infrastructure import InfrastructureService
 from .services.organization import OrganizationService
@@ -21,6 +22,10 @@ from .services.project import ProjectService
 from .storage.build_store import BuildStore
 from .storage.edition_build_history_store import EditionBuildHistoryStore
 from .storage.edition_store import EditionStore
+from .storage.editionpublisher import (
+    EditionPublisher,
+    create_edition_publisher,
+)
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
@@ -204,6 +209,70 @@ class Factory(ABC):
             credential_store=self.create_credential_store(),
             org_store=self._create_org_store(),
             logger=self._logger,
+        )
+
+    def create_edition_publishing_service(self) -> EditionPublishingService:
+        """Create an EditionPublishingService."""
+        return EditionPublishingService(
+            org_store=self._create_org_store(),
+            edition_store=EditionStore(
+                session=self._session, logger=self._logger
+            ),
+            history_store=EditionBuildHistoryStore(
+                session=self._session, logger=self._logger
+            ),
+            publisher_provider=self.create_edition_publisher_for_org,
+            logger=self._logger,
+        )
+
+    async def create_edition_publisher_for_org(
+        self, *, org_id: int, service_label: str
+    ) -> EditionPublisher:
+        """Resolve an org's EditionPublisher from its service configuration.
+
+        Uses the two-step resolution: service label -> config +
+        credential_label -> decrypt credential -> build EditionPublisher.
+
+        Parameters
+        ----------
+        org_id
+            Organization ID.
+        service_label
+            Service label to use (typically the org's
+            ``cdn_service_label``).
+
+        Returns
+        -------
+        EditionPublisher
+            An unopened EditionPublisher. Caller must use as async
+            context manager.
+        """
+        if self._http_client is None:
+            msg = "HTTP client is required to build an EditionPublisher"
+            raise RuntimeError(msg)
+
+        # Step 1: Load the service config
+        service_store = self.create_service_store()
+        svc = await service_store.get_by_label(
+            organization_id=org_id, label=service_label
+        )
+        if svc is None:
+            msg = f"Service {service_label!r} not found"
+            raise RuntimeError(msg)
+
+        # Step 2: Decrypt the credential
+        credential_service = self.create_credential_service()
+        _cred, cred_payload = await credential_service.get_decrypted(
+            org_id=org_id, label=svc.credential_label
+        )
+
+        # Step 3: Build the EditionPublisher from config + credentials
+        return create_edition_publisher(
+            provider=svc.provider,
+            config=svc.config,
+            credentials=cred_payload,
+            logger=self._logger,
+            http_client=self._http_client,
         )
 
     async def create_objectstore_for_org(

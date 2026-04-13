@@ -7,6 +7,7 @@ from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.domain.edition_build_history import (
@@ -71,6 +72,22 @@ class EditionBuildHistoryStore:
         if row is None:
             return None
         return EditionBuildHistory.model_validate(row)
+
+    async def set_publish_status(
+        self, *, history_id: int, status: PublishStatus
+    ) -> None:
+        """Set the ``publish_status`` column on a history row."""
+        result = await self._session.execute(
+            select(SqlEditionBuildHistory).where(
+                SqlEditionBuildHistory.id == history_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"EditionBuildHistory id={history_id} not found"
+            raise RuntimeError(msg)
+        row.publish_status = status.value
+        await self._session.flush()
 
     async def list_by_edition(
         self, edition_id: int
