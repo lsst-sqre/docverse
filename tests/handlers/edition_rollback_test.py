@@ -170,7 +170,7 @@ async def test_rollback_build_not_found(client: AsyncClient) -> None:
     await _setup(client)
     response = await client.post(
         "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
-        json={"build": "0000-0000-0000-00"},
+        json={"build": "1000-0000-0000-05"},
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
@@ -210,14 +210,14 @@ async def test_rollback_records_in_history(
 
 @pytest.mark.asyncio
 async def test_rollback_malformed_build_id(client: AsyncClient) -> None:
-    """Malformed base32 build ID returns 404."""
+    """Malformed base32 build ID returns 422."""
     await _setup(client)
     response = await client.post(
         "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
         json={"build": "totally-invalid"},
         headers={"X-Auth-Request-User": "testuser"},
     )
-    assert response.status_code == 404
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -226,7 +226,7 @@ async def test_rollback_edition_not_found(client: AsyncClient) -> None:
     await _setup(client)
     response = await client.post(
         "/docverse/orgs/rb-org/projects/rb-proj/editions/no-such-edition/rollback",
-        json={"build": "0000-0000-0000-00"},
+        json={"build": "1000-0000-0000-05"},
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404

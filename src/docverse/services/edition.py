@@ -7,7 +7,7 @@ from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
 from docverse.client.models.queue_enums import JobKind, PublishStatus
-from docverse.domain.base32id import serialize_base32_id, validate_base32_id
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.exceptions import ConflictError, NotFoundError
@@ -21,6 +21,7 @@ from docverse.storage.pagination import EditionBuildHistoryPositionCursor
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_backend import QueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
+from docverse.validation import parse_base32_id
 
 
 class EditionService:
@@ -204,11 +205,7 @@ class EditionService:
         build_public_id: str,
     ) -> Edition:
         """Point ``edition`` at an arbitrary build (emergency override)."""
-        try:
-            public_id = validate_base32_id(build_public_id)
-        except ValueError:
-            msg = f"Build {build_public_id!r} not found"
-            raise NotFoundError(msg) from None
+        public_id = parse_base32_id(build_public_id, resource="build")
 
         build = await self._build_store.get_by_public_id(
             project_id=project_id, public_id=public_id
@@ -370,11 +367,7 @@ class EditionService:
             msg = f"Edition {edition_slug!r} not found"
             raise NotFoundError(msg)
 
-        try:
-            public_id = validate_base32_id(build_public_id)
-        except ValueError:
-            msg = f"Build {build_public_id!r} not found"
-            raise NotFoundError(msg) from None
+        public_id = parse_base32_id(build_public_id, resource="build")
 
         build = await self._build_store.get_by_public_id(
             project_id=project_id, public_id=public_id

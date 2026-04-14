@@ -97,6 +97,17 @@ async def test_get_build(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_build_malformed_id(client: AsyncClient) -> None:
+    """GET with a malformed base32 build ID returns 422."""
+    await _setup(client)
+    response = await client.get(
+        "/docverse/orgs/build-org/projects/build-proj/builds/not-a-valid-id",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_patch_build_upload_complete(client: AsyncClient) -> None:
     await _setup(client)
     build_id = await seed_build("build-org", "build-proj")

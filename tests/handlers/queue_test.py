@@ -61,7 +61,7 @@ async def test_get_queue_job_not_found(
     client: AsyncClient,
 ) -> None:
     """Test 404 for a nonexistent queue job."""
-    response = await client.get("/docverse/queue/jobs/0000-0000-0000-00")
+    response = await client.get("/docverse/queue/jobs/1000-0000-0000-05")
     assert response.status_code == 404
 
 
@@ -69,9 +69,9 @@ async def test_get_queue_job_not_found(
 async def test_get_queue_job_invalid_id(
     client: AsyncClient,
 ) -> None:
-    """Test 404 for an invalid Base32 ID."""
+    """Test 422 for an invalid Base32 ID."""
     response = await client.get("/docverse/queue/jobs/not-a-valid-id")
-    assert response.status_code == 404
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

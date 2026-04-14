@@ -232,7 +232,7 @@ async def test_patch_override_build_not_found(client: AsyncClient) -> None:
     await _setup(client)
     response = await client.patch(
         "/docverse/orgs/pov-org/projects/pov-proj/editions/__main",
-        json={"build": "0000-0000-0000-00"},
+        json={"build": "1000-0000-0000-05"},
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
@@ -242,11 +242,11 @@ async def test_patch_override_build_not_found(client: AsyncClient) -> None:
 async def test_patch_override_malformed_build_id(
     client: AsyncClient,
 ) -> None:
-    """PATCH with a malformed base32 build ID returns 404."""
+    """PATCH with a malformed base32 build ID returns 422."""
     await _setup(client)
     response = await client.patch(
         "/docverse/orgs/pov-org/projects/pov-proj/editions/__main",
         json={"build": "totally-invalid"},
         headers={"X-Auth-Request-User": "testuser"},
     )
-    assert response.status_code == 404
+    assert response.status_code == 422
