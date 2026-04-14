@@ -81,6 +81,8 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     """Clean up resources for the arq worker process."""
     arq_queue = ctx.get("arq_queue")
     if arq_queue is not None:
+        # Private-attribute access until safir adds a public shutdown API;
+        # see https://github.com/lsst-sqre/safir/issues/522
         await arq_queue._pool.aclose()  # noqa: SLF001
     await ctx["http_client"].aclose()
     await db_session_dependency.aclose()
