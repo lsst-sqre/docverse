@@ -29,7 +29,7 @@ from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
-from docverse.factory import WorkerFactory
+from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.edition_tracking import EditionTrackingService
 from docverse.storage.build_store import BuildStore
@@ -128,7 +128,7 @@ def _mock_create_objectstore(
     """  # noqa: D205
 
     async def _create(
-        self: WorkerFactory,
+        self: Factory,
         *,
         org_id: int,
         service_label: str,
@@ -172,7 +172,7 @@ async def test_build_processing_updates_edition(
     )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_objectstore_for_org",
         _mock_create_objectstore(mock_store),
     )
@@ -259,7 +259,7 @@ async def test_build_processing_uses_stored_storage_prefix(
     )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_objectstore_for_org",
         _mock_create_objectstore(mock_store),
     )
@@ -323,7 +323,7 @@ async def test_build_processing_edition_failure_no_build_fail(
     )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_objectstore_for_org",
         _mock_create_objectstore(mock_store),
     )
@@ -412,7 +412,7 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
     )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_objectstore_for_org",
         _mock_create_objectstore(mock_store),
     )
@@ -556,7 +556,7 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
     )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_objectstore_for_org",
         _mock_create_objectstore(mock_store),
     )

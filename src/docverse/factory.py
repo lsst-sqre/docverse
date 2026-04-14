@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-
 import httpx
 import structlog
 from safir.arq import ArqQueue
@@ -41,33 +39,39 @@ from .storage.queue_job_store import QueueJobStore
 from .storage.user_info_store import UserInfoStore
 
 
-class Factory(ABC):
+class Factory:
     """Build Docverse service objects."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        arq_queue: ArqQueue | None = None,
+        default_queue_name: str = "arq:queue",
     ) -> None:
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
         self._superadmin_usernames = superadmin_usernames or []
         self._http_client = http_client
+        self._arq_queue = arq_queue
+        self._default_queue_name = default_queue_name
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
         self._logger = logger
 
-    @abstractmethod
-    def _create_queue_backend(self) -> QueueBackend: ...
-
     def create_queue_backend(self) -> QueueBackend:
         """Create a :class:`QueueBackend` for enqueuing jobs."""
-        return self._create_queue_backend()
+        if self._arq_queue is None:
+            return NullQueueBackend()
+        return ArqQueueBackend(
+            arq_queue=self._arq_queue,
+            default_queue_name=self._default_queue_name,
+        )
 
     def _create_org_store(self) -> OrganizationStore:
         return OrganizationStore(session=self._session, logger=self._logger)
@@ -103,7 +107,7 @@ class Factory(ABC):
         store = BuildStore(session=self._session, logger=self._logger)
         org_store = self._create_org_store()
         project_store = self._create_project_store()
-        queue_backend = self._create_queue_backend()
+        queue_backend = self.create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
         )
@@ -147,7 +151,7 @@ class Factory(ABC):
             session=self._session, logger=self._logger
         )
         build_store = BuildStore(session=self._session, logger=self._logger)
-        queue_backend = self._create_queue_backend()
+        queue_backend = self.create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
         )
@@ -350,55 +354,11 @@ class HandlerFactory(Factory):
             logger=logger,
             credential_encryptor=credential_encryptor,
             superadmin_usernames=superadmin_usernames,
+            arq_queue=arq_queue,
+            default_queue_name=default_queue_name,
         )
-        self._arq_queue = arq_queue
         self._user_info_store = user_info_store
-        self._default_queue_name = default_queue_name
-
-    def _create_queue_backend(self) -> ArqQueueBackend:
-        return ArqQueueBackend(
-            arq_queue=self._arq_queue,
-            default_queue_name=self._default_queue_name,
-        )
 
     def get_user_info_store(self) -> UserInfoStore:
         """Get the UserInfoStore instance."""
         return self._user_info_store
-
-
-class WorkerFactory(Factory):
-    """Factory for worker functions.
-
-    When ``arq_queue`` is provided, ``_create_queue_backend()`` returns an
-    :class:`ArqQueueBackend` so worker functions can enqueue child jobs.
-    Without it, a :class:`NullQueueBackend` is used for worker contexts that
-    only need status-transition methods.
-    """
-
-    def __init__(  # noqa: PLR0913
-        self,
-        session: AsyncSession,
-        logger: structlog.stdlib.BoundLogger,
-        credential_encryptor: CredentialEncryptor | None = None,
-        superadmin_usernames: list[str] | None = None,
-        http_client: httpx.AsyncClient | None = None,
-        arq_queue: ArqQueue | None = None,
-        default_queue_name: str = "arq:queue",
-    ) -> None:
-        super().__init__(
-            session=session,
-            logger=logger,
-            credential_encryptor=credential_encryptor,
-            superadmin_usernames=superadmin_usernames,
-            http_client=http_client,
-        )
-        self._arq_queue = arq_queue
-        self._default_queue_name = default_queue_name
-
-    def _create_queue_backend(self) -> QueueBackend:
-        if self._arq_queue is None:
-            return NullQueueBackend()
-        return ArqQueueBackend(
-            arq_queue=self._arq_queue,
-            default_queue_name=self._default_queue_name,
-        )

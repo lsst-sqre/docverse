@@ -31,7 +31,7 @@ from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
-from docverse.factory import WorkerFactory
+from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -91,7 +91,7 @@ def _mock_create_edition_publisher(
     """  # noqa: D205
 
     async def _create(
-        self: WorkerFactory,
+        self: Factory,
         *,
         org_id: int,
         service_label: str,
@@ -230,7 +230,7 @@ async def test_publish_edition_success_lifecycle(
         )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_edition_publisher_for_org",
         _mock_create_edition_publisher(mock_publisher),
     )
@@ -313,7 +313,7 @@ async def test_publish_edition_failure_lifecycle(
         )
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_edition_publisher_for_org",
         _mock_create_edition_publisher(failing_publisher),
     )
@@ -372,7 +372,7 @@ async def test_publish_edition_no_cdn_shortcut(
     logger = _logger()
 
     async def _provider_raises(
-        self: WorkerFactory,
+        self: Factory,
         *,
         org_id: int,
         service_label: str,
@@ -382,7 +382,7 @@ async def test_publish_edition_no_cdn_shortcut(
         raise AssertionError(msg)
 
     monkeypatch.setattr(
-        WorkerFactory,
+        Factory,
         "create_edition_publisher_for_org",
         _provider_raises,
     )

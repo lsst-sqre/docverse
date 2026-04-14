@@ -29,7 +29,7 @@ from docverse.domain.edition_tracking import (
     EditionTrackingResult,
 )
 from docverse.exceptions import NotFoundError
-from docverse.factory import WorkerFactory
+from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -78,7 +78,7 @@ async def build_processing(
     arq_queue: ArqQueue | None = ctx.get("arq_queue")
 
     async for session in db_session_dependency():
-        factory = WorkerFactory(
+        factory = Factory(
             session=session,
             logger=logger,
             credential_encryptor=encryptor,
@@ -182,7 +182,7 @@ async def _start_queue_job(
 async def _finalize_success(  # noqa: PLR0913
     *,
     session: AsyncSession,
-    factory: WorkerFactory,
+    factory: Factory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     org_id: int,
@@ -266,7 +266,7 @@ class _PendingEnqueue:
 async def _enqueue_publish_jobs(  # noqa: PLR0913
     *,
     session: AsyncSession,
-    factory: WorkerFactory,
+    factory: Factory,
     queue_job_store: QueueJobStore,
     tracking_result: EditionTrackingResult,
     org_id: int,
@@ -363,7 +363,7 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
 async def _track_editions(  # noqa: PLR0913
     *,
     session: AsyncSession,
-    factory: WorkerFactory,
+    factory: Factory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     build_id: int,

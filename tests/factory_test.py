@@ -7,7 +7,7 @@ import structlog
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.factory import WorkerFactory
+from docverse.factory import Factory
 from docverse.storage.queue_backend import ArqQueueBackend, NullQueueBackend
 
 
@@ -16,25 +16,23 @@ def _logger() -> structlog.stdlib.BoundLogger:
 
 
 @pytest.mark.asyncio
-async def test_worker_factory_without_arq_queue_uses_null_backend(
+async def test_factory_without_arq_queue_uses_null_backend(
     db_session: AsyncSession,
 ) -> None:
-    """WorkerFactory defaults to NullQueueBackend when no arq queue given."""
-    factory = WorkerFactory(session=db_session, logger=_logger())
-    backend = factory._create_queue_backend()
-    assert isinstance(backend, NullQueueBackend)
+    """Factory defaults to NullQueueBackend when no arq queue is given."""
+    factory = Factory(session=db_session, logger=_logger())
+    assert isinstance(factory.create_queue_backend(), NullQueueBackend)
 
 
 @pytest.mark.asyncio
-async def test_worker_factory_with_arq_queue_uses_arq_backend(
+async def test_factory_with_arq_queue_uses_arq_backend(
     db_session: AsyncSession,
 ) -> None:
-    """WorkerFactory uses ArqQueueBackend when an arq queue is provided."""
+    """Factory uses ArqQueueBackend when an arq queue is provided."""
     arq_queue = MockArqQueue(default_queue_name="docverse:queue")
-    factory = WorkerFactory(
+    factory = Factory(
         session=db_session,
         logger=_logger(),
         arq_queue=arq_queue,
     )
-    backend = factory._create_queue_backend()
-    assert isinstance(backend, ArqQueueBackend)
+    assert isinstance(factory.create_queue_backend(), ArqQueueBackend)

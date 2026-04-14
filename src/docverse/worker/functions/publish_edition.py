@@ -23,7 +23,7 @@ from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.exceptions import NotFoundError
-from docverse.factory import WorkerFactory
+from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -73,7 +73,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     queue_job_id: int = payload["queue_job_id"]
 
     async for session in db_session_dependency():
-        factory = WorkerFactory(
+        factory = Factory(
             session=session,
             logger=logger,
             credential_encryptor=encryptor,
