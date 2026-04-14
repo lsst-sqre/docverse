@@ -12,17 +12,21 @@ import structlog
 from cryptography.fernet import Fernet
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
+    EditionCreate,
+    EditionKind,
     OrganizationCreate,
     ProjectCreate,
+    TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.organization import SqlOrganization
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import WorkerFactory
@@ -36,6 +40,7 @@ from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_backend import ArqQueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.build_processing import build_processing
 
@@ -484,3 +489,146 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
             assert entry["publish_queue_job_public_id"] == serialize_base32_id(
                 child.public_id
             )
+
+
+@pytest.mark.asyncio
+async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase-A DB updates commit atomically even when phase-B arq fails.
+
+    Two editions track ``main``. The first ``publish_edition`` arq enqueue
+    raises. Because ``_enqueue_publish_jobs`` commits all DB rows in one
+    transaction before enqueueing, both editions and history entries should
+    be ``pending`` and both child ``QueueJob`` rows should exist, even
+    though no arq job was successfully enqueued. This is the single
+    failure shape a future reconciliation loop has to handle — and the
+    red-green distinction from the per-edition-transaction structure,
+    which would leave edition 2 entirely untouched on a first-edition
+    enqueue failure.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+    mock_arq = MockArqQueue()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        edition_store = EditionStore(session=db_session, logger=logger)
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Main",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="latest",
+                title="Latest",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-publish-fail",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        WorkerFactory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    async def failing_enqueue(
+        self: ArqQueueBackend,
+        job_type: str,
+        payload: dict[str, Any],
+        *,
+        queue_name: str | None = None,
+    ) -> str:
+        msg = "Simulated arq enqueue failure"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(ArqQueueBackend, "enqueue", failing_enqueue)
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-arq-publish-fail",
+        "arq_queue": mock_arq,
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    with pytest.raises(RuntimeError, match="Simulated arq enqueue failure"):
+        await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    # No arq publish_edition jobs were successfully enqueued.
+    enqueued = list(mock_arq._job_metadata["arq:queue"].values())
+    publish_arq_jobs = [j for j in enqueued if j.name == "publish_edition"]
+    assert len(publish_arq_jobs) == 0
+
+    # Phase A committed atomically: both editions and both histories are
+    # pending, and both child QueueJob rows exist.
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            )
+
+            for slug in ("main", "latest"):
+                edition = await edition_store.get_by_slug(
+                    project_id=project.id, slug=slug
+                )
+                assert edition is not None
+                assert edition.publish_status == PublishStatus.pending
+
+                history = await history_store.get_by_edition_and_build(
+                    edition_id=edition.id, build_id=build.id
+                )
+                assert history is not None
+                assert history.publish_status == PublishStatus.pending
+
+            child_rows = (
+                (
+                    await session.execute(
+                        select(SqlQueueJob).where(
+                            SqlQueueJob.build_id == build.id,
+                            SqlQueueJob.kind == JobKind.publish_edition.value,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(child_rows) == 2
