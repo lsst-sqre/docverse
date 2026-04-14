@@ -261,3 +261,12 @@ class EditionUpdate(BaseModel):
         default=None,
         description="Whether this edition is exempt from lifecycle rules.",
     )
+
+    build: str | None = Field(
+        default=None,
+        description=(
+            "Base32 public ID of a build to point this edition at. "
+            "Emergency-override path: unlike rollback, the build does not "
+            "have to be in the edition's history."
+        ),
+    )
