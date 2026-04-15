@@ -19,6 +19,7 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
@@ -264,7 +265,7 @@ async def test_publish_successful_calls_publisher_and_marks_published(
     call = mock_publisher.calls[0]
     assert call.project_slug == _PROJECT_SLUG
     assert call.edition_slug == edition.slug
-    assert call.build_public_id == str(build.public_id)
+    assert call.build_public_id == serialize_base32_id(build.public_id)
     assert call.object_key_prefix == build.storage_prefix
 
     async with db_session.begin():

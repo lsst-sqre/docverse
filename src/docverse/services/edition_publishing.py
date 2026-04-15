@@ -7,6 +7,7 @@ from typing import Protocol
 import structlog
 
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
@@ -107,7 +108,7 @@ class EditionPublishingService:
             await publisher.publish(
                 project_slug=project_slug,
                 edition_slug=edition.slug,
-                build_public_id=str(build.public_id),
+                build_public_id=serialize_base32_id(build.public_id),
                 object_key_prefix=build.storage_prefix,
             )
         await self._mark_published(

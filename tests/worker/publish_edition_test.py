@@ -257,7 +257,7 @@ async def test_publish_edition_success_lifecycle(
     call = mock_publisher.calls[0]
     assert call.project_slug == project.slug
     assert call.edition_slug == edition.slug
-    assert call.build_public_id == str(build.public_id)
+    assert call.build_public_id == serialize_base32_id(build.public_id)
     assert call.object_key_prefix == build.storage_prefix
 
     async for session in db_session_dependency():
