@@ -78,7 +78,15 @@ class CloudflareWorkersConfig(BaseModel):
 
     provider: Literal["cloudflare_workers"] = "cloudflare_workers"
     account_id: str = Field(description="Cloudflare account ID.")
-    zone_id: str = Field(description="Cloudflare zone ID.")
+    zone_id: str | None = Field(
+        default=None,
+        description=(
+            "Cloudflare DNS zone ID for the custom domain fronting the"
+            " Worker. Required for edge cache purges on publish via the"
+            " /zones/{zone_id}/purge_cache API. Omit for workers.dev"
+            " test deployments, which have no user-controllable zone."
+        ),
+    )
     kv_namespace_id: str | None = Field(
         default=None,
         description=(
