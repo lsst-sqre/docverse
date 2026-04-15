@@ -25,6 +25,7 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
@@ -45,6 +46,8 @@ from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.build_processing import build_processing
 
 _HASH = "sha256:" + "a" * 64
+
+_config = Configuration()
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -182,7 +185,7 @@ async def test_build_processing_updates_edition(
         "encryptor": encryptor,
         "http_client": httpx.AsyncClient(),
         "job_id": "test-arq-job-1",
-        "arq_queue": MockArqQueue(),
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
     }
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -269,7 +272,7 @@ async def test_build_processing_uses_stored_storage_prefix(
         "encryptor": encryptor,
         "http_client": httpx.AsyncClient(),
         "job_id": "test-arq-prefix",
-        "arq_queue": MockArqQueue(),
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
     }
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -388,7 +391,7 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
     """
     logger = _logger()
     mock_store = MockObjectStore()
-    mock_arq = MockArqQueue()
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
 
     async with db_session.begin():
         org, project = await _setup_org_and_project(db_session)
@@ -437,10 +440,15 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
     await ctx["http_client"].aclose()
     assert result == "completed"
 
-    # Inspect enqueued arq jobs for publish_edition
-    enqueued = list(mock_arq._job_metadata["arq:queue"].values())
+    # Inspect enqueued arq jobs for publish_edition. They must land under
+    # the configured queue name (not arq's default "arq:queue"), so that
+    # the worker listening on ``config.arq_queue_name`` actually picks
+    # them up.
+    assert "arq:queue" not in mock_arq._job_metadata
+    enqueued = list(mock_arq._job_metadata[_config.arq_queue_name].values())
     publish_arq_jobs = [j for j in enqueued if j.name == "publish_edition"]
     assert len(publish_arq_jobs) == 1
+    assert publish_arq_jobs[0].queue_name == _config.arq_queue_name
     pj_payload = publish_arq_jobs[0].kwargs["payload"]
     assert pj_payload["org_id"] == org.id
     assert pj_payload["project_slug"] == project.slug
@@ -511,7 +519,7 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
     """
     logger = _logger()
     mock_store = MockObjectStore()
-    mock_arq = MockArqQueue()
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
 
     async with db_session.begin():
         org, project = await _setup_org_and_project(db_session)
@@ -593,8 +601,10 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
     await ctx["http_client"].aclose()
 
     # No arq publish_edition jobs were successfully enqueued.
-    enqueued = list(mock_arq._job_metadata["arq:queue"].values())
-    publish_arq_jobs = [j for j in enqueued if j.name == "publish_edition"]
+    enqueued_by_queue = mock_arq._job_metadata.get(_config.arq_queue_name, {})
+    publish_arq_jobs = [
+        j for j in enqueued_by_queue.values() if j.name == "publish_edition"
+    ]
     assert len(publish_arq_jobs) == 0
 
     # Phase A committed atomically: both editions and both histories are

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildStatus
 from docverse.client.models.queue_enums import JobKind, PublishStatus
+from docverse.config import Configuration
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import (
@@ -42,6 +43,8 @@ from docverse.storage.queue_job_store import QueueJobStore
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
+
+config = Configuration()
 
 
 async def build_processing(
@@ -84,6 +87,7 @@ async def build_processing(
             credential_encryptor=encryptor,
             http_client=http_client,
             arq_queue=arq_queue,
+            default_queue_name=config.arq_queue_name,
         )
         build_store = BuildStore(session=session, logger=logger)
         org_store = OrganizationStore(session=session, logger=logger)

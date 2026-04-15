@@ -19,6 +19,7 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.config import Configuration
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
@@ -32,6 +33,8 @@ from docverse.storage.edition_build_history_store import (
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
+
+config = Configuration()
 
 
 @dataclass(slots=True)
@@ -79,6 +82,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             credential_encryptor=encryptor,
             http_client=http_client,
             arq_queue=arq_queue,
+            default_queue_name=config.arq_queue_name,
         )
         edition_store = EditionStore(session=session, logger=logger)
         history_store = EditionBuildHistoryStore(

@@ -50,7 +50,8 @@ class Factory:
         superadmin_usernames: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue | None = None,
-        default_queue_name: str = "arq:queue",
+        *,
+        default_queue_name: str,
     ) -> None:
         self._session = session
         self._logger = logger
@@ -347,7 +348,8 @@ class HandlerFactory(Factory):
         user_info_store: UserInfoStore,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
-        default_queue_name: str = "arq:queue",
+        *,
+        default_queue_name: str,
     ) -> None:
         super().__init__(
             session=session,
