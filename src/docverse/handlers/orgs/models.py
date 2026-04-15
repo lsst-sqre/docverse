@@ -291,6 +291,7 @@ class Edition(_EditionBase):
             tracking_mode=domain.tracking_mode,
             tracking_params=domain.tracking_params,
             lifecycle_exempt=domain.lifecycle_exempt,
+            publish_status=domain.publish_status,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )

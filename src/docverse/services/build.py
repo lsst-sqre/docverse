@@ -6,7 +6,7 @@ import structlog
 from safir.database import CountedPaginatedList
 
 from docverse.client.models import BuildCreate, BuildStatus, JobKind
-from docverse.domain.base32id import serialize_base32_id, validate_base32_id
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.project import Project
 from docverse.domain.queue import QueueJob
@@ -17,6 +17,7 @@ from docverse.storage.pagination import BuildDateCreatedCursor
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_backend import QueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
+from docverse.validation import parse_base32_id
 
 
 class BuildService:
@@ -56,11 +57,7 @@ class BuildService:
 
     def _validate_build_id(self, build_id: str) -> int:
         """Validate a base32 build ID string and return the int form."""
-        try:
-            return validate_base32_id(build_id)
-        except ValueError as exc:
-            msg = f"Invalid build ID {build_id!r}"
-            raise NotFoundError(msg) from exc
+        return parse_base32_id(build_id, resource="build")
 
     async def _resolve_build(self, project_id: int, build_id: str) -> Build:
         """Validate base32 ID and fetch the build, raising if not found."""

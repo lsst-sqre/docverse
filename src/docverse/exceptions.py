@@ -7,6 +7,7 @@ from safir.fastapi import ClientRequestError
 
 __all__ = [
     "ConflictError",
+    "InvalidBase32IdError",
     "InvalidBuildStateError",
     "InvalidJobStateError",
     "JobNotFoundError",
@@ -34,6 +35,13 @@ class MissingConfigurationError(ClientRequestError):
     """The organization is missing required configuration."""
 
     error = "missing_configuration"
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+
+
+class InvalidBase32IdError(ClientRequestError):
+    """A base32-encoded ID in the request is malformed."""
+
+    error = "invalid_id"
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
 
 

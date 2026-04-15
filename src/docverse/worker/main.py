@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import structlog
+from safir.arq import RedisArqQueue
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.db_session import db_session_dependency
 from safir.logging import configure_logging
@@ -18,7 +19,7 @@ from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.services.credential_encryptor import CredentialEncryptor
 
-from .functions import build_processing, ping
+from .functions import build_processing, ping, publish_edition
 
 config = Configuration()
 
@@ -65,11 +66,24 @@ async def startup(ctx: dict[str, Any]) -> None:
 
     ctx["http_client"] = httpx.AsyncClient()
 
+    if config.arq_redis_settings is None:
+        msg = "arq_redis_settings must be configured for the worker"
+        raise RuntimeError(msg)
+    ctx["arq_queue"] = await RedisArqQueue.initialize(
+        config.arq_redis_settings,
+        default_queue_name=config.arq_queue_name,
+    )
+
     logger.info("Worker startup complete")
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     """Clean up resources for the arq worker process."""
+    arq_queue = ctx.get("arq_queue")
+    if arq_queue is not None:
+        # Private-attribute access until safir adds a public shutdown API;
+        # see https://github.com/lsst-sqre/safir/issues/522
+        await arq_queue._pool.aclose()  # noqa: SLF001
     await ctx["http_client"].aclose()
     await db_session_dependency.aclose()
     logger = structlog.get_logger("docverse.worker")
@@ -79,7 +93,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """arq WorkerSettings for Docverse."""
 
-    functions = [build_processing, ping]
+    functions = [build_processing, ping, publish_edition]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
     on_startup = startup

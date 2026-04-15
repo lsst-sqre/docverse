@@ -6,7 +6,8 @@ import structlog
 from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
-from docverse.domain.base32id import validate_base32_id
+from docverse.client.models.queue_enums import JobKind, PublishStatus
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.exceptions import ConflictError, NotFoundError
@@ -18,6 +19,9 @@ from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import EditionBuildHistoryPositionCursor
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_backend import QueueBackend
+from docverse.storage.queue_job_store import QueueJobStore
+from docverse.validation import parse_base32_id
 
 
 class EditionService:
@@ -31,6 +35,8 @@ class EditionService:
         logger: structlog.stdlib.BoundLogger,
         history_store: EditionBuildHistoryStore,
         build_store: BuildStore,
+        queue_backend: QueueBackend,
+        queue_job_store: QueueJobStore,
     ) -> None:
         self._store = store
         self._org_store = org_store
@@ -38,6 +44,8 @@ class EditionService:
         self._logger = logger
         self._history_store = history_store
         self._build_store = build_store
+        self._queue_backend = queue_backend
+        self._queue_job_store = queue_job_store
 
     async def _resolve_project_id(
         self, org_slug: str, project_slug: str
@@ -138,22 +146,125 @@ class EditionService:
     ) -> Edition:
         """Update an edition.
 
+        If ``data.build`` is set, apply an emergency build override: point
+        the edition at the target build (even one not in history), record
+        a new history entry, mark the edition ``publish_status=pending``,
+        and enqueue a ``publish_edition`` job. Unlike rollback, this path
+        bypasses the history-membership guard.
+
         Raises
         ------
         NotFoundError
-            If the edition is not found.
+            If the edition or target build is not found.
         """
-        project_id = await self._resolve_project_id(org_slug, project_slug)
+        org = await self._org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        project = await self._project_store.get_by_slug(
+            org_id=org.id, slug=project_slug
+        )
+        if project is None:
+            msg = f"Project {project_slug!r} not found"
+            raise NotFoundError(msg)
+        project_id = project.id
+
+        build_public_id = data.build
+        other_updates = EditionUpdate.model_validate(
+            data.model_dump(exclude={"build"}, exclude_unset=True)
+        )
+
         edition = await self._store.update(
-            project_id=project_id, slug=slug, data=data
+            project_id=project_id, slug=slug, data=other_updates
         )
         if edition is None:
             msg = f"Edition {slug!r} not found"
             raise NotFoundError(msg)
+
+        if build_public_id is not None:
+            edition = await self._apply_build_override(
+                org_id=org.id,
+                project_id=project_id,
+                project_slug=project_slug,
+                edition=edition,
+                build_public_id=build_public_id,
+            )
+
         self._logger.info(
             "Updated edition", slug=slug, org=org_slug, project=project_slug
         )
         return edition
+
+    async def _apply_build_override(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        project_slug: str,
+        edition: Edition,
+        build_public_id: str,
+    ) -> Edition:
+        """Point ``edition`` at an arbitrary build (emergency override)."""
+        public_id = parse_base32_id(build_public_id, resource="build")
+
+        build = await self._build_store.get_by_public_id(
+            project_id=project_id, public_id=public_id
+        )
+        if build is None:
+            msg = f"Build {build_public_id!r} not found"
+            raise NotFoundError(msg)
+
+        updated_edition = await self._store.set_current_build(
+            edition_id=edition.id,
+            build_id=build.id,
+            skip_date_guard=True,
+        )
+        if updated_edition is None:
+            msg = "set_current_build returned None with skip_date_guard=True"
+            raise RuntimeError(msg)
+
+        new_history_entry = await self._history_store.record(
+            edition_id=edition.id, build_id=build.id
+        )
+
+        await self._store.set_publish_status(
+            edition_id=edition.id, status=PublishStatus.pending
+        )
+        await self._history_store.set_publish_status(
+            history_id=new_history_entry.id, status=PublishStatus.pending
+        )
+        updated_edition.publish_status = PublishStatus.pending
+
+        child_job = await self._queue_job_store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=project_id,
+            build_id=build.id,
+            edition_id=edition.id,
+        )
+        backend_job_id = await self._queue_backend.enqueue(
+            "publish_edition",
+            {
+                "org_id": org_id,
+                "project_slug": project_slug,
+                "edition_id": edition.id,
+                "edition_slug": edition.slug,
+                "build_id": build.id,
+                "build_public_id": serialize_base32_id(build.public_id),
+                "queue_job_id": child_job.id,
+            },
+        )
+
+        self._logger.info(
+            "Applied edition build override",
+            edition_id=edition.id,
+            build=build_public_id,
+            publish_queue_job_public_id=serialize_base32_id(
+                child_job.public_id
+            ),
+            publish_backend_job_id=backend_job_id,
+        )
+        return updated_edition
 
     async def set_current_build(
         self, *, edition_id: int, build_id: int
@@ -237,7 +348,17 @@ class EditionService:
         NotFoundError
             If the edition, build, or history entry is not found.
         """
-        project_id = await self._resolve_project_id(org_slug, project_slug)
+        org = await self._org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        project = await self._project_store.get_by_slug(
+            org_id=org.id, slug=project_slug
+        )
+        if project is None:
+            msg = f"Project {project_slug!r} not found"
+            raise NotFoundError(msg)
+        project_id = project.id
 
         edition = await self._store.get_by_slug(
             project_id=project_id, slug=edition_slug
@@ -246,11 +367,7 @@ class EditionService:
             msg = f"Edition {edition_slug!r} not found"
             raise NotFoundError(msg)
 
-        try:
-            public_id = validate_base32_id(build_public_id)
-        except ValueError:
-            msg = f"Build {build_public_id!r} not found"
-            raise NotFoundError(msg) from None
+        public_id = parse_base32_id(build_public_id, resource="build")
 
         build = await self._build_store.get_by_public_id(
             project_id=project_id, public_id=public_id
@@ -275,8 +392,36 @@ class EditionService:
             msg = "set_current_build returned None with skip_date_guard=True"
             raise RuntimeError(msg)
 
-        await self._history_store.record(
+        new_history_entry = await self._history_store.record(
             edition_id=edition.id, build_id=build.id
+        )
+
+        await self._store.set_publish_status(
+            edition_id=edition.id, status=PublishStatus.pending
+        )
+        await self._history_store.set_publish_status(
+            history_id=new_history_entry.id, status=PublishStatus.pending
+        )
+        updated_edition.publish_status = PublishStatus.pending
+
+        child_job = await self._queue_job_store.create(
+            kind=JobKind.publish_edition,
+            org_id=org.id,
+            project_id=project_id,
+            build_id=build.id,
+            edition_id=edition.id,
+        )
+        backend_job_id = await self._queue_backend.enqueue(
+            "publish_edition",
+            {
+                "org_id": org.id,
+                "project_slug": project_slug,
+                "edition_id": edition.id,
+                "edition_slug": edition.slug,
+                "build_id": build.id,
+                "build_public_id": serialize_base32_id(build.public_id),
+                "queue_job_id": child_job.id,
+            },
         )
 
         self._logger.info(
@@ -285,6 +430,10 @@ class EditionService:
             org=org_slug,
             project=project_slug,
             build=build_public_id,
+            publish_queue_job_public_id=serialize_base32_id(
+                child_job.public_id
+            ),
+            publish_backend_job_id=backend_job_id,
         )
         return updated_edition
 

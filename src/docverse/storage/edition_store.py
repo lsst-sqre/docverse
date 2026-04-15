@@ -20,6 +20,7 @@ from docverse.client.models import (
     EditionUpdate,
     TrackingMode,
 )
+from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.domain.edition import Edition
@@ -260,6 +261,20 @@ class EditionStore:
         result2 = await self._session.execute(stmt2)
         edition_row, build_public_id, build_git_ref = result2.one()
         return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def set_publish_status(
+        self, *, edition_id: int, status: PublishStatus
+    ) -> None:
+        """Set the ``publish_status`` column on an edition row."""
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.publish_status = status.value
+        await self._session.flush()
 
     async def soft_delete(self, *, project_id: int, slug: str) -> bool:
         """Soft-delete an edition by setting date_deleted.

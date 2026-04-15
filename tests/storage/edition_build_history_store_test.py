@@ -12,9 +12,11 @@ from docverse.client.models import (
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
+    PublishStatus,
     TrackingMode,
 )
 from docverse.client.models.builds import BuildAnnotations
+from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -107,6 +109,31 @@ async def test_first_record(
     assert entry.position == 1
     assert entry.build_id == build_ids[0]
     assert entry.edition_id == edition_id
+
+
+@pytest.mark.asyncio
+async def test_history_publish_status_persists(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """``publish_status`` on a history row roundtrips through the DB."""
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, edition_slug="pub-hist"
+        )
+        entry = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        row = await db_session.get(SqlEditionBuildHistory, entry.id)
+        assert row is not None
+        assert row.publish_status is None
+        row.publish_status = PublishStatus.published.value
+        await db_session.commit()
+
+    async with db_session.begin():
+        refetched = await db_session.get(SqlEditionBuildHistory, entry.id)
+        assert refetched is not None
+        assert refetched.publish_status == PublishStatus.published.value
 
 
 @pytest.mark.asyncio

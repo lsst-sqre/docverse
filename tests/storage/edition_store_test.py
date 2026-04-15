@@ -17,9 +17,11 @@ from docverse.client.models import (
     EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
+    PublishStatus,
     TrackingMode,
 )
 from docverse.dbschema.build import SqlBuild
+from docverse.dbschema.edition import SqlEdition
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
@@ -84,6 +86,35 @@ async def test_create_edition(
     assert edition.tracking_mode == TrackingMode.git_ref
     assert edition.current_build_id is None
     assert edition.current_build_public_id is None
+    assert edition.publish_status is None
+
+
+@pytest.mark.asyncio
+async def test_edition_publish_status_persists(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Setting ``publish_status`` via the ORM roundtrips through the DB."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="pub-ed",
+                title="Pub",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        row = await db_session.get(SqlEdition, edition.id)
+        assert row is not None
+        row.publish_status = PublishStatus.published.value
+        await db_session.commit()
+
+    async with db_session.begin():
+        refetched = await db_session.get(SqlEdition, edition.id)
+        assert refetched is not None
+        assert refetched.publish_status == PublishStatus.published.value
 
 
 @pytest.mark.asyncio

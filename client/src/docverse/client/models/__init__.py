@@ -46,7 +46,7 @@ from .organizations import (
 )
 from .projects import Project, ProjectCreate, ProjectUpdate
 from .queue import QueueJob
-from .queue_enums import JobKind, JobStatus
+from .queue_enums import JobKind, JobStatus, PublishStatus
 from .services import (
     OrganizationService,
     OrganizationServiceCreate,
@@ -92,6 +92,7 @@ __all__ = [
     "Project",
     "ProjectCreate",
     "ProjectUpdate",
+    "PublishStatus",
     "QueueJob",
     "S3Credentials",
     "ServiceCategory",

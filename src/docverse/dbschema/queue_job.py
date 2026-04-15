@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -47,6 +47,10 @@ class SqlQueueJob(Base):
     # created.
     project_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     build_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    edition_id: Mapped[int | None] = mapped_column(
+        ForeignKey("editions.id"),
+        nullable=True,
+    )
 
     progress: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True

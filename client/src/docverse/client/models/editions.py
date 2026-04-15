@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .builds import BuildAnnotations, BuildStatus
+from .queue_enums import PublishStatus
 
 __all__ = [
     "DefaultEditionConfig",
@@ -176,6 +177,15 @@ class Edition(BaseModel):
         description="Whether this edition is exempt from lifecycle rules."
     )
 
+    publish_status: PublishStatus | None = Field(
+        default=None,
+        description=(
+            "CDN publish state for the edition's current build. ``None`` when"
+            " the edition has never been associated with a build or predates"
+            " publish-status tracking."
+        ),
+    )
+
     date_created: datetime = Field(
         description="Timestamp when the edition was created."
     )
@@ -250,4 +260,13 @@ class EditionUpdate(BaseModel):
     lifecycle_exempt: bool | None = Field(
         default=None,
         description="Whether this edition is exempt from lifecycle rules.",
+    )
+
+    build: str | None = Field(
+        default=None,
+        description=(
+            "Base32 public ID of a build to point this edition at. "
+            "Emergency-override path: unlike rollback, the build does not "
+            "have to be in the edition's history."
+        ),
     )

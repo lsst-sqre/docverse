@@ -7,9 +7,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.domain.base32id import validate_base32_id
 from docverse.exceptions import NotFoundError
 from docverse.handlers.params import JobIdParam
+from docverse.validation import parse_base32_id
 
 from .models import QueueJob
 
@@ -25,11 +25,7 @@ async def get_queue_job(
     job_id: JobIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> QueueJob:
-    try:
-        public_id = validate_base32_id(job_id)
-    except ValueError as exc:
-        msg = f"Invalid job ID {job_id!r}"
-        raise NotFoundError(msg) from exc
+    public_id = parse_base32_id(job_id, resource="job")
     context.rebind_logger(job_id=job_id)
     async with context.session.begin():
         store = context.factory.create_queue_job_store()
