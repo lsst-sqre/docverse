@@ -256,6 +256,25 @@ async def test_cancel_completed_job_raises(
 
 
 @pytest.mark.asyncio
+async def test_set_backend_job_id(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """``set_backend_job_id`` records an arq job ID on an existing row."""
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.publish_edition, org_id=1)
+        assert job.backend_job_id is None
+        updated = await store.set_backend_job_id(job.id, "arq-job-42")
+        await db_session.commit()
+    assert updated.backend_job_id == "arq-job-42"
+
+    async with db_session.begin():
+        refetched = await store.get(job.id)
+    assert refetched is not None
+    assert refetched.backend_job_id == "arq-job-42"
+
+
+@pytest.mark.asyncio
 async def test_get_by_public_id(
     db_session: AsyncSession,
     store: QueueJobStore,

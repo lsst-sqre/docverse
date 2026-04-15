@@ -485,6 +485,7 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
             assert child.build_id == build.id
             assert child.org_id == org.id
             assert child.project_id == project.id
+            assert child.backend_job_id == publish_arq_jobs[0].id
 
             parent = await qjs.get_by_backend_job_id("test-arq-publish-1")
             assert parent is not None

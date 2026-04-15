@@ -113,6 +113,22 @@ class QueueJobStore:
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def set_backend_job_id(
+        self,
+        job_id: int,
+        backend_job_id: str,
+    ) -> QueueJob:
+        """Record the arq job ID on a previously-created QueueJob row.
+
+        Used by two-phase enqueue flows that insert the row before they
+        have a backend job ID (see ``_enqueue_publish_jobs``).
+        """
+        row = await self._get_row(job_id)
+        row.backend_job_id = backend_job_id
+        await self._session.flush()
+        await self._session.refresh(row)
+        return QueueJob.model_validate(row, from_attributes=True)
+
     async def update_phase(
         self,
         job_id: int,

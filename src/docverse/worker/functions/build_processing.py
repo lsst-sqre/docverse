@@ -338,7 +338,7 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     publish_jobs: list[dict[str, str]] = []
     for pending in pending_enqueues:
         outcome = pending.outcome
-        await queue_backend.enqueue(
+        backend_job_id = await queue_backend.enqueue(
             "publish_edition",
             {
                 "org_id": org_id,
@@ -350,6 +350,11 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
                 "queue_job_id": pending.child_queue_job_id,
             },
         )
+        async with session.begin():
+            await queue_job_store.set_backend_job_id(
+                pending.child_queue_job_id,
+                backend_job_id,
+            )
         publish_jobs.append(
             {
                 "edition_slug": outcome.slug,
