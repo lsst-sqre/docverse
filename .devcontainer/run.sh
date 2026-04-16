@@ -76,19 +76,10 @@ if $use_api; then
 fi
 
 # --- Secret loading (host-side via 1Password CLI) ---
-echo "Loading secrets from 1Password..."
-GH_TOKEN=$(op read --account "$op_account" "$gh_token_uri") || die "Failed to read GH token from 1Password"
-SIGNING_KEY_PEM=$(op read --account "$op_account" "$signing_key_private_uri") || die "Failed to read signing key (private)"
-SIGNING_KEY_PUB=$(op read --account "$op_account" "$signing_key_public_uri") || die "Failed to read signing key (public)"
-
-ANTHROPIC_API_KEY=""
-if $use_api; then
-    ANTHROPIC_API_KEY=$(op read --account "$op_account" "$anthropic_key_uri") || die "Failed to read Anthropic API key"
-fi
-
-# --- Host git identity ---
-GIT_USER_NAME=$(git config --global user.name 2>/dev/null) || die "git config --global user.name not set"
-GIT_USER_EMAIL=$(git config --global user.email 2>/dev/null) || die "git config --global user.email not set"
+# shellcheck source=lib/secrets.sh
+source "$SCRIPT_DIR/lib/secrets.sh"
+load_sandbox_secrets
+load_host_git_identity
 
 # --- Read prompt (unless login mode) ---
 PROMPT=""

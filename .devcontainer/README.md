@@ -109,6 +109,13 @@ devcontainer exec --workspace-folder /path/to/ltd-keeper \
 | `docverse-uv-cache` | `/home/node/.cache/uv` | Python package cache |
 | (DinD feature-managed) | `/var/lib/docker` | Docker-in-Docker storage |
 
+## Ralph loop (AFK autonomous mode)
+
+For longer unattended runs that work through a backlog of `prd-task` GitHub
+issues, use the Ralph loop driver in [`ralph/`](../ralph/README.md). It reuses
+the same 1Password secret loading and container lifecycle, so the env vars
+above apply.
+
 ## Testing inside the container
 
 ```bash
