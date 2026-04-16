@@ -26,7 +26,8 @@ Read the shortlist in the prompt. Each entry includes the issue number, title,
 and full body (which contains the Metadata table with `Parent PRD`, `Jira Key`,
 `Jira URL`, `Task Order`, `Type`, `Blocked by`, `Parallel with`, and `Branch`).
 
-**If the shortlist is empty**, skip to Phase 8 (emit sentinel and stop).
+**If the shortlist is empty**, skip to Phase 8 — that case is one of the two
+where you emit the sentinel.
 
 **If the prompt includes a forced `--issue N` marker**, pick that issue and
 skip the ranking.
@@ -190,14 +191,27 @@ Steps:
 
 A human clears the `agent-stuck` label to re-enable the issue in later runs.
 
-## Phase 8: Emit the completion sentinel
+## Phase 8: Completion sentinel (only when no work remains)
 
-After the iteration finishes — whether success, stuck, or empty shortlist —
-the last line of your response **must** be exactly:
+Do **not** emit a sentinel after a normal iteration. After a successful
+commit/PR/close (Phase 6) or a stuck-WIP push (Phase 7), simply end your
+response — the host loop will continue to the next iteration on its own.
+
+Emit the sentinel **only** when there is no further actionable work in this
+run. That covers two cases:
+
+1. The shortlist provided in the prompt was empty (the Phase 1 short-circuit).
+2. You inspected the shortlist and concluded that no entry is actionable in
+   this run (e.g. every remaining task is blocked by something the loop
+   cannot resolve).
+
+In those cases, and only those cases, the last line of your response **must**
+be exactly:
 
 ```
 <ralph-status>done</ralph-status>
 ```
 
-The host greps the final output for this string. If it's missing, the loop
-aborts.
+The host (`afk.sh`) greps the final `result` event for this string. Seeing
+it stops the loop immediately; not seeing it lets the loop run the next
+iteration.

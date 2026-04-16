@@ -31,6 +31,8 @@ __FORCED_ISSUE__
 
 ## Your job
 
-Invoke the `afk-iterate` skill. When the loop's work is done (either this
-iteration finishes successfully/stuck, or the shortlist is empty), emit the
-sentinel `<ralph-status>done</ralph-status>` as the last thing you say.
+Invoke the `afk-iterate` skill. After a normal iteration (success or stuck),
+end your response without a sentinel — the host loop will continue on its
+own. Only emit `<ralph-status>done</ralph-status>` as the last line of your
+response when there is no further work to do (empty shortlist or no
+actionable tasks remain), per Phase 8 of the skill.
