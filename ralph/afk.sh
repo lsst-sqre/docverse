@@ -3,14 +3,25 @@
 #
 # Repeatedly spawns Claude Code inside the docverse sandbox to work through the
 # backlog of open `prd-task` GitHub issues created by `rubin-prd-to-issues`.
-# Each iteration: picks one eligible task → drives it through red/green/refactor
-# via work-it → commits, pushes, opens/updates a PR, closes the issue (or marks
-# it `agent-stuck` on failure).
+#
+# Each iteration is split into two host-orchestrated Claude phases:
+#
+#   1. select  (cheap model, e.g. Haiku) — ranks the host-prefiltered
+#      shortlist by the priority rubric and emits a sentinel-wrapped JSON
+#      pick. Sees no code, runs no git commands.
+#   2. implement (default model) — receives only the picked issue's body +
+#      its parent PRD (if any) + git state, and drives TDD → commit → push →
+#      PR. Never sees the shortlist or rubric.
+#
+# Between the two phases the host extracts the picked issue from a JSON
+# shortlist index, fetches its parent PRD body (cached), and does branch
+# setup inside the container via `container_exec git …`.
 #
 # Usage:
 #   ralph/afk.sh <iterations>               # all open AFK prd-tasks
 #   ralph/afk.sh <iterations> --prd 42      # only children of PRD #42
-#   ralph/afk.sh <iterations> --issue 57    # force task #57 (bypasses filters)
+#   ralph/afk.sh <iterations> --issue 57    # force task #57 (bypasses filters
+#                                             *and* the select phase)
 #
 # Required env vars (same as .devcontainer/run.sh):
 #   DOCVERSE_SANDBOX_GH_TOKEN_OP
@@ -22,9 +33,9 @@
 #   DOCVERSE_SANDBOX_DOCKER_CONTEXT           (e.g. agent-sandbox)
 #   DOCVERSE_SANDBOX_OP_ACCOUNT               (default: my.1password.com)
 #
-# Requires bash 4+ (uses `mapfile` and modern array features).
-# macOS ships bash 3.2 — install a newer bash via Homebrew (`brew install bash`)
-# or run this script in the devcontainer.
+# Requires bash 4+ (uses `mapfile`, associative arrays, and modern array
+# features). macOS ships bash 3.2 — install a newer bash via Homebrew
+# (`brew install bash`) or run this script in the devcontainer.
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
     echo "ralph/afk.sh requires bash 4+ (you have ${BASH_VERSION:-unknown})." >&2
     echo "On macOS: brew install bash, then re-run with /opt/homebrew/bin/bash." >&2
@@ -53,7 +64,12 @@ anthropic_key_uri="${DOCVERSE_SANDBOX_ANTHROPIC_KEY_OP:-}"
 docker_context="${DOCVERSE_SANDBOX_DOCKER_CONTEXT:-}"
 op_account="${DOCVERSE_SANDBOX_OP_ACCOUNT:-my.1password.com}"
 
-# Container exec timeout per iteration (seconds). 3600 = 1 hour.
+# Model for the cheap selection phase. Haiku is the default; override with
+# DOCVERSE_RALPH_SELECT_MODEL=<model-id>. An empty value falls back to the
+# container's configured default model.
+select_model="${DOCVERSE_RALPH_SELECT_MODEL:-claude-haiku-4-5}"
+# Timeout per phase (seconds).
+select_timeout="${DOCVERSE_RALPH_SELECT_TIMEOUT:-120}"
 iter_timeout="${DOCVERSE_RALPH_ITER_TIMEOUT:-3600}"
 
 # ---- Flag parsing ----
@@ -95,6 +111,10 @@ fi
 source "$REPO_DIR/.devcontainer/lib/secrets.sh"
 load_sandbox_secrets
 load_host_git_identity
+
+# Export GH_TOKEN so host-side `gh` (used on branch-setup failure) finds it
+# automatically. The container also receives it via container_exec.
+export GH_TOKEN
 
 # ---- Docker context ----
 if [ -n "$docker_context" ]; then
@@ -142,7 +162,7 @@ echo "Logging to $log_dir"
 
 # jq filter: render stream-json events as human-readable text for the terminal
 # log. Preserves assistant text with CRLF-normalized newlines and flags tool
-# use. Raw stream is separately tee'd to iter-NN.jsonl for replay.
+# use. Raw stream is separately tee'd to iter-NN-<phase>.jsonl for replay.
 stream_filter='
   if .type == "assistant" then
     (.message.content // [])[]? |
@@ -160,169 +180,336 @@ stream_filter='
   else empty end
 '
 
-# ---- Helper: fetch the shortlist of eligible task issues ----
-# Writes markdown blocks to stdout, one per eligible issue.
+# ---- Cache for parent PRD bodies (keyed by issue number) ----
+declare -A prd_body_cache
+
+# ---- Helper: write the iter shortlist JSON and markdown ----
+# Writes the JSON index to $log_dir/iter-{iter_pad}.shortlist.json.
+# Sets globals: PF_SHORTLIST_MD (markdown rendering), SHORTLIST_JSON_PATH.
 build_shortlist() {
-    local prd="$1"
-    local forced="$2"
+    local iter_pad="$1"
+    local prd="$2"
+    local forced="$3"
+    local out_json="$log_dir/iter-${iter_pad}.shortlist.json"
 
+    local items
     if [ -n "$forced" ]; then
-        # --issue N: fetch that one issue, skip all filters
-        container_exec gh issue view "$forced" \
+        # --issue N: fetch that one issue, skip all filters.
+        local single
+        single=$(container_exec gh issue view "$forced" \
             --repo lsst-sqre/docverse \
-            --json number,title,body \
-            --template '--- ISSUE #{{.number}} ---
-{{.title}}
+            --json number,title,body) \
+            || die "gh issue view #$forced failed"
+        items=$(printf '%s\n' "$single" | jq '[.]')
+    else
+        local raw
+        raw=$(container_exec gh issue list \
+            --repo lsst-sqre/docverse \
+            --label prd-task --state open --limit 100 \
+            --json number,title,body,labels) \
+            || die "gh issue list failed"
 
-{{.body}}
+        # Apply label + Type + optional Parent PRD filters in jq.
+        local candidates
+        candidates=$(echo "$raw" | jq -c --arg prd "$prd" '
+            [.[]
+            | select(any(.labels[]; .name == "agent-stuck") | not)
+            | select(.body | test("\\|\\s*Type\\s*\\|\\s*AFK\\s*\\|"; "i"))
+            | select(
+                ($prd == "") or
+                (.body | test("\\|\\s*Parent PRD\\s*\\|\\s*#" + $prd + "\\b"))
+              )]
+        ') || die "jq filter failed"
 
-'
-        return
-    fi
-
-    # List open prd-task issues, drop those labeled agent-stuck, then filter
-    # by Type=AFK and (optional) Parent PRD via body-text matching.
-    local raw
-    raw=$(container_exec gh issue list \
-        --repo lsst-sqre/docverse \
-        --label prd-task --state open --limit 100 \
-        --json number,title,body,labels) \
-        || die "gh issue list failed"
-
-    # First pass: apply label + Type + optional Parent PRD filters in jq.
-    local candidates
-    candidates=$(echo "$raw" | jq -c --arg prd "$prd" '
-        .[]
-        | select(any(.labels[]; .name == "agent-stuck") | not)
-        | select(.body | test("\\|\\s*Type\\s*\\|\\s*AFK\\s*\\|"; "i"))
-        | select(
-            ($prd == "") or
-            (.body | test("\\|\\s*Parent PRD\\s*\\|\\s*#" + $prd + "\\b"))
-          )
-    ') || die "jq filter failed"
-
-    [ -z "$candidates" ] && return 0
-
-    # Second pass: for each candidate, check that every `Blocked by: #N` is
-    # closed. If any blocker is open, drop the candidate.
-    echo "$candidates" | while IFS= read -r issue_json; do
-        [ -z "$issue_json" ] && continue
-        local num body blockers ok=1
-        num=$(echo "$issue_json" | jq -r .number)
-        body=$(echo "$issue_json" | jq -r .body)
-        # Pull numbers from the line starting with `Blocked by:` or the table
-        # row `| Blocked by | #1, #2 |`.
-        blockers=$(printf '%s\n' "$body" \
-            | grep -iE '^\s*\|?\s*Blocked by' \
-            | head -n 1 \
-            | grep -oE '#[0-9]+' \
-            | tr -d '#' || true)
-        for b in $blockers; do
-            local state
-            state=$(container_exec gh issue view "$b" \
-                --repo lsst-sqre/docverse \
-                --json state --jq .state 2>/dev/null || echo "OPEN")
-            if [ "$state" != "CLOSED" ]; then
-                ok=0; break
+        # Blocker filtering: drop any candidate with an open `Blocked by` ref.
+        local filtered='[]'
+        local len
+        len=$(echo "$candidates" | jq 'length')
+        local k
+        for ((k=0; k<len; k++)); do
+            local entry body blockers ok=1
+            entry=$(echo "$candidates" | jq -c ".[$k]")
+            body=$(echo "$entry" | jq -r .body)
+            blockers=$(printf '%s\n' "$body" \
+                | grep -iE '^\s*\|?\s*Blocked by' \
+                | head -n 1 \
+                | grep -oE '#[0-9]+' \
+                | tr -d '#' || true)
+            for b in $blockers; do
+                local state
+                state=$(container_exec gh issue view "$b" \
+                    --repo lsst-sqre/docverse \
+                    --json state --jq .state 2>/dev/null || echo "OPEN")
+                if [ "$state" != "CLOSED" ]; then ok=0; break; fi
+            done
+            if [ "$ok" = "1" ]; then
+                filtered=$(jq -c --argjson e "$entry" '. + [$e]' <<<"$filtered")
             fi
         done
-        if [ "$ok" = "1" ]; then
-            local title
-            title=$(echo "$issue_json" | jq -r .title)
-            printf -- '--- ISSUE #%s ---\n%s\n\n%s\n\n' "$num" "$title" "$body"
-        fi
-    done
+        items="$filtered"
+    fi
+
+    # Transform items into an index keyed by issue_number with structured
+    # metadata extracted from each body's Metadata table. The items JSON is
+    # staged through a temp file because python3's stdin is consumed by the
+    # heredoc that carries the script body.
+    local items_tmp
+    items_tmp=$(mktemp)
+    printf '%s' "$items" > "$items_tmp"
+    local index
+    index=$(python3 - "$items_tmp" <<'PYEOF'
+import json, re, sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    items = json.load(f)
+
+index = {}
+
+def field(body, name):
+    pat = re.compile(
+        r"\|\s*" + re.escape(name) + r"\s*\|\s*([^|]*?)\s*\|",
+        re.IGNORECASE,
+    )
+    m = pat.search(body)
+    return m.group(1).strip() if m else ""
+
+for it in items:
+    num = it["number"]
+    body = it.get("body") or ""
+    parent_raw = field(body, "Parent PRD")
+    parent_match = re.search(r"#(\d+)", parent_raw)
+    parent_prd = parent_match.group(1) if parent_match else ""
+    order_raw = field(body, "Task Order")
+    order_digits = re.sub(r"\D", "", order_raw)
+    try:
+        task_order = int(order_digits) if order_digits else 9999
+    except ValueError:
+        task_order = 9999
+    index[str(num)] = {
+        "title": it.get("title") or "",
+        "body": body,
+        "jira_key": field(body, "Jira Key"),
+        "branch": field(body, "Branch"),
+        "task_order": task_order,
+        "parent_prd": parent_prd,
+    }
+
+json.dump(index, sys.stdout)
+PYEOF
+)
+    rm -f "$items_tmp"
+
+    printf '%s' "$index" > "$out_json"
+    SHORTLIST_JSON_PATH="$out_json"
+
+    # Render markdown from the same index, ordered by task_order then issue
+    # number (ascending).
+    PF_SHORTLIST_MD=$(printf '%s\n' "$index" | jq -r '
+        to_entries
+        | sort_by(.value.task_order, (.key | tonumber))
+        | map("--- ISSUE #\(.key) ---\n\(.value.title)\n\n\(.value.body)\n\n")
+        | join("")
+    ')
 }
 
-# ---- Helper: pre-fetch per-iteration context ----
-prefetch_context() {
-    local branch git_status git_log shortlist prd_context forced_marker
-
-    branch=$(container_exec git -C /workspace/docverse branch --show-current \
-        | tr -d '\r')
-    git_status=$(container_exec git -C /workspace/docverse status --porcelain \
-        | tr -d '\r' || true)
-    git_log=$(container_exec git -C /workspace/docverse log -n 10 \
-        --format='%H%n%ad%n%B---' --date=short \
-        | tr -d '\r' || true)
-
-    shortlist=$(build_shortlist "$prd_filter" "$forced_issue" || true)
-
-    prd_context=""
-    if [ -n "$prd_filter" ]; then
-        local prd_body
-        prd_body=$(container_exec gh issue view "$prd_filter" \
-            --repo lsst-sqre/docverse \
-            --json title,body \
-            --template '## Parent PRD context (#'"$prd_filter"': {{.title}})
+# ---- Helper: fetch parent PRD body, cached across iterations ----
+# Args: parent_issue_number
+# Echoes a markdown block (with a `## Parent PRD …` header) on stdout, or
+# empty string if no parent.
+get_parent_prd_body() {
+    local num="$1"
+    [ -z "$num" ] && return 0
+    if [ -n "${prd_body_cache[$num]+_}" ]; then
+        printf '%s' "${prd_body_cache[$num]}"
+        return 0
+    fi
+    local rendered
+    rendered=$(container_exec gh issue view "$num" \
+        --repo lsst-sqre/docverse \
+        --json title,body \
+        --template '## Parent PRD context (#'"$num"': {{.title}})
 
 {{.body}}' 2>/dev/null || true)
-        prd_context="$prd_body"
-    fi
-
-    forced_marker=""
-    if [ -n "$forced_issue" ]; then
-        forced_marker="## Forced issue
-The operator invoked \`afk.sh --issue ${forced_issue}\`. Pick that issue and
-skip the ranking rubric."
-    fi
-
-    # Export globals for render_prompt
-    PF_BRANCH="$branch"
-    PF_GIT_STATUS="$git_status"
-    PF_GIT_LOG="$git_log"
-    PF_SHORTLIST="$shortlist"
-    PF_PRD_CONTEXT="$prd_context"
-    PF_FORCED_MARKER="$forced_marker"
+    prd_body_cache[$num]="$rendered"
+    printf '%s' "$rendered"
 }
 
-# ---- Helper: render prompt.md with placeholders substituted ----
-# stdin: template
-# stdout: rendered prompt
+# ---- Helper: refresh git state from inside the container ----
+# Sets globals PF_BRANCH, PF_GIT_STATUS, PF_GIT_LOG.
+refresh_git_state() {
+    PF_BRANCH=$(container_exec git -C /workspace/docverse branch --show-current \
+        | tr -d '\r')
+    PF_GIT_STATUS=$(container_exec git -C /workspace/docverse status --porcelain \
+        | tr -d '\r' || true)
+    PF_GIT_LOG=$(container_exec git -C /workspace/docverse log -n 10 \
+        --format='%H%n%ad%n%B---' --date=short \
+        | tr -d '\r' || true)
+}
+
+# ---- Helper: render a prompt template, substituting __VAR__ placeholders ----
+# Args: template_path
+# Placeholders with empty values have their entire line stripped.
+# Reads mappings from PF_* env vars set by the caller.
 render_prompt() {
-    local iter="$1" total="$2"
-    local shortlist_text="$PF_SHORTLIST"
-    [ -z "$shortlist_text" ] && shortlist_text="(shortlist is empty — no eligible tasks)"
-    local git_status_text="$PF_GIT_STATUS"
-    [ -z "$git_status_text" ] && git_status_text="(clean)"
-
-    # Use python3 with env-var inputs: literal str.replace sidesteps awk's
-    # gsub replacement semantics (where `&` means the matched text) and
-    # `awk -v`'s backslash-escape processing on values.
-    PF_ITERATION="$iter" \
-    PF_TOTAL="$total" \
-    PF_GIT_STATUS_R="$git_status_text" \
-    PF_SHORTLIST_R="$shortlist_text" \
-    python3 - "$SCRIPT_DIR/prompt.md" <<'PYEOF'
+    local template="$1"
+    python3 - "$template" <<'PYEOF'
 import os, re, sys
+
 mapping = {
-    "__ITERATION__":    os.environ["PF_ITERATION"],
-    "__TOTAL__":        os.environ["PF_TOTAL"],
+    "__ITERATION__":    os.environ.get("PF_ITERATION", ""),
+    "__TOTAL__":        os.environ.get("PF_TOTAL", ""),
     "__BRANCH__":       os.environ.get("PF_BRANCH", ""),
-    "__GIT_STATUS__":   os.environ["PF_GIT_STATUS_R"],
+    "__GIT_STATUS__":   os.environ.get("PF_GIT_STATUS_R", ""),
     "__GIT_LOG__":      os.environ.get("PF_GIT_LOG", ""),
-    "__SHORTLIST__":    os.environ["PF_SHORTLIST_R"],
+    "__SHORTLIST__":    os.environ.get("PF_SHORTLIST_R", ""),
     "__PRD_CONTEXT__":  os.environ.get("PF_PRD_CONTEXT", ""),
-    "__FORCED_ISSUE__": os.environ.get("PF_FORCED_MARKER", ""),
+    "__ISSUE_NUMBER__": os.environ.get("PF_ISSUE_NUMBER", ""),
+    "__ISSUE_BODY__":   os.environ.get("PF_ISSUE_BODY", ""),
+    "__PRD_BODY__":     os.environ.get("PF_PRD_BODY", ""),
+    "__JIRA_KEY__":     os.environ.get("PF_JIRA_KEY", ""),
 }
+
 with open(sys.argv[1], encoding="utf-8") as f:
     text = f.read()
-for k, v in mapping.items():
-    if v == "":
-        # Remove the whole line (and trailing newline) when the value is empty,
-        # so we don't emit blank stanzas for unused placeholders.
-        text = re.sub(rf'^[^\n]*{re.escape(k)}[^\n]*\n?', '', text, flags=re.MULTILINE)
+
+for placeholder, value in mapping.items():
+    if value == "":
+        text = re.sub(
+            rf'^[^\n]*{re.escape(placeholder)}[^\n]*\n?',
+            '', text, flags=re.MULTILINE,
+        )
     else:
-        text = text.replace(k, v)
+        text = text.replace(placeholder, value)
+
 sys.stdout.write(text)
 PYEOF
 }
 
+# ---- Helper: run one Claude phase, return final result text ----
+# Args: phase_name prompt_file model timeout iter_pad
+#
+# Streams stream-json from claude inside the container through tee (→ jsonl
+# replay), jq (→ human-readable), and a final tee (→ log + stderr for live
+# terminal view). The function echoes only the parsed final `result` event on
+# stdout so the caller can $(…)-capture it.
+#
+# If `model` is non-empty, passes `--model <model>` to claude; otherwise uses
+# the container's configured default model.
+#
+# Emits log files named:
+#   iter-{iter_pad}-{phase}.prompt.md  (already written by caller)
+#   iter-{iter_pad}-{phase}.jsonl
+#   iter-{iter_pad}-{phase}.log
+run_phase() {
+    local phase="$1" prompt_file="$2" model="$3" to="$4" iter_pad="$5"
+
+    local jsonl="$log_dir/iter-${iter_pad}-${phase}.jsonl"
+    local logf="$log_dir/iter-${iter_pad}-${phase}.log"
+
+    local -a claude_args=(claude)
+    if [ -n "$model" ]; then
+        claude_args+=(--model "$model")
+    fi
+    claude_args+=(--dangerously-skip-permissions --verbose
+                  --output-format stream-json -p -)
+
+    echo "Running claude [$phase] (timeout ${to}s, model=${model:-default})..." >&2
+    set +e
+    cat "$prompt_file" | container_exec --timeout "$to" \
+        /usr/local/bin/agent-entry "${claude_args[@]}" \
+        | tee "$jsonl" \
+        | jq -r --unbuffered "$stream_filter" 2>/dev/null \
+        | tee "$logf" >&2
+    local rc=${PIPESTATUS[1]}
+    set -e
+
+    if [ "$rc" -ne 0 ]; then
+        abort_reason="claude [$phase] exited $rc on iter $iter_pad (see $logf / $jsonl)"
+        abort "$abort_reason"
+    fi
+
+    jq -r 'select(.type == "result") | .result // empty' "$jsonl" | tail -n1
+}
+
+# ---- Helper: parse a <ralph-pick> sentinel from a result blob ----
+# stdin: result text. stdout: pick JSON (one line) if sentinel present, else
+# empty. Returns 0 always; caller inspects output emptiness.
+parse_pick_sentinel() {
+    python3 - <<'PYEOF'
+import json, re, sys
+text = sys.stdin.read()
+m = re.search(r"<ralph-pick>\s*(.*?)\s*</ralph-pick>", text, re.DOTALL)
+if not m:
+    sys.exit(0)
+raw = m.group(1).strip()
+try:
+    obj = json.loads(raw)
+except Exception:
+    sys.exit(0)
+print(json.dumps(obj))
+PYEOF
+}
+
+# ---- Helper: set up the picked task's branch inside the container ----
+# Args: branch
+# stdout: empty on success; git error text on failure.
+# Return code: 0 success, 1 failure (all three checkout attempts failed).
+container_branch_setup() {
+    local branch="$1"
+    local errs=""
+
+    # Best-effort fetch of the specific branch; it may legitimately not exist
+    # upstream yet (new task branches).
+    container_exec git -C /workspace/docverse fetch --prune origin "$branch" \
+        >/dev/null 2>&1 || true
+
+    # Try local, then remote-tracking, then a fresh branch from main.
+    local out
+    if out=$(container_exec git -C /workspace/docverse checkout "$branch" 2>&1); then
+        return 0
+    fi
+    errs+=$'git checkout '"$branch"$':\n'"$out"$'\n'
+
+    if out=$(container_exec git -C /workspace/docverse \
+            checkout -b "$branch" "origin/$branch" 2>&1); then
+        return 0
+    fi
+    errs+=$'git checkout -b '"$branch"$' origin/'"$branch"$':\n'"$out"$'\n'
+
+    if out=$(container_exec git -C /workspace/docverse \
+            checkout -b "$branch" main 2>&1); then
+        return 0
+    fi
+    errs+=$'git checkout -b '"$branch"$' main:\n'"$out"$'\n'
+
+    printf '%s' "$errs"
+    return 1
+}
+
+# ---- Helper: host-side stuck marker when branch setup fails ----
+# Args: issue_number error_text
+host_mark_stuck() {
+    local issue="$1" err="$2"
+    local body
+    # shellcheck disable=SC2016  # backticks are literal markdown, not command substitution
+    body=$(printf 'Ralph host-side branch setup failed — no commit created.\n\n```\n%s\n```\n\nHuman intervention required; clear the `agent-stuck` label to retry.' "$err")
+    gh issue edit "$issue" --repo lsst-sqre/docverse --add-label agent-stuck \
+        >/dev/null 2>&1 \
+        || echo "warning: host gh issue edit failed for #$issue" >&2
+    gh issue comment "$issue" --repo lsst-sqre/docverse --body "$body" \
+        >/dev/null 2>&1 \
+        || echo "warning: host gh issue comment failed for #$issue" >&2
+    host_stuck_issues+=("#$issue")
+}
+
 # ---- Summary accumulators ----
 stuck_issues=()
+host_stuck_issues=()
 abort_reason=""
 sentinel_seen=false
 completed_iterations=0
+declare -a iter_picks=()
+declare -a iter_wall=()
 
 write_summary() {
     {
@@ -334,8 +521,23 @@ write_summary() {
         if [ -n "$prd_filter" ]; then echo "- Scope: --prd $prd_filter"; fi
         if [ -n "$forced_issue" ]; then echo "- Scope: --issue $forced_issue"; fi
         echo
+        if [ ${#iter_picks[@]} -gt 0 ]; then
+            echo "## Per-iteration picks"
+            for line in "${iter_picks[@]}"; do echo "- $line"; done
+            echo
+        fi
+        if [ ${#iter_wall[@]} -gt 0 ]; then
+            echo "## Per-phase wall-clock"
+            for line in "${iter_wall[@]}"; do echo "- $line"; done
+            echo
+        fi
+        if [ ${#host_stuck_issues[@]} -gt 0 ]; then
+            echo "## Host-marked stuck (branch-setup failures)"
+            for i in "${host_stuck_issues[@]}"; do echo "- $i"; done
+            echo
+        fi
         if [ ${#stuck_issues[@]} -gt 0 ]; then
-            echo "## Stuck issues (claimed during this run)"
+            echo "## Stuck issues observed this run"
             for i in "${stuck_issues[@]}"; do echo "- $i"; done
         fi
         if [ -n "$abort_reason" ]; then
@@ -366,55 +568,186 @@ for ((i=1; i<=iterations; i++)); do
     container_exec git -C /workspace/docverse fetch --prune origin \
         || die "git fetch origin failed on iter $i"
 
-    # --- Build context + shortlist ---
-    prefetch_context
+    # --- Build shortlist (writes JSON; sets PF_SHORTLIST_MD) ---
+    build_shortlist "$iter_pad" "$prd_filter" "$forced_issue"
 
-    # Short-circuit: empty shortlist + no forced issue → nothing to do.
-    if [ -z "$PF_SHORTLIST" ] && [ -z "$forced_issue" ]; then
-        echo "No eligible tasks remain; emitting sentinel and stopping."
+    # Short-circuit: empty shortlist + no forced issue → no Claude calls.
+    shortlist_empty=false
+    if [ "$(jq 'length' "$SHORTLIST_JSON_PATH")" = "0" ]; then
+        shortlist_empty=true
+    fi
+    if $shortlist_empty && [ -z "$forced_issue" ]; then
+        echo "No eligible tasks remain; exiting loop without any Claude calls."
         sentinel_seen=true
         break
     fi
 
-    # --- Render prompt to a log-dir file so we can replay it ---
-    prompt_file="$log_dir/iter-${iter_pad}.prompt.md"
-    render_prompt "$i" "$iterations" > "$prompt_file"
+    # --- Determine the pick (forced | select-phase | stop) ---
+    pick_json=""
+    if [ -n "$forced_issue" ]; then
+        pick_json=$(jq -c --arg n "$forced_issue" '
+            if has($n) then
+                {issue_number: ($n | tonumber),
+                 branch:       .[$n].branch,
+                 jira_key:     .[$n].jira_key,
+                 reason:       "forced via --issue"}
+            else null end
+        ' "$SHORTLIST_JSON_PATH")
+        if [ "$pick_json" = "null" ] || [ -z "$pick_json" ]; then
+            abort_reason="--issue $forced_issue not present in shortlist index"
+            abort "$abort_reason"
+        fi
+        echo "Forced pick: #$forced_issue (skipping select phase)."
+    else
+        # ----- SELECT PHASE -----
+        select_prompt_file="$log_dir/iter-${iter_pad}-select.prompt.md"
 
-    jsonl_file="$log_dir/iter-${iter_pad}.jsonl"
-    log_file="$log_dir/iter-${iter_pad}.log"
+        prd_context=""
+        if [ -n "$prd_filter" ]; then
+            prd_context=$(get_parent_prd_body "$prd_filter")
+        fi
 
-    # --- Run claude via devcontainer exec, streaming stream-json through tee
-    # (raw → jsonl) and through jq (pretty → terminal + .log). Exit status
-    # comes from the devcontainer exec in the pipeline.
-    echo "Running claude (timeout ${iter_timeout}s)..."
+        # Populate PF_GIT_LOG so the select prompt can surface recent
+        # `Next-iteration notes:` hints to the ranking model.
+        refresh_git_state
+
+        PF_ITERATION="$i" PF_TOTAL="$iterations" \
+        PF_GIT_LOG="$PF_GIT_LOG" \
+        PF_SHORTLIST_R="$PF_SHORTLIST_MD" \
+        PF_PRD_CONTEXT="$prd_context" \
+        render_prompt "$SCRIPT_DIR/select-prompt.md" > "$select_prompt_file"
+
+        select_start=$SECONDS
+        set +e
+        select_result=$(run_phase select "$select_prompt_file" \
+            "$select_model" "$select_timeout" "$iter_pad")
+        select_rc=$?
+        set -e
+        select_elapsed=$((SECONDS - select_start))
+        iter_wall+=("iter $iter_pad select: ${select_elapsed}s")
+        if [ "$select_rc" -ne 0 ]; then
+            # run_phase already aborted via the `abort` function; defensive.
+            abort_reason="run_phase select returned $select_rc on iter $i"
+            abort "$abort_reason"
+        fi
+
+        # Parse sentinels.
+        if printf '%s' "$select_result" | grep -q '<ralph-status>done</ralph-status>'; then
+            echo "Select phase signalled done on iter $i — stopping loop."
+            sentinel_seen=true
+            completed_iterations=$i
+            break
+        fi
+
+        pick_json=$(printf '%s' "$select_result" | parse_pick_sentinel || true)
+        if [ -z "$pick_json" ]; then
+            echo "Select phase produced no valid <ralph-pick> on iter $i; retrying once." >&2
+            set +e
+            select_result=$(run_phase select "$select_prompt_file" \
+                "$select_model" "$select_timeout" "${iter_pad}-retry")
+            retry_rc=$?
+            set -e
+            if [ "$retry_rc" -ne 0 ]; then
+                abort_reason="run_phase select retry returned $retry_rc on iter $i"
+                abort "$abort_reason"
+            fi
+            if printf '%s' "$select_result" | grep -q '<ralph-status>done</ralph-status>'; then
+                echo "Select phase retry signalled done — stopping loop."
+                sentinel_seen=true
+                completed_iterations=$i
+                break
+            fi
+            pick_json=$(printf '%s' "$select_result" | parse_pick_sentinel || true)
+            if [ -z "$pick_json" ]; then
+                echo "Select phase still malformed on iter $i; aborting iteration and continuing." >&2
+                iter_picks+=("iter $iter_pad: SELECT MALFORMED — iteration skipped")
+                continue
+            fi
+        fi
+    fi
+
+    # --- Validate pick against shortlist JSON ---
+    picked_num=$(printf '%s' "$pick_json" | jq -r '.issue_number')
+    if [ -z "$picked_num" ] || [ "$picked_num" = "null" ]; then
+        echo "Pick JSON missing issue_number on iter $i; aborting iteration." >&2
+        iter_picks+=("iter $iter_pad: INVALID PICK JSON — iteration skipped")
+        continue
+    fi
+    if [ "$(jq -r --arg n "$picked_num" 'has($n)' "$SHORTLIST_JSON_PATH")" != "true" ]; then
+        echo "Picked #$picked_num not in shortlist index on iter $i; aborting iteration." >&2
+        iter_picks+=("iter $iter_pad: PICK #$picked_num NOT IN SHORTLIST — iteration skipped")
+        continue
+    fi
+
+    # --- Extract picked task's data from JSON ---
+    picked_title=$(jq -r --arg n "$picked_num" '.[$n].title' "$SHORTLIST_JSON_PATH")
+    picked_body=$(jq -r --arg n "$picked_num" '.[$n].body' "$SHORTLIST_JSON_PATH")
+    picked_branch=$(jq -r --arg n "$picked_num" '.[$n].branch' "$SHORTLIST_JSON_PATH")
+    picked_jira=$(jq -r --arg n "$picked_num" '.[$n].jira_key' "$SHORTLIST_JSON_PATH")
+    picked_parent=$(jq -r --arg n "$picked_num" '.[$n].parent_prd' "$SHORTLIST_JSON_PATH")
+    pick_reason=$(printf '%s' "$pick_json" | jq -r '.reason // ""')
+    iter_picks+=("iter $iter_pad: #$picked_num ($picked_title) — $pick_reason")
+    echo "Picked #$picked_num: $picked_title"
+
+    if [ -z "$picked_branch" ] || [ "$picked_branch" = "null" ]; then
+        echo "Picked #$picked_num has no Branch metadata; marking stuck via host." >&2
+        host_mark_stuck "$picked_num" "Task issue is missing a Branch field in its Metadata table."
+        continue
+    fi
+
+    # --- Parent PRD body for implement prompt (cached) ---
+    picked_prd_body=""
+    if [ -n "$picked_parent" ] && [ "$picked_parent" != "null" ]; then
+        picked_prd_body=$(get_parent_prd_body "$picked_parent")
+    fi
+
+    # --- Container-side branch setup ---
+    echo "Setting up branch '$picked_branch' in container..."
     set +e
-    cat "$prompt_file" | container_exec --timeout "$iter_timeout" \
-        /usr/local/bin/agent-entry \
-        claude --dangerously-skip-permissions --verbose \
-               --output-format stream-json -p - \
-        | tee "$jsonl_file" \
-        | jq -r --unbuffered "$stream_filter" 2>/dev/null \
-        | tee "$log_file"
-    rc=${PIPESTATUS[1]}
+    branch_err=$(container_branch_setup "$picked_branch")
+    branch_rc=$?
     set -e
-
-    if [ "$rc" -ne 0 ]; then
-        abort_reason="claude exited $rc on iter $i (see $log_file / $jsonl_file)"
-        abort "$abort_reason"
+    if [ "$branch_rc" -ne 0 ]; then
+        echo "Container-side branch setup failed for #$picked_num:" >&2
+        printf '%s\n' "$branch_err" >&2
+        host_mark_stuck "$picked_num" "$branch_err"
+        continue
     fi
 
-    # --- Parse sentinel from final result event in the raw jsonl ---
-    final_result=$(jq -r 'select(.type == "result") | .result // empty' "$jsonl_file" | tail -n1)
-    if printf '%s' "$final_result" | grep -q '<ralph-status>done</ralph-status>'; then
-        echo "Sentinel reached on iter $i — stopping loop."
-        sentinel_seen=true
-        completed_iterations=$i
-        break
+    # --- Fresh git state after checkout ---
+    refresh_git_state
+
+    # --- Render implement prompt ---
+    implement_prompt_file="$log_dir/iter-${iter_pad}-implement.prompt.md"
+    git_status_text="$PF_GIT_STATUS"
+    [ -z "$git_status_text" ] && git_status_text="(clean)"
+
+    PF_ITERATION="$i" PF_TOTAL="$iterations" \
+    PF_BRANCH="$PF_BRANCH" \
+    PF_GIT_STATUS_R="$git_status_text" \
+    PF_GIT_LOG="$PF_GIT_LOG" \
+    PF_ISSUE_NUMBER="$picked_num" \
+    PF_ISSUE_BODY="$picked_body" \
+    PF_PRD_BODY="$picked_prd_body" \
+    PF_JIRA_KEY="$picked_jira" \
+    render_prompt "$SCRIPT_DIR/implement-prompt.md" > "$implement_prompt_file"
+
+    # --- Run implement phase ---
+    implement_start=$SECONDS
+    set +e
+    run_phase implement "$implement_prompt_file" "" "$iter_timeout" "$iter_pad" \
+        >/dev/null
+    implement_rc=$?
+    set -e
+    implement_elapsed=$((SECONDS - implement_start))
+    iter_wall+=("iter $iter_pad implement: ${implement_elapsed}s")
+    if [ "$implement_rc" -ne 0 ]; then
+        abort_reason="run_phase implement returned $implement_rc on iter $i"
+        abort "$abort_reason"
     fi
 
     # --- Check for stuck-label drift (informational for summary.md) ---
     if [ -z "$forced_issue" ]; then
-        # Re-query issues now labeled agent-stuck since run started.
         while IFS= read -r n; do
             [ -n "$n" ] && stuck_issues+=("#$n")
         done < <(container_exec gh issue list \
@@ -422,7 +755,6 @@ for ((i=1; i<=iterations; i++)); do
             --label agent-stuck --state open \
             --json number --jq '.[].number' 2>/dev/null \
             | tr -d '\r' || true)
-        # de-dup (bash 4+)
         if [ ${#stuck_issues[@]} -gt 0 ]; then
             mapfile -t stuck_issues < <(printf '%s\n' "${stuck_issues[@]}" | sort -u)
         fi
