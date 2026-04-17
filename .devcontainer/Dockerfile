@@ -41,10 +41,13 @@ RUN chmod +x /usr/local/bin/init-firewall.sh
 COPY agent-entry.sh /usr/local/bin/agent-entry
 RUN chmod +x /usr/local/bin/agent-entry
 
-# Restricted sudoers: node can run firewall script and chown only
-RUN echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/firewall \
-    && echo "node ALL=(root) NOPASSWD: /bin/chown" >> /etc/sudoers.d/firewall \
-    && echo "node ALL=(root) NOPASSWD: /bin/mkdir" >> /etc/sudoers.d/firewall \
+# Restricted sudoers: node can run exactly the argv patterns used by the lifecycle scripts
+RUN { \
+    echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh"; \
+    echo "node ALL=(root) NOPASSWD: /bin/mkdir -p /run/docverse-sandbox"; \
+    echo "node ALL=(root) NOPASSWD: /bin/chown node\\:node /run/docverse-sandbox"; \
+    echo "node ALL=(root) NOPASSWD: /bin/chown -R node\\:node /workspace /home/node/.claude /commandhistory /home/node/.cache/uv"; \
+    } > /etc/sudoers.d/firewall \
     && chmod 0440 /etc/sudoers.d/firewall
 
 USER node
