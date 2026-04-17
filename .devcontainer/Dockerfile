@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     dnsutils \
     aggregate \
+    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # uv - baked in, no runtime network call to astral.sh
@@ -37,6 +38,10 @@ RUN git config --system gpg.format ssh \
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh
 
+# Periodic firewall refresh so CDN-backed domains don't drift during long runs
+COPY firewall-refresh.cron /etc/cron.d/docverse-firewall
+RUN chmod 0644 /etc/cron.d/docverse-firewall
+
 # Agent entry point
 COPY agent-entry.sh /usr/local/bin/agent-entry
 RUN chmod +x /usr/local/bin/agent-entry
@@ -44,6 +49,7 @@ RUN chmod +x /usr/local/bin/agent-entry
 # Restricted sudoers: node can run exactly the argv patterns used by the lifecycle scripts
 RUN { \
     echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh"; \
+    echo "node ALL=(root) NOPASSWD: /usr/sbin/cron"; \
     echo "node ALL=(root) NOPASSWD: /bin/mkdir -p /run/docverse-sandbox"; \
     echo "node ALL=(root) NOPASSWD: /bin/chown node\\:node /run/docverse-sandbox"; \
     echo "node ALL=(root) NOPASSWD: /bin/chown -R node\\:node /workspace /home/node/.claude /commandhistory /home/node/.cache/uv"; \

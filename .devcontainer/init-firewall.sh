@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Egress firewall: allowlist-only outbound connections.
-# Re-run manually to refresh stale DNS: sudo /usr/local/bin/init-firewall.sh
+# Refreshed automatically every 15 min by cron (/etc/cron.d/docverse-firewall).
+# Manual re-run: sudo /usr/local/bin/init-firewall.sh
 set -euo pipefail
 
 ALLOWED_DOMAINS=(
@@ -129,4 +130,5 @@ ip6tables -A OUTPUT -j LOG --log-prefix "BLOCKED-EGRESS6: " --log-level 4
 ip6tables -A OUTPUT -j DROP
 
 echo "=== Egress firewall active ==="
-echo "Re-run this script to refresh DNS: sudo /usr/local/bin/init-firewall.sh"
+echo "Refreshed automatically every 15 min by cron (/etc/cron.d/docverse-firewall)."
+echo "Manual re-run: sudo /usr/local/bin/init-firewall.sh"

@@ -1,0 +1,3 @@
+# Refresh init-firewall.sh every 15 minutes to keep CDN-backed domain → IP
+# mappings current during multi-hour AFK runs. Output appended for debugging.
+*/15 * * * * root /usr/local/bin/init-firewall.sh >>/var/log/init-firewall.log 2>&1
