@@ -59,6 +59,11 @@ metadata): commit `WIP(stuck) ...`, push, comment on the issue, add the
 `agent-stuck` label. The issue stays open; a human clears the label to let
 Ralph try again in a later run.
 
+Successful iterations close the task issue immediately after opening the PR
+(rather than waiting for merge) so the next iteration's host filter sees
+dependent tasks become eligible. If a PR is later rejected, the closed issue
+must be manually reopened — this tradeoff is accepted.
+
 ## Eligibility
 
 A task is eligible when all of these are true:

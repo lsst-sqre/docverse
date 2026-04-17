@@ -95,7 +95,7 @@ The container runs an egress firewall that only allows connections to:
 To refresh stale DNS (if domains resolve to new IPs):
 
 ```bash
-devcontainer exec --workspace-folder /path/to/ltd-keeper \
+devcontainer exec --workspace-folder /path/to/docverse \
     sudo /usr/local/bin/init-firewall.sh
 ```
 
