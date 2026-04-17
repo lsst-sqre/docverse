@@ -447,7 +447,7 @@ run_phase() {
 # stdin: result text. stdout: pick JSON (one line) if sentinel present, else
 # empty. Returns 0 always; caller inspects output emptiness.
 parse_pick_sentinel() {
-    python3 - <<'PYEOF'
+    python3 -c '
 import json, re, sys
 text = sys.stdin.read()
 m = re.search(r"<ralph-pick>\s*(.*?)\s*</ralph-pick>", text, re.DOTALL)
@@ -459,7 +459,7 @@ try:
 except Exception:
     sys.exit(0)
 print(json.dumps(obj))
-PYEOF
+'
 }
 
 # ---- Helper: set up the picked task's branch inside the container ----
