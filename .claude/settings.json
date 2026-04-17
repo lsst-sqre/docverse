@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.command // empty' | { read -r cmd; stripped=$(printf '%s' \"$cmd\" | sed -E 's/uv run (--[^ ]+ +)*python3?/UVPY/g'); if printf '%s' \"$stripped\" | grep -qE '(^|[[:space:];&|()`])(python|python3)([[:space:]]|$)'; then printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Use \\\"uv run python\\\" (or \\\"uv run --only-group=<group> python\\\") instead of bare python/python3. This project manages its Python environment with uv, and bare python will bypass the project virtualenv.\"}}'; fi; }"
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/deny-bare-python.sh\""
           }
         ]
       }
