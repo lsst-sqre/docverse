@@ -294,7 +294,7 @@ render_prompt() {
     PF_GIT_STATUS_R="$git_status_text" \
     PF_SHORTLIST_R="$shortlist_text" \
     python3 - "$SCRIPT_DIR/prompt.md" <<'PYEOF'
-import os, sys
+import os, re, sys
 mapping = {
     "__ITERATION__":    os.environ["PF_ITERATION"],
     "__TOTAL__":        os.environ["PF_TOTAL"],
@@ -308,7 +308,12 @@ mapping = {
 with open(sys.argv[1], encoding="utf-8") as f:
     text = f.read()
 for k, v in mapping.items():
-    text = text.replace(k, v)
+    if v == "":
+        # Remove the whole line (and trailing newline) when the value is empty,
+        # so we don't emit blank stanzas for unused placeholders.
+        text = re.sub(rf'^[^\n]*{re.escape(k)}[^\n]*\n?', '', text, flags=re.MULTILINE)
+    else:
+        text = text.replace(k, v)
 sys.stdout.write(text)
 PYEOF
 }
