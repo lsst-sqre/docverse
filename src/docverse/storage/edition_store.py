@@ -67,6 +67,7 @@ class EditionStore:
             SqlEdition.kind,
             SqlEdition.tracking_mode,
             SqlEdition.tracking_params,
+            SqlEdition.alternate_name,
             SqlEdition.current_build_id,
             SqlBuild.public_id.label("current_build_public_id"),
             SqlBuild.git_ref.label("current_build_git_ref"),
@@ -113,6 +114,7 @@ class EditionStore:
         kind: EditionKind,
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any] | None = None,
+        alternate_name: str | None = None,
         lifecycle_exempt: bool = False,
     ) -> Edition:
         """Insert an edition row, bypassing slug validation.
@@ -128,6 +130,7 @@ class EditionStore:
             kind=kind,
             tracking_mode=tracking_mode,
             tracking_params=tracking_params,
+            alternate_name=alternate_name,
             lifecycle_exempt=lifecycle_exempt,
         )
         self._session.add(row)
@@ -274,6 +277,20 @@ class EditionStore:
             msg = f"Edition id={edition_id} not found"
             raise RuntimeError(msg)
         row.publish_status = status.value
+        await self._session.flush()
+
+    async def set_alternate_name(
+        self, *, edition_id: int, alternate_name: str
+    ) -> None:
+        """Set the ``alternate_name`` column on an edition row."""
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.alternate_name = alternate_name
         await self._session.flush()
 
     async def soft_delete(self, *, project_id: int, slug: str) -> bool:

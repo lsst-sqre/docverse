@@ -246,6 +246,19 @@ class EditionTrackingService:
                 action="skipped",
             )
 
+        # Backfill alternate_name on existing alt-mode editions whose row
+        # predates the column. The matching layer guarantees the build's
+        # alternate_name equals the edition's tracking_params alternate_name,
+        # so a NULL column is the only state that needs writing.
+        if (
+            updated.tracking_mode == TrackingMode.alternate_git_ref
+            and updated.alternate_name is None
+            and build.alternate_name is not None
+        ):
+            await self._edition_store.set_alternate_name(
+                edition_id=updated.id, alternate_name=build.alternate_name
+            )
+
         await self._history_store.record(
             edition_id=edition.id, build_id=build.id
         )
@@ -374,6 +387,7 @@ class EditionTrackingService:
             kind=derivation.edition_kind,
             tracking_mode=derivation.tracking_mode,
             tracking_params=derivation.tracking_params,
+            alternate_name=derivation.tracking_params.get("alternate_name"),
         )
         self._logger.info(
             "Auto-created edition",

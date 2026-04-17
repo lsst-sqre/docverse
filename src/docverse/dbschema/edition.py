@@ -52,6 +52,10 @@ class SqlEdition(Base):
         JSONB, nullable=True
     )
 
+    alternate_name: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+
     current_build_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )
