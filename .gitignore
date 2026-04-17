@@ -16,6 +16,7 @@ eggs/
 .eggs/
 lib/
 lib64/
+!.devcontainer/lib/
 parts/
 sdist/
 var/
@@ -68,3 +69,6 @@ docs/_build/
 node_modules/
 cloudflare-worker/node_modules/
 cloudflare-worker/dist/
+
+# Ralph AFK loop logs
+ralph/logs/
