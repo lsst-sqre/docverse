@@ -357,6 +357,10 @@ for ((i=1; i<=iterations; i++)); do
         abort "$abort_reason"
     fi
 
+    # --- Refresh remote state so we see other humans' merges mid-run ---
+    container_exec git -C /workspace/docverse fetch --prune origin \
+        || die "git fetch origin failed on iter $i"
+
     # --- Build context + shortlist ---
     prefetch_context
 
