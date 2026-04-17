@@ -277,27 +277,31 @@ render_prompt() {
     local git_status_text="$PF_GIT_STATUS"
     [ -z "$git_status_text" ] && git_status_text="(clean)"
 
-    # awk-based replacement is safer than sed for multiline values with
-    # arbitrary characters in the injected content.
-    awk -v it="$iter" -v tot="$total" \
-        -v branch="$PF_BRANCH" \
-        -v gs="$git_status_text" \
-        -v gl="$PF_GIT_LOG" \
-        -v sl="$shortlist_text" \
-        -v pc="$PF_PRD_CONTEXT" \
-        -v fm="$PF_FORCED_MARKER" '
-        {
-            gsub(/__ITERATION__/, it)
-            gsub(/__TOTAL__/, tot)
-            gsub(/__BRANCH__/, branch)
-            gsub(/__GIT_STATUS__/, gs)
-            gsub(/__GIT_LOG__/, gl)
-            gsub(/__SHORTLIST__/, sl)
-            gsub(/__PRD_CONTEXT__/, pc)
-            gsub(/__FORCED_ISSUE__/, fm)
-            print
-        }
-    ' "$SCRIPT_DIR/prompt.md"
+    # Use python3 with env-var inputs: literal str.replace sidesteps awk's
+    # gsub replacement semantics (where `&` means the matched text) and
+    # `awk -v`'s backslash-escape processing on values.
+    PF_ITERATION="$iter" \
+    PF_TOTAL="$total" \
+    PF_GIT_STATUS_R="$git_status_text" \
+    PF_SHORTLIST_R="$shortlist_text" \
+    python3 - "$SCRIPT_DIR/prompt.md" <<'PYEOF'
+import os, sys
+mapping = {
+    "__ITERATION__":    os.environ["PF_ITERATION"],
+    "__TOTAL__":        os.environ["PF_TOTAL"],
+    "__BRANCH__":       os.environ.get("PF_BRANCH", ""),
+    "__GIT_STATUS__":   os.environ["PF_GIT_STATUS_R"],
+    "__GIT_LOG__":      os.environ.get("PF_GIT_LOG", ""),
+    "__SHORTLIST__":    os.environ["PF_SHORTLIST_R"],
+    "__PRD_CONTEXT__":  os.environ.get("PF_PRD_CONTEXT", ""),
+    "__FORCED_ISSUE__": os.environ.get("PF_FORCED_MARKER", ""),
+}
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+for k, v in mapping.items():
+    text = text.replace(k, v)
+sys.stdout.write(text)
+PYEOF
 }
 
 # ---- Summary accumulators ----
