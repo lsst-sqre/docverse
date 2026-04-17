@@ -21,6 +21,15 @@
 #   DOCVERSE_SANDBOX_ANTHROPIC_KEY_OP         (with --api)
 #   DOCVERSE_SANDBOX_DOCKER_CONTEXT           (e.g. agent-sandbox)
 #   DOCVERSE_SANDBOX_OP_ACCOUNT               (default: my.1password.com)
+#
+# Requires bash 4+ (uses `mapfile` and modern array features).
+# macOS ships bash 3.2 — install a newer bash via Homebrew (`brew install bash`)
+# or run this script in the devcontainer.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    echo "ralph/afk.sh requires bash 4+ (you have ${BASH_VERSION:-unknown})." >&2
+    echo "On macOS: brew install bash, then re-run with /opt/homebrew/bin/bash." >&2
+    exit 1
+fi
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
