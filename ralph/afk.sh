@@ -32,6 +32,12 @@
 #   DOCVERSE_SANDBOX_ANTHROPIC_KEY_OP         (with --api)
 #   DOCVERSE_SANDBOX_DOCKER_CONTEXT           (e.g. agent-sandbox)
 #   DOCVERSE_SANDBOX_OP_ACCOUNT               (default: my.1password.com)
+#   DOCVERSE_RALPH_SELECT_MODEL               (default: claude-haiku-4-5)
+#   DOCVERSE_RALPH_SELECT_EFFORT              (low|medium|high|xhigh|max)
+#   DOCVERSE_RALPH_IMPLEMENT_MODEL            (default: container default)
+#   DOCVERSE_RALPH_IMPLEMENT_EFFORT           (low|medium|high|xhigh|max)
+#   DOCVERSE_RALPH_SELECT_TIMEOUT             (default: 120)
+#   DOCVERSE_RALPH_ITER_TIMEOUT               (default: 3600)
 #
 # Requires bash 4+ (uses `mapfile`, associative arrays, and modern array
 # features). macOS ships bash 3.2 — install a newer bash via Homebrew
@@ -64,10 +70,13 @@ anthropic_key_uri="${DOCVERSE_SANDBOX_ANTHROPIC_KEY_OP:-}"
 docker_context="${DOCVERSE_SANDBOX_DOCKER_CONTEXT:-}"
 op_account="${DOCVERSE_SANDBOX_OP_ACCOUNT:-my.1password.com}"
 
-# Model for the cheap selection phase. Haiku is the default; override with
-# DOCVERSE_RALPH_SELECT_MODEL=<model-id>. An empty value falls back to the
-# container's configured default model.
+# Per-phase model + effort knobs. Empty values fall back to the container's
+# configured defaults (i.e. the flag is omitted from the `claude` invocation).
+# See ralph/README.md for accepted effort levels.
 select_model="${DOCVERSE_RALPH_SELECT_MODEL:-claude-haiku-4-5}"
+select_effort="${DOCVERSE_RALPH_SELECT_EFFORT:-}"
+implement_model="${DOCVERSE_RALPH_IMPLEMENT_MODEL:-}"
+implement_effort="${DOCVERSE_RALPH_IMPLEMENT_EFFORT:-}"
 # Timeout per phase (seconds).
 select_timeout="${DOCVERSE_RALPH_SELECT_TIMEOUT:-120}"
 iter_timeout="${DOCVERSE_RALPH_ITER_TIMEOUT:-3600}"
@@ -386,22 +395,22 @@ PYEOF
 }
 
 # ---- Helper: run one Claude phase, return final result text ----
-# Args: phase_name prompt_file model timeout iter_pad
+# Args: phase_name prompt_file model effort timeout iter_pad
 #
 # Streams stream-json from claude inside the container through tee (→ jsonl
 # replay), jq (→ human-readable), and a final tee (→ log + stderr for live
 # terminal view). The function echoes only the parsed final `result` event on
 # stdout so the caller can $(…)-capture it.
 #
-# If `model` is non-empty, passes `--model <model>` to claude; otherwise uses
-# the container's configured default model.
+# If `model` / `effort` is non-empty, passes the corresponding flag to claude;
+# otherwise uses the container's configured defaults.
 #
 # Emits log files named:
 #   iter-{iter_pad}-{phase}.prompt.md  (already written by caller)
 #   iter-{iter_pad}-{phase}.jsonl
 #   iter-{iter_pad}-{phase}.log
 run_phase() {
-    local phase="$1" prompt_file="$2" model="$3" to="$4" iter_pad="$5"
+    local phase="$1" prompt_file="$2" model="$3" effort="$4" to="$5" iter_pad="$6"
 
     local jsonl="$log_dir/iter-${iter_pad}-${phase}.jsonl"
     local logf="$log_dir/iter-${iter_pad}-${phase}.log"
@@ -410,10 +419,13 @@ run_phase() {
     if [ -n "$model" ]; then
         claude_args+=(--model "$model")
     fi
+    if [ -n "$effort" ]; then
+        claude_args+=(--effort "$effort")
+    fi
     claude_args+=(--dangerously-skip-permissions --verbose
                   --output-format stream-json -p -)
 
-    echo "Running claude [$phase] (timeout ${to}s, model=${model:-default})..." >&2
+    echo "Running claude [$phase] (timeout ${to}s, model=${model:-default}, effort=${effort:-default})..." >&2
     set +e
     cat "$prompt_file" | container_exec --timeout "$to" \
         /usr/local/bin/agent-entry "${claude_args[@]}" \
@@ -521,6 +533,12 @@ write_summary() {
         if [ -n "$prd_filter" ]; then echo "- Scope: --prd $prd_filter"; fi
         if [ -n "$forced_issue" ]; then echo "- Scope: --issue $forced_issue"; fi
         echo
+        echo "## Configuration"
+        echo "- Select model: ${select_model:-<claude default>}"
+        echo "- Select effort: ${select_effort:-<claude default>}"
+        echo "- Implement model: ${implement_model:-<claude default>}"
+        echo "- Implement effort: ${implement_effort:-<claude default>}"
+        echo
         if [ ${#iter_picks[@]} -gt 0 ]; then
             echo "## Per-iteration picks"
             for line in "${iter_picks[@]}"; do echo "- $line"; done
@@ -620,7 +638,7 @@ for ((i=1; i<=iterations; i++)); do
         select_start=$SECONDS
         set +e
         select_result=$(run_phase select "$select_prompt_file" \
-            "$select_model" "$select_timeout" "$iter_pad")
+            "$select_model" "$select_effort" "$select_timeout" "$iter_pad")
         select_rc=$?
         set -e
         select_elapsed=$((SECONDS - select_start))
@@ -644,7 +662,7 @@ for ((i=1; i<=iterations; i++)); do
             echo "Select phase produced no valid <ralph-pick> on iter $i; retrying once." >&2
             set +e
             select_result=$(run_phase select "$select_prompt_file" \
-                "$select_model" "$select_timeout" "${iter_pad}-retry")
+                "$select_model" "$select_effort" "$select_timeout" "${iter_pad}-retry")
             retry_rc=$?
             set -e
             if [ "$retry_rc" -ne 0 ]; then
@@ -735,7 +753,8 @@ for ((i=1; i<=iterations; i++)); do
     # --- Run implement phase ---
     implement_start=$SECONDS
     set +e
-    run_phase implement "$implement_prompt_file" "" "$iter_timeout" "$iter_pad" \
+    run_phase implement "$implement_prompt_file" \
+        "$implement_model" "$implement_effort" "$iter_timeout" "$iter_pad" \
         >/dev/null
     implement_rc=$?
     set -e

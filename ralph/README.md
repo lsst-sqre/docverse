@@ -42,6 +42,16 @@ Per-phase tuning:
 - `DOCVERSE_RALPH_SELECT_MODEL` — model id for the cheap selection phase
   (default `claude-haiku-4-5`; empty falls back to the container's configured
   default).
+- `DOCVERSE_RALPH_SELECT_EFFORT` — Claude Code `--effort` level for the
+  selection phase (`low | medium | high | xhigh | max`; empty defers to
+  Claude's default).
+- `DOCVERSE_RALPH_IMPLEMENT_MODEL` — model id for the implementation phase
+  (empty defers to the container's configured default). Set to e.g. `opus`
+  when the backlog is gnarly.
+- `DOCVERSE_RALPH_IMPLEMENT_EFFORT` — Claude Code `--effort` level for the
+  implementation phase (`low | medium | high | xhigh | max`; empty defers to
+  Claude's default). Bumping to `xhigh` / `max` may warrant raising
+  `DOCVERSE_RALPH_ITER_TIMEOUT` beyond its 3600s default.
 - `DOCVERSE_RALPH_SELECT_TIMEOUT` — seconds for the selection phase (default
   `120`).
 - `DOCVERSE_RALPH_ITER_TIMEOUT` — seconds for the implementation phase
