@@ -136,7 +136,7 @@ if [ "$mode" = "login" ]; then
     exec docker exec "${docker_args[@]}" "$container_id" /usr/local/bin/agent-entry --interactive zsh
 else
     echo "Running claude with prompt..."
-    echo "$PROMPT" | devcontainer exec "${exec_args[@]}" \
+    printf '%s\n' "$PROMPT" | devcontainer exec "${exec_args[@]}" \
         /usr/local/bin/agent-entry \
         claude --dangerously-skip-permissions -p -
 fi
