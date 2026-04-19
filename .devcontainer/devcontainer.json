@@ -30,5 +30,6 @@
   "postCreateCommand": "sudo chown -R node:node /workspace /home/node/.claude /commandhistory /home/node/.cache/uv",
   "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && sudo cron",
   "waitFor": "postStartCommand",
+  "containerUser": "root",
   "remoteUser": "node"
 }
