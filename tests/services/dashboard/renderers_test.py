@@ -18,7 +18,7 @@ from docverse.domain.dashboard_context import (
     OrgContext,
     ProjectContext,
 )
-from docverse.services.dashboard_renderers import (
+from docverse.services.dashboard.renderers import (
     DashboardHtmlRenderer,
     EditionJsonRenderer,
     ErrorPageRenderer,

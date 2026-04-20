@@ -12,7 +12,7 @@ from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
-from .services.dashboard_publisher import DashboardPublisher
+from .services.dashboard.publisher import DashboardPublisher
 from .services.dashboard_publishing import DashboardPublishingService
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService

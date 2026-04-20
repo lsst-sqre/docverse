@@ -21,9 +21,9 @@ from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
-from .dashboard_asset_inliner import AssetInliner
-from .dashboard_context import DashboardContextBuilder
-from .dashboard_renderers import (
+from .asset_inliner import AssetInliner
+from .context import DashboardContextBuilder
+from .renderers import (
     DashboardHtmlRenderer,
     EditionJsonRenderer,
     ErrorPageRenderer,

@@ -16,7 +16,7 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.config import Configuration
-from docverse.services.dashboard_publisher import DashboardPublisher
+from docverse.services.dashboard.publisher import DashboardPublisher
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore

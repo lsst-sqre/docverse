@@ -19,7 +19,7 @@ from docverse.client.models import (
 )
 from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
-from docverse.services.dashboard_context import DashboardContextBuilder
+from docverse.services.dashboard.context import DashboardContextBuilder
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
