@@ -5,6 +5,7 @@ from __future__ import annotations
 import structlog
 
 from docverse.client.models.queue_enums import JobKind
+from docverse.domain.project import Project
 from docverse.domain.queue import QueueJob
 from docverse.exceptions import NotFoundError
 from docverse.storage.organization_store import OrganizationStore
@@ -106,3 +107,32 @@ class DashboardPublishingService:
         return await self.enqueue_for_project(
             org_id=org.id, project_id=project.id
         )
+
+    async def enqueue_for_org(
+        self,
+        *,
+        org_id: int,
+    ) -> list[tuple[Project, QueueJob]]:
+        """Enqueue one ``dashboard_build`` per non-deleted project in an org.
+
+        Returns a list of ``(project, queue_job)`` pairs in the order
+        projects were enumerated (slug ascending). An empty list is
+        returned for orgs with no non-deleted projects.
+
+        Raises
+        ------
+        NotFoundError
+            If the org cannot be loaded.
+        """
+        org = await self._org_store.get_by_id(org_id)
+        if org is None:
+            msg = f"Organization {org_id} not found"
+            raise NotFoundError(msg)
+        projects = await self._project_store.list_all_by_org(org_id)
+        results: list[tuple[Project, QueueJob]] = []
+        for project in projects:
+            queue_job = await self.enqueue_for_project(
+                org_id=org_id, project_id=project.id
+            )
+            results.append((project, queue_job))
+        return results
