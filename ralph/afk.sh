@@ -280,7 +280,12 @@ def field(body, name):
         re.IGNORECASE,
     )
     m = pat.search(body)
-    return m.group(1).strip() if m else ""
+    if not m:
+        return ""
+    value = m.group(1).strip()
+    # Strip markdown code-span backticks (single or double) and any
+    # whitespace that was padded around them.
+    return value.strip("`").strip()
 
 for it in items:
     num = it["number"]
