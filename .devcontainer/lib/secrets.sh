@@ -25,7 +25,9 @@ load_sandbox_secrets() {
     echo "Loading secrets from 1Password..."
     GH_TOKEN=$(op read --account "$op_account" "$gh_token_uri") \
         || die "Failed to read GH token from 1Password"
-    SIGNING_KEY_PEM=$(op read --account "$op_account" "$signing_key_private_uri") \
+    # op CLI defaults to PKCS#8 PEM for Ed25519 SSH keys, but git SSH signing
+    # (ssh-keygen -Y sign) only accepts OpenSSH format. Force it explicitly.
+    SIGNING_KEY_PEM=$(op read --account "$op_account" "${signing_key_private_uri}?ssh-format=openssh") \
         || die "Failed to read signing key (private)"
     SIGNING_KEY_PUB=$(op read --account "$op_account" "$signing_key_public_uri") \
         || die "Failed to read signing key (public)"
