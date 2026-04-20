@@ -10,7 +10,7 @@ import structlog
 from cryptography.fernet import Fernet
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -87,6 +87,10 @@ def _mock_create_objectstore(
         org_id: int,
         service_label: str,
     ) -> MockObjectStore:
+        # Mimic the real helper's DB access so callers that invoke it
+        # outside an explicit ``session.begin()`` block trigger autobegin
+        # and surface the same ``InvalidRequestError`` as production.
+        await self._session.execute(select(1))
         return mock_store
 
     return _create

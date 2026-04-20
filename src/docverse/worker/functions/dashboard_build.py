@@ -94,10 +94,10 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     project_id=project_id,
                     rendered_at=rendered_at,
                 )
+                object_store = await factory.create_objectstore_for_org(
+                    org_id=org_id, service_label=service_label
+                )
 
-            object_store = await factory.create_objectstore_for_org(
-                org_id=org_id, service_label=service_label
-            )
             async with session.begin():
                 await queue_job_store.update_phase(
                     queue_job_id,
