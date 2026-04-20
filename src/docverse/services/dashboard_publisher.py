@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import structlog
@@ -17,6 +17,7 @@ from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
+from .dashboard_asset_inliner import AssetInliner
 from .dashboard_context import DashboardContextBuilder
 from .dashboard_renderers import DashboardHtmlRenderer, SwitcherJsonRenderer
 from .dashboard_template_source import BuiltInTemplateSource, TemplateSource
@@ -98,6 +99,14 @@ class DashboardPublisher:
     ) -> DashboardUploadProgress:
         """Render the artifacts and upload them to the object store."""
         config = self._template_source.load_config()
+
+        inliner = AssetInliner(template_source=self._template_source)
+        dashboard_assets = inliner.inline(
+            css=config.dashboard.css,
+            js=config.dashboard.js,
+            images=config.dashboard.images,
+        )
+        context = replace(context, assets=dashboard_assets)
 
         html_renderer = DashboardHtmlRenderer(
             template_source=self._template_source

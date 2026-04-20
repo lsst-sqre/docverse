@@ -78,7 +78,19 @@ fallback_version = "0.0.0"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"docverse.dashboard_templates.builtin" = ["*.toml", "*.jinja", "*.html"]
+"docverse.dashboard_templates.builtin" = [
+    "*.toml",
+    "*.jinja",
+    "*.html",
+    "*.css",
+    "*.js",
+    "*.svg",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.webp",
+]
 
 [tool.ruff]
 extend = "ruff-shared.toml"

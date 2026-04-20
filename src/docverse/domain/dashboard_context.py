@@ -85,8 +85,10 @@ class EditionsContext:
 class AssetsContext:
     """Inlined CSS/JS/image assets surfaced to templates.
 
-    The MVP slice leaves these placeholders empty — task #3 wires the
-    real asset inliner in.
+    ``css`` and ``js`` are the concatenated source-text of all declared
+    files in declared order. ``images`` is keyed by the asset's basename
+    with dots and hyphens replaced by underscores; SVG values hold the
+    raw markup, and raster values hold a base64 ``data:`` URI.
     """
 
     css: str = ""

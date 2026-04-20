@@ -8,9 +8,9 @@
 template = "dashboard.html.jinja"
 
 [dashboard.assets]
-css = []
-js = []
-images = []
+css = ["dashboard.css"]
+js = ["dashboard.js"]
+images = ["logo.svg", "favicon.png"]
 
 [switcher]
 include_kinds = ["main", "release", "major", "alternate"]

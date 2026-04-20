@@ -115,7 +115,15 @@ async def test_publisher_uploads_dashboard_and_switcher(
 
     html_obj = mock_store.objects["pub-proj/__dashboard.html"]
     assert html_obj.content_type == "text/html; charset=utf-8"
-    assert b"v1.0.0" in html_obj.data
+    html_text = html_obj.data.decode("utf-8")
+    assert "v1.0.0" in html_text
+    # Assets from template.toml must be inlined into the rendered HTML:
+    # CSS in a single <style>, JS in a single <script>, SVG raw, and the
+    # PNG favicon as a base64 data URI.
+    assert "<style>" in html_text
+    assert "<script>" in html_text
+    assert "<svg" in html_text
+    assert "data:image/png;base64," in html_text
 
     switcher_obj = mock_store.objects["pub-proj/__switcher.json"]
     assert switcher_obj.content_type == "application/json; charset=utf-8"

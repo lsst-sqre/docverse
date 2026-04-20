@@ -5,15 +5,21 @@
 <title>{{ project.title }}</title>
 <meta name="generator" content="docverse {{ docverse.version }}">
 <meta name="docverse:rendered-at" content="{{ rendered_at.isoformat() }}">
+{% set favicon_png = assets.images.get('favicon_png') %}
+{% if favicon_png %}<link rel="icon" type="image/png" href="{{ favicon_png }}">{% endif %}
 {% if assets.css %}<style>{{ assets.css|safe }}</style>{% endif %}
 </head>
 <body>
 <header>
+  {% set logo_svg = assets.images.get('logo_svg') %}
+  {% if logo_svg %}<span class="logo">{{ logo_svg|safe }}</span>{% endif %}
+  <div>
   <p class="org">{{ org.title }}</p>
   <h1>{{ project.title }}</h1>
   {% if project.source_repo_url %}
   <p class="source"><a href="{{ project.source_repo_url }}">Source repository</a></p>
   {% endif %}
+  </div>
 </header>
 
 <main>
