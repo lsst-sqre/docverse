@@ -13,8 +13,7 @@ from collections.abc import Sequence
 from pathlib import PurePosixPath
 
 from docverse.domain.dashboard_context import AssetsContext
-
-from .dashboard_template_source import TemplateSource
+from docverse.storage.dashboard_templates.template_source import TemplateSource
 
 __all__ = ["AssetInliner"]
 

@@ -20,8 +20,10 @@ from docverse.domain.dashboard_context import (
     EditionContext,
     EditionsContext,
 )
-
-from .dashboard_template_source import SwitcherConfig, TemplateSource
+from docverse.storage.dashboard_templates.template_source import (
+    SwitcherConfig,
+    TemplateSource,
+)
 
 __all__ = [
     "DashboardHtmlRenderer",
@@ -32,7 +34,7 @@ __all__ = [
 
 _MAIN_SLUG = "__main"
 
-_DEFAULT_404_PACKAGE = "docverse.dashboard_templates.builtin"
+_DEFAULT_404_PACKAGE = "docverse.storage.dashboard_templates.builtin"
 _DEFAULT_404_TEMPLATE = "default_404.html.jinja"
 
 _DEFAULT_INCLUDE_KINDS: tuple[str, ...] = (

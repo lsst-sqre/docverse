@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from docverse.services.dashboard_template_source import (
+from docverse.storage.dashboard_templates.template_source import (
     BuiltInTemplateSource,
     parse_template_toml,
 )

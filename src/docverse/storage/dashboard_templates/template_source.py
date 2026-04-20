@@ -136,7 +136,7 @@ class BuiltInTemplateSource:
     development checkouts and in zipped distributions alike.
     """
 
-    _PACKAGE = "docverse.dashboard_templates.builtin"
+    _PACKAGE = "docverse.storage.dashboard_templates.builtin"
 
     def __init__(self) -> None:
         self._root = files(self._PACKAGE)

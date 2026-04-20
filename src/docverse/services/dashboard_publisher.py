@@ -12,6 +12,10 @@ from docverse.config import Configuration
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
 from docverse.exceptions import NotFoundError
 from docverse.storage.build_store import BuildStore
+from docverse.storage.dashboard_templates.template_source import (
+    BuiltInTemplateSource,
+    TemplateSource,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -25,7 +29,6 @@ from .dashboard_renderers import (
     ErrorPageRenderer,
     SwitcherJsonRenderer,
 )
-from .dashboard_template_source import BuiltInTemplateSource, TemplateSource
 
 __all__ = [
     "DashboardPublisher",

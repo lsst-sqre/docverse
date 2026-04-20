@@ -24,7 +24,7 @@ from docverse.services.dashboard_renderers import (
     ErrorPageRenderer,
     SwitcherJsonRenderer,
 )
-from docverse.services.dashboard_template_source import (
+from docverse.storage.dashboard_templates.template_source import (
     BuiltInTemplateSource,
     DashboardTemplateConfig,
     ParsedTemplateConfig,
