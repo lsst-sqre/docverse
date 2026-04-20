@@ -99,6 +99,20 @@ if gh_meta=$(curl -sf --max-time 10 https://api.github.com/meta 2>/dev/null); th
     echo "  Added GitHub CIDR ranges from meta API"
 fi
 
+# Fetch Cloudflare edge CIDRs (Docker Hub CDN is on Cloudflare)
+if cf_v4=$(curl -sf --max-time 10 https://www.cloudflare.com/ips-v4 2>/dev/null); then
+    while IFS= read -r cidr; do
+        [ -n "$cidr" ] && ipset add allowed_nets "$cidr" -exist
+    done <<< "$cf_v4"
+    echo "  Added Cloudflare IPv4 CIDRs"
+fi
+if cf_v6=$(curl -sf --max-time 10 https://www.cloudflare.com/ips-v6 2>/dev/null); then
+    while IFS= read -r cidr; do
+        [ -n "$cidr" ] && ipset add allowed_nets6 "$cidr" -exist
+    done <<< "$cf_v6"
+    echo "  Added Cloudflare IPv6 CIDRs"
+fi
+
 # Flush existing OUTPUT rules (idempotent re-run)
 iptables -F OUTPUT 2>/dev/null || true
 ip6tables -F OUTPUT 2>/dev/null || true
