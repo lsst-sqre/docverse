@@ -99,6 +99,45 @@ if gh_meta=$(curl -sf --max-time 10 https://api.github.com/meta 2>/dev/null); th
     echo "  Added GitHub CIDR ranges from meta API"
 fi
 
+# Cloudflare edge CIDRs (Docker Hub CDN + R2 blob storage are on Cloudflare).
+# Source: https://www.cloudflare.com/ips-v4 and /ips-v6
+# Static list to avoid a chicken-and-egg with the firewall itself blocking
+# the curl. Refresh manually if a pull starts timing out on a new Cloudflare
+# range (updates are rare — years apart).
+CLOUDFLARE_IPV4_CIDRS=(
+    173.245.48.0/20
+    103.21.244.0/22
+    103.22.200.0/22
+    103.31.4.0/22
+    141.101.64.0/18
+    108.162.192.0/18
+    190.93.240.0/20
+    188.114.96.0/20
+    197.234.240.0/22
+    198.41.128.0/17
+    162.158.0.0/15
+    104.16.0.0/13
+    104.24.0.0/14
+    172.64.0.0/13
+    131.0.72.0/22
+)
+CLOUDFLARE_IPV6_CIDRS=(
+    2400:cb00::/32
+    2606:4700::/32
+    2803:f800::/32
+    2405:b500::/32
+    2405:8100::/32
+    2a06:98c0::/29
+    2c0f:f248::/32
+)
+for cidr in "${CLOUDFLARE_IPV4_CIDRS[@]}"; do
+    ipset add allowed_nets "$cidr" -exist
+done
+for cidr in "${CLOUDFLARE_IPV6_CIDRS[@]}"; do
+    ipset add allowed_nets6 "$cidr" -exist
+done
+echo "  Added Cloudflare CIDRs (static)"
+
 # Flush existing OUTPUT rules (idempotent re-run)
 iptables -F OUTPUT 2>/dev/null || true
 ip6tables -F OUTPUT 2>/dev/null || true

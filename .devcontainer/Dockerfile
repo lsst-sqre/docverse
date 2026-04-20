@@ -56,4 +56,11 @@ RUN { \
     } > /etc/sudoers.d/firewall \
     && chmod 0440 /etc/sudoers.d/firewall
 
+# Oh-my-zsh for the node user + sane default .zshrc
+RUN chsh -s /usr/bin/zsh node \
+    && runuser -u node -- sh -c \
+       'RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c \
+        "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"'
+COPY --chown=node:node zshrc /home/node/.zshrc
+
 USER node

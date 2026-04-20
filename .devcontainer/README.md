@@ -66,6 +66,10 @@ echo "Run the test suite and fix any failures" | .devcontainer/run.sh
 .devcontainer/run.sh --login
 ```
 
+The login shell is zsh with oh-my-zsh (robbyrussell theme) preconfigured.
+Command history is persisted to the `docverse-cmdhistory` named volume, so
+it survives `--rebuild`.
+
 ### Stop the container
 
 ```bash

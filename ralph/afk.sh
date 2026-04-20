@@ -447,7 +447,7 @@ run_phase() {
 # stdin: result text. stdout: pick JSON (one line) if sentinel present, else
 # empty. Returns 0 always; caller inspects output emptiness.
 parse_pick_sentinel() {
-    python3 - <<'PYEOF'
+    python3 -c '
 import json, re, sys
 text = sys.stdin.read()
 m = re.search(r"<ralph-pick>\s*(.*?)\s*</ralph-pick>", text, re.DOTALL)
@@ -459,7 +459,7 @@ try:
 except Exception:
     sys.exit(0)
 print(json.dumps(obj))
-PYEOF
+'
 }
 
 # ---- Helper: set up the picked task's branch inside the container ----
@@ -478,6 +478,19 @@ container_branch_setup() {
     # Try local, then remote-tracking, then a fresh branch from main.
     local out
     if out=$(container_exec git -C /workspace/docverse checkout "$branch" 2>&1); then
+        # FF to origin if an upstream exists. The earlier branch-specific
+        # fetch made origin/$branch current; --ff-only keeps this safe by
+        # refusing to clobber local-only commits (divergence is surfaced
+        # as a setup failure for the user to resolve manually).
+        if container_exec git -C /workspace/docverse \
+                rev-parse --verify --quiet "origin/$branch" >/dev/null 2>&1; then
+            if ! out=$(container_exec git -C /workspace/docverse \
+                    merge --ff-only "origin/$branch" 2>&1); then
+                errs+=$'git merge --ff-only origin/'"$branch"$':\n'"$out"$'\n'
+                printf '%s' "$errs"
+                return 1
+            fi
+        fi
         return 0
     fi
     errs+=$'git checkout '"$branch"$':\n'"$out"$'\n'
@@ -489,10 +502,10 @@ container_branch_setup() {
     errs+=$'git checkout -b '"$branch"$' origin/'"$branch"$':\n'"$out"$'\n'
 
     if out=$(container_exec git -C /workspace/docverse \
-            checkout -b "$branch" main 2>&1); then
+            checkout -b "$branch" origin/main 2>&1); then
         return 0
     fi
-    errs+=$'git checkout -b '"$branch"$' main:\n'"$out"$'\n'
+    errs+=$'git checkout -b '"$branch"$' origin/main:\n'"$out"$'\n'
 
     printf '%s' "$errs"
     return 1

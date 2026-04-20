@@ -18,10 +18,12 @@
     "type=volume,source=docverse-workspace,target=/workspace",
     "type=volume,source=docverse-claude-home,target=/home/node/.claude",
     "type=volume,source=docverse-cmdhistory,target=/commandhistory",
-    "type=volume,source=docverse-uv-cache,target=/home/node/.cache/uv"
+    "type=volume,source=docverse-uv-cache,target=/home/node/.cache/uv",
+    "type=volume,source=docverse-docker-cache,target=/var/lib/docker"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
+    "UV_LINK_MODE": "copy",
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_AUTH_TOKEN": "",
     "CLAUDE_CODE_USE_BEDROCK": "",
@@ -30,5 +32,6 @@
   "postCreateCommand": "sudo chown -R node:node /workspace /home/node/.claude /commandhistory /home/node/.cache/uv",
   "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && sudo cron",
   "waitFor": "postStartCommand",
+  "containerUser": "root",
   "remoteUser": "node"
 }
