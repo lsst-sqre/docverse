@@ -26,7 +26,7 @@ from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
-from docverse.services.dashboard_trigger import (
+from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
 from docverse.storage.build_store import BuildStore

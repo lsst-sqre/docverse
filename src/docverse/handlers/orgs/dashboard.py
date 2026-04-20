@@ -48,7 +48,7 @@ async def post_dashboard_rebuild(
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardRebuildResponse:
     async with context.session.begin():
-        service = context.factory.create_dashboard_publishing_service()
+        service = context.factory.create_dashboard_build_enqueuer()
         queue_job = await service.enqueue_for_project_slug(
             org_slug=user.org.slug, project_slug=project_slug
         )
@@ -72,7 +72,7 @@ async def post_org_dashboard_rebuild(
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> list[OrgDashboardRebuildEntry]:
     async with context.session.begin():
-        service = context.factory.create_dashboard_publishing_service()
+        service = context.factory.create_dashboard_build_enqueuer()
         results = await service.enqueue_for_org(org_id=user.org.id)
         await context.session.commit()
 

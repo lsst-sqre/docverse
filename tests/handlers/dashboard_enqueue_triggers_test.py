@@ -28,7 +28,7 @@ from docverse.client.models import BuildCreate
 from docverse.client.models.queue_enums import JobKind
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
-from docverse.services import dashboard_publishing
+from docverse.services.dashboard import enqueue as dashboard_enqueue
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -230,7 +230,7 @@ async def test_enqueue_hook_failure_does_not_break_flow(
     await _setup(client)
 
     async def _boom(
-        self: dashboard_publishing.DashboardPublishingService,
+        self: dashboard_enqueue.DashboardBuildEnqueuer,
         *,
         org_slug: str,
         project_slug: str,
@@ -240,7 +240,7 @@ async def test_enqueue_hook_failure_does_not_break_flow(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(
-        dashboard_publishing.DashboardPublishingService,
+        dashboard_enqueue.DashboardBuildEnqueuer,
         "enqueue_for_project_slug",
         _boom,
     )

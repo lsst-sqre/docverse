@@ -12,8 +12,8 @@ from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
+from .services.dashboard.enqueue import DashboardBuildEnqueuer
 from .services.dashboard.publisher import DashboardPublisher
-from .services.dashboard_publishing import DashboardPublishingService
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_tracking import EditionTrackingService
@@ -243,11 +243,11 @@ class Factory:
             logger=self._logger,
         )
 
-    def create_dashboard_publishing_service(
+    def create_dashboard_build_enqueuer(
         self,
-    ) -> DashboardPublishingService:
-        """Create a DashboardPublishingService."""
-        return DashboardPublishingService(
+    ) -> DashboardBuildEnqueuer:
+        """Create a DashboardBuildEnqueuer."""
+        return DashboardBuildEnqueuer(
             org_store=self._create_org_store(),
             project_store=self._create_project_store(),
             queue_backend=self.create_queue_backend(),

@@ -14,7 +14,7 @@ from docverse.dependencies.auth import (
 )
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
-from docverse.services.dashboard_trigger import (
+from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
 from docverse.storage.pagination import (
