@@ -1,10 +1,9 @@
 """Stateless renderers that turn a :class:`DashboardContext` into bytes.
 
 Each renderer is independent so it can be unit-tested with a fixture
-context. The MVP slice ships three renderers — the dashboard HTML, the
-pydata-sphinx-theme switcher JSON, and the 404 error page. The
-per-edition JSON renderer is deferred to a follow-up ticket per the
-parent PRD.
+context. The pipeline ships four renderers — the dashboard HTML, the
+pydata-sphinx-theme switcher JSON, the 404 error page, and the
+per-edition metadata JSON.
 """
 
 from __future__ import annotations
@@ -26,9 +25,12 @@ from .dashboard_template_source import SwitcherConfig, TemplateSource
 
 __all__ = [
     "DashboardHtmlRenderer",
+    "EditionJsonRenderer",
     "ErrorPageRenderer",
     "SwitcherJsonRenderer",
 ]
+
+_MAIN_SLUG = "__main"
 
 _DEFAULT_404_PACKAGE = "docverse.dashboard_templates.builtin"
 _DEFAULT_404_TEMPLATE = "default_404.html.jinja"
@@ -218,3 +220,39 @@ def _version_sort_key(edition: EditionContext) -> tuple[int, ...]:
     if not parts:
         return (-1,)
     return tuple(parts)
+
+
+class EditionJsonRenderer:
+    """Render one edition's ``__editions/{slug}.json`` metadata file.
+
+    The rendered payload tells the client-side theme JS whether the
+    reader is viewing the canonical edition and, when they are not,
+    where the canonical edition lives. ``canonical_url`` always points
+    at the ``__main`` edition's ``published_url``; ``is_canonical`` is
+    true only for the ``__main`` edition. The payload therefore never
+    depends on per-edition bookkeeping — every per-edition file is
+    regenerated on every render, so a change to ``__main`` propagates
+    to all editions on the next render.
+    """
+
+    def render(
+        self,
+        edition: EditionContext,
+        context: DashboardContext,
+    ) -> bytes:
+        """Render one edition's metadata JSON and return UTF-8 bytes."""
+        canonical_url = (
+            context.editions.main.published_url
+            if context.editions.main is not None
+            else context.project.published_url
+        )
+        payload: dict[str, object] = {
+            "project_slug": context.project.slug,
+            "edition_slug": edition.slug,
+            "edition_title": edition.title,
+            "kind": edition.kind.value,
+            "is_canonical": edition.slug == _MAIN_SLUG,
+            "canonical_url": canonical_url,
+            "published_url": edition.published_url,
+        }
+        return json.dumps(payload, indent=2).encode("utf-8")

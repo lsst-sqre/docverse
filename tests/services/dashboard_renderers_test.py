@@ -20,6 +20,7 @@ from docverse.domain.dashboard_context import (
 )
 from docverse.services.dashboard_renderers import (
     DashboardHtmlRenderer,
+    EditionJsonRenderer,
     ErrorPageRenderer,
     SwitcherJsonRenderer,
 )
@@ -319,3 +320,61 @@ def test_switcher_include_kinds_filters(
         .decode("utf-8")
     )
     assert [e["version"] for e in payload] == expected
+
+
+def test_edition_json_main_is_canonical() -> None:
+    main = _edition(slug="__main", title="Latest", kind=EditionKind.main)
+    release = _edition(slug="v1.0.0", title="v1.0.0", kind=EditionKind.release)
+    ctx = _make_context(main=main, releases=[release])
+
+    payload = json.loads(
+        EditionJsonRenderer().render(main, ctx).decode("utf-8")
+    )
+
+    assert payload["is_canonical"] is True
+    assert payload["canonical_url"] == main.published_url
+    assert payload["edition_slug"] == "__main"
+    assert payload["published_url"] == main.published_url
+
+
+def test_edition_json_non_main_points_canonical_at_main() -> None:
+    main = _edition(slug="__main", title="Latest", kind=EditionKind.main)
+    release = _edition(slug="v1.0.0", title="v1.0.0", kind=EditionKind.release)
+    ctx = _make_context(main=main, releases=[release])
+
+    payload = json.loads(
+        EditionJsonRenderer().render(release, ctx).decode("utf-8")
+    )
+
+    assert payload["is_canonical"] is False
+    assert payload["canonical_url"] == main.published_url
+    assert payload["canonical_url"] != release.published_url
+    assert payload["edition_slug"] == "v1.0.0"
+    assert payload["published_url"] == release.published_url
+
+
+def test_edition_json_includes_project_and_kind_metadata() -> None:
+    main = _edition(slug="__main", title="Latest", kind=EditionKind.main)
+    release = _edition(slug="v1.0.0", title="v1.0.0", kind=EditionKind.release)
+    ctx = _make_context(main=main, releases=[release])
+
+    payload = json.loads(
+        EditionJsonRenderer().render(release, ctx).decode("utf-8")
+    )
+
+    assert payload["project_slug"] == "proj"
+    assert payload["edition_title"] == "v1.0.0"
+    assert payload["kind"] == "release"
+
+
+def test_edition_json_falls_back_to_project_url_when_main_missing() -> None:
+    """Defensive: a project without a ``__main`` edition still renders."""
+    release = _edition(slug="v1.0.0", title="v1.0.0", kind=EditionKind.release)
+    ctx = _make_context(releases=[release])
+
+    payload = json.loads(
+        EditionJsonRenderer().render(release, ctx).decode("utf-8")
+    )
+
+    assert payload["is_canonical"] is False
+    assert payload["canonical_url"] == ctx.project.published_url

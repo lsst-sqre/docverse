@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 
 import structlog
 
 from docverse.config import Configuration
-from docverse.domain.dashboard_context import DashboardContext
+from docverse.domain.dashboard_context import DashboardContext, EditionContext
 from docverse.exceptions import NotFoundError
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
@@ -21,6 +21,7 @@ from .dashboard_asset_inliner import AssetInliner
 from .dashboard_context import DashboardContextBuilder
 from .dashboard_renderers import (
     DashboardHtmlRenderer,
+    EditionJsonRenderer,
     ErrorPageRenderer,
     SwitcherJsonRenderer,
 )
@@ -44,14 +45,25 @@ class DashboardUploadProgress:
     total_size_bytes: int
 
 
+def _iter_editions(context: DashboardContext) -> Iterator[EditionContext]:
+    """Yield every edition present in the context exactly once."""
+    if context.editions.main is not None:
+        yield context.editions.main
+    yield from context.editions.releases
+    yield from context.editions.drafts
+    yield from context.editions.major
+    yield from context.editions.minor
+    yield from context.editions.alternates
+
+
 class DashboardPublisher:
     """Orchestrate one project's dashboard render + upload.
 
     The publisher composes the context builder, the template source,
     and the four renderers, then writes the rendered artifacts to the
-    project's object store. The MVP slice publishes the dashboard HTML,
-    the switcher JSON, and the 404 error page; the per-edition JSON
-    files are deferred to a follow-up ticket.
+    project's object store: the dashboard HTML, the switcher JSON, the
+    404 error page, and one per-edition metadata JSON per non-deleted
+    edition.
     """
 
     def __init__(  # noqa: PLR0913
@@ -119,6 +131,7 @@ class DashboardPublisher:
         error_renderer = ErrorPageRenderer(
             template_source=self._template_source
         )
+        edition_renderer = EditionJsonRenderer()
 
         html_bytes = html_renderer.render(dashboard_context)
         switcher_bytes = switcher_renderer.render(
@@ -139,7 +152,7 @@ class DashboardPublisher:
         error_bytes = error_renderer.render(error_context)
 
         project_slug = context.project.slug
-        artifacts = [
+        artifacts: list[tuple[str, bytes, str]] = [
             (
                 f"{project_slug}/__dashboard.html",
                 html_bytes,
@@ -156,6 +169,18 @@ class DashboardPublisher:
                 "application/json; charset=utf-8",
             ),
         ]
+
+        # One per-edition JSON per non-deleted edition. Every edition is
+        # re-rendered on every publish so a change to __main's
+        # canonical_url propagates without per-edition bookkeeping.
+        artifacts.extend(
+            (
+                f"{project_slug}/__editions/{edition.slug}.json",
+                edition_renderer.render(edition, context),
+                "application/json; charset=utf-8",
+            )
+            for edition in _iter_editions(context)
+        )
 
         total = 0
         for key, data, content_type in artifacts:
