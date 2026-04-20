@@ -9,8 +9,9 @@ import httpx
 import pytest
 import structlog
 from cryptography.fernet import Fernet
+from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -23,7 +24,9 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
@@ -441,3 +444,147 @@ async def test_publish_edition_no_cdn_shortcut(
             job = await qjs.get(queue_job.id)
             assert job is not None
             assert job.status == JobStatus.completed
+
+
+_config = Configuration()
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_success_enqueues_dashboard_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Success finalize enqueues exactly one dashboard_build QueueJob."""
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-dash-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-dash",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-publish-arq-dash",
+        "arq_queue": mock_arq,
+    }
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            dash_rows = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value
+                )
+            )
+            rows = list(dash_rows.scalars().all())
+            assert len(rows) == 1
+            assert rows[0].org_id == org.id
+            assert rows[0].project_id == project.id
+
+    enqueued = [
+        j for queue in mock_arq._job_metadata.values() for j in queue.values()
+    ]
+    dashboard_jobs = [j for j in enqueued if j.name == "dashboard_build"]
+    assert len(dashboard_jobs) == 1
+    dash_payload = dashboard_jobs[0].kwargs["payload"]
+    assert dash_payload["org_id"] == org.id
+    assert dash_payload["project_id"] == project.id
+    assert dash_payload["project_slug"] == project.slug
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_failure_does_not_enqueue_dashboard(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed publish_edition does not enqueue a dashboard_build."""
+    failing_publisher = _FailingPublisher(RuntimeError("publisher exploded"))
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-dash-fail-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-dash-fail",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(failing_publisher),
+    )
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-publish-arq-dash-fail",
+        "arq_queue": mock_arq,
+    }
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            dash_rows = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value
+                )
+            )
+            assert list(dash_rows.scalars().all()) == []
+
+    enqueued = [
+        j for queue in mock_arq._job_metadata.values() for j in queue.values()
+    ]
+    dashboard_jobs = [j for j in enqueued if j.name == "dashboard_build"]
+    assert dashboard_jobs == []

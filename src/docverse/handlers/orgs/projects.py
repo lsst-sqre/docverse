@@ -14,6 +14,9 @@ from docverse.dependencies.auth import (
 )
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
+from docverse.services.dashboard_trigger import (
+    try_enqueue_dashboard_build_by_slug,
+)
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -170,6 +173,13 @@ async def patch_project(
         )
         default_edition = await service.get_default_edition(project.id)
         await context.session.commit()
+    await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=org_slug,
+        project_slug=project_slug,
+    )
     return Project.from_domain(
         project, context.request, org_slug, default_edition=default_edition
     )

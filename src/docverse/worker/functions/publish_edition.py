@@ -26,6 +26,9 @@ from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.dashboard_trigger import (
+    try_enqueue_dashboard_build_by_id,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -126,6 +129,13 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         async with session.begin():
             await queue_job_store.complete(queue_job_id)
         logger.info("Edition publish completed")
+        await try_enqueue_dashboard_build_by_id(
+            factory=factory,
+            session=session,
+            logger=logger,
+            org_id=payload["org_id"],
+            project_id=resources.edition.project_id,
+        )
         return "completed"
 
     msg = "No database session available"

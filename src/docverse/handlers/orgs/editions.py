@@ -24,6 +24,9 @@ from docverse.handlers.params import (
     OrgSlugParam,
     ProjectSlugParam,
 )
+from docverse.services.dashboard_trigger import (
+    try_enqueue_dashboard_build_by_slug,
+)
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     EDITION_CURSOR_TYPES,
@@ -116,6 +119,13 @@ async def post_edition(
             org_slug=org_slug, project_slug=project_slug, data=data
         )
         await context.session.commit()
+    await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=org_slug,
+        project_slug=project_slug,
+    )
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
     )
@@ -233,6 +243,13 @@ async def post_edition_rollback(  # noqa: PLR0913
             build_public_id=data.build,
         )
         await context.session.commit()
+    await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=org_slug,
+        project_slug=project_slug,
+    )
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
     )
@@ -264,6 +281,13 @@ async def patch_edition(  # noqa: PLR0913
             data=data,
         )
         await context.session.commit()
+    await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=org_slug,
+        project_slug=project_slug,
+    )
     return Edition.from_domain(
         edition, context.request, org_slug, project_slug
     )
@@ -293,3 +317,10 @@ async def delete_edition(
             slug=edition_slug,
         )
         await context.session.commit()
+    await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=org_slug,
+        project_slug=project_slug,
+    )
