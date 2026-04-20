@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     fzf \
     zsh \
+    vim \
     iptables \
     ipset \
     iproute2 \
@@ -32,7 +33,8 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 # Git signing defaults (identity + signing key path set per-session by agent-entry)
 RUN git config --system gpg.format ssh \
     && git config --system commit.gpgsign true \
-    && git config --system tag.gpgsign true
+    && git config --system tag.gpgsign true \
+    && git config --system core.editor vim
 
 # Firewall script
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh

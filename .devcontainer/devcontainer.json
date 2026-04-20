@@ -24,6 +24,8 @@
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "UV_LINK_MODE": "copy",
+    "EDITOR": "vim",
+    "VISUAL": "vim",
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_AUTH_TOKEN": "",
     "CLAUDE_CODE_USE_BEDROCK": "",
