@@ -20,12 +20,38 @@ from docverse.domain.dashboard_context import (
 )
 from docverse.services.dashboard_renderers import (
     DashboardHtmlRenderer,
+    ErrorPageRenderer,
     SwitcherJsonRenderer,
 )
 from docverse.services.dashboard_template_source import (
     BuiltInTemplateSource,
+    DashboardTemplateConfig,
+    ParsedTemplateConfig,
+    Switcher404Config,
     SwitcherConfig,
 )
+
+
+class _FakeTemplateSource:
+    """In-memory ``TemplateSource`` for renderer tests."""
+
+    def __init__(
+        self,
+        *,
+        config: ParsedTemplateConfig,
+        templates: dict[str, str] | None = None,
+    ) -> None:
+        self._config = config
+        self._templates = templates or {}
+
+    def load_config(self) -> ParsedTemplateConfig:
+        return self._config
+
+    def read_template(self, name: str) -> str:
+        return self._templates[name]
+
+    def read_asset(self, path: str) -> bytes:  # pragma: no cover - unused
+        raise NotImplementedError
 
 
 def _edition(
@@ -214,6 +240,58 @@ def test_dashboard_html_includes_rendered_at_meta_tag() -> None:
         .decode("utf-8")
     )
     assert "2026-04-20T12:00:00+00:00" in html
+
+
+def test_error_page_falls_back_to_packaged_default_when_unconfigured() -> None:
+    """No ``[error_404]`` in template.toml → packaged default fires."""
+    ctx = _make_context()
+    renderer = ErrorPageRenderer(template_source=BuiltInTemplateSource())
+
+    html = renderer.render(ctx).decode("utf-8")
+
+    # Branded with project title and links back to the dashboard.
+    assert "<!DOCTYPE html>" in html
+    assert "A Project" in html
+    assert "https://proj.example.com/v/" in html
+    assert "404" in html
+
+
+def test_error_page_uses_configured_template_when_present() -> None:
+    """``[error_404]`` declared → renderer loads it from the source."""
+    config = ParsedTemplateConfig(
+        dashboard=DashboardTemplateConfig(),
+        error_404=Switcher404Config(template="custom_404.html.jinja"),
+        switcher=SwitcherConfig(),
+    )
+    template_source = _FakeTemplateSource(
+        config=config,
+        templates={
+            "custom_404.html.jinja": (
+                "<!doctype html><title>Custom 404</title>"
+                "<p>Project: {{ project.title }}</p>"
+                "<p>Org: {{ org.title }}</p>"
+            ),
+        },
+    )
+    ctx = _make_context()
+    renderer = ErrorPageRenderer(template_source=template_source)
+
+    html = renderer.render(ctx).decode("utf-8")
+
+    assert "Custom 404" in html
+    assert "Project: A Project" in html
+    assert "Org: Proj Org" in html
+
+
+def test_error_page_default_renders_for_empty_project() -> None:
+    """Empty-editions context still produces a 404 page."""
+    ctx = _make_context()
+    renderer = ErrorPageRenderer(template_source=BuiltInTemplateSource())
+
+    html = renderer.render(ctx).decode("utf-8")
+
+    assert "404" in html
+    assert "A Project" in html
 
 
 @pytest.mark.parametrize(

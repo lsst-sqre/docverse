@@ -19,7 +19,11 @@ from docverse.storage.project_store import ProjectStore
 
 from .dashboard_asset_inliner import AssetInliner
 from .dashboard_context import DashboardContextBuilder
-from .dashboard_renderers import DashboardHtmlRenderer, SwitcherJsonRenderer
+from .dashboard_renderers import (
+    DashboardHtmlRenderer,
+    ErrorPageRenderer,
+    SwitcherJsonRenderer,
+)
 from .dashboard_template_source import BuiltInTemplateSource, TemplateSource
 
 __all__ = [
@@ -45,9 +49,9 @@ class DashboardPublisher:
 
     The publisher composes the context builder, the template source,
     and the four renderers, then writes the rendered artifacts to the
-    project's object store. The MVP slice publishes the dashboard HTML
-    and switcher JSON; the 404 page and per-edition JSON files are
-    deferred to follow-up tickets.
+    project's object store. The MVP slice publishes the dashboard HTML,
+    the switcher JSON, and the 404 error page; the per-edition JSON
+    files are deferred to a follow-up ticket.
     """
 
     def __init__(  # noqa: PLR0913
@@ -106,23 +110,44 @@ class DashboardPublisher:
             js=config.dashboard.js,
             images=config.dashboard.images,
         )
-        context = replace(context, assets=dashboard_assets)
+        dashboard_context = replace(context, assets=dashboard_assets)
 
         html_renderer = DashboardHtmlRenderer(
             template_source=self._template_source
         )
         switcher_renderer = SwitcherJsonRenderer()
-
-        html_bytes = html_renderer.render(context)
-        switcher_bytes = switcher_renderer.render(
-            context, switcher_config=config.switcher
+        error_renderer = ErrorPageRenderer(
+            template_source=self._template_source
         )
+
+        html_bytes = html_renderer.render(dashboard_context)
+        switcher_bytes = switcher_renderer.render(
+            dashboard_context, switcher_config=config.switcher
+        )
+
+        # The 404 page consumes its own asset set when configured;
+        # the packaged fallback template is self-contained.
+        if config.error_404 is not None:
+            error_assets = inliner.inline(
+                css=config.error_404.css,
+                js=config.error_404.js,
+                images=config.error_404.images,
+            )
+            error_context = replace(context, assets=error_assets)
+        else:
+            error_context = dashboard_context
+        error_bytes = error_renderer.render(error_context)
 
         project_slug = context.project.slug
         artifacts = [
             (
                 f"{project_slug}/__dashboard.html",
                 html_bytes,
+                "text/html; charset=utf-8",
+            ),
+            (
+                f"{project_slug}/__404.html",
+                error_bytes,
                 "text/html; charset=utf-8",
             ),
             (

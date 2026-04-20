@@ -138,9 +138,10 @@ async def test_dashboard_build_completes_with_phase_transitions(
 
     assert result == "completed"
 
-    # Both artifacts written
+    # All MVP artifacts written
     assert "dash-proj/__dashboard.html" in mock_store.objects
     assert "dash-proj/__switcher.json" in mock_store.objects
+    assert "dash-proj/__404.html" in mock_store.objects
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -150,7 +151,7 @@ async def test_dashboard_build_completes_with_phase_transitions(
             assert job.status == JobStatus.completed
             assert job.phase == "complete"
             assert job.progress is not None
-            assert job.progress["object_count"] == 2
+            assert job.progress["object_count"] == 3
             assert job.progress["total_size_bytes"] > 0
 
 

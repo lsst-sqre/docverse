@@ -1,14 +1,17 @@
 """Stateless renderers that turn a :class:`DashboardContext` into bytes.
 
 Each renderer is independent so it can be unit-tested with a fixture
-context. The MVP slice ships two renderers — the dashboard HTML and the
-pydata-sphinx-theme switcher JSON. The 404 and per-edition JSON
-renderers are deferred to follow-up tickets per the parent PRD.
+context. The MVP slice ships three renderers — the dashboard HTML, the
+pydata-sphinx-theme switcher JSON, and the 404 error page. The
+per-edition JSON renderer is deferred to a follow-up ticket per the
+parent PRD.
 """
 
 from __future__ import annotations
 
 import json
+from importlib.resources import as_file, files
+from pathlib import Path
 
 import jinja2
 
@@ -23,8 +26,12 @@ from .dashboard_template_source import SwitcherConfig, TemplateSource
 
 __all__ = [
     "DashboardHtmlRenderer",
+    "ErrorPageRenderer",
     "SwitcherJsonRenderer",
 ]
+
+_DEFAULT_404_PACKAGE = "docverse.dashboard_templates.builtin"
+_DEFAULT_404_TEMPLATE = "default_404.html.jinja"
 
 _DEFAULT_INCLUDE_KINDS: tuple[str, ...] = (
     "main",
@@ -60,6 +67,51 @@ class DashboardHtmlRenderer:
             rendered_at=context.rendered_at,
         )
         return rendered.encode("utf-8")
+
+
+class ErrorPageRenderer:
+    """Render the project's ``__404.html`` page.
+
+    When the template source's ``template.toml`` declares ``[error_404]``,
+    the configured Jinja template is loaded through the source. Otherwise
+    the renderer falls back to a packaged default 404 shipped with the
+    server distribution so every project has a usable error page even
+    without a custom template.
+    """
+
+    def __init__(self, *, template_source: TemplateSource) -> None:
+        self._template_source = template_source
+
+    def render(self, context: DashboardContext) -> bytes:
+        """Render and return UTF-8 bytes for the 404 page."""
+        config = self._template_source.load_config()
+        env = jinja2.Environment(
+            autoescape=jinja2.select_autoescape(["html", "jinja"]),
+            undefined=jinja2.StrictUndefined,
+        )
+        if config.error_404 is not None:
+            env.loader = jinja2.FunctionLoader(
+                self._template_source.read_template
+            )
+            template = env.get_template(config.error_404.template)
+        else:
+            template = env.from_string(_load_default_404_template())
+        rendered = template.render(
+            org=context.org,
+            project=context.project,
+            editions=context.editions,
+            assets=context.assets,
+            docverse=context.docverse,
+            rendered_at=context.rendered_at,
+        )
+        return rendered.encode("utf-8")
+
+
+def _load_default_404_template() -> str:
+    """Read the packaged fallback 404 Jinja template."""
+    resource = files(_DEFAULT_404_PACKAGE).joinpath(_DEFAULT_404_TEMPLATE)
+    with as_file(resource) as path:
+        return Path(path).read_text(encoding="utf-8")
 
 
 class SwitcherJsonRenderer:

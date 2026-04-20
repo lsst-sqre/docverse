@@ -110,7 +110,7 @@ async def test_publisher_uploads_dashboard_and_switcher(
             object_store_provider=_provider,
         )
 
-    assert progress.object_count == 2
+    assert progress.object_count == 3
     assert progress.total_size_bytes > 0
 
     html_obj = mock_store.objects["pub-proj/__dashboard.html"]
@@ -131,8 +131,15 @@ async def test_publisher_uploads_dashboard_and_switcher(
     versions = [entry["version"] for entry in payload]
     assert versions == ["__main", "v1.0.0"]
 
-    # rendered_at is shared between both artifacts (single context)
+    error_obj = mock_store.objects["pub-proj/__404.html"]
+    assert error_obj.content_type == "text/html; charset=utf-8"
+    error_text = error_obj.data.decode("utf-8")
+    assert "404" in error_text
+    assert "Pub Project" in error_text
+
+    # rendered_at is shared across artifacts (single context)
     assert context.rendered_at.isoformat() in html_obj.data.decode("utf-8")
+    assert context.rendered_at.isoformat() in error_obj.data.decode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -177,3 +184,7 @@ async def test_publisher_handles_empty_project(
     assert "empty-pub-proj/__dashboard.html" in mock_store.objects
     switcher = mock_store.objects["empty-pub-proj/__switcher.json"]
     assert json.loads(switcher.data.decode("utf-8")) == []
+
+    error = mock_store.objects["empty-pub-proj/__404.html"]
+    assert error.content_type == "text/html; charset=utf-8"
+    assert "404" in error.data.decode("utf-8")

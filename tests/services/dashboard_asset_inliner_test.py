@@ -9,6 +9,7 @@ import pytest
 
 from docverse.services.dashboard_asset_inliner import AssetInliner
 from docverse.services.dashboard_template_source import (
+    BuiltInTemplateSource,
     ParsedTemplateConfig,
 )
 
@@ -133,9 +134,7 @@ def test_inliner_filename_key_replaces_dots_and_hyphens() -> None:
 
 
 def test_inliner_uses_basename_for_key_when_path_has_directory() -> None:
-    src = FakeTemplateSource(
-        assets={"images/logo.svg": b"<svg/>"}
-    )
+    src = FakeTemplateSource(assets={"images/logo.svg": b"<svg/>"})
     inliner = AssetInliner(template_source=src)
 
     assets = inliner.inline(css=(), js=(), images=("images/logo.svg",))
@@ -164,10 +163,6 @@ def test_inliner_returns_empty_assets_when_nothing_declared() -> None:
 
 def test_inliner_round_trips_packaged_built_in_template_assets() -> None:
     """Integration check: packaged assets load via importlib.resources."""
-    from docverse.services.dashboard_template_source import (
-        BuiltInTemplateSource,
-    )
-
     src = BuiltInTemplateSource()
     config = src.load_config()
     inliner = AssetInliner(template_source=src)
