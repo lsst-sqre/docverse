@@ -154,6 +154,28 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def list_all_by_project(self, project_id: int) -> list[Edition]:
+        """List every non-deleted edition for a project.
+
+        Returns editions ordered by slug. Used by the dashboard pipeline
+        which needs the full set of editions to group and sort, not a
+        paginated window.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
     async def list_by_project(
         self,
         project_id: int,

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ project.title }}</title>
+<meta name="generator" content="docverse {{ docverse.version }}">
+<meta name="docverse:rendered-at" content="{{ rendered_at.isoformat() }}">
+{% if assets.css %}<style>{{ assets.css|safe }}</style>{% endif %}
+</head>
+<body>
+<header>
+  <p class="org">{{ org.title }}</p>
+  <h1>{{ project.title }}</h1>
+  {% if project.source_repo_url %}
+  <p class="source"><a href="{{ project.source_repo_url }}">Source repository</a></p>
+  {% endif %}
+</header>
+
+<main>
+{% if editions.main %}
+<section id="main-edition">
+  <h2>Current</h2>
+  <ul>
+    <li><a href="{{ editions.main.published_url }}">{{ editions.main.title }}</a></li>
+  </ul>
+</section>
+{% endif %}
+
+{% if editions.releases %}
+<section id="releases">
+  <h2>Releases</h2>
+  <ul>
+  {% for edition in editions.releases %}
+    <li><a href="{{ edition.published_url }}">{{ edition.title }}</a></li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if editions.major %}
+<section id="major-versions">
+  <h2>Major versions</h2>
+  <ul>
+  {% for edition in editions.major %}
+    <li><a href="{{ edition.published_url }}">{{ edition.title }}</a></li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if editions.minor %}
+<section id="minor-versions">
+  <h2>Minor versions</h2>
+  <ul>
+  {% for edition in editions.minor %}
+    <li><a href="{{ edition.published_url }}">{{ edition.title }}</a></li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if editions.drafts %}
+<section id="drafts">
+  <h2>Drafts</h2>
+  <ul>
+  {% for edition in editions.drafts %}
+    <li><a href="{{ edition.published_url }}">{{ edition.title }}</a></li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if editions.alternates %}
+<section id="alternates">
+  <h2>Alternate deployments</h2>
+  <ul>
+  {% for edition in editions.alternates %}
+    <li><a href="{{ edition.published_url }}">{{ edition.title }}</a></li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+</main>
+
+{% if assets.js %}<script>{{ assets.js|safe }}</script>{% endif %}
+</body>
+</html>

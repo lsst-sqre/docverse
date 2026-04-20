@@ -70,6 +70,16 @@ class Configuration(BaseSettings):
         validation_alias="REPERTOIRE_BASE_URL",
     )
 
+    published_base_url: HttpUrl = Field(
+        HttpUrl("https://roundtable-dev.lsst.cloud/docverse/api"),
+        title="Publicly visible base URL of the Docverse API",
+        description=(
+            "Surfaced to dashboard templates as ``docverse.api_url``."
+            " Will be replaced by a Rubin Repertoire lookup once that"
+            " integration lands (see issue #185)."
+        ),
+    )
+
     credential_encryption_key: SecretStr = Field(
         title="Fernet key for encrypting organization credentials",
         description=(

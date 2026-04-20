@@ -1,0 +1,16 @@
+# Built-in default dashboard template configuration.
+#
+# This file is the contract loaded by ``BuiltInTemplateSource`` and
+# parsed by ``parse_template_toml``. Future GitHub-backed sources will
+# ship the same shape.
+
+[dashboard]
+template = "dashboard.html.jinja"
+
+[dashboard.assets]
+css = []
+js = []
+images = []
+
+[switcher]
+include_kinds = ["main", "release", "major", "alternate"]

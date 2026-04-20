@@ -17,6 +17,7 @@ class JobKind(StrEnum):
     build_processing = "build_processing"
     edition_update = "edition_update"
     publish_edition = "publish_edition"
+    dashboard_build = "dashboard_build"
     dashboard_sync = "dashboard_sync"
     lifecycle_eval = "lifecycle_eval"
     git_ref_audit = "git_ref_audit"
