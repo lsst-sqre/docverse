@@ -133,11 +133,6 @@ def _group_editions(
             minor.append(edition)
         elif edition.kind == EditionKind.alternate:
             alternates.append(edition)
-        elif edition.kind == EditionKind.main:
-            # Defensive: a kind=main edition without slug __main is
-            # unexpected, but surface it next to releases rather than
-            # silently dropping it.
-            releases.append(edition)
 
     releases.sort(key=_semver_release_sort_key, reverse=True)
     drafts.sort(key=lambda e: e.date_updated, reverse=True)
