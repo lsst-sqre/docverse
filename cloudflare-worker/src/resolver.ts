@@ -16,7 +16,10 @@
  * - `dashboard` routes delegate to `DashboardStore.getDashboard()`, which
  *   encapsulates the `__`-prefixed R2 key layout. The response body is the
  *   R2 object with `Content-Type: text/html; charset=utf-8` and
- *   `Cache-Control: public, max-age=60`.
+ *   `Cache-Control: public, max-age=60`. When the request carries an
+ *   `If-None-Match` header whose full value exactly matches the R2 object's
+ *   `httpEtag`, the resolver returns a bodiless 304 with the same `ETag` and
+ *   `Cache-Control` headers instead.
  *
  * - `switcher` routes delegate to `DashboardStore.getSwitcher()`, returning
  *   the project's version-switcher JSON with
@@ -70,6 +73,7 @@ export async function resolve(
         route.project,
         "text/html; charset=utf-8",
         () => dashboardStore.getDashboard(route.project),
+        request,
         dashboardStore,
       );
     case "switcher":
@@ -77,6 +81,7 @@ export async function resolve(
         route.project,
         "application/json; charset=utf-8",
         () => dashboardStore.getSwitcher(route.project),
+        request,
         dashboardStore,
       );
     case "edition_meta":
@@ -84,6 +89,7 @@ export async function resolve(
         route.project,
         "application/json; charset=utf-8",
         () => dashboardStore.getEditionMeta(route.project, route.edition),
+        request,
         dashboardStore,
       );
     case "edition":
@@ -105,16 +111,32 @@ function resolveRedirect(to: string, request: Request): Response {
  * appropriate `DashboardStore` getter plus the `Content-Type` the response
  * should carry. 404 fallback goes through `notFoundResponse` so the branded
  * `__404.html` / plain-text degradation is uniform across the family.
+ *
+ * Conditional-GET: if the request's `If-None-Match` header value matches the
+ * R2 object's `httpEtag` exactly, return a bodiless 304 with the same `ETag`
+ * and `Cache-Control` headers. The match is a full-string compare against
+ * the header value; RFC 7232 weak-tag / comma-list semantics are out of
+ * scope for v1.
  */
 async function resolveDashboardFamily(
   project: string,
   contentType: string,
   fetcher: () => Promise<R2ObjectBody | null>,
+  request: Request,
   dashboardStore: DashboardStore,
 ): Promise<Response> {
   const object = await fetcher();
   if (object === null) {
     return notFoundResponse(project, dashboardStore);
+  }
+  if (request.headers.get("If-None-Match") === object.httpEtag) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        "ETag": object.httpEtag,
+        "Cache-Control": "public, max-age=60",
+      },
+    });
   }
   return new Response(object.body, {
     status: 200,

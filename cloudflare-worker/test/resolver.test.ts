@@ -639,6 +639,169 @@ describe("resolve — edition_meta routes", () => {
   });
 });
 
+describe("resolve — dashboard-family If-None-Match 304 handling", () => {
+  it("returns 304 with ETag and Cache-Control when If-None-Match matches the dashboard httpEtag", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore({
+      "sqr-112": {
+        body: streamFromString("<html>dashboard</html>"),
+        size: 22,
+      },
+    });
+    const request = new Request("https://sqr-112.lsst.io/v/", {
+      headers: { "If-None-Match": '"sqr-112-dashboard-etag"' },
+    });
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("ETag")).toBe('"sqr-112-dashboard-etag"');
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(response.headers.get("Content-Type")).toBeNull();
+    expect(await response.text()).toBe("");
+  });
+
+  it("returns 200 when If-None-Match does not match the dashboard httpEtag", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore({
+      "sqr-112": {
+        body: streamFromString("<html>dashboard</html>"),
+        size: 22,
+      },
+    });
+    const request = new Request("https://sqr-112.lsst.io/v/", {
+      headers: { "If-None-Match": '"stale-etag"' },
+    });
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("ETag")).toBe('"sqr-112-dashboard-etag"');
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(await response.text()).toBe("<html>dashboard</html>");
+  });
+
+  it("returns 200 when the request omits If-None-Match (dashboard)", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore({
+      "sqr-112": {
+        body: streamFromString("<html>dashboard</html>"),
+        size: 22,
+      },
+    });
+    const request = new Request("https://sqr-112.lsst.io/v/");
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("ETag")).toBe('"sqr-112-dashboard-etag"');
+    expect(await response.text()).toBe("<html>dashboard</html>");
+  });
+
+  it("returns 304 when If-None-Match matches the switcher httpEtag", async () => {
+    const switcherRoute: Route = { kind: "switcher", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore(
+      {},
+      {
+        "sqr-112": {
+          body: streamFromString('[{"name":"main","url":"/v/main/"}]'),
+          size: 34,
+        },
+      },
+    );
+    const request = new Request("https://sqr-112.lsst.io/v/switcher.json", {
+      headers: { "If-None-Match": '"sqr-112-switcher-etag"' },
+    });
+
+    const response = await resolve(
+      switcherRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("ETag")).toBe('"sqr-112-switcher-etag"');
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe("");
+  });
+
+  it("returns 304 when If-None-Match matches the edition_meta httpEtag", async () => {
+    const metaRoute: Route = {
+      kind: "edition_meta",
+      project: "sqr-112",
+      edition: "main",
+    };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore(
+      {},
+      {},
+      {
+        "sqr-112/main": {
+          body: streamFromString(
+            '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+          ),
+          size: 63,
+        },
+      },
+    );
+    const request = new Request(
+      "https://sqr-112.lsst.io/v/main/_docverse.json",
+      {
+        headers: {
+          "If-None-Match": '"sqr-112-main-edition-meta-etag"',
+        },
+      },
+    );
+
+    const response = await resolve(
+      metaRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("ETag")).toBe(
+      '"sqr-112-main-edition-meta-etag"',
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe("");
+  });
+});
+
 describe("resolve — redirect routes", () => {
   it("returns a 301 with Location set to the redirect target", async () => {
     const redirectRoute: Route = { kind: "redirect", to: "/v/" };
