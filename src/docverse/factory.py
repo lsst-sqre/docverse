@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import httpx
 import structlog
+from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import Configuration
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.credential import CredentialService
@@ -53,6 +53,7 @@ class Factory:
         superadmin_usernames: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue | None = None,
+        discovery: DiscoveryClient | None = None,
         *,
         default_queue_name: str,
     ) -> None:
@@ -62,6 +63,7 @@ class Factory:
         self._superadmin_usernames = superadmin_usernames or []
         self._http_client = http_client
         self._arq_queue = arq_queue
+        self._discovery = discovery
         self._default_queue_name = default_queue_name
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
@@ -255,17 +257,17 @@ class Factory:
             logger=self._logger,
         )
 
-    def create_dashboard_publisher(
-        self, *, config: Configuration
-    ) -> DashboardPublisher:
+    def create_dashboard_publisher(self) -> DashboardPublisher:
         """Create a DashboardPublisher for one render.
 
-        Parameters
-        ----------
-        config
-            Application configuration. Passed in explicitly so tests can
-            inject a fake URL rather than relying on env vars.
+        Raises
+        ------
+        RuntimeError
+            If the Repertoire discovery client is not configured.
         """
+        if self._discovery is None:
+            msg = "DiscoveryClient is required to build a DashboardPublisher"
+            raise RuntimeError(msg)
         return DashboardPublisher(
             org_store=self._create_org_store(),
             project_store=self._create_project_store(),
@@ -273,7 +275,7 @@ class Factory:
                 session=self._session, logger=self._logger
             ),
             build_store=BuildStore(session=self._session, logger=self._logger),
-            config=config,
+            discovery=self._discovery,
             logger=self._logger,
         )
 
@@ -385,6 +387,7 @@ class HandlerFactory(Factory):
         user_info_store: UserInfoStore,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
+        discovery: DiscoveryClient | None = None,
         *,
         default_queue_name: str,
     ) -> None:
@@ -394,6 +397,7 @@ class HandlerFactory(Factory):
             credential_encryptor=credential_encryptor,
             superadmin_usernames=superadmin_usernames,
             arq_queue=arq_queue,
+            discovery=discovery,
             default_queue_name=default_queue_name,
         )
         self._user_info_store = user_info_store

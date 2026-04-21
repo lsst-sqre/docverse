@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2",
     "base32-lib",
     "rubin-gafaelfawr",
+    "rubin-repertoire",
     "safir[db,arq]>=13",
     "uvicorn[standard]>=0.34",
 ]

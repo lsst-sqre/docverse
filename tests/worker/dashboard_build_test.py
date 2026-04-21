@@ -8,6 +8,7 @@ import httpx
 import pytest
 import structlog
 from cryptography.fernet import Fernet
+from rubin.repertoire import DiscoveryClient
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
@@ -125,9 +126,11 @@ async def test_dashboard_build_completes_with_phase_transitions(
     )
 
     encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    http_client = httpx.AsyncClient()
     ctx: dict[str, Any] = {
         "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
+        "http_client": http_client,
+        "discovery": DiscoveryClient(http_client),
         "job_id": "test-arq-dashboard",
         "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
     }
@@ -210,9 +213,11 @@ async def test_dashboard_build_marks_failed_on_render_exception(
     )
 
     encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    http_client = httpx.AsyncClient()
     ctx: dict[str, Any] = {
         "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
+        "http_client": http_client,
+        "discovery": DiscoveryClient(http_client),
         "job_id": "test-arq-dash-fail",
         "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
     }

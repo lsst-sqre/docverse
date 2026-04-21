@@ -6,6 +6,7 @@ import json
 
 import pytest
 import structlog
+from rubin.repertoire import DiscoveryClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -15,7 +16,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.config import Configuration
 from docverse.services.dashboard.publisher import DashboardPublisher
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
@@ -30,14 +30,16 @@ def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
 
-def _make_publisher(session: AsyncSession) -> DashboardPublisher:
+def _make_publisher(
+    session: AsyncSession, discovery_client: DiscoveryClient
+) -> DashboardPublisher:
     logger = _logger()
     return DashboardPublisher(
         org_store=OrganizationStore(session=session, logger=logger),
         project_store=ProjectStore(session=session, logger=logger),
         edition_store=EditionStore(session=session, logger=logger),
         build_store=BuildStore(session=session, logger=logger),
-        config=Configuration(),
+        discovery=discovery_client,
         logger=logger,
     )
 
@@ -45,6 +47,7 @@ def _make_publisher(session: AsyncSession) -> DashboardPublisher:
 @pytest.mark.asyncio
 async def test_publisher_uploads_dashboard_and_switcher(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     logger = _logger()
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -97,7 +100,7 @@ async def test_publisher_uploads_dashboard_and_switcher(
         )
         await db_session.commit()
 
-    publisher = _make_publisher(db_session)
+    publisher = _make_publisher(db_session, discovery_client)
     mock_store = MockObjectStore()
 
     async def _provider() -> MockObjectStore:
@@ -147,6 +150,7 @@ async def test_publisher_uploads_dashboard_and_switcher(
 @pytest.mark.asyncio
 async def test_publisher_writes_per_edition_json_files(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     """One ``__editions/{slug}.json`` per non-deleted edition is uploaded."""
     logger = _logger()
@@ -188,7 +192,7 @@ async def test_publisher_writes_per_edition_json_files(
         )
         await db_session.commit()
 
-    publisher = _make_publisher(db_session)
+    publisher = _make_publisher(db_session, discovery_client)
     mock_store = MockObjectStore()
 
     async def _provider() -> MockObjectStore:
@@ -220,6 +224,7 @@ async def test_publisher_writes_per_edition_json_files(
 @pytest.mark.asyncio
 async def test_publisher_handles_empty_project(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     logger = _logger()
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -243,7 +248,7 @@ async def test_publisher_handles_empty_project(
         )
         await db_session.commit()
 
-    publisher = _make_publisher(db_session)
+    publisher = _make_publisher(db_session, discovery_client)
     mock_store = MockObjectStore()
 
     async def _provider() -> MockObjectStore:

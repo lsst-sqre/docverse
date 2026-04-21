@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import structlog
+from rubin.repertoire import DiscoveryClient
 from safir.arq import RedisArqQueue
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.db_session import db_session_dependency
@@ -65,6 +66,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     )
 
     ctx["http_client"] = httpx.AsyncClient()
+    ctx["discovery"] = DiscoveryClient(
+        ctx["http_client"],
+        base_url=str(config.repertoire_base_url),
+        logger=logger,
+    )
 
     if config.arq_redis_settings is None:
         msg = "arq_redis_settings must be configured for the worker"
