@@ -120,7 +120,6 @@ async function resolveDashboardFamily(
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Content-Length": object.size.toString(),
       "ETag": object.httpEtag,
       "Cache-Control": "public, max-age=60",
     },
@@ -189,7 +188,6 @@ async function resolveEdition(
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Content-Length": object.size.toString(),
       "ETag": object.httpEtag,
       "Cache-Control": "public, max-age=60",
     },

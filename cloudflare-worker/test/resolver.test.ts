@@ -138,7 +138,6 @@ describe("resolve — edition routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
-    expect(response.headers.get("Content-Length")).toBe("18");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/getting-started.html-etag"',
     );
@@ -253,7 +252,6 @@ describe("resolve — edition routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
-    expect(response.headers.get("Content-Length")).toBe("18");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/api/core/index.html-etag"',
     );
@@ -286,7 +284,6 @@ describe("resolve — edition routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
-    expect(response.headers.get("Content-Length")).toBe("22");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/index.html-etag"',
     );
@@ -319,7 +316,6 @@ describe("resolve — edition routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
-    expect(response.headers.get("Content-Length")).toBe("22");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/index.html-etag"',
     );
@@ -352,7 +348,6 @@ describe("resolve — edition routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/css");
-    expect(response.headers.get("Content-Length")).toBe("20");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/style.css-etag"',
     );
@@ -385,7 +380,6 @@ describe("resolve — edition routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("application/json");
-    expect(response.headers.get("Content-Length")).toBe("2");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/data.json-etag"',
     );
@@ -420,7 +414,6 @@ describe("resolve — edition routes", () => {
     expect(response.headers.get("Content-Type")).toBe(
       "application/octet-stream",
     );
-    expect(response.headers.get("Content-Length")).toBe("6");
     expect(response.headers.get("ETag")).toBe(
       '"pipelines/__main/b123/data.xyz123-etag"',
     );

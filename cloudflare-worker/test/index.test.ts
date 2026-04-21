@@ -160,6 +160,29 @@ describe("Worker integration — subdomain routing", () => {
     expect(await response.text()).toBe("<html>dashboard</html>");
   });
 
+  it("dashboard response delivers the full body size without an explicit mismatching Content-Length", async () => {
+    // Regression guard for the PR #202 review finding: the worker used to
+    // manually set `Content-Length: object.size` on dashboard-family
+    // responses. That explicit header can disagree with the actual bytes
+    // Cloudflare's edge sends (e.g. when gzip is applied) and hang the
+    // response. After removing the manual header, any Content-Length the
+    // response carries must be the runtime's own — so if it is present it
+    // must equal the delivered body size, and the body must be fully
+    // streamed without truncation.
+    const body = "<html>dashboard with a distinctive length</html>";
+    const expectedSize = new TextEncoder().encode(body).byteLength;
+    await seedR2Object("sqr-112/__dashboard.html", body);
+
+    const response = await SELF.fetch("https://sqr-112.lsst.io/v/");
+
+    expect(response.status).toBe(200);
+    const contentLength = response.headers.get("content-length");
+    if (contentLength !== null) {
+      expect(Number(contentLength)).toBe(expectedSize);
+    }
+    expect((await response.arrayBuffer()).byteLength).toBe(expectedSize);
+  });
+
   it("serves the dashboard at /v/index.html", async () => {
     await seedR2Object(
       "sqr-112/__dashboard.html",
