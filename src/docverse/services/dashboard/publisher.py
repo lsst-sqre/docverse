@@ -10,7 +10,6 @@ import structlog
 
 from docverse.config import Configuration
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
-from docverse.exceptions import NotFoundError
 from docverse.storage.build_store import BuildStore
 from docverse.storage.dashboard_templates.template_source import (
     BuiltInTemplateSource,
@@ -226,9 +225,6 @@ class DashboardPublisher:
             project_id=project_id,
             rendered_at=rendered_at,
         )
-        if context.project.slug == "":
-            msg = f"Project {project_id} has no slug"
-            raise NotFoundError(msg)
         object_store = await object_store_provider()
         async with object_store:
             progress = await self.render_and_upload(
