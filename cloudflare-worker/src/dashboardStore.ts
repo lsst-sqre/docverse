@@ -55,37 +55,29 @@ export interface DashboardStore {
  * `__`-prefixed keys.
  */
 export function createDashboardStore(r2: R2Bucket): DashboardStore {
+  const safeGet = async (key: string): Promise<R2ObjectBody | null> => {
+    try {
+      return await r2.get(key);
+    } catch {
+      return null;
+    }
+  };
+
   return {
-    async getDashboard(project: string): Promise<R2ObjectBody | null> {
-      try {
-        return await r2.get(`${project}/__dashboard.html`);
-      } catch {
-        return null;
-      }
+    getDashboard(project: string): Promise<R2ObjectBody | null> {
+      return safeGet(`${project}/__dashboard.html`);
     },
-    async getSwitcher(project: string): Promise<R2ObjectBody | null> {
-      try {
-        return await r2.get(`${project}/__switcher.json`);
-      } catch {
-        return null;
-      }
+    getSwitcher(project: string): Promise<R2ObjectBody | null> {
+      return safeGet(`${project}/__switcher.json`);
     },
-    async getEditionMeta(
+    getEditionMeta(
       project: string,
       edition: string,
     ): Promise<R2ObjectBody | null> {
-      try {
-        return await r2.get(`${project}/__editions/${edition}.json`);
-      } catch {
-        return null;
-      }
+      return safeGet(`${project}/__editions/${edition}.json`);
     },
-    async get404(project: string): Promise<R2ObjectBody | null> {
-      try {
-        return await r2.get(`${project}/__404.html`);
-      } catch {
-        return null;
-      }
+    get404(project: string): Promise<R2ObjectBody | null> {
+      return safeGet(`${project}/__404.html`);
     },
   };
 }
