@@ -7,12 +7,14 @@ re-introduced with the CDN cache-purging ticket.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from docverse.client.models import EditionKind
 
 __all__ = [
+    "MAIN_SLUG",
     "AssetsContext",
     "BuildContext",
     "DashboardContext",
@@ -21,7 +23,14 @@ __all__ = [
     "EditionsContext",
     "OrgContext",
     "ProjectContext",
+    "version_sort_key",
 ]
+
+
+MAIN_SLUG = "__main"
+"""Reserved slug for a project's canonical main edition."""
+
+_VERSION_PREFIX = re.compile(r"^v?(\d+(?:\.\d+){0,2})")
 
 
 @dataclass(frozen=True)
@@ -114,3 +123,15 @@ class DashboardContext:
     assets: AssetsContext
     docverse: DocverseContext
     rendered_at: datetime
+
+
+def version_sort_key(edition: EditionContext) -> tuple[int, ...]:
+    """Compute a descending sort key from an edition slug.
+
+    The key is parsed from the leading numeric run of ``edition.slug``.
+    Non-version slugs sort last (``(-1,)``).
+    """
+    match = _VERSION_PREFIX.match(edition.slug)
+    if match is None:
+        return (-1,)
+    return tuple(int(p) for p in match.group(1).split("."))

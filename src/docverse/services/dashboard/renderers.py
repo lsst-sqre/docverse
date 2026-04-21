@@ -16,9 +16,11 @@ import jinja2
 
 from docverse.client.models import EditionKind
 from docverse.domain.dashboard_context import (
+    MAIN_SLUG,
     DashboardContext,
     EditionContext,
     EditionsContext,
+    version_sort_key,
 )
 from docverse.storage.dashboard_templates.template_source import (
     SwitcherConfig,
@@ -31,8 +33,6 @@ __all__ = [
     "ErrorPageRenderer",
     "SwitcherJsonRenderer",
 ]
-
-_MAIN_SLUG = "__main"
 
 _DEFAULT_404_PACKAGE = "docverse.storage.dashboard_templates.builtin"
 _DEFAULT_404_TEMPLATE = "default_404.html.jinja"
@@ -190,7 +190,7 @@ def _switcher_entries(
     # The grouped lists are already kind-sorted; preserve that for ties
     # but enforce the documented "version descending across the rest"
     # rule for non-main / non-alternate slugs.
-    rest.sort(key=_version_sort_key, reverse=True)
+    rest.sort(key=version_sort_key, reverse=True)
 
     return [*main_entry, *alt_entries, *[_entry(e) for e in rest]]
 
@@ -204,24 +204,6 @@ def _entry(edition: EditionContext) -> dict[str, object]:
     if edition.kind.value in _PREFERRED_KINDS:
         entry["preferred"] = True
     return entry
-
-
-def _version_sort_key(edition: EditionContext) -> tuple[int, ...]:
-    """Stable descending key: parse leading version triple from the slug.
-
-    Slugs that don't start with a numeric version sort last by emitting
-    a leading ``-1``.
-    """
-    parts: list[int] = []
-    candidate = edition.slug.lstrip("v")
-    for token in candidate.split("."):
-        try:
-            parts.append(int(token))
-        except ValueError:
-            break
-    if not parts:
-        return (-1,)
-    return tuple(parts)
 
 
 class EditionJsonRenderer:
@@ -253,7 +235,7 @@ class EditionJsonRenderer:
             "edition_slug": edition.slug,
             "edition_title": edition.title,
             "kind": edition.kind.value,
-            "is_canonical": edition.slug == _MAIN_SLUG,
+            "is_canonical": edition.slug == MAIN_SLUG,
             "canonical_url": canonical_url,
             "published_url": edition.published_url,
         }

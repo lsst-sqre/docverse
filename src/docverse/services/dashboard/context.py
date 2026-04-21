@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 
@@ -13,6 +12,7 @@ from docverse.config import Configuration
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.dashboard_context import (
+    MAIN_SLUG,
     AssetsContext,
     BuildContext,
     DashboardContext,
@@ -21,6 +21,7 @@ from docverse.domain.dashboard_context import (
     EditionsContext,
     OrgContext,
     ProjectContext,
+    version_sort_key,
 )
 from docverse.domain.edition import Edition
 from docverse.domain.organization import Organization
@@ -33,11 +34,6 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
 __all__ = ["DashboardContextBuilder"]
-
-_MAIN_SLUG = "__main"
-
-# Matches the leading numeric run of a slug for tie-broken ordering.
-_VERSION_PREFIX = re.compile(r"^v?(\d+(?:\.\d+){0,2})")
 
 
 def _docverse_version() -> str:
@@ -66,7 +62,7 @@ def _project_published_url(org: Organization, project: Project) -> str:
 
 def _edition_published_url(project_url: str, edition: Edition) -> str:
     """Public URL for one edition under its project's URL space."""
-    if edition.slug == _MAIN_SLUG:
+    if edition.slug == MAIN_SLUG:
         return project_url
     return f"{project_url}v/{edition.slug}/"
 
@@ -97,18 +93,6 @@ def _edition_context(
     )
 
 
-def _version_sort_key(edition: EditionContext) -> tuple[int, ...]:
-    """Sort key for version-bearing edition slugs.
-
-    Returns a tuple of ints suitable for descending sort; non-numeric
-    slugs sort last (lowest sort key).
-    """
-    match = _VERSION_PREFIX.match(edition.slug)
-    if match is None:
-        return (-1,)
-    return tuple(int(p) for p in match.group(1).split("."))
-
-
 def _semver_release_sort_key(
     edition: EditionContext,
 ) -> tuple[int, int, int, int]:
@@ -136,7 +120,7 @@ def _group_editions(
     alternates: list[EditionContext] = []
 
     for edition in editions:
-        if edition.slug == _MAIN_SLUG:
+        if edition.slug == MAIN_SLUG:
             main = edition
             continue
         if edition.kind == EditionKind.release:
@@ -157,8 +141,8 @@ def _group_editions(
 
     releases.sort(key=_semver_release_sort_key, reverse=True)
     drafts.sort(key=lambda e: e.date_updated, reverse=True)
-    major.sort(key=_version_sort_key, reverse=True)
-    minor.sort(key=_version_sort_key, reverse=True)
+    major.sort(key=version_sort_key, reverse=True)
+    minor.sort(key=version_sort_key, reverse=True)
     alternates.sort(key=lambda e: e.title)
 
     return EditionsContext(
