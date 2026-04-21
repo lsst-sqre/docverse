@@ -17,6 +17,7 @@ from .credentials import (
     OrganizationCredentialCreate,
     S3Credentials,
 )
+from .dashboard import DashboardRebuildResponse, OrgDashboardRebuildEntry
 from .editions import (
     DefaultEditionConfig,
     Edition,
@@ -65,6 +66,7 @@ __all__ = [
     "CloudflareCredentials",
     "CredentialPayload",
     "CredentialProvider",
+    "DashboardRebuildResponse",
     "DefaultEditionConfig",
     "Edition",
     "EditionBuildHistoryEntry",
@@ -76,6 +78,7 @@ __all__ = [
     "GcpCredentials",
     "JobKind",
     "JobStatus",
+    "OrgDashboardRebuildEntry",
     "OrgMembership",
     "OrgMembershipCreate",
     "OrgRole",

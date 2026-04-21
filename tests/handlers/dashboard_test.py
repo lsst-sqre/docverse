@@ -36,6 +36,9 @@ async def test_dashboard_rebuild_returns_202_with_queue_id(
     assert "queue_job_id" in body
     assert isinstance(body["queue_job_id"], str)
     assert len(body["queue_job_id"]) > 0
+    assert body["queue_job_url"].endswith(
+        f"/queue/jobs/{body['queue_job_id']}"
+    )
 
 
 @pytest.mark.asyncio
@@ -110,6 +113,10 @@ async def test_org_dashboard_rebuild_returns_one_job_per_project(
     job_ids = {entry["queue_job_id"] for entry in body}
     assert len(job_ids) == 3
     assert all(isinstance(jid, str) and jid for jid in job_ids)
+    for entry in body:
+        assert entry["queue_job_url"].endswith(
+            f"/queue/jobs/{entry['queue_job_id']}"
+        )
 
 
 @pytest.mark.asyncio

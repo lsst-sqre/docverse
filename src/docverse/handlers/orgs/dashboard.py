@@ -5,33 +5,14 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel, Field
 
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.domain.base32id import serialize_base32_id
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 
+from .models import DashboardRebuildResponse, OrgDashboardRebuildEntry
+
 router = APIRouter()
-
-
-class DashboardRebuildResponse(BaseModel):
-    """Response body for the manual rebuild endpoint."""
-
-    queue_job_id: str = Field(
-        description="Public Base32 identifier for the enqueued job."
-    )
-
-
-class OrgDashboardRebuildEntry(BaseModel):
-    """One enqueued ``dashboard_build`` in the org-wide rebuild response."""
-
-    project_slug: str = Field(
-        description="Slug of the project the job will rebuild."
-    )
-    queue_job_id: str = Field(
-        description="Public Base32 identifier for the enqueued job."
-    )
 
 
 @router.post(
@@ -54,9 +35,7 @@ async def post_dashboard_rebuild(
         )
         await context.session.commit()
 
-    return DashboardRebuildResponse(
-        queue_job_id=serialize_base32_id(queue_job.public_id)
-    )
+    return DashboardRebuildResponse.from_queue_job(queue_job, context.request)
 
 
 @router.post(
@@ -77,9 +56,8 @@ async def post_org_dashboard_rebuild(
         await context.session.commit()
 
     return [
-        OrgDashboardRebuildEntry(
-            project_slug=project.slug,
-            queue_job_id=serialize_base32_id(queue_job.public_id),
+        OrgDashboardRebuildEntry.from_domain(
+            project, queue_job, context.request
         )
         for project, queue_job in results
     ]
