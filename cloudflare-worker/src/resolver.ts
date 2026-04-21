@@ -73,6 +73,8 @@ export async function resolve(
       return resolveEditionMeta(route.project, route.edition, dashboardStore);
     case "edition":
       return resolveEdition(route, request, kv, r2, dashboardStore);
+    default:
+      return route satisfies never;
   }
 }
 
