@@ -16,10 +16,16 @@ from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
+    UrlScheme,
 )
 from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
-from docverse.services.dashboard.context import DashboardContextBuilder
+from docverse.domain.organization import Organization
+from docverse.domain.project import Project
+from docverse.services.dashboard.context import (
+    DashboardContextBuilder,
+    _project_published_url,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
@@ -447,3 +453,71 @@ async def test_build_context_populated_when_current_build_set(
     assert main is not None
     assert main.build is not None
     assert main.build.git_ref == "main"
+
+
+def _make_org(base_domain: str, url_scheme: UrlScheme) -> Organization:
+    now = datetime.now(tz=UTC)
+    return Organization.model_construct(
+        id=1,
+        slug="org",
+        title="Org",
+        base_domain=base_domain,
+        url_scheme=url_scheme,
+        root_path_prefix="/",
+        slug_rewrite_rules=None,
+        lifecycle_rules=None,
+        default_edition_config=None,
+        publishing_store_label=None,
+        staging_store_label=None,
+        cdn_service_label=None,
+        dns_service_label=None,
+        purgatory_retention=timedelta(seconds=0),
+        date_created=now,
+        date_updated=now,
+    )
+
+
+def _make_project() -> Project:
+    now = datetime.now(tz=UTC)
+    return Project.model_construct(
+        id=1,
+        slug="proj",
+        title="Project",
+        org_id=1,
+        doc_repo="https://example.com/repo",
+        slug_rewrite_rules=None,
+        lifecycle_rules=None,
+        date_created=now,
+        date_updated=now,
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_base_domain",
+    [
+        "lsst.io",
+        "https://lsst.io",
+        "https://lsst.io/",
+        "http://lsst.io",
+        "docverse-dev-jsc-test-20260409.jsickcodes.workers.dev",
+        "https://docverse-dev-jsc-test-20260409.jsickcodes.workers.dev",
+    ],
+)
+@pytest.mark.parametrize(
+    "url_scheme", [UrlScheme.subdomain, UrlScheme.path_prefix]
+)
+def test_project_published_url_normalizes_base_domain(
+    raw_base_domain: str, url_scheme: UrlScheme
+) -> None:
+    org = _make_org(raw_base_domain, url_scheme)
+    project = _make_project()
+
+    url = _project_published_url(org, project)
+
+    assert url.startswith("https://")
+    assert url.endswith("/")
+    # Exactly one scheme prefix.
+    assert url.count("https://") == 1
+    assert "http://" not in url[len("https://") :]
+    # Single trailing slash.
+    assert not url.endswith("//")

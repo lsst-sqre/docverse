@@ -8,6 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 import structlog
 
 from docverse.client.models import EditionKind, UrlScheme
+from docverse.client.models.organizations import normalize_base_domain
 from docverse.config import Configuration
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
@@ -50,14 +51,15 @@ def _project_published_url(org: Organization, project: Project) -> str:
     path-prefix orgs serve under ``base_domain + root_path_prefix +
     project_slug``. Always returns a trailing slash.
     """
+    base_domain = normalize_base_domain(org.base_domain)
     if org.url_scheme == UrlScheme.subdomain:
-        return f"https://{project.slug}.{org.base_domain}/"
+        return f"https://{project.slug}.{base_domain}/"
     prefix = org.root_path_prefix or "/"
     if not prefix.endswith("/"):
         prefix = f"{prefix}/"
     if not prefix.startswith("/"):
         prefix = f"/{prefix}"
-    return f"https://{org.base_domain}{prefix}{project.slug}/"
+    return f"https://{base_domain}{prefix}{project.slug}/"
 
 
 def _edition_published_url(project_url: str, edition: Edition) -> str:

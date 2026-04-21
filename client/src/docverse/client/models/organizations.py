@@ -13,6 +13,32 @@ from .memberships import OrgMembershipCreate
 from .services import OrganizationServiceSummary
 
 
+def normalize_base_domain(value: str) -> str:
+    """Normalize a base domain by stripping scheme and trailing slash.
+
+    Strips a leading ``http://`` or ``https://`` and any trailing ``/``,
+    then validates that what remains is non-empty, contains no whitespace,
+    and contains no path segments (no embedded ``/``).
+    """
+    stripped = value.strip()
+    lowered = stripped.lower()
+    for scheme in ("https://", "http://"):
+        if lowered.startswith(scheme):
+            stripped = stripped[len(scheme) :]
+            break
+    stripped = stripped.rstrip("/")
+    if not stripped:
+        msg = "base_domain must not be empty after normalization"
+        raise ValueError(msg)
+    if any(ch.isspace() for ch in stripped):
+        msg = "base_domain must not contain whitespace"
+        raise ValueError(msg)
+    if "/" in stripped:
+        msg = "base_domain must not contain path segments"
+        raise ValueError(msg)
+    return stripped
+
+
 class UrlScheme(StrEnum):
     """URL scheme for serving documentation within an organization."""
 
@@ -58,6 +84,11 @@ class OrganizationCreate(BaseModel):
             examples=["lsst.io"],
         ),
     ]
+
+    @field_validator("base_domain")
+    @classmethod
+    def _normalize_base_domain(cls, value: str) -> str:
+        return normalize_base_domain(value)
 
     url_scheme: UrlScheme = Field(
         default=UrlScheme.subdomain,
@@ -216,6 +247,13 @@ class OrganizationUpdate(BaseModel):
         default=None,
         description="Base domain for documentation sites.",
     )
+
+    @field_validator("base_domain")
+    @classmethod
+    def _normalize_base_domain(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_base_domain(value)
 
     url_scheme: UrlScheme | None = Field(
         default=None,
