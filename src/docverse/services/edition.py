@@ -252,6 +252,9 @@ class EditionService:
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
                 "queue_job_id": child_job.id,
+                "queue_job_public_id": serialize_base32_id(
+                    child_job.public_id
+                ),
             },
         )
 
@@ -421,6 +424,9 @@ class EditionService:
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
                 "queue_job_id": child_job.id,
+                "queue_job_public_id": serialize_base32_id(
+                    child_job.public_id
+                ),
             },
         )
 

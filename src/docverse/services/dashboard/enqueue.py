@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from docverse.client.models.queue_enums import JobKind
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.project import Project
 from docverse.domain.queue import QueueJob
 from docverse.exceptions import NotFoundError
@@ -86,6 +87,9 @@ class DashboardBuildEnqueuer:
                 "project_id": project_id,
                 "project_slug": project.slug,
                 "queue_job_id": queue_job.id,
+                "queue_job_public_id": serialize_base32_id(
+                    queue_job.public_id
+                ),
             },
         )
         return await self._queue_job_store.set_backend_job_id(

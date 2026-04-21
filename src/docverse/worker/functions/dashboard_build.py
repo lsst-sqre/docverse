@@ -34,7 +34,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         arq worker context (encryptor, http_client, queue).
     payload
         Job payload with ``org_id``, ``org_slug``, ``project_id``,
-        ``project_slug``, ``queue_job_id``.
+        ``project_slug``, ``queue_job_id``, ``queue_job_public_id``.
 
     Returns
     -------
@@ -44,7 +44,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     logger = structlog.get_logger("docverse.worker.dashboard_build").bind(
         org=payload["org_slug"],
         project=payload["project_slug"],
-        queue_job_id=payload["queue_job_id"],
+        queue_job_id=payload["queue_job_public_id"],
     )
     org_id: int = payload["org_id"]
     project_id: int = payload["project_id"]

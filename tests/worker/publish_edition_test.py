@@ -13,6 +13,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.client.models import (
     BuildCreate,
@@ -204,6 +205,7 @@ def _make_payload(
         "build_id": build.id,
         "build_public_id": serialize_base32_id(build.public_id),
         "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
     }
 
 
@@ -251,11 +253,22 @@ async def test_publish_edition_success_lifecycle(
         build=build,
         queue_job=queue_job,
     )
+    queue_job_public_id = serialize_base32_id(queue_job.public_id)
 
-    result = await publish_edition(ctx, payload)
+    with capture_logs() as captured:
+        result = await publish_edition(ctx, payload)
     await ctx["http_client"].aclose()
 
     assert result == "completed"
+    # Log records bind ``queue_job_id`` to the base32 public ID, never the
+    # integer database id.
+    bound_ids = {
+        event.get("queue_job_id")
+        for event in captured
+        if "queue_job_id" in event
+    }
+    assert bound_ids == {queue_job_public_id}
+    assert queue_job.id not in bound_ids
     assert len(mock_publisher.calls) == 1
     call = mock_publisher.calls[0]
     assert call.project_slug == project.slug

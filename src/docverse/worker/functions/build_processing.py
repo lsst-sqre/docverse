@@ -348,6 +348,7 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
                 "build_id": build_id,
                 "build_public_id": build_public_id,
                 "queue_job_id": pending.child_queue_job_id,
+                "queue_job_public_id": pending.child_public_id,
             },
         )
         async with session.begin():

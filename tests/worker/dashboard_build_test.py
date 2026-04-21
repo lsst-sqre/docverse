@@ -12,6 +12,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.client.models import (
     EditionKind,
@@ -21,6 +22,7 @@ from docverse.client.models import (
 )
 from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
@@ -129,18 +131,31 @@ async def test_dashboard_build_completes_with_phase_transitions(
         "job_id": "test-arq-dashboard",
         "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
     }
+    queue_job_public_id = serialize_base32_id(queue_job.public_id)
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
         "project_id": project.id,
         "project_slug": project.slug,
         "queue_job_id": queue_job.id,
+        "queue_job_public_id": queue_job_public_id,
     }
 
-    result = await dashboard_build(ctx, payload)
+    with capture_logs() as captured:
+        result = await dashboard_build(ctx, payload)
     await ctx["http_client"].aclose()
 
     assert result == "completed"
+
+    # Log records bind ``queue_job_id`` to the base32 public ID, never the
+    # integer database id.
+    bound_ids = {
+        event.get("queue_job_id")
+        for event in captured
+        if "queue_job_id" in event
+    }
+    assert bound_ids == {queue_job_public_id}
+    assert queue_job.id not in bound_ids
 
     # All MVP artifacts written, plus one per-edition JSON for __main.
     assert "dash-proj/__dashboard.html" in mock_store.objects
@@ -207,6 +222,7 @@ async def test_dashboard_build_marks_failed_on_render_exception(
         "project_id": project.id,
         "project_slug": project.slug,
         "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
     }
 
     result = await dashboard_build(ctx, payload)
