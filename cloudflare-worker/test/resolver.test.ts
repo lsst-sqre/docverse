@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { resolve } from "../src/resolver";
+import type { DashboardStore } from "../src/dashboardStore";
 import type { Route } from "../src/router";
 
 /**
@@ -44,6 +45,26 @@ function createMockR2(
 }
 
 /**
+ * Create a mock DashboardStore backed by an in-memory map keyed by project.
+ */
+function createMockDashboardStore(
+  dashboards: Record<string, { body: ReadableStream; size: number }> = {},
+): DashboardStore {
+  return {
+    getDashboard: vi.fn(async (project: string) => {
+      const obj = dashboards[project];
+      if (!obj) return null;
+      return {
+        body: obj.body,
+        size: obj.size,
+        httpEtag: `"${project}-dashboard-etag"`,
+        httpMetadata: {},
+      } as R2ObjectBody;
+    }),
+  };
+}
+
+/**
  * Helper to create a ReadableStream from a string.
  */
 function streamFromString(s: string): ReadableStream {
@@ -55,8 +76,9 @@ function streamFromString(s: string): ReadableStream {
   });
 }
 
-describe("resolve", () => {
+describe("resolve — edition routes", () => {
   const route: Route = {
+    kind: "edition",
     project: "pipelines",
     edition: "__main",
     path: "getting-started.html",
@@ -75,9 +97,10 @@ describe("resolve", () => {
         size: 18,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2);
+    const response = await resolve(route, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -94,9 +117,10 @@ describe("resolve", () => {
   it("returns 404 when KV entry is missing", async () => {
     const kv = createMockKV({});
     const r2 = createMockR2({});
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2);
+    const response = await resolve(route, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
@@ -109,9 +133,10 @@ describe("resolve", () => {
       "pipelines/__main": "not-json",
     });
     const r2 = createMockR2({});
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2);
+    const response = await resolve(route, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
@@ -127,9 +152,10 @@ describe("resolve", () => {
       }),
     });
     const r2 = createMockR2({});
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2);
+    const response = await resolve(route, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
@@ -139,6 +165,7 @@ describe("resolve", () => {
 
   it("redirects to trailing slash for directory paths", async () => {
     const directoryRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "api/core",
@@ -155,9 +182,10 @@ describe("resolve", () => {
         size: 18,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/api/core");
 
-    const response = await resolve(directoryRoute, request, kv, r2);
+    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(301);
     expect(response.headers.get("Location")).toBe(
@@ -167,6 +195,7 @@ describe("resolve", () => {
 
   it("serves index.html when path has trailing slash", async () => {
     const directoryRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "api/core/",
@@ -183,9 +212,10 @@ describe("resolve", () => {
         size: 18,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/api/core/");
 
-    const response = await resolve(directoryRoute, request, kv, r2);
+    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -198,6 +228,7 @@ describe("resolve", () => {
 
   it("falls back to index.html for empty path", async () => {
     const rootRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "",
@@ -214,9 +245,10 @@ describe("resolve", () => {
         size: 22,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/");
 
-    const response = await resolve(rootRoute, request, kv, r2);
+    const response = await resolve(rootRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -229,6 +261,7 @@ describe("resolve", () => {
 
   it("falls back to index.html for empty path when r2_prefix lacks trailing slash", async () => {
     const rootRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "",
@@ -245,9 +278,10 @@ describe("resolve", () => {
         size: 22,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/");
 
-    const response = await resolve(rootRoute, request, kv, r2);
+    const response = await resolve(rootRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -260,6 +294,7 @@ describe("resolve", () => {
 
   it("infers Content-Type for CSS files", async () => {
     const cssRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "style.css",
@@ -276,9 +311,10 @@ describe("resolve", () => {
         size: 20,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/style.css");
 
-    const response = await resolve(cssRoute, request, kv, r2);
+    const response = await resolve(cssRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/css");
@@ -291,6 +327,7 @@ describe("resolve", () => {
 
   it("infers Content-Type for JSON files", async () => {
     const jsonRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "data.json",
@@ -307,9 +344,10 @@ describe("resolve", () => {
         size: 2,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/data.json");
 
-    const response = await resolve(jsonRoute, request, kv, r2);
+    const response = await resolve(jsonRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("application/json");
@@ -322,6 +360,7 @@ describe("resolve", () => {
 
   it("uses application/octet-stream for unknown extensions", async () => {
     const unknownRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "data.xyz123",
@@ -338,9 +377,10 @@ describe("resolve", () => {
         size: 6,
       },
     });
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/data.xyz123");
 
-    const response = await resolve(unknownRoute, request, kv, r2);
+    const response = await resolve(unknownRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe(
@@ -355,6 +395,7 @@ describe("resolve", () => {
 
   it("returns 404 when both exact and index.html fallback miss", async () => {
     const directoryRoute: Route = {
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "nonexistent/dir",
@@ -366,10 +407,66 @@ describe("resolve", () => {
       }),
     });
     const r2 = createMockR2({});
+    const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/nonexistent/dir");
 
-    const response = await resolve(directoryRoute, request, kv, r2);
+    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore);
 
     expect(response.status).toBe(404);
+  });
+});
+
+describe("resolve — dashboard routes", () => {
+  it("delegates to DashboardStore and returns the HTML body with dashboard headers", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore({
+      "sqr-112": {
+        body: streamFromString("<html>dashboard</html>"),
+        size: 22,
+      },
+    });
+    const request = new Request("https://sqr-112.lsst.io/v/");
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.getDashboard).toHaveBeenCalledWith("sqr-112");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe("<html>dashboard</html>");
+    // Edition path must not be touched for dashboard dispatch.
+    expect(kv.get).not.toHaveBeenCalled();
+    expect(r2.get).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 text when DashboardStore returns null", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://sqr-112.lsst.io/v/");
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
   });
 });

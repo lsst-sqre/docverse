@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseRoute, Route, UrlScheme } from "../src/router";
+import { parseRoute, UrlScheme } from "../src/router";
 
 /**
  * Helper to create a minimal Request object from a URL string.
@@ -17,6 +17,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "",
@@ -29,6 +30,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "getting-started.html",
@@ -41,6 +43,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "__main",
       path: "modules/lsst.pipe/index.html",
@@ -53,6 +56,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "main",
       path: "",
@@ -65,6 +69,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "v1.0",
       path: "changelog.html",
@@ -77,6 +82,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "weekly-2024",
       path: "api/core.html",
@@ -89,6 +95,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "pipelines",
       edition: "main",
       path: "",
@@ -101,6 +108,7 @@ describe("Subdomain routing", () => {
       scheme,
     );
     expect(route).toEqual({
+      kind: "edition",
       project: "sqr-112",
       edition: "__main",
       path: "",
@@ -117,15 +125,42 @@ describe("Subdomain routing", () => {
     expect(route).toBeNull();
   });
 
-  it("routes /v/ with no edition to __main", () => {
+  it("classifies /v/ as a dashboard route", () => {
     const route = parseRoute(
-      makeRequest("https://pipelines.lsst.io/v/"),
+      makeRequest("https://sqr-112.lsst.io/v/"),
       scheme,
     );
     expect(route).toEqual({
-      project: "pipelines",
-      edition: "__main",
-      path: "",
+      kind: "dashboard",
+      project: "sqr-112",
+    });
+  });
+
+  it("classifies /v/index.html as a dashboard route", () => {
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v/index.html"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "dashboard",
+      project: "sqr-112",
+    });
+  });
+
+  it("classifies /v/switcher.json/extra as an edition named switcher.json", () => {
+    // Locks in classification order: only /v/ and /v/index.html are
+    // dashboard routes; everything else under /v/ is an edition. Later
+    // slices will add switcher / edition-meta routes; this negative case
+    // guards against over-matching.
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v/switcher.json/extra"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition",
+      project: "sqr-112",
+      edition: "switcher.json",
+      path: "extra",
     });
   });
 });
@@ -140,6 +175,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "",
@@ -152,6 +188,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "getting-started.html",
@@ -166,6 +203,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "main",
         path: "changelog.html",
@@ -178,6 +216,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "v2.0",
         path: "",
@@ -190,6 +229,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "main",
         path: "",
@@ -202,6 +242,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "",
@@ -214,6 +255,7 @@ describe("Path-prefix routing", () => {
         scheme,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "api/core/index.html",
@@ -227,6 +269,41 @@ describe("Path-prefix routing", () => {
       );
       expect(route).toBeNull();
     });
+
+    it("classifies /{project}/v/ as a dashboard route", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/v/"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "dashboard",
+        project: "sqr-112",
+      });
+    });
+
+    it("classifies /{project}/v/index.html as a dashboard route", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/v/index.html"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "dashboard",
+        project: "sqr-112",
+      });
+    });
+
+    it("classifies /{project}/v/switcher.json/extra as edition switcher.json", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/v/switcher.json/extra"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "edition",
+        project: "sqr-112",
+        edition: "switcher.json",
+        path: "extra",
+      });
+    });
   });
 
   describe("with root prefix", () => {
@@ -239,6 +316,7 @@ describe("Path-prefix routing", () => {
         prefix,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "",
@@ -252,6 +330,7 @@ describe("Path-prefix routing", () => {
         prefix,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "getting-started.html",
@@ -267,6 +346,7 @@ describe("Path-prefix routing", () => {
         prefix,
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "main",
         path: "changelog.html",
@@ -298,6 +378,7 @@ describe("Path-prefix routing", () => {
         "/docs",
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "index.html",
@@ -311,9 +392,34 @@ describe("Path-prefix routing", () => {
         "docs/",
       );
       expect(route).toEqual({
+        kind: "edition",
         project: "pipelines",
         edition: "__main",
         path: "index.html",
+      });
+    });
+
+    it("classifies /docs/{project}/v/ as a dashboard route", () => {
+      const route = parseRoute(
+        makeRequest("https://example.com/docs/sqr-112/v/"),
+        scheme,
+        prefix,
+      );
+      expect(route).toEqual({
+        kind: "dashboard",
+        project: "sqr-112",
+      });
+    });
+
+    it("classifies /docs/{project}/v/index.html as a dashboard route", () => {
+      const route = parseRoute(
+        makeRequest("https://example.com/docs/sqr-112/v/index.html"),
+        scheme,
+        prefix,
+      );
+      expect(route).toEqual({
+        kind: "dashboard",
+        project: "sqr-112",
       });
     });
   });

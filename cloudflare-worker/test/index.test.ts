@@ -143,6 +143,39 @@ describe("Worker integration — subdomain routing", () => {
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
   });
+
+  it("serves the project dashboard at /v/ from __dashboard.html", async () => {
+    await seedR2Object(
+      "sqr-112/__dashboard.html",
+      "<html>dashboard</html>",
+    );
+
+    const response = await SELF.fetch("https://sqr-112.lsst.io/v/");
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe("<html>dashboard</html>");
+  });
+
+  it("serves the dashboard at /v/index.html", async () => {
+    await seedR2Object(
+      "sqr-112/__dashboard.html",
+      "<html>dashboard</html>",
+    );
+
+    const response = await SELF.fetch(
+      "https://sqr-112.lsst.io/v/index.html",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(await response.text()).toBe("<html>dashboard</html>");
+  });
 });
 
 describe("Worker integration — path-prefix routing", () => {
@@ -232,5 +265,23 @@ describe("Worker integration — path-prefix routing", () => {
     );
 
     expect(response.status).toBe(404);
+  });
+
+  it("serves the project dashboard at /docs/{project}/v/", async () => {
+    await seedR2Object(
+      "sqr-112/__dashboard.html",
+      "<html>dashboard</html>",
+    );
+
+    const response = await fetchPathPrefix(
+      "https://docs.example.com/docs/sqr-112/v/",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe("<html>dashboard</html>");
   });
 });

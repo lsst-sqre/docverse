@@ -1,17 +1,26 @@
 /**
- * KV-to-R2 resolution module.
+ * Route-to-response resolver.
  *
- * Given a parsed route (project, edition, file path), this module:
- * 1. Looks up the KV key `{project}/{edition}` to get the build mapping
- * 2. Constructs the R2 object key as `{r2_prefix}{file_path}`
- * 3. Tries exact path, then `{path}/index.html` for directory index resolution
- * 4. Returns the R2 object with Content-Type inferred from the file extension
- *    and Cache-Control: public, max-age=60
- * 5. Returns a plain text 404 for missing KV entries or missing R2 objects
+ * Dispatches on `route.kind`:
+ *
+ * - `edition` routes follow the existing KV → R2 hot path:
+ *   1. Look up `{project}/{edition}` in KV to get the build mapping.
+ *   2. Construct the R2 object key as `{r2_prefix}{file_path}`.
+ *   3. Try exact path, then `{path}/index.html` for directory index
+ *      resolution.
+ *   4. Return the R2 object with `Content-Type` inferred from the file
+ *      extension and `Cache-Control: public, max-age=60`.
+ *   5. Return a plain-text 404 on missing KV entry or missing R2 object.
+ *
+ * - `dashboard` routes delegate to `DashboardStore.getDashboard()`, which
+ *   encapsulates the `__`-prefixed R2 key layout. The response body is the
+ *   R2 object with `Content-Type: text/html; charset=utf-8` and
+ *   `Cache-Control: public, max-age=60`.
  */
 
 import mime from "mime";
-import type { Route } from "./router";
+import type { DashboardStore } from "./dashboardStore";
+import type { Route, EditionRoute } from "./router";
 
 /** Shape of the JSON value stored in the editions KV namespace. */
 interface EditionMapping {
@@ -20,10 +29,44 @@ interface EditionMapping {
 }
 
 /**
- * Resolve a route to an R2 object and return an HTTP response.
+ * Resolve a route to an HTTP response.
  */
 export async function resolve(
   route: Route,
+  request: Request,
+  kv: KVNamespace,
+  r2: R2Bucket,
+  dashboardStore: DashboardStore,
+): Promise<Response> {
+  switch (route.kind) {
+    case "dashboard":
+      return resolveDashboard(route.project, dashboardStore);
+    case "edition":
+      return resolveEdition(route, request, kv, r2);
+  }
+}
+
+async function resolveDashboard(
+  project: string,
+  dashboardStore: DashboardStore,
+): Promise<Response> {
+  const object = await dashboardStore.getDashboard(project);
+  if (object === null) {
+    return notFoundText();
+  }
+  return new Response(object.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Length": object.size.toString(),
+      "ETag": object.httpEtag,
+      "Cache-Control": "public, max-age=60",
+    },
+  });
+}
+
+async function resolveEdition(
+  route: EditionRoute,
   request: Request,
   kv: KVNamespace,
   r2: R2Bucket,
@@ -32,20 +75,14 @@ export async function resolve(
   const kvKey = `${route.project}/${route.edition}`;
   const kvValue = await kv.get(kvKey);
   if (kvValue === null) {
-    return new Response("Not Found", {
-      status: 404,
-      headers: { "Content-Type": "text/plain" },
-    });
+    return notFoundText();
   }
 
   let mapping: EditionMapping;
   try {
     mapping = JSON.parse(kvValue);
   } catch {
-    return new Response("Not Found", {
-      status: 404,
-      headers: { "Content-Type": "text/plain" },
-    });
+    return notFoundText();
   }
 
   // Normalize r2_prefix to always end with "/"
@@ -78,10 +115,7 @@ export async function resolve(
   }
 
   if (object === null) {
-    return new Response("Not Found", {
-      status: 404,
-      headers: { "Content-Type": "text/plain" },
-    });
+    return notFoundText();
   }
 
   // Step 4: Infer Content-Type from file extension
@@ -96,5 +130,12 @@ export async function resolve(
       "ETag": object.httpEtag,
       "Cache-Control": "public, max-age=60",
     },
+  });
+}
+
+function notFoundText(): Response {
+  return new Response("Not Found", {
+    status: 404,
+    headers: { "Content-Type": "text/plain" },
   });
 }

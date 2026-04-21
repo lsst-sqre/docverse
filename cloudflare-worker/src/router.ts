@@ -1,31 +1,44 @@
 /**
  * URL routing module.
  *
- * Parses incoming HTTP requests into a structured route consisting of
- * project slug, edition name, and file path. Supports two URL schemes:
+ * Parses incoming HTTP requests into a structured route. Supports two
+ * URL schemes:
  *
  * - **Subdomain**: project slug from the leftmost subdomain label of the
- *   Host header; edition and path from the URL path.
+ *   Host header; remaining classification from the URL path.
  * - **Path-prefix**: project slug extracted from the URL path after an
- *   optional configurable root prefix; edition and path from the remaining
- *   path.
+ *   optional configurable root prefix; remaining classification from the
+ *   rest of the path.
  *
- * Edition URL grammar:
- * - `/page.html` or `/` → `__main` edition
- * - `/v/{edition}/page.html` → named edition
+ * A parsed route is a discriminated union on the `kind` field:
+ *
+ * - `{kind: 'edition', project, edition, path}` — a build URL resolved via
+ *   the KV → R2 hot path. `/page.html` or `/` maps to the `__main` edition;
+ *   `/v/{edition}/...` maps to a named edition.
+ * - `{kind: 'dashboard', project}` — the project dashboard page. Matches
+ *   exactly `/v/` and `/v/index.html`.
  */
 
-/** Result of parsing a request URL. */
-export interface Route {
+/** Edition (build) route — resolved via KV → R2. */
+export interface EditionRoute {
+  kind: "edition";
   /** Project slug (e.g., "pipelines"). */
   project: string;
-
   /** Edition name (e.g., "__main", "v1.0", "main"). */
   edition: string;
-
   /** File path within the edition (e.g., "page.html", "api/index.html"). */
   path: string;
 }
+
+/** Dashboard route — served from `{project}/__dashboard.html` in R2. */
+export interface DashboardRoute {
+  kind: "dashboard";
+  /** Project slug (e.g., "pipelines"). */
+  project: string;
+}
+
+/** Result of parsing a request URL. */
+export type Route = EditionRoute | DashboardRoute;
 
 /** Supported URL routing schemes. */
 export type UrlScheme = "subdomain" | "path-prefix";
@@ -59,40 +72,45 @@ export function parseRoute(
 }
 
 /**
- * Parse edition and path from a URL path relative to the project root.
+ * Classify a project-relative path into a Route.
  *
- * Handles the edition URL grammar:
- * - `/v/{edition}/...` → named edition with remaining path
- * - anything else → `__main` edition
+ * Classification order:
+ * 1. `v/` or `v/index.html` → dashboard route.
+ * 2. Anything else starting with `v/` → named-edition route.
+ * 3. Anything else → `__main`-edition route.
  */
-function parseEditionAndPath(relativePath: string): {
-  edition: string;
-  path: string;
-} {
-  // Remove leading slash
+function classifyRelativePath(project: string, relativePath: string): Route {
   const stripped = relativePath.startsWith("/")
     ? relativePath.slice(1)
     : relativePath;
 
-  // Check for /v/{edition}/... pattern
+  if (stripped === "v/" || stripped === "v/index.html") {
+    return { kind: "dashboard", project };
+  }
+
   if (stripped.startsWith("v/")) {
     const afterV = stripped.slice(2); // after "v/"
     const slashIndex = afterV.indexOf("/");
     if (slashIndex === -1) {
       // Path is exactly "v/{edition}" with no trailing slash
       const edition = afterV || DEFAULT_EDITION;
-      return { edition, path: "" };
+      return { kind: "edition", project, edition, path: "" };
     }
     const edition = afterV.slice(0, slashIndex);
     if (edition === "") {
-      // Path is "v/..." with empty edition — treat as __main
-      return { edition: DEFAULT_EDITION, path: afterV.slice(1) };
+      // Path is "v//..." with empty edition — treat as __main
+      return {
+        kind: "edition",
+        project,
+        edition: DEFAULT_EDITION,
+        path: afterV.slice(1),
+      };
     }
     const path = afterV.slice(slashIndex + 1);
-    return { edition, path };
+    return { kind: "edition", project, edition, path };
   }
 
-  return { edition: DEFAULT_EDITION, path: stripped };
+  return { kind: "edition", project, edition: DEFAULT_EDITION, path: stripped };
 }
 
 function parseSubdomainRoute(request: Request): Route | null {
@@ -111,8 +129,7 @@ function parseSubdomainRoute(request: Request): Route | null {
     return null;
   }
 
-  const { edition, path } = parseEditionAndPath(url.pathname);
-  return { project, edition, path };
+  return classifyRelativePath(project, url.pathname);
 }
 
 function parsePathPrefixRoute(
@@ -143,8 +160,7 @@ function parsePathPrefixRoute(
     if (pathname === "") {
       return null;
     }
-    const { edition, path } = parseEditionAndPath("");
-    return { project: pathname, edition, path };
+    return classifyRelativePath(pathname, "");
   }
 
   const project = pathname.slice(0, slashIndex);
@@ -153,8 +169,7 @@ function parsePathPrefixRoute(
   }
 
   const rest = pathname.slice(slashIndex); // includes leading "/"
-  const { edition, path } = parseEditionAndPath(rest);
-  return { project, edition, path };
+  return classifyRelativePath(project, rest);
 }
 
 /**

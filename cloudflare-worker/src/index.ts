@@ -1,3 +1,4 @@
+import { createDashboardStore } from "./dashboardStore";
 import { resolve } from "./resolver";
 import { parseRoute } from "./router";
 import { Env } from "./types";
@@ -15,6 +16,13 @@ export default {
         headers: { "Content-Type": "text/plain" },
       });
     }
-    return resolve(route, request, env.EDITIONS_KV, env.BUILDS_R2);
+    const dashboardStore = createDashboardStore(env.BUILDS_R2);
+    return resolve(
+      route,
+      request,
+      env.EDITIONS_KV,
+      env.BUILDS_R2,
+      dashboardStore,
+    );
   },
 } satisfies ExportedHandler<Env>;
