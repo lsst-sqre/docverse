@@ -184,6 +184,46 @@ describe("Subdomain routing", () => {
       to: "/v/",
     });
   });
+
+  it("classifies /v/{edition}/_docverse.json as an edition_meta route", () => {
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v/main/_docverse.json"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition_meta",
+      project: "sqr-112",
+      edition: "main",
+    });
+  });
+
+  it("classifies /v/{edition}/_docverse.json with a dashy edition name", () => {
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v/weekly-2024/_docverse.json"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition_meta",
+      project: "sqr-112",
+      edition: "weekly-2024",
+    });
+  });
+
+  it("classifies /v/main/_docverse.json/extra as an edition file path", () => {
+    // Locks in classification order: the exact-match edition_meta branch
+    // must not swallow deeper paths. /v/main/_docverse.json/extra must
+    // continue to route as edition "main", path "_docverse.json/extra".
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v/main/_docverse.json/extra"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition",
+      project: "sqr-112",
+      edition: "main",
+      path: "_docverse.json/extra",
+    });
+  });
 });
 
 describe("Path-prefix routing", () => {
@@ -345,6 +385,33 @@ describe("Path-prefix routing", () => {
       expect(route).toEqual({
         kind: "redirect",
         to: "/sqr-112/v/",
+      });
+    });
+
+    it("classifies /{project}/v/{edition}/_docverse.json as edition_meta", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/v/main/_docverse.json"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "edition_meta",
+        project: "sqr-112",
+        edition: "main",
+      });
+    });
+
+    it("classifies /{project}/v/main/_docverse.json/extra as edition path", () => {
+      const route = parseRoute(
+        makeRequest(
+          "https://docs.example.com/sqr-112/v/main/_docverse.json/extra",
+        ),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "edition",
+        project: "sqr-112",
+        edition: "main",
+        path: "_docverse.json/extra",
       });
     });
   });

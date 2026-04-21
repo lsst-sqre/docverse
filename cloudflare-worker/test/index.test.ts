@@ -335,4 +335,24 @@ describe("Worker integration — path-prefix routing", () => {
       '[{"name":"main","url":"/docs/sqr-112/v/main/"}]',
     );
   });
+
+  it("serves edition metadata at /docs/{project}/v/{edition}/_docverse.json", async () => {
+    await seedR2Object(
+      "sqr-112/__editions/main.json",
+      '{"canonical_url":"https://docs.example.com/docs/sqr-112/","is_canonical":true}',
+    );
+
+    const response = await fetchPathPrefix(
+      "https://docs.example.com/docs/sqr-112/v/main/_docverse.json",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe(
+      '{"canonical_url":"https://docs.example.com/docs/sqr-112/","is_canonical":true}',
+    );
+  });
 });

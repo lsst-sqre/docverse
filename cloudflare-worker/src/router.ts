@@ -19,6 +19,10 @@
  *   exactly `/v/` and `/v/index.html`.
  * - `{kind: 'switcher', project}` — the per-project version-switcher JSON.
  *   Matches exactly `/v/switcher.json`.
+ * - `{kind: 'edition_meta', project, edition}` — per-edition metadata JSON
+ *   (canonical URL, `is_canonical`). Matches exactly
+ *   `/v/{edition}/_docverse.json`; deeper paths like
+ *   `/v/main/_docverse.json/extra` fall through to edition routing.
  */
 
 /** Edition (build) route — resolved via KV → R2. */
@@ -47,6 +51,20 @@ export interface SwitcherRoute {
 }
 
 /**
+ * Edition-metadata route — served from `{project}/__editions/{edition}.json`
+ * in R2. Exposes per-edition metadata (canonical URL, `is_canonical`) at
+ * `/v/{edition}/_docverse.json` so that client-side JS and programmatic
+ * consumers can check canonicality without round-tripping to the API.
+ */
+export interface EditionMetaRoute {
+  kind: "edition_meta";
+  /** Project slug (e.g., "pipelines"). */
+  project: string;
+  /** Edition name (e.g., "main", "v1.0"). */
+  edition: string;
+}
+
+/**
  * Redirect route — returns a 301 to `to`.
  *
  * Used to canonicalize `/v` (no trailing slash) to `/v/` so that relative
@@ -63,6 +81,7 @@ export type Route =
   | EditionRoute
   | DashboardRoute
   | SwitcherRoute
+  | EditionMetaRoute
   | RedirectRoute;
 
 /** Supported URL routing schemes. */
@@ -103,8 +122,9 @@ export function parseRoute(
  * 1. Exactly `v` (no trailing slash) → redirect to `requestPathname + "/"`.
  * 2. `v/` or `v/index.html` → dashboard route.
  * 3. `v/switcher.json` → switcher route.
- * 4. Anything else starting with `v/` → named-edition route.
- * 5. Anything else → `__main`-edition route.
+ * 4. `v/{edition}/_docverse.json` (exactly) → edition_meta route.
+ * 5. Anything else starting with `v/` → named-edition route.
+ * 6. Anything else → `__main`-edition route.
  */
 function classifyRelativePath(
   project: string,
@@ -125,6 +145,11 @@ function classifyRelativePath(
 
   if (stripped === "v/switcher.json") {
     return { kind: "switcher", project };
+  }
+
+  const editionMetaMatch = matchEditionMeta(stripped);
+  if (editionMetaMatch !== null) {
+    return { kind: "edition_meta", project, edition: editionMetaMatch };
   }
 
   if (stripped.startsWith("v/")) {
@@ -209,6 +234,27 @@ function parsePathPrefixRoute(
 
   const rest = pathname.slice(slashIndex); // includes leading "/"
   return classifyRelativePath(project, rest, url.pathname);
+}
+
+/**
+ * If `stripped` matches the exact pattern `v/{edition}/_docverse.json`,
+ * return the edition name. Otherwise return `null`.
+ *
+ * The match requires exactly three path segments (`v`, `{edition}`,
+ * `_docverse.json`) with no trailing content, so `v/main/_docverse.json/extra`
+ * falls through to edition routing and is not silently captured.
+ */
+const EDITION_META_SUFFIX = "/_docverse.json";
+
+function matchEditionMeta(stripped: string): string | null {
+  if (!stripped.startsWith("v/") || !stripped.endsWith(EDITION_META_SUFFIX)) {
+    return null;
+  }
+  const edition = stripped.slice(2, stripped.length - EDITION_META_SUFFIX.length);
+  if (edition === "" || edition.includes("/")) {
+    return null;
+  }
+  return edition;
 }
 
 /**

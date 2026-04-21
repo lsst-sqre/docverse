@@ -45,11 +45,13 @@ function createMockR2(
 }
 
 /**
- * Create a mock DashboardStore backed by in-memory maps keyed by project.
+ * Create a mock DashboardStore backed by in-memory maps keyed by project
+ * (for dashboard/switcher) or `{project}/{edition}` (for edition_meta).
  */
 function createMockDashboardStore(
   dashboards: Record<string, { body: ReadableStream; size: number }> = {},
   switchers: Record<string, { body: ReadableStream; size: number }> = {},
+  editionMetas: Record<string, { body: ReadableStream; size: number }> = {},
 ): DashboardStore {
   return {
     getDashboard: vi.fn(async (project: string) => {
@@ -69,6 +71,16 @@ function createMockDashboardStore(
         body: obj.body,
         size: obj.size,
         httpEtag: `"${project}-switcher-etag"`,
+        httpMetadata: {},
+      } as R2ObjectBody;
+    }),
+    getEditionMeta: vi.fn(async (project: string, edition: string) => {
+      const obj = editionMetas[`${project}/${edition}`];
+      if (!obj) return null;
+      return {
+        body: obj.body,
+        size: obj.size,
+        httpEtag: `"${project}-${edition}-edition-meta-etag"`,
         httpMetadata: {},
       } as R2ObjectBody;
     }),
@@ -531,6 +543,87 @@ describe("resolve — switcher routes", () => {
 
     const response = await resolve(
       switcherRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
+  });
+});
+
+describe("resolve — edition_meta routes", () => {
+  it("delegates to DashboardStore and returns JSON with edition-meta headers", async () => {
+    const metaRoute: Route = {
+      kind: "edition_meta",
+      project: "sqr-112",
+      edition: "main",
+    };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore(
+      {},
+      {},
+      {
+        "sqr-112/main": {
+          body: streamFromString(
+            '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+          ),
+          size: 63,
+        },
+      },
+    );
+    const request = new Request(
+      "https://sqr-112.lsst.io/v/main/_docverse.json",
+    );
+
+    const response = await resolve(
+      metaRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.getEditionMeta).toHaveBeenCalledWith(
+      "sqr-112",
+      "main",
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe(
+      '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+    );
+    // Edition / dashboard / switcher paths must not be touched for
+    // edition_meta dispatch.
+    expect(kv.get).not.toHaveBeenCalled();
+    expect(r2.get).not.toHaveBeenCalled();
+    expect(dashboardStore.getDashboard).not.toHaveBeenCalled();
+    expect(dashboardStore.getSwitcher).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 text when DashboardStore returns null for edition_meta", async () => {
+    const metaRoute: Route = {
+      kind: "edition_meta",
+      project: "sqr-112",
+      edition: "nonexistent",
+    };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request(
+      "https://sqr-112.lsst.io/v/nonexistent/_docverse.json",
+    );
+
+    const response = await resolve(
+      metaRoute,
       request,
       kv,
       r2,

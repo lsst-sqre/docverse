@@ -25,6 +25,19 @@ export interface DashboardStore {
    * @returns The R2 object body on hit, or `null` on miss / R2 error.
    */
   getSwitcher(project: string): Promise<R2ObjectBody | null>;
+
+  /**
+   * Fetch the per-edition metadata JSON (canonical URL, `is_canonical`) for
+   * a given edition of a project.
+   *
+   * @param project - Project slug.
+   * @param edition - Edition name.
+   * @returns The R2 object body on hit, or `null` on miss / R2 error.
+   */
+  getEditionMeta(
+    project: string,
+    edition: string,
+  ): Promise<R2ObjectBody | null>;
 }
 
 /**
@@ -45,6 +58,16 @@ export function createDashboardStore(r2: R2Bucket): DashboardStore {
     async getSwitcher(project: string): Promise<R2ObjectBody | null> {
       try {
         return await r2.get(`${project}/__switcher.json`);
+      } catch {
+        return null;
+      }
+    },
+    async getEditionMeta(
+      project: string,
+      edition: string,
+    ): Promise<R2ObjectBody | null> {
+      try {
+        return await r2.get(`${project}/__editions/${edition}.json`);
       } catch {
         return null;
       }

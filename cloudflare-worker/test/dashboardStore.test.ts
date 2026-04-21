@@ -117,3 +117,48 @@ describe("DashboardStore.getSwitcher", () => {
     await expect(store.getSwitcher("sqr-112")).resolves.toBeNull();
   });
 });
+
+describe("DashboardStore.getEditionMeta", () => {
+  it("returns the R2 object for {project}/__editions/{edition}.json on hit", async () => {
+    const r2 = createMockR2({
+      "sqr-112/__editions/main.json": {
+        body: streamFromString(
+          '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+        ),
+        size: 63,
+      },
+    });
+    const store = createDashboardStore(r2);
+
+    const object = await store.getEditionMeta("sqr-112", "main");
+
+    expect(object).not.toBeNull();
+    expect(r2.get).toHaveBeenCalledWith("sqr-112/__editions/main.json");
+    const body = await new Response(object!.body).text();
+    expect(body).toBe(
+      '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+    );
+  });
+
+  it("returns null on miss", async () => {
+    const r2 = createMockR2({});
+    const store = createDashboardStore(r2);
+
+    const object = await store.getEditionMeta("sqr-112", "main");
+
+    expect(object).toBeNull();
+  });
+
+  it("never throws when R2.get rejects", async () => {
+    const r2 = {
+      get: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    } as unknown as R2Bucket;
+    const store = createDashboardStore(r2);
+
+    await expect(
+      store.getEditionMeta("sqr-112", "main"),
+    ).resolves.toBeNull();
+  });
+});

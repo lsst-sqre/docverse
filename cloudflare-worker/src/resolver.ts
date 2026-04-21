@@ -22,6 +22,11 @@
  *   `Content-Type: application/json; charset=utf-8` and the same
  *   `Cache-Control` as other dashboard-family responses.
  *
+ * - `edition_meta` routes delegate to `DashboardStore.getEditionMeta()`,
+ *   returning per-edition metadata (canonical URL, `is_canonical`) with the
+ *   same JSON `Content-Type` and `Cache-Control` as other dashboard-family
+ *   responses.
+ *
  * - `redirect` routes return a 301 with `Location` set to `route.to` on the
  *   request's origin, preserving the original query string.
  */
@@ -53,6 +58,8 @@ export async function resolve(
       return resolveDashboard(route.project, dashboardStore);
     case "switcher":
       return resolveSwitcher(route.project, dashboardStore);
+    case "edition_meta":
+      return resolveEditionMeta(route.project, route.edition, dashboardStore);
     case "edition":
       return resolveEdition(route, request, kv, r2);
   }
@@ -88,6 +95,26 @@ async function resolveSwitcher(
   dashboardStore: DashboardStore,
 ): Promise<Response> {
   const object = await dashboardStore.getSwitcher(project);
+  if (object === null) {
+    return notFoundText();
+  }
+  return new Response(object.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": object.size.toString(),
+      "ETag": object.httpEtag,
+      "Cache-Control": "public, max-age=60",
+    },
+  });
+}
+
+async function resolveEditionMeta(
+  project: string,
+  edition: string,
+  dashboardStore: DashboardStore,
+): Promise<Response> {
+  const object = await dashboardStore.getEditionMeta(project, edition);
   if (object === null) {
     return notFoundText();
   }
