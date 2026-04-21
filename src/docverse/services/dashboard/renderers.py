@@ -37,12 +37,6 @@ __all__ = [
 _DEFAULT_404_PACKAGE = "docverse.storage.dashboard_templates.builtin"
 _DEFAULT_404_TEMPLATE = "default_404.html.jinja"
 
-_DEFAULT_INCLUDE_KINDS: tuple[str, ...] = (
-    "main",
-    "release",
-    "major",
-    "alternate",
-)
 _PREFERRED_KINDS = frozenset({"main", "alternate"})
 
 
@@ -154,12 +148,7 @@ class SwitcherJsonRenderer:
     ) -> bytes:
         """Render the switcher JSON and return UTF-8 bytes."""
         config = switcher_config or SwitcherConfig()
-        include_kinds = (
-            tuple(config.include_kinds)
-            if config.include_kinds
-            else _DEFAULT_INCLUDE_KINDS
-        )
-        entries = _switcher_entries(context.editions, include_kinds)
+        entries = _switcher_entries(context.editions, config.include_kinds)
         return json.dumps(entries, indent=2).encode("utf-8")
 
 

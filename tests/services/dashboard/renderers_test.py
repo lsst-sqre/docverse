@@ -300,7 +300,7 @@ def test_error_page_default_renders_for_empty_project() -> None:
     [
         (("main",), ["__main"]),
         (("alternate",), ["dev-east"]),
-        ((), ["__main", "dev-east", "v1.0.0"]),
+        ((), []),
     ],
 )
 def test_switcher_include_kinds_filters(
