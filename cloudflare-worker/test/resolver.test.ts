@@ -52,6 +52,7 @@ function createMockDashboardStore(
   dashboards: Record<string, { body: ReadableStream; size: number }> = {},
   switchers: Record<string, { body: ReadableStream; size: number }> = {},
   editionMetas: Record<string, { body: ReadableStream; size: number }> = {},
+  notFounds: Record<string, { body: ReadableStream; size: number }> = {},
 ): DashboardStore {
   return {
     getDashboard: vi.fn(async (project: string) => {
@@ -81,6 +82,16 @@ function createMockDashboardStore(
         body: obj.body,
         size: obj.size,
         httpEtag: `"${project}-${edition}-edition-meta-etag"`,
+        httpMetadata: {},
+      } as R2ObjectBody;
+    }),
+    get404: vi.fn(async (project: string) => {
+      const obj = notFounds[project];
+      if (!obj) return null;
+      return {
+        body: obj.body,
+        size: obj.size,
+        httpEtag: `"${project}-404-etag"`,
         httpMetadata: {},
       } as R2ObjectBody;
     }),
@@ -704,5 +715,142 @@ describe("resolve — redirect routes", () => {
     expect(new URL(response.headers.get("Location") ?? "").pathname).toBe(
       "/docs/sqr-112/v/",
     );
+  });
+});
+
+describe("resolve — branded 404 fallback", () => {
+  it("serves __404.html with 404 status and HTML headers when dashboard route misses and __404.html is present", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore(
+      {},
+      {},
+      {},
+      {
+        "sqr-112": {
+          body: streamFromString("<html>branded 404</html>"),
+          size: 24,
+        },
+      },
+    );
+    const request = new Request("https://sqr-112.lsst.io/v/");
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.get404).toHaveBeenCalledWith("sqr-112");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe("<html>branded 404</html>");
+  });
+
+  it("serves __404.html when edition route's KV lookup misses and __404.html is present", async () => {
+    const editionRoute: Route = {
+      kind: "edition",
+      project: "sqr-112",
+      edition: "__main",
+      path: "page.html",
+    };
+    const kv = createMockKV({});
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore(
+      {},
+      {},
+      {},
+      {
+        "sqr-112": {
+          body: streamFromString("<html>branded 404</html>"),
+          size: 24,
+        },
+      },
+    );
+    const request = new Request("https://sqr-112.lsst.io/page.html");
+
+    const response = await resolve(
+      editionRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.get404).toHaveBeenCalledWith("sqr-112");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe("<html>branded 404</html>");
+  });
+
+  it("falls back to plain-text Not Found with cache headers when __404.html is absent (dashboard branch)", async () => {
+    const dashboardRoute: Route = { kind: "dashboard", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://sqr-112.lsst.io/v/");
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.get404).toHaveBeenCalledWith("sqr-112");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe("Not Found");
+  });
+
+  it("falls back to plain-text Not Found with cache headers when __404.html is absent (edition R2 miss)", async () => {
+    const editionRoute: Route = {
+      kind: "edition",
+      project: "pipelines",
+      edition: "__main",
+      path: "missing.html",
+    };
+    const kv = createMockKV({
+      "pipelines/__main": JSON.stringify({
+        build_id: "b123",
+        r2_prefix: "pipelines/__main/b123/",
+      }),
+    });
+    const r2 = createMockR2({});
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://pipelines.lsst.io/missing.html");
+
+    const response = await resolve(
+      editionRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.get404).toHaveBeenCalledWith("pipelines");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe("Not Found");
   });
 });

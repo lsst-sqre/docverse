@@ -38,6 +38,14 @@ export interface DashboardStore {
     project: string,
     edition: string,
   ): Promise<R2ObjectBody | null>;
+
+  /**
+   * Fetch the project's branded 404 HTML page.
+   *
+   * @param project - Project slug.
+   * @returns The R2 object body on hit, or `null` on miss / R2 error.
+   */
+  get404(project: string): Promise<R2ObjectBody | null>;
 }
 
 /**
@@ -68,6 +76,13 @@ export function createDashboardStore(r2: R2Bucket): DashboardStore {
     ): Promise<R2ObjectBody | null> {
       try {
         return await r2.get(`${project}/__editions/${edition}.json`);
+      } catch {
+        return null;
+      }
+    },
+    async get404(project: string): Promise<R2ObjectBody | null> {
+      try {
+        return await r2.get(`${project}/__404.html`);
       } catch {
         return null;
       }

@@ -207,6 +207,24 @@ describe("Worker integration — subdomain routing", () => {
       "/v/",
     );
   });
+
+  it("serves the branded __404.html for an unknown edition", async () => {
+    await seedR2Object(
+      "pipelines/__404.html",
+      "<html>branded 404 page</html>",
+    );
+
+    const response = await SELF.fetch(
+      "https://pipelines.lsst.io/v/nonexistent/",
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe("<html>branded 404 page</html>");
+  });
 });
 
 describe("Worker integration — path-prefix routing", () => {

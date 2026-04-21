@@ -162,3 +162,42 @@ describe("DashboardStore.getEditionMeta", () => {
     ).resolves.toBeNull();
   });
 });
+
+describe("DashboardStore.get404", () => {
+  it("returns the R2 object for {project}/__404.html on hit", async () => {
+    const r2 = createMockR2({
+      "sqr-112/__404.html": {
+        body: streamFromString("<html>branded 404</html>"),
+        size: 24,
+      },
+    });
+    const store = createDashboardStore(r2);
+
+    const object = await store.get404("sqr-112");
+
+    expect(object).not.toBeNull();
+    expect(r2.get).toHaveBeenCalledWith("sqr-112/__404.html");
+    const body = await new Response(object!.body).text();
+    expect(body).toBe("<html>branded 404</html>");
+  });
+
+  it("returns null on miss", async () => {
+    const r2 = createMockR2({});
+    const store = createDashboardStore(r2);
+
+    const object = await store.get404("sqr-112");
+
+    expect(object).toBeNull();
+  });
+
+  it("never throws when R2.get rejects", async () => {
+    const r2 = {
+      get: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    } as unknown as R2Bucket;
+    const store = createDashboardStore(r2);
+
+    await expect(store.get404("sqr-112")).resolves.toBeNull();
+  });
+});

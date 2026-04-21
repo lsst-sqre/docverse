@@ -10,7 +10,8 @@
  *      resolution.
  *   4. Return the R2 object with `Content-Type` inferred from the file
  *      extension and `Cache-Control: public, max-age=60`.
- *   5. Return a plain-text 404 on missing KV entry or missing R2 object.
+ *   5. Route any 404 (missing KV entry, malformed KV JSON, missing R2
+ *      object after the index-html fallback) through `notFoundResponse`.
  *
  * - `dashboard` routes delegate to `DashboardStore.getDashboard()`, which
  *   encapsulates the `__`-prefixed R2 key layout. The response body is the
@@ -29,6 +30,16 @@
  *
  * - `redirect` routes return a 301 with `Location` set to `route.to` on the
  *   request's origin, preserving the original query string.
+ *
+ * 404 handling: every 404-producing branch in this module routes through
+ * `notFoundResponse(project, dashboardStore)`, which serves the project's
+ * branded `{project}/__404.html` when present and degrades to plain-text
+ * `Not Found` otherwise. Both variants apply the same
+ * `Cache-Control: public, max-age=60` so dashboard rebuilds and newly
+ * published editions become visible within one minute and 404s don't get
+ * CDN-stuck. Unroutable requests (no extractable project slug) bypass this
+ * helper at the worker entry point, since there's no project to fall back
+ * on.
  */
 
 import mime from "mime";
@@ -61,7 +72,7 @@ export async function resolve(
     case "edition_meta":
       return resolveEditionMeta(route.project, route.edition, dashboardStore);
     case "edition":
-      return resolveEdition(route, request, kv, r2);
+      return resolveEdition(route, request, kv, r2, dashboardStore);
   }
 }
 
@@ -77,7 +88,7 @@ async function resolveDashboard(
 ): Promise<Response> {
   const object = await dashboardStore.getDashboard(project);
   if (object === null) {
-    return notFoundText();
+    return notFoundResponse(project, dashboardStore);
   }
   return new Response(object.body, {
     status: 200,
@@ -96,7 +107,7 @@ async function resolveSwitcher(
 ): Promise<Response> {
   const object = await dashboardStore.getSwitcher(project);
   if (object === null) {
-    return notFoundText();
+    return notFoundResponse(project, dashboardStore);
   }
   return new Response(object.body, {
     status: 200,
@@ -116,7 +127,7 @@ async function resolveEditionMeta(
 ): Promise<Response> {
   const object = await dashboardStore.getEditionMeta(project, edition);
   if (object === null) {
-    return notFoundText();
+    return notFoundResponse(project, dashboardStore);
   }
   return new Response(object.body, {
     status: 200,
@@ -134,19 +145,20 @@ async function resolveEdition(
   request: Request,
   kv: KVNamespace,
   r2: R2Bucket,
+  dashboardStore: DashboardStore,
 ): Promise<Response> {
   // Step 1: Look up the edition mapping in KV
   const kvKey = `${route.project}/${route.edition}`;
   const kvValue = await kv.get(kvKey);
   if (kvValue === null) {
-    return notFoundText();
+    return notFoundResponse(route.project, dashboardStore);
   }
 
   let mapping: EditionMapping;
   try {
     mapping = JSON.parse(kvValue);
   } catch {
-    return notFoundText();
+    return notFoundResponse(route.project, dashboardStore);
   }
 
   // Normalize r2_prefix to always end with "/"
@@ -179,7 +191,7 @@ async function resolveEdition(
   }
 
   if (object === null) {
-    return notFoundText();
+    return notFoundResponse(route.project, dashboardStore);
   }
 
   // Step 4: Infer Content-Type from file extension
@@ -197,9 +209,33 @@ async function resolveEdition(
   });
 }
 
-function notFoundText(): Response {
+/**
+ * Build a 404 response for a routable request, preferring the project's
+ * branded `__404.html` and degrading to plain text on miss. Both variants
+ * apply the same `Cache-Control: public, max-age=60` so CDN behavior is
+ * uniform across the `/v/` namespace.
+ */
+export async function notFoundResponse(
+  project: string,
+  dashboardStore: DashboardStore,
+): Promise<Response> {
+  const object = await dashboardStore.get404(project);
+  if (object !== null) {
+    return new Response(object.body, {
+      status: 404,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": object.size.toString(),
+        "ETag": object.httpEtag,
+        "Cache-Control": "public, max-age=60",
+      },
+    });
+  }
   return new Response("Not Found", {
     status: 404,
-    headers: { "Content-Type": "text/plain" },
+    headers: {
+      "Content-Type": "text/plain",
+      "Cache-Control": "public, max-age=60",
+    },
   });
 }
