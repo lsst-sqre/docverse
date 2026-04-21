@@ -82,7 +82,7 @@ async def get_projects(  # noqa: PLR0913
                 if cursor is not None
                 else None
             )
-            result = await service.list_by_org(
+            org, result = await service.list_by_org(
                 org_slug, query=q, limit=limit, cursor=search_cursor
             )
         else:
@@ -90,7 +90,7 @@ async def get_projects(  # noqa: PLR0913
             parsed_cursor = (
                 cursor_type.from_str(cursor) if cursor is not None else None
             )
-            result = await service.list_by_org(
+            org, result = await service.list_by_org(
                 org_slug,
                 cursor_type=cursor_type,
                 cursor=parsed_cursor,
@@ -101,8 +101,7 @@ async def get_projects(  # noqa: PLR0913
         context.response.headers["Link"] = link
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
-        Project.from_domain(p, context.request, org_slug)
-        for p in result.entries
+        Project.from_domain(p, context.request, org) for p in result.entries
     ]
 
 
@@ -121,12 +120,15 @@ async def post_project(
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        project, default_edition = await service.create(
+        org, project, default_edition = await service.create(
             org_slug=org_slug, data=data
         )
         await context.session.commit()
     return Project.from_domain(
-        project, context.request, org_slug, default_edition=default_edition
+        project,
+        context.request,
+        org,
+        default_edition=default_edition,
     )
 
 
@@ -144,12 +146,15 @@ async def get_project(
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        project = await service.get_by_slug(
+        org, project = await service.get_by_slug(
             org_slug=org_slug, slug=project_slug
         )
         default_edition = await service.get_default_edition(project.id)
     return Project.from_domain(
-        project, context.request, org_slug, default_edition=default_edition
+        project,
+        context.request,
+        org,
+        default_edition=default_edition,
     )
 
 
@@ -168,7 +173,7 @@ async def patch_project(
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        project = await service.update(
+        org, project = await service.update(
             org_slug=org_slug, slug=project_slug, data=data
         )
         default_edition = await service.get_default_edition(project.id)
@@ -181,7 +186,10 @@ async def patch_project(
         project_slug=project_slug,
     )
     return Project.from_domain(
-        project, context.request, org_slug, default_edition=default_edition
+        project,
+        context.request,
+        org,
+        default_edition=default_edition,
     )
 
 

@@ -22,10 +22,8 @@ from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
-from docverse.services.dashboard.context import (
-    DashboardContextBuilder,
-    _project_published_url,
-)
+from docverse.domain.published_url import project_published_url
+from docverse.services.dashboard.context import DashboardContextBuilder
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
@@ -512,7 +510,7 @@ def test_project_published_url_normalizes_base_domain(
     org = _make_org(raw_base_domain, url_scheme)
     project = _make_project()
 
-    url = _project_published_url(org, project)
+    url = project_published_url(org, project)
 
     assert url.startswith("https://")
     assert url.endswith("/")

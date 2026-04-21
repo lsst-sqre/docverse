@@ -45,6 +45,10 @@ from docverse.domain.organization_service import (
     OrganizationService as OrganizationServiceDomain,
 )
 from docverse.domain.project import Project as ProjectDomain
+from docverse.domain.published_url import (
+    edition_published_url,
+    project_published_url,
+)
 from docverse.domain.queue import QueueJob as QueueJobDomain
 
 
@@ -140,36 +144,43 @@ class Project(_ProjectBase):
         cls,
         domain: ProjectDomain,
         request: Request,
-        org_slug: str,
+        org: OrganizationDomain,
         *,
         default_edition: EditionDomain | None = None,
     ) -> Self:
         """Create from a domain object, adding HATEOAS URLs."""
         edition_response = None
         if default_edition is not None:
+            project_url = project_published_url(org, domain)
             edition_response = Edition.from_domain(
-                default_edition, request, org_slug, domain.slug
+                default_edition,
+                request,
+                org.slug,
+                domain.slug,
+                published_url=edition_published_url(
+                    project_url, default_edition
+                ),
             )
         return cls(
             self_url=str(
                 request.url_for(
                     "get_project",
-                    org=org_slug,
+                    org=org.slug,
                     project=domain.slug,
                 )
             ),
-            org_url=str(request.url_for("get_organization", org=org_slug)),
+            org_url=str(request.url_for("get_organization", org=org.slug)),
             editions_url=str(
                 request.url_for(
                     "get_editions",
-                    org=org_slug,
+                    org=org.slug,
                     project=domain.slug,
                 )
             ),
             builds_url=str(
                 request.url_for(
                     "get_builds",
-                    org=org_slug,
+                    org=org.slug,
                     project=domain.slug,
                 )
             ),

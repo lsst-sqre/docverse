@@ -105,6 +105,7 @@ async def test_rollback_success(
     assert target_public_id.replace("-", "") in data["build_url"].replace(
         "-", ""
     )
+    assert data["published_url"] == "https://rb-proj.rb-org.example.com/"
 
 
 @pytest.mark.asyncio

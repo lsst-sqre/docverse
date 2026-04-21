@@ -18,6 +18,10 @@ from docverse.dependencies.auth import (
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.domain.published_url import (
+    edition_published_url,
+    project_published_url,
+)
 from docverse.exceptions import PermissionDeniedError
 from docverse.handlers.params import (
     EditionSlugParam,
@@ -83,7 +87,7 @@ async def get_editions(  # noqa: PLR0913
     )
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        result = await service.list_by_project(
+        org, project, result = await service.list_by_project(
             org_slug=org_slug,
             project_slug=project_slug,
             cursor_type=cursor_type,
@@ -93,8 +97,15 @@ async def get_editions(  # noqa: PLR0913
         )
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
+    project_url = project_published_url(org, project)
     return [
-        Edition.from_domain(e, context.request, org_slug, project_slug)
+        Edition.from_domain(
+            e,
+            context.request,
+            org_slug,
+            project_slug,
+            published_url=edition_published_url(project_url, e),
+        )
         for e in result.entries
     ]
 
@@ -115,7 +126,7 @@ async def post_edition(
 ) -> Edition:
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        edition = await service.create(
+        org, project, edition = await service.create(
             org_slug=org_slug, project_slug=project_slug, data=data
         )
         await context.session.commit()
@@ -126,8 +137,13 @@ async def post_edition(
         org_slug=org_slug,
         project_slug=project_slug,
     )
+    project_url = project_published_url(org, project)
     return Edition.from_domain(
-        edition, context.request, org_slug, project_slug
+        edition,
+        context.request,
+        org_slug,
+        project_slug,
+        published_url=edition_published_url(project_url, edition),
     )
 
 
@@ -146,13 +162,18 @@ async def get_edition(
 ) -> Edition:
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        edition = await service.get_by_slug(
+        org, project, edition = await service.get_by_slug(
             org_slug=org_slug,
             project_slug=project_slug,
             slug=edition_slug,
         )
+    project_url = project_published_url(org, project)
     return Edition.from_domain(
-        edition, context.request, org_slug, project_slug
+        edition,
+        context.request,
+        org_slug,
+        project_slug,
+        published_url=edition_published_url(project_url, edition),
     )
 
 
@@ -236,7 +257,7 @@ async def post_edition_rollback(  # noqa: PLR0913
 ) -> Edition:
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        edition = await service.rollback(
+        org, project, edition = await service.rollback(
             org_slug=org_slug,
             project_slug=project_slug,
             edition_slug=edition_slug,
@@ -250,8 +271,13 @@ async def post_edition_rollback(  # noqa: PLR0913
         org_slug=org_slug,
         project_slug=project_slug,
     )
+    project_url = project_published_url(org, project)
     return Edition.from_domain(
-        edition, context.request, org_slug, project_slug
+        edition,
+        context.request,
+        org_slug,
+        project_slug,
+        published_url=edition_published_url(project_url, edition),
     )
 
 
@@ -274,7 +300,7 @@ async def patch_edition(  # noqa: PLR0913
         raise PermissionDeniedError(msg)
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        edition = await service.update(
+        org, project, edition = await service.update(
             org_slug=org_slug,
             project_slug=project_slug,
             slug=edition_slug,
@@ -288,8 +314,13 @@ async def patch_edition(  # noqa: PLR0913
         org_slug=org_slug,
         project_slug=project_slug,
     )
+    project_url = project_published_url(org, project)
     return Edition.from_domain(
-        edition, context.request, org_slug, project_slug
+        edition,
+        context.request,
+        org_slug,
+        project_slug,
+        published_url=edition_published_url(project_url, edition),
     )
 
 

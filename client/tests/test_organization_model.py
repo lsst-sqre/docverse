@@ -44,7 +44,7 @@ def test_normalize_base_domain_accepts_and_normalizes(
     ],
 )
 def test_normalize_base_domain_rejects_invalid(raw: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="base_domain"):
         normalize_base_domain(raw)
 
 

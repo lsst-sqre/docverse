@@ -7,8 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import structlog
 
-from docverse.client.models import EditionKind, UrlScheme
-from docverse.client.models.organizations import normalize_base_domain
+from docverse.client.models import EditionKind
 from docverse.config import Configuration
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
@@ -25,8 +24,10 @@ from docverse.domain.dashboard_context import (
     version_sort_key,
 )
 from docverse.domain.edition import Edition
-from docverse.domain.organization import Organization
-from docverse.domain.project import Project
+from docverse.domain.published_url import (
+    edition_published_url,
+    project_published_url,
+)
 from docverse.domain.version import SemverVersion
 from docverse.exceptions import NotFoundError
 from docverse.storage.build_store import BuildStore
@@ -42,31 +43,6 @@ def _docverse_version() -> str:
         return version("docverse")
     except PackageNotFoundError:
         return "0.0.0"
-
-
-def _project_published_url(org: Organization, project: Project) -> str:
-    """Best-effort publishing root for a project.
-
-    Subdomain orgs serve each project under ``project.base_domain``;
-    path-prefix orgs serve under ``base_domain + root_path_prefix +
-    project_slug``. Always returns a trailing slash.
-    """
-    base_domain = normalize_base_domain(org.base_domain)
-    if org.url_scheme == UrlScheme.subdomain:
-        return f"https://{project.slug}.{base_domain}/"
-    prefix = org.root_path_prefix or "/"
-    if not prefix.endswith("/"):
-        prefix = f"{prefix}/"
-    if not prefix.startswith("/"):
-        prefix = f"/{prefix}"
-    return f"https://{base_domain}{prefix}{project.slug}/"
-
-
-def _edition_published_url(project_url: str, edition: Edition) -> str:
-    """Public URL for one edition under its project's URL space."""
-    if edition.slug == MAIN_SLUG:
-        return project_url
-    return f"{project_url}v/{edition.slug}/"
 
 
 def _build_context(build: Build | None) -> BuildContext | None:
@@ -90,7 +66,7 @@ def _edition_context(
         kind=edition.kind,
         alternate_name=edition.alternate_name,
         date_updated=edition.date_updated,
-        published_url=_edition_published_url(project_url, edition),
+        published_url=edition_published_url(project_url, edition),
         build=_build_context(build),
     )
 
@@ -197,7 +173,7 @@ class DashboardContextBuilder:
 
         editions = await self._edition_store.list_all_by_project(project_id)
 
-        project_url = _project_published_url(org, project)
+        project_url = project_published_url(org, project)
         edition_contexts: list[EditionContext] = []
         for edition in editions:
             build: Build | None = None
