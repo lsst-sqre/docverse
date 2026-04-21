@@ -1,31 +1,90 @@
 /**
  * URL routing module.
  *
- * Parses incoming HTTP requests into a structured route consisting of
- * project slug, edition name, and file path. Supports two URL schemes:
+ * Parses incoming HTTP requests into a structured route. Supports two
+ * URL schemes:
  *
  * - **Subdomain**: project slug from the leftmost subdomain label of the
- *   Host header; edition and path from the URL path.
+ *   Host header; remaining classification from the URL path.
  * - **Path-prefix**: project slug extracted from the URL path after an
- *   optional configurable root prefix; edition and path from the remaining
- *   path.
+ *   optional configurable root prefix; remaining classification from the
+ *   rest of the path.
  *
- * Edition URL grammar:
- * - `/page.html` or `/` → `__main` edition
- * - `/v/{edition}/page.html` → named edition
+ * A parsed route is a discriminated union on the `kind` field:
+ *
+ * - `{kind: 'edition', project, edition, path}` — a build URL resolved via
+ *   the KV → R2 hot path. `/page.html` or `/` maps to the `__main` edition;
+ *   `/v/{edition}/...` maps to a named edition.
+ * - `{kind: 'dashboard', project}` — the project dashboard page. Matches
+ *   exactly `/v/` and `/v/index.html`.
+ * - `{kind: 'switcher', project}` — the per-project version-switcher JSON.
+ *   Matches exactly `/v/switcher.json`.
+ * - `{kind: 'edition_meta', project, edition}` — per-edition metadata JSON
+ *   (canonical URL, `is_canonical`). Matches exactly
+ *   `/v/{edition}/_docverse.json`, and also `/_docverse.json` at the
+ *   project root (resolved to the `__main` edition). Deeper paths like
+ *   `/v/main/_docverse.json/extra` or `/sub/_docverse.json` fall through
+ *   to edition routing.
  */
 
-/** Result of parsing a request URL. */
-export interface Route {
+/** Edition (build) route — resolved via KV → R2. */
+export interface EditionRoute {
+  kind: "edition";
   /** Project slug (e.g., "pipelines"). */
   project: string;
-
   /** Edition name (e.g., "__main", "v1.0", "main"). */
   edition: string;
-
   /** File path within the edition (e.g., "page.html", "api/index.html"). */
   path: string;
 }
+
+/** Dashboard route — served from `{project}/__dashboard.html` in R2. */
+export interface DashboardRoute {
+  kind: "dashboard";
+  /** Project slug (e.g., "pipelines"). */
+  project: string;
+}
+
+/** Switcher route — served from `{project}/__switcher.json` in R2. */
+export interface SwitcherRoute {
+  kind: "switcher";
+  /** Project slug (e.g., "pipelines"). */
+  project: string;
+}
+
+/**
+ * Edition-metadata route — served from `{project}/__editions/{edition}.json`
+ * in R2. Exposes per-edition metadata (canonical URL, `is_canonical`) at
+ * `/v/{edition}/_docverse.json` so that client-side JS and programmatic
+ * consumers can check canonicality without round-tripping to the API.
+ */
+export interface EditionMetaRoute {
+  kind: "edition_meta";
+  /** Project slug (e.g., "pipelines"). */
+  project: string;
+  /** Edition name (e.g., "main", "v1.0"). */
+  edition: string;
+}
+
+/**
+ * Redirect route — returns a 301 to `to`.
+ *
+ * Used to canonicalize `/v` (no trailing slash) to `/v/` so that relative
+ * links inside the dashboard HTML resolve correctly.
+ */
+export interface RedirectRoute {
+  kind: "redirect";
+  /** Target pathname (absolute, starts with "/"). */
+  to: string;
+}
+
+/** Result of parsing a request URL. */
+export type Route =
+  | EditionRoute
+  | DashboardRoute
+  | SwitcherRoute
+  | EditionMetaRoute
+  | RedirectRoute;
 
 /** Supported URL routing schemes. */
 export type UrlScheme = "subdomain" | "path-prefix";
@@ -59,40 +118,72 @@ export function parseRoute(
 }
 
 /**
- * Parse edition and path from a URL path relative to the project root.
+ * Classify a project-relative path into a Route.
  *
- * Handles the edition URL grammar:
- * - `/v/{edition}/...` → named edition with remaining path
- * - anything else → `__main` edition
+ * Classification order:
+ * 1. Exactly `v` (no trailing slash) → redirect to `requestPathname + "/"`.
+ * 2. `v/` or `v/index.html` → dashboard route.
+ * 3. `v/switcher.json` → switcher route.
+ * 4. `v/{edition}/_docverse.json` (exactly) → edition_meta route.
+ * 5. Anything else starting with `v/` → named-edition route.
+ * 6. Exactly `_docverse.json` at the project root → edition_meta route for
+ *    the `__main` edition. Deeper paths (`_docverse.json/extra`,
+ *    `sub/_docverse.json`) fall through to the `__main` edition file route.
+ * 7. Anything else → `__main`-edition route.
  */
-function parseEditionAndPath(relativePath: string): {
-  edition: string;
-  path: string;
-} {
-  // Remove leading slash
+function classifyRelativePath(
+  project: string,
+  relativePath: string,
+  requestPathname: string,
+): Route {
   const stripped = relativePath.startsWith("/")
     ? relativePath.slice(1)
     : relativePath;
 
-  // Check for /v/{edition}/... pattern
+  if (stripped === "v") {
+    return { kind: "redirect", to: `${requestPathname}/` };
+  }
+
+  if (stripped === "v/" || stripped === "v/index.html") {
+    return { kind: "dashboard", project };
+  }
+
+  if (stripped === "v/switcher.json") {
+    return { kind: "switcher", project };
+  }
+
+  const editionMetaMatch = matchEditionMeta(stripped);
+  if (editionMetaMatch !== null) {
+    return { kind: "edition_meta", project, edition: editionMetaMatch };
+  }
+
+  if (stripped === "_docverse.json") {
+    return { kind: "edition_meta", project, edition: DEFAULT_EDITION };
+  }
+
   if (stripped.startsWith("v/")) {
     const afterV = stripped.slice(2); // after "v/"
     const slashIndex = afterV.indexOf("/");
     if (slashIndex === -1) {
       // Path is exactly "v/{edition}" with no trailing slash
       const edition = afterV || DEFAULT_EDITION;
-      return { edition, path: "" };
+      return { kind: "edition", project, edition, path: "" };
     }
     const edition = afterV.slice(0, slashIndex);
     if (edition === "") {
-      // Path is "v/..." with empty edition — treat as __main
-      return { edition: DEFAULT_EDITION, path: afterV.slice(1) };
+      // Path is "v//..." with empty edition — treat as __main
+      return {
+        kind: "edition",
+        project,
+        edition: DEFAULT_EDITION,
+        path: afterV.slice(1),
+      };
     }
     const path = afterV.slice(slashIndex + 1);
-    return { edition, path };
+    return { kind: "edition", project, edition, path };
   }
 
-  return { edition: DEFAULT_EDITION, path: stripped };
+  return { kind: "edition", project, edition: DEFAULT_EDITION, path: stripped };
 }
 
 function parseSubdomainRoute(request: Request): Route | null {
@@ -111,8 +202,7 @@ function parseSubdomainRoute(request: Request): Route | null {
     return null;
   }
 
-  const { edition, path } = parseEditionAndPath(url.pathname);
-  return { project, edition, path };
+  return classifyRelativePath(project, url.pathname, url.pathname);
 }
 
 function parsePathPrefixRoute(
@@ -143,8 +233,7 @@ function parsePathPrefixRoute(
     if (pathname === "") {
       return null;
     }
-    const { edition, path } = parseEditionAndPath("");
-    return { project: pathname, edition, path };
+    return classifyRelativePath(pathname, "", url.pathname);
   }
 
   const project = pathname.slice(0, slashIndex);
@@ -153,8 +242,28 @@ function parsePathPrefixRoute(
   }
 
   const rest = pathname.slice(slashIndex); // includes leading "/"
-  const { edition, path } = parseEditionAndPath(rest);
-  return { project, edition, path };
+  return classifyRelativePath(project, rest, url.pathname);
+}
+
+/**
+ * If `stripped` matches the exact pattern `v/{edition}/_docverse.json`,
+ * return the edition name. Otherwise return `null`.
+ *
+ * The match requires exactly three path segments (`v`, `{edition}`,
+ * `_docverse.json`) with no trailing content, so `v/main/_docverse.json/extra`
+ * falls through to edition routing and is not silently captured.
+ */
+const EDITION_META_SUFFIX = "/_docverse.json";
+
+function matchEditionMeta(stripped: string): string | null {
+  if (!stripped.startsWith("v/") || !stripped.endsWith(EDITION_META_SUFFIX)) {
+    return null;
+  }
+  const edition = stripped.slice(2, stripped.length - EDITION_META_SUFFIX.length);
+  if (edition === "" || edition.includes("/")) {
+    return null;
+  }
+  return edition;
 }
 
 /**
