@@ -54,6 +54,7 @@ const NOT_FOUND_TEST_PROJECTS = [
   "sqr-112",
   "cache-hit-branded",
   "cache-hit-plain",
+  "rejecting-get404",
 ];
 
 afterEach(async () => {
@@ -1056,6 +1057,39 @@ describe("resolve — branded 404 fallback", () => {
     expect(response.headers.get("Cache-Control")).toBe(
       "public, max-age=60",
     );
+    expect(await response.text()).toBe("Not Found");
+  });
+
+  it("falls back to plain-text Not Found when get404 itself rejects (defensive against contract regression)", async () => {
+    const dashboardRoute: Route = {
+      kind: "dashboard",
+      project: "rejecting-get404",
+    };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore: DashboardStore = {
+      getDashboard: vi.fn(async () => null),
+      getSwitcher: vi.fn(async () => null),
+      getEditionMeta: vi.fn(async () => null),
+      get404: vi.fn(async () => {
+        throw new Error("simulated R2 outage");
+      }),
+    };
+    const request = new Request("https://rejecting-get404.lsst.io/v/");
+
+    const response = await resolve(
+      dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+      ctx,
+    );
+
+    expect(dashboardStore.get404).toHaveBeenCalledWith("rejecting-get404");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
     expect(await response.text()).toBe("Not Found");
   });
 

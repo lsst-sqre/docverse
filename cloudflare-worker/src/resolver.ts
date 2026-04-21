@@ -50,6 +50,13 @@
  * `ctx.waitUntil(caches.default.put(...))` so repeated 404s for the same
  * project don't re-hit R2 within the 60-second TTL. Both the branded and
  * the plain-text fallback branches are cached.
+ *
+ * Defensive against `get404` rejections: `DashboardStore.get404` is
+ * documented as "never throws", but `notFoundResponse` is the last line of
+ * defense for 404 production. The `get404` call is wrapped in a try/catch
+ * so a buggy or future implementation that rejects still degrades to the
+ * plain-text fallback rather than letting a rejection propagate out of the
+ * worker.
  */
 
 import mime from "mime";
@@ -251,7 +258,12 @@ export async function notFoundResponse(
   if (cached !== undefined) {
     return cached;
   }
-  const object = await dashboardStore.get404(project);
+  let object: R2ObjectBody | null;
+  try {
+    object = await dashboardStore.get404(project);
+  } catch {
+    object = null;
+  }
   const response =
     object !== null
       ? new Response(object.body, {
