@@ -79,7 +79,7 @@ async def test_publish_edition_job_with_edition_id(
             data=EditionCreate(
                 slug="qj-ed",
                 title="QJ Ed",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )

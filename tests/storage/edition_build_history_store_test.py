@@ -72,7 +72,7 @@ async def _create_edition_and_builds(
         data=EditionCreate(
             slug=edition_slug,
             title=f"Edition {edition_slug}",
-            kind=EditionKind.main,
+            kind=EditionKind.release,
             tracking_mode=TrackingMode.git_ref,
             tracking_params={"git_ref": "main"},
         ),
@@ -311,7 +311,7 @@ async def test_list_with_build_info_includes_annotations(
             data=EditionCreate(
                 slug="ann-ed",
                 title="Ann Edition",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),

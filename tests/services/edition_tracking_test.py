@@ -171,7 +171,7 @@ async def test_track_build_updates_existing_edition(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -200,7 +200,7 @@ async def test_track_build_stale_skipped(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -425,7 +425,7 @@ async def test_track_build_multiple_matches(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -542,7 +542,7 @@ async def test_track_build_auto_create_race_guard(
             data=EditionCreate(
                 slug="main",
                 title="Pre-existing",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),

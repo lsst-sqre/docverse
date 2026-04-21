@@ -43,7 +43,7 @@ async def test_create_edition(client: AsyncClient) -> None:
         json={
             "slug": "main",
             "title": "Latest",
-            "kind": "main",
+            "kind": "release",
             "tracking_mode": "git_ref",
             "tracking_params": {"git_ref": "main"},
         },
@@ -52,7 +52,7 @@ async def test_create_edition(client: AsyncClient) -> None:
     assert response.status_code == 201
     data = response.json()
     assert data["slug"] == "main"
-    assert data["kind"] == "main"
+    assert data["kind"] == "release"
     assert data["tracking_mode"] == "git_ref"
     assert data["build_url"] is None
     assert data["self_url"].endswith(

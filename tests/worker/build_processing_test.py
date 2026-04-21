@@ -533,7 +533,7 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
             data=EditionCreate(
                 slug="main",
                 title="Main",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),

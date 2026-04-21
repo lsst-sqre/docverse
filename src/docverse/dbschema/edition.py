@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     Index,
@@ -88,6 +89,10 @@ class SqlEdition(Base):
     __table_args__ = (
         UniqueConstraint(
             "project_id", "slug", name="uq_editions_project_slug"
+        ),
+        CheckConstraint(
+            "(kind = 'main') = (slug = '__main')",
+            name="ck_editions_main_slug_kind",
         ),
         Index("idx_editions_project_id", "project_id"),
     )

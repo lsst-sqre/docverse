@@ -155,7 +155,7 @@ async def _setup_publish_scenario(
         data=EditionCreate(
             slug="main",
             title="Latest",
-            kind=EditionKind.main,
+            kind=EditionKind.release,
             tracking_mode=TrackingMode.git_ref,
             tracking_params={"git_ref": "main"},
         ),
