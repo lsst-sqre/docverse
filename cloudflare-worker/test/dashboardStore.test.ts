@@ -201,3 +201,86 @@ describe("DashboardStore.get404", () => {
     await expect(store.get404("sqr-112")).resolves.toBeNull();
   });
 });
+
+describe("DashboardStore logging on R2 error", () => {
+  function rejectingR2(message: string): R2Bucket {
+    return {
+      get: vi.fn(async () => {
+        throw new Error(message);
+      }),
+    } as unknown as R2Bucket;
+  }
+
+  it.each([
+    [
+      "getDashboard",
+      "sqr-112/__dashboard.html",
+      (s: ReturnType<typeof createDashboardStore>) => s.getDashboard("sqr-112"),
+    ],
+    [
+      "getSwitcher",
+      "sqr-112/__switcher.json",
+      (s: ReturnType<typeof createDashboardStore>) => s.getSwitcher("sqr-112"),
+    ],
+    [
+      "getEditionMeta",
+      "sqr-112/__editions/main.json",
+      (s: ReturnType<typeof createDashboardStore>) =>
+        s.getEditionMeta("sqr-112", "main"),
+    ],
+    [
+      "get404",
+      "sqr-112/__404.html",
+      (s: ReturnType<typeof createDashboardStore>) => s.get404("sqr-112"),
+    ],
+  ])(
+    "%s emits a structured console.warn with {event, key, error} on R2 rejection",
+    async (_name, expectedKey, call) => {
+      const warnSpy = vi
+        .spyOn(console, "warn")
+        .mockImplementation(() => undefined);
+      const store = createDashboardStore(rejectingR2("boom"));
+
+      await call(store);
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(warnSpy.mock.calls[0][0] as string);
+      expect(payload).toEqual({
+        event: "dashboard_store_r2_error",
+        key: expectedKey,
+        error: "Error: boom",
+      });
+      warnSpy.mockRestore();
+    },
+  );
+
+  it("does not log on hit", async () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const r2 = createMockR2({
+      "sqr-112/__dashboard.html": {
+        body: streamFromString("<html>dashboard</html>"),
+        size: 22,
+      },
+    });
+    const store = createDashboardStore(r2);
+
+    await store.getDashboard("sqr-112");
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("does not log on plain miss", async () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const store = createDashboardStore(createMockR2({}));
+
+    await store.getDashboard("sqr-112");
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+});

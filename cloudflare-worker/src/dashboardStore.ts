@@ -58,7 +58,14 @@ export function createDashboardStore(r2: R2Bucket): DashboardStore {
   const safeGet = async (key: string): Promise<R2ObjectBody | null> => {
     try {
       return await r2.get(key);
-    } catch {
+    } catch (err) {
+      console.warn(
+        JSON.stringify({
+          event: "dashboard_store_r2_error",
+          key,
+          error: String(err),
+        }),
+      );
       return null;
     }
   };
