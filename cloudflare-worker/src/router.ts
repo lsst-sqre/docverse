@@ -37,8 +37,20 @@ export interface DashboardRoute {
   project: string;
 }
 
+/**
+ * Redirect route — returns a 301 to `to`.
+ *
+ * Used to canonicalize `/v` (no trailing slash) to `/v/` so that relative
+ * links inside the dashboard HTML resolve correctly.
+ */
+export interface RedirectRoute {
+  kind: "redirect";
+  /** Target pathname (absolute, starts with "/"). */
+  to: string;
+}
+
 /** Result of parsing a request URL. */
-export type Route = EditionRoute | DashboardRoute;
+export type Route = EditionRoute | DashboardRoute | RedirectRoute;
 
 /** Supported URL routing schemes. */
 export type UrlScheme = "subdomain" | "path-prefix";
@@ -75,14 +87,23 @@ export function parseRoute(
  * Classify a project-relative path into a Route.
  *
  * Classification order:
- * 1. `v/` or `v/index.html` → dashboard route.
- * 2. Anything else starting with `v/` → named-edition route.
- * 3. Anything else → `__main`-edition route.
+ * 1. Exactly `v` (no trailing slash) → redirect to `requestPathname + "/"`.
+ * 2. `v/` or `v/index.html` → dashboard route.
+ * 3. Anything else starting with `v/` → named-edition route.
+ * 4. Anything else → `__main`-edition route.
  */
-function classifyRelativePath(project: string, relativePath: string): Route {
+function classifyRelativePath(
+  project: string,
+  relativePath: string,
+  requestPathname: string,
+): Route {
   const stripped = relativePath.startsWith("/")
     ? relativePath.slice(1)
     : relativePath;
+
+  if (stripped === "v") {
+    return { kind: "redirect", to: `${requestPathname}/` };
+  }
 
   if (stripped === "v/" || stripped === "v/index.html") {
     return { kind: "dashboard", project };
@@ -129,7 +150,7 @@ function parseSubdomainRoute(request: Request): Route | null {
     return null;
   }
 
-  return classifyRelativePath(project, url.pathname);
+  return classifyRelativePath(project, url.pathname, url.pathname);
 }
 
 function parsePathPrefixRoute(
@@ -160,7 +181,7 @@ function parsePathPrefixRoute(
     if (pathname === "") {
       return null;
     }
-    return classifyRelativePath(pathname, "");
+    return classifyRelativePath(pathname, "", url.pathname);
   }
 
   const project = pathname.slice(0, slashIndex);
@@ -169,7 +190,7 @@ function parsePathPrefixRoute(
   }
 
   const rest = pathname.slice(slashIndex); // includes leading "/"
-  return classifyRelativePath(project, rest);
+  return classifyRelativePath(project, rest, url.pathname);
 }
 
 /**

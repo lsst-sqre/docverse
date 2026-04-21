@@ -16,6 +16,9 @@
  *   encapsulates the `__`-prefixed R2 key layout. The response body is the
  *   R2 object with `Content-Type: text/html; charset=utf-8` and
  *   `Cache-Control: public, max-age=60`.
+ *
+ * - `redirect` routes return a 301 with `Location` set to `route.to` on the
+ *   request's origin, preserving the original query string.
  */
 
 import mime from "mime";
@@ -39,11 +42,19 @@ export async function resolve(
   dashboardStore: DashboardStore,
 ): Promise<Response> {
   switch (route.kind) {
+    case "redirect":
+      return resolveRedirect(route.to, request);
     case "dashboard":
       return resolveDashboard(route.project, dashboardStore);
     case "edition":
       return resolveEdition(route, request, kv, r2);
   }
+}
+
+function resolveRedirect(to: string, request: Request): Response {
+  const url = new URL(request.url);
+  url.pathname = to;
+  return Response.redirect(url.toString(), 301);
 }
 
 async function resolveDashboard(

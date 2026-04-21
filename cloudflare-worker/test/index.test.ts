@@ -176,6 +176,17 @@ describe("Worker integration — subdomain routing", () => {
     );
     expect(await response.text()).toBe("<html>dashboard</html>");
   });
+
+  it("301-redirects /v (no trailing slash) to /v/", async () => {
+    const response = await SELF.fetch("https://sqr-112.lsst.io/v", {
+      redirect: "manual",
+    });
+
+    expect(response.status).toBe(301);
+    expect(new URL(response.headers.get("Location") ?? "").pathname).toBe(
+      "/v/",
+    );
+  });
 });
 
 describe("Worker integration — path-prefix routing", () => {

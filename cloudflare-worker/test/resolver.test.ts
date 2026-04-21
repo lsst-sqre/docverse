@@ -470,3 +470,75 @@ describe("resolve — dashboard routes", () => {
     expect(response.headers.get("Content-Type")).toBe("text/plain");
   });
 });
+
+describe("resolve — redirect routes", () => {
+  it("returns a 301 with Location set to the redirect target", async () => {
+    const redirectRoute: Route = { kind: "redirect", to: "/v/" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://sqr-112.lsst.io/v");
+
+    const response = await resolve(
+      redirectRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(301);
+    expect(new URL(response.headers.get("Location") ?? "").pathname).toBe(
+      "/v/",
+    );
+    // Edition / dashboard paths must not be touched for redirect dispatch.
+    expect(kv.get).not.toHaveBeenCalled();
+    expect(r2.get).not.toHaveBeenCalled();
+    expect(dashboardStore.getDashboard).not.toHaveBeenCalled();
+  });
+
+  it("preserves query string on redirect", async () => {
+    const redirectRoute: Route = { kind: "redirect", to: "/v/" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://sqr-112.lsst.io/v?foo=bar&baz=1");
+
+    const response = await resolve(
+      redirectRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(301);
+    const location = new URL(response.headers.get("Location") ?? "");
+    expect(location.pathname).toBe("/v/");
+    expect(location.search).toBe("?foo=bar&baz=1");
+  });
+
+  it("redirects under path-prefix scheme target", async () => {
+    const redirectRoute: Route = {
+      kind: "redirect",
+      to: "/docs/sqr-112/v/",
+    };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://docs.example.com/docs/sqr-112/v");
+
+    const response = await resolve(
+      redirectRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(301);
+    expect(new URL(response.headers.get("Location") ?? "").pathname).toBe(
+      "/docs/sqr-112/v/",
+    );
+  });
+});

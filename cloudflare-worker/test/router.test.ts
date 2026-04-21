@@ -163,6 +163,17 @@ describe("Subdomain routing", () => {
       path: "extra",
     });
   });
+
+  it("classifies /v (no trailing slash) as a redirect to /v/", () => {
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "redirect",
+      to: "/v/",
+    });
+  });
 });
 
 describe("Path-prefix routing", () => {
@@ -304,6 +315,17 @@ describe("Path-prefix routing", () => {
         path: "extra",
       });
     });
+
+    it("classifies /{project}/v (no trailing slash) as a redirect", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/v"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "redirect",
+        to: "/sqr-112/v/",
+      });
+    });
   });
 
   describe("with root prefix", () => {
@@ -420,6 +442,18 @@ describe("Path-prefix routing", () => {
       expect(route).toEqual({
         kind: "dashboard",
         project: "sqr-112",
+      });
+    });
+
+    it("classifies /docs/{project}/v (no trailing slash) as a redirect", () => {
+      const route = parseRoute(
+        makeRequest("https://example.com/docs/sqr-112/v"),
+        scheme,
+        prefix,
+      );
+      expect(route).toEqual({
+        kind: "redirect",
+        to: "/docs/sqr-112/v/",
       });
     });
   });
