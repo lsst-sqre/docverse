@@ -72,6 +72,24 @@ class ProjectStore:
             return None
         return Project.model_validate(row)
 
+    async def list_all_by_org(self, org_id: int) -> list[Project]:
+        """List every non-deleted project for an organization.
+
+        Used by bulk operations (e.g. org-wide dashboard rebuild) where
+        every project is processed in a single request and pagination
+        would only complicate the caller. Ordered by slug ascending for
+        stable iteration.
+        """
+        result = await self._session.execute(
+            select(SqlProject)
+            .where(
+                SqlProject.org_id == org_id,
+                SqlProject.date_deleted.is_(None),
+            )
+            .order_by(SqlProject.slug.asc())
+        )
+        return [Project.model_validate(row) for row in result.scalars().all()]
+
     async def list_by_org(
         self,
         org_id: int,

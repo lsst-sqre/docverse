@@ -7,10 +7,13 @@ import structlog
 from safir.arq import ArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import Configuration
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
+from .services.dashboard.enqueue import DashboardBuildEnqueuer
+from .services.dashboard.publisher import DashboardPublisher
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_tracking import EditionTrackingService
@@ -237,6 +240,40 @@ class Factory:
                 session=self._session, logger=self._logger
             ),
             publisher_provider=self.create_edition_publisher_for_org,
+            logger=self._logger,
+        )
+
+    def create_dashboard_build_enqueuer(
+        self,
+    ) -> DashboardBuildEnqueuer:
+        """Create a DashboardBuildEnqueuer."""
+        return DashboardBuildEnqueuer(
+            org_store=self._create_org_store(),
+            project_store=self._create_project_store(),
+            queue_backend=self.create_queue_backend(),
+            queue_job_store=self.create_queue_job_store(),
+            logger=self._logger,
+        )
+
+    def create_dashboard_publisher(
+        self, *, config: Configuration
+    ) -> DashboardPublisher:
+        """Create a DashboardPublisher for one render.
+
+        Parameters
+        ----------
+        config
+            Application configuration. Passed in explicitly so tests can
+            inject a fake URL rather than relying on env vars.
+        """
+        return DashboardPublisher(
+            org_store=self._create_org_store(),
+            project_store=self._create_project_store(),
+            edition_store=EditionStore(
+                session=self._session, logger=self._logger
+            ),
+            build_store=BuildStore(session=self._session, logger=self._logger),
+            config=config,
             logger=self._logger,
         )
 

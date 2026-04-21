@@ -388,6 +388,11 @@ async def test_create_project_has_default_edition(
     assert edition["self_url"].endswith(
         "/orgs/proj-org/projects/default-ed/editions/__main"
     )
+    # default_edition is the __main edition so its published_url is the
+    # project publishing root (no v/{slug}/ suffix).
+    assert edition["published_url"] == (
+        "https://default-ed.proj-org.example.com/"
+    )
 
 
 @pytest.mark.asyncio
@@ -440,6 +445,9 @@ async def test_get_project_includes_default_edition(
     edition = response.json()["default_edition"]
     assert edition is not None
     assert edition["slug"] == "__main"
+    assert edition["published_url"] == (
+        "https://get-ed-proj.proj-org.example.com/"
+    )
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,9 @@ from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.dashboard.enqueue import (
+    try_enqueue_dashboard_build_by_id,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -53,8 +56,8 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         arq worker context.
     payload
         Job payload with ``org_id``, ``project_slug``, ``edition_id``,
-        ``edition_slug``, ``build_id``, ``build_public_id``, and
-        ``queue_job_id``.
+        ``edition_slug``, ``build_id``, ``build_public_id``,
+        ``queue_job_id``, and ``queue_job_public_id``.
 
     Returns
     -------
@@ -67,7 +70,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         project=payload["project_slug"],
         edition=payload["edition_slug"],
         build=payload["build_public_id"],
-        queue_job_id=payload["queue_job_id"],
+        queue_job_id=payload["queue_job_public_id"],
     )
 
     encryptor: CredentialEncryptor = ctx["encryptor"]
@@ -126,6 +129,13 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         async with session.begin():
             await queue_job_store.complete(queue_job_id)
         logger.info("Edition publish completed")
+        await try_enqueue_dashboard_build_by_id(
+            factory=factory,
+            session=session,
+            logger=logger,
+            org_id=payload["org_id"],
+            project_id=resources.edition.project_id,
+        )
         return "completed"
 
     msg = "No database session available"

@@ -39,6 +39,15 @@ class Edition(BaseModel):
         description="Parameters for the tracking mode.",
     )
 
+    alternate_name: str | None = Field(
+        default=None,
+        description=(
+            "Deployment variant scope for the edition (e.g., 'usdf-dev'). "
+            "Populated for deployment-scoped tracking rules; ``None`` for "
+            "all other editions."
+        ),
+    )
+
     current_build_id: int | None = Field(
         default=None,
         description="ID of the currently published build.",

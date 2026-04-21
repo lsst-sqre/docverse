@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from .builds import router as builds_router
 from .credentials import router as credentials_router
+from .dashboard import router as dashboard_router
 from .editions import router as editions_router
 from .members import router as members_router
 from .organizations import router as organizations_router
@@ -18,5 +19,6 @@ orgs_router.include_router(editions_router, tags=["projects"])
 orgs_router.include_router(members_router, tags=["orgs"])
 orgs_router.include_router(credentials_router, tags=["orgs"])
 orgs_router.include_router(services_router, tags=["orgs"])
+orgs_router.include_router(dashboard_router, tags=["projects"])
 
 __all__ = ["orgs_router"]

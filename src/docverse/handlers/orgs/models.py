@@ -8,6 +8,9 @@ from starlette.requests import Request
 
 from docverse.client.models import Build as _BuildBase
 from docverse.client.models import (
+    DashboardRebuildResponse as _DashboardRebuildResponseBase,
+)
+from docverse.client.models import (
     DefaultEditionConfig,
     OrganizationServiceSummary,
 )
@@ -21,6 +24,9 @@ from docverse.client.models import (
 )
 from docverse.client.models import (
     OrganizationService as _OrganizationServiceBase,
+)
+from docverse.client.models import (
+    OrgDashboardRebuildEntry as _OrgDashboardRebuildEntryBase,
 )
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
@@ -39,6 +45,11 @@ from docverse.domain.organization_service import (
     OrganizationService as OrganizationServiceDomain,
 )
 from docverse.domain.project import Project as ProjectDomain
+from docverse.domain.published_url import (
+    edition_published_url,
+    project_published_url,
+)
+from docverse.domain.queue import QueueJob as QueueJobDomain
 
 
 class Organization(_OrganizationBase):
@@ -133,36 +144,43 @@ class Project(_ProjectBase):
         cls,
         domain: ProjectDomain,
         request: Request,
-        org_slug: str,
+        org: OrganizationDomain,
         *,
         default_edition: EditionDomain | None = None,
     ) -> Self:
         """Create from a domain object, adding HATEOAS URLs."""
         edition_response = None
         if default_edition is not None:
+            project_url = project_published_url(org, domain)
             edition_response = Edition.from_domain(
-                default_edition, request, org_slug, domain.slug
+                default_edition,
+                request,
+                org.slug,
+                domain.slug,
+                published_url=edition_published_url(
+                    project_url, default_edition
+                ),
             )
         return cls(
             self_url=str(
                 request.url_for(
                     "get_project",
-                    org=org_slug,
+                    org=org.slug,
                     project=domain.slug,
                 )
             ),
-            org_url=str(request.url_for("get_organization", org=org_slug)),
+            org_url=str(request.url_for("get_organization", org=org.slug)),
             editions_url=str(
                 request.url_for(
                     "get_editions",
-                    org=org_slug,
+                    org=org.slug,
                     project=domain.slug,
                 )
             ),
             builds_url=str(
                 request.url_for(
                     "get_builds",
-                    org=org_slug,
+                    org=org.slug,
                     project=domain.slug,
                 )
             ),
@@ -381,6 +399,44 @@ class OrganizationCredentialResponse(_OrganizationCredentialBase):
             provider=domain.provider,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
+        )
+
+
+class DashboardRebuildResponse(_DashboardRebuildResponseBase):
+    """Dashboard rebuild response with HATEOAS URL."""
+
+    @classmethod
+    def from_queue_job(
+        cls, queue_job: QueueJobDomain, request: Request
+    ) -> Self:
+        """Create from a domain queue job, adding the queue_job_url."""
+        queue_job_id = serialize_base32_id(queue_job.public_id)
+        return cls(
+            queue_job_id=queue_job_id,
+            queue_job_url=str(
+                request.url_for("get_queue_job", job=queue_job_id)
+            ),
+        )
+
+
+class OrgDashboardRebuildEntry(_OrgDashboardRebuildEntryBase):
+    """Org-wide dashboard rebuild entry with HATEOAS URL."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        project: ProjectDomain,
+        queue_job: QueueJobDomain,
+        request: Request,
+    ) -> Self:
+        """Create from a domain project + queue job, adding queue_job_url."""
+        queue_job_id = serialize_base32_id(queue_job.public_id)
+        return cls(
+            project_slug=project.slug,
+            queue_job_id=queue_job_id,
+            queue_job_url=str(
+                request.url_for("get_queue_job", job=queue_job_id)
+            ),
         )
 
 

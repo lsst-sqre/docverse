@@ -10,6 +10,8 @@ from docverse.client.models.queue_enums import JobKind, PublishStatus
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
+from docverse.domain.organization import Organization
+from docverse.domain.project import Project
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -47,10 +49,10 @@ class EditionService:
         self._queue_backend = queue_backend
         self._queue_job_store = queue_job_store
 
-    async def _resolve_project_id(
+    async def _resolve_org_project(
         self, org_slug: str, project_slug: str
-    ) -> int:
-        """Resolve org slug + project slug to a project internal ID."""
+    ) -> tuple[Organization, Project]:
+        """Resolve org + project slugs to their domain objects."""
         org = await self._org_store.get_by_slug(org_slug)
         if org is None:
             msg = f"Organization {org_slug!r} not found"
@@ -61,7 +63,7 @@ class EditionService:
         if project is None:
             msg = f"Project {project_slug!r} not found"
             raise NotFoundError(msg)
-        return project.id
+        return org, project
 
     async def create(
         self,
@@ -69,7 +71,7 @@ class EditionService:
         org_slug: str,
         project_slug: str,
         data: EditionCreate,
-    ) -> Edition:
+    ) -> tuple[Organization, Project, Edition]:
         """Create a new edition.
 
         Raises
@@ -77,21 +79,21 @@ class EditionService:
         ConflictError
             If an edition with the same slug already exists.
         """
-        project_id = await self._resolve_project_id(org_slug, project_slug)
+        org, project = await self._resolve_org_project(org_slug, project_slug)
         existing = await self._store.get_by_slug(
-            project_id=project_id, slug=data.slug
+            project_id=project.id, slug=data.slug
         )
         if existing is not None:
             msg = f"Edition with slug {data.slug!r} already exists"
             raise ConflictError(msg)
-        edition = await self._store.create(project_id=project_id, data=data)
+        edition = await self._store.create(project_id=project.id, data=data)
         self._logger.info(
             "Created edition",
             slug=data.slug,
             org=org_slug,
             project=project_slug,
         )
-        return edition
+        return org, project, edition
 
     async def get_by_slug(
         self,
@@ -99,7 +101,7 @@ class EditionService:
         org_slug: str,
         project_slug: str,
         slug: str,
-    ) -> Edition:
+    ) -> tuple[Organization, Project, Edition]:
         """Get an edition by slug within a project.
 
         Raises
@@ -107,14 +109,14 @@ class EditionService:
         NotFoundError
             If the edition is not found.
         """
-        project_id = await self._resolve_project_id(org_slug, project_slug)
+        org, project = await self._resolve_org_project(org_slug, project_slug)
         edition = await self._store.get_by_slug(
-            project_id=project_id, slug=slug
+            project_id=project.id, slug=slug
         )
         if edition is None:
             msg = f"Edition {slug!r} not found"
             raise NotFoundError(msg)
-        return edition
+        return org, project, edition
 
     async def list_by_project(  # noqa: PLR0913
         self,
@@ -125,16 +127,21 @@ class EditionService:
         cursor: PaginationCursor[Edition] | None = None,
         limit: int,
         kind: EditionKind | None = None,
-    ) -> CountedPaginatedList[Edition, PaginationCursor[Edition]]:
+    ) -> tuple[
+        Organization,
+        Project,
+        CountedPaginatedList[Edition, PaginationCursor[Edition]],
+    ]:
         """List all editions for a project."""
-        project_id = await self._resolve_project_id(org_slug, project_slug)
-        return await self._store.list_by_project(
-            project_id,
+        org, project = await self._resolve_org_project(org_slug, project_slug)
+        result = await self._store.list_by_project(
+            project.id,
             cursor_type=cursor_type,
             cursor=cursor,
             limit=limit,
             kind=kind,
         )
+        return org, project, result
 
     async def update(
         self,
@@ -143,7 +150,7 @@ class EditionService:
         project_slug: str,
         slug: str,
         data: EditionUpdate,
-    ) -> Edition:
+    ) -> tuple[Organization, Project, Edition]:
         """Update an edition.
 
         If ``data.build`` is set, apply an emergency build override: point
@@ -157,17 +164,7 @@ class EditionService:
         NotFoundError
             If the edition or target build is not found.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        project = await self._project_store.get_by_slug(
-            org_id=org.id, slug=project_slug
-        )
-        if project is None:
-            msg = f"Project {project_slug!r} not found"
-            raise NotFoundError(msg)
-        project_id = project.id
+        org, project = await self._resolve_org_project(org_slug, project_slug)
 
         build_public_id = data.build
         other_updates = EditionUpdate.model_validate(
@@ -175,7 +172,7 @@ class EditionService:
         )
 
         edition = await self._store.update(
-            project_id=project_id, slug=slug, data=other_updates
+            project_id=project.id, slug=slug, data=other_updates
         )
         if edition is None:
             msg = f"Edition {slug!r} not found"
@@ -184,7 +181,7 @@ class EditionService:
         if build_public_id is not None:
             edition = await self._apply_build_override(
                 org_id=org.id,
-                project_id=project_id,
+                project_id=project.id,
                 project_slug=project_slug,
                 edition=edition,
                 build_public_id=build_public_id,
@@ -193,7 +190,7 @@ class EditionService:
         self._logger.info(
             "Updated edition", slug=slug, org=org_slug, project=project_slug
         )
-        return edition
+        return org, project, edition
 
     async def _apply_build_override(
         self,
@@ -252,6 +249,9 @@ class EditionService:
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
                 "queue_job_id": child_job.id,
+                "queue_job_public_id": serialize_base32_id(
+                    child_job.public_id
+                ),
             },
         )
 
@@ -308,9 +308,9 @@ class EditionService:
         EditionBuildHistoryPositionCursor,
     ]:
         """List build history for an edition."""
-        project_id = await self._resolve_project_id(org_slug, project_slug)
+        _, project = await self._resolve_org_project(org_slug, project_slug)
         edition = await self._store.get_by_slug(
-            project_id=project_id, slug=edition_slug
+            project_id=project.id, slug=edition_slug
         )
         if edition is None:
             msg = f"Edition {edition_slug!r} not found"
@@ -329,7 +329,7 @@ class EditionService:
         project_slug: str,
         edition_slug: str,
         build_public_id: str,
-    ) -> Edition:
+    ) -> tuple[Organization, Project, Edition]:
         """Roll back an edition to a previously-recorded build.
 
         Parameters
@@ -348,20 +348,10 @@ class EditionService:
         NotFoundError
             If the edition, build, or history entry is not found.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        project = await self._project_store.get_by_slug(
-            org_id=org.id, slug=project_slug
-        )
-        if project is None:
-            msg = f"Project {project_slug!r} not found"
-            raise NotFoundError(msg)
-        project_id = project.id
+        org, project = await self._resolve_org_project(org_slug, project_slug)
 
         edition = await self._store.get_by_slug(
-            project_id=project_id, slug=edition_slug
+            project_id=project.id, slug=edition_slug
         )
         if edition is None:
             msg = f"Edition {edition_slug!r} not found"
@@ -370,7 +360,7 @@ class EditionService:
         public_id = parse_base32_id(build_public_id, resource="build")
 
         build = await self._build_store.get_by_public_id(
-            project_id=project_id, public_id=public_id
+            project_id=project.id, public_id=public_id
         )
         if build is None:
             msg = f"Build {build_public_id!r} not found"
@@ -407,7 +397,7 @@ class EditionService:
         child_job = await self._queue_job_store.create(
             kind=JobKind.publish_edition,
             org_id=org.id,
-            project_id=project_id,
+            project_id=project.id,
             build_id=build.id,
             edition_id=edition.id,
         )
@@ -421,6 +411,9 @@ class EditionService:
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
                 "queue_job_id": child_job.id,
+                "queue_job_public_id": serialize_base32_id(
+                    child_job.public_id
+                ),
             },
         )
 
@@ -435,7 +428,7 @@ class EditionService:
             ),
             publish_backend_job_id=backend_job_id,
         )
-        return updated_edition
+        return org, project, updated_edition
 
     async def soft_delete(
         self, *, org_slug: str, project_slug: str, slug: str
@@ -447,9 +440,9 @@ class EditionService:
         NotFoundError
             If the edition is not found.
         """
-        project_id = await self._resolve_project_id(org_slug, project_slug)
+        _, project = await self._resolve_org_project(org_slug, project_slug)
         deleted = await self._store.soft_delete(
-            project_id=project_id, slug=slug
+            project_id=project.id, slug=slug
         )
         if not deleted:
             msg = f"Edition {slug!r} not found"

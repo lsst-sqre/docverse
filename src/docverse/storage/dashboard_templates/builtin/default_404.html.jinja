@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Not found — {{ project.title }}</title>
+<meta name="generator" content="docverse {{ docverse.version }}">
+<meta name="docverse:rendered-at" content="{{ rendered_at.isoformat() }}">
+<style>
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 4rem auto;
+  max-width: 32rem;
+  color: #222;
+  text-align: center;
+}
+h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+p { color: #555; margin: 0.75rem 0; }
+a { color: #1d4ed8; }
+</style>
+</head>
+<body>
+<h1>404 &mdash; Not found</h1>
+<p>The page you requested doesn&rsquo;t exist in <strong>{{ project.title }}</strong>.</p>
+<p><a href="{{ project.published_url }}v/">Browse all editions of {{ project.title }} &rarr;</a></p>
+</body>
+</html>

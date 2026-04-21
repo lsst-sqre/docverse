@@ -12,6 +12,7 @@ dependencies = [
     "docverse-client",
     "fastapi>=0.115",
     "httpx",
+    "jinja2>=3.1",
     "pydantic>=2",
     "pydantic-settings>=2",
     "base32-lib",
@@ -75,6 +76,21 @@ fallback_version = "0.0.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"docverse.storage.dashboard_templates.builtin" = [
+    "*.toml",
+    "*.jinja",
+    "*.html",
+    "*.css",
+    "*.js",
+    "*.svg",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.webp",
+]
 
 [tool.ruff]
 extend = "ruff-shared.toml"

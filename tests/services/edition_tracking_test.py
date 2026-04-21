@@ -171,7 +171,7 @@ async def test_track_build_updates_existing_edition(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -200,7 +200,7 @@ async def test_track_build_stale_skipped(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -316,6 +316,79 @@ async def test_track_build_alternate_name(
 
 
 @pytest.mark.asyncio
+async def test_track_build_alternate_name_populates_column(
+    db_session: AsyncSession,
+) -> None:
+    """Auto-create alt-mode edition populates the alternate_name column."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alt-col-org")
+        build = await _create_build(
+            db_session, project.id, git_ref="main", alternate_name="usdf-dev"
+        )
+
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="usdf-dev--main"
+        )
+        assert edition is not None
+        assert edition.alternate_name == "usdf-dev"
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_alternate_name_backfills_existing_edition(
+    db_session: AsyncSession,
+) -> None:
+    """Tracking an existing alt-mode edition backfills NULL alternate_name.
+
+    Pre-existing rows from before the column was introduced are left
+    NULL by the migration. The next tracking event on a deployment-scoped
+    rule populates the column from the build.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alt-backfill-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        # Pre-create the alt-mode edition without the column populated.
+        existing = await edition_store.create_internal(
+            project_id=project.id,
+            slug="usdf-dev--main",
+            title="usdf-dev--main",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.alternate_git_ref,
+            tracking_params={
+                "git_ref": "main",
+                "alternate_name": "usdf-dev",
+            },
+        )
+        # Sanity check: existing edition has no alternate_name yet.
+        assert existing.alternate_name is None
+
+        build = await _create_build(
+            db_session, project.id, git_ref="main", alternate_name="usdf-dev"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert len(result.outcomes) == 1
+    assert result.outcomes[0].action == "updated"
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="usdf-dev--main"
+        )
+        assert edition is not None
+        assert edition.alternate_name == "usdf-dev"
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
 async def test_track_build_invalid_slug(
     db_session: AsyncSession,
 ) -> None:
@@ -352,7 +425,7 @@ async def test_track_build_multiple_matches(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -469,7 +542,7 @@ async def test_track_build_auto_create_race_guard(
             data=EditionCreate(
                 slug="main",
                 title="Pre-existing",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),

@@ -129,7 +129,7 @@ async def test_edition_kind_filter(
     await _create_project(client, "ed-filt-proj")
     await _create_edition(client, "ed-filt-proj", "ed-draft-1", "draft")
     await _create_edition(client, "ed-filt-proj", "ed-draft-2", "draft")
-    await _create_edition(client, "ed-filt-proj", "ed-main", "main")
+    await _create_edition(client, "ed-filt-proj", "ed-rel", "release")
 
     # Unfiltered (3 explicit + 1 auto-created __main)
     resp = await client.get(

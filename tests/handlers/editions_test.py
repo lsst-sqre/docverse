@@ -43,7 +43,7 @@ async def test_create_edition(client: AsyncClient) -> None:
         json={
             "slug": "main",
             "title": "Latest",
-            "kind": "main",
+            "kind": "release",
             "tracking_mode": "git_ref",
             "tracking_params": {"git_ref": "main"},
         },
@@ -52,7 +52,7 @@ async def test_create_edition(client: AsyncClient) -> None:
     assert response.status_code == 201
     data = response.json()
     assert data["slug"] == "main"
-    assert data["kind"] == "main"
+    assert data["kind"] == "release"
     assert data["tracking_mode"] == "git_ref"
     assert data["build_url"] is None
     assert data["self_url"].endswith(
@@ -63,6 +63,11 @@ async def test_create_edition(client: AsyncClient) -> None:
     )
     assert data["rollback_url"].endswith(
         "/orgs/ed-org/projects/ed-proj/editions/main/rollback"
+    )
+    # Non-main edition: published_url appends v/{slug}/ under the
+    # project publishing root.
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/main/"
     )
 
 
@@ -115,6 +120,9 @@ async def test_get_edition(client: AsyncClient) -> None:
     assert data["rollback_url"].endswith(
         "/orgs/ed-org/projects/ed-proj/editions/get-ed/rollback"
     )
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/get-ed/"
+    )
 
 
 @pytest.mark.asyncio
@@ -136,7 +144,11 @@ async def test_update_edition(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 200
-    assert response.json()["title"] == "Updated"
+    data = response.json()
+    assert data["title"] == "Updated"
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/upd-ed/"
+    )
 
 
 @pytest.mark.asyncio
@@ -177,6 +189,8 @@ async def test_get_default_edition(client: AsyncClient) -> None:
     data = response.json()
     assert data["slug"] == "__main"
     assert data["kind"] == "main"
+    # __main surfaces as the project publishing root (no v/{slug}/ suffix).
+    assert data["published_url"] == "https://ed-proj.ed-org.example.com/"
 
 
 @pytest.mark.asyncio

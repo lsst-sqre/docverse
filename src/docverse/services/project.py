@@ -66,7 +66,7 @@ class ProjectService:
 
     async def create(
         self, *, org_slug: str, data: ProjectCreate
-    ) -> tuple[Project, Edition]:
+    ) -> tuple[Organization, Project, Edition]:
         """Create a new project with its default ``__main`` edition.
 
         Raises
@@ -95,9 +95,11 @@ class ProjectService:
         )
 
         self._logger.info("Created project", slug=data.slug, org=org_slug)
-        return project, default_edition
+        return org, project, default_edition
 
-    async def get_by_slug(self, *, org_slug: str, slug: str) -> Project:
+    async def get_by_slug(
+        self, *, org_slug: str, slug: str
+    ) -> tuple[Organization, Project]:
         """Get a project by slug within an organization.
 
         Raises
@@ -110,7 +112,7 @@ class ProjectService:
         if project is None:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
-        return project
+        return org, project
 
     async def get_default_edition(self, project_id: int) -> Edition | None:
         """Fetch the ``__main`` edition for a project."""
@@ -126,26 +128,31 @@ class ProjectService:
         cursor_type: type[PaginationCursor[Project]] | None = None,
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
-    ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
+    ) -> tuple[
+        Organization,
+        CountedPaginatedList[Project, PaginationCursor[Project]],
+    ]:
         """List all projects for an organization."""
         org = await self._resolve_org(org_slug)
         if query is not None:
             search_cursor = (
                 cursor if isinstance(cursor, ProjectSearchCursor) else None
             )
-            return await self._store.search_by_org(
+            result = await self._store.search_by_org(
                 org.id, query=query, limit=limit, cursor=search_cursor
             )
+            return org, result
         if cursor_type is None:
             msg = "cursor_type is required when query is not set"
             raise RuntimeError(msg)
-        return await self._store.list_by_org(
+        result = await self._store.list_by_org(
             org.id, cursor_type=cursor_type, cursor=cursor, limit=limit
         )
+        return org, result
 
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate
-    ) -> Project:
+    ) -> tuple[Organization, Project]:
         """Update a project.
 
         Raises
@@ -159,7 +166,7 @@ class ProjectService:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
         self._logger.info("Updated project", slug=slug, org=org_slug)
-        return project
+        return org, project
 
     async def soft_delete(self, *, org_slug: str, slug: str) -> None:
         """Soft-delete a project.

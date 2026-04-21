@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -75,14 +76,14 @@ async def test_create_edition(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
         )
         await db_session.commit()
     assert edition.slug == "main"
-    assert edition.kind == EditionKind.main
+    assert edition.kind == EditionKind.release
     assert edition.tracking_mode == TrackingMode.git_ref
     assert edition.current_build_id is None
     assert edition.current_build_public_id is None
@@ -102,7 +103,7 @@ async def test_edition_publish_status_persists(
             data=EditionCreate(
                 slug="pub-ed",
                 title="Pub",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
@@ -153,7 +154,7 @@ async def test_list_by_project(
             data=EditionCreate(
                 slug="ed-aa",
                 title="A",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
@@ -224,7 +225,7 @@ async def test_set_current_build(
             data=EditionCreate(
                 slug="with-build",
                 title="With Build",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
@@ -283,7 +284,7 @@ async def test_set_current_build_skips_stale(
             data=EditionCreate(
                 slug="guard-stale",
                 title="Guard Stale",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
@@ -345,7 +346,7 @@ async def test_set_current_build_skips_equal(
             data=EditionCreate(
                 slug="guard-equal",
                 title="Guard Equal",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
@@ -406,7 +407,7 @@ async def test_set_current_build_applies_when_newer(
             data=EditionCreate(
                 slug="guard-newer",
                 title="Guard Newer",
-                kind=EditionKind.main,
+                kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
@@ -464,7 +465,7 @@ async def test_find_matching_editions_git_ref(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.draft,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -491,7 +492,7 @@ async def test_find_matching_editions_git_ref_excludes_alternate(
             data=EditionCreate(
                 slug="main",
                 title="Latest",
-                kind=EditionKind.main,
+                kind=EditionKind.draft,
                 tracking_mode=TrackingMode.git_ref,
                 tracking_params={"git_ref": "main"},
             ),
@@ -922,3 +923,73 @@ async def test_find_matching_lsst_doc_main_rejected_when_showing_version(
         )
         assert len(matched) == 0
         await db_session.commit()
+
+
+# ── Main-slug/kind invariant (ck_editions_main_slug_kind) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_main_kind_requires_main_slug(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """kind=main with a non-__main slug must violate the CHECK."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await db_session.commit()
+    with pytest.raises(IntegrityError):
+        async with db_session.begin():
+            await edition_store.create_internal(
+                project_id=project_id,
+                slug="not-main",
+                title="Not Main",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            )
+
+
+@pytest.mark.asyncio
+async def test_main_slug_requires_main_kind(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """slug=__main with a non-main kind must violate the CHECK."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await db_session.commit()
+    with pytest.raises(IntegrityError):
+        async with db_session.begin():
+            await edition_store.create_internal(
+                project_id=project_id,
+                slug="__main",
+                title="Squatter",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            )
+
+
+@pytest.mark.asyncio
+async def test_second_main_edition_rejected(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only one kind=main edition per project (via UNIQUE + CHECK)."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+        )
+        await db_session.commit()
+    with pytest.raises(IntegrityError):
+        async with db_session.begin():
+            await edition_store.create_internal(
+                project_id=project_id,
+                slug="__main",
+                title="Main duplicate",
+                kind=EditionKind.main,
+                tracking_mode=TrackingMode.git_ref,
+            )
