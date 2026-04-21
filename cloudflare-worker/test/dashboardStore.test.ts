@@ -78,3 +78,42 @@ describe("DashboardStore.getDashboard", () => {
     await expect(store.getDashboard("sqr-112")).resolves.toBeNull();
   });
 });
+
+describe("DashboardStore.getSwitcher", () => {
+  it("returns the R2 object for {project}/__switcher.json on hit", async () => {
+    const r2 = createMockR2({
+      "sqr-112/__switcher.json": {
+        body: streamFromString('[{"name":"main","url":"/v/main/"}]'),
+        size: 34,
+      },
+    });
+    const store = createDashboardStore(r2);
+
+    const object = await store.getSwitcher("sqr-112");
+
+    expect(object).not.toBeNull();
+    expect(r2.get).toHaveBeenCalledWith("sqr-112/__switcher.json");
+    const body = await new Response(object!.body).text();
+    expect(body).toBe('[{"name":"main","url":"/v/main/"}]');
+  });
+
+  it("returns null on miss", async () => {
+    const r2 = createMockR2({});
+    const store = createDashboardStore(r2);
+
+    const object = await store.getSwitcher("sqr-112");
+
+    expect(object).toBeNull();
+  });
+
+  it("never throws when R2.get rejects", async () => {
+    const r2 = {
+      get: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    } as unknown as R2Bucket;
+    const store = createDashboardStore(r2);
+
+    await expect(store.getSwitcher("sqr-112")).resolves.toBeNull();
+  });
+});

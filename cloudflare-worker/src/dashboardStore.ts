@@ -17,6 +17,14 @@ export interface DashboardStore {
    * @returns The R2 object body on hit, or `null` on miss / R2 error.
    */
   getDashboard(project: string): Promise<R2ObjectBody | null>;
+
+  /**
+   * Fetch the version-switcher JSON for a project.
+   *
+   * @param project - Project slug.
+   * @returns The R2 object body on hit, or `null` on miss / R2 error.
+   */
+  getSwitcher(project: string): Promise<R2ObjectBody | null>;
 }
 
 /**
@@ -30,6 +38,13 @@ export function createDashboardStore(r2: R2Bucket): DashboardStore {
     async getDashboard(project: string): Promise<R2ObjectBody | null> {
       try {
         return await r2.get(`${project}/__dashboard.html`);
+      } catch {
+        return null;
+      }
+    },
+    async getSwitcher(project: string): Promise<R2ObjectBody | null> {
+      try {
+        return await r2.get(`${project}/__switcher.json`);
       } catch {
         return null;
       }

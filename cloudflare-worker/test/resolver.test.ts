@@ -45,10 +45,11 @@ function createMockR2(
 }
 
 /**
- * Create a mock DashboardStore backed by an in-memory map keyed by project.
+ * Create a mock DashboardStore backed by in-memory maps keyed by project.
  */
 function createMockDashboardStore(
   dashboards: Record<string, { body: ReadableStream; size: number }> = {},
+  switchers: Record<string, { body: ReadableStream; size: number }> = {},
 ): DashboardStore {
   return {
     getDashboard: vi.fn(async (project: string) => {
@@ -58,6 +59,16 @@ function createMockDashboardStore(
         body: obj.body,
         size: obj.size,
         httpEtag: `"${project}-dashboard-etag"`,
+        httpMetadata: {},
+      } as R2ObjectBody;
+    }),
+    getSwitcher: vi.fn(async (project: string) => {
+      const obj = switchers[project];
+      if (!obj) return null;
+      return {
+        body: obj.body,
+        size: obj.size,
+        httpEtag: `"${project}-switcher-etag"`,
         httpMetadata: {},
       } as R2ObjectBody;
     }),
@@ -460,6 +471,66 @@ describe("resolve — dashboard routes", () => {
 
     const response = await resolve(
       dashboardRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
+  });
+});
+
+describe("resolve — switcher routes", () => {
+  it("delegates to DashboardStore and returns JSON with switcher headers", async () => {
+    const switcherRoute: Route = { kind: "switcher", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore(
+      {},
+      {
+        "sqr-112": {
+          body: streamFromString('[{"name":"main","url":"/v/main/"}]'),
+          size: 34,
+        },
+      },
+    );
+    const request = new Request("https://sqr-112.lsst.io/v/switcher.json");
+
+    const response = await resolve(
+      switcherRoute,
+      request,
+      kv,
+      r2,
+      dashboardStore,
+    );
+
+    expect(dashboardStore.getSwitcher).toHaveBeenCalledWith("sqr-112");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60",
+    );
+    expect(await response.text()).toBe('[{"name":"main","url":"/v/main/"}]');
+    // Edition path must not be touched for switcher dispatch.
+    expect(kv.get).not.toHaveBeenCalled();
+    expect(r2.get).not.toHaveBeenCalled();
+    // Dashboard lookup must not be touched for switcher dispatch.
+    expect(dashboardStore.getDashboard).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 text when DashboardStore returns null for switcher", async () => {
+    const switcherRoute: Route = { kind: "switcher", project: "sqr-112" };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://sqr-112.lsst.io/v/switcher.json");
+
+    const response = await resolve(
+      switcherRoute,
       request,
       kv,
       r2,

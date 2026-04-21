@@ -147,11 +147,21 @@ describe("Subdomain routing", () => {
     });
   });
 
+  it("classifies /v/switcher.json as a switcher route", () => {
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/v/switcher.json"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "switcher",
+      project: "sqr-112",
+    });
+  });
+
   it("classifies /v/switcher.json/extra as an edition named switcher.json", () => {
-    // Locks in classification order: only /v/ and /v/index.html are
-    // dashboard routes; everything else under /v/ is an edition. Later
-    // slices will add switcher / edition-meta routes; this negative case
-    // guards against over-matching.
+    // Locks in classification order: exact-match dashboard-family routes
+    // (dashboard, switcher) win over the generic /v/ edition fallback, but
+    // anything with extra path segments falls back to edition routing.
     const route = parseRoute(
       makeRequest("https://sqr-112.lsst.io/v/switcher.json/extra"),
       scheme,
@@ -303,6 +313,17 @@ describe("Path-prefix routing", () => {
       });
     });
 
+    it("classifies /{project}/v/switcher.json as a switcher route", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/v/switcher.json"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "switcher",
+        project: "sqr-112",
+      });
+    });
+
     it("classifies /{project}/v/switcher.json/extra as edition switcher.json", () => {
       const route = parseRoute(
         makeRequest("https://docs.example.com/sqr-112/v/switcher.json/extra"),
@@ -441,6 +462,18 @@ describe("Path-prefix routing", () => {
       );
       expect(route).toEqual({
         kind: "dashboard",
+        project: "sqr-112",
+      });
+    });
+
+    it("classifies /docs/{project}/v/switcher.json as a switcher route", () => {
+      const route = parseRoute(
+        makeRequest("https://example.com/docs/sqr-112/v/switcher.json"),
+        scheme,
+        prefix,
+      );
+      expect(route).toEqual({
+        kind: "switcher",
         project: "sqr-112",
       });
     });

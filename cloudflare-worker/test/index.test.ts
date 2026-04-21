@@ -177,6 +177,26 @@ describe("Worker integration — subdomain routing", () => {
     expect(await response.text()).toBe("<html>dashboard</html>");
   });
 
+  it("serves the version switcher at /v/switcher.json from __switcher.json", async () => {
+    await seedR2Object(
+      "sqr-112/__switcher.json",
+      '[{"name":"main","url":"https://sqr-112.lsst.io/v/main/"}]',
+    );
+
+    const response = await SELF.fetch(
+      "https://sqr-112.lsst.io/v/switcher.json",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe(
+      '[{"name":"main","url":"https://sqr-112.lsst.io/v/main/"}]',
+    );
+  });
+
   it("301-redirects /v (no trailing slash) to /v/", async () => {
     const response = await SELF.fetch("https://sqr-112.lsst.io/v", {
       redirect: "manual",
@@ -294,5 +314,25 @@ describe("Worker integration — path-prefix routing", () => {
     );
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
     expect(await response.text()).toBe("<html>dashboard</html>");
+  });
+
+  it("serves the switcher at /docs/{project}/v/switcher.json", async () => {
+    await seedR2Object(
+      "sqr-112/__switcher.json",
+      '[{"name":"main","url":"/docs/sqr-112/v/main/"}]',
+    );
+
+    const response = await fetchPathPrefix(
+      "https://docs.example.com/docs/sqr-112/v/switcher.json",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe(
+      '[{"name":"main","url":"/docs/sqr-112/v/main/"}]',
+    );
   });
 });

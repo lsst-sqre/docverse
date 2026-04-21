@@ -17,6 +17,11 @@
  *   R2 object with `Content-Type: text/html; charset=utf-8` and
  *   `Cache-Control: public, max-age=60`.
  *
+ * - `switcher` routes delegate to `DashboardStore.getSwitcher()`, returning
+ *   the project's version-switcher JSON with
+ *   `Content-Type: application/json; charset=utf-8` and the same
+ *   `Cache-Control` as other dashboard-family responses.
+ *
  * - `redirect` routes return a 301 with `Location` set to `route.to` on the
  *   request's origin, preserving the original query string.
  */
@@ -46,6 +51,8 @@ export async function resolve(
       return resolveRedirect(route.to, request);
     case "dashboard":
       return resolveDashboard(route.project, dashboardStore);
+    case "switcher":
+      return resolveSwitcher(route.project, dashboardStore);
     case "edition":
       return resolveEdition(route, request, kv, r2);
   }
@@ -69,6 +76,25 @@ async function resolveDashboard(
     status: 200,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
+      "Content-Length": object.size.toString(),
+      "ETag": object.httpEtag,
+      "Cache-Control": "public, max-age=60",
+    },
+  });
+}
+
+async function resolveSwitcher(
+  project: string,
+  dashboardStore: DashboardStore,
+): Promise<Response> {
+  const object = await dashboardStore.getSwitcher(project);
+  if (object === null) {
+    return notFoundText();
+  }
+  return new Response(object.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
       "Content-Length": object.size.toString(),
       "ETag": object.httpEtag,
       "Cache-Control": "public, max-age=60",

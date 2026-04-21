@@ -17,6 +17,8 @@
  *   `/v/{edition}/...` maps to a named edition.
  * - `{kind: 'dashboard', project}` — the project dashboard page. Matches
  *   exactly `/v/` and `/v/index.html`.
+ * - `{kind: 'switcher', project}` — the per-project version-switcher JSON.
+ *   Matches exactly `/v/switcher.json`.
  */
 
 /** Edition (build) route — resolved via KV → R2. */
@@ -37,6 +39,13 @@ export interface DashboardRoute {
   project: string;
 }
 
+/** Switcher route — served from `{project}/__switcher.json` in R2. */
+export interface SwitcherRoute {
+  kind: "switcher";
+  /** Project slug (e.g., "pipelines"). */
+  project: string;
+}
+
 /**
  * Redirect route — returns a 301 to `to`.
  *
@@ -50,7 +59,11 @@ export interface RedirectRoute {
 }
 
 /** Result of parsing a request URL. */
-export type Route = EditionRoute | DashboardRoute | RedirectRoute;
+export type Route =
+  | EditionRoute
+  | DashboardRoute
+  | SwitcherRoute
+  | RedirectRoute;
 
 /** Supported URL routing schemes. */
 export type UrlScheme = "subdomain" | "path-prefix";
@@ -89,8 +102,9 @@ export function parseRoute(
  * Classification order:
  * 1. Exactly `v` (no trailing slash) → redirect to `requestPathname + "/"`.
  * 2. `v/` or `v/index.html` → dashboard route.
- * 3. Anything else starting with `v/` → named-edition route.
- * 4. Anything else → `__main`-edition route.
+ * 3. `v/switcher.json` → switcher route.
+ * 4. Anything else starting with `v/` → named-edition route.
+ * 5. Anything else → `__main`-edition route.
  */
 function classifyRelativePath(
   project: string,
@@ -107,6 +121,10 @@ function classifyRelativePath(
 
   if (stripped === "v/" || stripped === "v/index.html") {
     return { kind: "dashboard", project };
+  }
+
+  if (stripped === "v/switcher.json") {
+    return { kind: "switcher", project };
   }
 
   if (stripped.startsWith("v/")) {
