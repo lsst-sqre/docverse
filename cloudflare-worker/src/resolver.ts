@@ -66,11 +66,26 @@ export async function resolve(
     case "redirect":
       return resolveRedirect(route.to, request);
     case "dashboard":
-      return resolveDashboard(route.project, dashboardStore);
+      return resolveDashboardFamily(
+        route.project,
+        "text/html; charset=utf-8",
+        () => dashboardStore.getDashboard(route.project),
+        dashboardStore,
+      );
     case "switcher":
-      return resolveSwitcher(route.project, dashboardStore);
+      return resolveDashboardFamily(
+        route.project,
+        "application/json; charset=utf-8",
+        () => dashboardStore.getSwitcher(route.project),
+        dashboardStore,
+      );
     case "edition_meta":
-      return resolveEditionMeta(route.project, route.edition, dashboardStore);
+      return resolveDashboardFamily(
+        route.project,
+        "application/json; charset=utf-8",
+        () => dashboardStore.getEditionMeta(route.project, route.edition),
+        dashboardStore,
+      );
     case "edition":
       return resolveEdition(route, request, kv, r2, dashboardStore);
     default:
@@ -84,57 +99,27 @@ function resolveRedirect(to: string, request: Request): Response {
   return Response.redirect(url.toString(), 301);
 }
 
-async function resolveDashboard(
+/**
+ * Shared response builder for dashboard-family routes (dashboard, switcher,
+ * edition_meta). Each caller supplies a fetcher that delegates to the
+ * appropriate `DashboardStore` getter plus the `Content-Type` the response
+ * should carry. 404 fallback goes through `notFoundResponse` so the branded
+ * `__404.html` / plain-text degradation is uniform across the family.
+ */
+async function resolveDashboardFamily(
   project: string,
+  contentType: string,
+  fetcher: () => Promise<R2ObjectBody | null>,
   dashboardStore: DashboardStore,
 ): Promise<Response> {
-  const object = await dashboardStore.getDashboard(project);
+  const object = await fetcher();
   if (object === null) {
     return notFoundResponse(project, dashboardStore);
   }
   return new Response(object.body, {
     status: 200,
     headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Content-Length": object.size.toString(),
-      "ETag": object.httpEtag,
-      "Cache-Control": "public, max-age=60",
-    },
-  });
-}
-
-async function resolveSwitcher(
-  project: string,
-  dashboardStore: DashboardStore,
-): Promise<Response> {
-  const object = await dashboardStore.getSwitcher(project);
-  if (object === null) {
-    return notFoundResponse(project, dashboardStore);
-  }
-  return new Response(object.body, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Content-Length": object.size.toString(),
-      "ETag": object.httpEtag,
-      "Cache-Control": "public, max-age=60",
-    },
-  });
-}
-
-async function resolveEditionMeta(
-  project: string,
-  edition: string,
-  dashboardStore: DashboardStore,
-): Promise<Response> {
-  const object = await dashboardStore.getEditionMeta(project, edition);
-  if (object === null) {
-    return notFoundResponse(project, dashboardStore);
-  }
-  return new Response(object.body, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
+      "Content-Type": contentType,
       "Content-Length": object.size.toString(),
       "ETag": object.httpEtag,
       "Cache-Control": "public, max-age=60",
