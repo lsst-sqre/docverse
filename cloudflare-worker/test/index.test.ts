@@ -12,9 +12,32 @@
  * same Miniflare-backed KV and R2 from `env`.
  */
 
-import { env, SELF } from "cloudflare:test";
-import { describe, it, expect, beforeEach } from "vitest";
+import {
+  env,
+  SELF,
+  createExecutionContext,
+  waitOnExecutionContext,
+} from "cloudflare:test";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import worker from "../src/index";
+import { notFoundCacheKey } from "../src/resolver";
+
+/**
+ * Projects that integration tests route through `notFoundResponse`.
+ * `caches.default` persists across tests inside a single Miniflare run,
+ * so evict each project's cached 404 entry before every test.
+ */
+const NOT_FOUND_TEST_PROJECTS = [
+  "pipelines",
+  "sqr-112",
+  "cache-hit-integration",
+];
+
+beforeEach(async () => {
+  for (const project of NOT_FOUND_TEST_PROJECTS) {
+    await caches.default.delete(notFoundCacheKey(project));
+  }
+});
 
 /**
  * Helper to seed KV with an edition mapping.
@@ -248,6 +271,65 @@ describe("Worker integration — subdomain routing", () => {
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
     expect(await response.text()).toBe("<html>branded 404 page</html>");
   });
+
+  it("serves a cached 404 on the second request without re-reading __404.html from R2", async () => {
+    // Seed a branded 404 and spy on BUILDS_R2.get so we can count how many
+    // times the worker reaches into R2 for the __404.html key across two
+    // successive requests. The first request populates caches.default;
+    // the second request must hit the cache and skip the R2 GET entirely.
+    //
+    // We use worker.fetch() with createExecutionContext() +
+    // waitOnExecutionContext() rather than SELF.fetch so the first
+    // request's ctx.waitUntil(caches.default.put(...)) is observable and
+    // drained before the second request runs — otherwise the put can
+    // race with the cache read in request #2 and the test flakes.
+    await seedR2Object(
+      "cache-hit-integration/__404.html",
+      "<html>cached 404 body</html>",
+    );
+    const r2Get = vi.spyOn(env.BUILDS_R2, "get");
+
+    const ctx1 = createExecutionContext();
+    const first = await worker.fetch(
+      new Request(
+        "https://cache-hit-integration.lsst.io/nonexistent.html",
+      ),
+      env,
+      ctx1,
+    );
+    await first.arrayBuffer();
+    await waitOnExecutionContext(ctx1);
+    const firstHitCount = r2Get.mock.calls.filter(
+      (call: unknown[]) => call[0] === "cache-hit-integration/__404.html",
+    ).length;
+
+    const ctx2 = createExecutionContext();
+    const second = await worker.fetch(
+      new Request(
+        "https://cache-hit-integration.lsst.io/another-missing.html",
+      ),
+      env,
+      ctx2,
+    );
+    await waitOnExecutionContext(ctx2);
+    const secondHitCount = r2Get.mock.calls.filter(
+      (call: unknown[]) => call[0] === "cache-hit-integration/__404.html",
+    ).length;
+
+    expect(first.status).toBe(404);
+    expect(second.status).toBe(404);
+    expect(second.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(second.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await second.text()).toBe("<html>cached 404 body</html>");
+    // First request populated the cache — one R2 GET for __404.html.
+    expect(firstHitCount).toBe(1);
+    // Second request was served from caches.default — no additional GET.
+    expect(secondHitCount).toBe(1);
+
+    r2Get.mockRestore();
+  });
 });
 
 describe("Worker integration — path-prefix routing", () => {
@@ -257,21 +339,30 @@ describe("Worker integration — path-prefix routing", () => {
 
   /**
    * Call the worker directly with path-prefix env overrides.
+   *
+   * Uses `createExecutionContext()` + `waitOnExecutionContext()` so any
+   * `ctx.waitUntil(caches.default.put(...))` kicked off inside the worker
+   * has settled before this helper returns. Otherwise a prior test's 404
+   * cache write could race with the next test's `beforeEach` eviction and
+   * re-poison `caches.default` for the shared project slug.
    */
   async function fetchPathPrefix(
     url: string,
     init?: RequestInit,
   ): Promise<Response> {
     const request = new Request(url, init);
-    return worker.fetch(
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
       request,
       {
         ...env,
         URL_SCHEME: "path-prefix" as const,
         PATH_PREFIX: "/docs/",
       },
-      { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext,
+      ctx,
     );
+    await waitOnExecutionContext(ctx);
+    return response;
   }
 
   beforeEach(async () => {

@@ -1,7 +1,73 @@
-import { describe, it, expect, vi } from "vitest";
-import { resolve } from "../src/resolver";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { resolve, notFoundCacheKey } from "../src/resolver";
 import type { DashboardStore } from "../src/dashboardStore";
 import type { Route } from "../src/router";
+
+/**
+ * Stub ExecutionContext for tests. Every `waitUntil` promise is tracked and
+ * awaited by `afterEach` so that cache writes from one test complete before
+ * the next test's `beforeEach` evicts cached entries; without this, a
+ * previous test's pending `caches.default.put` could race with and re-poison
+ * the current test's cache state.
+ */
+const pendingCtxPromises: Promise<unknown>[] = [];
+
+const ctx: ExecutionContext = {
+  waitUntil: (p: Promise<unknown>) => {
+    pendingCtxPromises.push(Promise.resolve(p).catch(() => {}));
+  },
+  passThroughOnException: () => {},
+} as unknown as ExecutionContext;
+
+/**
+ * Variant ctx used by tests that consult the cache twice within a single
+ * test: the test explicitly flushes pending `waitUntil` promises between
+ * the two resolve calls so the second call observes the first call's write.
+ */
+function createWaitingCtx(): {
+  ctx: ExecutionContext;
+  flush: () => Promise<void>;
+} {
+  const pending: Promise<unknown>[] = [];
+  return {
+    ctx: {
+      waitUntil: (p: Promise<unknown>) => {
+        pending.push(Promise.resolve(p).catch(() => {}));
+      },
+      passThroughOnException: () => {},
+    } as unknown as ExecutionContext,
+    flush: async () => {
+      await Promise.all(pending);
+      pending.length = 0;
+    },
+  };
+}
+
+/**
+ * Projects that tests route through `notFoundResponse`. `caches.default`
+ * persists across tests inside a single Miniflare run, so evict the cached
+ * 404 entry for each project before every test to keep assertions on
+ * `get404` call counts deterministic.
+ */
+const NOT_FOUND_TEST_PROJECTS = [
+  "pipelines",
+  "sqr-112",
+  "cache-hit-branded",
+  "cache-hit-plain",
+];
+
+afterEach(async () => {
+  // Wait for any `ctx.waitUntil` cache writes kicked off by the previous
+  // test to settle before the next `beforeEach` evicts cache entries.
+  await Promise.all(pendingCtxPromises);
+  pendingCtxPromises.length = 0;
+});
+
+beforeEach(async () => {
+  for (const project of NOT_FOUND_TEST_PROJECTS) {
+    await caches.default.delete(notFoundCacheKey(project));
+  }
+});
 
 /**
  * Create a mock KV namespace.
@@ -134,7 +200,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2, dashboardStore);
+    const response = await resolve(route, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -153,7 +219,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2, dashboardStore);
+    const response = await resolve(route, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
@@ -169,7 +235,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2, dashboardStore);
+    const response = await resolve(route, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
@@ -188,7 +254,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/getting-started.html");
 
-    const response = await resolve(route, request, kv, r2, dashboardStore);
+    const response = await resolve(route, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(404);
     expect(response.headers.get("Content-Type")).toBe("text/plain");
@@ -218,7 +284,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/api/core");
 
-    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(301);
     expect(response.headers.get("Location")).toBe(
@@ -248,7 +314,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/api/core/");
 
-    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -280,7 +346,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/");
 
-    const response = await resolve(rootRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(rootRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -312,7 +378,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/");
 
-    const response = await resolve(rootRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(rootRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
@@ -344,7 +410,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/style.css");
 
-    const response = await resolve(cssRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(cssRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/css");
@@ -376,7 +442,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/data.json");
 
-    const response = await resolve(jsonRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(jsonRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("application/json");
@@ -408,7 +474,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/data.xyz123");
 
-    const response = await resolve(unknownRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(unknownRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe(
@@ -437,7 +503,7 @@ describe("resolve — edition routes", () => {
     const dashboardStore = createMockDashboardStore();
     const request = new Request("https://example.com/pipelines/nonexistent/dir");
 
-    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore);
+    const response = await resolve(directoryRoute, request, kv, r2, dashboardStore, ctx);
 
     expect(response.status).toBe(404);
   });
@@ -462,6 +528,7 @@ describe("resolve — dashboard routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.getDashboard).toHaveBeenCalledWith("sqr-112");
@@ -491,6 +558,7 @@ describe("resolve — dashboard routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(404);
@@ -520,6 +588,7 @@ describe("resolve — switcher routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.getSwitcher).toHaveBeenCalledWith("sqr-112");
@@ -551,6 +620,7 @@ describe("resolve — switcher routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(404);
@@ -589,6 +659,7 @@ describe("resolve — edition_meta routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.getEditionMeta).toHaveBeenCalledWith(
@@ -632,6 +703,7 @@ describe("resolve — edition_meta routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(404);
@@ -660,6 +732,7 @@ describe("resolve — dashboard-family If-None-Match 304 handling", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(304);
@@ -689,6 +762,7 @@ describe("resolve — dashboard-family If-None-Match 304 handling", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(200);
@@ -718,6 +792,7 @@ describe("resolve — dashboard-family If-None-Match 304 handling", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(200);
@@ -748,6 +823,7 @@ describe("resolve — dashboard-family If-None-Match 304 handling", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(304);
@@ -791,6 +867,7 @@ describe("resolve — dashboard-family If-None-Match 304 handling", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(304);
@@ -816,6 +893,7 @@ describe("resolve — redirect routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(301);
@@ -841,6 +919,7 @@ describe("resolve — redirect routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(301);
@@ -865,6 +944,7 @@ describe("resolve — redirect routes", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(response.status).toBe(301);
@@ -898,6 +978,7 @@ describe("resolve — branded 404 fallback", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.get404).toHaveBeenCalledWith("sqr-112");
@@ -939,6 +1020,7 @@ describe("resolve — branded 404 fallback", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.get404).toHaveBeenCalledWith("sqr-112");
@@ -965,6 +1047,7 @@ describe("resolve — branded 404 fallback", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.get404).toHaveBeenCalledWith("sqr-112");
@@ -999,6 +1082,7 @@ describe("resolve — branded 404 fallback", () => {
       kv,
       r2,
       dashboardStore,
+      ctx,
     );
 
     expect(dashboardStore.get404).toHaveBeenCalledWith("pipelines");
@@ -1008,5 +1092,62 @@ describe("resolve — branded 404 fallback", () => {
       "public, max-age=60",
     );
     expect(await response.text()).toBe("Not Found");
+  });
+});
+
+describe("resolve — 404 caching via caches.default", () => {
+  it("does not call get404 again on a second 404 for the same project (branded HTML branch is cached)", async () => {
+    const editionRoute: Route = {
+      kind: "edition",
+      project: "cache-hit-branded",
+      edition: "__main",
+      path: "page.html",
+    };
+    const kv = createMockKV({}); // Missing KV entry → 404 path
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore({}, {}, {}, {
+      "cache-hit-branded": {
+        body: streamFromString("<html>branded 404</html>"),
+        size: 24,
+      },
+    });
+    const { ctx, flush } = createWaitingCtx();
+    const request = new Request("https://cache-hit-branded.lsst.io/page.html");
+
+    const first = await resolve(editionRoute, request, kv, r2, dashboardStore, ctx);
+    await first.arrayBuffer();
+    await flush();
+    const second = await resolve(editionRoute, request, kv, r2, dashboardStore, ctx);
+
+    expect(dashboardStore.get404).toHaveBeenCalledTimes(1);
+    expect(second.status).toBe(404);
+    expect(second.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(second.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await second.text()).toBe("<html>branded 404</html>");
+  });
+
+  it("does not call get404 again on a second 404 for the same project (plain-text fallback is cached)", async () => {
+    const dashboardRoute: Route = {
+      kind: "dashboard",
+      project: "cache-hit-plain",
+    };
+    const kv = createMockKV();
+    const r2 = createMockR2();
+    const dashboardStore = createMockDashboardStore();
+    const { ctx, flush } = createWaitingCtx();
+    const request = new Request("https://cache-hit-plain.lsst.io/v/");
+
+    const first = await resolve(dashboardRoute, request, kv, r2, dashboardStore, ctx);
+    await first.arrayBuffer();
+    await flush();
+    const second = await resolve(dashboardRoute, request, kv, r2, dashboardStore, ctx);
+
+    expect(dashboardStore.get404).toHaveBeenCalledTimes(1);
+    expect(second.status).toBe(404);
+    expect(second.headers.get("Content-Type")).toBe("text/plain");
+    expect(second.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await second.text()).toBe("Not Found");
   });
 });

@@ -35,14 +35,21 @@
  *   request's origin, preserving the original query string.
  *
  * 404 handling: every 404-producing branch in this module routes through
- * `notFoundResponse(project, dashboardStore)`, which serves the project's
- * branded `{project}/__404.html` when present and degrades to plain-text
- * `Not Found` otherwise. Both variants apply the same
+ * `notFoundResponse(project, dashboardStore, ctx)`, which serves the
+ * project's branded `{project}/__404.html` when present and degrades to
+ * plain-text `Not Found` otherwise. Both variants apply the same
  * `Cache-Control: public, max-age=60` so dashboard rebuilds and newly
  * published editions become visible within one minute and 404s don't get
  * CDN-stuck. Unroutable requests (no extractable project slug) bypass this
  * helper at the worker entry point, since there's no project to fall back
  * on.
+ *
+ * 404 caching: `notFoundResponse` consults `caches.default` before calling
+ * `dashboardStore.get404`, keyed per project. On miss it constructs the
+ * branded-HTML or plain-text response and writes it back via
+ * `ctx.waitUntil(caches.default.put(...))` so repeated 404s for the same
+ * project don't re-hit R2 within the 60-second TTL. Both the branded and
+ * the plain-text fallback branches are cached.
  */
 
 import mime from "mime";
@@ -64,6 +71,7 @@ export async function resolve(
   kv: KVNamespace,
   r2: R2Bucket,
   dashboardStore: DashboardStore,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   switch (route.kind) {
     case "redirect":
@@ -75,6 +83,7 @@ export async function resolve(
         () => dashboardStore.getDashboard(route.project),
         request,
         dashboardStore,
+        ctx,
       );
     case "switcher":
       return resolveDashboardFamily(
@@ -83,6 +92,7 @@ export async function resolve(
         () => dashboardStore.getSwitcher(route.project),
         request,
         dashboardStore,
+        ctx,
       );
     case "edition_meta":
       return resolveDashboardFamily(
@@ -91,9 +101,10 @@ export async function resolve(
         () => dashboardStore.getEditionMeta(route.project, route.edition),
         request,
         dashboardStore,
+        ctx,
       );
     case "edition":
-      return resolveEdition(route, request, kv, r2, dashboardStore);
+      return resolveEdition(route, request, kv, r2, dashboardStore, ctx);
     default:
       return route satisfies never;
   }
@@ -124,10 +135,11 @@ async function resolveDashboardFamily(
   fetcher: () => Promise<R2ObjectBody | null>,
   request: Request,
   dashboardStore: DashboardStore,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   const object = await fetcher();
   if (object === null) {
-    return notFoundResponse(project, dashboardStore);
+    return notFoundResponse(project, dashboardStore, ctx);
   }
   if (request.headers.get("If-None-Match") === object.httpEtag) {
     return new Response(null, {
@@ -154,19 +166,20 @@ async function resolveEdition(
   kv: KVNamespace,
   r2: R2Bucket,
   dashboardStore: DashboardStore,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   // Step 1: Look up the edition mapping in KV
   const kvKey = `${route.project}/${route.edition}`;
   const kvValue = await kv.get(kvKey);
   if (kvValue === null) {
-    return notFoundResponse(route.project, dashboardStore);
+    return notFoundResponse(route.project, dashboardStore, ctx);
   }
 
   let mapping: EditionMapping;
   try {
     mapping = JSON.parse(kvValue);
   } catch {
-    return notFoundResponse(route.project, dashboardStore);
+    return notFoundResponse(route.project, dashboardStore, ctx);
   }
 
   // Normalize r2_prefix to always end with "/"
@@ -199,7 +212,7 @@ async function resolveEdition(
   }
 
   if (object === null) {
-    return notFoundResponse(route.project, dashboardStore);
+    return notFoundResponse(route.project, dashboardStore, ctx);
   }
 
   // Step 4: Infer Content-Type from file extension
@@ -221,28 +234,53 @@ async function resolveEdition(
  * branded `__404.html` and degrading to plain text on miss. Both variants
  * apply the same `Cache-Control: public, max-age=60` so CDN behavior is
  * uniform across the `/v/` namespace.
+ *
+ * Consults `caches.default` before calling `get404` so repeated 404s for the
+ * same project don't re-hit R2 within the 60-second TTL. The cache key is a
+ * synthetic, project-scoped URL; both the branded HTML and the plain-text
+ * fallback branches are cached. Cache writes are dispatched via
+ * `ctx.waitUntil` so they don't delay the response.
  */
 export async function notFoundResponse(
   project: string,
   dashboardStore: DashboardStore,
+  ctx: ExecutionContext,
 ): Promise<Response> {
-  const object = await dashboardStore.get404(project);
-  if (object !== null) {
-    return new Response(object.body, {
-      status: 404,
-      headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Content-Length": object.size.toString(),
-        "ETag": object.httpEtag,
-        "Cache-Control": "public, max-age=60",
-      },
-    });
+  const cacheKey = notFoundCacheKey(project);
+  const cached = await caches.default.match(cacheKey);
+  if (cached !== undefined) {
+    return cached;
   }
-  return new Response("Not Found", {
-    status: 404,
-    headers: {
-      "Content-Type": "text/plain",
-      "Cache-Control": "public, max-age=60",
-    },
-  });
+  const object = await dashboardStore.get404(project);
+  const response =
+    object !== null
+      ? new Response(object.body, {
+          status: 404,
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": object.size.toString(),
+            "ETag": object.httpEtag,
+            "Cache-Control": "public, max-age=60",
+          },
+        })
+      : new Response("Not Found", {
+          status: 404,
+          headers: {
+            "Content-Type": "text/plain",
+            "Cache-Control": "public, max-age=60",
+          },
+        });
+  ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+  return response;
+}
+
+/**
+ * Build the `caches.default` cache key for a project's 404 response.
+ *
+ * The URL is synthetic (no real host) and project-scoped, so entries are
+ * isolated per project without colliding with any request-path URL.
+ * Exported so tests can evict cached entries between runs.
+ */
+export function notFoundCacheKey(project: string): Request {
+  return new Request(`https://cache/__404/${encodeURIComponent(project)}`);
 }

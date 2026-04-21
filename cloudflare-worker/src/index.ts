@@ -23,6 +23,7 @@ export default {
       env.EDITIONS_KV,
       env.BUILDS_R2,
       dashboardStore,
+      ctx,
     );
   },
 } satisfies ExportedHandler<Env>;
