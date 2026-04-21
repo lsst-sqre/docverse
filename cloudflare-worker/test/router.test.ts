@@ -224,6 +224,48 @@ describe("Subdomain routing", () => {
       path: "_docverse.json/extra",
     });
   });
+
+  it("classifies /_docverse.json at project root as __main edition_meta", () => {
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/_docverse.json"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition_meta",
+      project: "sqr-112",
+      edition: "__main",
+    });
+  });
+
+  it("classifies /_docverse.json/extra as a regular __main edition path", () => {
+    // The reserved name only applies at the exact project root — deeper
+    // paths must fall through to the __main edition file route.
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/_docverse.json/extra"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition",
+      project: "sqr-112",
+      edition: "__main",
+      path: "_docverse.json/extra",
+    });
+  });
+
+  it("classifies /sub/_docverse.json as a regular __main edition path", () => {
+    // Reserved name applies only at the project root, not inside
+    // subdirectories of the __main edition.
+    const route = parseRoute(
+      makeRequest("https://sqr-112.lsst.io/sub/_docverse.json"),
+      scheme,
+    );
+    expect(route).toEqual({
+      kind: "edition",
+      project: "sqr-112",
+      edition: "__main",
+      path: "sub/_docverse.json",
+    });
+  });
 });
 
 describe("Path-prefix routing", () => {
@@ -414,6 +456,44 @@ describe("Path-prefix routing", () => {
         path: "_docverse.json/extra",
       });
     });
+
+    it("classifies /{project}/_docverse.json as __main edition_meta", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/_docverse.json"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "edition_meta",
+        project: "sqr-112",
+        edition: "__main",
+      });
+    });
+
+    it("classifies /{project}/_docverse.json/extra as a __main edition path", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/_docverse.json/extra"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "edition",
+        project: "sqr-112",
+        edition: "__main",
+        path: "_docverse.json/extra",
+      });
+    });
+
+    it("classifies /{project}/sub/_docverse.json as a __main edition path", () => {
+      const route = parseRoute(
+        makeRequest("https://docs.example.com/sqr-112/sub/_docverse.json"),
+        scheme,
+      );
+      expect(route).toEqual({
+        kind: "edition",
+        project: "sqr-112",
+        edition: "__main",
+        path: "sub/_docverse.json",
+      });
+    });
   });
 
   describe("with root prefix", () => {
@@ -554,6 +634,19 @@ describe("Path-prefix routing", () => {
       expect(route).toEqual({
         kind: "redirect",
         to: "/docs/sqr-112/v/",
+      });
+    });
+
+    it("classifies /docs/{project}/_docverse.json as __main edition_meta", () => {
+      const route = parseRoute(
+        makeRequest("https://example.com/docs/sqr-112/_docverse.json"),
+        scheme,
+        prefix,
+      );
+      expect(route).toEqual({
+        kind: "edition_meta",
+        project: "sqr-112",
+        edition: "__main",
       });
     });
   });

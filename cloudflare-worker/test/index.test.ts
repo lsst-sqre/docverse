@@ -272,6 +272,49 @@ describe("Worker integration — subdomain routing", () => {
     expect(await response.text()).toBe("<html>branded 404 page</html>");
   });
 
+  it("serves __main edition metadata at project-root /_docverse.json", async () => {
+    await seedR2Object(
+      "sqr-112/__editions/__main.json",
+      '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+    );
+
+    const response = await SELF.fetch(
+      "https://sqr-112.lsst.io/_docverse.json",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe(
+      '{"canonical_url":"https://sqr-112.lsst.io/","is_canonical":true}',
+    );
+  });
+
+  it("falls back to branded __404.html when project-root _docverse.json is missing", async () => {
+    // Miniflare-backed R2 persists across tests within a single run, so an
+    // earlier test that seeds sqr-112/__editions/__main.json would leak
+    // into this one. Delete the key to guarantee the edition_meta miss the
+    // branded-404 fallback depends on.
+    await env.BUILDS_R2.delete("sqr-112/__editions/__main.json");
+    await seedR2Object(
+      "sqr-112/__404.html",
+      "<html>branded 404 page</html>",
+    );
+
+    const response = await SELF.fetch(
+      "https://sqr-112.lsst.io/_docverse.json",
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Content-Type")).toBe(
+      "text/html; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe("<html>branded 404 page</html>");
+  });
+
   it("serves a cached 404 on the second request without re-reading __404.html from R2", async () => {
     // Seed a branded 404 and spy on BUILDS_R2.get so we can count how many
     // times the worker reaches into R2 for the __404.html key across two
@@ -476,6 +519,26 @@ describe("Worker integration — path-prefix routing", () => {
 
     const response = await fetchPathPrefix(
       "https://docs.example.com/docs/sqr-112/v/main/_docverse.json",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe(
+      "application/json; charset=utf-8",
+    );
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.text()).toBe(
+      '{"canonical_url":"https://docs.example.com/docs/sqr-112/","is_canonical":true}',
+    );
+  });
+
+  it("serves __main edition metadata at project-root /docs/{project}/_docverse.json", async () => {
+    await seedR2Object(
+      "sqr-112/__editions/__main.json",
+      '{"canonical_url":"https://docs.example.com/docs/sqr-112/","is_canonical":true}',
+    );
+
+    const response = await fetchPathPrefix(
+      "https://docs.example.com/docs/sqr-112/_docverse.json",
     );
 
     expect(response.status).toBe(200);

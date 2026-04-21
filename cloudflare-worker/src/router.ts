@@ -21,8 +21,10 @@
  *   Matches exactly `/v/switcher.json`.
  * - `{kind: 'edition_meta', project, edition}` — per-edition metadata JSON
  *   (canonical URL, `is_canonical`). Matches exactly
- *   `/v/{edition}/_docverse.json`; deeper paths like
- *   `/v/main/_docverse.json/extra` fall through to edition routing.
+ *   `/v/{edition}/_docverse.json`, and also `/_docverse.json` at the
+ *   project root (resolved to the `__main` edition). Deeper paths like
+ *   `/v/main/_docverse.json/extra` or `/sub/_docverse.json` fall through
+ *   to edition routing.
  */
 
 /** Edition (build) route — resolved via KV → R2. */
@@ -124,7 +126,10 @@ export function parseRoute(
  * 3. `v/switcher.json` → switcher route.
  * 4. `v/{edition}/_docverse.json` (exactly) → edition_meta route.
  * 5. Anything else starting with `v/` → named-edition route.
- * 6. Anything else → `__main`-edition route.
+ * 6. Exactly `_docverse.json` at the project root → edition_meta route for
+ *    the `__main` edition. Deeper paths (`_docverse.json/extra`,
+ *    `sub/_docverse.json`) fall through to the `__main` edition file route.
+ * 7. Anything else → `__main`-edition route.
  */
 function classifyRelativePath(
   project: string,
@@ -150,6 +155,10 @@ function classifyRelativePath(
   const editionMetaMatch = matchEditionMeta(stripped);
   if (editionMetaMatch !== null) {
     return { kind: "edition_meta", project, edition: editionMetaMatch };
+  }
+
+  if (stripped === "_docverse.json") {
+    return { kind: "edition_meta", project, edition: DEFAULT_EDITION };
   }
 
   if (stripped.startsWith("v/")) {
