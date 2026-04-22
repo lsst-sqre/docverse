@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+import time
 from typing import Any
 
 import httpx
@@ -33,6 +34,7 @@ from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.edition_tracking import EditionTrackingService
+from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -44,6 +46,7 @@ from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_backend import ArqQueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.build_processing import build_processing
+from tests.support.lock_service_spy import install_recording_lock_service
 
 _HASH = "sha256:" + "a" * 64
 
@@ -139,6 +142,35 @@ def _mock_create_objectstore(
         return mock_store
 
     return _create
+
+
+class _RecordingMockObjectStore(MockObjectStore):
+    """``MockObjectStore`` that timestamps every mutating call.
+
+    Tests use this to verify that worker-issued object-store ops happen
+    *after* an advisory-lock acquisition, by comparing the recorded
+    timestamps against the lock-event timestamps.
+    """
+
+    def __init__(self, op_timestamps: list[float]) -> None:
+        super().__init__()
+        self._op_timestamps = op_timestamps
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> None:
+        self._op_timestamps.append(time.monotonic())
+        await super().upload_object(
+            key=key, data=data, content_type=content_type
+        )
+
+    async def download_object(self, *, key: str) -> bytes:
+        self._op_timestamps.append(time.monotonic())
+        return await super().download_object(key=key)
+
+    async def delete_object(self, *, key: str) -> None:
+        self._op_timestamps.append(time.monotonic())
+        await super().delete_object(key=key)
 
 
 @pytest.mark.asyncio
@@ -750,3 +782,196 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
                 .all()
             )
             assert len(child_rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_build_processing_acquires_build_lock_before_object_store(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """build_processing acquires BUILD_PROCESSING before any obj-store op.
+
+    Verifies the worker wires the lock to the correct key — the
+    integration tests in ``tests/services/locks_integration_test.py``
+    already prove the mechanism works, but they do not pin which key
+    each worker uses. A spy ``LockService`` records every acquire
+    timestamp; a spy ``MockObjectStore`` records every mutating call's
+    timestamp. The first BUILD_PROCESSING acquire must precede every
+    worker-issued upload/download/delete.
+    """
+    logger = _logger()
+    op_timestamps: list[float] = []
+    mock_store = _RecordingMockObjectStore(op_timestamps=op_timestamps)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-lock-bp",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    # Discard the staging-upload bookkeeping so only worker-issued ops
+    # are compared against the lock-event timestamps.
+    op_timestamps.clear()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+    events = install_recording_lock_service(monkeypatch)
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-arq-lock-bp",
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    expected = LockKey.for_build_processing(
+        org_id=org.id, project_id=project.id, git_ref="main"
+    )
+    bp_enters = [
+        e
+        for e in events
+        if e.event == "enter"
+        and e.lock_key.lock_class == LockClass.BUILD_PROCESSING
+    ]
+    assert len(bp_enters) == 1
+    assert bp_enters[0].lock_key == expected
+
+    assert op_timestamps, "expected at least one worker object-store call"
+    bp_enter_ts = bp_enters[0].timestamp
+    assert all(ts > bp_enter_ts for ts in op_timestamps)
+
+
+@pytest.mark.asyncio
+async def test_build_processing_nested_lock_sequence(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EDITION_UPDATE acquisitions nest inside the BUILD_PROCESSING block.
+
+    The ``main`` git_ref auto-creates a ``main`` edition and updates its
+    pointer via ``EditionTrackingService.set_current_build``, which
+    acquires an EDITION_UPDATE lock. The recorded event sequence must
+    be ``BUILD_PROCESSING.enter -> EDITION_UPDATE.enter ->
+    EDITION_UPDATE.exit -> BUILD_PROCESSING.exit`` so the per-edition
+    pointer cannot diverge from the build-level state mid-flight.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-lock-nested",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+    events = install_recording_lock_service(monkeypatch)
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-arq-lock-nested",
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Outer brackets: the BUILD_PROCESSING enter must be the very first
+    # recorded event and its exit the very last.
+    expected_bp = LockKey.for_build_processing(
+        org_id=org.id, project_id=project.id, git_ref="main"
+    )
+    assert len(events) >= 4
+    assert events[0].event == "enter"
+    assert events[0].lock_key == expected_bp
+    assert events[-1].event == "exit"
+    assert events[-1].lock_key == expected_bp
+
+    # At least one EDITION_UPDATE acquire/release pair is fully nested
+    # inside the BUILD_PROCESSING block. Each pair's enter precedes its
+    # exit, and both indices fall strictly between the outer brackets.
+    inner = events[1:-1]
+    eu_enter_idx = [
+        i
+        for i, e in enumerate(inner)
+        if e.event == "enter"
+        and e.lock_key.lock_class == LockClass.EDITION_UPDATE
+    ]
+    eu_exit_idx = [
+        i
+        for i, e in enumerate(inner)
+        if e.event == "exit"
+        and e.lock_key.lock_class == LockClass.EDITION_UPDATE
+    ]
+    assert len(eu_enter_idx) >= 1
+    assert len(eu_enter_idx) == len(eu_exit_idx)
+    for enter_i, exit_i in zip(eu_enter_idx, eu_exit_idx, strict=True):
+        assert enter_i < exit_i
+        assert inner[enter_i].lock_key == inner[exit_i].lock_key
+
+    # No BUILD_PROCESSING events fire inside the outer brackets — the
+    # outer lock is taken once and released once.
+    inner_bp = [
+        e for e in inner if e.lock_key.lock_class == LockClass.BUILD_PROCESSING
+    ]
+    assert inner_bp == []
