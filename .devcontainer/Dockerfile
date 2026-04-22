@@ -54,6 +54,7 @@ RUN { \
     echo "node ALL=(root) NOPASSWD: /usr/sbin/cron"; \
     echo "node ALL=(root) NOPASSWD: /bin/mkdir -p /run/docverse-sandbox"; \
     echo "node ALL=(root) NOPASSWD: /bin/chown node\\:node /run/docverse-sandbox"; \
+    echo "node ALL=(root) NOPASSWD: /bin/chown node\\:node /home/node/.cache"; \
     echo "node ALL=(root) NOPASSWD: /bin/chown -R node\\:node /workspace /home/node/.claude /commandhistory /home/node/.cache/uv"; \
     } > /etc/sudoers.d/firewall \
     && chmod 0440 /etc/sudoers.d/firewall
