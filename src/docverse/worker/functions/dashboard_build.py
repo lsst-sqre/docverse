@@ -20,6 +20,7 @@ from docverse.config import Configuration
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.lock_service import LockKey
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.queue_job_store import QueueJobStore
 
@@ -68,79 +69,91 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         )
         queue_job_store = QueueJobStore(session=session, logger=logger)
         org_store = OrganizationStore(session=session, logger=logger)
+        lock_service = factory.create_lock_service()
 
-        async with session.begin():
-            await queue_job_store.start(queue_job_id)
-            await queue_job_store.update_phase(
-                queue_job_id,
-                "rendering",
-                progress={"message": "Rendering dashboard artifacts"},
-            )
+        lock_key = LockKey.for_project(org_id=org_id, project_id=project_id)
+        async with lock_service.acquire(lock_key):
+            # The pg_advisory_lock SELECT auto-began a transaction on
+            # the session; commit it so the explicit session.begin()
+            # blocks below don't trip "transaction already begun".
+            # The advisory lock is connection-scoped so it survives
+            # the commit until pg_advisory_unlock runs (or the worker
+            # connection closes).
+            await session.commit()
 
-        try:
             async with session.begin():
-                org = await org_store.get_by_id(org_id)
-                if org is None:
-                    msg = f"Organization {org_id} not found"
-                    raise NotFoundError(msg)  # noqa: TRY301
-                service_label = org.resolved_staging_store_label
-                if service_label is None:
-                    msg = (
-                        f"No object store service configured for org {org_id}"
-                    )
-                    raise RuntimeError(msg)  # noqa: TRY301
+                await queue_job_store.start(queue_job_id)
+                await queue_job_store.update_phase(
+                    queue_job_id,
+                    "rendering",
+                    progress={"message": "Rendering dashboard artifacts"},
+                )
 
-                publisher = factory.create_dashboard_publisher()
-                rendered_at = datetime.now(tz=UTC)
-                context = await publisher.build_context(
-                    org_id=org_id,
-                    project_id=project_id,
-                    rendered_at=rendered_at,
-                )
-                object_store = await factory.create_objectstore_for_org(
-                    org_id=org_id, service_label=service_label
-                )
+            try:
+                async with session.begin():
+                    org = await org_store.get_by_id(org_id)
+                    if org is None:
+                        msg = f"Organization {org_id} not found"
+                        raise NotFoundError(msg)  # noqa: TRY301
+                    service_label = org.resolved_staging_store_label
+                    if service_label is None:
+                        msg = (
+                            f"No object store service configured for "
+                            f"org {org_id}"
+                        )
+                        raise RuntimeError(msg)  # noqa: TRY301
+
+                    publisher = factory.create_dashboard_publisher()
+                    rendered_at = datetime.now(tz=UTC)
+                    context = await publisher.build_context(
+                        org_id=org_id,
+                        project_id=project_id,
+                        rendered_at=rendered_at,
+                    )
+                    object_store = await factory.create_objectstore_for_org(
+                        org_id=org_id, service_label=service_label
+                    )
+
+                async with session.begin():
+                    await queue_job_store.update_phase(
+                        queue_job_id,
+                        "uploading",
+                        progress={
+                            "message": "Uploading dashboard artifacts",
+                            "object_count": 0,
+                        },
+                    )
+                async with object_store:
+                    progress = await publisher.render_and_upload(
+                        context=context, object_store=object_store
+                    )
+            except Exception as exc:
+                logger.exception("Dashboard build failed")
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                return "failed"
 
             async with session.begin():
                 await queue_job_store.update_phase(
                     queue_job_id,
-                    "uploading",
+                    "complete",
                     progress={
-                        "message": "Uploading dashboard artifacts",
-                        "object_count": 0,
+                        "message": "Dashboard build complete",
+                        "object_count": progress.object_count,
+                        "total_size_bytes": progress.total_size_bytes,
+                        "rendered_at": context.rendered_at.isoformat(),
                     },
                 )
-            async with object_store:
-                progress = await publisher.render_and_upload(
-                    context=context, object_store=object_store
-                )
-        except Exception as exc:
-            logger.exception("Dashboard build failed")
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-            return "failed"
-
-        async with session.begin():
-            await queue_job_store.update_phase(
-                queue_job_id,
-                "complete",
-                progress={
-                    "message": "Dashboard build complete",
-                    "object_count": progress.object_count,
-                    "total_size_bytes": progress.total_size_bytes,
-                    "rendered_at": context.rendered_at.isoformat(),
-                },
-            )
-            await queue_job_store.complete(queue_job_id)
-        logger.info("Dashboard build completed")
-        return "completed"
+                await queue_job_store.complete(queue_job_id)
+            logger.info("Dashboard build completed")
+            return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
