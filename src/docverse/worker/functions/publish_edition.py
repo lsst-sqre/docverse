@@ -117,14 +117,6 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             edition_id=payload["edition_id"],
         )
         async with lock_service.acquire(lock_key):
-            # The pg_advisory_lock SELECT auto-began a transaction on
-            # the session; commit it so the explicit session.begin()
-            # blocks below don't trip "transaction already begun".
-            # The advisory lock is connection-scoped so it survives
-            # the commit until pg_advisory_unlock runs (or the worker
-            # connection closes).
-            await session.commit()
-
             async with session.begin():
                 resources = await _load_resources(
                     session=session, logger=logger, payload=payload

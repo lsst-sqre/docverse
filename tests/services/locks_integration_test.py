@@ -116,6 +116,34 @@ async def test_different_classes_do_not_block(
 
 
 @pytest.mark.asyncio
+async def test_connection_identity_stable_across_lock_block(
+    lock_engine: AsyncEngine,
+) -> None:
+    """The session's connection is preserved across ``acquire`` + exit.
+
+    ``acquire`` holds the advisory lock on a dedicated pooled
+    connection, not the caller's session — so the session's bookkeeping
+    must be untouched by entering, running, and exiting the lock
+    block. A regression that accidentally committed or closed the
+    session inside ``acquire`` would swap its connection and trip this
+    test.
+    """
+    maker = async_sessionmaker(lock_engine, expire_on_commit=False)
+    lock_key = LockKey.for_project(org_id=7, project_id=11)
+
+    async with maker() as session:
+        svc = LockService(session=session, logger=_logger())
+
+        conn_before = await session.connection()
+        async with svc.acquire(lock_key):
+            conn_inside = await session.connection()
+        conn_after = await session.connection()
+
+        assert id(conn_before) == id(conn_inside)
+        assert id(conn_inside) == id(conn_after)
+
+
+@pytest.mark.asyncio
 async def test_session_close_releases_lock_on_crash(
     app: FastAPI,
 ) -> None:

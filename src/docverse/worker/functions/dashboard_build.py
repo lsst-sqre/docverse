@@ -73,14 +73,6 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 
         lock_key = LockKey.for_project(org_id=org_id, project_id=project_id)
         async with lock_service.acquire(lock_key):
-            # The pg_advisory_lock SELECT auto-began a transaction on
-            # the session; commit it so the explicit session.begin()
-            # blocks below don't trip "transaction already begun".
-            # The advisory lock is connection-scoped so it survives
-            # the commit until pg_advisory_unlock runs (or the worker
-            # connection closes).
-            await session.commit()
-
             async with session.begin():
                 await queue_job_store.start(queue_job_id)
                 await queue_job_store.update_phase(

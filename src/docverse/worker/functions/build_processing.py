@@ -110,14 +110,6 @@ async def build_processing(  # noqa: PLR0915
             git_ref=build.git_ref,
         )
         async with lock_service.acquire(lock_key):
-            # The pg_advisory_lock SELECT auto-began a transaction on
-            # the session; commit it so the explicit session.begin()
-            # blocks below don't trip "transaction already begun".
-            # The advisory lock is connection-scoped so it survives
-            # the commit until pg_advisory_unlock runs (or the worker
-            # connection closes).
-            await session.commit()
-
             # Stale-build guard runs *inside* the lock so two
             # concurrent supersession checks cannot race: only the
             # newest build for (project, git_ref) does any work; any

@@ -22,7 +22,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 
 class LockClass(IntEnum):
@@ -168,48 +168,82 @@ class LockService:
 
         Blocks the caller until the lock is granted via
         ``SELECT pg_advisory_lock(:lock_id)``. On exit (normal or
-        exceptional) issues ``SELECT pg_advisory_unlock(:lock_id)``. If
-        the session's underlying connection dies before unlock runs
+        exceptional) issues ``SELECT pg_advisory_unlock(:lock_id)``
+        and returns the lock's connection to the pool.
+
+        The lock is held on a **dedicated** connection checked out from
+        the engine for the duration of the block, not on the caller's
+        session. This insulates the lock from the caller's pool
+        lifecycle: ``session.commit()`` inside the caller returns the
+        session's connection to the pool, and a concurrent sibling
+        session that picks up that connection would see the lock
+        re-entrantly — a silent mutex leak. With a dedicated
+        connection, the lock stays pinned for the whole block, and the
+        caller's session.begin() blocks work unmodified because
+        ``acquire`` never auto-begins on the caller's session. If the
+        dedicated connection dies before ``pg_advisory_unlock`` runs
         (e.g. a crashed worker), Postgres releases the lock when the
-        connection closes — session lifetime is the ultimate owner.
+        TCP connection closes.
         """
+        engine: AsyncEngine = self._session.bind  # type: ignore[assignment]
         self._logger.debug(
             "Acquiring advisory lock",
             lock_id=lock_key.lock_id,
             lock_label=lock_key.label,
             lock_class=lock_key.lock_class.name,
         )
-        await self._session.execute(
-            text("SELECT pg_advisory_lock(:lock_id)"),
-            {"lock_id": lock_key.lock_id},
-        )
-        self._logger.debug(
-            "Acquired advisory lock",
-            lock_id=lock_key.lock_id,
-            lock_label=lock_key.label,
-        )
-        try:
-            yield
-        finally:
+        async with engine.connect() as lock_conn:
+            await lock_conn.execute(
+                text("SELECT pg_advisory_lock(:lock_id)"),
+                {"lock_id": lock_key.lock_id},
+            )
+            # Commit the lock_conn transaction so the connection is
+            # clean for the unlock path; the advisory lock itself is
+            # connection-scoped (not transaction-scoped) so it
+            # survives the commit until unlock runs or the connection
+            # closes.
+            await lock_conn.commit()
+            self._logger.debug(
+                "Acquired advisory lock",
+                lock_id=lock_key.lock_id,
+                lock_label=lock_key.label,
+            )
             try:
-                await self._session.execute(
-                    text("SELECT pg_advisory_unlock(:lock_id)"),
-                    {"lock_id": lock_key.lock_id},
-                )
-            except Exception:  # noqa: BLE001
-                # Unlock is best-effort: on session or connection
-                # failure the DB releases the lock when the connection
-                # closes. Log and continue so the original exception
-                # (if any) still propagates.
-                self._logger.warning(
-                    "Failed to release advisory lock",
-                    lock_id=lock_key.lock_id,
-                    lock_label=lock_key.label,
-                    exc_info=True,
-                )
-            else:
-                self._logger.debug(
-                    "Released advisory lock",
-                    lock_id=lock_key.lock_id,
-                    lock_label=lock_key.label,
-                )
+                yield
+            finally:
+                try:
+                    await lock_conn.execute(
+                        text("SELECT pg_advisory_unlock(:lock_id)"),
+                        {"lock_id": lock_key.lock_id},
+                    )
+                    await lock_conn.commit()
+                except Exception:
+                    # A stuck unlock leaks the lock onto this pooled
+                    # connection; invalidate so the pool discards it
+                    # and the DB releases the lock on close. Raising
+                    # ``error`` (not ``warning``) because every
+                    # subsequent job on this key is blocked until the
+                    # connection is actually closed. The original
+                    # exception from the lock body (if any) still
+                    # propagates because this branch swallows only
+                    # the unlock failure.
+                    self._logger.exception(
+                        "Failed to release advisory lock",
+                        lock_id=lock_key.lock_id,
+                        lock_label=lock_key.label,
+                    )
+                    try:
+                        await lock_conn.invalidate()
+                    except Exception:  # noqa: BLE001
+                        self._logger.warning(
+                            "Failed to invalidate stuck lock connection",
+                            lock_id=lock_key.lock_id,
+                            lock_label=lock_key.label,
+                            exc_info=True,
+                        )
+                else:
+                    self._logger.debug(
+                        "Released advisory lock",
+                        lock_id=lock_key.lock_id,
+                        lock_label=lock_key.label,
+                    )
