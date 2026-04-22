@@ -62,6 +62,13 @@ coverage.xml
 # Ruff
 .ruff_cache/
 
+# pre-commit (fallback when $HOME/.cache/pre-commit isn't writable)
+.pre-commit-cache/
+
+# Linux core dumps
+core
+core.*
+
 # Sphinx documentation
 docs/_build/
 
