@@ -79,7 +79,7 @@ class SqlBuild(Base):
     )
 
     __table_args__ = (
-        Index("idx_builds_project_id", "project_id"),
+        Index("idx_builds_project_id_git_ref", "project_id", "git_ref"),
         Index("idx_builds_status", "status"),
         Index("idx_builds_git_ref", "git_ref"),
     )

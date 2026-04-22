@@ -16,8 +16,12 @@ from .services.dashboard.enqueue import DashboardBuildEnqueuer
 from .services.dashboard.publisher import DashboardPublisher
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
-from .services.edition_tracking import EditionTrackingService
+from .services.edition_tracking import (
+    EditionTrackingDeps,
+    EditionTrackingService,
+)
 from .services.infrastructure import InfrastructureService
+from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .storage.build_store import BuildStore
@@ -135,8 +139,15 @@ class Factory:
         )
 
     def create_edition_tracking_service(self) -> EditionTrackingService:
-        """Create an EditionTrackingService."""
-        return EditionTrackingService(
+        """Create an EditionTrackingService.
+
+        The factory always wires in a :class:`LockService` so worker
+        call paths (``build_processing``) get the EDITION_UPDATE
+        advisory lock around each ``set_current_build`` call. Direct
+        unit-test constructions of the service may omit ``lock_service``
+        on the :class:`EditionTrackingDeps` dataclass.
+        """
+        deps = EditionTrackingDeps(
             edition_store=EditionStore(
                 session=self._session, logger=self._logger
             ),
@@ -146,7 +157,9 @@ class Factory:
             project_store=self._create_project_store(),
             org_store=self._create_org_store(),
             logger=self._logger,
+            lock_service=self.create_lock_service(),
         )
+        return EditionTrackingService(deps)
 
     def create_edition_service(self) -> EditionService:
         """Create an EditionService."""
@@ -230,6 +243,10 @@ class Factory:
             org_store=self._create_org_store(),
             logger=self._logger,
         )
+
+    def create_lock_service(self) -> LockService:
+        """Create a LockService bound to this factory's session."""
+        return LockService(session=self._session, logger=self._logger)
 
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""

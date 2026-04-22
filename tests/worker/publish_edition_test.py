@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from types import TracebackType
 from typing import Any, Self
 
@@ -37,6 +38,7 @@ from docverse.domain.project import Project
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -50,6 +52,7 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.publish_edition import publish_edition
+from tests.support.lock_service_spy import install_recording_lock_service
 
 _HASH = "sha256:" + "a" * 64
 
@@ -601,3 +604,103 @@ async def test_publish_edition_failure_does_not_enqueue_dashboard(
     ]
     dashboard_jobs = [j for j in enqueued if j.name == "dashboard_build"]
     assert dashboard_jobs == []
+
+
+class _RecordingMockEditionPublisher(MockEditionPublisher):
+    """``MockEditionPublisher`` that timestamps each ``publish`` call."""
+
+    def __init__(self, publish_timestamps: list[float]) -> None:
+        super().__init__()
+        self._publish_timestamps = publish_timestamps
+
+    async def publish(
+        self,
+        *,
+        project_slug: str,
+        edition_slug: str,
+        build_public_id: str,
+        object_key_prefix: str,
+    ) -> None:
+        self._publish_timestamps.append(time.monotonic())
+        await super().publish(
+            project_slug=project_slug,
+            edition_slug=edition_slug,
+            build_public_id=build_public_id,
+            object_key_prefix=object_key_prefix,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_acquires_edition_update_lock(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publish_edition takes EDITION_UPDATE before invoking the publisher.
+
+    Verifies the worker wires the lock to the correct
+    ``LockKey.for_edition_update`` for the resolved
+    ``(org_id, project_id, edition_id)`` tuple, and that the spy
+    publisher's ``publish`` call (the externally observable CDN
+    mutation) happens strictly after the EDITION_UPDATE acquire.
+    """
+    publish_timestamps: list[float] = []
+    mock_publisher = _RecordingMockEditionPublisher(
+        publish_timestamps=publish_timestamps
+    )
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-lock-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-lock",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+    events = install_recording_lock_service(monkeypatch)
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-publish-arq-lock",
+    }
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    expected = LockKey.for_edition_update(
+        org_id=org.id, project_id=project.id, edition_id=edition.id
+    )
+    eu_enters = [
+        e
+        for e in events
+        if e.event == "enter"
+        and e.lock_key.lock_class == LockClass.EDITION_UPDATE
+    ]
+    assert len(eu_enters) == 1
+    assert eu_enters[0].lock_key == expected
+
+    assert publish_timestamps, "expected publisher.publish to be called"
+    eu_enter_ts = eu_enters[0].timestamp
+    assert all(ts > eu_enter_ts for ts in publish_timestamps)

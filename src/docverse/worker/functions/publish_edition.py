@@ -29,6 +29,7 @@ from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
+from docverse.services.lock_service import LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -92,51 +93,74 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             session=session, logger=logger
         )
         queue_job_store = QueueJobStore(session=session, logger=logger)
+        project_store = ProjectStore(session=session, logger=logger)
+        lock_service = factory.create_lock_service()
 
+        # Pre-lock: resolve project_id from the payload's project_slug so
+        # the EDITION_UPDATE lock key can be computed. The arq payload
+        # carries project_slug rather than project_id, so a small SELECT
+        # is required before the lock is acquired.
         async with session.begin():
-            resources = await _load_resources(
-                session=session, logger=logger, payload=payload
+            project = await project_store.get_by_slug(
+                org_id=payload["org_id"], slug=payload["project_slug"]
             )
-            await _mark_publishing(
-                queue_job_store=queue_job_store,
-                edition_store=edition_store,
-                history_store=history_store,
-                resources=resources,
-                queue_job_id=queue_job_id,
-            )
-
-        try:
-            async with session.begin():
-                await factory.create_edition_publishing_service().publish(
-                    org_id=payload["org_id"],
-                    project_slug=payload["project_slug"],
-                    edition=resources.edition,
-                    build=resources.build,
-                    history_entry=resources.history_entry,
+            if project is None:
+                msg = (
+                    f"Project {payload['project_slug']!r} not found "
+                    f"for org {payload['org_id']}"
                 )
-        except Exception as exc:
-            logger.exception("Edition publish failed")
+                raise NotFoundError(msg)
+
+        lock_key = LockKey.for_edition_update(
+            org_id=payload["org_id"],
+            project_id=project.id,
+            edition_id=payload["edition_id"],
+        )
+        async with lock_service.acquire(lock_key):
             async with session.begin():
-                await _mark_failed(
+                resources = await _load_resources(
+                    session=session, logger=logger, payload=payload
+                )
+                await _mark_publishing(
+                    queue_job_store=queue_job_store,
                     edition_store=edition_store,
                     history_store=history_store,
-                    queue_job_store=queue_job_store,
                     resources=resources,
                     queue_job_id=queue_job_id,
-                    exc=exc,
                 )
-            return "failed"
-        async with session.begin():
-            await queue_job_store.complete(queue_job_id)
-        logger.info("Edition publish completed")
-        await try_enqueue_dashboard_build_by_id(
-            factory=factory,
-            session=session,
-            logger=logger,
-            org_id=payload["org_id"],
-            project_id=resources.edition.project_id,
-        )
-        return "completed"
+
+            try:
+                async with session.begin():
+                    await factory.create_edition_publishing_service().publish(
+                        org_id=payload["org_id"],
+                        project_slug=payload["project_slug"],
+                        edition=resources.edition,
+                        build=resources.build,
+                        history_entry=resources.history_entry,
+                    )
+            except Exception as exc:
+                logger.exception("Edition publish failed")
+                async with session.begin():
+                    await _mark_failed(
+                        edition_store=edition_store,
+                        history_store=history_store,
+                        queue_job_store=queue_job_store,
+                        resources=resources,
+                        queue_job_id=queue_job_id,
+                        exc=exc,
+                    )
+                return "failed"
+            async with session.begin():
+                await queue_job_store.complete(queue_job_id)
+            logger.info("Edition publish completed")
+            await try_enqueue_dashboard_build_by_id(
+                factory=factory,
+                session=session,
+                logger=logger,
+                org_id=payload["org_id"],
+                project_id=resources.edition.project_id,
+            )
+            return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)

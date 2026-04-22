@@ -99,6 +99,25 @@ class BuildStore:
             return None
         return Build.model_validate(row)
 
+    async def get_latest_build_id_for_ref(
+        self, *, project_id: int, git_ref: str
+    ) -> int | None:
+        """Return the max build id for a ``(project_id, git_ref)`` pair.
+
+        Used by the ``build_processing`` stale-build guard: a job whose
+        build id is less than the latest known id for the same ref has
+        been superseded and must skip its expensive work. Includes
+        soft-deleted rows so a deletion mid-processing cannot make a
+        superseded build look current.
+        """
+        result = await self._session.execute(
+            select(func.max(SqlBuild.id)).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def list_by_project(
         self,
         project_id: int,

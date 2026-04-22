@@ -24,7 +24,10 @@ from docverse.dbschema.project import SqlProject
 from docverse.domain.build import Build
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
-from docverse.services.edition_tracking import EditionTrackingService
+from docverse.services.edition_tracking import (
+    EditionTrackingDeps,
+    EditionTrackingService,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -44,7 +47,7 @@ def _make_service(
     db_session: AsyncSession,
 ) -> EditionTrackingService:
     logger = _logger()
-    return EditionTrackingService(
+    deps = EditionTrackingDeps(
         edition_store=EditionStore(session=db_session, logger=logger),
         history_store=EditionBuildHistoryStore(
             session=db_session, logger=logger
@@ -53,6 +56,7 @@ def _make_service(
         org_store=OrganizationStore(session=db_session, logger=logger),
         logger=logger,
     )
+    return EditionTrackingService(deps)
 
 
 async def _setup(

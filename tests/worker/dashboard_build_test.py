@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -27,12 +28,14 @@ from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.dashboard_build import dashboard_build
+from tests.support.lock_service_spy import install_recording_lock_service
 
 _config = Configuration()
 
@@ -243,3 +246,88 @@ async def test_dashboard_build_marks_failed_on_render_exception(
             assert job.status == JobStatus.failed
             assert job.errors is not None
             assert "Simulated objectstore" in job.errors["message"]
+
+
+class _RecordingMockObjectStore(MockObjectStore):
+    """``MockObjectStore`` that timestamps every upload."""
+
+    def __init__(self, op_timestamps: list[float]) -> None:
+        super().__init__()
+        self._op_timestamps = op_timestamps
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> None:
+        self._op_timestamps.append(time.monotonic())
+        await super().upload_object(
+            key=key, data=data, content_type=content_type
+        )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_acquires_project_lock_before_render(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dashboard_build acquires PROJECT before any render upload.
+
+    Verifies the worker wires the lock to ``LockKey.for_project`` for
+    the payload's ``(org_id, project_id)`` and that no render upload
+    happens before the lock is held.
+    """
+    logger = _logger()
+    op_timestamps: list[float] = []
+    mock_store = _RecordingMockObjectStore(op_timestamps=op_timestamps)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-lock",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+    events = install_recording_lock_service(monkeypatch)
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    http_client = httpx.AsyncClient()
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": http_client,
+        "discovery": DiscoveryClient(http_client),
+        "job_id": "test-arq-dash-lock",
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    expected = LockKey.for_project(org_id=org.id, project_id=project.id)
+    proj_enters = [
+        e
+        for e in events
+        if e.event == "enter" and e.lock_key.lock_class == LockClass.PROJECT
+    ]
+    assert len(proj_enters) == 1
+    assert proj_enters[0].lock_key == expected
+
+    assert op_timestamps, "expected dashboard render uploads"
+    proj_enter_ts = proj_enters[0].timestamp
+    assert all(ts > proj_enter_ts for ts in op_timestamps)

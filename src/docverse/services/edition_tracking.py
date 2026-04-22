@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import structlog
@@ -24,6 +25,7 @@ from docverse.domain.version import (
     SemverVersion,
     parse_version_for_mode,
 )
+from docverse.services.lock_service import LockKey, LockService
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -45,6 +47,25 @@ _VERSION_MODES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class EditionTrackingDeps:
+    """Collaborators required by :class:`EditionTrackingService`.
+
+    ``lock_service`` is optional: when set (workers), each
+    ``set_current_build`` call is wrapped in an EDITION_UPDATE advisory
+    lock so it serializes against concurrent ``publish_edition`` jobs
+    and admin-triggered edition pointer changes. ``None`` for
+    non-worker call paths (unit tests, out-of-scope code paths).
+    """
+
+    edition_store: EditionStore
+    history_store: EditionBuildHistoryStore
+    project_store: ProjectStore
+    org_store: OrganizationStore
+    logger: structlog.stdlib.BoundLogger
+    lock_service: LockService | None = None
+
+
 class EditionTrackingService:
     """Orchestrate edition tracking when a build completes.
 
@@ -53,19 +74,8 @@ class EditionTrackingService:
     stale-build guard), and records build history.
     """
 
-    def __init__(
-        self,
-        edition_store: EditionStore,
-        history_store: EditionBuildHistoryStore,
-        project_store: ProjectStore,
-        org_store: OrganizationStore,
-        logger: structlog.stdlib.BoundLogger,
-    ) -> None:
-        self._edition_store = edition_store
-        self._history_store = history_store
-        self._project_store = project_store
-        self._org_store = org_store
-        self._logger = logger
+    def __init__(self, deps: EditionTrackingDeps) -> None:
+        self._deps = deps
 
     async def track_build(self, build: Build) -> EditionTrackingResult:
         """Evaluate tracking rules for a completed build.
@@ -87,7 +97,7 @@ class EditionTrackingService:
             (data integrity violation).
         """
         # 1. Load project
-        project = await self._project_store.get_by_id(build.project_id)
+        project = await self._deps.project_store.get_by_id(build.project_id)
         if project is None:
             msg = (
                 f"Project id={build.project_id} not found"
@@ -96,7 +106,7 @@ class EditionTrackingService:
             raise RuntimeError(msg)
 
         # 2. Load org
-        org = await self._org_store.get_by_id(project.org_id)
+        org = await self._deps.org_store.get_by_id(project.org_id)
         if org is None:
             msg = (
                 f"Organization id={project.org_id} not found"
@@ -114,7 +124,7 @@ class EditionTrackingService:
                 build.git_ref, rules, alternate_name=build.alternate_name
             )
         except InvalidSlugError as exc:
-            self._logger.warning(
+            self._deps.logger.warning(
                 "Invalid slug derived from git ref",
                 git_ref=build.git_ref,
                 error=str(exc),
@@ -124,7 +134,7 @@ class EditionTrackingService:
             return EditionTrackingResult(derived_slug=None, suppressed=False)
 
         if derivation is None:
-            self._logger.info(
+            self._deps.logger.info(
                 "Git ref suppressed by ignore rule",
                 git_ref=build.git_ref,
                 build_id=build.id,
@@ -132,7 +142,7 @@ class EditionTrackingService:
             )
             return EditionTrackingResult(derived_slug=None, suppressed=True)
 
-        self._logger.info(
+        self._deps.logger.info(
             "Derived edition slug",
             slug=derivation.slug,
             edition_kind=derivation.edition_kind,
@@ -142,7 +152,7 @@ class EditionTrackingService:
         )
 
         # 5. Find matching editions (includes version-based modes)
-        editions = await self._edition_store.find_matching_editions(
+        editions = await self._deps.edition_store.find_matching_editions(
             project_id=project.id,
             git_ref=build.git_ref,
             alternate_name=build.alternate_name,
@@ -172,7 +182,11 @@ class EditionTrackingService:
 
         # 8. Update each edition
         outcomes = await self._update_editions(
-            editions, build, created_ids=created_ids
+            editions,
+            build,
+            created_ids=created_ids,
+            org_id=org.id,
+            project_id=project.id,
         )
 
         return EditionTrackingResult(
@@ -187,6 +201,8 @@ class EditionTrackingService:
         build: Build,
         *,
         created_ids: set[int],
+        org_id: int,
+        project_id: int,
     ) -> list[EditionTrackingOutcome]:
         """Apply build to each matched edition, returning outcomes."""
         outcomes: list[EditionTrackingOutcome] = []
@@ -195,6 +211,8 @@ class EditionTrackingService:
                 edition,
                 build,
                 auto_created=edition.id in created_ids,
+                org_id=org_id,
+                project_id=project_id,
             )
             outcomes.append(outcome)
         return outcomes
@@ -205,10 +223,12 @@ class EditionTrackingService:
         build: Build,
         *,
         auto_created: bool,
+        org_id: int,
+        project_id: int,
     ) -> EditionTrackingOutcome:
         """Attempt to update a single edition's build pointer."""
         if not self._should_update(edition, build):
-            self._logger.info(
+            self._deps.logger.info(
                 "Version guard skipped edition",
                 edition_slug=edition.slug,
                 edition_id=edition.id,
@@ -227,13 +247,15 @@ class EditionTrackingService:
             and build.git_ref == "main"
             and edition.current_build_git_ref == "main"
         )
-        updated = await self._edition_store.set_current_build(
+        updated = await self._set_current_build_locked(
+            org_id=org_id,
+            project_id=project_id,
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=skip_date_guard,
         )
         if updated is None:
-            self._logger.info(
+            self._deps.logger.info(
                 "Stale build skipped for edition",
                 edition_slug=edition.slug,
                 edition_id=edition.id,
@@ -255,17 +277,17 @@ class EditionTrackingService:
             and updated.alternate_name is None
             and build.alternate_name is not None
         ):
-            await self._edition_store.set_alternate_name(
+            await self._deps.edition_store.set_alternate_name(
                 edition_id=updated.id, alternate_name=build.alternate_name
             )
 
-        await self._history_store.record(
+        await self._deps.history_store.record(
             edition_id=edition.id, build_id=build.id
         )
         action: Literal["updated", "created"] = (
             "created" if auto_created else "updated"
         )
-        self._logger.info(
+        self._deps.logger.info(
             "Edition pointer updated",
             edition_slug=edition.slug,
             edition_id=edition.id,
@@ -278,6 +300,42 @@ class EditionTrackingService:
             build_id=build.id,
             action=action,
         )
+
+    async def _set_current_build_locked(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        edition_id: int,
+        build_id: int,
+        skip_date_guard: bool,
+    ) -> Edition | None:
+        """Update the edition pointer under an EDITION_UPDATE lock.
+
+        When ``self._deps.lock_service`` is configured (worker call paths),
+        the call serializes against concurrent ``publish_edition`` jobs
+        and admin-triggered edition pointer changes for the same
+        edition. With no lock service (unit-test call paths), the
+        update runs unwrapped — non-worker callers are explicitly
+        out of scope per the design (SQR-112).
+        """
+        if self._deps.lock_service is None:
+            return await self._deps.edition_store.set_current_build(
+                edition_id=edition_id,
+                build_id=build_id,
+                skip_date_guard=skip_date_guard,
+            )
+        lock_key = LockKey.for_edition_update(
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_id,
+        )
+        async with self._deps.lock_service.acquire(lock_key):
+            return await self._deps.edition_store.set_current_build(
+                edition_id=edition_id,
+                build_id=build_id,
+                skip_date_guard=skip_date_guard,
+            )
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -369,18 +427,18 @@ class EditionTrackingService:
         the existing edition is returned instead.
         """
         # Race guard: check if another worker already created it
-        existing = await self._edition_store.get_by_slug(
+        existing = await self._deps.edition_store.get_by_slug(
             project_id=project_id, slug=derivation.slug
         )
         if existing is not None:
-            self._logger.info(
+            self._deps.logger.info(
                 "Edition already exists, skipping auto-create",
                 slug=derivation.slug,
                 project_id=project_id,
             )
             return existing
 
-        edition = await self._edition_store.create_internal(
+        edition = await self._deps.edition_store.create_internal(
             project_id=project_id,
             slug=derivation.slug,
             title=derivation.slug,
@@ -389,7 +447,7 @@ class EditionTrackingService:
             tracking_params=derivation.tracking_params,
             alternate_name=derivation.tracking_params.get("alternate_name"),
         )
-        self._logger.info(
+        self._deps.logger.info(
             "Auto-created edition",
             slug=edition.slug,
             kind=edition.kind,
@@ -421,11 +479,11 @@ class EditionTrackingService:
 
         # --- semver_major ---
         major_slug = str(sv.major)
-        major_edition = await self._edition_store.get_by_slug(
+        major_edition = await self._deps.edition_store.get_by_slug(
             project_id=project_id, slug=major_slug
         )
         if major_edition is None:
-            major_edition = await self._edition_store.create_internal(
+            major_edition = await self._deps.edition_store.create_internal(
                 project_id=project_id,
                 slug=major_slug,
                 title=f"Latest {sv.major}.x",
@@ -433,7 +491,7 @@ class EditionTrackingService:
                 tracking_mode=TrackingMode.semver_major,
                 tracking_params={"major_version": sv.major},
             )
-            self._logger.info(
+            self._deps.logger.info(
                 "Auto-created semver_major edition",
                 slug=major_slug,
                 project_id=project_id,
@@ -445,11 +503,11 @@ class EditionTrackingService:
 
         # --- semver_minor ---
         minor_slug = f"{sv.major}.{sv.minor}"
-        minor_edition = await self._edition_store.get_by_slug(
+        minor_edition = await self._deps.edition_store.get_by_slug(
             project_id=project_id, slug=minor_slug
         )
         if minor_edition is None:
-            minor_edition = await self._edition_store.create_internal(
+            minor_edition = await self._deps.edition_store.create_internal(
                 project_id=project_id,
                 slug=minor_slug,
                 title=f"Latest {sv.major}.{sv.minor}.x",
@@ -460,7 +518,7 @@ class EditionTrackingService:
                     "minor_version": sv.minor,
                 },
             )
-            self._logger.info(
+            self._deps.logger.info(
                 "Auto-created semver_minor edition",
                 slug=minor_slug,
                 project_id=project_id,
