@@ -121,6 +121,10 @@ async def build_processing(  # noqa: PLR0915
                         git_ref=build.git_ref,
                     )
                 )
+            # A newer build landing between this read and _mark_stale_skipped
+            # is benign: the BUILD_PROCESSING lock serializes supersession
+            # checks, so the newer build's own check will discard this
+            # build's "stale" verdict and proceed correctly.
             if latest_build_id is not None and latest_build_id != build_id:
                 await _mark_stale_skipped(
                     session=session,

@@ -101,6 +101,7 @@ class LockKey:
         Serializes builds sharing the same ``(org, project, git_ref)``.
         """
         lock_class = LockClass.BUILD_PROCESSING
+        # kwarg order is load-bearing; do not reorder (see compute_lock_id).
         lock_id = compute_lock_id(
             lock_class,
             org_id=org_id,
@@ -123,6 +124,7 @@ class LockKey:
         and its per-edition metadata JSON).
         """
         lock_class = LockClass.EDITION_UPDATE
+        # kwarg order is load-bearing; do not reorder (see compute_lock_id).
         lock_id = compute_lock_id(
             lock_class,
             org_id=org_id,
@@ -142,6 +144,7 @@ class LockKey:
         Serializes per-project work such as dashboard renders.
         """
         lock_class = LockClass.PROJECT
+        # kwarg order is load-bearing; do not reorder (see compute_lock_id).
         lock_id = compute_lock_id(
             lock_class,
             org_id=org_id,
