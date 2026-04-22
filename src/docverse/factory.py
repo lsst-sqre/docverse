@@ -18,6 +18,7 @@ from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_tracking import EditionTrackingService
 from .services.infrastructure import InfrastructureService
+from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .storage.build_store import BuildStore
@@ -230,6 +231,10 @@ class Factory:
             org_store=self._create_org_store(),
             logger=self._logger,
         )
+
+    def create_lock_service(self) -> LockService:
+        """Create a LockService bound to this factory's session."""
+        return LockService(session=self._session, logger=self._logger)
 
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""
