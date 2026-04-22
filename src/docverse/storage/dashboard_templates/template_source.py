@@ -11,11 +11,22 @@ import tomllib
 from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NoReturn, Protocol, runtime_checkable
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from docverse.dbschema.dashboard_template_content import (
+    SqlDashboardTemplateContent,
+)
+from docverse.dbschema.dashboard_template_content_file import (
+    SqlDashboardTemplateContentFile,
+)
 
 __all__ = [
     "BuiltInTemplateSource",
     "DashboardTemplateConfig",
+    "DbTemplateSource",
     "ParsedTemplateConfig",
     "Switcher404Config",
     "SwitcherConfig",
@@ -161,3 +172,83 @@ class BuiltInTemplateSource:
         resource = self._root.joinpath(relative)
         with as_file(resource) as path:
             return Path(path).read_bytes()
+
+
+class DbTemplateSource:
+    """Template source backed by a ``dashboard_template_contents`` row.
+
+    Construction is cheap; the actual file bytes are loaded once via
+    :meth:`preload`. The :class:`TemplateSource` protocol's methods are
+    synchronous, so all DB I/O is funneled through the async ``preload``
+    step and the read methods then serve from an in-memory cache.
+    """
+
+    def __init__(self, *, content_id: int, session: AsyncSession) -> None:
+        self._content_id = content_id
+        self._session = session
+        self._template_toml: bytes | None = None
+        self._files: dict[str, bytes] = {}
+        self._config: ParsedTemplateConfig | None = None
+
+    async def preload(self) -> None:
+        """Load the content row and its files into memory.
+
+        Raises
+        ------
+        LookupError
+            If no content row exists for ``content_id``.
+        """
+        content_result = await self._session.execute(
+            select(SqlDashboardTemplateContent).where(
+                SqlDashboardTemplateContent.id == self._content_id,
+            )
+        )
+        content_row = content_result.scalar_one_or_none()
+        if content_row is None:
+            msg = f"DashboardTemplateContent {self._content_id} not found"
+            raise LookupError(msg)
+        self._template_toml = content_row.template_toml
+
+        files_result = await self._session.execute(
+            select(SqlDashboardTemplateContentFile).where(
+                SqlDashboardTemplateContentFile.content_id == self._content_id,
+            )
+        )
+        self._files = {
+            row.relative_path: row.data for row in files_result.scalars().all()
+        }
+
+    def load_config(self) -> ParsedTemplateConfig:
+        """Parse and cache the synced ``template.toml``."""
+        if self._template_toml is None:
+            self._raise_not_preloaded()
+        if self._config is None:
+            self._config = parse_template_toml(self._template_toml)
+        return self._config
+
+    def read_template(self, name: str) -> str:
+        """Read a Jinja template by name from the synced tree."""
+        return self._read_bytes(name).decode("utf-8")
+
+    def read_asset(self, path: str) -> bytes:
+        """Read an asset by relative path from the synced tree."""
+        return self._read_bytes(path)
+
+    def _read_bytes(self, relative: str) -> bytes:
+        if self._template_toml is None:
+            self._raise_not_preloaded()
+        try:
+            return self._files[relative]
+        except KeyError as exc:
+            msg = (
+                f"File {relative!r} not found in dashboard template "
+                f"content {self._content_id}"
+            )
+            raise FileNotFoundError(msg) from exc
+
+    def _raise_not_preloaded(self) -> NoReturn:
+        msg = (
+            "DbTemplateSource has not been preloaded; call "
+            "`await source.preload()` before reading."
+        )
+        raise RuntimeError(msg)
