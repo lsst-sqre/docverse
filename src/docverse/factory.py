@@ -16,7 +16,10 @@ from .services.dashboard.enqueue import DashboardBuildEnqueuer
 from .services.dashboard.publisher import DashboardPublisher
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
-from .services.edition_tracking import EditionTrackingService
+from .services.edition_tracking import (
+    EditionTrackingDeps,
+    EditionTrackingService,
+)
 from .services.infrastructure import InfrastructureService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
@@ -141,9 +144,10 @@ class Factory:
         The factory always wires in a :class:`LockService` so worker
         call paths (``build_processing``) get the EDITION_UPDATE
         advisory lock around each ``set_current_build`` call. Direct
-        unit-test constructions of the service may pass ``None``.
+        unit-test constructions of the service may omit ``lock_service``
+        on the :class:`EditionTrackingDeps` dataclass.
         """
-        return EditionTrackingService(
+        deps = EditionTrackingDeps(
             edition_store=EditionStore(
                 session=self._session, logger=self._logger
             ),
@@ -155,6 +159,7 @@ class Factory:
             logger=self._logger,
             lock_service=self.create_lock_service(),
         )
+        return EditionTrackingService(deps)
 
     def create_edition_service(self) -> EditionService:
         """Create an EditionService."""
