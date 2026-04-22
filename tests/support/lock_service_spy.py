@@ -25,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.factory import Factory
 from docverse.services.lock_service import LockKey, LockService
 
-__all__ = ["LockEvent", "RecordingLockService", "install_recording_lock_service"]
+__all__ = [
+    "LockEvent",
+    "RecordingLockService",
+    "install_recording_lock_service",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +66,9 @@ class RecordingLockService(LockService):
         async with super().acquire(lock_key):
             self._events.append(
                 LockEvent(
-                    event="enter", lock_key=lock_key, timestamp=time.monotonic()
+                    event="enter",
+                    lock_key=lock_key,
+                    timestamp=time.monotonic(),
                 )
             )
             try:
@@ -91,8 +97,8 @@ def install_recording_lock_service(
 
     def _create(self: Factory) -> RecordingLockService:
         return RecordingLockService(
-            session=self._session,  # noqa: SLF001
-            logger=self._logger,  # noqa: SLF001
+            session=self._session,
+            logger=self._logger,
             events=events,
         )
 
