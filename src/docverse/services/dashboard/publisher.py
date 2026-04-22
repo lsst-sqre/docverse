@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 
 import structlog
+from rubin.repertoire import DiscoveryClient
 
-from docverse.config import Configuration
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
 from docverse.storage.build_store import BuildStore
 from docverse.storage.dashboard_templates.template_source import (
@@ -75,7 +75,7 @@ class DashboardPublisher:
         project_store: ProjectStore,
         edition_store: EditionStore,
         build_store: BuildStore,
-        config: Configuration,
+        discovery: DiscoveryClient,
         logger: structlog.stdlib.BoundLogger,
         template_source: TemplateSource | None = None,
     ) -> None:
@@ -83,7 +83,7 @@ class DashboardPublisher:
         self._project_store = project_store
         self._edition_store = edition_store
         self._build_store = build_store
-        self._config = config
+        self._discovery = discovery
         self._logger = logger
         self._template_source = template_source or BuiltInTemplateSource()
 
@@ -100,7 +100,7 @@ class DashboardPublisher:
             project_store=self._project_store,
             edition_store=self._edition_store,
             build_store=self._build_store,
-            config=self._config,
+            discovery=self._discovery,
             logger=self._logger,
         )
         return await builder.build(

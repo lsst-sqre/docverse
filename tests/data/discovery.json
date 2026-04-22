@@ -1,0 +1,11 @@
+{
+  "applications": ["docverse"],
+  "environment_name": "docverse-test",
+  "services": {
+    "internal": {
+      "docverse": {
+        "url": "https://example.test/docverse/api"
+      }
+    }
+  }
+}

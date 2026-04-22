@@ -5,8 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
+import respx
 import structlog
+from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,7 +21,6 @@ from docverse.client.models import (
     TrackingMode,
     UrlScheme,
 )
-from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
@@ -36,14 +38,16 @@ def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
 
-def _make_builder(session: AsyncSession) -> DashboardContextBuilder:
+def _make_builder(
+    session: AsyncSession, discovery_client: DiscoveryClient
+) -> DashboardContextBuilder:
     logger = _logger()
     return DashboardContextBuilder(
         org_store=OrganizationStore(session=session, logger=logger),
         project_store=ProjectStore(session=session, logger=logger),
         edition_store=EditionStore(session=session, logger=logger),
         build_store=BuildStore(session=session, logger=logger),
-        config=Configuration(),
+        discovery=discovery_client,
         logger=logger,
     )
 
@@ -122,6 +126,7 @@ async def _create_edition(
 @pytest.mark.asyncio
 async def test_context_builder_groups_editions_by_kind(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(db_session)
@@ -177,7 +182,7 @@ async def test_context_builder_groups_editions_by_kind(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert ctx.editions.main is not None
@@ -192,6 +197,7 @@ async def test_context_builder_groups_editions_by_kind(
 @pytest.mark.asyncio
 async def test_releases_sorted_semver_descending(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -209,7 +215,7 @@ async def test_releases_sorted_semver_descending(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert [e.slug for e in ctx.editions.releases] == [
@@ -223,6 +229,7 @@ async def test_releases_sorted_semver_descending(
 @pytest.mark.asyncio
 async def test_drafts_sorted_by_date_updated_descending(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -257,7 +264,7 @@ async def test_drafts_sorted_by_date_updated_descending(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert [e.slug for e in ctx.editions.drafts] == [
@@ -269,6 +276,7 @@ async def test_drafts_sorted_by_date_updated_descending(
 @pytest.mark.asyncio
 async def test_alternates_sorted_alphabetically_by_title(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -285,7 +293,7 @@ async def test_alternates_sorted_alphabetically_by_title(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert [e.title for e in ctx.editions.alternates] == ["East", "West"]
@@ -294,6 +302,7 @@ async def test_alternates_sorted_alphabetically_by_title(
 @pytest.mark.asyncio
 async def test_edition_without_current_build_has_no_build(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -309,7 +318,7 @@ async def test_edition_without_current_build_has_no_build(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert ctx.editions.main is not None
@@ -319,6 +328,7 @@ async def test_edition_without_current_build_has_no_build(
 @pytest.mark.asyncio
 async def test_alternate_name_surfaces_into_edition_context(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -339,7 +349,7 @@ async def test_alternate_name_surfaces_into_edition_context(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     drafts = ctx.editions.drafts
@@ -350,6 +360,7 @@ async def test_alternate_name_surfaces_into_edition_context(
 @pytest.mark.asyncio
 async def test_main_surfaced_separately_not_in_releases(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -372,7 +383,7 @@ async def test_main_surfaced_separately_not_in_releases(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert ctx.editions.main is not None
@@ -383,6 +394,7 @@ async def test_main_surfaced_separately_not_in_releases(
 @pytest.mark.asyncio
 async def test_empty_project_yields_empty_groupings(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -391,7 +403,7 @@ async def test_empty_project_yields_empty_groupings(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     assert ctx.editions.main is None
@@ -405,6 +417,7 @@ async def test_empty_project_yields_empty_groupings(
 @pytest.mark.asyncio
 async def test_rendered_at_defaults_to_now_utc(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -413,7 +426,7 @@ async def test_rendered_at_defaults_to_now_utc(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         before = datetime.now(tz=UTC)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
         after = datetime.now(tz=UTC)
@@ -425,6 +438,7 @@ async def test_rendered_at_defaults_to_now_utc(
 @pytest.mark.asyncio
 async def test_build_context_populated_when_current_build_set(
     db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
 ) -> None:
     async with db_session.begin():
         org, project = await _seed_org_and_project(
@@ -444,13 +458,58 @@ async def test_build_context_populated_when_current_build_set(
         await db_session.commit()
 
     async with db_session.begin():
-        builder = _make_builder(db_session)
+        builder = _make_builder(db_session, discovery_client)
         ctx = await builder.build(org_id=org.id, project_id=project.id)
 
     main = ctx.editions.main
     assert main is not None
     assert main.build is not None
     assert main.build.git_ref == "main"
+
+
+@pytest.mark.asyncio
+async def test_api_url_comes_from_repertoire_discovery(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """The built context's ``docverse.api_url`` is the Repertoire URL."""
+    async with db_session.begin():
+        org, project = await _seed_org_and_project(
+            db_session, org_slug="rep-org", project_slug="rep-proj"
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        builder = _make_builder(db_session, discovery_client)
+        ctx = await builder.build(org_id=org.id, project_id=project.id)
+
+    assert ctx.docverse.api_url == "https://example.test/docverse/api"
+
+
+@pytest.mark.asyncio
+async def test_build_raises_when_docverse_not_registered(
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """``build()`` raises when Repertoire returns no ``docverse`` URL."""
+    # Re-register discovery without a ``docverse`` internal service.
+    mock_discovery.reset()
+    register_mock_discovery(mock_discovery, {"services": {"internal": {}}})
+
+    async with db_session.begin():
+        org, project = await _seed_org_and_project(
+            db_session, org_slug="norep-org", project_slug="norep-proj"
+        )
+        await db_session.commit()
+
+    async with httpx.AsyncClient() as http_client:
+        discovery = DiscoveryClient(http_client)
+        async with db_session.begin():
+            builder = _make_builder(db_session, discovery)
+            with pytest.raises(
+                RuntimeError, match="not registered in Repertoire"
+            ):
+                await builder.build(org_id=org.id, project_id=project.id)
 
 
 def _make_org(base_domain: str, url_scheme: UrlScheme) -> Organization:

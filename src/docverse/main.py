@@ -9,6 +9,7 @@ from importlib.metadata import metadata, version
 import structlog
 from fastapi import FastAPI
 from rubin.gafaelfawr import GafaelfawrClient
+from rubin.repertoire import DiscoveryClient
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
@@ -81,12 +82,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
     http_client = await http_client_dependency()
     gafaelfawr_client = GafaelfawrClient(http_client)
     user_info_store = GafaelfawrUserInfoStore(gafaelfawr_client)
+    discovery = DiscoveryClient(
+        http_client,
+        base_url=str(config.repertoire_base_url),
+        logger=logger,
+    )
 
     await context_dependency.initialize(
         credential_encryptor=encryptor,
         superadmin_usernames=config.superadmin_usernames,
         user_info_store=user_info_store,
         arq_queue_name=config.arq_queue_name,
+        discovery=discovery,
     )
     yield
     await context_dependency.aclose()

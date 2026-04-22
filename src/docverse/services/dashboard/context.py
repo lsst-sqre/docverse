@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 
 import structlog
+from rubin.repertoire import DiscoveryClient
 
 from docverse.client.models import EditionKind
-from docverse.config import Configuration
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.dashboard_context import (
@@ -138,14 +138,14 @@ class DashboardContextBuilder:
         project_store: ProjectStore,
         edition_store: EditionStore,
         build_store: BuildStore,
-        config: Configuration,
+        discovery: DiscoveryClient,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
         self._project_store = project_store
         self._edition_store = edition_store
         self._build_store = build_store
-        self._config = config
+        self._discovery = discovery
         self._logger = logger
 
     async def build(
@@ -170,6 +170,11 @@ class DashboardContextBuilder:
         if project is None:
             msg = f"Project {project_id} not found"
             raise NotFoundError(msg)
+
+        api_url = await self._discovery.url_for_internal("docverse")
+        if api_url is None:
+            msg = "Docverse is not registered in Repertoire"
+            raise RuntimeError(msg)
 
         editions = await self._edition_store.list_all_by_project(project_id)
 
@@ -202,7 +207,7 @@ class DashboardContextBuilder:
             editions=editions_context,
             assets=AssetsContext(),
             docverse=DocverseContext(
-                api_url=str(self._config.published_base_url),
+                api_url=api_url,
                 version=_docverse_version(),
             ),
             rendered_at=rendered_at or datetime.now(tz=UTC),

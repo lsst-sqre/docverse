@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import structlog
+from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 
@@ -53,6 +54,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     encryptor: CredentialEncryptor = ctx["encryptor"]
     http_client: httpx.AsyncClient = ctx["http_client"]
     arq_queue: ArqQueue | None = ctx.get("arq_queue")
+    discovery: DiscoveryClient = ctx["discovery"]
 
     async for session in db_session_dependency():
         factory = Factory(
@@ -61,6 +63,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             credential_encryptor=encryptor,
             http_client=http_client,
             arq_queue=arq_queue,
+            discovery=discovery,
             default_queue_name=config.arq_queue_name,
         )
         queue_job_store = QueueJobStore(session=session, logger=logger)
@@ -87,7 +90,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     )
                     raise RuntimeError(msg)  # noqa: TRY301
 
-                publisher = factory.create_dashboard_publisher(config=config)
+                publisher = factory.create_dashboard_publisher()
                 rendered_at = datetime.now(tz=UTC)
                 context = await publisher.build_context(
                     org_id=org_id,

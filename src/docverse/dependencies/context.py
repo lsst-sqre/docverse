@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import Depends, Request, Response
+from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
@@ -81,6 +82,7 @@ class ContextDependency:
         self._credential_encryptor: CredentialEncryptor | None = None
         self._superadmin_usernames: list[str] = []
         self._arq_queue_name: str = "arq:queue"
+        self._discovery: DiscoveryClient | None = None
 
     async def __call__(
         self,
@@ -109,6 +111,7 @@ class ContextDependency:
                 user_info_store=self._user_info_store,
                 credential_encryptor=self._credential_encryptor,
                 superadmin_usernames=self._superadmin_usernames,
+                discovery=self._discovery,
                 default_queue_name=self._arq_queue_name,
             ),
         )
@@ -119,6 +122,7 @@ class ContextDependency:
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
         arq_queue_name: str | None = None,
+        discovery: DiscoveryClient | None = None,
     ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
@@ -130,6 +134,8 @@ class ContextDependency:
             self._superadmin_usernames = superadmin_usernames
         if arq_queue_name is not None:
             self._arq_queue_name = arq_queue_name
+        if discovery is not None:
+            self._discovery = discovery
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""

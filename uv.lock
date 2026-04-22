@@ -608,6 +608,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "rubin-gafaelfawr" },
+    { name = "rubin-repertoire" },
     { name = "safir", extra = ["arq", "db"] },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -649,6 +650,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },
     { name = "rubin-gafaelfawr" },
+    { name = "rubin-repertoire" },
     { name = "safir", extras = ["arq", "db"], specifier = ">=13" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]

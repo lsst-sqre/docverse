@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
+import respx
 import structlog
 from asgi_lifespan import LifespanManager
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from safir.arq import MockArqQueue
 from safir.database import (
     create_database_engine,
@@ -46,6 +50,27 @@ __all__ = [
     "seed_member",
     "seed_org_with_admin",
 ]
+
+_DISCOVERY_FIXTURE = Path(__file__).parent / "data" / "discovery.json"
+
+
+@pytest.fixture(autouse=True)
+def mock_discovery() -> Iterator[respx.Router]:
+    """Mock the Repertoire discovery endpoint for the whole test suite.
+
+    Passes through any other HTTP requests so the ASGI transport used by
+    the FastAPI test client still reaches the app.
+    """
+    with respx.mock(assert_all_called=False, assert_all_mocked=False) as mock:
+        register_mock_discovery(mock, _DISCOVERY_FIXTURE)
+        yield mock
+
+
+@pytest_asyncio.fixture
+async def discovery_client() -> AsyncGenerator[DiscoveryClient]:
+    """Return a ``DiscoveryClient`` backed by the autouse respx mock."""
+    async with httpx.AsyncClient() as http_client:
+        yield DiscoveryClient(http_client)
 
 
 @pytest_asyncio.fixture
