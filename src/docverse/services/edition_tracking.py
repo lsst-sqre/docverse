@@ -24,6 +24,7 @@ from docverse.domain.version import (
     SemverVersion,
     parse_version_for_mode,
 )
+from docverse.services.lock_service import LockKey, LockService
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -53,19 +54,25 @@ class EditionTrackingService:
     stale-build guard), and records build history.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         edition_store: EditionStore,
         history_store: EditionBuildHistoryStore,
         project_store: ProjectStore,
         org_store: OrganizationStore,
         logger: structlog.stdlib.BoundLogger,
+        lock_service: LockService | None = None,
     ) -> None:
         self._edition_store = edition_store
         self._history_store = history_store
         self._project_store = project_store
         self._org_store = org_store
         self._logger = logger
+        # Optional: when set (workers), each set_current_build call is
+        # wrapped in an EDITION_UPDATE advisory lock so it serializes
+        # against concurrent publish_edition jobs and admin-triggered
+        # edition pointer changes. None for non-worker call paths.
+        self._lock_service = lock_service
 
     async def track_build(self, build: Build) -> EditionTrackingResult:
         """Evaluate tracking rules for a completed build.
@@ -172,7 +179,11 @@ class EditionTrackingService:
 
         # 8. Update each edition
         outcomes = await self._update_editions(
-            editions, build, created_ids=created_ids
+            editions,
+            build,
+            created_ids=created_ids,
+            org_id=org.id,
+            project_id=project.id,
         )
 
         return EditionTrackingResult(
@@ -187,6 +198,8 @@ class EditionTrackingService:
         build: Build,
         *,
         created_ids: set[int],
+        org_id: int,
+        project_id: int,
     ) -> list[EditionTrackingOutcome]:
         """Apply build to each matched edition, returning outcomes."""
         outcomes: list[EditionTrackingOutcome] = []
@@ -195,6 +208,8 @@ class EditionTrackingService:
                 edition,
                 build,
                 auto_created=edition.id in created_ids,
+                org_id=org_id,
+                project_id=project_id,
             )
             outcomes.append(outcome)
         return outcomes
@@ -205,6 +220,8 @@ class EditionTrackingService:
         build: Build,
         *,
         auto_created: bool,
+        org_id: int,
+        project_id: int,
     ) -> EditionTrackingOutcome:
         """Attempt to update a single edition's build pointer."""
         if not self._should_update(edition, build):
@@ -227,7 +244,9 @@ class EditionTrackingService:
             and build.git_ref == "main"
             and edition.current_build_git_ref == "main"
         )
-        updated = await self._edition_store.set_current_build(
+        updated = await self._set_current_build_locked(
+            org_id=org_id,
+            project_id=project_id,
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=skip_date_guard,
@@ -278,6 +297,42 @@ class EditionTrackingService:
             build_id=build.id,
             action=action,
         )
+
+    async def _set_current_build_locked(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        edition_id: int,
+        build_id: int,
+        skip_date_guard: bool,
+    ) -> Edition | None:
+        """Update the edition pointer under an EDITION_UPDATE lock.
+
+        When ``self._lock_service`` is configured (worker call paths),
+        the call serializes against concurrent ``publish_edition`` jobs
+        and admin-triggered edition pointer changes for the same
+        edition. With no lock service (unit-test call paths), the
+        update runs unwrapped — non-worker callers are explicitly
+        out of scope per the design (SQR-112).
+        """
+        if self._lock_service is None:
+            return await self._edition_store.set_current_build(
+                edition_id=edition_id,
+                build_id=build_id,
+                skip_date_guard=skip_date_guard,
+            )
+        lock_key = LockKey.for_edition_update(
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_id,
+        )
+        async with self._lock_service.acquire(lock_key):
+            return await self._edition_store.set_current_build(
+                edition_id=edition_id,
+                build_id=build_id,
+                skip_date_guard=skip_date_guard,
+            )
 
     # ------------------------------------------------------------------
     # Private helpers

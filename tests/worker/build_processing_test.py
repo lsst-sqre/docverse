@@ -501,6 +501,113 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
 
 
 @pytest.mark.asyncio
+async def test_build_processing_skips_stale_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A superseded build skips before any object-store interaction.
+
+    Two builds exist for the same ``(project, git_ref)``. The older
+    build is dispatched after the newer one. The stale-build guard
+    inside the BUILD_PROCESSING lock detects that the incoming
+    ``build_id`` is not the max for the ``(project_id, git_ref)``
+    pair, marks the parent ``QueueJob`` ``completed`` with
+    ``progress["stale_skipped"] = True`` and the latest id, and
+    returns without invoking any uploads or touching edition state.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        older_build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        newer_build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        # Pre-create the edition with no current_build so we can later
+        # assert the pointer was never moved by the stale dispatch.
+        edition_store = EditionStore(session=db_session, logger=logger)
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Main",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=older_build.id,
+            backend_job_id="test-arq-stale",
+        )
+
+    # Intentionally do NOT stage a tarball: the stale-build guard
+    # must short-circuit before any download or upload is attempted.
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": httpx.AsyncClient(),
+        "job_id": "test-arq-stale",
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": older_build.id,
+        "build_public_id": serialize_base32_id(older_build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    # No uploads or downloads occurred — the mock store stayed empty.
+    assert mock_store.objects == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id("test-arq-stale")
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("stale_skipped") is True
+            assert job.progress.get("latest_build_id") == newer_build.id
+
+            # The pre-created edition's pointer must be untouched.
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.current_build_id is None
+
+            # The older build's status was not transitioned by the
+            # stale-skip path; it stays in ``processing``.
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed_older = await build_store.get_by_id(older_build.id)
+            assert refreshed_older is not None
+            assert refreshed_older.status == BuildStatus.processing
+
+
+@pytest.mark.asyncio
 async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
     app: None,
     db_session: AsyncSession,

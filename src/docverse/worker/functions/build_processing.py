@@ -32,6 +32,7 @@ from docverse.domain.edition_tracking import (
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.lock_service import LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -47,7 +48,7 @@ _UPLOAD_CONCURRENCY = 50
 config = Configuration()
 
 
-async def build_processing(
+async def build_processing(  # noqa: PLR0915
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
     """Process a build: download tarball, unpack, upload files.
@@ -92,76 +93,158 @@ async def build_processing(
         build_store = BuildStore(session=session, logger=logger)
         org_store = OrganizationStore(session=session, logger=logger)
         queue_job_store = QueueJobStore(session=session, logger=logger)
+        lock_service = factory.create_lock_service()
 
-        # Phase 1: Load metadata and mark QueueJob as in_progress
+        # Pre-lock: load just enough build metadata to compute the
+        # BUILD_PROCESSING lock key. Acquired below before any tarball
+        # work so two jobs sharing (project, git_ref) serialize.
         async with session.begin():
             build = await build_store.get_by_id(build_id)
             if build is None:
                 msg = f"Build {build_id} not found"
                 raise NotFoundError(msg)
 
-            org = await org_store.get_by_id(org_id)
-            if org is None:
-                msg = f"Organization {org_id} not found"
-                raise NotFoundError(msg)
+        lock_key = LockKey.for_build_processing(
+            org_id=org_id,
+            project_id=build.project_id,
+            git_ref=build.git_ref,
+        )
+        async with lock_service.acquire(lock_key):
+            # The pg_advisory_lock SELECT auto-began a transaction on
+            # the session; commit it so the explicit session.begin()
+            # blocks below don't trip "transaction already begun".
+            # The advisory lock is connection-scoped so it survives
+            # the commit until pg_advisory_unlock runs (or the worker
+            # connection closes).
+            await session.commit()
 
-            service_label = org.resolved_staging_store_label
-            if service_label is None:
-                msg = f"No object store service configured for org {org_id}"
-                raise RuntimeError(msg)
-
-            object_store = await factory.create_objectstore_for_org(
-                org_id=org_id, service_label=service_label
-            )
-
-            queue_job_id = await _start_queue_job(ctx, queue_job_store)
-            if queue_job_id is not None:
-                await queue_job_store.update_phase(
-                    queue_job_id,
-                    "unpacking",
-                    progress={
-                        "message": "Unpacking build into object store",
-                    },
+            # Stale-build guard runs *inside* the lock so two
+            # concurrent supersession checks cannot race: only the
+            # newest build for (project, git_ref) does any work; any
+            # older build observes a higher latest id and skips.
+            async with session.begin():
+                latest_build_id = (
+                    await build_store.get_latest_build_id_for_ref(
+                        project_id=build.project_id,
+                        git_ref=build.git_ref,
+                    )
                 )
-
-        # Phase 2: Upload files and mark build complete
-        try:
-            async with object_store, session.begin():
-                object_count, total_size_bytes = await _process_build(
-                    object_store=object_store,
-                    build=build,
-                    build_store=build_store,
+            if latest_build_id is not None and latest_build_id != build_id:
+                await _mark_stale_skipped(
+                    session=session,
+                    ctx=ctx,
+                    queue_job_store=queue_job_store,
+                    build_id=build_id,
+                    latest_build_id=latest_build_id,
                     logger=logger,
                 )
-        except Exception:
-            # Phase 3a: Mark build and queue job as failed
-            logger.exception("Build processing failed")
+                return "completed"
+
+            # Phase 1: Load metadata and mark QueueJob as in_progress
             async with session.begin():
-                build_service = factory.create_build_service()
-                await build_service.fail(build_id=build_id)
+                org = await org_store.get_by_id(org_id)
+                if org is None:
+                    msg = f"Organization {org_id} not found"
+                    raise NotFoundError(msg)
+
+                service_label = org.resolved_staging_store_label
+                if service_label is None:
+                    msg = (
+                        f"No object store service configured for org {org_id}"
+                    )
+                    raise RuntimeError(msg)
+
+                object_store = await factory.create_objectstore_for_org(
+                    org_id=org_id, service_label=service_label
+                )
+
+                queue_job_id = await _start_queue_job(ctx, queue_job_store)
                 if queue_job_id is not None:
-                    await queue_job_store.fail(queue_job_id)
-            return "failed"
-        else:
-            await _finalize_success(
-                session=session,
-                factory=factory,
-                build_store=build_store,
-                queue_job_store=queue_job_store,
-                org_id=org_id,
-                project_id=build.project_id,
-                project_slug=project_slug,
-                build_id=build_id,
-                build_public_id=build_public_id,
-                queue_job_id=queue_job_id,
-                object_count=object_count,
-                total_size_bytes=total_size_bytes,
-                logger=logger,
-            )
-            return "completed"
+                    await queue_job_store.update_phase(
+                        queue_job_id,
+                        "unpacking",
+                        progress={
+                            "message": "Unpacking build into object store",
+                        },
+                    )
+
+            # Phase 2: Upload files and mark build complete
+            try:
+                async with object_store, session.begin():
+                    object_count, total_size_bytes = await _process_build(
+                        object_store=object_store,
+                        build=build,
+                        build_store=build_store,
+                        logger=logger,
+                    )
+            except Exception:
+                # Phase 3a: Mark build and queue job as failed
+                logger.exception("Build processing failed")
+                async with session.begin():
+                    build_service = factory.create_build_service()
+                    await build_service.fail(build_id=build_id)
+                    if queue_job_id is not None:
+                        await queue_job_store.fail(queue_job_id)
+                return "failed"
+            else:
+                await _finalize_success(
+                    session=session,
+                    factory=factory,
+                    build_store=build_store,
+                    queue_job_store=queue_job_store,
+                    org_id=org_id,
+                    project_id=build.project_id,
+                    project_slug=project_slug,
+                    build_id=build_id,
+                    build_public_id=build_public_id,
+                    queue_job_id=queue_job_id,
+                    object_count=object_count,
+                    total_size_bytes=total_size_bytes,
+                    logger=logger,
+                )
+                return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _mark_stale_skipped(  # noqa: PLR0913
+    *,
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    queue_job_store: QueueJobStore,
+    build_id: int,
+    latest_build_id: int,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Mark a superseded build's QueueJob complete with a stale-skip flag.
+
+    Operators identify these runs by ``progress["stale_skipped"]`` plus
+    the dedicated log line; the QueueJob status stays ``completed``
+    because nothing was wrong with the build itself — a newer build
+    for the same ``(project, git_ref)`` simply took over.
+    """
+    logger.info(
+        "Stale build skipped",
+        build_id=build_id,
+        latest_build_id=latest_build_id,
+    )
+    async with session.begin():
+        queue_job_id = await _start_queue_job(ctx, queue_job_store)
+        if queue_job_id is not None:
+            await queue_job_store.update_phase(
+                queue_job_id,
+                "complete",
+                progress={
+                    "message": (
+                        "Stale build skipped; superseded by "
+                        f"build id {latest_build_id}"
+                    ),
+                    "stale_skipped": True,
+                    "latest_build_id": latest_build_id,
+                },
+            )
+            await queue_job_store.complete(queue_job_id)
 
 
 async def _start_queue_job(

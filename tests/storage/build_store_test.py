@@ -279,3 +279,69 @@ async def test_update_inventory(
         await db_session.commit()
     assert updated.object_count == 42
     assert updated.total_size_bytes == 1024000
+
+
+@pytest.mark.asyncio
+async def test_get_latest_build_id_for_ref(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Returns the max build id for a (project, git_ref) pair.
+
+    A second build on the same ref supersedes the first; a build on a
+    different ref does not influence the answer; an unknown ref or
+    project returns ``None``.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+
+        first_main = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:" + "1" * 64,
+            ),
+            uploader="testuser",
+        )
+        second_main = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:" + "2" * 64,
+            ),
+            uploader="testuser",
+        )
+        other_ref = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=BuildCreate(
+                git_ref="release/v1",
+                content_hash="sha256:" + "3" * 64,
+            ),
+            uploader="testuser",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        latest_main = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="main"
+        )
+        assert latest_main == second_main.id
+        assert latest_main != first_main.id
+
+        latest_release = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="release/v1"
+        )
+        assert latest_release == other_ref.id
+
+        missing_ref = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="does-not-exist"
+        )
+        assert missing_ref is None
+
+        missing_project = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id + 9999, git_ref="main"
+        )
+        assert missing_project is None

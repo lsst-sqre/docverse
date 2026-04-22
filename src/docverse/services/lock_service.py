@@ -66,9 +66,7 @@ def compute_lock_id(lock_class: LockClass, **parts: Any) -> int:
         A signed 64-bit int suitable for ``pg_advisory_lock(bigint)``.
     """
     joined = "|".join(str(value) for value in parts.values())
-    digest = hashlib.blake2b(
-        joined.encode("utf-8"), digest_size=6
-    ).digest()
+    digest = hashlib.blake2b(joined.encode("utf-8"), digest_size=6).digest()
     hash_int = int.from_bytes(digest, "big")
     unsigned = (int(lock_class.value) << 48) | hash_int
     if unsigned >= (1 << 63):
@@ -165,9 +163,7 @@ class LockService:
         self._logger = logger
 
     @asynccontextmanager
-    async def acquire(
-        self, lock_key: LockKey
-    ) -> AsyncGenerator[None]:
+    async def acquire(self, lock_key: LockKey) -> AsyncGenerator[None]:
         """Acquire ``lock_key`` for the lifetime of the context block.
 
         Blocks the caller until the lock is granted via
@@ -200,7 +196,7 @@ class LockService:
                     text("SELECT pg_advisory_unlock(:lock_id)"),
                     {"lock_id": lock_key.lock_id},
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # Unlock is best-effort: on session or connection
                 # failure the DB releases the lock when the connection
                 # closes. Log and continue so the original exception

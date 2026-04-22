@@ -32,9 +32,9 @@ def _logger() -> structlog.stdlib.BoundLogger:
 
 @pytest_asyncio.fixture
 async def lock_engine(
-    app: FastAPI,  # noqa: ARG001
+    app: FastAPI,
 ) -> AsyncGenerator[AsyncEngine]:
-    """A dedicated engine so the test controls connection disposal.
+    """Yield a dedicated engine so the test controls connection disposal.
 
     Requests the ``app`` fixture so the database schema is initialised
     before this engine connects. Disposed at teardown so locks from a
@@ -58,12 +58,8 @@ async def test_same_lock_serializes_concurrent_sessions(
     lock_key = LockKey.for_project(org_id=42, project_id=99)
 
     async with maker() as holder_session, maker() as waiter_session:
-        holder = LockService(
-            session=holder_session, logger=_logger()
-        )
-        waiter = LockService(
-            session=waiter_session, logger=_logger()
-        )
+        holder = LockService(session=holder_session, logger=_logger())
+        waiter = LockService(session=waiter_session, logger=_logger())
 
         acquired = asyncio.Event()
         release = asyncio.Event()
@@ -84,9 +80,7 @@ async def test_same_lock_serializes_concurrent_sessions(
 
         # The waiter must block while the holder has the lock.
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                asyncio.shield(wait_task), timeout=0.5
-            )
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.5)
         assert not wait_task.done()
 
         # Releasing the holder unblocks the waiter.
@@ -123,7 +117,7 @@ async def test_different_classes_do_not_block(
 
 @pytest.mark.asyncio
 async def test_session_close_releases_lock_on_crash(
-    app: FastAPI,  # noqa: ARG001
+    app: FastAPI,
 ) -> None:
     """Connection death releases the lock even without ``__aexit__``.
 

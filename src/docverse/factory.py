@@ -136,7 +136,13 @@ class Factory:
         )
 
     def create_edition_tracking_service(self) -> EditionTrackingService:
-        """Create an EditionTrackingService."""
+        """Create an EditionTrackingService.
+
+        The factory always wires in a :class:`LockService` so worker
+        call paths (``build_processing``) get the EDITION_UPDATE
+        advisory lock around each ``set_current_build`` call. Direct
+        unit-test constructions of the service may pass ``None``.
+        """
         return EditionTrackingService(
             edition_store=EditionStore(
                 session=self._session, logger=self._logger
@@ -147,6 +153,7 @@ class Factory:
             project_store=self._create_project_store(),
             org_store=self._create_org_store(),
             logger=self._logger,
+            lock_service=self.create_lock_service(),
         )
 
     def create_edition_service(self) -> EditionService:
