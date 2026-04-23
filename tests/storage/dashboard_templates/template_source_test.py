@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
 from docverse.storage.dashboard_templates.template_source import (
-    BuiltInTemplateSource,
     parse_template_toml,
 )
 
