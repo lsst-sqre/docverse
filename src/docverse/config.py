@@ -47,6 +47,35 @@ class Configuration(BaseSettings):
         description="If set, alerts will be posted to this Slack webhook",
     )
 
+    github_app_id: int | None = Field(
+        None,
+        title="GitHub App ID",
+        description=(
+            "Numeric ID of the GitHub App installed by Docverse tenants."
+            " Leave unset to disable the GitHub App feature. All three"
+            " ``github_app_*`` / ``github_webhook_*`` values must be set"
+            " together for the feature to be enabled."
+        ),
+    )
+
+    github_app_private_key: SecretStr | None = Field(
+        None,
+        title="GitHub App private key (PEM)",
+        description=(
+            "PEM-encoded private key for the GitHub App. Used to sign"
+            " JWTs when exchanging for installation access tokens."
+        ),
+    )
+
+    github_webhook_secret: SecretStr | None = Field(
+        None,
+        title="GitHub webhook shared secret",
+        description=(
+            "Shared secret used to verify the HMAC signature on incoming"
+            " GitHub webhooks."
+        ),
+    )
+
     database_url: str = Field(
         title="URL of the PostgreSQL database",
         description=(

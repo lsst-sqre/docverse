@@ -44,7 +44,10 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.user_info_store import StubUserInfoStore
 
+from .support.github_mock import GitHubMock, make_rsa_pem
+
 __all__ = [
+    "GitHubMock",
     "seed_build",
     "seed_group_member",
     "seed_member",
@@ -64,6 +67,28 @@ def mock_discovery() -> Iterator[respx.Router]:
     with respx.mock(assert_all_called=False, assert_all_mocked=False) as mock:
         register_mock_discovery(mock, _DISCOVERY_FIXTURE)
         yield mock
+
+
+@pytest.fixture(scope="session")
+def github_app_private_key_pem() -> str:
+    """Session-scoped RSA PEM so the 2048-bit keygen only runs once."""
+    return make_rsa_pem()
+
+
+@pytest.fixture
+def mock_github(
+    mock_discovery: respx.Router,
+    github_app_private_key_pem: str,
+) -> GitHubMock:
+    """Seeder for GitHub REST API responses on the autouse respx router.
+
+    Composes with ``mock_discovery`` by sharing its router, so a single
+    ``respx.mock`` context covers both mocks. Tests that need GitHub
+    fakes depend on this fixture; tests that don't are unaffected.
+    """
+    return GitHubMock(
+        router=mock_discovery, private_key_pem=github_app_private_key_pem
+    )
 
 
 @pytest_asyncio.fixture
