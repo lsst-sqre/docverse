@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM model for the ``dashboard_template_bindings`` table."""
+"""SQLAlchemy ORM model for ``dashboard_github_template_bindings``."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from sqlalchemy.sql import func
 from .base import Base
 
 
-class SqlDashboardTemplateBinding(Base):
-    """ORM model for the ``dashboard_template_bindings`` table.
+class SqlDashboardGitHubTemplateBinding(Base):
+    """ORM model for the ``dashboard_github_template_bindings`` table.
 
     A binding records the GitHub source (``owner``/``repo``/``ref``/
     ``root_path``) that an organization or a project should use for its
@@ -33,7 +33,7 @@ class SqlDashboardTemplateBinding(Base):
     standard unique constraints.
     """
 
-    __tablename__ = "dashboard_template_bindings"
+    __tablename__ = "dashboard_github_template_bindings"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
@@ -58,9 +58,9 @@ class SqlDashboardTemplateBinding(Base):
         String(512), nullable=False, default="/", server_default="/"
     )
 
-    content_id: Mapped[int | None] = mapped_column(
+    github_template_id: Mapped[int | None] = mapped_column(
         Integer,
-        ForeignKey("dashboard_template_contents.id", ondelete="SET NULL"),
+        ForeignKey("dashboard_github_templates.id", ondelete="SET NULL"),
         nullable=True,
     )
 
@@ -90,21 +90,24 @@ class SqlDashboardTemplateBinding(Base):
         UniqueConstraint(
             "org_id",
             "project_id",
-            name="uq_dashboard_template_bindings_org_project",
+            name="uq_dashboard_github_template_bindings_org_project",
         ),
         Index(
-            "uq_dashboard_template_bindings_org_default",
+            "uq_dashboard_github_template_bindings_org_default",
             "org_id",
             unique=True,
             postgresql_where=text("project_id IS NULL"),
         ),
-        Index("idx_dashboard_template_bindings_org_id", "org_id"),
         Index(
-            "idx_dashboard_template_bindings_content_id",
-            "content_id",
+            "idx_dashboard_github_template_bindings_org_id",
+            "org_id",
         ),
         Index(
-            "idx_dashboard_template_bindings_repo_ref",
+            "idx_dashboard_github_template_bindings_github_template_id",
+            "github_template_id",
+        ),
+        Index(
+            "idx_dashboard_github_template_bindings_repo_ref",
             "github_owner",
             "github_repo",
             "github_ref",

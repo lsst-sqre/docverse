@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM model for the ``dashboard_template_contents`` table."""
+"""SQLAlchemy ORM model for the ``dashboard_github_templates`` table."""
 
 from __future__ import annotations
 
@@ -11,15 +11,15 @@ from sqlalchemy.sql import func
 from .base import Base
 
 
-class SqlDashboardTemplateContent(Base):
-    """ORM model for the ``dashboard_template_contents`` table.
+class SqlDashboardGitHubTemplate(Base):
+    """ORM model for the ``dashboard_github_templates`` table.
 
     Holds the synced bytes of a template tree. One row per unique
     ``(github_owner, github_repo, github_ref, root_path)`` so multiple
     bindings pointing at the same source share a single cached copy.
     """
 
-    __tablename__ = "dashboard_template_contents"
+    __tablename__ = "dashboard_github_templates"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
@@ -48,6 +48,6 @@ class SqlDashboardTemplateContent(Base):
             "github_repo",
             "github_ref",
             "root_path",
-            name="uq_dashboard_template_contents_source_key",
+            name="uq_dashboard_github_templates_source_key",
         ),
     )

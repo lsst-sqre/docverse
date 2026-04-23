@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM model for the ``dashboard_template_content_files`` table."""
+"""SQLAlchemy ORM model for the ``dashboard_github_template_files`` table."""
 
 from __future__ import annotations
 
@@ -16,24 +16,24 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 
-class SqlDashboardTemplateContentFile(Base):
-    """ORM model for the ``dashboard_template_content_files`` table.
+class SqlDashboardGitHubTemplateFile(Base):
+    """ORM model for the ``dashboard_github_template_files`` table.
 
     One row per file in a synced template tree, keyed by
-    ``(content_id, relative_path)``. ``is_text`` distinguishes Jinja /
-    TOML / CSS / JS sources that are read as decoded text from binary
-    assets (images, fonts, etc.) returned as raw bytes.
+    ``(github_template_id, relative_path)``. ``is_text`` distinguishes
+    Jinja / TOML / CSS / JS sources that are read as decoded text from
+    binary assets (images, fonts, etc.) returned as raw bytes.
     """
 
-    __tablename__ = "dashboard_template_content_files"
+    __tablename__ = "dashboard_github_template_files"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
     )
 
-    content_id: Mapped[int] = mapped_column(
+    github_template_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("dashboard_template_contents.id", ondelete="CASCADE"),
+        ForeignKey("dashboard_github_templates.id", ondelete="CASCADE"),
         nullable=False,
     )
 
@@ -47,8 +47,8 @@ class SqlDashboardTemplateContentFile(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "content_id",
+            "github_template_id",
             "relative_path",
-            name="uq_dashboard_template_content_files_content_path",
+            name="uq_dashboard_github_template_files_template_path",
         ),
     )

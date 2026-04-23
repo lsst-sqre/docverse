@@ -1,4 +1,4 @@
-"""Tests for DashboardTemplateBindingStore."""
+"""Tests for DashboardGitHubTemplateBindingStore."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.storage.dashboard_templates.binding_store import (
-    DashboardTemplateBindingCreate,
-    DashboardTemplateBindingStore,
+from docverse.storage.dashboard_templates.github import (
+    DashboardGitHubTemplateBindingCreate,
+    DashboardGitHubTemplateBindingStore,
 )
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
@@ -43,15 +43,15 @@ async def _seed_org_and_project(
     return org.id, project.id
 
 
-def _store(session: AsyncSession) -> DashboardTemplateBindingStore:
+def _store(session: AsyncSession) -> DashboardGitHubTemplateBindingStore:
     logger = structlog.get_logger("test")
-    return DashboardTemplateBindingStore(session=session, logger=logger)
+    return DashboardGitHubTemplateBindingStore(session=session, logger=logger)
 
 
 def _binding(
     *, org_id: int, project_id: int | None = None
-) -> DashboardTemplateBindingCreate:
-    return DashboardTemplateBindingCreate(
+) -> DashboardGitHubTemplateBindingCreate:
+    return DashboardGitHubTemplateBindingCreate(
         org_id=org_id,
         project_id=project_id,
         github_owner="acme",
@@ -76,7 +76,7 @@ async def test_create_org_default_binding(
     assert binding.github_repo == "dashboard-templates"
     assert binding.github_ref == "main"
     assert binding.root_path == "/"
-    assert binding.content_id is None
+    assert binding.github_template_id is None
     assert binding.last_sync_status == "pending"
     assert binding.last_sync_error is None
 
@@ -145,7 +145,7 @@ async def test_get_project_override_returns_binding(
 
 
 async def _attempt_create(
-    session: AsyncSession, data: DashboardTemplateBindingCreate
+    session: AsyncSession, data: DashboardGitHubTemplateBindingCreate
 ) -> None:
     """Open a transaction and try to insert a binding — for raises tests."""
     async with session.begin():
@@ -202,7 +202,7 @@ async def test_update_sync_state_records_success(
             binding_id=binding.id,
             last_sync_status="succeeded",
             last_sync_error=None,
-            content_id=None,
+            github_template_id=None,
         )
         await db_session.commit()
     assert updated is not None
@@ -211,14 +211,14 @@ async def test_update_sync_state_records_success(
 
 
 @pytest.mark.asyncio
-async def test_update_sync_state_records_failure_keeps_content(
+async def test_update_sync_state_records_failure_keeps_template(
     db_session: AsyncSession,
 ) -> None:
-    """Failure must not blank the binding's content pointer.
+    """Failure must not blank the binding's template pointer.
 
     The PRD requires sync failures to leave dashboards rendering from
-    the last-good content; the store enforces this by only assigning
-    ``content_id`` when the caller explicitly passes one.
+    the last-good template; the store enforces this by only assigning
+    ``github_template_id`` when the caller explicitly passes one.
     """
     async with db_session.begin():
         org_id, _ = await _seed_org_and_project(db_session)
@@ -227,7 +227,7 @@ async def test_update_sync_state_records_failure_keeps_content(
         await store.update_sync_state(
             binding_id=binding.id,
             last_sync_status="succeeded",
-            content_id=None,
+            github_template_id=None,
         )
         await db_session.commit()
     async with db_session.begin():
@@ -236,7 +236,7 @@ async def test_update_sync_state_records_failure_keeps_content(
             binding_id=binding.id,
             last_sync_status="failed",
             last_sync_error="boom",
-            content_id=None,
+            github_template_id=None,
         )
         await db_session.commit()
     assert failed is not None

@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 import pytest
 
 from docverse.services.dashboard.asset_inliner import AssetInliner
+from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
 from docverse.storage.dashboard_templates.template_source import (
-    BuiltInTemplateSource,
     ParsedTemplateConfig,
 )
 

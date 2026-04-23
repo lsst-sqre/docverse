@@ -11,10 +11,8 @@ from rubin.repertoire import DiscoveryClient
 
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
 from docverse.storage.build_store import BuildStore
-from docverse.storage.dashboard_templates.template_source import (
-    BuiltInTemplateSource,
-    TemplateSource,
-)
+from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
+from docverse.storage.dashboard_templates.template_source import TemplateSource
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore

@@ -1,4 +1,4 @@
-"""Domain model for dashboard template bindings."""
+"""Domain model for dashboard GitHub template bindings."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class DashboardTemplateBinding(BaseModel):
+class DashboardGitHubTemplateBinding(BaseModel):
     """A configuration row binding an org or project to a GitHub source.
 
     A binding with ``project_id`` set is a project-specific override; a
     binding with ``project_id`` ``None`` is the org default. Bindings
-    point at a synced :class:`DashboardTemplateContent` row via
-    ``content_id`` once the first sync has succeeded.
+    point at a synced :class:`DashboardGitHubTemplate` row via
+    ``github_template_id`` once the first sync has succeeded.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -34,10 +34,11 @@ class DashboardTemplateBinding(BaseModel):
         description="Path within the repo where the template lives."
     )
 
-    content_id: int | None = Field(
+    github_template_id: int | None = Field(
         default=None,
         description=(
-            "ID of the synced content row, or ``None`` until first sync."
+            "ID of the synced GitHub template row, or ``None`` until first "
+            "sync."
         ),
     )
 

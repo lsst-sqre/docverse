@@ -1,9 +1,9 @@
-"""Add dashboard template binding/content/content-file tables.
+"""Add dashboard GitHub template binding/template/template-file tables.
 
 Adds the persistence layer for the GitHub-backed dashboard-template
 system. Three tables land in one revision:
 
-- ``dashboard_template_bindings`` records which GitHub source
+- ``dashboard_github_template_bindings`` records which GitHub source
   (``owner``/``repo``/``ref``/``root_path``) an org or project should
   use. ``project_id`` is nullable; ``NULL`` denotes the org default.
   PostgreSQL treats ``NULL`` as distinct in standard unique
@@ -11,13 +11,13 @@ system. Three tables land in one revision:
   unique index (``project_id IS NULL``) alongside the regular unique
   constraint on ``(org_id, project_id)``.
 
-- ``dashboard_template_contents`` holds the synced bytes of one
+- ``dashboard_github_templates`` holds the synced bytes of one
   template tree, keyed by ``(github_owner, github_repo, github_ref,
   root_path)`` so multiple bindings pointing at the same source share
   one cached copy.
 
-- ``dashboard_template_content_files`` holds one row per file in a
-  content tree, unique on ``(content_id, relative_path)``.
+- ``dashboard_github_template_files`` holds one row per file in a
+  template tree, unique on ``(github_template_id, relative_path)``.
 
 Revision ID: m1n2o3p4q5r6
 Revises: l0m1n2o3p4q5
@@ -37,7 +37,7 @@ depends_on: str | None = None
 
 def upgrade() -> None:
     op.create_table(
-        "dashboard_template_contents",
+        "dashboard_github_templates",
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
         sa.Column("github_owner", sa.String(256), nullable=False),
         sa.Column("github_repo", sa.String(256), nullable=False),
@@ -57,19 +57,17 @@ def upgrade() -> None:
             "github_repo",
             "github_ref",
             "root_path",
-            name="uq_dashboard_template_contents_source_key",
+            name="uq_dashboard_github_templates_source_key",
         ),
     )
 
     op.create_table(
-        "dashboard_template_content_files",
+        "dashboard_github_template_files",
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
         sa.Column(
-            "content_id",
+            "github_template_id",
             sa.Integer,
-            sa.ForeignKey(
-                "dashboard_template_contents.id", ondelete="CASCADE"
-            ),
+            sa.ForeignKey("dashboard_github_templates.id", ondelete="CASCADE"),
             nullable=False,
         ),
         sa.Column("relative_path", sa.String(512), nullable=False),
@@ -77,14 +75,14 @@ def upgrade() -> None:
         sa.Column("data", sa.LargeBinary, nullable=False),
         sa.Column("size_bytes", sa.BigInteger, nullable=False),
         sa.UniqueConstraint(
-            "content_id",
+            "github_template_id",
             "relative_path",
-            name="uq_dashboard_template_content_files_content_path",
+            name="uq_dashboard_github_template_files_template_path",
         ),
     )
 
     op.create_table(
-        "dashboard_template_bindings",
+        "dashboard_github_template_bindings",
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
         sa.Column(
             "org_id",
@@ -108,10 +106,10 @@ def upgrade() -> None:
             server_default="/",
         ),
         sa.Column(
-            "content_id",
+            "github_template_id",
             sa.Integer,
             sa.ForeignKey(
-                "dashboard_template_contents.id", ondelete="SET NULL"
+                "dashboard_github_templates.id", ondelete="SET NULL"
             ),
             nullable=True,
         ),
@@ -137,51 +135,51 @@ def upgrade() -> None:
         sa.UniqueConstraint(
             "org_id",
             "project_id",
-            name="uq_dashboard_template_bindings_org_project",
+            name="uq_dashboard_github_template_bindings_org_project",
         ),
     )
 
     op.create_index(
-        "uq_dashboard_template_bindings_org_default",
-        "dashboard_template_bindings",
+        "uq_dashboard_github_template_bindings_org_default",
+        "dashboard_github_template_bindings",
         ["org_id"],
         unique=True,
         postgresql_where=sa.text("project_id IS NULL"),
     )
     op.create_index(
-        "idx_dashboard_template_bindings_org_id",
-        "dashboard_template_bindings",
+        "idx_dashboard_github_template_bindings_org_id",
+        "dashboard_github_template_bindings",
         ["org_id"],
     )
     op.create_index(
-        "idx_dashboard_template_bindings_content_id",
-        "dashboard_template_bindings",
-        ["content_id"],
+        "idx_dashboard_github_template_bindings_github_template_id",
+        "dashboard_github_template_bindings",
+        ["github_template_id"],
     )
     op.create_index(
-        "idx_dashboard_template_bindings_repo_ref",
-        "dashboard_template_bindings",
+        "idx_dashboard_github_template_bindings_repo_ref",
+        "dashboard_github_template_bindings",
         ["github_owner", "github_repo", "github_ref"],
     )
 
 
 def downgrade() -> None:
     op.drop_index(
-        "idx_dashboard_template_bindings_repo_ref",
-        table_name="dashboard_template_bindings",
+        "idx_dashboard_github_template_bindings_repo_ref",
+        table_name="dashboard_github_template_bindings",
     )
     op.drop_index(
-        "idx_dashboard_template_bindings_content_id",
-        table_name="dashboard_template_bindings",
+        "idx_dashboard_github_template_bindings_github_template_id",
+        table_name="dashboard_github_template_bindings",
     )
     op.drop_index(
-        "idx_dashboard_template_bindings_org_id",
-        table_name="dashboard_template_bindings",
+        "idx_dashboard_github_template_bindings_org_id",
+        table_name="dashboard_github_template_bindings",
     )
     op.drop_index(
-        "uq_dashboard_template_bindings_org_default",
-        table_name="dashboard_template_bindings",
+        "uq_dashboard_github_template_bindings_org_default",
+        table_name="dashboard_github_template_bindings",
     )
-    op.drop_table("dashboard_template_bindings")
-    op.drop_table("dashboard_template_content_files")
-    op.drop_table("dashboard_template_contents")
+    op.drop_table("dashboard_github_template_bindings")
+    op.drop_table("dashboard_github_template_files")
+    op.drop_table("dashboard_github_templates")
