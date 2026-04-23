@@ -18,6 +18,10 @@ from .credentials import (
     S3Credentials,
 )
 from .dashboard import DashboardRebuildResponse, OrgDashboardRebuildEntry
+from .dashboard_template import (
+    DashboardTemplateBinding,
+    DashboardTemplateBindingCreate,
+)
 from .editions import (
     DefaultEditionConfig,
     Edition,
@@ -67,6 +71,8 @@ __all__ = [
     "CredentialPayload",
     "CredentialProvider",
     "DashboardRebuildResponse",
+    "DashboardTemplateBinding",
+    "DashboardTemplateBindingCreate",
     "DefaultEditionConfig",
     "Edition",
     "EditionBuildHistoryEntry",
