@@ -17,7 +17,11 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.services.dashboard.publisher import DashboardPublisher
+from docverse.services.dashboard_templates.resolver import TemplateResolver
 from docverse.storage.build_store import BuildStore
+from docverse.storage.dashboard_templates.github import (
+    DashboardGitHubTemplateBindingStore,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -34,6 +38,13 @@ def _make_publisher(
     session: AsyncSession, discovery_client: DiscoveryClient
 ) -> DashboardPublisher:
     logger = _logger()
+    resolver = TemplateResolver(
+        binding_store=DashboardGitHubTemplateBindingStore(
+            session=session, logger=logger
+        ),
+        session=session,
+        logger=logger,
+    )
     return DashboardPublisher(
         org_store=OrganizationStore(session=session, logger=logger),
         project_store=ProjectStore(session=session, logger=logger),
@@ -41,6 +52,7 @@ def _make_publisher(
         build_store=BuildStore(session=session, logger=logger),
         discovery=discovery_client,
         logger=logger,
+        template_resolver=resolver,
     )
 
 

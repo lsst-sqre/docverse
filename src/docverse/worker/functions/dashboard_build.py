@@ -115,9 +115,16 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                             "object_count": 0,
                         },
                     )
-                async with object_store:
+                async with object_store, session.begin():
+                    # render_and_upload resolves the TemplateSource at
+                    # render time (project override → org default →
+                    # built-in), so the DB reads live inside a
+                    # session.begin() that commits before the next
+                    # phase update opens its own transaction.
                     progress = await publisher.render_and_upload(
-                        context=context, object_store=object_store
+                        context=context,
+                        object_store=object_store,
+                        project_id=project_id,
                     )
             except Exception as exc:
                 logger.exception("Dashboard build failed")

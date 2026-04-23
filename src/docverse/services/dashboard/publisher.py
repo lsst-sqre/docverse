@@ -10,9 +10,9 @@ import structlog
 from rubin.repertoire import DiscoveryClient
 
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
+from docverse.exceptions import NotFoundError
+from docverse.services.dashboard_templates.resolver import TemplateResolver
 from docverse.storage.build_store import BuildStore
-from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
-from docverse.storage.dashboard_templates.template_source import TemplateSource
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -75,7 +75,7 @@ class DashboardPublisher:
         build_store: BuildStore,
         discovery: DiscoveryClient,
         logger: structlog.stdlib.BoundLogger,
-        template_source: TemplateSource | None = None,
+        template_resolver: TemplateResolver,
     ) -> None:
         self._org_store = org_store
         self._project_store = project_store
@@ -83,7 +83,7 @@ class DashboardPublisher:
         self._build_store = build_store
         self._discovery = discovery
         self._logger = logger
-        self._template_source = template_source or BuiltInTemplateSource()
+        self._template_resolver = template_resolver
 
     async def build_context(
         self,
@@ -112,11 +112,29 @@ class DashboardPublisher:
         *,
         context: DashboardContext,
         object_store: ObjectStore,
+        project_id: int,
     ) -> DashboardUploadProgress:
-        """Render the artifacts and upload them to the object store."""
-        config = self._template_source.load_config()
+        """Render the artifacts and upload them to the object store.
 
-        inliner = AssetInliner(template_source=self._template_source)
+        The :class:`TemplateSource` is resolved here (not at construction
+        time) so the per-project override / org default / built-in
+        fallback chain is evaluated freshly for each render.
+
+        Raises
+        ------
+        NotFoundError
+            If ``project_id`` does not correspond to an existing project.
+        """
+        project = await self._project_store.get_by_id(project_id)
+        if project is None:
+            msg = f"Project {project_id} not found"
+            raise NotFoundError(msg)
+        resolved = await self._template_resolver.resolve_for_project(project)
+        template_source = resolved.source
+
+        config = template_source.load_config()
+
+        inliner = AssetInliner(template_source=template_source)
         dashboard_assets = inliner.inline(
             css=config.dashboard.css,
             js=config.dashboard.js,
@@ -124,13 +142,9 @@ class DashboardPublisher:
         )
         dashboard_context = replace(context, assets=dashboard_assets)
 
-        html_renderer = DashboardHtmlRenderer(
-            template_source=self._template_source
-        )
+        html_renderer = DashboardHtmlRenderer(template_source=template_source)
         switcher_renderer = SwitcherJsonRenderer()
-        error_renderer = ErrorPageRenderer(
-            template_source=self._template_source
-        )
+        error_renderer = ErrorPageRenderer(template_source=template_source)
         edition_renderer = EditionJsonRenderer()
 
         html_bytes = html_renderer.render(dashboard_context)
@@ -226,6 +240,8 @@ class DashboardPublisher:
         object_store = await object_store_provider()
         async with object_store:
             progress = await self.render_and_upload(
-                context=context, object_store=object_store
+                context=context,
+                object_store=object_store,
+                project_id=project_id,
             )
         return context, progress
