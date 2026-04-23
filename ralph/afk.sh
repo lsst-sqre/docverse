@@ -249,7 +249,9 @@ build_shortlist() {
                 state=$(container_exec gh issue view "$b" \
                     --repo lsst-sqre/docverse \
                     --json state --jq .state 2>/dev/null || echo "OPEN")
-                if [ "$state" != "CLOSED" ]; then ok=0; break; fi
+                # gh issue view works on PR numbers too; merged PRs report state=MERGED.
+                # Treat anything other than OPEN as "blocker resolved".
+                if [ "$state" = "OPEN" ]; then ok=0; break; fi
             done
             if [ "$ok" = "1" ]; then
                 filtered=$(jq -c --argjson e "$entry" '. + [$e]' <<<"$filtered")
