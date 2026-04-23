@@ -34,6 +34,28 @@ class DashboardGitHubTemplateBinding(BaseModel):
         description="Path within the repo where the template lives."
     )
 
+    github_owner_id: int | None = Field(
+        default=None,
+        description=(
+            "Stable GitHub numeric ID of the owner, or ``None`` until first "
+            "successful sync captures it."
+        ),
+    )
+    github_repo_id: int | None = Field(
+        default=None,
+        description=(
+            "Stable GitHub numeric ID of the repository, or ``None`` until "
+            "first successful sync captures it."
+        ),
+    )
+    github_installation_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub App installation ID for this binding, or ``None`` when "
+            "the app is not installed or no sync has captured it yet."
+        ),
+    )
+
     github_template_id: int | None = Field(
         default=None,
         description=(

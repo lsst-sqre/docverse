@@ -31,6 +31,9 @@ class DashboardGitHubTemplateBindingCreate:
     github_repo: str
     github_ref: str
     root_path: str = "/"
+    github_owner_id: int | None = None
+    github_repo_id: int | None = None
+    github_installation_id: int | None = None
 
 
 class DashboardGitHubTemplateBindingStore:
@@ -55,6 +58,9 @@ class DashboardGitHubTemplateBindingStore:
             github_repo=data.github_repo,
             github_ref=data.github_ref,
             root_path=data.root_path,
+            github_owner_id=data.github_owner_id,
+            github_repo_id=data.github_repo_id,
+            github_installation_id=data.github_installation_id,
         )
         self._session.add(row)
         await self._session.flush()
@@ -126,19 +132,23 @@ class DashboardGitHubTemplateBindingStore:
         await self._session.refresh(row)
         return DashboardGitHubTemplateBinding.model_validate(row)
 
-    async def update_sync_state(
+    async def update_sync_state(  # noqa: PLR0913
         self,
         *,
         binding_id: int,
         last_sync_status: str,
         last_sync_error: str | None = None,
         github_template_id: int | None = None,
+        github_owner_id: int | None = None,
+        github_repo_id: int | None = None,
+        github_installation_id: int | None = None,
     ) -> DashboardGitHubTemplateBinding | None:
         """Update sync-state fields after a sync attempt.
 
-        ``github_template_id`` is only assigned when provided; passing
-        ``None`` leaves the existing pointer in place so a failed sync
-        keeps the last-good template reference.
+        ``github_template_id`` and the three ``github_*_id`` fields are
+        only assigned when provided; passing ``None`` leaves the
+        existing values in place so a failed sync keeps the last-good
+        template reference and previously-captured GitHub identities.
         """
         row = await self._get_row(binding_id)
         if row is None:
@@ -147,6 +157,12 @@ class DashboardGitHubTemplateBindingStore:
         row.last_sync_error = last_sync_error
         if github_template_id is not None:
             row.github_template_id = github_template_id
+        if github_owner_id is not None:
+            row.github_owner_id = github_owner_id
+        if github_repo_id is not None:
+            row.github_repo_id = github_repo_id
+        if github_installation_id is not None:
+            row.github_installation_id = github_installation_id
         await self._session.flush()
         await self._session.refresh(row)
         return DashboardGitHubTemplateBinding.model_validate(row)

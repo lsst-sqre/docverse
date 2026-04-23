@@ -26,6 +26,21 @@ class DashboardGitHubTemplate(BaseModel):
         description="Path within the repo where the template lives."
     )
 
+    github_owner_id: int | None = Field(
+        default=None,
+        description=(
+            "Stable GitHub numeric ID of the owner, or ``None`` until first "
+            "successful sync captures it."
+        ),
+    )
+    github_repo_id: int | None = Field(
+        default=None,
+        description=(
+            "Stable GitHub numeric ID of the repository, or ``None`` until "
+            "first successful sync captures it."
+        ),
+    )
+
     commit_sha: str = Field(
         description="Git commit SHA captured from the sync source."
     )

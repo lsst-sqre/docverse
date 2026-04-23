@@ -94,7 +94,7 @@ class DashboardGitHubTemplateStore:
             return None
         return DashboardGitHubTemplate.model_validate(row)
 
-    async def upsert(
+    async def upsert(  # noqa: PLR0913
         self,
         *,
         key: GitHubTemplateKey,
@@ -102,6 +102,8 @@ class DashboardGitHubTemplateStore:
         etag: str,
         template_toml: bytes,
         files: list[GitHubTemplateFileInput],
+        github_owner_id: int | None = None,
+        github_repo_id: int | None = None,
     ) -> UpsertResult:
         """Insert or update a template row + its files.
 
@@ -111,6 +113,10 @@ class DashboardGitHubTemplateStore:
         the ETag differs (or the row is absent), the template row is
         inserted/updated and *all* of its existing file rows are
         replaced with the supplied list.
+
+        ``github_owner_id`` / ``github_repo_id`` are only assigned when
+        provided (non-``None``); passing ``None`` on an update leaves
+        any previously-captured IDs in place.
         """
         existing = await self._get_row_by_key(key)
         if existing is not None and existing.etag == etag:
@@ -128,6 +134,8 @@ class DashboardGitHubTemplateStore:
                 commit_sha=commit_sha,
                 etag=etag,
                 template_toml=template_toml,
+                github_owner_id=github_owner_id,
+                github_repo_id=github_repo_id,
             )
             self._session.add(row)
             await self._session.flush()
@@ -136,6 +144,10 @@ class DashboardGitHubTemplateStore:
             row.commit_sha = commit_sha
             row.etag = etag
             row.template_toml = template_toml
+            if github_owner_id is not None:
+                row.github_owner_id = github_owner_id
+            if github_repo_id is not None:
+                row.github_repo_id = github_repo_id
             await self._session.flush()
             await self._session.execute(
                 delete(SqlDashboardGitHubTemplateFile).where(

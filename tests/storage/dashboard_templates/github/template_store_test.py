@@ -81,6 +81,37 @@ async def test_upsert_creates_new_template_and_files(
     assert result.template.commit_sha == "deadbeef"
     assert result.template.etag == "etag-1"
     assert result.template.template_toml == _TEMPLATE_TOML
+    assert result.template.github_owner_id is None
+    assert result.template.github_repo_id is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_round_trips_github_numeric_ids(
+    db_session: AsyncSession,
+) -> None:
+    """Populated numeric IDs survive an upsert → re-fetch round-trip."""
+    async with db_session.begin():
+        store = _store(db_session)
+        result = await store.upsert(
+            key=_KEY,
+            commit_sha="deadbeef",
+            etag="etag-1",
+            template_toml=_TEMPLATE_TOML,
+            files=_files(),
+            github_owner_id=12345,
+            github_repo_id=67890,
+        )
+        await db_session.commit()
+    assert result.template.github_owner_id == 12345
+    assert result.template.github_repo_id == 67890
+
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_key(_KEY)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.github_owner_id == 12345
+    assert fetched.github_repo_id == 67890
 
     async with db_session.begin():
         store = _store(db_session)

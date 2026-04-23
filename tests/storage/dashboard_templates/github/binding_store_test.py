@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from sqlalchemy import Table
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.dbschema.dashboard_github_template_binding import (
+    SqlDashboardGitHubTemplateBinding,
+)
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
@@ -79,6 +83,41 @@ async def test_create_org_default_binding(
     assert binding.github_template_id is None
     assert binding.last_sync_status == "pending"
     assert binding.last_sync_error is None
+    assert binding.github_owner_id is None
+    assert binding.github_repo_id is None
+    assert binding.github_installation_id is None
+
+
+@pytest.mark.asyncio
+async def test_create_binding_round_trips_github_numeric_ids(
+    db_session: AsyncSession,
+) -> None:
+    """Populated numeric IDs survive a create → re-fetch round-trip."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        created = await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+                github_owner_id=12345,
+                github_repo_id=67890,
+                github_installation_id=111222,
+            )
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(created.id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.github_owner_id == 12345
+    assert fetched.github_repo_id == 67890
+    assert fetched.github_installation_id == 111222
 
 
 @pytest.mark.asyncio
@@ -208,6 +247,84 @@ async def test_update_sync_state_records_success(
     assert updated is not None
     assert updated.last_sync_status == "succeeded"
     assert updated.last_sync_error is None
+
+
+@pytest.mark.asyncio
+async def test_update_sync_state_writes_github_numeric_ids(
+    db_session: AsyncSession,
+) -> None:
+    """Sync worker can record GitHub IDs via the existing update path."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        updated = await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=None,
+            github_owner_id=12345,
+            github_repo_id=67890,
+            github_installation_id=111222,
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.github_owner_id == 12345
+    assert updated.github_repo_id == 67890
+    assert updated.github_installation_id == 111222
+
+
+@pytest.mark.asyncio
+async def test_update_sync_state_keeps_github_ids_when_none_passed(
+    db_session: AsyncSession,
+) -> None:
+    """Passing no IDs on a later update leaves previously-captured IDs."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=None,
+            github_owner_id=12345,
+            github_repo_id=67890,
+            github_installation_id=111222,
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        updated = await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="failed",
+            last_sync_error="boom",
+            github_template_id=None,
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.github_owner_id == 12345
+    assert updated.github_repo_id == 67890
+    assert updated.github_installation_id == 111222
+
+
+def test_bindings_table_has_repo_id_ref_composite_index() -> None:
+    """The ID-preferential push-lookup index is declared on the ORM table."""
+    table = SqlDashboardGitHubTemplateBinding.__table__
+    assert isinstance(table, Table)
+    index_names = {ix.name for ix in table.indexes}
+    assert "idx_dashboard_github_template_bindings_repo_id_ref" in index_names
+    target = next(
+        ix
+        for ix in table.indexes
+        if ix.name == "idx_dashboard_github_template_bindings_repo_id_ref"
+    )
+    assert [col.name for col in target.columns] == [
+        "github_repo_id",
+        "github_ref",
+    ]
+    assert target.unique is False
 
 
 @pytest.mark.asyncio

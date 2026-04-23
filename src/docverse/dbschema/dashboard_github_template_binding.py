@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     ForeignKey,
     Index,
@@ -56,6 +57,19 @@ class SqlDashboardGitHubTemplateBinding(Base):
     github_ref: Mapped[str] = mapped_column(String(256), nullable=False)
     root_path: Mapped[str] = mapped_column(
         String(512), nullable=False, default="/", server_default="/"
+    )
+
+    # Stable GitHub numeric IDs captured on first successful sync.
+    # Nullable permanently: pre-first-sync rows have no IDs, and the
+    # GitHub App is a feature-flag so tenants may never populate them.
+    github_owner_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    github_repo_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    github_installation_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
     )
 
     github_template_id: Mapped[int | None] = mapped_column(
@@ -110,6 +124,11 @@ class SqlDashboardGitHubTemplateBinding(Base):
             "idx_dashboard_github_template_bindings_repo_ref",
             "github_owner",
             "github_repo",
+            "github_ref",
+        ),
+        Index(
+            "idx_dashboard_github_template_bindings_repo_id_ref",
+            "github_repo_id",
             "github_ref",
         ),
     )

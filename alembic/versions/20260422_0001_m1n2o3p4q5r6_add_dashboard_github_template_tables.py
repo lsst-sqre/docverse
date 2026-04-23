@@ -9,12 +9,17 @@ system. Three tables land in one revision:
   PostgreSQL treats ``NULL`` as distinct in standard unique
   constraints, so the org default uniqueness is enforced via a partial
   unique index (``project_id IS NULL``) alongside the regular unique
-  constraint on ``(org_id, project_id)``.
+  constraint on ``(org_id, project_id)``. Bindings also carry nullable
+  stable GitHub numeric IDs (``github_owner_id``, ``github_repo_id``,
+  ``github_installation_id``); a composite non-unique index on
+  ``(github_repo_id, github_ref)`` supports the push processor's
+  ID-preferential lookup.
 
 - ``dashboard_github_templates`` holds the synced bytes of one
   template tree, keyed by ``(github_owner, github_repo, github_ref,
   root_path)`` so multiple bindings pointing at the same source share
-  one cached copy.
+  one cached copy. Also carries nullable ``github_owner_id`` /
+  ``github_repo_id`` for rename-robust internal lookups.
 
 - ``dashboard_github_template_files`` holds one row per file in a
   template tree, unique on ``(github_template_id, relative_path)``.
@@ -43,6 +48,8 @@ def upgrade() -> None:
         sa.Column("github_repo", sa.String(256), nullable=False),
         sa.Column("github_ref", sa.String(256), nullable=False),
         sa.Column("root_path", sa.String(512), nullable=False),
+        sa.Column("github_owner_id", sa.BigInteger, nullable=True),
+        sa.Column("github_repo_id", sa.BigInteger, nullable=True),
         sa.Column("commit_sha", sa.String(64), nullable=False),
         sa.Column("etag", sa.String(256), nullable=False),
         sa.Column("template_toml", sa.LargeBinary, nullable=False),
@@ -105,6 +112,9 @@ def upgrade() -> None:
             nullable=False,
             server_default="/",
         ),
+        sa.Column("github_owner_id", sa.BigInteger, nullable=True),
+        sa.Column("github_repo_id", sa.BigInteger, nullable=True),
+        sa.Column("github_installation_id", sa.BigInteger, nullable=True),
         sa.Column(
             "github_template_id",
             sa.Integer,
@@ -161,9 +171,18 @@ def upgrade() -> None:
         "dashboard_github_template_bindings",
         ["github_owner", "github_repo", "github_ref"],
     )
+    op.create_index(
+        "idx_dashboard_github_template_bindings_repo_id_ref",
+        "dashboard_github_template_bindings",
+        ["github_repo_id", "github_ref"],
+    )
 
 
 def downgrade() -> None:
+    op.drop_index(
+        "idx_dashboard_github_template_bindings_repo_id_ref",
+        table_name="dashboard_github_template_bindings",
+    )
     op.drop_index(
         "idx_dashboard_github_template_bindings_repo_ref",
         table_name="dashboard_github_template_bindings",

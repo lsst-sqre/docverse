@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, LargeBinary, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Integer,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -29,6 +36,16 @@ class SqlDashboardGitHubTemplate(Base):
     github_repo: Mapped[str] = mapped_column(String(256), nullable=False)
     github_ref: Mapped[str] = mapped_column(String(256), nullable=False)
     root_path: Mapped[str] = mapped_column(String(512), nullable=False)
+
+    # Stable GitHub numeric IDs captured on first successful sync.
+    # Nullable permanently: pre-first-sync rows have no IDs, and the
+    # GitHub App is a feature-flag so tenants may never populate them.
+    github_owner_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    github_repo_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
 
     commit_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     etag: Mapped[str] = mapped_column(String(256), nullable=False)
