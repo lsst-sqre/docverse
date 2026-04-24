@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
+from pydantic import BaseModel, Field
 
 from docverse.client.models import OrganizationCreate
 from docverse.dependencies.auth import require_superadmin
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.domain.base32id import serialize_base32_id
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import OrgSlugParam
 
@@ -109,3 +111,33 @@ async def delete_organization(
             msg = f"Organization {org_slug!r} not found"
             raise NotFoundError(msg)
         await context.session.commit()
+
+
+class DashboardTemplateSyncEnqueuedResponse(BaseModel):
+    """Response body for the super-admin force-sync endpoint."""
+
+    binding_id: int = Field(description="ID of the binding that was synced.")
+    queue_job_id: str = Field(
+        description="Base32 public ID of the enqueued ``dashboard_sync`` job."
+    )
+
+
+@router.post(
+    "/admin/dashboard-templates/{binding_id}/sync",
+    response_model=DashboardTemplateSyncEnqueuedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Force a re-sync of a dashboard-template binding",
+    name="admin_sync_dashboard_template",
+)
+async def sync_dashboard_template(
+    binding_id: int,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+) -> DashboardTemplateSyncEnqueuedResponse:
+    async with context.session.begin():
+        enqueuer = context.factory.create_dashboard_sync_enqueuer()
+        queue_job = await enqueuer.enqueue(binding_id)
+        await context.session.commit()
+    return DashboardTemplateSyncEnqueuedResponse(
+        binding_id=binding_id,
+        queue_job_id=serialize_base32_id(queue_job.public_id),
+    )

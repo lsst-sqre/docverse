@@ -17,7 +17,10 @@ from .services.credential_encryptor import CredentialEncryptor
 from .services.dashboard.enqueue import DashboardBuildEnqueuer
 from .services.dashboard.publisher import DashboardPublisher
 from .services.dashboard_templates import (
+    DashboardRebuildFanout,
+    DashboardSyncEnqueuer,
     DashboardTemplateBindingService,
+    DashboardTemplateSyncer,
     TemplateResolver,
 )
 from .services.edition import EditionService
@@ -364,6 +367,47 @@ class Factory:
         return TemplateResolver(
             binding_store=binding_store,
             template_store=template_store,
+            logger=self._logger,
+        )
+
+    def create_dashboard_sync_enqueuer(self) -> DashboardSyncEnqueuer:
+        """Create a :class:`DashboardSyncEnqueuer`."""
+        return DashboardSyncEnqueuer(
+            binding_store=self._create_dashboard_github_template_binding_store(),
+            queue_backend=self.create_queue_backend(),
+            queue_job_store=self.create_queue_job_store(),
+            logger=self._logger,
+        )
+
+    def create_dashboard_rebuild_fanout(self) -> DashboardRebuildFanout:
+        """Create a :class:`DashboardRebuildFanout`."""
+        return DashboardRebuildFanout(
+            binding_store=self._create_dashboard_github_template_binding_store(),
+            project_store=self._create_project_store(),
+            enqueuer=self.create_dashboard_build_enqueuer(),
+            logger=self._logger,
+        )
+
+    def create_dashboard_template_syncer(self) -> DashboardTemplateSyncer:
+        """Create a :class:`DashboardTemplateSyncer`.
+
+        Raises
+        ------
+        GitHubAppNotConfiguredError
+            If the GitHub App feature is not configured.
+        RuntimeError
+            If the shared HTTP client is not configured.
+        """
+        if self._http_client is None:
+            msg = "HTTP client is required to build a DashboardTemplateSyncer"
+            raise RuntimeError(msg)
+        return DashboardTemplateSyncer(
+            binding_store=self._create_dashboard_github_template_binding_store(),
+            template_store=DashboardGitHubTemplateStore(
+                session=self._session, logger=self._logger
+            ),
+            app_client=self.create_github_app_client(),
+            http_client=self._http_client,
             logger=self._logger,
         )
 

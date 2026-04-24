@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 import structlog
 from httpx import AsyncClient
+from safir.arq import JobMetadata, MockArqQueue
+from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.client.models import OrgRole
@@ -580,3 +582,96 @@ async def test_org_default_and_project_override_are_independent(
     )
     assert org_after.status_code == 200
     assert org_after.json()["github_ref"] == "main"
+
+
+def _dashboard_sync_enqueues(mock_arq: MockArqQueue) -> list[JobMetadata]:
+    """Return every ``dashboard_sync`` job recorded on the mock queue."""
+    return [
+        j
+        for queue in mock_arq._job_metadata.values()
+        for j in queue.values()
+        if j.name == "dashboard_sync"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_org_put_enqueues_dashboard_sync_on_create(
+    client: AsyncClient,
+) -> None:
+    """Creating an org-default binding enqueues an initial sync."""
+    await _setup_org(client)
+    mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
+    before = len(_dashboard_sync_enqueues(mock_arq))
+
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+
+    enqueues = _dashboard_sync_enqueues(mock_arq)
+    assert len(enqueues) == before + 1
+
+    # Verify the enqueued job points at the binding the PUT created.
+    binding_id: int | None = None
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(
+                session=session, logger=structlog.get_logger("test")
+            )
+            org = await org_store.get_by_slug(_ORG)
+            assert org is not None
+            binding_store = DashboardGitHubTemplateBindingStore(
+                session=session, logger=structlog.get_logger("test")
+            )
+            binding = await binding_store.get_org_default(org.id)
+            assert binding is not None
+            binding_id = binding.id
+    assert binding_id is not None
+    payload = enqueues[-1].kwargs["payload"]
+    assert payload["binding_id"] == binding_id
+
+
+@pytest.mark.asyncio
+async def test_org_put_idempotent_noop_does_not_enqueue_dashboard_sync(
+    client: AsyncClient,
+) -> None:
+    """A PUT that writes no changes must not enqueue a new sync."""
+    await _setup_org(client)
+    await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
+    before = len(_dashboard_sync_enqueues(mock_arq))
+
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+
+    assert len(_dashboard_sync_enqueues(mock_arq)) == before
+
+
+@pytest.mark.asyncio
+async def test_project_put_enqueues_dashboard_sync(
+    client: AsyncClient,
+) -> None:
+    """Creating a project override enqueues an initial sync."""
+    await _setup_org_and_project(client)
+    mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
+    before = len(_dashboard_sync_enqueues(mock_arq))
+
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/projects/{_PROJECT}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+
+    enqueues = _dashboard_sync_enqueues(mock_arq)
+    assert len(enqueues) == before + 1

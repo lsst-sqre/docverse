@@ -20,7 +20,13 @@ from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.services.credential_encryptor import CredentialEncryptor
 
-from .functions import build_processing, dashboard_build, ping, publish_edition
+from .functions import (
+    build_processing,
+    dashboard_build,
+    dashboard_sync,
+    ping,
+    publish_edition,
+)
 
 config = Configuration()
 
@@ -71,6 +77,9 @@ async def startup(ctx: dict[str, Any]) -> None:
         base_url=str(config.repertoire_base_url),
         logger=logger,
     )
+    ctx["github_app_id"] = config.github_app_id
+    ctx["github_app_private_key"] = config.github_app_private_key
+    ctx["github_webhook_secret"] = config.github_webhook_secret
 
     if config.arq_redis_settings is None:
         msg = "arq_redis_settings must be configured for the worker"
@@ -99,7 +108,13 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """arq WorkerSettings for Docverse."""
 
-    functions = [build_processing, dashboard_build, ping, publish_edition]
+    functions = [
+        build_processing,
+        dashboard_build,
+        dashboard_sync,
+        ping,
+        publish_edition,
+    ]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
     on_startup = startup

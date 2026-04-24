@@ -116,6 +116,76 @@ async def test_different_classes_do_not_block(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_template_lock_does_not_block_project_lock(
+    lock_engine: AsyncEngine,
+) -> None:
+    """DASHBOARD_TEMPLATE + PROJECT on the same org run in parallel.
+
+    dashboard_sync must not wedge behind dashboard_build (or vice
+    versa) even when both jobs touch the same org — the sync serialises
+    on (owner, repo, ref, root_path) while builds serialise on
+    (org_id, project_id), and the two classes must never contend.
+    """
+    maker = async_sessionmaker(lock_engine, expire_on_commit=False)
+
+    template_key = LockKey.for_dashboard_template(
+        owner="acme", repo="templates", ref="main", root_path="/"
+    )
+    project_key = LockKey.for_project(org_id=42, project_id=99)
+
+    async with maker() as s1, maker() as s2:
+        svc1 = LockService(session=s1, logger=_logger())
+        svc2 = LockService(session=s2, logger=_logger())
+
+        async with asyncio.timeout(5.0):
+            async with (
+                svc1.acquire(template_key),
+                svc2.acquire(project_key),
+            ):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_same_dashboard_template_serializes_concurrent_syncs(
+    lock_engine: AsyncEngine,
+) -> None:
+    """Two dashboard_sync jobs on the same content tuple must serialise."""
+    maker = async_sessionmaker(lock_engine, expire_on_commit=False)
+    lock_key = LockKey.for_dashboard_template(
+        owner="acme", repo="templates", ref="main", root_path="/"
+    )
+
+    async with maker() as holder_session, maker() as waiter_session:
+        holder = LockService(session=holder_session, logger=_logger())
+        waiter = LockService(session=waiter_session, logger=_logger())
+
+        acquired = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            async with holder.acquire(lock_key):
+                acquired.set()
+                await release.wait()
+
+        async def wait_for_lock() -> None:
+            async with waiter.acquire(lock_key):
+                pass
+
+        hold_task = asyncio.create_task(hold())
+        await asyncio.wait_for(acquired.wait(), timeout=5.0)
+
+        wait_task = asyncio.create_task(wait_for_lock())
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.5)
+        assert not wait_task.done()
+
+        release.set()
+        await asyncio.wait_for(hold_task, timeout=5.0)
+        await asyncio.wait_for(wait_task, timeout=5.0)
+
+
+@pytest.mark.asyncio
 async def test_connection_identity_stable_across_lock_block(
     lock_engine: AsyncEngine,
 ) -> None:
