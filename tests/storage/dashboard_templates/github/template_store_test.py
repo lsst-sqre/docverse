@@ -311,6 +311,44 @@ async def test_get_file_returns_single_row(
 
 
 @pytest.mark.asyncio
+async def test_load_preloaded_source_round_trips_synced_files(
+    db_session: AsyncSession,
+) -> None:
+    """The store hands back a preloaded source whose sync reads hit cache."""
+    async with db_session.begin():
+        store = _store(db_session)
+        upsert = await store.upsert(
+            key=_KEY,
+            commit_sha="deadbeef",
+            etag="etag-1",
+            template_toml=_TEMPLATE_TOML,
+            files=_files(),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = _store(db_session)
+        source = await store.load_preloaded_source(upsert.template.id)
+        html = source.read_template("dashboard.html.jinja")
+        css = source.read_asset("dashboard.css")
+        await db_session.rollback()
+    assert html == "<html></html>"
+    assert css == b"body { color: red; }"
+
+
+@pytest.mark.asyncio
+async def test_load_preloaded_source_raises_lookup_error_for_missing_id(
+    db_session: AsyncSession,
+) -> None:
+    """A non-existent template id surfaces as ``LookupError``."""
+    async with db_session.begin():
+        store = _store(db_session)
+        with pytest.raises(LookupError):
+            await store.load_preloaded_source(999_999)
+        await db_session.rollback()
+
+
+@pytest.mark.asyncio
 async def test_unique_template_key_blocks_direct_duplicate(
     db_session: AsyncSession,
 ) -> None:

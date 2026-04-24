@@ -29,6 +29,13 @@ from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockClass, LockKey
+from docverse.storage.dashboard_templates.github import (
+    DashboardGitHubTemplateBindingCreate,
+    DashboardGitHubTemplateBindingStore,
+    DashboardGitHubTemplateStore,
+    GitHubTemplateFileInput,
+    GitHubTemplateKey,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -331,3 +338,135 @@ async def test_dashboard_build_acquires_project_lock_before_render(
     assert op_timestamps, "expected dashboard render uploads"
     proj_enter_ts = proj_enters[0].timestamp
     assert all(ts > proj_enter_ts for ts in op_timestamps)
+
+
+_CUSTOM_TEMPLATE_TOML = b"""\
+[dashboard]
+template = "dashboard.html.jinja"
+
+[dashboard.assets]
+css = []
+js = []
+images = []
+
+[switcher]
+include_kinds = ["main", "release"]
+"""
+
+# Intentionally distinctive so we can tell this template rendered vs. the
+# packaged built-in. The built-in dashboard renders a <main> element; ours
+# renders a single <div id="custom-marker"> with a well-known token.
+_CUSTOM_DASHBOARD_JINJA = b"""\
+<!DOCTYPE html>
+<html lang="en">
+<head><title>{{ project.title }}</title></head>
+<body>
+<div id="custom-marker">GITHUB-TEMPLATE-RENDERED-{{ project.slug }}</div>
+</body>
+</html>
+"""
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_uses_github_template_when_bound(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound GitHub template is used for the render instead of built-in.
+
+    Seeds a synced GitHub template with distinctive bytes and an
+    org-default binding pointing at it, then runs ``dashboard_build``
+    and asserts the rendered HTML reflects the synced bytes rather than
+    the packaged ``BuiltInTemplateSource`` defaults.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        # Seed a synced GitHub template + bind it as the org default so
+        # TemplateResolver returns it for this project's render.
+        template_store = DashboardGitHubTemplateStore(
+            session=db_session, logger=logger
+        )
+        template_result = await template_store.upsert(
+            key=GitHubTemplateKey(
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            ),
+            commit_sha="deadbeef",
+            etag="etag-1",
+            template_toml=_CUSTOM_TEMPLATE_TOML,
+            files=[
+                GitHubTemplateFileInput(
+                    relative_path="dashboard.html.jinja",
+                    is_text=True,
+                    data=_CUSTOM_DASHBOARD_JINJA,
+                ),
+            ],
+        )
+        binding_store = DashboardGitHubTemplateBindingStore(
+            session=db_session, logger=logger
+        )
+        binding = await binding_store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org.id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await binding_store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=template_result.template.id,
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-github",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
+    http_client = httpx.AsyncClient()
+    ctx: dict[str, Any] = {
+        "encryptor": encryptor,
+        "http_client": http_client,
+        "discovery": DiscoveryClient(http_client),
+        "job_id": "test-arq-dash-github",
+        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
+    }
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    html_obj = mock_store.objects["dash-proj/__dashboard.html"]
+    html_text = html_obj.data.decode("utf-8")
+    # Marker proves the GitHub-synced template rendered.
+    assert "GITHUB-TEMPLATE-RENDERED-dash-proj" in html_text
+    assert 'id="custom-marker"' in html_text
+    # Built-in template's <main> element must not appear — if it does
+    # we resolved to BuiltInTemplateSource, which would be a regression.
+    assert "<main>" not in html_text

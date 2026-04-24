@@ -10,9 +10,11 @@ import structlog
 from rubin.repertoire import DiscoveryClient
 
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
+from docverse.services.dashboard_templates.resolver import (
+    ResolvedTemplate,
+    TemplateResolver,
+)
 from docverse.storage.build_store import BuildStore
-from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
-from docverse.storage.dashboard_templates.template_source import TemplateSource
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -75,7 +77,7 @@ class DashboardPublisher:
         build_store: BuildStore,
         discovery: DiscoveryClient,
         logger: structlog.stdlib.BoundLogger,
-        template_source: TemplateSource | None = None,
+        template_resolver: TemplateResolver,
     ) -> None:
         self._org_store = org_store
         self._project_store = project_store
@@ -83,7 +85,7 @@ class DashboardPublisher:
         self._build_store = build_store
         self._discovery = discovery
         self._logger = logger
-        self._template_source = template_source or BuiltInTemplateSource()
+        self._template_resolver = template_resolver
 
     async def build_context(
         self,
@@ -107,16 +109,41 @@ class DashboardPublisher:
             rendered_at=rendered_at,
         )
 
+    async def resolve_template(
+        self, *, org_id: int, project_id: int
+    ) -> ResolvedTemplate:
+        """Resolve the effective template for one project render.
+
+        Callers that want to split the resolve (DB-bound) and
+        render-and-upload (pure CPU + object store) steps across separate
+        transaction scopes can call this first and then pass the result
+        into :meth:`render_and_upload`.
+        """
+        return await self._template_resolver.resolve(
+            org_id=org_id, project_id=project_id
+        )
+
     async def render_and_upload(
         self,
         *,
         context: DashboardContext,
         object_store: ObjectStore,
+        resolved: ResolvedTemplate,
     ) -> DashboardUploadProgress:
-        """Render the artifacts and upload them to the object store."""
-        config = self._template_source.load_config()
+        """Render the artifacts and upload them to the object store.
 
-        inliner = AssetInliner(template_source=self._template_source)
+        Accepts a pre-resolved :class:`ResolvedTemplate` so callers can
+        close their resolve-time DB transaction before the upload loop
+        opens the object store. ``resolved.source`` is expected to be
+        fully preloaded (GitHub-backed sources are preloaded by
+        :class:`TemplateResolver`), so no DB reads run here.
+        """
+        template_source = resolved.source
+        logger = self._logger.bind(template_origin=resolved.origin.value)
+
+        config = template_source.load_config()
+
+        inliner = AssetInliner(template_source=template_source)
         dashboard_assets = inliner.inline(
             css=config.dashboard.css,
             js=config.dashboard.js,
@@ -124,13 +151,9 @@ class DashboardPublisher:
         )
         dashboard_context = replace(context, assets=dashboard_assets)
 
-        html_renderer = DashboardHtmlRenderer(
-            template_source=self._template_source
-        )
+        html_renderer = DashboardHtmlRenderer(template_source=template_source)
         switcher_renderer = SwitcherJsonRenderer()
-        error_renderer = ErrorPageRenderer(
-            template_source=self._template_source
-        )
+        error_renderer = ErrorPageRenderer(template_source=template_source)
         edition_renderer = EditionJsonRenderer()
 
         html_bytes = html_renderer.render(dashboard_context)
@@ -189,7 +212,7 @@ class DashboardPublisher:
             )
             total += len(data)
 
-        self._logger.info(
+        logger.info(
             "Uploaded dashboard artifacts",
             project=project_slug,
             object_count=len(artifacts),
@@ -223,9 +246,14 @@ class DashboardPublisher:
             project_id=project_id,
             rendered_at=rendered_at,
         )
+        resolved = await self.resolve_template(
+            org_id=org_id, project_id=project_id
+        )
         object_store = await object_store_provider()
         async with object_store:
             progress = await self.render_and_upload(
-                context=context, object_store=object_store
+                context=context,
+                object_store=object_store,
+                resolved=resolved,
             )
         return context, progress

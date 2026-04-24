@@ -14,6 +14,7 @@ from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.dashboard.enqueue import DashboardBuildEnqueuer
 from .services.dashboard.publisher import DashboardPublisher
+from .services.dashboard_templates import TemplateResolver
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_tracking import (
@@ -25,6 +26,10 @@ from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .storage.build_store import BuildStore
+from .storage.dashboard_templates.github import (
+    DashboardGitHubTemplateBindingStore,
+    DashboardGitHubTemplateStore,
+)
 from .storage.edition_build_history_store import EditionBuildHistoryStore
 from .storage.edition_store import EditionStore
 from .storage.editionpublisher import (
@@ -274,6 +279,20 @@ class Factory:
             logger=self._logger,
         )
 
+    def create_template_resolver(self) -> TemplateResolver:
+        """Create a TemplateResolver for render-time template lookup."""
+        binding_store = DashboardGitHubTemplateBindingStore(
+            session=self._session, logger=self._logger
+        )
+        template_store = DashboardGitHubTemplateStore(
+            session=self._session, logger=self._logger
+        )
+        return TemplateResolver(
+            binding_store=binding_store,
+            template_store=template_store,
+            logger=self._logger,
+        )
+
     def create_dashboard_publisher(self) -> DashboardPublisher:
         """Create a DashboardPublisher for one render.
 
@@ -294,6 +313,7 @@ class Factory:
             build_store=BuildStore(session=self._session, logger=self._logger),
             discovery=self._discovery,
             logger=self._logger,
+            template_resolver=self.create_template_resolver(),
         )
 
     async def create_edition_publisher_for_org(

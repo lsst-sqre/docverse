@@ -105,6 +105,13 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     object_store = await factory.create_objectstore_for_org(
                         org_id=org_id, service_label=service_label
                     )
+                    # Preload the template source in the same short
+                    # transaction so the upload loop below runs with no
+                    # open DB transaction — GitHub-backed sources cache
+                    # their bytes at resolve time.
+                    resolved = await publisher.resolve_template(
+                        org_id=org_id, project_id=project_id
+                    )
 
                 async with session.begin():
                     await queue_job_store.update_phase(
@@ -117,7 +124,9 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     )
                 async with object_store:
                     progress = await publisher.render_and_upload(
-                        context=context, object_store=object_store
+                        context=context,
+                        object_store=object_store,
+                        resolved=resolved,
                     )
             except Exception as exc:
                 logger.exception("Dashboard build failed")
