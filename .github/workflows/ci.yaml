@@ -128,7 +128,7 @@ jobs:
 
   build:
     needs: [test, client-test, worker-test, deploy-worker-test]
-    uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v3
+    uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
     with:
       images: ghcr.io/${{ github.repository }}
       # Only push on server releases and ticket branch PRs (exclude client
