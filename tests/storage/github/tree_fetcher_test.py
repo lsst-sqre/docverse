@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import structlog
@@ -12,6 +14,7 @@ from docverse.storage.github import (
     GitHubTreeFetcher,
     InstallationAuth,
 )
+from docverse.storage.github import tree_fetcher as tree_fetcher_module
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 
@@ -240,6 +243,105 @@ async def test_tree_fetcher_raises_on_non_2xx_ref_resolution(
             await fetcher.fetch(
                 owner="acme", repo="templates", ref="main", root_path="/"
             )
+
+
+@pytest.mark.asyncio
+async def test_tree_fetcher_runs_blob_fetches_concurrently(
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blob fetches overlap in-flight, bounded by the module concurrency.
+
+    Monkeypatches ``_fetch_blob`` to record the peak in-flight count.
+    With the default constant (12) and eight kept files, peak must be
+    strictly greater than 1 — a serial loop would pin it to 1.
+    """
+    assert tree_fetcher_module._BLOB_FETCH_CONCURRENCY == 12
+    file_count = 8
+    mock_github.seed_tree(
+        "acme",
+        "templates",
+        "main",
+        files={
+            f"file-{i}.txt": f"data-{i}".encode() for i in range(file_count)
+        },
+    )
+    auth = mock_github.installation_auth("acme", "templates")
+
+    in_flight = 0
+    peak = 0
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
+        original = fetcher._fetch_blob
+
+        async def spy(owner: str, repo: str, blob_sha: str) -> bytes:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0.01)
+                return await original(owner, repo, blob_sha)
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(fetcher, "_fetch_blob", spy)
+        tree = await fetcher.fetch(
+            owner="acme", repo="templates", ref="main", root_path="/"
+        )
+
+    assert len(tree.files) == file_count
+    assert peak > 1
+
+
+@pytest.mark.asyncio
+async def test_tree_fetcher_preserves_tree_entry_order(
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``FetchedTree.files`` order matches filtered tree-entry order.
+
+    Makes the first-scheduled blob the slowest to complete so completion
+    order is inverted from entry order; slot pre-allocation is what
+    keeps ``files[0]`` pointing at the first entry.
+    """
+    expected_paths = [f"file-{i}.txt" for i in range(6)]
+    mock_github.seed_tree(
+        "acme",
+        "templates",
+        "main",
+        files={
+            path: f"data-{i}".encode() for i, path in enumerate(expected_paths)
+        },
+    )
+    auth = mock_github.installation_auth("acme", "templates")
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
+        original = fetcher._fetch_blob
+        call_count = 0
+
+        async def invert_completion_order(
+            owner: str, repo: str, blob_sha: str
+        ) -> bytes:
+            nonlocal call_count
+            call_count += 1
+            # The first task scheduled waits longest, so completion
+            # order is the reverse of entry order.
+            delay = max(0.0, 0.02 - 0.003 * (call_count - 1))
+            await asyncio.sleep(delay)
+            return await original(owner, repo, blob_sha)
+
+        monkeypatch.setattr(fetcher, "_fetch_blob", invert_completion_order)
+        tree = await fetcher.fetch(
+            owner="acme", repo="templates", ref="main", root_path="/"
+        )
+
+    assert [f.path for f in tree.files] == expected_paths
 
 
 @pytest.mark.asyncio

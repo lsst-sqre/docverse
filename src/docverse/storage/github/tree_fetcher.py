@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import structlog
@@ -11,6 +12,14 @@ import structlog
 from .app_client import InstallationAuth
 
 __all__ = ["FetchedTree", "FetchedTreeFile", "GitHubTreeFetcher"]
+
+# Cap on concurrent blob fetches per ``GitHubTreeFetcher.fetch`` call.
+# Mid-point of the 8-16 range reviewers pinned on PR #246: enough to
+# hide per-blob round-trip latency for a realistic template tree while
+# leaving headroom under GitHub's secondary rate-limits for the ref +
+# tree calls and any other sync worker running in parallel. Bumping
+# further is deferred until GraphQL blob-batching is evaluated.
+_BLOB_FETCH_CONCURRENCY = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +111,7 @@ class GitHubTreeFetcher:
         normalized_root = _normalize_root(root_path)
         prefix = f"{normalized_root}/" if normalized_root else ""
 
-        files: list[FetchedTreeFile] = []
+        kept: list[tuple[str, dict[str, Any]]] = []
         for entry in tree_entries:
             if entry.get("type") != "blob":
                 continue
@@ -110,16 +119,30 @@ class GitHubTreeFetcher:
             if prefix and not path.startswith(prefix):
                 continue
             rel_path = path[len(prefix) :] if prefix else path
+            kept.append((rel_path, entry))
+
+        files: list[FetchedTreeFile | None] = [None] * len(kept)
+        semaphore = asyncio.Semaphore(_BLOB_FETCH_CONCURRENCY)
+
+        async def _fetch_into(
+            slot: int, rel_path: str, entry: dict[str, Any]
+        ) -> None:
             blob_sha = entry["sha"]
-            data = await self._fetch_blob(owner, repo, blob_sha)
-            files.append(
-                FetchedTreeFile(
-                    path=rel_path,
-                    blob_sha=blob_sha,
-                    size=int(entry.get("size", len(data))),
-                    data=data,
-                )
+            async with semaphore:
+                data = await self._fetch_blob(owner, repo, blob_sha)
+            files[slot] = FetchedTreeFile(
+                path=rel_path,
+                blob_sha=blob_sha,
+                size=int(entry.get("size", len(data))),
+                data=data,
             )
+
+        await asyncio.gather(
+            *(
+                asyncio.create_task(_fetch_into(i, rel_path, entry))
+                for i, (rel_path, entry) in enumerate(kept)
+            )
+        )
 
         return FetchedTree(
             owner=owner,
@@ -129,7 +152,7 @@ class GitHubTreeFetcher:
             commit_sha=commit_sha,
             tree_sha=tree_sha,
             etag=etag,
-            files=tuple(files),
+            files=tuple(cast("list[FetchedTreeFile]", files)),
         )
 
     def _auth_headers(self, accept: str) -> dict[str, str]:
