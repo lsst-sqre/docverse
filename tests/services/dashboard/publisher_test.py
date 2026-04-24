@@ -18,7 +18,11 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.services.dashboard.publisher import DashboardPublisher
-from docverse.services.dashboard_templates.resolver import TemplateResolver
+from docverse.services.dashboard_templates.resolver import (
+    ResolvedTemplate,
+    ResolvedTemplateOrigin,
+    TemplateResolver,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
@@ -317,6 +321,148 @@ _CUSTOM_DASHBOARD_JINJA = b"""\
 </body>
 </html>
 """
+
+
+@pytest.mark.asyncio
+async def test_publisher_resolve_template_returns_builtin_when_unbound(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """``resolve_template`` returns a ``builtin`` ResolvedTemplate.
+
+    Exercises the no-binding path: a project without an override or
+    org-default binding resolves through to ``BuiltInTemplateSource``.
+    """
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="resolve-builtin-org",
+                title="Resolve Builtin Org",
+                base_domain="resolve-builtin.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="resolve-builtin-proj",
+                title="Resolve Builtin Project",
+                doc_repo="https://github.com/example/resolve-builtin",
+            ),
+        )
+        await db_session.commit()
+
+    publisher = _make_publisher(db_session, discovery_client)
+
+    async with db_session.begin():
+        resolved = await publisher.resolve_template(
+            org_id=org.id, project_id=project.id
+        )
+
+    assert isinstance(resolved, ResolvedTemplate)
+    assert resolved.origin is ResolvedTemplateOrigin.builtin
+
+
+@pytest.mark.asyncio
+async def test_publisher_render_and_upload_uses_provided_resolved_template(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """``render_and_upload`` renders from the caller-supplied ``resolved``.
+
+    Pins the contract that the upload loop is a pure consumer of the
+    pre-resolved template: no DB reads happen inside ``render_and_upload``
+    itself, so the worker can commit its resolve-time transaction before
+    entering the object-store context.
+    """
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    template_store = DashboardGitHubTemplateStore(
+        session=db_session, logger=logger
+    )
+    binding_store = DashboardGitHubTemplateBindingStore(
+        session=db_session, logger=logger
+    )
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="render-provided-org",
+                title="Render Provided Org",
+                base_domain="render-provided.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="render-provided-proj",
+                title="Render Provided Project",
+                doc_repo="https://github.com/example/render-provided",
+            ),
+        )
+        template_result = await template_store.upsert(
+            key=GitHubTemplateKey(
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            ),
+            commit_sha="deadbeef",
+            etag="etag-1",
+            template_toml=_CUSTOM_TEMPLATE_TOML,
+            files=[
+                GitHubTemplateFileInput(
+                    relative_path="dashboard.html.jinja",
+                    is_text=True,
+                    data=_CUSTOM_DASHBOARD_JINJA,
+                ),
+            ],
+        )
+        binding = await binding_store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org.id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await binding_store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=template_result.template.id,
+        )
+        await db_session.commit()
+
+    publisher = _make_publisher(db_session, discovery_client)
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        context = await publisher.build_context(
+            org_id=org.id, project_id=project.id
+        )
+        resolved = await publisher.resolve_template(
+            org_id=org.id, project_id=project.id
+        )
+
+    # Upload loop runs outside any DB transaction: the preloaded
+    # GitHub template source must satisfy every renderer read.
+    async with mock_store:
+        await publisher.render_and_upload(
+            context=context,
+            object_store=mock_store,
+            resolved=resolved,
+        )
+
+    html_obj = mock_store.objects["render-provided-proj/__dashboard.html"]
+    html_text = html_obj.data.decode("utf-8")
+    assert "GITHUB-TEMPLATE-RENDERED-render-provided-proj" in html_text
+    assert resolved.origin is ResolvedTemplateOrigin.org_default
 
 
 @pytest.mark.asyncio

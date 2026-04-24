@@ -10,7 +10,10 @@ import structlog
 from rubin.repertoire import DiscoveryClient
 
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
-from docverse.services.dashboard_templates.resolver import TemplateResolver
+from docverse.services.dashboard_templates.resolver import (
+    ResolvedTemplate,
+    TemplateResolver,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
@@ -106,23 +109,35 @@ class DashboardPublisher:
             rendered_at=rendered_at,
         )
 
+    async def resolve_template(
+        self, *, org_id: int, project_id: int
+    ) -> ResolvedTemplate:
+        """Resolve the effective template for one project render.
+
+        Callers that want to split the resolve (DB-bound) and
+        render-and-upload (pure CPU + object store) steps across separate
+        transaction scopes can call this first and then pass the result
+        into :meth:`render_and_upload`.
+        """
+        return await self._template_resolver.resolve(
+            org_id=org_id, project_id=project_id
+        )
+
     async def render_and_upload(
         self,
         *,
         context: DashboardContext,
         object_store: ObjectStore,
-        org_id: int,
-        project_id: int,
+        resolved: ResolvedTemplate,
     ) -> DashboardUploadProgress:
         """Render the artifacts and upload them to the object store.
 
-        The :class:`TemplateSource` is resolved here (not at construction
-        time) so the per-project override / org default / built-in
-        fallback chain is evaluated freshly for each render.
+        Accepts a pre-resolved :class:`ResolvedTemplate` so callers can
+        close their resolve-time DB transaction before the upload loop
+        opens the object store. ``resolved.source`` is expected to be
+        fully preloaded (GitHub-backed sources are preloaded by
+        :class:`TemplateResolver`), so no DB reads run here.
         """
-        resolved = await self._template_resolver.resolve(
-            org_id=org_id, project_id=project_id
-        )
         template_source = resolved.source
         logger = self._logger.bind(template_origin=resolved.origin.value)
 
@@ -231,12 +246,14 @@ class DashboardPublisher:
             project_id=project_id,
             rendered_at=rendered_at,
         )
+        resolved = await self.resolve_template(
+            org_id=org_id, project_id=project_id
+        )
         object_store = await object_store_provider()
         async with object_store:
             progress = await self.render_and_upload(
                 context=context,
                 object_store=object_store,
-                org_id=org_id,
-                project_id=project_id,
+                resolved=resolved,
             )
         return context, progress
