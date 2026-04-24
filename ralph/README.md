@@ -21,6 +21,10 @@ ralph/afk.sh 10 --prd 42
 
 # Force exactly issue #57 (bypasses eligibility filters *and* the select phase)
 ralph/afk.sh 1 --issue 57
+
+# Preview the shortlist without making any Claude calls or GitHub mutations
+ralph/afk.sh --dry-run
+ralph/afk.sh --dry-run --prd 42
 ```
 
 Flags:
@@ -29,6 +33,7 @@ Flags:
 |---|---|
 | `--prd N` | Only consider task issues whose Metadata `Parent PRD` field points at #N. |
 | `--issue N` | Force this specific issue. Mutually exclusive with `--prd`. Skips the agent-stuck filter and the selection phase entirely — the host fabricates a pick from the issue's own metadata. |
+| `--dry-run` | Build the shortlist and print it to stdout, then exit 0. Makes no Claude calls and no GitHub mutations. The iterations positional arg is optional with this flag (and ignored if passed, since the shortlist is a pure function of current GitHub state). Compatible with `--prd` and `--issue`. |
 | `--api` | Use `ANTHROPIC_API_KEY` (from 1Password) instead of Max OAuth. |
 | `--docker-context NAME` | Target a non-default docker context (e.g. `agent-sandbox`). |
 
