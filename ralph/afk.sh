@@ -22,6 +22,9 @@
 #   ralph/afk.sh <iterations> --prd 42      # only children of PRD #42
 #   ralph/afk.sh <iterations> --issue 57    # force task #57 (bypasses filters
 #                                             *and* the select phase)
+#   ralph/afk.sh --dry-run [--prd N | --issue N]
+#                                           # print the shortlist and exit;
+#                                             no Claude calls, no mutations
 #
 # Required env vars (same as .devcontainer/run.sh):
 #   DOCVERSE_SANDBOX_GH_TOKEN_OP
@@ -62,6 +65,7 @@ abort() { echo "abort: $*" >&2; exit "$EX_ABORT"; }
 iterations=""
 prd_filter=""
 forced_issue=""
+dry_run=false
 use_api=false
 gh_token_uri="${DOCVERSE_SANDBOX_GH_TOKEN_OP:-}"
 signing_key_private_uri="${DOCVERSE_SANDBOX_SIGNING_KEY_PRIVATE_OP:-}"
@@ -86,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --prd)            prd_filter="$2"; shift 2 ;;
         --issue)          forced_issue="$2"; shift 2 ;;
+        --dry-run)        dry_run=true; shift ;;
         --api)            use_api=true; shift ;;
         --docker-context) docker_context="$2"; shift 2 ;;
         --op-account)     op_account="$2"; shift 2 ;;
@@ -100,9 +105,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[ -n "$iterations" ] || die "Usage: $0 <iterations> [--prd N | --issue N]"
-[[ "$iterations" =~ ^[0-9]+$ ]] || die "iterations must be a positive integer"
-[ "$iterations" -gt 0 ] || die "iterations must be > 0"
+if $dry_run; then
+    if [ -n "$iterations" ]; then
+        echo "note: --dry-run ignores the iterations argument; shortlist is printed once." >&2
+    fi
+    iterations=1
+else
+    [ -n "$iterations" ] || die "Usage: $0 <iterations> [--prd N | --issue N] [--dry-run]"
+    [[ "$iterations" =~ ^[0-9]+$ ]] || die "iterations must be a positive integer"
+    [ "$iterations" -gt 0 ] || die "iterations must be > 0"
+fi
 if [ -n "$prd_filter" ] && [ -n "$forced_issue" ]; then
     die "--prd and --issue are mutually exclusive"
 fi
@@ -656,6 +668,54 @@ for ((i=1; i<=iterations; i++)); do
 
     # --- Build shortlist (writes JSON; sets PF_SHORTLIST_MD) ---
     build_shortlist "$iter_pad" "$prd_filter" "$forced_issue"
+
+    # --- Dry-run: print the shortlist rows and exit without Claude calls ---
+    if $dry_run; then
+        scope_label="all AFK tasks"
+        if [ -n "$forced_issue" ]; then
+            scope_label="forced #$forced_issue"
+        elif [ -n "$prd_filter" ]; then
+            scope_label="PRD #$prd_filter"
+        fi
+        count=$(jq 'length' "$SHORTLIST_JSON_PATH")
+        echo
+        echo "Ralph dry-run: ${count} eligible task(s) — scope: ${scope_label}"
+        if [ "$count" = "0" ]; then
+            echo "(Nothing matches the host-side filters right now.)"
+        else
+            echo
+            python3 - "$SHORTLIST_JSON_PATH" <<'PYEOF'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    idx = json.load(f)
+
+rows = sorted(
+    idx.items(),
+    key=lambda kv: (kv[1].get("task_order", 9999), int(kv[0])),
+)
+
+jira_w = max((len(v.get("jira_key") or "") for _, v in rows), default=0)
+branch_w = max((len(v.get("branch") or "") for _, v in rows), default=0)
+
+for num, v in rows:
+    jira = v.get("jira_key") or ""
+    branch = v.get("branch") or ""
+    parent = v.get("parent_prd") or ""
+    parent_s = f"parent #{parent}" if parent else ""
+    order = v.get("task_order", "")
+    title = v.get("title") or ""
+    print(
+        f"  #{num:>4}  order {order:<3}  "
+        f"{jira:<{jira_w}}  {branch:<{branch_w}}  "
+        f"{parent_s:<12}  {title}"
+    )
+PYEOF
+        fi
+        echo
+        echo "Full shortlist JSON: $SHORTLIST_JSON_PATH"
+        exit 0
+    fi
 
     # Short-circuit: empty shortlist + no forced issue → no Claude calls.
     shortlist_empty=false
