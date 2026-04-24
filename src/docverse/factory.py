@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import httpx
 import structlog
+from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
+from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .services.authorization import AuthorizationService
@@ -39,6 +41,7 @@ from .storage.editionpublisher import (
     EditionPublisher,
     create_edition_publisher,
 )
+from .storage.github import GitHubAppClient, GitHubAppNotConfiguredError
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
@@ -66,6 +69,10 @@ class Factory:
         http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue | None = None,
         discovery: DiscoveryClient | None = None,
+        github_app_id: int | None = None,
+        github_app_private_key: SecretStr | None = None,
+        github_webhook_secret: SecretStr | None = None,
+        github_app_name: str = "lsst-sqre/docverse",
         *,
         default_queue_name: str,
     ) -> None:
@@ -76,6 +83,10 @@ class Factory:
         self._http_client = http_client
         self._arq_queue = arq_queue
         self._discovery = discovery
+        self._github_app_id = github_app_id
+        self._github_app_private_key = github_app_private_key
+        self._github_webhook_secret = github_webhook_secret
+        self._github_app_name = github_app_name
         self._default_queue_name = default_queue_name
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
@@ -255,6 +266,48 @@ class Factory:
     def create_lock_service(self) -> LockService:
         """Create a LockService bound to this factory's session."""
         return LockService(session=self._session, logger=self._logger)
+
+    def create_github_app_client(self) -> GitHubAppClient:
+        """Create a GitHubAppClient from the configured GitHub App secrets.
+
+        The returned :class:`GitHubAppClient` exposes installation-token
+        exchange and a :class:`InstallationAuth` factory; downstream
+        helpers (tree fetcher, compare API helper) attach that auth to
+        the shared ``httpx.AsyncClient`` per request rather than
+        receiving a pre-authenticated client of their own.
+
+        Raises
+        ------
+        GitHubAppNotConfiguredError
+            If any of ``github_app_id``, ``github_app_private_key``, or
+            ``github_webhook_secret`` is unset. Callers at HTTP
+            boundaries translate this to a feature-disabled response
+            (503 for admin endpoints, 404 for the webhook endpoint).
+        RuntimeError
+            If no shared ``httpx.AsyncClient`` is configured on the
+            factory — the GitHub REST calls need one.
+        """
+        if (
+            self._github_app_id is None
+            or self._github_app_private_key is None
+            or self._github_webhook_secret is None
+        ):
+            msg = "GitHub App is not configured"
+            raise GitHubAppNotConfiguredError(msg)
+        if self._http_client is None:
+            msg = "HTTP client is required to build a GitHubAppClient"
+            raise RuntimeError(msg)
+        factory = GitHubAppClientFactory(
+            id=self._github_app_id,
+            key=self._github_app_private_key.get_secret_value(),
+            name=self._github_app_name,
+            http_client=self._http_client,
+        )
+        return GitHubAppClient(
+            factory=factory,
+            http_client=self._http_client,
+            logger=self._logger,
+        )
 
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""
@@ -446,6 +499,10 @@ class HandlerFactory(Factory):
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
         discovery: DiscoveryClient | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        github_app_id: int | None = None,
+        github_app_private_key: SecretStr | None = None,
+        github_webhook_secret: SecretStr | None = None,
         *,
         default_queue_name: str,
     ) -> None:
@@ -456,6 +513,10 @@ class HandlerFactory(Factory):
             superadmin_usernames=superadmin_usernames,
             arq_queue=arq_queue,
             discovery=discovery,
+            http_client=http_client,
+            github_app_id=github_app_id,
+            github_app_private_key=github_app_private_key,
+            github_webhook_secret=github_webhook_secret,
             default_queue_name=default_queue_name,
         )
         self._user_info_store = user_info_store

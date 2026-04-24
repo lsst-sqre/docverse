@@ -94,6 +94,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         user_info_store=user_info_store,
         arq_queue_name=config.arq_queue_name,
         discovery=discovery,
+        http_client=http_client,
+        github_app_id=config.github_app_id,
+        github_app_private_key=config.github_app_private_key,
+        github_webhook_secret=config.github_webhook_secret,
     )
     yield
     await context_dependency.aclose()
