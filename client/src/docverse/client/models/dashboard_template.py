@@ -22,7 +22,8 @@ class DashboardTemplateBindingCreate(BaseModel):
         str,
         Field(
             min_length=1,
-            max_length=256,
+            max_length=39,
+            pattern=r"^[A-Za-z0-9](?:-?[A-Za-z0-9])*$",
             description="GitHub owner (user or organization login).",
         ),
     ]
@@ -31,7 +32,8 @@ class DashboardTemplateBindingCreate(BaseModel):
         str,
         Field(
             min_length=1,
-            max_length=256,
+            max_length=100,
+            pattern=r"^[A-Za-z0-9._-]+$",
             description="GitHub repository name.",
         ),
     ]

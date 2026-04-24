@@ -239,9 +239,12 @@ class DashboardTemplateBindingService:
             github_ref=data.github_ref,
             root_path=data.root_path,
         )
-        # ``update_source`` only returns ``None`` if the row disappeared
-        # between our read and write — impossible inside one transaction.
-        assert updated is not None
+        if updated is None:
+            msg = (
+                f"Binding {existing.id} disappeared mid-transaction during "
+                "dashboard-template binding update"
+            )
+            raise RuntimeError(msg)
         self._logger.info(
             "Updated dashboard-template binding",
             binding_id=updated.id,

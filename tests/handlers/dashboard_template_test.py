@@ -299,6 +299,94 @@ async def test_org_put_does_not_auto_link_github_template(
 
 
 # ---------------------------------------------------------------------------
+# Payload validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_owner",
+    [
+        "../evil",
+        "foo/bar",
+        "-foo",
+        "foo--",
+        "",
+        "a" * 40,
+    ],
+)
+async def test_put_rejects_invalid_github_owner(
+    client: AsyncClient, invalid_owner: str
+) -> None:
+    await _setup_org(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_owner": invalid_owner},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "valid_owner",
+    ["lsst-sqre", "Org1", "a"],
+)
+async def test_put_accepts_valid_github_owner(
+    client: AsyncClient, valid_owner: str
+) -> None:
+    await _setup_org(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_owner": valid_owner},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+    assert response.json()["github_owner"] == valid_owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_repo",
+    [
+        "../evil",
+        "foo/bar",
+        "foo bar",
+        "",
+        "a" * 101,
+    ],
+)
+async def test_put_rejects_invalid_github_repo(
+    client: AsyncClient, invalid_repo: str
+) -> None:
+    await _setup_org(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_repo": invalid_repo},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "valid_repo",
+    ["docverse-templates", "my.repo", "_repo"],
+)
+async def test_put_accepts_valid_github_repo(
+    client: AsyncClient, valid_repo: str
+) -> None:
+    await _setup_org(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_repo": valid_repo},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+    assert response.json()["github_repo"] == valid_repo
+
+
+# ---------------------------------------------------------------------------
 # Project-override binding
 # ---------------------------------------------------------------------------
 

@@ -270,14 +270,19 @@ class Factory:
             logger=self._logger,
         )
 
+    def _create_dashboard_github_template_binding_store(
+        self,
+    ) -> DashboardGitHubTemplateBindingStore:
+        return DashboardGitHubTemplateBindingStore(
+            session=self._session, logger=self._logger
+        )
+
     def create_dashboard_template_binding_service(
         self,
     ) -> DashboardTemplateBindingService:
         """Create a :class:`DashboardTemplateBindingService`."""
         return DashboardTemplateBindingService(
-            binding_store=DashboardGitHubTemplateBindingStore(
-                session=self._session, logger=self._logger
-            ),
+            binding_store=self._create_dashboard_github_template_binding_store(),
             org_store=self._create_org_store(),
             project_store=self._create_project_store(),
             logger=self._logger,
