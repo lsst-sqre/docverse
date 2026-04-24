@@ -86,7 +86,7 @@ rebase. Route to the stuck path (Phase 5).
 Check whether a PR already exists for the branch:
 
 ```
-gh pr list --head <branch> --json number,title,body --limit 1
+gh pr list --head <branch> --json number,title,body,baseRefName,state --limit 1
 ```
 
 - **No existing PR** → invoke the `rubin-create-pr` skill to open one.
@@ -96,9 +96,88 @@ gh pr list --head <branch> --json number,title,body --limit 1
   - Single-branch PRDs (multiple tasks on one branch): fetch the parent PRD
     title with `gh issue view <parent_prd> --json title` and use that as the PR
     title. Body still includes `Closes #<task_issue>`.
-- **Existing PR on this branch** → update the body to append a new line
-  `Closes #<task_issue>` in the refs section (idempotent — skip if already
-  present). Do not rewrite the title.
+- **Existing PR on this branch** → regenerate the PR body from the branch's
+  cumulative scope so Summary, Validation steps, and References all reflect
+  every task that has landed on the branch, not just the first. Do not
+  rewrite the title. If the PR's `state` is not `OPEN` (merged or closed),
+  skip PR handling entirely — log the fact and proceed to the comment +
+  close steps below. Otherwise, follow steps 1–5:
+
+  1. **Collect branch scope.** Enumerate every commit between the PR's base
+     and the branch tip, including full trailers:
+
+     ```
+     git log origin/<baseRefName>..HEAD --format='%H%n%s%n%b---'
+     ```
+
+     Use `baseRefName` from the `gh pr list` result — do not hardcode
+     `origin/main`.
+
+  2. **Enumerate all referenced tasks.** Take the union of:
+     - `Closes #N` trailers harvested from the commit bodies in step 1.
+     - `Closes #N` lines already present in the existing PR body's
+       References section (covers tasks closed by earlier iterations whose
+       commit trailers may have been squashed or rewritten).
+     - The currently-picked task (`<task_issue>`).
+
+     `Refs #N` trailers (used by stuck WIP commits) naturally do not appear
+     here, so stuck work never leaks into References or Summary.
+
+  3. **Fetch each referenced task.** For each unique `N`:
+
+     ```
+     gh issue view <N> --json number,title,body,state
+     ```
+
+     Parse `## Acceptance criteria` from the body for manual-QA bullets. If
+     a referenced issue is not a `prd-task` (no acceptance criteria
+     section), use its title for Summary framing and skip it for
+     Validation.
+
+  4. **Compose a fresh body** using the `rubin-create-pr` template verbatim
+     — Summary / Validation steps / References, as defined in
+     `.claude/skills/rubin-create-pr/SKILL.md` §3. Keep the two in sync if
+     that template ever changes. Composition rules:
+
+     - **Summary** — 1–3 bullets (up to 5 if scope is genuinely diverse),
+       phrased in user/PRD-level language. Draw ground truth of what
+       actually landed from the commit log; draw user-facing framing from
+       task-issue titles. Collapse multiple commits advancing the same
+       slice into one bullet.
+     - **Validation steps** — union of manual-QA items from each referenced
+       task's `## Acceptance criteria`. Drop bullets CI already covers.
+       Drop bullets superseded by later commits. Prefer the set that
+       reflects the current tip of the branch, not full history.
+     - **References** — one `Closes #N` line per referenced task, sorted
+       ascending; then `PRD: #<parent_prd>` (omit if none); then `Jira:
+       <jira_url>`. Idempotent by construction.
+
+  5. **Apply.** Use the heredoc pattern from `rubin-create-pr` §4:
+
+     ```
+     gh pr edit <pr_number> --body "$(cat <<'EOF'
+     <new body>
+     EOF
+     )"
+     ```
+
+     If the regenerated body is byte-identical to the existing body, you
+     may skip the edit to avoid activity-log noise. GitHub accepts no-op
+     edits, so this short-circuit is optional polish.
+
+### Why the body is fully regenerated
+
+- **Single-branch PRDs land multiple tasks on one PR.** The first iteration
+  opens the PR and its Summary reflects only task #1. Without regeneration,
+  Summary and Validation steps never catch up as more tasks land, and
+  References becomes the only accurate section. Regenerating every iteration
+  keeps all three sections aligned with the branch's actual tip.
+- **Human edits to the PR body are clobbered by design.** AFK runs own the
+  PR body on open PRs. If a human wants to preserve notes, merge or close
+  the PR (state != `OPEN` skips regeneration) or pause the loop — do not
+  try to merge hand-edits into the regenerated body.
+- **The stuck path (Phase 5) still skips all PR handling**, so `WIP(stuck)`
+  commits and their `Refs #N` trailers never reach this regenerator.
 
 Then comment on the task issue:
 
