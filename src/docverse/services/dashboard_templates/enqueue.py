@@ -95,13 +95,36 @@ async def try_enqueue_dashboard_sync(
     failure. The enqueue runs in a freshly started transaction on
     ``session`` — the caller must have already committed the binding
     write it wants persisted.
+
+    If the enqueue fails, a second transaction flips the binding's
+    ``last_sync_status`` to ``"failed"`` with a descriptive
+    ``last_sync_error``. That way the row does not sit in ``"pending"``
+    forever after a silent enqueue drop — operators see the failure by
+    reading the binding, and the existing force-sync endpoint is the
+    recovery path.
     """
     try:
         async with session.begin():
             service = factory.create_dashboard_sync_enqueuer()
             await service.enqueue(binding_id)
             await session.commit()
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Failed to enqueue dashboard_sync", binding_id=binding_id
         )
+        try:
+            async with session.begin():
+                binding_store = DashboardGitHubTemplateBindingStore(
+                    session=session, logger=logger
+                )
+                await binding_store.update_sync_state(
+                    binding_id=binding_id,
+                    last_sync_status="failed",
+                    last_sync_error=f"Enqueue failed: {exc}",
+                )
+                await session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to mark binding as enqueue-failed",
+                binding_id=binding_id,
+            )

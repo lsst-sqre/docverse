@@ -10,6 +10,7 @@ from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.client.models import OrgRole
+from docverse.services.dashboard_templates.enqueue import DashboardSyncEnqueuer
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
@@ -675,3 +676,50 @@ async def test_project_put_enqueues_dashboard_sync(
 
     enqueues = _dashboard_sync_enqueues(mock_arq)
     assert len(enqueues) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_org_put_enqueue_failure_marks_binding_failed(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mark the binding ``failed`` when the fire-and-forget enqueue raises.
+
+    The PUT must still succeed, but the binding must reflect the failure
+    as ``last_sync_status="failed"`` with a descriptive
+    ``last_sync_error`` so operators can detect the stuck row.
+    """
+    await _setup_org(client)
+
+    boom_message = "arq down"
+
+    async def _boom(
+        self: DashboardSyncEnqueuer,
+        binding_id: int,
+    ) -> None:
+        raise RuntimeError(boom_message)
+
+    monkeypatch.setattr(DashboardSyncEnqueuer, "enqueue", _boom)
+
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            ostore = OrganizationStore(session=session, logger=logger)
+            org = await ostore.get_by_slug(_ORG)
+            assert org is not None
+            bstore = DashboardGitHubTemplateBindingStore(
+                session=session, logger=logger
+            )
+            binding = await bstore.get_org_default(org.id)
+            assert binding is not None
+            assert binding.last_sync_status == "failed"
+            assert binding.last_sync_error is not None
+            assert "arq down" in binding.last_sync_error
+        break
