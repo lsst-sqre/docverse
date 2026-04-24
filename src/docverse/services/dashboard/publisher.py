@@ -131,6 +131,7 @@ class DashboardPublisher:
             raise NotFoundError(msg)
         resolved = await self._template_resolver.resolve_for_project(project)
         template_source = resolved.source
+        logger = self._logger.bind(template_origin=resolved.origin.value)
 
         config = template_source.load_config()
 
@@ -203,7 +204,7 @@ class DashboardPublisher:
             )
             total += len(data)
 
-        self._logger.info(
+        logger.info(
             "Uploaded dashboard artifacts",
             project=project_slug,
             object_count=len(artifacts),

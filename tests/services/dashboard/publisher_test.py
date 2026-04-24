@@ -8,6 +8,7 @@ import pytest
 import structlog
 from rubin.repertoire import DiscoveryClient
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.client.models import (
     BuildCreate,
@@ -20,7 +21,11 @@ from docverse.services.dashboard.publisher import DashboardPublisher
 from docverse.services.dashboard_templates.resolver import TemplateResolver
 from docverse.storage.build_store import BuildStore
 from docverse.storage.dashboard_templates.github import (
+    DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
+    DashboardGitHubTemplateStore,
+    GitHubTemplateFileInput,
+    GitHubTemplateKey,
 )
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import MockObjectStore
@@ -286,3 +291,168 @@ async def test_publisher_handles_empty_project(
         key.startswith("empty-pub-proj/__editions/")
         for key in mock_store.objects
     )
+
+
+_CUSTOM_TEMPLATE_TOML = b"""\
+[dashboard]
+template = "dashboard.html.jinja"
+
+[dashboard.assets]
+css = []
+js = []
+images = []
+
+[switcher]
+include_kinds = ["main", "release"]
+"""
+
+_CUSTOM_DASHBOARD_JINJA = b"""\
+<!DOCTYPE html>
+<html lang="en">
+<head><title>{{ project.title }}</title></head>
+<body>
+<div id="custom-marker">GITHUB-TEMPLATE-RENDERED-{{ project.slug }}</div>
+</body>
+</html>
+"""
+
+
+@pytest.mark.asyncio
+async def test_publisher_logs_builtin_template_origin(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """``template_origin='builtin'`` is bound on unbound-project uploads."""
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="origin-builtin-org",
+                title="Origin Builtin Org",
+                base_domain="origin-builtin.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="origin-builtin-proj",
+                title="Origin Builtin Project",
+                doc_repo="https://github.com/example/origin-builtin",
+            ),
+        )
+        await db_session.commit()
+
+    publisher = _make_publisher(db_session, discovery_client)
+    mock_store = MockObjectStore()
+
+    async def _provider() -> MockObjectStore:
+        return mock_store
+
+    with capture_logs() as captured:
+        async with db_session.begin():
+            await publisher.publish(
+                org_id=org.id,
+                project_id=project.id,
+                object_store_provider=_provider,
+            )
+
+    upload_events = [
+        event
+        for event in captured
+        if event.get("event") == "Uploaded dashboard artifacts"
+    ]
+    assert len(upload_events) == 1
+    assert upload_events[0]["template_origin"] == "builtin"
+
+
+@pytest.mark.asyncio
+async def test_publisher_logs_github_template_origin(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """A GitHub-bound render logs ``template_origin='org_default'``."""
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    template_store = DashboardGitHubTemplateStore(
+        session=db_session, logger=logger
+    )
+    binding_store = DashboardGitHubTemplateBindingStore(
+        session=db_session, logger=logger
+    )
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="origin-github-org",
+                title="Origin GitHub Org",
+                base_domain="origin-github.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="origin-github-proj",
+                title="Origin GitHub Project",
+                doc_repo="https://github.com/example/origin-github",
+            ),
+        )
+        template_result = await template_store.upsert(
+            key=GitHubTemplateKey(
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            ),
+            commit_sha="deadbeef",
+            etag="etag-1",
+            template_toml=_CUSTOM_TEMPLATE_TOML,
+            files=[
+                GitHubTemplateFileInput(
+                    relative_path="dashboard.html.jinja",
+                    is_text=True,
+                    data=_CUSTOM_DASHBOARD_JINJA,
+                ),
+            ],
+        )
+        binding = await binding_store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org.id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await binding_store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=template_result.template.id,
+        )
+        await db_session.commit()
+
+    publisher = _make_publisher(db_session, discovery_client)
+    mock_store = MockObjectStore()
+
+    async def _provider() -> MockObjectStore:
+        return mock_store
+
+    with capture_logs() as captured:
+        async with db_session.begin():
+            await publisher.publish(
+                org_id=org.id,
+                project_id=project.id,
+                object_store_provider=_provider,
+            )
+
+    upload_events = [
+        event
+        for event in captured
+        if event.get("event") == "Uploaded dashboard artifacts"
+    ]
+    assert len(upload_events) == 1
+    assert upload_events[0]["template_origin"] == "org_default"

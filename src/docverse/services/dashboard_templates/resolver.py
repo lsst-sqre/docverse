@@ -38,7 +38,10 @@ class ResolvedTemplate:
     ``source`` is a :class:`TemplateSource` ready for synchronous reads
     by the renderer pipeline. :class:`GitHubTemplateSource` instances
     returned here have already been ``preload``-ed so the sync read
-    methods do not raise.
+    methods do not raise. ``preload`` loads the template's
+    ``template.toml`` bytes plus every template-file row into an
+    in-memory cache keyed by relative path, so synchronous
+    ``read_template`` / ``read_asset`` calls never raise.
     """
 
     source: TemplateSource
