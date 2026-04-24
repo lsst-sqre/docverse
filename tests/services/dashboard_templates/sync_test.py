@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import httpx
 import pytest
 import structlog
@@ -10,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate
 from docverse.exceptions import NotFoundError
+from docverse.services.dashboard_templates import sync as sync_module
 from docverse.services.dashboard_templates.sync import (
     DashboardSyncStatus,
     DashboardTemplateSyncer,
@@ -19,7 +22,7 @@ from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
 )
-from docverse.storage.github import GitHubAppClient
+from docverse.storage.github import GitHubAppClient, InstallationAuth
 from docverse.storage.organization_store import OrganizationStore
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
@@ -337,12 +340,14 @@ async def test_sync_github_error_records_failure_without_clearing_content(
         )
         await db_session.commit()
 
-    # Do not seed any tree for owner=acme repo=broken — the fetcher's
-    # HTTP call will 404 because respx is configured with
-    # assert_all_mocked=False and the underlying httpx.AsyncClient
-    # cannot reach the network. Seed only the installation lookup so
-    # we exercise the tree-fetch failure branch.
+    # Seed the installation lookup so auth succeeds, then wire an
+    # explicit 404 on the tree's commit lookup so the fetcher raises
+    # ``httpx.HTTPStatusError`` (a subclass of ``httpx.HTTPError``) and
+    # the syncer records the failure via its narrow catch.
     mock_github.seed_installation("acme", "broken", installation_id=77)
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/broken/commits/main"
+    ).mock(return_value=httpx.Response(404, json={"message": "Not Found"}))
 
     async with httpx.AsyncClient() as http_client:
         syncer = _make_syncer(
@@ -364,3 +369,139 @@ async def test_sync_github_error_records_failure_without_clearing_content(
     assert binding.last_sync_status == "failed"
     assert binding.last_sync_error
     assert binding.github_template_id is None
+
+
+@pytest.mark.asyncio
+async def test_sync_unexpected_auth_error_propagates(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Unexpected errors from the app-client lookup propagate.
+
+    The syncer's failure-recording catches only the known-bad cases
+    (``httpx.HTTPError``, gidgethub exceptions). A programming bug that
+    surfaces as ``RuntimeError`` must bubble up so the worker's outer
+    ``except Exception`` records it with a full traceback, rather than
+    being hidden as a user-visible sync failure.
+    """
+    async with db_session.begin():
+        binding_id = await _seed_binding(
+            db_session, org_slug="sync-unexpected-auth"
+        )
+        await db_session.commit()
+
+    class _ExplodingAppClient:
+        async def get_installation_auth(
+            self,
+            *,
+            owner: str,  # noqa: ARG002
+            repo: str,  # noqa: ARG002
+        ) -> InstallationAuth:
+            msg = "unexpected bug during auth lookup"
+            raise RuntimeError(msg)
+
+    logger = _logger()
+    async with httpx.AsyncClient() as http_client:
+        syncer = DashboardTemplateSyncer(
+            binding_store=DashboardGitHubTemplateBindingStore(
+                session=db_session, logger=logger
+            ),
+            template_store=DashboardGitHubTemplateStore(
+                session=db_session, logger=logger
+            ),
+            app_client=cast("Any", _ExplodingAppClient()),
+            http_client=http_client,
+            logger=logger,
+        )
+        with pytest.raises(RuntimeError, match="unexpected bug"):
+            async with db_session.begin():
+                await syncer.sync(binding_id)
+
+
+@pytest.mark.asyncio
+async def test_sync_unexpected_fetch_error_propagates(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error raised during tree fetch propagates.
+
+    The fetch block's catch is narrowed to ``httpx.HTTPError``; a
+    programming bug that surfaces as ``RuntimeError`` must reach the
+    worker's outer handler so it's logged with a traceback instead of
+    being recorded as a generic user-visible sync failure.
+    """
+    async with db_session.begin():
+        binding_id = await _seed_binding(
+            db_session, org_slug="sync-unexpected-fetch"
+        )
+        await db_session.commit()
+
+    mock_github.seed_installation("acme", "templates", installation_id=42)
+
+    class _ExplodingFetcher:
+        def __init__(
+            self,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            pass
+
+        async def fetch(self, **kwargs: Any) -> Any:  # noqa: ARG002
+            msg = "unexpected bug during tree fetch"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(sync_module, "GitHubTreeFetcher", _ExplodingFetcher)
+
+    async with httpx.AsyncClient() as http_client:
+        syncer = _make_syncer(
+            db_session, http_client=http_client, mock_github=mock_github
+        )
+        with pytest.raises(RuntimeError, match="unexpected bug"):
+            async with db_session.begin():
+                await syncer.sync(binding_id)
+
+
+@pytest.mark.asyncio
+async def test_sync_unexpected_parse_error_propagates(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error raised during TOML parse propagates.
+
+    The parse block's catch is narrowed to ``tomllib.TOMLDecodeError``
+    and ``UnicodeDecodeError``; programming bugs that surface as
+    ``RuntimeError`` must bubble up so the worker's outer handler
+    records them with a full traceback.
+    """
+    async with db_session.begin():
+        binding_id = await _seed_binding(
+            db_session, org_slug="sync-unexpected-parse"
+        )
+        await db_session.commit()
+
+    mock_github.seed_installation("acme", "templates", installation_id=42)
+    mock_github.seed_tree(
+        "acme",
+        "templates",
+        "main",
+        files={
+            "template.toml": _VALID_TEMPLATE_TOML,
+            "dashboard.html.jinja": b"<html>ok</html>",
+        },
+    )
+
+    def _exploding_parse(data: bytes) -> Any:
+        msg = "unexpected bug during template parse"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(sync_module, "parse_template_toml", _exploding_parse)
+
+    async with httpx.AsyncClient() as http_client:
+        syncer = _make_syncer(
+            db_session, http_client=http_client, mock_github=mock_github
+        )
+        with pytest.raises(RuntimeError, match="unexpected bug"):
+            async with db_session.begin():
+                await syncer.sync(binding_id)

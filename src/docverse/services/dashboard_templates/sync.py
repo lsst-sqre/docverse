@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
 
+import gidgethub
 import httpx
 import structlog
 
@@ -140,7 +142,7 @@ class DashboardTemplateSyncer:
             auth = await self._app_client.get_installation_auth(
                 owner=binding.github_owner, repo=binding.github_repo
             )
-        except Exception as exc:  # noqa: BLE001
+        except (httpx.HTTPError, gidgethub.GitHubException) as exc:
             return await self._record_failure(
                 binding=binding,
                 logger=logger,
@@ -157,7 +159,7 @@ class DashboardTemplateSyncer:
                 ref=binding.github_ref,
                 root_path=binding.root_path,
             )
-        except Exception as exc:  # noqa: BLE001
+        except httpx.HTTPError as exc:
             return await self._record_failure(
                 binding=binding,
                 logger=logger,
@@ -190,7 +192,7 @@ class DashboardTemplateSyncer:
 
         try:
             parse_template_toml(template_toml)
-        except Exception as exc:  # noqa: BLE001
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             return await self._record_failure(
                 binding=binding,
                 logger=logger,
