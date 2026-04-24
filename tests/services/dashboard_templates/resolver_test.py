@@ -110,9 +110,12 @@ def _make_resolver(session: AsyncSession) -> TemplateResolver:
     binding_store = DashboardGitHubTemplateBindingStore(
         session=session, logger=logger
     )
+    template_store = DashboardGitHubTemplateStore(
+        session=session, logger=logger
+    )
     return TemplateResolver(
         binding_store=binding_store,
-        session=session,
+        template_store=template_store,
         logger=logger,
     )
 

@@ -28,6 +28,7 @@ from .services.project import ProjectService
 from .storage.build_store import BuildStore
 from .storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
+    DashboardGitHubTemplateStore,
 )
 from .storage.edition_build_history_store import EditionBuildHistoryStore
 from .storage.edition_store import EditionStore
@@ -283,9 +284,12 @@ class Factory:
         binding_store = DashboardGitHubTemplateBindingStore(
             session=self._session, logger=self._logger
         )
+        template_store = DashboardGitHubTemplateStore(
+            session=self._session, logger=self._logger
+        )
         return TemplateResolver(
             binding_store=binding_store,
-            session=self._session,
+            template_store=template_store,
             logger=self._logger,
         )
 

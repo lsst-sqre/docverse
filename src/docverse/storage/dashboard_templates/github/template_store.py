@@ -25,6 +25,8 @@ from docverse.domain.dashboard_github_template import (
     DashboardGitHubTemplateFile,
 )
 
+from .source import GitHubTemplateSource
+
 __all__ = [
     "DashboardGitHubTemplateStore",
     "GitHubTemplateFileInput",
@@ -173,6 +175,34 @@ class DashboardGitHubTemplateStore:
             template=DashboardGitHubTemplate.model_validate(row),
             changed=True,
         )
+
+    async def load_preloaded_source(
+        self, template_id: int
+    ) -> GitHubTemplateSource:
+        """Construct and preload a :class:`GitHubTemplateSource`.
+
+        The returned source has already had its async ``preload`` step
+        run, so the synchronous :class:`TemplateSource` reads
+        (``load_config`` / ``read_template`` / ``read_asset``) serve
+        from the in-memory cache without further I/O.
+
+        Raises
+        ------
+        LookupError
+            If no template row exists for ``template_id``.
+        """
+        source = GitHubTemplateSource(
+            template_id=template_id, session=self._session
+        )
+        try:
+            await source.preload()
+        except LookupError as exc:
+            msg = (
+                f"DashboardGitHubTemplate {template_id} not found while "
+                "loading preloaded source"
+            )
+            raise LookupError(msg) from exc
+        return source
 
     async def list_files(
         self, template_id: int

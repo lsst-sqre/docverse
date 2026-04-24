@@ -6,12 +6,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
-    GitHubTemplateSource,
+    DashboardGitHubTemplateStore,
 )
 from docverse.storage.dashboard_templates.template_source import TemplateSource
 
@@ -61,17 +60,29 @@ class TemplateResolver:
     "not found" for resolution purposes — initial-sync-pending bindings
     fall through to the next layer so dashboards keep rendering while
     the first sync is still in flight (or has failed outright).
+
+    The FK
+    ``dashboard_github_template_bindings.github_template_id ->
+    dashboard_github_templates.id`` uses ``ON DELETE SET NULL``
+    (see ``src/docverse/dbschema/dashboard_github_template_binding.py``),
+    so within a single transaction a binding with a non-null
+    ``github_template_id`` always points at an existing template row.
+    Across transaction boundaries, a concurrent template delete
+    transitions the binding's ``github_template_id`` to ``NULL`` rather
+    than leaving a dangling reference, so the next resolve call simply
+    falls through to the null-handling branch instead of raising on a
+    missing row.
     """
 
     def __init__(
         self,
         *,
         binding_store: DashboardGitHubTemplateBindingStore,
-        session: AsyncSession,
+        template_store: DashboardGitHubTemplateStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._binding_store = binding_store
-        self._session = session
+        self._template_store = template_store
         self._logger = logger
 
     async def resolve(
@@ -82,7 +93,7 @@ class TemplateResolver:
             org_id=org_id, project_id=project_id
         )
         if override is not None and override.github_template_id is not None:
-            source = await self._load_github_source(
+            source = await self._template_store.load_preloaded_source(
                 override.github_template_id
             )
             return ResolvedTemplate(
@@ -92,7 +103,9 @@ class TemplateResolver:
 
         default = await self._binding_store.get_org_default(org_id)
         if default is not None and default.github_template_id is not None:
-            source = await self._load_github_source(default.github_template_id)
+            source = await self._template_store.load_preloaded_source(
+                default.github_template_id
+            )
             return ResolvedTemplate(
                 source=source,
                 origin=ResolvedTemplateOrigin.org_default,
@@ -102,12 +115,3 @@ class TemplateResolver:
             source=BuiltInTemplateSource(),
             origin=ResolvedTemplateOrigin.builtin,
         )
-
-    async def _load_github_source(
-        self, template_id: int
-    ) -> GitHubTemplateSource:
-        source = GitHubTemplateSource(
-            template_id=template_id, session=self._session
-        )
-        await source.preload()
-        return source

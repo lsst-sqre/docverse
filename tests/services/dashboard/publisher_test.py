@@ -47,7 +47,9 @@ def _make_publisher(
         binding_store=DashboardGitHubTemplateBindingStore(
             session=session, logger=logger
         ),
-        session=session,
+        template_store=DashboardGitHubTemplateStore(
+            session=session, logger=logger
+        ),
         logger=logger,
     )
     return DashboardPublisher(
