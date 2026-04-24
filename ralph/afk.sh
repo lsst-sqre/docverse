@@ -180,6 +180,14 @@ container_exec() {
 # themselves PR numbers, any non-OPEN state (CLOSED or MERGED) counts as
 # resolved. Query failures fall back to "blocked" so transient ratelimit or
 # network blips don't silently unblock a task.
+#
+# We also consult the issue's stateReason to disambiguate "CLOSED with no
+# merged PR": afk-implement runs `gh issue close` immediately after
+# `gh pr create`, and GitHub may not have indexed the PR body's "Closes #N"
+# keyword yet — so closedByPullRequestsReferences can briefly be empty for
+# an issue that *does* have an open closing PR. Treat COMPLETED (or unknown)
+# without a merged PR as still blocking; only NOT_PLANNED / DUPLICATE count
+# as resolved abandonment.
 blocker_is_open() {
     local num="$1"
     local payload
@@ -191,6 +199,7 @@ blocker_is_open() {
               __typename
               ... on Issue {
                 state
+                stateReason
                 closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
                   nodes { state }
                 }
@@ -201,13 +210,12 @@ blocker_is_open() {
         }
     ' --jq .data.repository.issueOrPullRequest 2>/dev/null || echo '{}')
 
-    local tn st any_merged pr_count
+    local tn st any_merged state_reason
     tn=$(echo "$payload" | jq -r '.__typename // ""')
     st=$(echo "$payload" | jq -r '.state // ""')
     any_merged=$(echo "$payload" \
         | jq -r '[.closedByPullRequestsReferences.nodes[]?.state] | any(. == "MERGED")')
-    pr_count=$(echo "$payload" \
-        | jq -r '[.closedByPullRequestsReferences.nodes[]?] | length')
+    state_reason=$(echo "$payload" | jq -r '.stateReason // ""')
 
     # Query failed or ref not found → treat as blocked (conservative).
     if [ -z "$tn" ] || [ "$tn" = "null" ]; then
@@ -217,9 +225,19 @@ blocker_is_open() {
     if [ "$st" = "OPEN" ]; then
         return 0
     fi
-    # Closed issue with closing PRs, none merged → blocked.
-    if [ "$tn" = "Issue" ] && [ "$pr_count" -gt 0 ] && [ "$any_merged" != "true" ]; then
-        return 0
+    # A CLOSED issue counts as resolved only when:
+    #   - one of its linked PRs has MERGED (the AFK happy path), OR
+    #   - it was closed as NOT_PLANNED or DUPLICATE (explicit abandonment).
+    # Closed-as-COMPLETED without a merged PR is the AFK race: the
+    # afk-implement skill runs `gh issue close` immediately after `gh pr
+    # create`, and GitHub may not have indexed the PR body's "Closes #N"
+    # yet — so closedByPullRequestsReferences can briefly be empty. Treat
+    # that case as still blocking.
+    if [ "$tn" = "Issue" ] && [ "$any_merged" != "true" ]; then
+        case "$state_reason" in
+            NOT_PLANNED|DUPLICATE) : ;;   # resolved — fall through to return 1
+            *) return 0 ;;                # COMPLETED or unknown → blocked
+        esac
     fi
     return 1
 }
