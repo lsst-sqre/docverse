@@ -158,6 +158,60 @@ container_exec() {
     fi
 }
 
+# ---- Helper: decide whether a blocker ref is still blocking ----
+# Args: issue_or_pr_number
+# Return code: 0 if still blocking, 1 if resolved.
+#
+# The AFK flow closes task issues at PR-creation time (see README.md), so an
+# issue being CLOSED alone does not mean the code has landed — we must follow
+# it to its closing PR and require that PR to be MERGED. For refs that are
+# themselves PR numbers, any non-OPEN state (CLOSED or MERGED) counts as
+# resolved. Query failures fall back to "blocked" so transient ratelimit or
+# network blips don't silently unblock a task.
+blocker_is_open() {
+    local num="$1"
+    local payload
+    # shellcheck disable=SC2016  # $num is a GraphQL variable, not a shell var
+    payload=$(container_exec gh api graphql -F num="$num" -f query='
+        query($num: Int!) {
+          repository(owner: "lsst-sqre", name: "docverse") {
+            issueOrPullRequest(number: $num) {
+              __typename
+              ... on Issue {
+                state
+                closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
+                  nodes { state }
+                }
+              }
+              ... on PullRequest { state }
+            }
+          }
+        }
+    ' --jq .data.repository.issueOrPullRequest 2>/dev/null || echo '{}')
+
+    local tn st any_merged pr_count
+    tn=$(echo "$payload" | jq -r '.__typename // ""')
+    st=$(echo "$payload" | jq -r '.state // ""')
+    any_merged=$(echo "$payload" \
+        | jq -r '[.closedByPullRequestsReferences.nodes[]?.state] | any(. == "MERGED")')
+    pr_count=$(echo "$payload" \
+        | jq -r '[.closedByPullRequestsReferences.nodes[]?] | length')
+
+    # Query failed or ref not found → treat as blocked (conservative).
+    if [ -z "$tn" ] || [ "$tn" = "null" ]; then
+        return 0
+    fi
+    # Still open → blocked.
+    if [ "$st" = "OPEN" ]; then
+        return 0
+    fi
+    # Closed issue with closing PRs, none merged → blocked.
+    if [ "$tn" = "Issue" ] && [ "$pr_count" -gt 0 ] && [ "$any_merged" != "true" ]; then
+        return 0
+    fi
+    return 1
+}
+
 # ---- Loop-start fetch so we see other humans' merges ----
 echo "Fetching origin inside container..."
 container_exec git -C /workspace/docverse fetch --prune origin \
@@ -245,13 +299,7 @@ build_shortlist() {
                 | grep -oE '#[0-9]+' \
                 | tr -d '#' || true)
             for b in $blockers; do
-                local state
-                state=$(container_exec gh issue view "$b" \
-                    --repo lsst-sqre/docverse \
-                    --json state --jq .state 2>/dev/null || echo "OPEN")
-                # gh issue view works on PR numbers too; merged PRs report state=MERGED.
-                # Treat anything other than OPEN as "blocker resolved".
-                if [ "$state" = "OPEN" ]; then ok=0; break; fi
+                if blocker_is_open "$b"; then ok=0; break; fi
             done
             if [ "$ok" = "1" ]; then
                 filtered=$(jq -c --argjson e "$entry" '. + [$e]' <<<"$filtered")

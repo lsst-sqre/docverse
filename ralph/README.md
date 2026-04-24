@@ -119,7 +119,9 @@ A task is eligible when all of these are true:
 
 - Labeled `prd-task`, state `open`.
 - Metadata `Type` is `AFK`.
-- Every issue number in the Metadata `Blocked by` row is `CLOSED`.
+- Every issue number in the Metadata `Blocked by` row is resolved: open PRs
+  still block, and a closed issue is only resolved once its closing PR is
+  merged (or if it has no closing PR).
 - Not labeled `agent-stuck`.
 - If `--prd N` is passed, Metadata `Parent PRD` references `#N`.
 
