@@ -11,7 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated, Any
 
+import httpx
 from fastapi import Depends, Request, Response
+from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
 from safir.dependencies.arq import arq_dependency
@@ -83,6 +85,10 @@ class ContextDependency:
         self._superadmin_usernames: list[str] = []
         self._arq_queue_name: str = "arq:queue"
         self._discovery: DiscoveryClient | None = None
+        self._http_client: httpx.AsyncClient | None = None
+        self._github_app_id: int | None = None
+        self._github_app_private_key: SecretStr | None = None
+        self._github_webhook_secret: SecretStr | None = None
 
     async def __call__(
         self,
@@ -112,17 +118,25 @@ class ContextDependency:
                 credential_encryptor=self._credential_encryptor,
                 superadmin_usernames=self._superadmin_usernames,
                 discovery=self._discovery,
+                http_client=self._http_client,
+                github_app_id=self._github_app_id,
+                github_app_private_key=self._github_app_private_key,
+                github_webhook_secret=self._github_webhook_secret,
                 default_queue_name=self._arq_queue_name,
             ),
         )
 
-    async def initialize(
+    async def initialize(  # noqa: PLR0913
         self,
         user_info_store: UserInfoStore | None = None,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
         arq_queue_name: str | None = None,
         discovery: DiscoveryClient | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        github_app_id: int | None = None,
+        github_app_private_key: SecretStr | None = None,
+        github_webhook_secret: SecretStr | None = None,
     ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
@@ -136,6 +150,14 @@ class ContextDependency:
             self._arq_queue_name = arq_queue_name
         if discovery is not None:
             self._discovery = discovery
+        if http_client is not None:
+            self._http_client = http_client
+        if github_app_id is not None:
+            self._github_app_id = github_app_id
+        if github_app_private_key is not None:
+            self._github_app_private_key = github_app_private_key
+        if github_webhook_secret is not None:
+            self._github_webhook_secret = github_webhook_secret
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""
