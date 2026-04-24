@@ -130,7 +130,9 @@ async def test_resolve_returns_builtin_when_no_bindings_exist(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.builtin
@@ -170,7 +172,9 @@ async def test_resolve_returns_org_default_when_only_default_synced(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.org_default
@@ -232,7 +236,9 @@ async def test_resolve_returns_project_override_when_override_synced(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.project_override
@@ -280,7 +286,9 @@ async def test_resolve_falls_through_when_override_template_id_is_null(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.org_default
@@ -313,7 +321,9 @@ async def test_resolve_falls_through_to_builtin_when_both_template_ids_null(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.builtin
@@ -339,7 +349,9 @@ async def test_resolve_returns_builtin_when_only_org_default_is_null(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.builtin
@@ -365,7 +377,9 @@ async def test_resolve_returns_builtin_when_only_override_is_null(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         await db_session.rollback()
 
     assert resolved.origin is ResolvedTemplateOrigin.builtin
@@ -411,7 +425,9 @@ async def test_resolve_preloads_github_source_so_reads_are_cache_hits(
 
     resolver = _make_resolver(db_session)
     async with db_session.begin():
-        resolved = await resolver.resolve_for_project(project)
+        resolved = await resolver.resolve(
+            org_id=project.org_id, project_id=project.id
+        )
         # Reading template contents should succeed synchronously.
         text = resolved.source.read_template("dashboard.html.jinja")
         await db_session.rollback()

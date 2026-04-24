@@ -8,7 +8,6 @@ from enum import StrEnum
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.domain.project import Project
 from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
@@ -75,10 +74,12 @@ class TemplateResolver:
         self._session = session
         self._logger = logger
 
-    async def resolve_for_project(self, project: Project) -> ResolvedTemplate:
-        """Return the template source for rendering ``project``."""
+    async def resolve(
+        self, *, org_id: int, project_id: int
+    ) -> ResolvedTemplate:
+        """Return the template source for rendering the given project."""
         override = await self._binding_store.get_project_override(
-            org_id=project.org_id, project_id=project.id
+            org_id=org_id, project_id=project_id
         )
         if override is not None and override.github_template_id is not None:
             source = await self._load_github_source(
@@ -89,7 +90,7 @@ class TemplateResolver:
                 origin=ResolvedTemplateOrigin.project_override,
             )
 
-        default = await self._binding_store.get_org_default(project.org_id)
+        default = await self._binding_store.get_org_default(org_id)
         if default is not None and default.github_template_id is not None:
             source = await self._load_github_source(default.github_template_id)
             return ResolvedTemplate(

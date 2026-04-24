@@ -124,6 +124,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     progress = await publisher.render_and_upload(
                         context=context,
                         object_store=object_store,
+                        org_id=org_id,
                         project_id=project_id,
                     )
             except Exception as exc:

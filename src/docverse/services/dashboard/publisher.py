@@ -10,7 +10,6 @@ import structlog
 from rubin.repertoire import DiscoveryClient
 
 from docverse.domain.dashboard_context import DashboardContext, EditionContext
-from docverse.exceptions import NotFoundError
 from docverse.services.dashboard_templates.resolver import TemplateResolver
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
@@ -112,6 +111,7 @@ class DashboardPublisher:
         *,
         context: DashboardContext,
         object_store: ObjectStore,
+        org_id: int,
         project_id: int,
     ) -> DashboardUploadProgress:
         """Render the artifacts and upload them to the object store.
@@ -119,17 +119,10 @@ class DashboardPublisher:
         The :class:`TemplateSource` is resolved here (not at construction
         time) so the per-project override / org default / built-in
         fallback chain is evaluated freshly for each render.
-
-        Raises
-        ------
-        NotFoundError
-            If ``project_id`` does not correspond to an existing project.
         """
-        project = await self._project_store.get_by_id(project_id)
-        if project is None:
-            msg = f"Project {project_id} not found"
-            raise NotFoundError(msg)
-        resolved = await self._template_resolver.resolve_for_project(project)
+        resolved = await self._template_resolver.resolve(
+            org_id=org_id, project_id=project_id
+        )
         template_source = resolved.source
         logger = self._logger.bind(template_origin=resolved.origin.value)
 
@@ -243,6 +236,7 @@ class DashboardPublisher:
             progress = await self.render_and_upload(
                 context=context,
                 object_store=object_store,
+                org_id=org_id,
                 project_id=project_id,
             )
         return context, progress
