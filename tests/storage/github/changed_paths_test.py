@@ -115,3 +115,49 @@ async def test_fetch_changed_paths_from_compare_includes_rename_source(
         )
 
     assert paths == ["templates/new.html", "templates/old.html"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_changed_paths_from_compare_with_null_files(
+    mock_github: GitHubMock,
+) -> None:
+    """``{"files": null}`` from GitHub coerces to an empty list, not a crash.
+
+    Pins the ``data.get("files") or []`` defence in
+    :func:`fetch_changed_paths_from_compare` against an upstream
+    refactor that might switch to ``data["files"] or []`` (KeyError) or
+    ``data.get("files", [])`` (TypeError on ``None``).
+    """
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/repo/compare/aaaa...bbbb"
+    ).mock(return_value=httpx.Response(200, json={"files": None}))
+
+    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+        paths = await fetch_changed_paths_from_compare(
+            client, owner="acme", repo="repo", before="aaaa", after="bbbb"
+        )
+
+    assert paths == []
+
+
+@pytest.mark.parametrize("status", [404, 429, 500], ids=["404", "429", "500"])
+@pytest.mark.asyncio
+async def test_fetch_changed_paths_from_compare_raises_on_non_2xx(
+    mock_github: GitHubMock,
+    status: int,
+) -> None:
+    """Non-2xx GitHub responses surface as ``httpx.HTTPStatusError``.
+
+    Pins today's bare ``raise_for_status`` behaviour so when the sync
+    worker (#237) layers a richer typed-exception taxonomy on top, the
+    regression fence catches an accidental swallow.
+    """
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/repo/compare/aaaa...bbbb"
+    ).mock(return_value=httpx.Response(status))
+
+    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_changed_paths_from_compare(
+                client, owner="acme", repo="repo", before="aaaa", after="bbbb"
+            )

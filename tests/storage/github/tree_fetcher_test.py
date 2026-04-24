@@ -151,6 +151,32 @@ async def test_tree_fetcher_ignores_non_blob_entries(
     assert {f.path for f in tree.files} == {"template.toml"}
 
 
+@pytest.mark.parametrize("status", [404, 429, 500], ids=["404", "429", "500"])
+@pytest.mark.asyncio
+async def test_tree_fetcher_raises_on_non_2xx_ref_resolution(
+    mock_github: GitHubMock,
+    status: int,
+) -> None:
+    """Non-2xx responses on ref resolution raise ``httpx.HTTPStatusError``.
+
+    Seeds the failing status on ``commits/{ref}`` (the first call in
+    :meth:`GitHubTreeFetcher.fetch`) — sufficient to pin the
+    ``raise_for_status`` behaviour without permuting every sub-call.
+    The sync worker (#237) will layer typed exceptions on top; this
+    test fences against an accidental swallow at the storage layer.
+    """
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/commits/main"
+    ).mock(return_value=httpx.Response(status))
+
+    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetcher.fetch(
+                owner="acme", repo="templates", ref="main", root_path="/"
+            )
+
+
 @pytest.mark.asyncio
 async def test_mock_github_composes_with_app_client_end_to_end(
     mock_github: GitHubMock,

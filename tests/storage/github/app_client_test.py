@@ -103,7 +103,18 @@ async def test_factory_create_github_app_client_all_set(
     db_session: AsyncSession,
     mock_github: GitHubMock,
 ) -> None:
-    """With all three secrets set, the helper returns a GitHubAppClient."""
+    """With all three secrets set, the helper returns a usable client.
+
+    Exercises an actual installation-token round-trip through the shared
+    http_client to prove the returned client is wired end-to-end, not
+    just type-checks. ``isinstance`` would still pass against a client
+    whose internal ``_http_client`` had already been closed by the
+    surrounding ``async with`` block.
+    """
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, token="ghs_factory_test"
+    )
+
     async with httpx.AsyncClient() as http_client:
         factory = Factory(
             session=db_session,
@@ -115,8 +126,17 @@ async def test_factory_create_github_app_client_all_set(
             default_queue_name="docverse:queue",
         )
         client = factory.create_github_app_client()
-
-    assert isinstance(client, GitHubAppClient)
+        assert isinstance(client, GitHubAppClient)
+        installation_client = await client.create_installation_http_client(
+            owner="acme", repo="templates"
+        )
+        try:
+            assert (
+                installation_client.headers["authorization"]
+                == "Bearer ghs_factory_test"
+            )
+        finally:
+            await installation_client.aclose()
 
 
 @pytest.mark.parametrize(
