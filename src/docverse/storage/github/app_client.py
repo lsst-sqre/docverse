@@ -2,16 +2,37 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import httpx
 import structlog
 from gidgethub.apps import get_installation_access_token
 from gidgethub.httpx import GitHubAPI
 from safir.github import GitHubAppClientFactory
 
-__all__ = ["GitHubAppClient", "GitHubAppNotConfiguredError"]
+__all__ = [
+    "GITHUB_API_BASE_URL",
+    "GitHubAppClient",
+    "GitHubAppNotConfiguredError",
+    "InstallationAuth",
+]
 
 
-_GITHUB_API_BASE = "https://api.github.com"
+GITHUB_API_BASE_URL = "https://api.github.com"
+
+
+@dataclass(frozen=True, slots=True)
+class InstallationAuth:
+    """Per-installation GitHub auth applied to the shared HTTP client.
+
+    Callers (tree fetcher, compare API helper) build absolute URLs from
+    ``base_url`` and attach ``Authorization: Bearer {token}`` on each
+    request so the process-wide ``httpx.AsyncClient`` defaults stay
+    untouched.
+    """
+
+    token: str
+    base_url: str = GITHUB_API_BASE_URL
 
 
 class GitHubAppNotConfiguredError(Exception):
@@ -29,10 +50,11 @@ class GitHubAppClient:
     """Installation-scoped access to the GitHub REST API.
 
     Thin wrapper over :class:`safir.github.GitHubAppClientFactory`.
-    Exposes installation-token exchange and a ready-to-use
-    :class:`httpx.AsyncClient` pre-authenticated as a given installation,
-    for downstream helpers (tree fetcher, compare API calls) that need
-    raw REST access, including response headers such as ``ETag``.
+    Exposes installation-token exchange and a small
+    :class:`InstallationAuth` record that downstream helpers (tree
+    fetcher, compare API calls) attach to the shared
+    ``httpx.AsyncClient`` on every request — the wrapper never mints
+    its own client, so process-wide default headers stay untouched.
     """
 
     def __init__(
@@ -81,15 +103,19 @@ class GitHubAppClient:
         )
         return str(token_info["token"])
 
-    async def create_installation_http_client(
+    async def get_installation_auth(
         self, *, owner: str, repo: str
-    ) -> httpx.AsyncClient:
-        """Return a new ``httpx.AsyncClient`` scoped to an installation.
+    ) -> InstallationAuth:
+        """Return the per-installation auth record for ``owner/repo``.
 
-        The returned client has ``base_url`` set to the GitHub API and
-        an ``Authorization: Bearer <token>`` header pre-configured.
-        The caller owns the client and MUST close it (typically via
-        ``async with``).
+        Resolves the installation ID, exchanges it for a short-lived
+        installation token, and returns an :class:`InstallationAuth` the
+        caller attaches to the shared ``httpx.AsyncClient`` on each
+        request. The wrapper does not construct an
+        :class:`httpx.AsyncClient` of its own — the process-wide client
+        from the ``main.py`` lifespan is reused so its default headers
+        (used by Gafaelfawr/Repertoire/CDN calls) cannot leak the
+        installation token.
 
         Parameters
         ----------
@@ -100,11 +126,4 @@ class GitHubAppClient:
         """
         installation_id = await self.get_installation_id(owner, repo)
         token = await self.exchange_installation_token(installation_id)
-        return httpx.AsyncClient(
-            base_url=_GITHUB_API_BASE,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
+        return InstallationAuth(token=token)

@@ -11,8 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.factory import Factory
 from docverse.storage.github import (
+    GITHUB_API_BASE_URL,
     GitHubAppClient,
     GitHubAppNotConfiguredError,
+    InstallationAuth,
 )
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
@@ -66,10 +68,16 @@ async def test_exchange_installation_token(mock_github: GitHubMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_installation_http_client_sets_auth_header(
+async def test_get_installation_auth_returns_token_record(
     mock_github: GitHubMock,
 ) -> None:
-    """Returned client carries ``Authorization: Bearer <token>``."""
+    """``get_installation_auth`` round-trips through both endpoints.
+
+    Pins that the wrapper resolves the installation ID then exchanges
+    it for a token, returning an :class:`InstallationAuth` with the
+    seeded token and the default GitHub API base URL — without minting
+    any per-call ``httpx.AsyncClient``.
+    """
     mock_github.seed_installation(
         "acme", "templates", installation_id=42, token="ghs_installtok"
     )
@@ -84,18 +92,13 @@ async def test_create_installation_http_client_sets_auth_header(
         client = GitHubAppClient(
             factory=factory, http_client=http_client, logger=_logger()
         )
-        installation_client = await client.create_installation_http_client(
+        auth = await client.get_installation_auth(
             owner="acme", repo="templates"
         )
 
-    try:
-        assert (
-            installation_client.headers["authorization"]
-            == "Bearer ghs_installtok"
-        )
-        assert str(installation_client.base_url) == "https://api.github.com"
-    finally:
-        await installation_client.aclose()
+    assert isinstance(auth, InstallationAuth)
+    assert auth.token == "ghs_installtok"  # noqa: S105
+    assert auth.base_url == GITHUB_API_BASE_URL
 
 
 @pytest.mark.asyncio
@@ -107,9 +110,9 @@ async def test_factory_create_github_app_client_all_set(
 
     Exercises an actual installation-token round-trip through the shared
     http_client to prove the returned client is wired end-to-end, not
-    just type-checks. ``isinstance`` would still pass against a client
-    whose internal ``_http_client`` had already been closed by the
-    surrounding ``async with`` block.
+    just type-checks. Asserting on ``InstallationAuth.token`` (rather
+    than ``isinstance``) catches the case where the shared client is
+    closed or otherwise unusable by the time the helper runs.
     """
     mock_github.seed_installation(
         "acme", "templates", installation_id=42, token="ghs_factory_test"
@@ -127,16 +130,11 @@ async def test_factory_create_github_app_client_all_set(
         )
         client = factory.create_github_app_client()
         assert isinstance(client, GitHubAppClient)
-        installation_client = await client.create_installation_http_client(
+        auth = await client.get_installation_auth(
             owner="acme", repo="templates"
         )
-        try:
-            assert (
-                installation_client.headers["authorization"]
-                == "Bearer ghs_factory_test"
-            )
-        finally:
-            await installation_client.aclose()
+
+    assert auth.token == "ghs_factory_test"  # noqa: S105
 
 
 @pytest.mark.parametrize(

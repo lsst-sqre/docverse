@@ -8,6 +8,8 @@ from typing import Any
 import httpx
 import structlog
 
+from .app_client import InstallationAuth
+
 __all__ = ["FetchedTree", "FetchedTreeFile", "GitHubTreeFetcher"]
 
 
@@ -31,8 +33,16 @@ class FetchedTreeFile:
 class FetchedTree:
     """A GitHub tree scoped to ``root_path``, plus identity/cache metadata.
 
-    ``etag`` is captured from the git-trees response so the syncer can
-    short-circuit a subsequent unchanged fetch via ``If-None-Match``.
+    ``etag`` is the value of the git-trees response's ``ETag`` header,
+    captured so the syncer can use it as a content cache key: after a
+    full fetch, comparing the new ETag against the previously-stored
+    one lets the syncer skip the no-op upsert + dashboard rebuild
+    fan-out when nothing under ``root_path`` actually changed. The
+    fetcher itself does not perform a conditional ``If-None-Match``
+    request — issuing the conditional GET to skip the body fetch
+    entirely is a possible future optimisation tracked alongside
+    the dashboard sync worker (#237).
+
     ``commit_sha`` is the resolved commit the ref pointed at when the
     tree was read, independent of whether ``ref`` was a branch, tag, or
     raw SHA.
@@ -56,19 +66,25 @@ def _normalize_root(root_path: str) -> str:
 class GitHubTreeFetcher:
     """Fetch a subtree of a repo using the GitHub REST API.
 
-    Uses a raw :class:`httpx.AsyncClient` (pre-authenticated as an
-    installation) rather than gidgethub so callers see response headers
-    — specifically ``ETag`` on the tree response — which we need to
-    deduplicate unchanged syncs.
+    Uses the shared :class:`httpx.AsyncClient` from the application
+    lifespan and attaches an ``Authorization: Bearer {token}`` header
+    per request from a caller-supplied :class:`InstallationAuth`. The
+    client's default headers and ``base_url`` are deliberately not
+    mutated so the same client can serve Gafaelfawr / Repertoire / CDN
+    calls without leaking installation tokens or re-rooting their URLs.
+    Reading raw HTTP responses (rather than going through gidgethub)
+    keeps the ``ETag`` header and raw blob bytes accessible.
     """
 
     def __init__(
         self,
         *,
-        client: httpx.AsyncClient,
+        http_client: httpx.AsyncClient,
+        auth: InstallationAuth,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
-        self._client = client
+        self._http_client = http_client
+        self._auth = auth
         self._logger = logger
 
     async def fetch(
@@ -116,13 +132,19 @@ class GitHubTreeFetcher:
             files=tuple(files),
         )
 
+    def _auth_headers(self, accept: str) -> dict[str, str]:
+        return {
+            "Accept": accept,
+            "Authorization": f"Bearer {self._auth.token}",
+        }
+
     async def _resolve_ref(
         self, owner: str, repo: str, ref: str
     ) -> tuple[str, str]:
         """Resolve a ref (branch/tag/SHA) to (commit_sha, tree_sha)."""
-        response = await self._client.get(
-            f"/repos/{owner}/{repo}/commits/{ref}",
-            headers={"Accept": "application/vnd.github+json"},
+        response = await self._http_client.get(
+            f"{self._auth.base_url}/repos/{owner}/{repo}/commits/{ref}",
+            headers=self._auth_headers("application/vnd.github+json"),
         )
         response.raise_for_status()
         data = response.json()
@@ -132,10 +154,10 @@ class GitHubTreeFetcher:
         self, owner: str, repo: str, tree_sha: str
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Return the recursive tree entries and the response ETag."""
-        response = await self._client.get(
-            f"/repos/{owner}/{repo}/git/trees/{tree_sha}",
+        response = await self._http_client.get(
+            f"{self._auth.base_url}/repos/{owner}/{repo}/git/trees/{tree_sha}",
             params={"recursive": "1"},
-            headers={"Accept": "application/vnd.github+json"},
+            headers=self._auth_headers("application/vnd.github+json"),
         )
         response.raise_for_status()
         data = response.json()
@@ -150,9 +172,9 @@ class GitHubTreeFetcher:
         is the file bytes verbatim — no base64 round-trip, which matters
         for binary assets (images, fonts) referenced by templates.
         """
-        response = await self._client.get(
-            f"/repos/{owner}/{repo}/git/blobs/{blob_sha}",
-            headers={"Accept": "application/vnd.github.raw"},
+        response = await self._http_client.get(
+            f"{self._auth.base_url}/repos/{owner}/{repo}/git/blobs/{blob_sha}",
+            headers=self._auth_headers("application/vnd.github.raw"),
         )
         response.raise_for_status()
         return response.content

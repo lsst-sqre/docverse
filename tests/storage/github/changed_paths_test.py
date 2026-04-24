@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from docverse.storage.github import (
+    InstallationAuth,
     extract_changed_paths_from_push,
     fetch_changed_paths_from_compare,
 )
@@ -86,10 +87,16 @@ async def test_fetch_changed_paths_from_compare(
         after="bbbb",
         changed_paths=["templates/a.html", "templates/b.html", "docs/c.md"],
     )
+    auth = mock_github.installation_auth("acme", "repo")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+    async with httpx.AsyncClient() as http_client:
         paths = await fetch_changed_paths_from_compare(
-            client, owner="acme", repo="repo", before="aaaa", after="bbbb"
+            http_client,
+            auth=auth,
+            owner="acme",
+            repo="repo",
+            before="aaaa",
+            after="bbbb",
         )
 
     assert paths == ["docs/c.md", "templates/a.html", "templates/b.html"]
@@ -108,10 +115,16 @@ async def test_fetch_changed_paths_from_compare_includes_rename_source(
         changed_paths=["templates/new.html"],
         renamed={"templates/new.html": "templates/old.html"},
     )
+    auth = mock_github.installation_auth("acme", "repo")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+    async with httpx.AsyncClient() as http_client:
         paths = await fetch_changed_paths_from_compare(
-            client, owner="acme", repo="repo", before="aaaa", after="bbbb"
+            http_client,
+            auth=auth,
+            owner="acme",
+            repo="repo",
+            before="aaaa",
+            after="bbbb",
         )
 
     assert paths == ["templates/new.html", "templates/old.html"]
@@ -131,13 +144,60 @@ async def test_fetch_changed_paths_from_compare_with_null_files(
     mock_github.router.get(
         "https://api.github.com/repos/acme/repo/compare/aaaa...bbbb"
     ).mock(return_value=httpx.Response(200, json={"files": None}))
+    auth = InstallationAuth(token="ghs_test")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+    async with httpx.AsyncClient() as http_client:
         paths = await fetch_changed_paths_from_compare(
-            client, owner="acme", repo="repo", before="aaaa", after="bbbb"
+            http_client,
+            auth=auth,
+            owner="acme",
+            repo="repo",
+            before="aaaa",
+            after="bbbb",
         )
 
     assert paths == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_changed_paths_from_compare_attaches_authorization(
+    mock_github: GitHubMock,
+) -> None:
+    """Compare call carries ``Authorization: Bearer <token>`` per request.
+
+    Mirrors the no-mutation contract on the tree fetcher: the helper
+    must not rely on the shared client's defaults for either base URL
+    or auth, since the same client also serves Gafaelfawr / Repertoire
+    / CDN traffic.
+    """
+    mock_github.seed_compare(
+        "acme",
+        "repo",
+        before="aaaa",
+        after="bbbb",
+        changed_paths=["templates/a.html"],
+    )
+    auth = InstallationAuth(token="ghs_compare_attach")
+
+    async with httpx.AsyncClient() as http_client:
+        assert "authorization" not in http_client.headers
+        await fetch_changed_paths_from_compare(
+            http_client,
+            auth=auth,
+            owner="acme",
+            repo="repo",
+            before="aaaa",
+            after="bbbb",
+        )
+        assert "authorization" not in http_client.headers
+
+    sent = [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.path == "/repos/acme/repo/compare/aaaa...bbbb"
+    ]
+    assert sent, "expected the compare endpoint to be called"
+    assert sent[-1].headers["authorization"] == "Bearer ghs_compare_attach"
 
 
 @pytest.mark.parametrize("status", [404, 429, 500], ids=["404", "429", "500"])
@@ -155,9 +215,15 @@ async def test_fetch_changed_paths_from_compare_raises_on_non_2xx(
     mock_github.router.get(
         "https://api.github.com/repos/acme/repo/compare/aaaa...bbbb"
     ).mock(return_value=httpx.Response(status))
+    auth = InstallationAuth(token="ghs_test")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+    async with httpx.AsyncClient() as http_client:
         with pytest.raises(httpx.HTTPStatusError):
             await fetch_changed_paths_from_compare(
-                client, owner="acme", repo="repo", before="aaaa", after="bbbb"
+                http_client,
+                auth=auth,
+                owner="acme",
+                repo="repo",
+                before="aaaa",
+                after="bbbb",
             )

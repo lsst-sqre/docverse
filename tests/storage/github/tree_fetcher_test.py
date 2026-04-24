@@ -7,7 +7,11 @@ import pytest
 import structlog
 from safir.github import GitHubAppClientFactory
 
-from docverse.storage.github import GitHubAppClient, GitHubTreeFetcher
+from docverse.storage.github import (
+    GitHubAppClient,
+    GitHubTreeFetcher,
+    InstallationAuth,
+)
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 
@@ -32,9 +36,12 @@ async def test_tree_fetcher_scoped_to_root_path(
         },
         etag='W/"abc"',
     )
+    auth = mock_github.installation_auth("acme", "templates")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
-        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
         tree = await fetcher.fetch(
             owner="acme",
             repo="templates",
@@ -60,9 +67,12 @@ async def test_tree_fetcher_captures_etag_and_commit_sha(
         tree_sha="treecafe",
         etag='W/"tree-etag-1"',
     )
+    auth = mock_github.installation_auth("acme", "templates")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
-        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
         tree = await fetcher.fetch(
             owner="acme", repo="templates", ref="main", root_path="/"
         )
@@ -84,9 +94,12 @@ async def test_tree_fetcher_blob_bytes_are_verbatim(
         "main",
         files={"assets/logo.png": logo_bytes},
     )
+    auth = mock_github.installation_auth("acme", "templates")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
-        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
         tree = await fetcher.fetch(
             owner="acme", repo="templates", ref="main", root_path="/"
         )
@@ -107,9 +120,12 @@ async def test_tree_fetcher_empty_when_root_path_missing(
         "main",
         files={"README.md": b"# readme\n"},
     )
+    auth = mock_github.installation_auth("acme", "templates")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
-        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
         tree = await fetcher.fetch(
             owner="acme",
             repo="templates",
@@ -141,14 +157,60 @@ async def test_tree_fetcher_ignores_non_blob_entries(
             }
         ],
     )
+    auth = mock_github.installation_auth("acme", "templates")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
-        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
         tree = await fetcher.fetch(
             owner="acme", repo="templates", ref="main", root_path="/"
         )
 
     assert {f.path for f in tree.files} == {"template.toml"}
+
+
+@pytest.mark.asyncio
+async def test_tree_fetcher_attaches_authorization_header(
+    mock_github: GitHubMock,
+) -> None:
+    """Each GitHub call carries ``Authorization: Bearer <token>``.
+
+    Pins the no-mutation contract: the fetcher attaches auth per
+    request rather than mutating the shared client's defaults. Without
+    this guarantee, the lifespan client could leak the installation
+    token onto unrelated requests (Gafaelfawr/Repertoire/CDN).
+    """
+    mock_github.seed_tree(
+        "acme",
+        "templates",
+        "main",
+        files={"template.toml": b"[dashboard]\n"},
+    )
+    auth = InstallationAuth(token="ghs_attach_test")
+
+    async with httpx.AsyncClient() as http_client:
+        # The shared client must not be configured with a base_url or an
+        # Authorization header — those would defeat the per-request
+        # attachment the fetcher under test is supposed to perform.
+        assert "authorization" not in http_client.headers
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
+        await fetcher.fetch(
+            owner="acme", repo="templates", ref="main", root_path="/"
+        )
+        # Defaults still untouched after the fetch returns.
+        assert "authorization" not in http_client.headers
+
+    sent_requests = [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.path.startswith("/repos/acme/templates")
+    ]
+    assert sent_requests, "expected at least one GitHub call"
+    for request in sent_requests:
+        assert request.headers["authorization"] == "Bearer ghs_attach_test"
 
 
 @pytest.mark.parametrize("status", [404, 429, 500], ids=["404", "429", "500"])
@@ -168,9 +230,12 @@ async def test_tree_fetcher_raises_on_non_2xx_ref_resolution(
     mock_github.router.get(
         "https://api.github.com/repos/acme/templates/commits/main"
     ).mock(return_value=httpx.Response(status))
+    auth = InstallationAuth(token="ghs_test")
 
-    async with httpx.AsyncClient(base_url="https://api.github.com") as client:
-        fetcher = GitHubTreeFetcher(client=client, logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
         with pytest.raises(httpx.HTTPStatusError):
             await fetcher.fetch(
                 owner="acme", repo="templates", ref="main", root_path="/"
@@ -181,7 +246,7 @@ async def test_tree_fetcher_raises_on_non_2xx_ref_resolution(
 async def test_mock_github_composes_with_app_client_end_to_end(
     mock_github: GitHubMock,
 ) -> None:
-    """Full flow: app JWT → install-token exchange → install client → tree.
+    """Full flow: app JWT → install-token exchange → InstallationAuth → tree.
 
     Exercises both fixture helpers (``seed_installation`` +
     ``seed_tree``) on the same ``mock_discovery`` router in a single
@@ -208,20 +273,17 @@ async def test_mock_github_composes_with_app_client_end_to_end(
             http_client=http_client,
             logger=_logger(),
         )
-        installation_client = await app_client.create_installation_http_client(
+        auth = await app_client.get_installation_auth(
             owner="acme", repo="templates"
         )
-        try:
-            fetcher = GitHubTreeFetcher(
-                client=installation_client, logger=_logger()
-            )
-            tree = await fetcher.fetch(
-                owner="acme",
-                repo="templates",
-                ref="main",
-                root_path="/",
-            )
-        finally:
-            await installation_client.aclose()
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
+        tree = await fetcher.fetch(
+            owner="acme",
+            repo="templates",
+            ref="main",
+            root_path="/",
+        )
 
     assert {f.path for f in tree.files} == {"template.toml"}

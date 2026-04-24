@@ -270,6 +270,12 @@ class Factory:
     def create_github_app_client(self) -> GitHubAppClient:
         """Create a GitHubAppClient from the configured GitHub App secrets.
 
+        The returned :class:`GitHubAppClient` exposes installation-token
+        exchange and a :class:`InstallationAuth` factory; downstream
+        helpers (tree fetcher, compare API helper) attach that auth to
+        the shared ``httpx.AsyncClient`` per request rather than
+        receiving a pre-authenticated client of their own.
+
         Raises
         ------
         GitHubAppNotConfiguredError

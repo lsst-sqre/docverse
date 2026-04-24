@@ -18,6 +18,8 @@ import respx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from docverse.storage.github import GITHUB_API_BASE_URL, InstallationAuth
+
 __all__ = ["DEFAULT_APP_ID", "DEFAULT_APP_NAME", "GitHubMock", "make_rsa_pem"]
 
 
@@ -75,6 +77,9 @@ class GitHubMock:
     default_installation_id: int = 99
     default_token: str = "ghs_test_installation_token"  # noqa: S105
     _installation_ids: dict[tuple[str, str], int] = field(default_factory=dict)
+    _installation_tokens: dict[tuple[str, str], str] = field(
+        default_factory=dict
+    )
 
     @cached_property
     def installation_token(self) -> str:
@@ -92,13 +97,17 @@ class GitHubMock:
         """Wire (repo → installation id) lookup and (id → token) exchange.
 
         Both endpoints are needed for
-        ``GitHubAppClient.create_installation_http_client`` to succeed;
-        seed them together so callers only write one line. Returns the
-        installation id for downstream assertions.
+        ``GitHubAppClient.get_installation_auth`` to succeed; seed them
+        together so callers only write one line. Returns the
+        installation id for downstream assertions; pair with
+        :meth:`installation_auth` when the test needs the
+        ``InstallationAuth`` record without round-tripping the app
+        client.
         """
         iid = installation_id or self.default_installation_id
         bearer_token = token or self.default_token
         self._installation_ids[(owner, repo)] = iid
+        self._installation_tokens[(owner, repo)] = bearer_token
 
         self.router.get(
             f"{_GITHUB_API}/repos/{owner}/{repo}/installation"
@@ -119,6 +128,27 @@ class GitHubMock:
             )
         )
         return iid
+
+    def installation_auth(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        base_url: str = GITHUB_API_BASE_URL,
+    ) -> InstallationAuth:
+        """Return an :class:`InstallationAuth` for a previously-seeded repo.
+
+        Tests that exercise the tree fetcher / compare helper directly
+        — without going through ``GitHubAppClient.get_installation_auth``
+        — call this to grab the same token they seeded on the router.
+        Falls back to ``default_token`` when ``seed_installation`` was
+        not called for ``(owner, repo)``, which mirrors what the live
+        client would have minted from a default installation.
+        """
+        token = self._installation_tokens.get(
+            (owner, repo), self.default_token
+        )
+        return InstallationAuth(token=token, base_url=base_url)
 
     def seed_tree(
         self,

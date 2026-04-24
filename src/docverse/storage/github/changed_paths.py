@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from .app_client import InstallationAuth
+
 __all__ = [
     "extract_changed_paths_from_push",
     "fetch_changed_paths_from_compare",
@@ -68,9 +70,10 @@ def extract_changed_paths_from_push(
     return sorted(paths)
 
 
-async def fetch_changed_paths_from_compare(
+async def fetch_changed_paths_from_compare(  # noqa: PLR0913
     client: httpx.AsyncClient,
     *,
+    auth: InstallationAuth,
     owner: str,
     repo: str,
     before: str,
@@ -78,15 +81,21 @@ async def fetch_changed_paths_from_compare(
 ) -> list[str]:
     """Return the sorted set of paths changed between two commits.
 
-    Calls ``GET /repos/{owner}/{repo}/compare/{before}...{after}`` and
-    unions each entry's ``filename`` (new path) with any
-    ``previous_filename`` (old path on renames). Both sides are needed
-    so a rename whose new path is outside the binding's ``root_path``
-    but whose old path was inside still triggers a resync.
+    Calls ``GET /repos/{owner}/{repo}/compare/{before}...{after}`` on
+    the shared ``client`` with ``auth.base_url`` + an
+    ``Authorization: Bearer {auth.token}`` header attached per request,
+    so the client's defaults stay untouched. Unions each entry's
+    ``filename`` (new path) with any ``previous_filename`` (old path on
+    renames). Both sides are needed so a rename whose new path is
+    outside the binding's ``root_path`` but whose old path was inside
+    still triggers a resync.
     """
     response = await client.get(
-        f"/repos/{owner}/{repo}/compare/{before}...{after}",
-        headers={"Accept": "application/vnd.github+json"},
+        f"{auth.base_url}/repos/{owner}/{repo}/compare/{before}...{after}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {auth.token}",
+        },
     )
     response.raise_for_status()
     data = response.json()
