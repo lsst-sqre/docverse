@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from .binding import (
+    DashboardTemplateBindingResult,
+    DashboardTemplateBindingService,
+)
 from .resolver import (
     ResolvedTemplate,
     ResolvedTemplateOrigin,
@@ -9,6 +13,8 @@ from .resolver import (
 )
 
 __all__ = [
+    "DashboardTemplateBindingResult",
+    "DashboardTemplateBindingService",
     "ResolvedTemplate",
     "ResolvedTemplateOrigin",
     "TemplateResolver",

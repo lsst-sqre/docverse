@@ -11,6 +11,9 @@ from docverse.client.models import (
     DashboardRebuildResponse as _DashboardRebuildResponseBase,
 )
 from docverse.client.models import (
+    DashboardTemplateBinding as _DashboardTemplateBindingBase,
+)
+from docverse.client.models import (
     DefaultEditionConfig,
     OrganizationServiceSummary,
 )
@@ -32,6 +35,9 @@ from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
+from docverse.domain.dashboard_github_template import (
+    DashboardGitHubTemplateBinding as DashboardGitHubTemplateBindingDomain,
+)
 from docverse.domain.edition import Edition as EditionDomain
 from docverse.domain.edition_build_history import (
     EditionBuildHistoryWithBuild as EditionBuildHistoryWithBuildDomain,
@@ -437,6 +443,44 @@ class OrgDashboardRebuildEntry(_OrgDashboardRebuildEntryBase):
             queue_job_url=str(
                 request.url_for("get_queue_job", job=queue_job_id)
             ),
+        )
+
+
+class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
+    """Dashboard-template binding response with HATEOAS URL."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        domain: DashboardGitHubTemplateBindingDomain,
+        request: Request,
+        *,
+        org_slug: str,
+        project_slug: str | None = None,
+    ) -> Self:
+        """Create from a domain binding, adding the ``self_url``."""
+        if project_slug is None:
+            self_url = str(
+                request.url_for("get_org_dashboard_template", org=org_slug)
+            )
+        else:
+            self_url = str(
+                request.url_for(
+                    "get_project_dashboard_template",
+                    org=org_slug,
+                    project=project_slug,
+                )
+            )
+        return cls(
+            self_url=self_url,
+            github_owner=domain.github_owner,
+            github_repo=domain.github_repo,
+            github_ref=domain.github_ref,
+            root_path=domain.root_path,
+            last_sync_status=domain.last_sync_status,
+            last_sync_error=domain.last_sync_error,
+            date_created=domain.date_created,
+            date_updated=domain.date_updated,
         )
 
 

@@ -14,7 +14,10 @@ from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.dashboard.enqueue import DashboardBuildEnqueuer
 from .services.dashboard.publisher import DashboardPublisher
-from .services.dashboard_templates import TemplateResolver
+from .services.dashboard_templates import (
+    DashboardTemplateBindingService,
+    TemplateResolver,
+)
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_tracking import (
@@ -264,6 +267,24 @@ class Factory:
                 session=self._session, logger=self._logger
             ),
             publisher_provider=self.create_edition_publisher_for_org,
+            logger=self._logger,
+        )
+
+    def _create_dashboard_github_template_binding_store(
+        self,
+    ) -> DashboardGitHubTemplateBindingStore:
+        return DashboardGitHubTemplateBindingStore(
+            session=self._session, logger=self._logger
+        )
+
+    def create_dashboard_template_binding_service(
+        self,
+    ) -> DashboardTemplateBindingService:
+        """Create a :class:`DashboardTemplateBindingService`."""
+        return DashboardTemplateBindingService(
+            binding_store=self._create_dashboard_github_template_binding_store(),
+            org_store=self._create_org_store(),
+            project_store=self._create_project_store(),
             logger=self._logger,
         )
 
