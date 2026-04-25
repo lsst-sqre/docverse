@@ -26,6 +26,7 @@ from .handlers.admin import admin_router
 from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
+from .handlers.webhooks import webhook_router
 from .services.credential_encryptor import CredentialEncryptor
 from .storage.user_info_store import GafaelfawrUserInfoStore
 
@@ -138,6 +139,7 @@ app.include_router(internal_router)
 app.include_router(admin_router, prefix=config.path_prefix)
 app.include_router(orgs_router, prefix=config.path_prefix)
 app.include_router(queue_router, prefix=config.path_prefix)
+app.include_router(webhook_router, prefix=config.path_prefix)
 app.add_middleware(XForwardedMiddleware)
 
 if config.slack_webhook:

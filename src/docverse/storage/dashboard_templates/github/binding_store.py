@@ -126,6 +126,33 @@ class DashboardGitHubTemplateBindingStore:
             for row in result.scalars().all()
         ]
 
+    async def list_by_repo_ref(
+        self,
+        *,
+        github_owner: str,
+        github_repo: str,
+        github_ref: str,
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """List every binding for a ``(owner, repo, ref)`` triple.
+
+        Backed by the ``idx_dashboard_github_template_bindings_repo_ref``
+        composite index. Matches both org-default and project-override
+        bindings; the caller filters further (typically by intersecting
+        the push event's changed-path set with each binding's
+        ``root_path``).
+        """
+        result = await self._session.execute(
+            select(SqlDashboardGitHubTemplateBinding).where(
+                SqlDashboardGitHubTemplateBinding.github_owner == github_owner,
+                SqlDashboardGitHubTemplateBinding.github_repo == github_repo,
+                SqlDashboardGitHubTemplateBinding.github_ref == github_ref,
+            )
+        )
+        return [
+            DashboardGitHubTemplateBinding.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
     async def list_project_overrides_for_org(
         self, org_id: int
     ) -> list[DashboardGitHubTemplateBinding]:

@@ -392,3 +392,84 @@ async def test_delete_returns_false_when_missing(
         deleted = await store.delete(999_999)
         await db_session.rollback()
     assert deleted is False
+
+
+@pytest.mark.asyncio
+async def test_list_by_repo_ref_matches_owner_repo_and_ref(
+    db_session: AsyncSession,
+) -> None:
+    """Bindings for ``(owner, repo, ref)`` are returned; others are skipped."""
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug="repo-ref-org"
+        )
+        store = _store(db_session)
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=project_id,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/themes/blue",
+            )
+        )
+        # Different repo — should not match.
+        other_org_id, _ = await _seed_org_and_project(
+            db_session,
+            org_slug="repo-ref-other-org",
+            project_slug="other-proj",
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=other_org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="other",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        matches = await store.list_by_repo_ref(
+            github_owner="acme", github_repo="templates", github_ref="main"
+        )
+        await db_session.rollback()
+    assert len(matches) == 2
+    root_paths = {m.root_path for m in matches}
+    assert root_paths == {"/", "/themes/blue"}
+
+
+@pytest.mark.asyncio
+async def test_list_by_repo_ref_returns_empty_when_no_matches(
+    db_session: AsyncSession,
+) -> None:
+    """An unbound ``(owner, repo, ref)`` returns an empty list."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(
+            db_session, org_slug="empty-repo-ref"
+        )
+        store = _store(db_session)
+        await store.create(_binding(org_id=org_id))
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        matches = await store.list_by_repo_ref(
+            github_owner="other-owner",
+            github_repo="templates",
+            github_ref="main",
+        )
+        await db_session.rollback()
+    assert matches == []
