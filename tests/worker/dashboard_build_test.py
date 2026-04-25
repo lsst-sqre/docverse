@@ -8,9 +8,6 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from cryptography.fernet import Fernet
-from rubin.repertoire import DiscoveryClient
-from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,12 +19,10 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
@@ -43,8 +38,7 @@ from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.dashboard_build import dashboard_build
 from tests.support.lock_service_spy import install_recording_lock_service
-
-_config = Configuration()
+from tests.worker.conftest import make_worker_ctx
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -135,15 +129,11 @@ async def test_dashboard_build_completes_with_phase_transitions(
         _mock_create_objectstore(mock_store),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
     http_client = httpx.AsyncClient()
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": http_client,
-        "discovery": DiscoveryClient(http_client),
-        "job_id": "test-arq-dashboard",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dashboard",
+    )
     queue_job_public_id = serialize_base32_id(queue_job.public_id)
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -222,15 +212,11 @@ async def test_dashboard_build_marks_failed_on_render_exception(
         _broken_create_objectstore,
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
     http_client = httpx.AsyncClient()
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": http_client,
-        "discovery": DiscoveryClient(http_client),
-        "job_id": "test-arq-dash-fail",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-fail",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -304,15 +290,11 @@ async def test_dashboard_build_acquires_project_lock_before_render(
     )
     events = install_recording_lock_service(monkeypatch)
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
     http_client = httpx.AsyncClient()
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": http_client,
-        "discovery": DiscoveryClient(http_client),
-        "job_id": "test-arq-dash-lock",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-lock",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -440,15 +422,11 @@ async def test_dashboard_build_uses_github_template_when_bound(
         _mock_create_objectstore(mock_store),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
     http_client = httpx.AsyncClient()
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": http_client,
-        "discovery": DiscoveryClient(http_client),
-        "job_id": "test-arq-dash-github",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-github",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,

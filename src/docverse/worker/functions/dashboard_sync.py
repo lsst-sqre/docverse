@@ -10,33 +10,22 @@ from __future__ import annotations
 import traceback
 from typing import Any
 
-import httpx
 import structlog
-from pydantic import SecretStr
-from rubin.repertoire import DiscoveryClient
-from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.config import Configuration
 from docverse.exceptions import NotFoundError
-from docverse.factory import Factory
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.dashboard_templates.sync import DashboardSyncStatus
 from docverse.services.lock_service import LockKey
 
-config = Configuration()
 
-
-async def dashboard_sync(  # noqa: PLR0915
-    ctx: dict[str, Any], payload: dict[str, Any]
-) -> str:
+async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Sync one dashboard-template binding from GitHub.
 
     Parameters
     ----------
     ctx
-        arq worker context (encryptor, http_client, discovery, queue,
-        GitHub-App secrets).
+        arq worker context (``factory_builder``, ``http_client``,
+        ``arq_queue``).
     payload
         Job payload with ``binding_id``, ``queue_job_id``,
         ``queue_job_public_id``.
@@ -53,29 +42,8 @@ async def dashboard_sync(  # noqa: PLR0915
     binding_id: int = payload["binding_id"]
     queue_job_id: int = payload["queue_job_id"]
 
-    encryptor: CredentialEncryptor = ctx["encryptor"]
-    http_client: httpx.AsyncClient = ctx["http_client"]
-    arq_queue: ArqQueue | None = ctx.get("arq_queue")
-    discovery: DiscoveryClient = ctx["discovery"]
-    github_app_id: int | None = ctx.get("github_app_id")
-    github_app_private_key: SecretStr | None = ctx.get(
-        "github_app_private_key"
-    )
-    github_webhook_secret: SecretStr | None = ctx.get("github_webhook_secret")
-
     async for session in db_session_dependency():
-        factory = Factory(
-            session=session,
-            logger=logger,
-            credential_encryptor=encryptor,
-            http_client=http_client,
-            arq_queue=arq_queue,
-            discovery=discovery,
-            github_app_id=github_app_id,
-            github_app_private_key=github_app_private_key,
-            github_webhook_secret=github_webhook_secret,
-            default_queue_name=config.arq_queue_name,
-        )
+        factory = ctx["factory_builder"](session=session, logger=logger)
         queue_job_store = factory.create_queue_job_store()
         binding_store = (
             factory.create_dashboard_github_template_binding_store()

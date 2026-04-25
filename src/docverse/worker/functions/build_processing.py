@@ -14,15 +14,12 @@ import tarfile
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
 import structlog
-from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildStatus
 from docverse.client.models.queue_enums import JobKind, PublishStatus
-from docverse.config import Configuration
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import (
@@ -31,7 +28,6 @@ from docverse.domain.edition_tracking import (
 )
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.objectstore import ObjectStore
@@ -40,8 +36,6 @@ from docverse.storage.queue_job_store import QueueJobStore
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
-
-config = Configuration()
 
 
 async def build_processing(
@@ -52,7 +46,8 @@ async def build_processing(
     Parameters
     ----------
     ctx
-        arq worker context (contains encryptor).
+        arq worker context (``factory_builder``, ``http_client``,
+        ``arq_queue``).
     payload
         Job payload with ``org_id``, ``project_id``, ``build_id``.
 
@@ -73,19 +68,8 @@ async def build_processing(
         build=build_public_id,
     )
 
-    encryptor: CredentialEncryptor = ctx["encryptor"]
-    http_client: httpx.AsyncClient = ctx["http_client"]
-    arq_queue: ArqQueue | None = ctx.get("arq_queue")
-
     async for session in db_session_dependency():
-        factory = Factory(
-            session=session,
-            logger=logger,
-            credential_encryptor=encryptor,
-            http_client=http_client,
-            arq_queue=arq_queue,
-            default_queue_name=config.arq_queue_name,
-        )
+        factory = ctx["factory_builder"](session=session, logger=logger)
         build_store = factory.create_build_store()
         org_store = factory.create_org_store()
         queue_job_store = factory.create_queue_job_store()

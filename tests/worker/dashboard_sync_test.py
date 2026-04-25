@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 import pytest
 import structlog
-from cryptography.fernet import Fernet
 from pydantic import SecretStr
-from rubin.repertoire import DiscoveryClient
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import update
@@ -20,7 +16,6 @@ from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
@@ -32,6 +27,7 @@ from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.dashboard_sync import dashboard_sync
 from tests.support.github_mock import GitHubMock
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.worker.conftest import make_worker_ctx
 
 _config = Configuration()
 
@@ -112,17 +108,14 @@ def _make_ctx(
     arq_queue: MockArqQueue,
     http_client: httpx.AsyncClient,
     mock_github: GitHubMock,
-) -> dict[str, Any]:
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    return {
-        "encryptor": encryptor,
-        "http_client": http_client,
-        "discovery": DiscoveryClient(http_client),
-        "arq_queue": arq_queue,
-        "github_app_id": mock_github.app_id,
-        "github_app_private_key": SecretStr(mock_github.private_key_pem),
-        "github_webhook_secret": SecretStr("webhook-secret"),
-    }
+) -> dict[str, object]:
+    return make_worker_ctx(
+        http_client=http_client,
+        arq_queue=arq_queue,
+        github_app_id=mock_github.app_id,
+        github_app_private_key=SecretStr(mock_github.private_key_pem),
+        github_webhook_secret=SecretStr("webhook-secret"),
+    )
 
 
 @pytest.mark.asyncio

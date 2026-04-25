@@ -10,7 +10,6 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from cryptography.fernet import Fernet
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
@@ -32,7 +31,6 @@ from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.edition_tracking import EditionTrackingService
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.build_store import BuildStore
@@ -47,6 +45,7 @@ from docverse.storage.queue_backend import ArqQueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.build_processing import build_processing
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.worker.conftest import make_worker_ctx
 
 _HASH = "sha256:" + "a" * 64
 
@@ -212,13 +211,10 @@ async def test_build_processing_updates_edition(
         _mock_create_objectstore(mock_store),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-job-1",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-job-1",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -299,13 +295,10 @@ async def test_build_processing_uses_stored_storage_prefix(
         _mock_create_objectstore(mock_store),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-prefix",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-prefix",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -373,12 +366,10 @@ async def test_build_processing_edition_failure_no_build_fail(
 
     monkeypatch.setattr(EditionTrackingService, "track_build", _broken_track)
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-job-2",
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-job-2",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -452,13 +443,11 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
         _mock_create_objectstore(mock_store),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-publish-1",
-        "arq_queue": mock_arq,
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-arq-publish-1",
+    )
     build_public_id = serialize_base32_id(build.public_id)
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -590,13 +579,10 @@ async def test_build_processing_skips_stale_build(
         _mock_create_objectstore(mock_store),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-stale",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-stale",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -721,13 +707,11 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
 
     monkeypatch.setattr(ArqQueueBackend, "enqueue", failing_enqueue)
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-publish-fail",
-        "arq_queue": mock_arq,
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-arq-publish-fail",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -835,13 +819,10 @@ async def test_build_processing_acquires_build_lock_before_object_store(
     )
     events = install_recording_lock_service(monkeypatch)
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-lock-bp",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-lock-bp",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
@@ -917,13 +898,10 @@ async def test_build_processing_nested_lock_sequence(
     )
     events = install_recording_lock_service(monkeypatch)
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-arq-lock-nested",
-        "arq_queue": MockArqQueue(default_queue_name=_config.arq_queue_name),
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-lock-nested",
+    )
     payload: dict[str, Any] = {
         "org_id": org.id,
         "org_slug": org.slug,
