@@ -36,6 +36,7 @@ class LockClass(IntEnum):
     BUILD_PROCESSING = 0x0000
     EDITION_UPDATE = 0x0001
     PROJECT = 0x0002
+    DASHBOARD_TEMPLATE = 0x0003
 
 
 def compute_lock_id(lock_class: LockClass, **parts: Any) -> int:
@@ -151,6 +152,39 @@ class LockKey:
             project_id=project_id,
         )
         label = f"project(org={org_id},project={project_id})"
+        return cls(lock_class=lock_class, lock_id=lock_id, label=label)
+
+    @classmethod
+    def for_dashboard_template(
+        cls,
+        *,
+        owner: str,
+        repo: str,
+        ref: str,
+        root_path: str,
+    ) -> LockKey:
+        """Build the lock key for a ``dashboard_sync`` job.
+
+        Serializes syncs of the same ``(owner, repo, ref, root_path)``
+        content so the ETag-compare-and-upsert sequence runs under a
+        single hold across workers. Keyed on the content dedup tuple —
+        not on the binding id — because multiple bindings may point at
+        the same upstream template and must not race each other on the
+        shared content row.
+        """
+        lock_class = LockClass.DASHBOARD_TEMPLATE
+        # kwarg order is load-bearing; do not reorder (see compute_lock_id).
+        lock_id = compute_lock_id(
+            lock_class,
+            owner=owner,
+            repo=repo,
+            ref=ref,
+            root_path=root_path,
+        )
+        label = (
+            f"dashboard_template(owner={owner},repo={repo},"
+            f"ref={ref},root={root_path})"
+        )
         return cls(lock_class=lock_class, lock_id=lock_id, label=label)
 
 

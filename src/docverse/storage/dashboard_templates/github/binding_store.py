@@ -111,6 +111,36 @@ class DashboardGitHubTemplateBindingStore:
             return None
         return DashboardGitHubTemplateBinding.model_validate(row)
 
+    async def list_by_github_template_id(
+        self, github_template_id: int
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """List every binding that currently points at a template row."""
+        result = await self._session.execute(
+            select(SqlDashboardGitHubTemplateBinding).where(
+                SqlDashboardGitHubTemplateBinding.github_template_id
+                == github_template_id,
+            )
+        )
+        return [
+            DashboardGitHubTemplateBinding.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
+    async def list_project_overrides_for_org(
+        self, org_id: int
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """List every project-override binding within an organization."""
+        result = await self._session.execute(
+            select(SqlDashboardGitHubTemplateBinding).where(
+                SqlDashboardGitHubTemplateBinding.org_id == org_id,
+                SqlDashboardGitHubTemplateBinding.project_id.is_not(None),
+            )
+        )
+        return [
+            DashboardGitHubTemplateBinding.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
     async def update_source(
         self,
         *,

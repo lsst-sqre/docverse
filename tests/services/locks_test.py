@@ -40,10 +40,18 @@ def test_compute_lock_id_is_deterministic() -> None:
         org_id=1,
         project_id=2,
     )
+    template_id = compute_lock_id(
+        LockClass.DASHBOARD_TEMPLATE,
+        owner="acme",
+        repo="dashboard-templates",
+        ref="main",
+        root_path="/",
+    )
 
     assert build_id == 136049745188599
     assert edition_id == 510729122043644
     assert project_id == 792169873651098
+    assert template_id == 873459670219191
 
 
 def test_lock_key_constructors_match_compute_lock_id() -> None:
@@ -53,6 +61,15 @@ def test_lock_key_constructors_match_compute_lock_id() -> None:
     )
     assert LockKey.for_edition_update(1, 2, 3).lock_id == (510729122043644)
     assert LockKey.for_project(1, 2).lock_id == 792169873651098
+    assert (
+        LockKey.for_dashboard_template(
+            owner="acme",
+            repo="dashboard-templates",
+            ref="main",
+            root_path="/",
+        ).lock_id
+        == 873459670219191
+    )
 
 
 def test_high_16_bits_match_lock_class() -> None:
@@ -64,6 +81,9 @@ def test_high_16_bits_match_lock_class() -> None:
         org_id=42, project_id=99, edition_id=7
     )
     project_key = LockKey.for_project(org_id=42, project_id=99)
+    template_key = LockKey.for_dashboard_template(
+        owner="acme", repo="templates", ref="main", root_path="/"
+    )
 
     assert _high_16_bits(build_key.lock_id) == (
         LockClass.BUILD_PROCESSING.value
@@ -72,6 +92,9 @@ def test_high_16_bits_match_lock_class() -> None:
         LockClass.EDITION_UPDATE.value
     )
     assert _high_16_bits(project_key.lock_id) == LockClass.PROJECT.value
+    assert _high_16_bits(template_key.lock_id) == (
+        LockClass.DASHBOARD_TEMPLATE.value
+    )
 
 
 def test_different_classes_with_same_fields_differ() -> None:
@@ -95,9 +118,23 @@ def test_result_fits_in_signed_int64() -> None:
         LockKey.for_edition_update(2**31 - 1, 2**31 - 1, 2**31 - 1).lock_id,
         LockKey.for_project(1, 2).lock_id,
         LockKey.for_project(2**31 - 1, 2**31 - 1).lock_id,
+        LockKey.for_dashboard_template(
+            owner="a" * 128, repo="b" * 128, ref="c" * 128, root_path="/" * 16
+        ).lock_id,
     ]
     for value in samples:
         assert SIGNED_INT64_MIN <= value <= SIGNED_INT64_MAX
+
+
+def test_dashboard_template_key_distinguishes_root_paths() -> None:
+    """Same repo, different root_path → different lock ids."""
+    root = LockKey.for_dashboard_template(
+        owner="acme", repo="templates", ref="main", root_path="/"
+    )
+    nested = LockKey.for_dashboard_template(
+        owner="acme", repo="templates", ref="main", root_path="sub/dir"
+    )
+    assert root.lock_id != nested.lock_id
 
 
 def test_lock_key_carries_label_and_class() -> None:

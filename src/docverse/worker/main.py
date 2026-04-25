@@ -10,19 +10,82 @@ from typing import Any
 
 import httpx
 import structlog
+from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
-from safir.arq import RedisArqQueue
+from safir.arq import ArqQueue, RedisArqQueue
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.db_session import db_session_dependency
 from safir.logging import configure_logging
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.config import Configuration
 from docverse.database import get_current_revision
+from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 
-from .functions import build_processing, dashboard_build, ping, publish_edition
+from .functions import (
+    build_processing,
+    dashboard_build,
+    dashboard_sync,
+    ping,
+    publish_edition,
+)
 
 config = Configuration()
+
+
+class WorkerFactoryBuilder:
+    """Build per-job :class:`Factory` instances inside the arq worker.
+
+    Captures the worker's process-lifetime dependencies once and exposes
+    a ``__call__(session, logger)`` that mints a fresh
+    :class:`docverse.factory.Factory` for the duration of one arq job.
+    Mirrors the request-side pattern in
+    :class:`safir.dependencies.context.ContextDependency`, where the
+    process-lifetime deps are captured once and a per-request
+    ``RequestContext`` is built around them.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        encryptor: CredentialEncryptor,
+        http_client: httpx.AsyncClient,
+        arq_queue: ArqQueue,
+        discovery: DiscoveryClient,
+        github_app_id: int | None,
+        github_app_private_key: SecretStr | None,
+        github_webhook_secret: SecretStr | None,
+        default_queue_name: str,
+    ) -> None:
+        self._encryptor = encryptor
+        self._http_client = http_client
+        self._arq_queue = arq_queue
+        self._discovery = discovery
+        self._github_app_id = github_app_id
+        self._github_app_private_key = github_app_private_key
+        self._github_webhook_secret = github_webhook_secret
+        self._default_queue_name = default_queue_name
+
+    def __call__(
+        self,
+        *,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> Factory:
+        """Build a :class:`Factory` for one arq job."""
+        return Factory(
+            session=session,
+            logger=logger,
+            credential_encryptor=self._encryptor,
+            http_client=self._http_client,
+            arq_queue=self._arq_queue,
+            discovery=self._discovery,
+            github_app_id=self._github_app_id,
+            github_app_private_key=self._github_app_private_key,
+            github_webhook_secret=self._github_webhook_secret,
+            default_queue_name=self._default_queue_name,
+        )
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -60,14 +123,14 @@ async def startup(ctx: dict[str, Any]) -> None:
         if config.credential_encryption_key_retired
         else None
     )
-    ctx["encryptor"] = CredentialEncryptor(
+    encryptor = CredentialEncryptor(
         current_key=config.credential_encryption_key.get_secret_value(),
         retired_key=retired_key,
     )
 
-    ctx["http_client"] = httpx.AsyncClient()
-    ctx["discovery"] = DiscoveryClient(
-        ctx["http_client"],
+    http_client = httpx.AsyncClient()
+    discovery = DiscoveryClient(
+        http_client,
         base_url=str(config.repertoire_base_url),
         logger=logger,
     )
@@ -75,8 +138,24 @@ async def startup(ctx: dict[str, Any]) -> None:
     if config.arq_redis_settings is None:
         msg = "arq_redis_settings must be configured for the worker"
         raise RuntimeError(msg)
-    ctx["arq_queue"] = await RedisArqQueue.initialize(
+    arq_queue = await RedisArqQueue.initialize(
         config.arq_redis_settings,
+        default_queue_name=config.arq_queue_name,
+    )
+
+    # ``http_client`` and ``arq_queue`` stay in ctx because ``shutdown``
+    # owns their teardown. The factory builder captures them by reference,
+    # so worker functions never need to look them up directly.
+    ctx["http_client"] = http_client
+    ctx["arq_queue"] = arq_queue
+    ctx["factory_builder"] = WorkerFactoryBuilder(
+        encryptor=encryptor,
+        http_client=http_client,
+        arq_queue=arq_queue,
+        discovery=discovery,
+        github_app_id=config.github_app_id,
+        github_app_private_key=config.github_app_private_key,
+        github_webhook_secret=config.github_webhook_secret,
         default_queue_name=config.arq_queue_name,
     )
 
@@ -99,7 +178,13 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """arq WorkerSettings for Docverse."""
 
-    functions = [build_processing, dashboard_build, ping, publish_edition]
+    functions = [
+        build_processing,
+        dashboard_build,
+        dashboard_sync,
+        ping,
+        publish_edition,
+    ]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
     on_startup = startup

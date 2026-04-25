@@ -10,6 +10,9 @@ from docverse.client.models import DashboardTemplateBindingCreate
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
+from docverse.services.dashboard_templates.enqueue import (
+    try_enqueue_dashboard_sync,
+)
 
 from .models import DashboardTemplateBindingResponse
 
@@ -58,6 +61,13 @@ async def put_org_dashboard_template(
         result = await service.put_org_default(org_slug=org_slug, data=data)
         if result.changed:
             await context.session.commit()
+    if result.changed:
+        await try_enqueue_dashboard_sync(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            binding_id=result.binding.id,
+        )
     response.status_code = (
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
@@ -134,6 +144,13 @@ async def put_project_dashboard_template(  # noqa: PLR0913
         )
         if result.changed:
             await context.session.commit()
+    if result.changed:
+        await try_enqueue_dashboard_sync(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            binding_id=result.binding.id,
+        )
     response.status_code = (
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )

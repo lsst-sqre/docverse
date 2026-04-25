@@ -10,21 +10,11 @@ import traceback
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import structlog
-from rubin.repertoire import DiscoveryClient
-from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.config import Configuration
 from docverse.exceptions import NotFoundError
-from docverse.factory import Factory
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockKey
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
-
-config = Configuration()
 
 
 async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -33,7 +23,8 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     Parameters
     ----------
     ctx
-        arq worker context (encryptor, http_client, queue).
+        arq worker context (``factory_builder``, ``http_client``,
+        ``arq_queue``).
     payload
         Job payload with ``org_id``, ``org_slug``, ``project_id``,
         ``project_slug``, ``queue_job_id``, ``queue_job_public_id``.
@@ -52,23 +43,10 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     project_id: int = payload["project_id"]
     queue_job_id: int = payload["queue_job_id"]
 
-    encryptor: CredentialEncryptor = ctx["encryptor"]
-    http_client: httpx.AsyncClient = ctx["http_client"]
-    arq_queue: ArqQueue | None = ctx.get("arq_queue")
-    discovery: DiscoveryClient = ctx["discovery"]
-
     async for session in db_session_dependency():
-        factory = Factory(
-            session=session,
-            logger=logger,
-            credential_encryptor=encryptor,
-            http_client=http_client,
-            arq_queue=arq_queue,
-            discovery=discovery,
-            default_queue_name=config.arq_queue_name,
-        )
-        queue_job_store = QueueJobStore(session=session, logger=logger)
-        org_store = OrganizationStore(session=session, logger=logger)
+        factory = ctx["factory_builder"](session=session, logger=logger)
+        queue_job_store = factory.create_queue_job_store()
+        org_store = factory.create_org_store()
         lock_service = factory.create_lock_service()
 
         lock_key = LockKey.for_project(org_id=org_id, project_id=project_id)

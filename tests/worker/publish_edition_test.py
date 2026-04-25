@@ -9,7 +9,6 @@ from typing import Any, Self
 import httpx
 import pytest
 import structlog
-from cryptography.fernet import Fernet
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
@@ -37,7 +36,6 @@ from docverse.domain.organization import Organization
 from docverse.domain.project import Project
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.factory import Factory
-from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -53,6 +51,7 @@ from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.publish_edition import publish_edition
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.worker.conftest import make_worker_ctx
 
 _HASH = "sha256:" + "a" * 64
 
@@ -243,12 +242,10 @@ async def test_publish_edition_success_lifecycle(
         _mock_create_edition_publisher(mock_publisher),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-publish-arq-1",
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-1",
+    )
     payload = _make_payload(
         org=org,
         project=project,
@@ -337,12 +334,10 @@ async def test_publish_edition_failure_lifecycle(
         _mock_create_edition_publisher(failing_publisher),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-publish-arq-fail",
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-fail",
+    )
     payload = _make_payload(
         org=org,
         project=project,
@@ -421,12 +416,10 @@ async def test_publish_edition_no_cdn_shortcut(
             backend_job_id="test-publish-arq-nocdn",
         )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-publish-arq-nocdn",
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-nocdn",
+    )
     payload = _make_payload(
         org=org,
         project=project,
@@ -495,14 +488,12 @@ async def test_publish_edition_success_enqueues_dashboard_build(
         _mock_create_edition_publisher(mock_publisher),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
     mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-publish-arq-dash",
-        "arq_queue": mock_arq,
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-publish-arq-dash",
+    )
     payload = _make_payload(
         org=org,
         project=project,
@@ -569,14 +560,12 @@ async def test_publish_edition_failure_does_not_enqueue_dashboard(
         _mock_create_edition_publisher(failing_publisher),
     )
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
     mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-publish-arq-dash-fail",
-        "arq_queue": mock_arq,
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-publish-arq-dash-fail",
+    )
     payload = _make_payload(
         org=org,
         project=project,
@@ -671,12 +660,10 @@ async def test_publish_edition_acquires_edition_update_lock(
     )
     events = install_recording_lock_service(monkeypatch)
 
-    encryptor = CredentialEncryptor(current_key=Fernet.generate_key().decode())
-    ctx: dict[str, Any] = {
-        "encryptor": encryptor,
-        "http_client": httpx.AsyncClient(),
-        "job_id": "test-publish-arq-lock",
-    }
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-lock",
+    )
     payload = _make_payload(
         org=org,
         project=project,
