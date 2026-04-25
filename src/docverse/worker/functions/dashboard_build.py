@@ -21,8 +21,6 @@ from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockKey
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
 
 config = Configuration()
 
@@ -67,8 +65,8 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             discovery=discovery,
             default_queue_name=config.arq_queue_name,
         )
-        queue_job_store = QueueJobStore(session=session, logger=logger)
-        org_store = OrganizationStore(session=session, logger=logger)
+        queue_job_store = factory.create_queue_job_store()
+        org_store = factory.create_org_store()
         lock_service = factory.create_lock_service()
 
         lock_key = LockKey.for_project(org_id=org_id, project_id=project_id)

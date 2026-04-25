@@ -105,15 +105,25 @@ class Factory:
             default_queue_name=self._default_queue_name,
         )
 
-    def _create_org_store(self) -> OrganizationStore:
+    def create_org_store(self) -> OrganizationStore:
+        """Create an :class:`OrganizationStore`."""
         return OrganizationStore(session=self._session, logger=self._logger)
 
-    def _create_project_store(self) -> ProjectStore:
+    def create_project_store(self) -> ProjectStore:
+        """Create a :class:`ProjectStore`."""
         return ProjectStore(session=self._session, logger=self._logger)
+
+    def create_build_store(self) -> BuildStore:
+        """Create a :class:`BuildStore`."""
+        return BuildStore(session=self._session, logger=self._logger)
+
+    def create_edition_store(self) -> EditionStore:
+        """Create an :class:`EditionStore`."""
+        return EditionStore(session=self._session, logger=self._logger)
 
     def create_organization_service(self) -> OrganizationService:
         """Create an OrganizationService."""
-        store = self._create_org_store()
+        store = self.create_org_store()
         return OrganizationService(
             store=store,
             service_store=self.create_service_store(),
@@ -122,11 +132,9 @@ class Factory:
 
     def create_project_service(self) -> ProjectService:
         """Create a ProjectService."""
-        store = self._create_project_store()
-        org_store = self._create_org_store()
-        edition_store = EditionStore(
-            session=self._session, logger=self._logger
-        )
+        store = self.create_project_store()
+        org_store = self.create_org_store()
+        edition_store = self.create_edition_store()
         return ProjectService(
             store=store,
             org_store=org_store,
@@ -136,9 +144,9 @@ class Factory:
 
     def create_build_service(self) -> BuildService:
         """Create a BuildService."""
-        store = BuildStore(session=self._session, logger=self._logger)
-        org_store = self._create_org_store()
-        project_store = self._create_project_store()
+        store = self.create_build_store()
+        org_store = self.create_org_store()
+        project_store = self.create_project_store()
         queue_backend = self.create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
@@ -170,14 +178,12 @@ class Factory:
         on the :class:`EditionTrackingDeps` dataclass.
         """
         deps = EditionTrackingDeps(
-            edition_store=EditionStore(
-                session=self._session, logger=self._logger
-            ),
+            edition_store=self.create_edition_store(),
             history_store=EditionBuildHistoryStore(
                 session=self._session, logger=self._logger
             ),
-            project_store=self._create_project_store(),
-            org_store=self._create_org_store(),
+            project_store=self.create_project_store(),
+            org_store=self.create_org_store(),
             logger=self._logger,
             lock_service=self.create_lock_service(),
         )
@@ -185,13 +191,13 @@ class Factory:
 
     def create_edition_service(self) -> EditionService:
         """Create an EditionService."""
-        store = EditionStore(session=self._session, logger=self._logger)
-        org_store = self._create_org_store()
-        project_store = self._create_project_store()
+        store = self.create_edition_store()
+        org_store = self.create_org_store()
+        project_store = self.create_project_store()
         history_store = EditionBuildHistoryStore(
             session=self._session, logger=self._logger
         )
-        build_store = BuildStore(session=self._session, logger=self._logger)
+        build_store = self.create_build_store()
         queue_backend = self.create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
@@ -251,7 +257,7 @@ class Factory:
             raise RuntimeError(msg)
         return CredentialService(
             store=self.create_credential_store(),
-            org_store=self._create_org_store(),
+            org_store=self.create_org_store(),
             service_store=self.create_service_store(),
             encryptor=self._credential_encryptor,
             logger=self._logger,
@@ -262,7 +268,7 @@ class Factory:
         return InfrastructureService(
             store=self.create_service_store(),
             credential_store=self.create_credential_store(),
-            org_store=self._create_org_store(),
+            org_store=self.create_org_store(),
             logger=self._logger,
         )
 
@@ -315,10 +321,8 @@ class Factory:
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""
         return EditionPublishingService(
-            org_store=self._create_org_store(),
-            edition_store=EditionStore(
-                session=self._session, logger=self._logger
-            ),
+            org_store=self.create_org_store(),
+            edition_store=self.create_edition_store(),
             history_store=EditionBuildHistoryStore(
                 session=self._session, logger=self._logger
             ),
@@ -326,9 +330,10 @@ class Factory:
             logger=self._logger,
         )
 
-    def _create_dashboard_github_template_binding_store(
+    def create_dashboard_github_template_binding_store(
         self,
     ) -> DashboardGitHubTemplateBindingStore:
+        """Create a :class:`DashboardGitHubTemplateBindingStore`."""
         return DashboardGitHubTemplateBindingStore(
             session=self._session, logger=self._logger
         )
@@ -338,9 +343,9 @@ class Factory:
     ) -> DashboardTemplateBindingService:
         """Create a :class:`DashboardTemplateBindingService`."""
         return DashboardTemplateBindingService(
-            binding_store=self._create_dashboard_github_template_binding_store(),
-            org_store=self._create_org_store(),
-            project_store=self._create_project_store(),
+            binding_store=self.create_dashboard_github_template_binding_store(),
+            org_store=self.create_org_store(),
+            project_store=self.create_project_store(),
             logger=self._logger,
         )
 
@@ -349,8 +354,8 @@ class Factory:
     ) -> DashboardBuildEnqueuer:
         """Create a DashboardBuildEnqueuer."""
         return DashboardBuildEnqueuer(
-            org_store=self._create_org_store(),
-            project_store=self._create_project_store(),
+            org_store=self.create_org_store(),
+            project_store=self.create_project_store(),
             queue_backend=self.create_queue_backend(),
             queue_job_store=self.create_queue_job_store(),
             logger=self._logger,
@@ -373,7 +378,7 @@ class Factory:
     def create_dashboard_sync_enqueuer(self) -> DashboardSyncEnqueuer:
         """Create a :class:`DashboardSyncEnqueuer`."""
         return DashboardSyncEnqueuer(
-            binding_store=self._create_dashboard_github_template_binding_store(),
+            binding_store=self.create_dashboard_github_template_binding_store(),
             queue_backend=self.create_queue_backend(),
             queue_job_store=self.create_queue_job_store(),
             logger=self._logger,
@@ -382,8 +387,8 @@ class Factory:
     def create_dashboard_rebuild_fanout(self) -> DashboardRebuildFanout:
         """Create a :class:`DashboardRebuildFanout`."""
         return DashboardRebuildFanout(
-            binding_store=self._create_dashboard_github_template_binding_store(),
-            project_store=self._create_project_store(),
+            binding_store=self.create_dashboard_github_template_binding_store(),
+            project_store=self.create_project_store(),
             enqueuer=self.create_dashboard_build_enqueuer(),
             logger=self._logger,
         )
@@ -402,7 +407,7 @@ class Factory:
             msg = "HTTP client is required to build a DashboardTemplateSyncer"
             raise RuntimeError(msg)
         return DashboardTemplateSyncer(
-            binding_store=self._create_dashboard_github_template_binding_store(),
+            binding_store=self.create_dashboard_github_template_binding_store(),
             template_store=DashboardGitHubTemplateStore(
                 session=self._session, logger=self._logger
             ),
@@ -423,12 +428,10 @@ class Factory:
             msg = "DiscoveryClient is required to build a DashboardPublisher"
             raise RuntimeError(msg)
         return DashboardPublisher(
-            org_store=self._create_org_store(),
-            project_store=self._create_project_store(),
-            edition_store=EditionStore(
-                session=self._session, logger=self._logger
-            ),
-            build_store=BuildStore(session=self._session, logger=self._logger),
+            org_store=self.create_org_store(),
+            project_store=self.create_project_store(),
+            edition_store=self.create_edition_store(),
+            build_store=self.create_build_store(),
             discovery=self._discovery,
             logger=self._logger,
             template_resolver=self.create_template_resolver(),

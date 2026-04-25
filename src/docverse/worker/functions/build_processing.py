@@ -34,10 +34,6 @@ from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.lock_service import LockKey
 from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
-    EditionBuildHistoryStore,
-)
-from docverse.storage.edition_store import EditionStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.queue_job_store import QueueJobStore
@@ -90,9 +86,9 @@ async def build_processing(
             arq_queue=arq_queue,
             default_queue_name=config.arq_queue_name,
         )
-        build_store = BuildStore(session=session, logger=logger)
-        org_store = OrganizationStore(session=session, logger=logger)
-        queue_job_store = QueueJobStore(session=session, logger=logger)
+        build_store = factory.create_build_store()
+        org_store = factory.create_org_store()
+        queue_job_store = factory.create_queue_job_store()
         lock_service = factory.create_lock_service()
 
         # Pre-lock: load just enough build metadata to compute the
@@ -433,8 +429,8 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     Returns a list of ``{edition_slug, publish_queue_job_public_id}``
     entries suitable for embedding in the parent build job's progress.
     """
-    edition_store = EditionStore(session=session, logger=logger)
-    history_store = EditionBuildHistoryStore(session=session, logger=logger)
+    edition_store = factory.create_edition_store()
+    history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
 
     pending_enqueues: list[_PendingEnqueue] = []

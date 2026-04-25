@@ -114,8 +114,8 @@ async def try_enqueue_dashboard_sync(
         )
         try:
             async with session.begin():
-                binding_store = DashboardGitHubTemplateBindingStore(
-                    session=session, logger=logger
+                binding_store = (
+                    factory.create_dashboard_github_template_binding_store()
                 )
                 await binding_store.update_sync_state(
                     binding_id=binding_id,

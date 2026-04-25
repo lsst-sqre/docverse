@@ -23,10 +23,6 @@ from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.dashboard_templates.sync import DashboardSyncStatus
 from docverse.services.lock_service import LockKey
-from docverse.storage.dashboard_templates.github import (
-    DashboardGitHubTemplateBindingStore,
-)
-from docverse.storage.queue_job_store import QueueJobStore
 
 config = Configuration()
 
@@ -80,9 +76,9 @@ async def dashboard_sync(  # noqa: PLR0915
             github_webhook_secret=github_webhook_secret,
             default_queue_name=config.arq_queue_name,
         )
-        queue_job_store = QueueJobStore(session=session, logger=logger)
-        binding_store = DashboardGitHubTemplateBindingStore(
-            session=session, logger=logger
+        queue_job_store = factory.create_queue_job_store()
+        binding_store = (
+            factory.create_dashboard_github_template_binding_store()
         )
         lock_service = factory.create_lock_service()
 

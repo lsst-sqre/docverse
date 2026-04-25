@@ -16,7 +16,6 @@ import httpx
 import structlog
 from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.config import Configuration
@@ -30,12 +29,10 @@ from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
 from docverse.services.lock_service import LockKey
-from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse.storage.edition_store import EditionStore
-from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 
 config = Configuration()
@@ -88,12 +85,10 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             arq_queue=arq_queue,
             default_queue_name=config.arq_queue_name,
         )
-        edition_store = EditionStore(session=session, logger=logger)
-        history_store = EditionBuildHistoryStore(
-            session=session, logger=logger
-        )
-        queue_job_store = QueueJobStore(session=session, logger=logger)
-        project_store = ProjectStore(session=session, logger=logger)
+        edition_store = factory.create_edition_store()
+        history_store = factory.create_edition_build_history_store()
+        queue_job_store = factory.create_queue_job_store()
+        project_store = factory.create_project_store()
         lock_service = factory.create_lock_service()
 
         # Pre-lock: resolve project_id from the payload's project_slug so
@@ -119,7 +114,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         async with lock_service.acquire(lock_key):
             async with session.begin():
                 resources = await _load_resources(
-                    session=session, logger=logger, payload=payload
+                    factory=factory, payload=payload
                 )
                 await _mark_publishing(
                     queue_job_store=queue_job_store,
@@ -168,15 +163,14 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 
 async def _load_resources(
     *,
-    session: AsyncSession,
-    logger: structlog.stdlib.BoundLogger,
+    factory: Factory,
     payload: dict[str, Any],
 ) -> _PublishResources:
     """Load project, edition, build, and history entry for the job."""
-    project_store = ProjectStore(session=session, logger=logger)
-    edition_store = EditionStore(session=session, logger=logger)
-    build_store = BuildStore(session=session, logger=logger)
-    history_store = EditionBuildHistoryStore(session=session, logger=logger)
+    project_store = factory.create_project_store()
+    edition_store = factory.create_edition_store()
+    build_store = factory.create_build_store()
+    history_store = factory.create_edition_build_history_store()
 
     project = await project_store.get_by_slug(
         org_id=payload["org_id"], slug=payload["project_slug"]
