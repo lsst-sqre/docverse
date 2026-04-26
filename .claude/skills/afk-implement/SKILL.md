@@ -41,10 +41,30 @@ stuck path (Phase 5).
 
 ## Phase 2: Commit (success path)
 
-Stage the relevant files (do not use `git add -A`). Commit with a signed commit
-using this template verbatim — both `Key decisions:` and `Next-iteration notes:`
-are required sections so the next iteration's selection phase can parse them
-from `git log`:
+**Before staging, require a stable clean tree.** work-it Phase 4 tells you to
+run `pre-commit run --all-files`; this skill defines what "passing" actually
+means — `pre-commit` exiting 0 on a re-run after auto-fixes is **not** the
+success condition. The success condition is: a single `pre-commit run
+--all-files` invocation exits 0 on a tree with no working-tree modifications.
+
+1. Run `uv run --only-group=lint pre-commit run --all-files` until it exits 0
+   *and* `git status --porcelain` shows no unintended changes.
+2. If ruff auto-fixed unrelated files, review the diff (`git diff`). Either
+   stage them as part of this commit (preferred — drive-by lint cleanup is
+   fine) or revert them with `git restore <path>` before committing. The tree
+   must be a fixpoint before `git commit`.
+3. `pre-commit run --all-files` must show **no remaining errors** — output
+   like "Found N errors (X fixed, Y remaining)" is a failure, not a success.
+   Fix the Y remaining manually, even when ruff couldn't auto-fix them.
+
+Stage with `git add <paths>` listing every path that should land in this
+commit (your task files plus any drive-by ruff fixes you chose to keep).
+`git add -A` is allowed *only* after the fixpoint check above has confirmed
+every working-tree change is intentional.
+
+Commit with a signed commit using this template verbatim — both `Key decisions:`
+and `Next-iteration notes:` are required sections so the next iteration's
+selection phase can parse them from `git log`:
 
 ```
 <imperative subject, ≤70 chars>
@@ -65,12 +85,25 @@ No Jira prefix on the subject — the branch name and PR title already carry tha
 No `Co-authored-by:` trailer (SSH signing is self-identifying). No
 files-changed section (`git show` covers it).
 
-**Pre-commit hook retries:** if a pre-commit hook fails, fix the reported issue,
+**Pre-commit hook retries:** if `git commit`'s hook fails (the staged-file run
+catches something the Phase 2 fixpoint missed), fix the reported issue,
 re-stage, and create a **new** commit (never `--amend`, never `--no-verify`).
 After **3** consecutive failed commit attempts in this iteration, route to the
 stuck path.
 
 ## Phase 3: Push
+
+**Push-time backstop (belt-and-suspenders):** before pushing, re-run
+
+```
+uv run --only-group=lint pre-commit run --all-files
+```
+
+and `git status --porcelain`. If the Phase 2 fixpoint was done correctly this
+is redundant. If either reports anything — non-zero exit, "X fixed, Y remaining",
+or working-tree changes — Phase 2 missed an unstaged auto-fix or an unfixable
+violation; route to the stuck path (Phase 5) rather than pushing a tree CI will
+reject.
 
 Push the branch:
 
