@@ -44,9 +44,7 @@ async def test_helpers_restrict_to_named_queue() -> None:
     await queue.enqueue("alpha", _queue_name="docverse:queue", payload={})
     await queue.enqueue("alpha", _queue_name="other:queue", payload={})
 
-    assert (
-        count_jobs_by_name(queue, "alpha", queue_name="docverse:queue") == 1
-    )
+    assert count_jobs_by_name(queue, "alpha", queue_name="docverse:queue") == 1
     assert count_jobs_by_name(queue, "alpha", queue_name="missing:queue") == 0
     other_only = get_jobs_by_name(queue, "alpha", queue_name="other:queue")
     assert [j.queue_name for j in other_only] == ["other:queue"]

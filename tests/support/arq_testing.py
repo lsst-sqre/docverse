@@ -29,7 +29,7 @@ def register_queue(arq_queue: MockArqQueue, name: str) -> None:
     ``default_queue_name``; enqueueing into any other queue raises
     ``KeyError`` until that queue's name is added to ``_job_metadata``.
     """
-    arq_queue._job_metadata.setdefault(name, {})  # noqa: SLF001
+    arq_queue._job_metadata.setdefault(name, {})
 
 
 def get_jobs_by_name(
@@ -51,11 +51,11 @@ def get_jobs_by_name(
         union jobs across every queue the mock has touched.
     """
     if queue_name is not None:
-        per_queue = arq_queue._job_metadata.get(queue_name, {})  # noqa: SLF001
+        per_queue = arq_queue._job_metadata.get(queue_name, {})
         return [job for job in per_queue.values() if job.name == name]
     return [
         job
-        for queue in arq_queue._job_metadata.values()  # noqa: SLF001
+        for queue in arq_queue._job_metadata.values()
         for job in queue.values()
         if job.name == name
     ]
@@ -71,9 +71,7 @@ def count_jobs_by_name(
 
     See :func:`get_jobs_by_name` for the ``queue_name`` semantics.
     """
-    return len(
-        get_jobs_by_name(arq_queue, name, queue_name=queue_name)
-    )
+    return len(get_jobs_by_name(arq_queue, name, queue_name=queue_name))
 
 
 def queue_names(arq_queue: MockArqQueue) -> set[str]:
@@ -82,4 +80,4 @@ def queue_names(arq_queue: MockArqQueue) -> set[str]:
     Useful for asserting that jobs landed under the configured queue name
     rather than arq's default ``"arq:queue"``.
     """
-    return set(arq_queue._job_metadata.keys())  # noqa: SLF001
+    return set(arq_queue._job_metadata.keys())
