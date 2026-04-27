@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -72,8 +72,8 @@ class PushEventProcessor:
         match the push's ``(owner, repo, ref)`` or when none of the
         matching bindings' ``root_path`` overlap the changed-path set).
         """
-        repo = payload.get("repository") or {}
-        owner_block = repo.get("owner") or {}
+        repo = payload.get("repository", {})
+        owner_block = repo.get("owner", {})
         owner = (
             owner_block.get("login")
             or owner_block.get("name")
@@ -183,7 +183,7 @@ def _normalize_root(root_path: str) -> str:
     return root_path.strip("/")
 
 
-def _root_path_matches(root_path: str, changed_paths: Iterable[str]) -> bool:
+def _root_path_matches(root_path: str, changed_paths: Sequence[str]) -> bool:
     """Return ``True`` if any changed path is inside ``root_path``.
 
     ``root_path = "/"`` (or empty after stripping slashes) is the
@@ -193,6 +193,6 @@ def _root_path_matches(root_path: str, changed_paths: Iterable[str]) -> bool:
     """
     normalized = _normalize_root(root_path)
     if not normalized:
-        return any(True for _ in changed_paths)
+        return bool(changed_paths)
     prefix = f"{normalized}/"
     return any(p.startswith(prefix) or p == normalized for p in changed_paths)
