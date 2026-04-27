@@ -23,6 +23,7 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from tests.conftest import seed_org_with_admin
+from tests.support.arq_testing import get_jobs_by_name
 
 
 async def _setup(client: AsyncClient) -> None:
@@ -205,9 +206,7 @@ async def test_patch_override_enqueues_arq_job(
 
     mock_arq = arq_dependency._arq_queue
     assert isinstance(mock_arq, MockArqQueue)
-    queues = list(mock_arq._job_metadata.values())
-    enqueued = [j for queue in queues for j in queue.values()]
-    publish_jobs = [j for j in enqueued if j.name == "publish_edition"]
+    publish_jobs = get_jobs_by_name(mock_arq, "publish_edition")
     assert len(publish_jobs) == 1
     payload = publish_jobs[0].kwargs["payload"]
     assert payload["project_slug"] == "pov-proj"

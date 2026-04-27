@@ -14,6 +14,7 @@ from docverse.storage.dashboard_templates.github import (
 )
 from docverse.storage.organization_store import OrganizationStore
 from tests.conftest import seed_org_with_admin
+from tests.support.arq_testing import get_jobs_by_name
 
 _SUPERADMIN = "superadmin"
 _ADMIN = "admin-user"
@@ -55,12 +56,7 @@ async def _create_binding(client: AsyncClient) -> int:
 
 
 def _dashboard_sync_enqueues(mock_arq: MockArqQueue) -> list[JobMetadata]:
-    return [
-        j
-        for queue in mock_arq._job_metadata.values()
-        for j in queue.values()
-        if j.name == "dashboard_sync"
-    ]
+    return get_jobs_by_name(mock_arq, "dashboard_sync")
 
 
 @pytest.mark.asyncio

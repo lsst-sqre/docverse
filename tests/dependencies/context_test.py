@@ -73,3 +73,55 @@ async def test_request_context_raises_when_github_secret_missing(
         )
         with pytest.raises(GitHubAppNotConfiguredError):
             context.factory.create_github_app_client()
+
+
+@pytest.mark.asyncio
+async def test_set_github_secrets_overrides_three_fields(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """``set_github_secrets`` updates the three GitHub-App secret slots."""
+    dep = ContextDependency()
+    async with httpx.AsyncClient() as http_client:
+        await dep.initialize(http_client=http_client)
+        # No secrets yet.
+        context = await dep(
+            request=Mock(spec=Request),
+            response=Mock(spec=Response),
+            session=db_session,
+            logger=_logger(),
+            arq_queue=MockArqQueue(default_queue_name="docverse:queue"),
+        )
+        with pytest.raises(GitHubAppNotConfiguredError):
+            context.factory.create_github_app_client()
+
+        # Toggle on via the public setter.
+        dep.set_github_secrets(
+            app_id=mock_github.app_id,
+            private_key=SecretStr(mock_github.private_key_pem),
+            webhook_secret=SecretStr("webhook-secret"),
+        )
+        context = await dep(
+            request=Mock(spec=Request),
+            response=Mock(spec=Response),
+            session=db_session,
+            logger=_logger(),
+            arq_queue=MockArqQueue(default_queue_name="docverse:queue"),
+        )
+        assert isinstance(
+            context.factory.create_github_app_client(), GitHubAppClient
+        )
+
+        # Toggle back off in a single call.
+        dep.set_github_secrets(
+            app_id=None, private_key=None, webhook_secret=None
+        )
+        context = await dep(
+            request=Mock(spec=Request),
+            response=Mock(spec=Response),
+            session=db_session,
+            logger=_logger(),
+            arq_queue=MockArqQueue(default_queue_name="docverse:queue"),
+        )
+        with pytest.raises(GitHubAppNotConfiguredError):
+            context.factory.create_github_app_client()

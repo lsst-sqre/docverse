@@ -25,6 +25,7 @@ from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
 )
 from docverse.storage.organization_store import OrganizationStore
+from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 
 _WEBHOOK_PATH = "/docverse/webhooks/github"
@@ -37,16 +38,6 @@ def _sign(secret: str, body: bytes) -> str:
         secret.encode("utf-8"), msg=body, digestmod=hashlib.sha256
     ).hexdigest()
     return f"sha256={digest}"
-
-
-def _count_dashboard_sync_jobs(arq_queue: MockArqQueue) -> int:
-    """Count ``dashboard_sync`` jobs across every queue on the mock."""
-    return sum(
-        1
-        for queue in arq_queue._job_metadata.values()
-        for job in queue.values()
-        if job.name == "dashboard_sync"
-    )
 
 
 @pytest_asyncio.fixture
@@ -64,19 +55,19 @@ async def github_app_enabled(
         context_dependency._github_app_private_key,
         context_dependency._github_webhook_secret,
     )
-    context_dependency._github_app_id = mock_github.app_id
-    context_dependency._github_app_private_key = SecretStr(
-        mock_github.private_key_pem
+    context_dependency.set_github_secrets(
+        app_id=mock_github.app_id,
+        private_key=SecretStr(mock_github.private_key_pem),
+        webhook_secret=SecretStr(_WEBHOOK_SECRET),
     )
-    context_dependency._github_webhook_secret = SecretStr(_WEBHOOK_SECRET)
     try:
         yield
     finally:
-        (
-            context_dependency._github_app_id,
-            context_dependency._github_app_private_key,
-            context_dependency._github_webhook_secret,
-        ) = saved
+        context_dependency.set_github_secrets(
+            app_id=saved[0],
+            private_key=saved[1],
+            webhook_secret=saved[2],
+        )
 
 
 def _push_payload(
@@ -223,7 +214,7 @@ async def test_post_signed_push_enqueues_dashboard_sync(
     assert response.status_code == 200
     arq_queue = arq_dependency._arq_queue
     assert isinstance(arq_queue, MockArqQueue)
-    assert _count_dashboard_sync_jobs(arq_queue) >= 1
+    assert count_jobs_by_name(arq_queue, "dashboard_sync") >= 1
 
 
 @pytest.mark.asyncio
@@ -234,7 +225,7 @@ async def test_post_signed_push_with_no_matching_root_path_no_enqueue(
     """A signed push that does not touch any binding's root_path is a no-op."""
     arq_queue = arq_dependency._arq_queue
     assert isinstance(arq_queue, MockArqQueue)
-    before = _count_dashboard_sync_jobs(arq_queue)
+    before = count_jobs_by_name(arq_queue, "dashboard_sync")
     await _seed_binding(root_path="templates/red")
     payload = _push_payload(
         changed_files=["templates/blue/dashboard.html.jinja"],
@@ -252,7 +243,7 @@ async def test_post_signed_push_with_no_matching_root_path_no_enqueue(
         },
     )
     assert response.status_code == 200
-    after = _count_dashboard_sync_jobs(arq_queue)
+    after = count_jobs_by_name(arq_queue, "dashboard_sync")
     assert after == before
 
 
@@ -264,7 +255,7 @@ async def test_post_signed_unrelated_event_is_no_op(
     """An event we do not subscribe to (``ping``) returns 200, no enqueue."""
     arq_queue = arq_dependency._arq_queue
     assert isinstance(arq_queue, MockArqQueue)
-    before = _count_dashboard_sync_jobs(arq_queue)
+    before = count_jobs_by_name(arq_queue, "dashboard_sync")
     body = json.dumps({"zen": "Speak like a human."}).encode("utf-8")
     response = await client.post(
         _WEBHOOK_PATH,
@@ -277,5 +268,5 @@ async def test_post_signed_unrelated_event_is_no_op(
         },
     )
     assert response.status_code == 200
-    after = _count_dashboard_sync_jobs(arq_queue)
+    after = count_jobs_by_name(arq_queue, "dashboard_sync")
     assert after == before

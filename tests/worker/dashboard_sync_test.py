@@ -25,6 +25,7 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.dashboard_sync import dashboard_sync
+from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
@@ -185,10 +186,7 @@ async def test_dashboard_sync_happy_path_fans_out_dashboard_builds(
             assert binding.last_sync_status == "succeeded"
             assert binding.github_template_id is not None
 
-    enqueued = [
-        j for queue in arq_queue._job_metadata.values() for j in queue.values()
-    ]
-    build_jobs = [j for j in enqueued if j.name == "dashboard_build"]
+    build_jobs = get_jobs_by_name(arq_queue, "dashboard_build")
     assert len(build_jobs) == len(project_ids)
 
 
@@ -317,12 +315,7 @@ async def test_dashboard_sync_etag_short_circuit_skips_fanout(
                 ),
             },
         )
-        enqueues_after_first = sum(
-            1
-            for queue in arq_queue._job_metadata.values()
-            for j in queue.values()
-            if j.name == "dashboard_build"
-        )
+        enqueues_after_first = count_jobs_by_name(arq_queue, "dashboard_build")
         second_result = await dashboard_sync(
             ctx,
             {
@@ -337,12 +330,7 @@ async def test_dashboard_sync_etag_short_circuit_skips_fanout(
     assert first_result == "completed"
     assert second_result == "completed"
 
-    enqueues_after_second = sum(
-        1
-        for queue in arq_queue._job_metadata.values()
-        for j in queue.values()
-        if j.name == "dashboard_build"
-    )
+    enqueues_after_second = count_jobs_by_name(arq_queue, "dashboard_build")
     assert enqueues_after_second == enqueues_after_first, (
         "Unchanged re-sync must not enqueue any additional dashboard_build"
     )
@@ -408,10 +396,7 @@ async def test_dashboard_sync_invalid_template_marks_job_failed(
             assert binding is not None
             assert binding.last_sync_status == "failed"
 
-    enqueued = [
-        j for queue in arq_queue._job_metadata.values() for j in queue.values()
-    ]
-    assert not any(j.name == "dashboard_build" for j in enqueued)
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
 
 
 @pytest.mark.asyncio

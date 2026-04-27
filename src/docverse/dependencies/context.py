@@ -159,6 +159,25 @@ class ContextDependency:
         if github_webhook_secret is not None:
             self._github_webhook_secret = github_webhook_secret
 
+    def set_github_secrets(
+        self,
+        *,
+        app_id: int | None,
+        private_key: SecretStr | None,
+        webhook_secret: SecretStr | None,
+    ) -> None:
+        """Set the three GitHub-App secret slots in one call.
+
+        Unlike :meth:`initialize`, every argument is honored as-is — passing
+        ``None`` clears that slot. This is the supported way to toggle the
+        GitHub-App feature on or off from a test fixture, in lieu of poking
+        ``_github_app_id`` / ``_github_app_private_key`` /
+        ``_github_webhook_secret`` directly on the singleton.
+        """
+        self._github_app_id = app_id
+        self._github_app_private_key = private_key
+        self._github_webhook_secret = webhook_secret
+
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""
         self._initialized = False
