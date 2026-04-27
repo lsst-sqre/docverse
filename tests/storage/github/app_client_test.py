@@ -101,6 +101,7 @@ async def test_get_installation_auth_returns_token_record(
     assert isinstance(auth, InstallationAuth)
     assert auth.token == "ghs_installtok"  # noqa: S105
     assert auth.base_url == GITHUB_API_BASE_URL
+    assert auth.installation_id == 42
 
 
 @pytest.mark.asyncio

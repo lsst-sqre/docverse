@@ -144,7 +144,7 @@ async def test_fetch_changed_paths_from_compare_with_null_files(
     mock_github.router.get(
         "https://api.github.com/repos/acme/repo/compare/aaaa...bbbb"
     ).mock(return_value=httpx.Response(200, json={"files": None}))
-    auth = InstallationAuth(token="ghs_test")
+    auth = InstallationAuth(token="ghs_test", installation_id=99)
 
     async with httpx.AsyncClient() as http_client:
         paths = await fetch_changed_paths_from_compare(
@@ -177,7 +177,7 @@ async def test_fetch_changed_paths_from_compare_attaches_authorization(
         after="bbbb",
         changed_paths=["templates/a.html"],
     )
-    auth = InstallationAuth(token="ghs_compare_attach")
+    auth = InstallationAuth(token="ghs_compare_attach", installation_id=99)
 
     async with httpx.AsyncClient() as http_client:
         assert "authorization" not in http_client.headers
@@ -215,7 +215,7 @@ async def test_fetch_changed_paths_from_compare_raises_on_non_2xx(
     mock_github.router.get(
         "https://api.github.com/repos/acme/repo/compare/aaaa...bbbb"
     ).mock(return_value=httpx.Response(status))
-    auth = InstallationAuth(token="ghs_test")
+    auth = InstallationAuth(token="ghs_test", installation_id=99)
 
     async with httpx.AsyncClient() as http_client:
         with pytest.raises(httpx.HTTPStatusError):

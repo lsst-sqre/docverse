@@ -9,6 +9,9 @@ import httpx
 import structlog
 
 from docverse.client.models.dashboard_template import normalize_github_ref
+from docverse.domain.dashboard_github_template import (
+    DashboardGitHubTemplateBinding,
+)
 from docverse.domain.queue import QueueJob
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
@@ -95,10 +98,10 @@ class PushEventProcessor:
             return []
 
         normalized_ref = normalize_github_ref(ref)
-        bindings = await self._binding_store.list_by_repo_ref(
-            github_owner=owner,
-            github_repo=repo_name,
-            github_ref=normalized_ref,
+        repo_id = _coerce_int(repo.get("id"))
+
+        bindings = await self._lookup_bindings(
+            owner=owner, repo=repo_name, ref=normalized_ref, repo_id=repo_id
         )
         if not bindings:
             self._logger.info(
@@ -107,6 +110,7 @@ class PushEventProcessor:
                 github_repo=repo_name,
                 github_ref_raw=ref,
                 github_ref=normalized_ref,
+                github_repo_id=repo_id,
             )
             return []
 
@@ -143,6 +147,51 @@ class PushEventProcessor:
         )
         return jobs
 
+    async def _lookup_bindings(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        ref: str,
+        repo_id: int | None,
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """Find bindings for a push, preferring ``github_repo_id``.
+
+        Two queries, unioned and deduplicated by binding id:
+
+        - ``list_by_repo_id_and_ref`` — when the payload carries a
+          ``repository.id``, this is the rename-robust primary lookup.
+          Bindings that completed at least one successful sync have
+          their ``github_repo_id`` populated and match here even when
+          the GitHub display name has since changed.
+        - ``list_unsynced_by_repo_ref`` — fallback for bindings that
+          have never synced (and therefore lack a stable ID). The
+          ``github_repo_id IS NULL`` filter inside the store keeps
+          synced bindings whose name happens to coincide with this
+          push out of the result, so a different repo now sitting at
+          the old name does not accidentally trigger a sync.
+
+        Dedup defends against any future loosening of either query.
+        """
+        seen: set[int] = set()
+        bindings: list[DashboardGitHubTemplateBinding] = []
+        if repo_id is not None:
+            for binding in await self._binding_store.list_by_repo_id_and_ref(
+                github_repo_id=repo_id, github_ref=ref
+            ):
+                if binding.id in seen:
+                    continue
+                seen.add(binding.id)
+                bindings.append(binding)
+        for binding in await self._binding_store.list_unsynced_by_repo_ref(
+            github_owner=owner, github_repo=repo, github_ref=ref
+        ):
+            if binding.id in seen:
+                continue
+            seen.add(binding.id)
+            bindings.append(binding)
+        return bindings
+
     async def _resolve_changed_paths(
         self, payload: Mapping[str, Any], *, owner: str, repo: str
     ) -> list[str]:
@@ -177,6 +226,21 @@ def _split_full_name_tuple(full_name: object) -> tuple[str, str] | None:
     if isinstance(full_name, str) and "/" in full_name:
         owner, repo = full_name.split("/", 1)
         return owner, repo
+    return None
+
+
+def _coerce_int(value: object) -> int | None:
+    """Return ``value`` as ``int`` when it is a non-bool int, else ``None``.
+
+    GitHub webhooks send numeric IDs as JSON ints, but defensive
+    payload parsing prefers a strict guard: the ``not isinstance(bool)``
+    clause keeps the ``isinstance(True, int)`` quirk from leaking a
+    truth value through as the repo id.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
     return None
 
 

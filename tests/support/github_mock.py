@@ -117,6 +117,7 @@ class GitHubMock:
         *,
         installation_id: int | None = None,
         token: str | None = None,
+        owner_id: int = 1,
     ) -> int:
         """Wire (repo → installation id) lookup and (id → token) exchange.
 
@@ -127,6 +128,10 @@ class GitHubMock:
         :meth:`installation_auth` when the test needs the
         ``InstallationAuth`` record without round-tripping the app
         client.
+
+        ``owner_id`` populates ``account.id`` on the installation
+        lookup response, mirroring real GitHub. Tests that exercise
+        the rename-robust ID capture path override the default.
         """
         iid = installation_id or self.default_installation_id
         bearer_token = token or self.default_token
@@ -137,7 +142,11 @@ class GitHubMock:
             f"{_GITHUB_API}/repos/{owner}/{repo}/installation"
         ).mock(
             return_value=httpx.Response(
-                200, json={"id": iid, "account": {"login": owner}}
+                200,
+                json={
+                    "id": iid,
+                    "account": {"login": owner, "id": owner_id},
+                },
             )
         )
         self.router.post(
@@ -153,6 +162,35 @@ class GitHubMock:
         )
         return iid
 
+    def seed_repo(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        repo_id: int = 1,
+        owner_id: int = 1,
+    ) -> None:
+        """Register ``GET /repos/{owner}/{repo}`` returning numeric IDs.
+
+        The tree fetcher calls this endpoint on every fetch so the
+        rename-robust ID capture path (#241) sees stable
+        ``repository.id`` / ``repository.owner.id`` values. Tests that
+        only exercise tree/blob fetches without asserting on captured
+        IDs may accept the (1, 1) defaults; tests that round-trip
+        captured IDs into the database should pass values that match
+        the rest of the assertion.
+        """
+        self.router.get(f"{_GITHUB_API}/repos/{owner}/{repo}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": repo_id,
+                    "name": repo,
+                    "owner": {"login": owner, "id": owner_id},
+                },
+            )
+        )
+
     def installation_auth(
         self,
         owner: str,
@@ -165,14 +203,22 @@ class GitHubMock:
         Tests that exercise the tree fetcher / compare helper directly
         — without going through ``GitHubAppClient.get_installation_auth``
         — call this to grab the same token they seeded on the router.
-        Falls back to ``default_token`` when ``seed_installation`` was
-        not called for ``(owner, repo)``, which mirrors what the live
+        Falls back to ``default_token`` /
+        ``default_installation_id`` when ``seed_installation`` was not
+        called for ``(owner, repo)``, which mirrors what the live
         client would have minted from a default installation.
         """
         token = self._installation_tokens.get(
             (owner, repo), self.default_token
         )
-        return InstallationAuth(token=token, base_url=base_url)
+        installation_id = self._installation_ids.get(
+            (owner, repo), self.default_installation_id
+        )
+        return InstallationAuth(
+            token=token,
+            installation_id=installation_id,
+            base_url=base_url,
+        )
 
     def seed_tree(
         self,
@@ -185,6 +231,8 @@ class GitHubMock:
         tree_sha: str | None = None,
         etag: str = 'W/"test-etag"',
         extra_tree_entries: list[dict[str, object]] | None = None,
+        repo_id: int = 1,
+        owner_id: int = 1,
     ) -> tuple[str, str]:
         """Register the commit, tree, and blob endpoints for a fetch.
 
@@ -201,6 +249,8 @@ class GitHubMock:
         """
         csha = commit_sha or f"commit-{owner}-{repo}-{ref}"
         tsha = tree_sha or f"tree-{owner}-{repo}-{ref}"
+
+        self.seed_repo(owner, repo, repo_id=repo_id, owner_id=owner_id)
 
         self.router.get(
             f"{_GITHUB_API}/repos/{owner}/{repo}/commits/{ref}"

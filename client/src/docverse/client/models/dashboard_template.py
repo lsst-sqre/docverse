@@ -151,6 +151,34 @@ class DashboardTemplateBinding(BaseModel):
         ),
     )
 
+    github_owner_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub's stable numeric ID for the owner. Captured on first "
+            "successful sync; ``None`` for un-synced bindings. Informational "
+            "only — the public API remains keyed on ``github_owner``."
+        ),
+    )
+
+    github_repo_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub's stable numeric ID for the repository. Captured on "
+            "first successful sync; ``None`` for un-synced bindings. "
+            "Informational only — the public API remains keyed on "
+            "``github_repo``."
+        ),
+    )
+
+    github_installation_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub App installation ID for the repository. Captured on "
+            "first successful sync; ``None`` for un-synced bindings or when "
+            "the GitHub App is not installed. Informational only."
+        ),
+    )
+
     date_created: datetime = Field(
         description="Timestamp when the binding was created."
     )

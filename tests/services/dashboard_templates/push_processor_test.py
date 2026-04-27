@@ -64,6 +64,9 @@ async def _seed_org_with_bindings(
             github_repo=raw.github_repo,
             github_ref=raw.github_ref,
             root_path=raw.root_path,
+            github_owner_id=raw.github_owner_id,
+            github_repo_id=raw.github_repo_id,
+            github_installation_id=raw.github_installation_id,
         )
         created = await binding_store.create(new)
         binding_ids.append(created.id)
@@ -119,17 +122,31 @@ def _make_push_payload(
     commits: list[dict[str, Any]] | None = None,
     size: int | None = None,
     installation_id: int = 99,
+    repo_id: int | None = None,
+    owner_id: int | None = None,
 ) -> dict[str, Any]:
-    """Build a minimal push-event payload."""
+    """Build a minimal push-event payload.
+
+    ``repo_id`` and ``owner_id`` mirror GitHub's real ``repository.id``
+    and ``repository.owner.id`` fields. They are optional so legacy
+    tests that only need name-based matching keep their current
+    payload shape; tests that exercise the rename-robust ID-keyed
+    lookup path pass them explicitly.
+    """
+    repository: dict[str, Any] = {
+        "name": repo,
+        "full_name": f"{owner}/{repo}",
+        "owner": {"login": owner, "name": owner},
+    }
+    if repo_id is not None:
+        repository["id"] = repo_id
+    if owner_id is not None:
+        repository["owner"]["id"] = owner_id
     payload: dict[str, Any] = {
         "ref": ref,
         "before": before,
         "after": after,
-        "repository": {
-            "name": repo,
-            "full_name": f"{owner}/{repo}",
-            "owner": {"login": owner, "name": owner},
-        },
+        "repository": repository,
         "installation": {"id": installation_id},
     }
     if commits is not None:
@@ -583,6 +600,256 @@ async def test_process_compare_fallback_filters_correctly(
         before="before-sha",
         after="after-sha",
         changed_paths=["templates/blue/dashboard.html.jinja"],
+    )
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+        await db_session.commit()
+
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_process_matches_synced_binding_by_repo_id(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A push with ``repository.id`` finds bindings keyed by stable ID.
+
+    The binding's ``github_owner`` / ``github_repo`` deliberately do
+    NOT match the payload — this is the rename / transfer case where
+    the display name has changed but the numeric ID is invariant.
+    Without ID-keyed lookup the binding would be lost.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        _, _ = await _seed_org_with_bindings(
+            db_session,
+            org_slug="push-by-id-rename",
+            bindings=[
+                DashboardGitHubTemplateBindingCreate(
+                    org_id=0,
+                    project_id=None,
+                    github_owner="acme",
+                    github_repo="old-name",
+                    github_ref="main",
+                    root_path="/",
+                    github_repo_id=12345,
+                    github_owner_id=999,
+                ),
+            ],
+        )
+        await db_session.commit()
+
+    payload = _make_push_payload(
+        owner="acme",
+        repo="renamed-repo",
+        ref="refs/heads/main",
+        commits=[
+            {
+                "id": "after-sha",
+                "modified": ["dashboard.html.jinja"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=1,
+        repo_id=12345,
+        owner_id=999,
+    )
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+        await db_session.commit()
+
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_falls_back_to_name_for_unsynced_bindings(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A push for an un-synced binding still matches by ``(owner, repo)``.
+
+    Bindings created via the binding PUT but not yet synced have
+    ``github_repo_id IS NULL``. Until their first successful sync
+    populates the stable ID, name-based matching is the only way the
+    push processor can route a push event to them.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        _, _ = await _seed_org_with_bindings(
+            db_session,
+            org_slug="push-name-fallback",
+            bindings=[
+                DashboardGitHubTemplateBindingCreate(
+                    org_id=0,
+                    project_id=None,
+                    github_owner="acme",
+                    github_repo="templates",
+                    github_ref="main",
+                    root_path="/",
+                ),
+            ],
+        )
+        await db_session.commit()
+
+    payload = _make_push_payload(
+        owner="acme",
+        repo="templates",
+        ref="refs/heads/main",
+        commits=[
+            {
+                "id": "after-sha",
+                "modified": ["dashboard.html.jinja"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=1,
+        repo_id=12345,
+        owner_id=999,
+    )
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+        await db_session.commit()
+
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_dedupes_id_and_name_matches(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A binding that matches by both ID and name is enqueued once.
+
+    The two store lookups are disjoint by construction
+    (``list_unsynced_by_repo_ref`` filters out populated IDs), but
+    pin the dedup-by-binding-id step at the processor seam so a
+    refactor that loosens that filter cannot regress to double-
+    enqueueing the same sync job.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        _, _ = await _seed_org_with_bindings(
+            db_session,
+            org_slug="push-dedup",
+            bindings=[
+                DashboardGitHubTemplateBindingCreate(
+                    org_id=0,
+                    project_id=None,
+                    github_owner="acme",
+                    github_repo="templates",
+                    github_ref="main",
+                    root_path="/",
+                    github_repo_id=12345,
+                ),
+            ],
+        )
+        await db_session.commit()
+
+    payload = _make_push_payload(
+        owner="acme",
+        repo="templates",
+        ref="refs/heads/main",
+        commits=[
+            {
+                "id": "after-sha",
+                "modified": ["dashboard.html.jinja"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=1,
+        repo_id=12345,
+        owner_id=999,
+    )
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+        await db_session.commit()
+
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_synced_binding_with_different_repo_id_no_match(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Once synced, a binding only matches its captured repo ID.
+
+    A push that shares the binding's ``(owner, repo, ref)`` strings
+    but carries a *different* ``repository.id`` must NOT match the
+    binding — that scenario indicates a different repository now
+    sitting at the old name (e.g. after a rename + new-repo creation
+    cycle), not the original one the binding was anchored to.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        _, _ = await _seed_org_with_bindings(
+            db_session,
+            org_slug="push-stale-name",
+            bindings=[
+                DashboardGitHubTemplateBindingCreate(
+                    org_id=0,
+                    project_id=None,
+                    github_owner="acme",
+                    github_repo="templates",
+                    github_ref="main",
+                    root_path="/",
+                    github_repo_id=12345,
+                ),
+            ],
+        )
+        await db_session.commit()
+
+    payload = _make_push_payload(
+        owner="acme",
+        repo="templates",
+        ref="refs/heads/main",
+        commits=[
+            {
+                "id": "after-sha",
+                "modified": ["dashboard.html.jinja"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=1,
+        repo_id=99999,
+        owner_id=999,
     )
 
     async with httpx.AsyncClient() as http_client, db_session.begin():
