@@ -76,7 +76,18 @@ def _push_payload(
     repo: str = "templates",
     ref: str = "refs/heads/main",
     changed_files: list[str] | None = None,
+    commits: list[dict[str, Any]] | None = None,
+    size: int = 1,
 ) -> dict[str, Any]:
+    if commits is None:
+        commits = [
+            {
+                "id": "after-sha",
+                "modified": changed_files or [],
+                "added": [],
+                "removed": [],
+            }
+        ]
     return {
         "ref": ref,
         "before": "before-sha",
@@ -87,15 +98,8 @@ def _push_payload(
             "owner": {"login": owner, "name": owner},
         },
         "installation": {"id": 99},
-        "size": 1,
-        "commits": [
-            {
-                "id": "after-sha",
-                "modified": changed_files or [],
-                "added": [],
-                "removed": [],
-            }
-        ],
+        "size": size,
+        "commits": commits,
     }
 
 
@@ -245,6 +249,100 @@ async def test_post_signed_push_with_no_matching_root_path_no_enqueue(
     assert response.status_code == 200
     after = count_jobs_by_name(arq_queue, "dashboard_sync")
     assert after == before
+
+
+@pytest.mark.asyncio
+async def test_post_signed_truncated_push_falls_back_to_compare(
+    client: AsyncClient,
+    github_app_enabled: None,
+    mock_github: GitHubMock,
+) -> None:
+    """A truncated push (``size > len(commits)``) hits the compare API.
+
+    The in-payload ``commits`` list reports only ``docs/index.md``, but
+    the compare API — authoritative for truncated pushes — reports a
+    template path inside the binding's ``root_path``. Exactly one
+    ``dashboard_sync`` job lands on the queue.
+    """
+    arq_queue = arq_dependency._arq_queue
+    assert isinstance(arq_queue, MockArqQueue)
+    before = count_jobs_by_name(arq_queue, "dashboard_sync")
+    await _seed_binding(root_path="/")
+    payload = _push_payload(
+        commits=[
+            {
+                "id": "first-sha",
+                "modified": ["docs/index.md"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=30,
+    )
+    mock_github.seed_installation("acme", "templates", installation_id=99)
+    mock_github.seed_compare(
+        "acme",
+        "templates",
+        before="before-sha",
+        after="after-sha",
+        changed_paths=["templates/blue/dashboard.html.jinja"],
+    )
+    body = json.dumps(payload).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000002",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+    assert response.status_code == 200
+    after = count_jobs_by_name(arq_queue, "dashboard_sync")
+    assert after - before == 1
+
+
+@pytest.mark.asyncio
+async def test_post_signed_empty_commits_no_enqueue(
+    client: AsyncClient,
+    github_app_enabled: None,
+    mock_github: GitHubMock,
+) -> None:
+    """A push with ``commits=[]`` and ``size=0`` enqueues nothing.
+
+    The processor's cheap path returns an empty changed-path set
+    without falling back to the compare API; assert the compare route
+    sees zero requests so a future regression that swaps the
+    truncation signal can't sneak past us.
+    """
+    arq_queue = arq_dependency._arq_queue
+    assert isinstance(arq_queue, MockArqQueue)
+    before = count_jobs_by_name(arq_queue, "dashboard_sync")
+    await _seed_binding(root_path="/")
+    payload = _push_payload(commits=[], size=0)
+    body = json.dumps(payload).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000003",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+    assert response.status_code == 200
+    after = count_jobs_by_name(arq_queue, "dashboard_sync")
+    assert after == before
+    compare_calls = [
+        call
+        for call in mock_github.router.calls
+        if "/compare/" in call.request.url.path
+    ]
+    assert compare_calls == []
 
 
 @pytest.mark.asyncio
