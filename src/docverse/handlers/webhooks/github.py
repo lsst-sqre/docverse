@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Annotated
 
 import gidgethub
@@ -53,11 +54,7 @@ async def _handle_push(
     async with context.session.begin():
         jobs = await processor.process(event.data)
         await context.session.commit()
-    context.logger.info(
-        "Processed push webhook",
-        delivery_id=event.delivery_id,
-        enqueued=len(jobs),
-    )
+    context.logger.info("Processed push webhook", enqueued=len(jobs))
 
 
 @router.post(
@@ -88,8 +85,7 @@ async def post_github_webhook(
     chosen not to act on.
     """
     try:
-        secret = context.factory.get_github_webhook_secret()
-        processor = context.factory.create_push_event_processor()
+        secret, processor = context.factory.create_webhook_dispatch()
     except GitHubAppNotConfiguredError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -116,7 +112,7 @@ async def post_github_webhook(
     return {"status": "ok"}
 
 
-def _lowercase_headers(headers: object) -> dict[str, str]:
+def _lowercase_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """Return a dict of request headers with lower-cased keys.
 
     ``gidgethub.sansio.Event.from_http`` expects a mapping that
@@ -125,5 +121,4 @@ def _lowercase_headers(headers: object) -> dict[str, str]:
     ``headers["x-github-event"]`` directly, so a plain dict with
     pre-lower-cased keys is the safest contract.
     """
-    items = headers.items() if hasattr(headers, "items") else []
-    return {str(k).lower(): str(v) for k, v in items}
+    return {k.lower(): v for k, v in headers.items()}

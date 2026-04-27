@@ -417,19 +417,21 @@ class Factory:
             logger=self._logger,
         )
 
-    def get_github_webhook_secret(self) -> str:
-        """Return the configured GitHub webhook HMAC secret.
+    def create_webhook_dispatch(self) -> tuple[str, PushEventProcessor]:
+        """Return the GitHub webhook secret and a :class:`PushEventProcessor`.
 
-        Callers (the webhook handler) need the secret to verify the
-        ``x-hub-signature-256`` header on each delivery. Routes
-        through this accessor instead of reading the private
-        attribute directly so the GitHub App's "all-or-nothing"
-        invariant is enforced in one place.
+        The webhook handler needs both the HMAC secret (to verify
+        ``x-hub-signature-256``) and the processor (to fan a push out
+        to ``dashboard_sync`` enqueues). Bundling them into one
+        accessor gives the handler a single ``GitHubAppNotConfiguredError``
+        raise site to translate into its 404 feature-disabled response.
 
         Raises
         ------
         GitHubAppNotConfiguredError
             If any of the three GitHub App secrets is unset.
+        RuntimeError
+            If the shared HTTP client is not configured.
         """
         if (
             self._github_app_id is None
@@ -438,30 +440,17 @@ class Factory:
         ):
             msg = "GitHub App is not configured"
             raise GitHubAppNotConfiguredError(msg)
-        return self._github_webhook_secret.get_secret_value()
-
-    def create_push_event_processor(self) -> PushEventProcessor:
-        """Create a :class:`PushEventProcessor` for the webhook handler.
-
-        Raises
-        ------
-        GitHubAppNotConfiguredError
-            If the GitHub App feature is not configured. The webhook
-            handler translates this into a 404 response so the feature
-            stays cleanly disabled when secrets are unset.
-        RuntimeError
-            If the shared HTTP client is not configured.
-        """
         if self._http_client is None:
             msg = "HTTP client is required to build a PushEventProcessor"
             raise RuntimeError(msg)
-        return PushEventProcessor(
+        processor = PushEventProcessor(
             binding_store=self.create_dashboard_github_template_binding_store(),
             enqueuer=self.create_dashboard_sync_enqueuer(),
             app_client=self.create_github_app_client(),
             http_client=self._http_client,
             logger=self._logger,
         )
+        return self._github_webhook_secret.get_secret_value(), processor
 
     def create_dashboard_publisher(self) -> DashboardPublisher:
         """Create a DashboardPublisher for one render.
