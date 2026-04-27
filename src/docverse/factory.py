@@ -277,6 +277,34 @@ class Factory:
         """Create a LockService bound to this factory's session."""
         return LockService(session=self._session, logger=self._logger)
 
+    def _require_github_app_config(
+        self,
+    ) -> tuple[int, SecretStr, SecretStr]:
+        """Return the three GitHub App secrets, or raise if any is unset.
+
+        The GitHub App feature is all-or-nothing: callers that touch
+        any of the three secrets must treat them as a single bundle so
+        a partial configuration cannot silently degrade behaviour.
+
+        Raises
+        ------
+        GitHubAppNotConfiguredError
+            If any of ``github_app_id``, ``github_app_private_key``, or
+            ``github_webhook_secret`` is unset.
+        """
+        if (
+            self._github_app_id is None
+            or self._github_app_private_key is None
+            or self._github_webhook_secret is None
+        ):
+            msg = "GitHub App is not configured"
+            raise GitHubAppNotConfiguredError(msg)
+        return (
+            self._github_app_id,
+            self._github_app_private_key,
+            self._github_webhook_secret,
+        )
+
     def create_github_app_client(self) -> GitHubAppClient:
         """Create a GitHubAppClient from the configured GitHub App secrets.
 
@@ -297,19 +325,13 @@ class Factory:
             If no shared ``httpx.AsyncClient`` is configured on the
             factory — the GitHub REST calls need one.
         """
-        if (
-            self._github_app_id is None
-            or self._github_app_private_key is None
-            or self._github_webhook_secret is None
-        ):
-            msg = "GitHub App is not configured"
-            raise GitHubAppNotConfiguredError(msg)
+        app_id, private_key, _ = self._require_github_app_config()
         if self._http_client is None:
             msg = "HTTP client is required to build a GitHubAppClient"
             raise RuntimeError(msg)
         factory = GitHubAppClientFactory(
-            id=self._github_app_id,
-            key=self._github_app_private_key.get_secret_value(),
+            id=app_id,
+            key=private_key.get_secret_value(),
             name=self._github_app_name,
             http_client=self._http_client,
         )
@@ -433,13 +455,7 @@ class Factory:
         RuntimeError
             If the shared HTTP client is not configured.
         """
-        if (
-            self._github_app_id is None
-            or self._github_app_private_key is None
-            or self._github_webhook_secret is None
-        ):
-            msg = "GitHub App is not configured"
-            raise GitHubAppNotConfiguredError(msg)
+        _, _, webhook_secret = self._require_github_app_config()
         if self._http_client is None:
             msg = "HTTP client is required to build a PushEventProcessor"
             raise RuntimeError(msg)
@@ -450,7 +466,7 @@ class Factory:
             http_client=self._http_client,
             logger=self._logger,
         )
-        return self._github_webhook_secret.get_secret_value(), processor
+        return webhook_secret.get_secret_value(), processor
 
     def create_dashboard_publisher(self) -> DashboardPublisher:
         """Create a DashboardPublisher for one render.
