@@ -74,14 +74,15 @@ class PushEventProcessor:
         """
         repo = payload.get("repository", {})
         owner_block = repo.get("owner", {})
+        fallback_owner, fallback_repo = _split_full_name_tuple(
+            repo.get("full_name")
+        ) or (None, None)
         owner = (
             owner_block.get("login")
             or owner_block.get("name")
-            or _split_full_name(repo.get("full_name"))
+            or fallback_owner
         )
-        repo_name = repo.get("name") or _repo_from_full_name(
-            repo.get("full_name")
-        )
+        repo_name = repo.get("name") or fallback_repo
         ref = payload.get("ref")
         if not (owner and repo_name and ref):
             self._logger.warning(
@@ -167,15 +168,10 @@ class PushEventProcessor:
         )
 
 
-def _split_full_name(full_name: object) -> str | None:
+def _split_full_name_tuple(full_name: object) -> tuple[str, str] | None:
     if isinstance(full_name, str) and "/" in full_name:
-        return full_name.split("/", 1)[0]
-    return None
-
-
-def _repo_from_full_name(full_name: object) -> str | None:
-    if isinstance(full_name, str) and "/" in full_name:
-        return full_name.split("/", 1)[1]
+        owner, repo = full_name.split("/", 1)
+        return owner, repo
     return None
 
 
