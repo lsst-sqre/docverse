@@ -28,6 +28,7 @@ from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
 from .handlers.webhooks import webhook_router
 from .services.credential_encryptor import CredentialEncryptor
+from .storage.github import validate_github_app
 from .storage.user_info_store import GafaelfawrUserInfoStore
 
 __all__ = ["app"]
@@ -99,6 +100,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         github_app_id=config.github_app_id,
         github_app_private_key=config.github_app_private_key,
         github_webhook_secret=config.github_webhook_secret,
+    )
+    await validate_github_app(
+        state=context_dependency,
+        app_id=config.github_app_id,
+        private_key=config.github_app_private_key,
+        app_name="lsst-sqre/docverse",
+        http_client=http_client,
+        logger=logger,
     )
     yield
     await context_dependency.aclose()

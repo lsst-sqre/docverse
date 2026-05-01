@@ -22,6 +22,7 @@ from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.storage.github import validate_github_app
 
 from .functions import (
     build_processing,
@@ -65,7 +66,32 @@ class WorkerFactoryBuilder:
         self._github_app_id = github_app_id
         self._github_app_private_key = github_app_private_key
         self._github_webhook_secret = github_webhook_secret
+        self._github_app_validated = True
         self._default_queue_name = default_queue_name
+
+    @property
+    def github_app_enabled(self) -> bool:
+        """Whether all three GitHub App secrets are set on this builder."""
+        return (
+            self._github_app_id is not None
+            and self._github_app_private_key is not None
+            and self._github_webhook_secret is not None
+        )
+
+    @property
+    def github_app_id(self) -> int | None:
+        """Configured GitHub App numeric ID, or ``None``."""
+        return self._github_app_id
+
+    def set_github_app_validated(self, *, value: bool) -> None:
+        """Record the outcome of the worker's startup-time validation.
+
+        Mirrors
+        :meth:`docverse.dependencies.context.ContextDependency.set_github_app_validated`
+        so a single shared validator helper can flip either state
+        holder via the same call.
+        """
+        self._github_app_validated = value
 
     def __call__(
         self,
@@ -84,6 +110,7 @@ class WorkerFactoryBuilder:
             github_app_id=self._github_app_id,
             github_app_private_key=self._github_app_private_key,
             github_webhook_secret=self._github_webhook_secret,
+            github_app_validated=self._github_app_validated,
             default_queue_name=self._default_queue_name,
         )
 
@@ -148,7 +175,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     # so worker functions never need to look them up directly.
     ctx["http_client"] = http_client
     ctx["arq_queue"] = arq_queue
-    ctx["factory_builder"] = WorkerFactoryBuilder(
+    factory_builder = WorkerFactoryBuilder(
         encryptor=encryptor,
         http_client=http_client,
         arq_queue=arq_queue,
@@ -158,6 +185,15 @@ async def startup(ctx: dict[str, Any]) -> None:
         github_webhook_secret=config.github_webhook_secret,
         default_queue_name=config.arq_queue_name,
     )
+    await validate_github_app(
+        state=factory_builder,
+        app_id=config.github_app_id,
+        private_key=config.github_app_private_key,
+        app_name="lsst-sqre/docverse",
+        http_client=http_client,
+        logger=logger,
+    )
+    ctx["factory_builder"] = factory_builder
 
     logger.info("Worker startup complete")
 

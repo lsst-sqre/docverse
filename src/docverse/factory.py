@@ -78,6 +78,7 @@ class Factory:
         github_webhook_secret: SecretStr | None = None,
         github_app_name: str = "lsst-sqre/docverse",
         *,
+        github_app_validated: bool = True,
         default_queue_name: str,
     ) -> None:
         self._session = session
@@ -91,6 +92,7 @@ class Factory:
         self._github_app_private_key = github_app_private_key
         self._github_webhook_secret = github_webhook_secret
         self._github_app_name = github_app_name
+        self._github_app_validated = github_app_validated
         self._default_queue_name = default_queue_name
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
@@ -284,13 +286,18 @@ class Factory:
 
         The GitHub App feature is all-or-nothing: callers that touch
         any of the three secrets must treat them as a single bundle so
-        a partial configuration cannot silently degrade behaviour.
+        a partial configuration cannot silently degrade behaviour. The
+        gate also rejects when the startup-time credential validation
+        has been recorded as failed — keeping the binding endpoints +
+        webhook in lockstep with the startup hook's
+        ``set_github_app_validated(False)`` decision.
 
         Raises
         ------
         GitHubAppNotConfiguredError
             If any of ``github_app_id``, ``github_app_private_key``, or
-            ``github_webhook_secret`` is unset.
+            ``github_webhook_secret`` is unset, or the startup-time
+            validation marked the credentials as invalid.
         """
         if (
             self._github_app_id is None
@@ -298,6 +305,9 @@ class Factory:
             or self._github_webhook_secret is None
         ):
             msg = "GitHub App is not configured"
+            raise GitHubAppNotConfiguredError(msg)
+        if not self._github_app_validated:
+            msg = "GitHub App credentials failed startup validation"
             raise GitHubAppNotConfiguredError(msg)
         return (
             self._github_app_id,
@@ -603,6 +613,7 @@ class HandlerFactory(Factory):
         github_app_private_key: SecretStr | None = None,
         github_webhook_secret: SecretStr | None = None,
         *,
+        github_app_validated: bool = True,
         default_queue_name: str,
     ) -> None:
         super().__init__(
@@ -616,6 +627,7 @@ class HandlerFactory(Factory):
             github_app_id=github_app_id,
             github_app_private_key=github_app_private_key,
             github_webhook_secret=github_webhook_secret,
+            github_app_validated=github_app_validated,
             default_queue_name=default_queue_name,
         )
         self._user_info_store = user_info_store

@@ -68,6 +68,27 @@ class GitHubAppClient:
         self._http_client = http_client
         self._logger = logger
 
+    async def validate(self) -> None:
+        """Validate that the configured GitHub App credentials work.
+
+        Two-step check:
+
+        1. Mint an app JWT — surfaces ``jwt.exceptions.InvalidKeyError``
+           and any other cryptography-stack errors immediately so a
+           malformed PEM is caught before any network call.
+        2. ``GET /app`` against the GitHub API with that JWT — confirms
+           that GitHub itself accepts the credentials, catching wrong
+           ``app_id`` values and keys that parse locally but do not match
+           the App they're paired with.
+
+        Raises any exception encountered during the two steps; callers
+        are expected to log the failure and disable the feature for the
+        lifetime of the process.
+        """
+        jwt = self._factory.get_app_jwt()
+        anon = GitHubAPI(self._http_client, self._factory.app_name)
+        await anon.getitem("/app", jwt=jwt)
+
     async def get_installation_id(self, owner: str, repo: str) -> int:
         """Resolve the installation ID for a repository.
 

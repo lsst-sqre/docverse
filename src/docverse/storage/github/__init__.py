@@ -12,6 +12,7 @@ from .changed_paths import (
     extract_changed_paths_from_push,
     fetch_changed_paths_from_compare,
 )
+from .startup import GitHubAppValidationState, validate_github_app
 from .tree_fetcher import FetchedTree, FetchedTreeFile, GitHubTreeFetcher
 
 __all__ = [
@@ -20,8 +21,10 @@ __all__ = [
     "FetchedTreeFile",
     "GitHubAppClient",
     "GitHubAppNotConfiguredError",
+    "GitHubAppValidationState",
     "GitHubTreeFetcher",
     "InstallationAuth",
     "extract_changed_paths_from_push",
     "fetch_changed_paths_from_compare",
+    "validate_github_app",
 ]
