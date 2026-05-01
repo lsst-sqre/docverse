@@ -67,6 +67,9 @@ class Organization(_OrganizationBase):
                 request.url_for("admin_get_organization", org=domain.slug)
             ),
             org_url=str(request.url_for("get_organization", org=domain.slug)),
+            dashboard_template_url=str(
+                request.url_for("get_org_dashboard_template", org=domain.slug)
+            ),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,

@@ -71,6 +71,12 @@ class Project(BaseModel):
 
     builds_url: str = Field(description="URL to list builds for this project.")
 
+    dashboard_template_url: str = Field(
+        description=(
+            "URL to the project's dashboard-template binding override."
+        ),
+    )
+
     slug: str = Field(description="URL-safe identifier for the project.")
 
     title: str = Field(description="Display title for the project.")

@@ -50,6 +50,7 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.publish_edition import publish_edition
+from tests.support.arq_testing import get_jobs_by_name
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
 
@@ -519,10 +520,7 @@ async def test_publish_edition_success_enqueues_dashboard_build(
             assert rows[0].org_id == org.id
             assert rows[0].project_id == project.id
 
-    enqueued = [
-        j for queue in mock_arq._job_metadata.values() for j in queue.values()
-    ]
-    dashboard_jobs = [j for j in enqueued if j.name == "dashboard_build"]
+    dashboard_jobs = get_jobs_by_name(mock_arq, "dashboard_build")
     assert len(dashboard_jobs) == 1
     dash_payload = dashboard_jobs[0].kwargs["payload"]
     assert dash_payload["org_id"] == org.id
@@ -588,11 +586,7 @@ async def test_publish_edition_failure_does_not_enqueue_dashboard(
             )
             assert list(dash_rows.scalars().all()) == []
 
-    enqueued = [
-        j for queue in mock_arq._job_metadata.values() for j in queue.values()
-    ]
-    dashboard_jobs = [j for j in enqueued if j.name == "dashboard_build"]
-    assert dashboard_jobs == []
+    assert get_jobs_by_name(mock_arq, "dashboard_build") == []
 
 
 class _RecordingMockEditionPublisher(MockEditionPublisher):

@@ -9,14 +9,46 @@ from fastapi import APIRouter, Depends, Response, status
 from docverse.client.models import DashboardTemplateBindingCreate
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.dashboard_github_template import (
+    DashboardGitHubTemplateBinding,
+)
+from docverse.domain.queue import QueueJob
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 from docverse.services.dashboard_templates.enqueue import (
     try_enqueue_dashboard_sync,
 )
 
-from .models import DashboardTemplateBindingResponse
+from .models import (
+    DashboardTemplateBindingResponse,
+    DashboardTemplateSyncEnqueuedResponse,
+)
 
-router = APIRouter()
+
+def _attach_queue_job(
+    binding: DashboardGitHubTemplateBinding, queue_job: QueueJob | None
+) -> DashboardGitHubTemplateBinding:
+    """Override the binding's queue-job public id from the just-enqueued job.
+
+    The binding object handed back by the service was loaded *before*
+    the enqueue ran, so its ``last_sync_queue_job_public_id`` reflects
+    the prior sync (if any). When the enqueue succeeds, surface the
+    new job's id so the response shows the just-enqueued URL without a
+    re-fetch.
+    """
+    if queue_job is None:
+        return binding
+    return binding.model_copy(
+        update={
+            "last_sync_queue_job_public_id": serialize_base32_id(
+                queue_job.public_id
+            ),
+        }
+    )
+
+
+org_default_router = APIRouter()
+project_override_router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +56,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 
-@router.get(
+@org_default_router.get(
     "/orgs/{org}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Get the organization's default dashboard-template binding",
@@ -43,7 +75,7 @@ async def get_org_dashboard_template(
     )
 
 
-@router.put(
+@org_default_router.put(
     "/orgs/{org}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Create or update the org-default dashboard-template binding",
@@ -61,8 +93,9 @@ async def put_org_dashboard_template(
         result = await service.put_org_default(org_slug=org_slug, data=data)
         if result.changed:
             await context.session.commit()
+    queue_job: QueueJob | None = None
     if result.changed:
-        await try_enqueue_dashboard_sync(
+        queue_job = await try_enqueue_dashboard_sync(
             factory=context.factory,
             session=context.session,
             logger=context.logger,
@@ -72,11 +105,13 @@ async def put_org_dashboard_template(
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
     return DashboardTemplateBindingResponse.from_domain(
-        result.binding, context.request, org_slug=org_slug
+        _attach_queue_job(result.binding, queue_job),
+        context.request,
+        org_slug=org_slug,
     )
 
 
-@router.delete(
+@org_default_router.delete(
     "/orgs/{org}/dashboard-template",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete the organization's default dashboard-template binding",
@@ -93,12 +128,35 @@ async def delete_org_dashboard_template(
         await context.session.commit()
 
 
+@org_default_router.post(
+    "/orgs/{org}/dashboard-template/sync",
+    response_model=DashboardTemplateSyncEnqueuedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Force a re-sync of the org-default dashboard-template binding",
+    name="sync_org_dashboard_template",
+)
+async def sync_org_dashboard_template(
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+) -> DashboardTemplateSyncEnqueuedResponse:
+    async with context.session.begin():
+        service = context.factory.create_dashboard_template_binding_service()
+        binding = await service.get_org_default(org_slug=org_slug)
+        enqueuer = context.factory.create_dashboard_sync_enqueuer()
+        queue_job = await enqueuer.enqueue(binding.id)
+        await context.session.commit()
+    return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
+        binding.id, queue_job, context.request
+    )
+
+
 # ---------------------------------------------------------------------------
 # Project-override binding
 # ---------------------------------------------------------------------------
 
 
-@router.get(
+@project_override_router.get(
     "/orgs/{org}/projects/{project}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Get a project's dashboard-template binding override",
@@ -123,7 +181,7 @@ async def get_project_dashboard_template(
     )
 
 
-@router.put(
+@project_override_router.put(
     "/orgs/{org}/projects/{project}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Create or update a project's dashboard-template binding override",
@@ -144,8 +202,9 @@ async def put_project_dashboard_template(  # noqa: PLR0913
         )
         if result.changed:
             await context.session.commit()
+    queue_job: QueueJob | None = None
     if result.changed:
-        await try_enqueue_dashboard_sync(
+        queue_job = await try_enqueue_dashboard_sync(
             factory=context.factory,
             session=context.session,
             logger=context.logger,
@@ -155,14 +214,14 @@ async def put_project_dashboard_template(  # noqa: PLR0913
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
     return DashboardTemplateBindingResponse.from_domain(
-        result.binding,
+        _attach_queue_job(result.binding, queue_job),
         context.request,
         org_slug=org_slug,
         project_slug=project_slug,
     )
 
 
-@router.delete(
+@project_override_router.delete(
     "/orgs/{org}/projects/{project}/dashboard-template",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a project's dashboard-template binding override",
@@ -180,3 +239,29 @@ async def delete_project_dashboard_template(
             org_slug=org_slug, project_slug=project_slug
         )
         await context.session.commit()
+
+
+@project_override_router.post(
+    "/orgs/{org}/projects/{project}/dashboard-template/sync",
+    response_model=DashboardTemplateSyncEnqueuedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Force a re-sync of a project-override dashboard-template binding",
+    name="sync_project_dashboard_template",
+)
+async def sync_project_dashboard_template(
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+) -> DashboardTemplateSyncEnqueuedResponse:
+    async with context.session.begin():
+        service = context.factory.create_dashboard_template_binding_service()
+        binding = await service.get_project_override(
+            org_slug=org_slug, project_slug=project_slug
+        )
+        enqueuer = context.factory.create_dashboard_sync_enqueuer()
+        queue_job = await enqueuer.enqueue(binding.id)
+        await context.session.commit()
+    return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
+        binding.id, queue_job, context.request
+    )

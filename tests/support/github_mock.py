@@ -86,6 +86,30 @@ class GitHubMock:
         """Installation token returned by the mocked exchange endpoint."""
         return self.default_token
 
+    def seed_app(
+        self,
+        *,
+        status_code: int = 200,
+        body: dict[str, object] | None = None,
+    ) -> None:
+        """Wire the ``GET /app`` endpoint used by startup validation.
+
+        Called by tests that exercise
+        :meth:`GitHubAppClient.validate`. ``status_code`` defaults to
+        200 with a minimal app body matching ``self.app_id`` /
+        ``self.app_name``; pass ``status_code=401`` (etc.) to drive the
+        failure branch of the validator.
+        """
+        if body is None:
+            body = {
+                "id": self.app_id,
+                "slug": self.app_name.split("/", 1)[-1],
+                "name": self.app_name,
+            }
+        self.router.get(f"{_GITHUB_API}/app").mock(
+            return_value=httpx.Response(status_code, json=body)
+        )
+
     def seed_installation(
         self,
         owner: str,

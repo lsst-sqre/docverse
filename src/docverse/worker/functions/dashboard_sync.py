@@ -106,6 +106,13 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     sync_result = await syncer.sync(binding_id)
             except Exception as exc:
                 logger.exception("Dashboard sync failed unexpectedly")
+                error_message = f"{type(exc).__name__}: {exc}"
+                async with session.begin():
+                    await binding_store.update_sync_state(
+                        binding_id=binding_id,
+                        last_sync_status="failed",
+                        last_sync_error=error_message,
+                    )
                 async with session.begin():
                     await queue_job_store.fail(
                         queue_job_id,

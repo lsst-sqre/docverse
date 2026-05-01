@@ -37,6 +37,7 @@ from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
+from tests.support.arq_testing import count_jobs_by_name
 
 
 async def _setup(client: AsyncClient) -> None:
@@ -63,12 +64,11 @@ async def _count_dashboard_jobs(db_session: AsyncSession) -> int:
     return len(list(result.scalars().all()))
 
 
-def _dashboard_arq_jobs() -> list[str]:
-    """Return enqueued arq job names across every queue."""
+def _dashboard_build_arq_count() -> int:
+    """Count enqueued ``dashboard_build`` arq jobs across every queue."""
     mock_arq = arq_dependency._arq_queue
     assert isinstance(mock_arq, MockArqQueue)
-    queues = list(mock_arq._job_metadata.values())
-    return [j.name for queue in queues for j in queue.values()]
+    return count_jobs_by_name(mock_arq, "dashboard_build")
 
 
 @pytest.mark.asyncio
@@ -93,7 +93,7 @@ async def test_edition_create_enqueues_dashboard_build(
 
     async with db_session.begin():
         assert await _count_dashboard_jobs(db_session) == 1
-    assert _dashboard_arq_jobs().count("dashboard_build") == 1
+    assert _dashboard_build_arq_count() == 1
 
 
 @pytest.mark.asyncio
@@ -112,7 +112,7 @@ async def test_edition_patch_enqueues_dashboard_build(
 
     async with db_session.begin():
         assert await _count_dashboard_jobs(db_session) == 1
-    assert _dashboard_arq_jobs().count("dashboard_build") == 1
+    assert _dashboard_build_arq_count() == 1
 
 
 @pytest.mark.asyncio
@@ -217,7 +217,7 @@ async def test_project_patch_enqueues_dashboard_build(
 
     async with db_session.begin():
         assert await _count_dashboard_jobs(db_session) == 1
-    assert _dashboard_arq_jobs().count("dashboard_build") == 1
+    assert _dashboard_build_arq_count() == 1
 
 
 @pytest.mark.asyncio

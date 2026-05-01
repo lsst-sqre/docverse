@@ -44,6 +44,11 @@ from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_backend import ArqQueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.build_processing import build_processing
+from tests.support.arq_testing import (
+    count_jobs_by_name,
+    get_jobs_by_name,
+    queue_names,
+)
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
 
@@ -465,9 +470,10 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
     # the configured queue name (not arq's default "arq:queue"), so that
     # the worker listening on ``config.arq_queue_name`` actually picks
     # them up.
-    assert "arq:queue" not in mock_arq._job_metadata
-    enqueued = list(mock_arq._job_metadata[_config.arq_queue_name].values())
-    publish_arq_jobs = [j for j in enqueued if j.name == "publish_edition"]
+    assert "arq:queue" not in queue_names(mock_arq)
+    publish_arq_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
     assert len(publish_arq_jobs) == 1
     assert publish_arq_jobs[0].queue_name == _config.arq_queue_name
     pj_payload = publish_arq_jobs[0].kwargs["payload"]
@@ -725,11 +731,12 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
     await ctx["http_client"].aclose()
 
     # No arq publish_edition jobs were successfully enqueued.
-    enqueued_by_queue = mock_arq._job_metadata.get(_config.arq_queue_name, {})
-    publish_arq_jobs = [
-        j for j in enqueued_by_queue.values() if j.name == "publish_edition"
-    ]
-    assert len(publish_arq_jobs) == 0
+    assert (
+        count_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == 0
+    )
 
     # Phase A committed atomically: both editions and both histories are
     # pending, and both child QueueJob rows exist.

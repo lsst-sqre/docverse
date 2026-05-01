@@ -89,6 +89,28 @@ class ContextDependency:
         self._github_app_id: int | None = None
         self._github_app_private_key: SecretStr | None = None
         self._github_webhook_secret: SecretStr | None = None
+        self._github_app_validated: bool = True
+
+    @property
+    def github_app_enabled(self) -> bool:
+        """Return whether all three GitHub App secrets are set.
+
+        The startup-time validator uses this to decide whether to
+        attempt a ``GET /app`` round-trip — when the deployment has not
+        configured the feature at all (any secret unset), the validator
+        skips silently and ``_require_github_app_config`` raises on its
+        own at the secrets-unset gate.
+        """
+        return (
+            self._github_app_id is not None
+            and self._github_app_private_key is not None
+            and self._github_webhook_secret is not None
+        )
+
+    @property
+    def github_app_id(self) -> int | None:
+        """Return the configured GitHub App numeric ID, or ``None``."""
+        return self._github_app_id
 
     async def __call__(
         self,
@@ -122,6 +144,7 @@ class ContextDependency:
                 github_app_id=self._github_app_id,
                 github_app_private_key=self._github_app_private_key,
                 github_webhook_secret=self._github_webhook_secret,
+                github_app_validated=self._github_app_validated,
                 default_queue_name=self._arq_queue_name,
             ),
         )
@@ -158,6 +181,39 @@ class ContextDependency:
             self._github_app_private_key = github_app_private_key
         if github_webhook_secret is not None:
             self._github_webhook_secret = github_webhook_secret
+
+    def set_github_secrets(
+        self,
+        *,
+        app_id: int | None,
+        private_key: SecretStr | None,
+        webhook_secret: SecretStr | None,
+    ) -> None:
+        """Set the three GitHub-App secret slots in one call.
+
+        Unlike :meth:`initialize`, every argument is honored as-is — passing
+        ``None`` clears that slot. This is the supported way to toggle the
+        GitHub-App feature on or off from a test fixture, in lieu of poking
+        ``_github_app_id`` / ``_github_app_private_key`` /
+        ``_github_webhook_secret`` directly on the singleton.
+
+        Resets ``github_app_validated`` to ``True``: a freshly-configured
+        secret bundle has not yet been rejected by the startup validator.
+        """
+        self._github_app_id = app_id
+        self._github_app_private_key = private_key
+        self._github_webhook_secret = webhook_secret
+        self._github_app_validated = True
+
+    def set_github_app_validated(self, *, value: bool) -> None:
+        """Record the outcome of the startup-time GitHub App validation.
+
+        Called by the API service lifespan and the arq worker startup
+        hook with ``value=False`` when a parse / ``GET /app``
+        round-trip fails, disabling the feature for the lifetime of
+        this process without taking the service down.
+        """
+        self._github_app_validated = value
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""

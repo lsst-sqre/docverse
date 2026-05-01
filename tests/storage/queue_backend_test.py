@@ -4,6 +4,7 @@ import pytest
 from safir.arq import MockArqQueue
 
 from docverse.storage.queue_backend import ArqQueueBackend
+from tests.support.arq_testing import get_jobs_by_name
 
 
 @pytest.fixture
@@ -31,9 +32,12 @@ async def test_enqueue_passes_payload_as_single_kwarg(
     job_id = await queue_backend.enqueue("test_task", payload)
     # Inspect the stored job metadata to verify the payload was passed
     # as a single kwarg rather than spread as individual kwargs.
-    queue_jobs = mock_queue._job_metadata["docverse:queue"]
-    stored_job = queue_jobs[job_id]
-    assert stored_job.kwargs == {"payload": payload}
+    stored_jobs = get_jobs_by_name(
+        mock_queue, "test_task", queue_name="docverse:queue"
+    )
+    assert len(stored_jobs) == 1
+    assert stored_jobs[0].id == job_id
+    assert stored_jobs[0].kwargs == {"payload": payload}
 
 
 @pytest.mark.asyncio

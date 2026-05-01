@@ -66,6 +66,14 @@ class DashboardSyncEnqueuer:
             org_id=binding.org_id,
             project_id=binding.project_id,
         )
+        # Back-point the binding at the freshly-created queue job so an
+        # operator who reads ``last_sync_status="failed"`` can click
+        # straight through to the traceback. Runs in the same
+        # transaction as the queue-job insert; if the backend enqueue
+        # below fails, both writes roll back.
+        await self._binding_store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=queue_job.id
+        )
         backend_job_id = await self._queue_backend.enqueue(
             "dashboard_sync",
             {
@@ -87,14 +95,18 @@ async def try_enqueue_dashboard_sync(
     session: AsyncSession,
     logger: structlog.stdlib.BoundLogger,
     binding_id: int,
-) -> None:
+) -> QueueJob | None:
     """Enqueue one ``dashboard_sync`` job in its own transaction.
 
-    Exceptions are logged but never re-raised, so the caller's flow
-    (typically a binding PUT handler) is not broken by an enqueue
-    failure. The enqueue runs in a freshly started transaction on
-    ``session`` — the caller must have already committed the binding
-    write it wants persisted.
+    Returns the freshly-created :class:`QueueJob` on success so the
+    caller can surface ``last_sync_queue_job_url`` in its response.
+    Returns ``None`` on any failure — exceptions are logged but never
+    re-raised, so the caller's flow (typically a binding PUT handler)
+    is not broken by an enqueue failure.
+
+    The enqueue runs in a freshly started transaction on ``session`` —
+    the caller must have already committed the binding write it wants
+    persisted.
 
     If the enqueue fails, a second transaction flips the binding's
     ``last_sync_status`` to ``"failed"`` with a descriptive
@@ -106,7 +118,7 @@ async def try_enqueue_dashboard_sync(
     try:
         async with session.begin():
             service = factory.create_dashboard_sync_enqueuer()
-            await service.enqueue(binding_id)
+            queue_job = await service.enqueue(binding_id)
             await session.commit()
     except Exception as exc:
         logger.exception(
@@ -128,3 +140,6 @@ async def try_enqueue_dashboard_sync(
                 "Failed to mark binding as enqueue-failed",
                 binding_id=binding_id,
             )
+        return None
+    else:
+        return queue_job

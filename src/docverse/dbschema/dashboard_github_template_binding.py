@@ -78,6 +78,16 @@ class SqlDashboardGitHubTemplateBinding(Base):
         nullable=True,
     )
 
+    # Back-pointer to the most-recently-enqueued ``dashboard_sync`` queue
+    # job. Nullable permanently: pre-existing rows have no job, a freshly-
+    # created binding has no job until the enqueuer runs, and the
+    # ondelete=SET NULL cascade absorbs queue-job retention pruning.
+    last_sync_queue_job_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("queue_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     last_sync_status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -130,5 +140,9 @@ class SqlDashboardGitHubTemplateBinding(Base):
             "idx_dashboard_github_template_bindings_repo_id_ref",
             "github_repo_id",
             "github_ref",
+        ),
+        Index(
+            "idx_dashboard_github_template_bindings_last_sync_queue_job_id",
+            "last_sync_queue_job_id",
         ),
     )

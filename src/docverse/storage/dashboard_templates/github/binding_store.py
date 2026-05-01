@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.dbschema.dashboard_github_template import (
+    SqlDashboardGitHubTemplate,
+)
 from docverse.dbschema.dashboard_github_template_binding import (
     SqlDashboardGitHubTemplateBinding,
 )
+from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.dashboard_github_template import (
     DashboardGitHubTemplateBinding,
 )
@@ -34,6 +40,63 @@ class DashboardGitHubTemplateBindingCreate:
     github_owner_id: int | None = None
     github_repo_id: int | None = None
     github_installation_id: int | None = None
+
+
+def _select_with_joins() -> Any:
+    """Return a SELECT that left-joins queue_jobs and template-content rows.
+
+    Two left joins materialize the read-side fields the response layer
+    needs without a second round-trip:
+
+    * ``queue_jobs.public_id`` → builds ``last_sync_queue_job_url``.
+    * ``dashboard_github_templates.commit_sha`` → exposes the latest
+      synced commit on the binding response.
+
+    Both joins are left joins because the FKs are nullable: pre-first-
+    enqueue rows have no queue job, and pre-first-sync (or sync-failed)
+    rows have no linked content row.
+
+    The ``Any`` return type sidesteps SQLAlchemy's typed-Select claim
+    that the joined columns are non-nullable: a left join produces
+    ``int | None`` / ``str | None`` for unmatched rows, which the type
+    stubs cannot express.
+    """
+    return (
+        select(
+            SqlDashboardGitHubTemplateBinding,
+            SqlQueueJob.public_id,
+            SqlDashboardGitHubTemplate.commit_sha,
+        )
+        .outerjoin(
+            SqlQueueJob,
+            SqlDashboardGitHubTemplateBinding.last_sync_queue_job_id
+            == SqlQueueJob.id,
+        )
+        .outerjoin(
+            SqlDashboardGitHubTemplate,
+            SqlDashboardGitHubTemplateBinding.github_template_id
+            == SqlDashboardGitHubTemplate.id,
+        )
+    )
+
+
+def _to_domain(
+    row: SqlDashboardGitHubTemplateBinding,
+    queue_job_public_id: int | None,
+    commit_sha: str | None,
+) -> DashboardGitHubTemplateBinding:
+    """Build the domain object from a row + joined read-side columns."""
+    binding = DashboardGitHubTemplateBinding.model_validate(row)
+    updates: dict[str, Any] = {}
+    if queue_job_public_id is not None:
+        updates["last_sync_queue_job_public_id"] = serialize_base32_id(
+            queue_job_public_id
+        )
+    if commit_sha is not None:
+        updates["commit_sha"] = commit_sha
+    if not updates:
+        return binding
+    return binding.model_copy(update=updates)
 
 
 class DashboardGitHubTemplateBindingStore:
@@ -65,6 +128,8 @@ class DashboardGitHubTemplateBindingStore:
         self._session.add(row)
         await self._session.flush()
         await self._session.refresh(row)
+        # A freshly-created binding has no queue job yet, so the FK is
+        # NULL and there is no public_id to materialize.
         return DashboardGitHubTemplateBinding.model_validate(row)
 
     async def get_by_id(
@@ -72,58 +137,88 @@ class DashboardGitHubTemplateBindingStore:
     ) -> DashboardGitHubTemplateBinding | None:
         """Fetch a binding by internal ID."""
         result = await self._session.execute(
-            select(SqlDashboardGitHubTemplateBinding).where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.id == binding_id,
             )
         )
-        row = result.scalar_one_or_none()
+        row = result.one_or_none()
         if row is None:
             return None
-        return DashboardGitHubTemplateBinding.model_validate(row)
+        binding_row, public_id, commit_sha = row
+        return _to_domain(binding_row, public_id, commit_sha)
 
     async def get_org_default(
         self, org_id: int
     ) -> DashboardGitHubTemplateBinding | None:
         """Fetch the org-default binding (``project_id IS NULL``)."""
         result = await self._session.execute(
-            select(SqlDashboardGitHubTemplateBinding).where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.org_id == org_id,
                 SqlDashboardGitHubTemplateBinding.project_id.is_(None),
             )
         )
-        row = result.scalar_one_or_none()
+        row = result.one_or_none()
         if row is None:
             return None
-        return DashboardGitHubTemplateBinding.model_validate(row)
+        binding_row, public_id, commit_sha = row
+        return _to_domain(binding_row, public_id, commit_sha)
 
     async def get_project_override(
         self, *, org_id: int, project_id: int
     ) -> DashboardGitHubTemplateBinding | None:
         """Fetch the project-specific binding for ``project_id``."""
         result = await self._session.execute(
-            select(SqlDashboardGitHubTemplateBinding).where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.org_id == org_id,
                 SqlDashboardGitHubTemplateBinding.project_id == project_id,
             )
         )
-        row = result.scalar_one_or_none()
+        row = result.one_or_none()
         if row is None:
             return None
-        return DashboardGitHubTemplateBinding.model_validate(row)
+        binding_row, public_id, commit_sha = row
+        return _to_domain(binding_row, public_id, commit_sha)
 
     async def list_by_github_template_id(
         self, github_template_id: int
     ) -> list[DashboardGitHubTemplateBinding]:
         """List every binding that currently points at a template row."""
         result = await self._session.execute(
-            select(SqlDashboardGitHubTemplateBinding).where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.github_template_id
                 == github_template_id,
             )
         )
         return [
-            DashboardGitHubTemplateBinding.model_validate(row)
-            for row in result.scalars().all()
+            _to_domain(binding_row, public_id, commit_sha)
+            for binding_row, public_id, commit_sha in result
+        ]
+
+    async def list_by_repo_ref(
+        self,
+        *,
+        github_owner: str,
+        github_repo: str,
+        github_ref: str,
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """List every binding for a ``(owner, repo, ref)`` triple.
+
+        Backed by the ``idx_dashboard_github_template_bindings_repo_ref``
+        composite index. Matches both org-default and project-override
+        bindings; the caller filters further (typically by intersecting
+        the push event's changed-path set with each binding's
+        ``root_path``).
+        """
+        result = await self._session.execute(
+            _select_with_joins().where(
+                SqlDashboardGitHubTemplateBinding.github_owner == github_owner,
+                SqlDashboardGitHubTemplateBinding.github_repo == github_repo,
+                SqlDashboardGitHubTemplateBinding.github_ref == github_ref,
+            )
+        )
+        return [
+            _to_domain(binding_row, public_id, commit_sha)
+            for binding_row, public_id, commit_sha in result
         ]
 
     async def list_project_overrides_for_org(
@@ -131,14 +226,14 @@ class DashboardGitHubTemplateBindingStore:
     ) -> list[DashboardGitHubTemplateBinding]:
         """List every project-override binding within an organization."""
         result = await self._session.execute(
-            select(SqlDashboardGitHubTemplateBinding).where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.org_id == org_id,
                 SqlDashboardGitHubTemplateBinding.project_id.is_not(None),
             )
         )
         return [
-            DashboardGitHubTemplateBinding.model_validate(row)
-            for row in result.scalars().all()
+            _to_domain(binding_row, public_id, commit_sha)
+            for binding_row, public_id, commit_sha in result
         ]
 
     async def update_source(
@@ -159,8 +254,7 @@ class DashboardGitHubTemplateBindingStore:
         row.github_ref = github_ref
         row.root_path = root_path
         await self._session.flush()
-        await self._session.refresh(row)
-        return DashboardGitHubTemplateBinding.model_validate(row)
+        return await self.get_by_id(binding_id)
 
     async def update_sync_state(  # noqa: PLR0913
         self,
@@ -194,8 +288,38 @@ class DashboardGitHubTemplateBindingStore:
         if github_installation_id is not None:
             row.github_installation_id = github_installation_id
         await self._session.flush()
-        await self._session.refresh(row)
-        return DashboardGitHubTemplateBinding.model_validate(row)
+        return await self.get_by_id(binding_id)
+
+    async def set_last_sync_queue_job(
+        self, *, binding_id: int, queue_job_id: int
+    ) -> DashboardGitHubTemplateBinding | None:
+        """Point the binding at a freshly-created ``dashboard_sync`` job.
+
+        Called from ``DashboardSyncEnqueuer.enqueue`` immediately after
+        the queue-job row exists, inside the same transaction. The
+        previous FK is overwritten so the binding always points at the
+        most recent sync attempt.
+
+        ``date_updated`` is explicitly preserved — this column tracks
+        operator-visible source-coordinate changes (owner/repo/ref/
+        root_path), and a sync-bookkeeping write should not bump it.
+        Including ``date_updated`` in the ``values()`` dict suppresses
+        the column's ``onupdate=now()`` server-side default.
+        """
+        existing = await self._get_row(binding_id)
+        if existing is None:
+            return None
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(SqlDashboardGitHubTemplateBinding.id == binding_id)
+            .values(
+                last_sync_queue_job_id=queue_job_id,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
+        return await self.get_by_id(binding_id)
 
     async def delete(self, binding_id: int) -> bool:
         """Delete a binding row.

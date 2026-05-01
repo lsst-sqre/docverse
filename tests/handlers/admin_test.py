@@ -91,6 +91,10 @@ async def test_list_organizations(client: AsyncClient) -> None:
     for org in data:
         assert f"/admin/orgs/{org['slug']}" in org["self_url"]
         assert f"/orgs/{org['slug']}" in org["org_url"]
+        assert org["dashboard_template_url"].endswith(
+            f"/orgs/{org['slug']}/dashboard-template"
+        )
+        assert org["dashboard_template_url"].startswith("http")
 
 
 @pytest.mark.asyncio
@@ -114,6 +118,9 @@ async def test_get_organization(client: AsyncClient) -> None:
     assert data["title"] == "Get Org"
     assert "/admin/orgs/get-org" in data["self_url"]
     assert "/orgs/get-org" in data["org_url"]
+    assert data["dashboard_template_url"].endswith(
+        "/orgs/get-org/dashboard-template"
+    )
 
 
 @pytest.mark.asyncio

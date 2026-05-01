@@ -9,15 +9,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.queue_enums import JobKind
 from docverse.dbschema.dashboard_github_template_binding import (
     SqlDashboardGitHubTemplateBinding,
 )
+from docverse.domain.base32id import serialize_base32_id
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
+    DashboardGitHubTemplateStore,
+    GitHubTemplateFileInput,
+    GitHubTemplateKey,
 )
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_job_store import QueueJobStore
 
 
 async def _seed_org_and_project(
@@ -86,6 +92,148 @@ async def test_create_org_default_binding(
     assert binding.github_owner_id is None
     assert binding.github_repo_id is None
     assert binding.github_installation_id is None
+    assert binding.last_sync_queue_job_public_id is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_none_public_id_when_no_queue_job(
+    db_session: AsyncSession,
+) -> None:
+    """A newly-created binding's join with ``queue_jobs`` produces NULL."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.last_sync_queue_job_public_id is None
+    assert fetched.commit_sha is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_materializes_commit_sha_from_template_join(
+    db_session: AsyncSession,
+) -> None:
+    """When ``github_template_id`` is set, the join surfaces ``commit_sha``.
+
+    Mirrors the queue-job join pattern: the read methods materialize the
+    template content's ``commit_sha`` so the response layer can show
+    "last synced at <sha>" without a second query.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        template_store = DashboardGitHubTemplateStore(
+            session=db_session, logger=logger
+        )
+        upserted = await template_store.upsert(
+            key=GitHubTemplateKey(
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            ),
+            commit_sha="cafebabe",
+            etag='W/"etag-cafebabe"',
+            template_toml=b"[meta]\nname='t'\n",
+            files=[
+                GitHubTemplateFileInput(
+                    relative_path="template.toml",
+                    is_text=True,
+                    data=b"[meta]\nname='t'\n",
+                )
+            ],
+        )
+        await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=upserted.template.id,
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        org_default = await store.get_org_default(org_id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.commit_sha == "cafebabe"
+    assert org_default is not None
+    assert org_default.commit_sha == "cafebabe"
+
+
+@pytest.mark.asyncio
+async def test_set_last_sync_queue_job_materializes_public_id_via_join(
+    db_session: AsyncSession,
+) -> None:
+    """``set_last_sync_queue_job`` surfaces the FK's public_id via the join.
+
+    After setting the FK, every read method materializes the queue
+    job's base32 ``public_id`` so callers do not need a second query
+    to build a URL.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_sync, org_id=org_id
+        )
+        await store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=queue_job.id
+        )
+        await db_session.commit()
+    expected_public_id = serialize_base32_id(queue_job.public_id)
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        org_default = await store.get_org_default(org_id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.last_sync_queue_job_public_id == expected_public_id
+    assert org_default is not None
+    assert org_default.last_sync_queue_job_public_id == expected_public_id
+
+
+@pytest.mark.asyncio
+async def test_set_last_sync_queue_job_overwrites_prior_fk(
+    db_session: AsyncSession,
+) -> None:
+    """A second sync attempt overwrites the FK with the new job's id."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        first = await queue_job_store.create(
+            kind=JobKind.dashboard_sync, org_id=org_id
+        )
+        await store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=first.id
+        )
+        second = await queue_job_store.create(
+            kind=JobKind.dashboard_sync, org_id=org_id
+        )
+        await store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=second.id
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.last_sync_queue_job_public_id == serialize_base32_id(
+        second.public_id
+    )
 
 
 @pytest.mark.asyncio
@@ -392,3 +540,84 @@ async def test_delete_returns_false_when_missing(
         deleted = await store.delete(999_999)
         await db_session.rollback()
     assert deleted is False
+
+
+@pytest.mark.asyncio
+async def test_list_by_repo_ref_matches_owner_repo_and_ref(
+    db_session: AsyncSession,
+) -> None:
+    """Bindings for ``(owner, repo, ref)`` are returned; others are skipped."""
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug="repo-ref-org"
+        )
+        store = _store(db_session)
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=project_id,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/themes/blue",
+            )
+        )
+        # Different repo — should not match.
+        other_org_id, _ = await _seed_org_and_project(
+            db_session,
+            org_slug="repo-ref-other-org",
+            project_slug="other-proj",
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=other_org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="other",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        matches = await store.list_by_repo_ref(
+            github_owner="acme", github_repo="templates", github_ref="main"
+        )
+        await db_session.rollback()
+    assert len(matches) == 2
+    root_paths = {m.root_path for m in matches}
+    assert root_paths == {"/", "/themes/blue"}
+
+
+@pytest.mark.asyncio
+async def test_list_by_repo_ref_returns_empty_when_no_matches(
+    db_session: AsyncSession,
+) -> None:
+    """An unbound ``(owner, repo, ref)`` returns an empty list."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(
+            db_session, org_slug="empty-repo-ref"
+        )
+        store = _store(db_session)
+        await store.create(_binding(org_id=org_id))
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        matches = await store.list_by_repo_ref(
+            github_owner="other-owner",
+            github_repo="templates",
+            github_ref="main",
+        )
+        await db_session.rollback()
+    assert matches == []

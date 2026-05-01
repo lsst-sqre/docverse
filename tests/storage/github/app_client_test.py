@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gidgethub
 import httpx
+import jwt as pyjwt
 import pytest
 import structlog
 from pydantic import SecretStr
@@ -99,6 +101,74 @@ async def test_get_installation_auth_returns_token_record(
     assert isinstance(auth, InstallationAuth)
     assert auth.token == "ghs_installtok"  # noqa: S105
     assert auth.base_url == GITHUB_API_BASE_URL
+
+
+@pytest.mark.asyncio
+async def test_validate_succeeds_on_2xx_app_response(
+    mock_github: GitHubMock,
+) -> None:
+    """``validate`` returns cleanly when ``GET /app`` returns 200."""
+    mock_github.seed_app()
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        await client.validate()
+
+
+@pytest.mark.asyncio
+async def test_validate_raises_on_malformed_private_key() -> None:
+    """A malformed PEM raises before any network call.
+
+    The pyjwt → safir.github → gidgethub stack surfaces an
+    ``InvalidKeyError`` from ``get_app_jwt``; the validator must not
+    swallow it. Asserting on the real propagation path (rather than
+    mocking ``get_app_jwt`` to raise) catches the case where a future
+    safir update changes the exception type.
+    """
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=12345,
+            key="not-a-real-pem",
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        with pytest.raises(pyjwt.exceptions.InvalidKeyError):
+            await client.validate()
+
+
+@pytest.mark.asyncio
+async def test_validate_raises_on_unauthorized_app_response(
+    mock_github: GitHubMock,
+) -> None:
+    """A 401 from ``GET /app`` raises a ``gidgethub`` error."""
+    mock_github.seed_app(
+        status_code=401,
+        body={"message": "Bad credentials"},
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        with pytest.raises(gidgethub.GitHubException):
+            await client.validate()
 
 
 @pytest.mark.asyncio

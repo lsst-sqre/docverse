@@ -160,6 +160,12 @@ class Organization(BaseModel):
 
     self_url: str = Field(description="URL to this organization resource.")
 
+    dashboard_template_url: str = Field(
+        description=(
+            "URL to the organization's default dashboard-template binding."
+        ),
+    )
+
     slug: str = Field(description="URL-safe identifier for the organization.")
 
     title: str = Field(description="Display title for the organization.")

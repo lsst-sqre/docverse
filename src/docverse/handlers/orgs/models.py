@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Self
 
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from docverse.client.models import Build as _BuildBase
@@ -56,6 +57,7 @@ from docverse.domain.published_url import (
     project_published_url,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
+from docverse.storage.github import build_github_browse_url
 
 
 class Organization(_OrganizationBase):
@@ -116,6 +118,9 @@ class Organization(_OrganizationBase):
             ),
             projects_url=str(request.url_for("get_projects", org=domain.slug)),
             members_url=str(request.url_for("get_members", org=domain.slug)),
+            dashboard_template_url=str(
+                request.url_for("get_org_dashboard_template", org=domain.slug)
+            ),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,
@@ -186,6 +191,13 @@ class Project(_ProjectBase):
             builds_url=str(
                 request.url_for(
                     "get_builds",
+                    org=org.slug,
+                    project=domain.slug,
+                )
+            ),
+            dashboard_template_url=str(
+                request.url_for(
+                    "get_project_dashboard_template",
                     org=org.slug,
                     project=domain.slug,
                 )
@@ -446,6 +458,35 @@ class OrgDashboardRebuildEntry(_OrgDashboardRebuildEntryBase):
         )
 
 
+class DashboardTemplateSyncEnqueuedResponse(BaseModel):
+    """Response body for the dashboard-template force-sync endpoints."""
+
+    binding_id: int = Field(description="ID of the binding that was synced.")
+    queue_job_id: str = Field(
+        description="Base32 public ID of the enqueued ``dashboard_sync`` job."
+    )
+    queue_job_url: str = Field(
+        description="URL of the enqueued ``dashboard_sync`` queue job."
+    )
+
+    @classmethod
+    def from_queue_job(
+        cls,
+        binding_id: int,
+        queue_job: QueueJobDomain,
+        request: Request,
+    ) -> Self:
+        """Create from a binding id + queue job, attaching the URL."""
+        queue_job_id = serialize_base32_id(queue_job.public_id)
+        return cls(
+            binding_id=binding_id,
+            queue_job_id=queue_job_id,
+            queue_job_url=str(
+                request.url_for("get_queue_job", job=queue_job_id)
+            ),
+        )
+
+
 class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
     """Dashboard-template binding response with HATEOAS URL."""
 
@@ -471,14 +512,29 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
                     project=project_slug,
                 )
             )
+        queue_job_public_id = domain.last_sync_queue_job_public_id
+        last_sync_queue_job_url = (
+            str(request.url_for("get_queue_job", job=queue_job_public_id))
+            if queue_job_public_id is not None
+            else None
+        )
+        web_url = build_github_browse_url(
+            owner=domain.github_owner,
+            repo=domain.github_repo,
+            ref=domain.github_ref,
+            root_path=domain.root_path,
+        )
         return cls(
             self_url=self_url,
+            web_url=web_url,
             github_owner=domain.github_owner,
             github_repo=domain.github_repo,
             github_ref=domain.github_ref,
             root_path=domain.root_path,
+            commit_sha=domain.commit_sha,
             last_sync_status=domain.last_sync_status,
             last_sync_error=domain.last_sync_error,
+            last_sync_queue_job_url=last_sync_queue_job_url,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )
