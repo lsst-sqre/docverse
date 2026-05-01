@@ -19,7 +19,10 @@ from docverse.services.dashboard_templates.enqueue import (
     try_enqueue_dashboard_sync,
 )
 
-from .models import DashboardTemplateBindingResponse
+from .models import (
+    DashboardTemplateBindingResponse,
+    DashboardTemplateSyncEnqueuedResponse,
+)
 
 
 def _attach_queue_job(
@@ -125,6 +128,29 @@ async def delete_org_dashboard_template(
         await context.session.commit()
 
 
+@org_default_router.post(
+    "/orgs/{org}/dashboard-template/sync",
+    response_model=DashboardTemplateSyncEnqueuedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Force a re-sync of the org-default dashboard-template binding",
+    name="sync_org_dashboard_template",
+)
+async def sync_org_dashboard_template(
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+) -> DashboardTemplateSyncEnqueuedResponse:
+    async with context.session.begin():
+        service = context.factory.create_dashboard_template_binding_service()
+        binding = await service.get_org_default(org_slug=org_slug)
+        enqueuer = context.factory.create_dashboard_sync_enqueuer()
+        queue_job = await enqueuer.enqueue(binding.id)
+        await context.session.commit()
+    return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
+        binding.id, queue_job, context.request
+    )
+
+
 # ---------------------------------------------------------------------------
 # Project-override binding
 # ---------------------------------------------------------------------------
@@ -213,3 +239,29 @@ async def delete_project_dashboard_template(
             org_slug=org_slug, project_slug=project_slug
         )
         await context.session.commit()
+
+
+@project_override_router.post(
+    "/orgs/{org}/projects/{project}/dashboard-template/sync",
+    response_model=DashboardTemplateSyncEnqueuedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Force a re-sync of a project-override dashboard-template binding",
+    name="sync_project_dashboard_template",
+)
+async def sync_project_dashboard_template(
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+) -> DashboardTemplateSyncEnqueuedResponse:
+    async with context.session.begin():
+        service = context.factory.create_dashboard_template_binding_service()
+        binding = await service.get_project_override(
+            org_slug=org_slug, project_slug=project_slug
+        )
+        enqueuer = context.factory.create_dashboard_sync_enqueuer()
+        queue_job = await enqueuer.enqueue(binding.id)
+        await context.session.commit()
+    return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
+        binding.id, queue_job, context.request
+    )

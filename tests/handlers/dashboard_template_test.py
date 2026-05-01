@@ -18,6 +18,7 @@ from docverse.storage.dashboard_templates.github import (
     GitHubTemplateKey,
 )
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_member, seed_org_with_admin
 from tests.support.arq_testing import get_jobs_by_name
 
@@ -925,6 +926,220 @@ async def test_org_put_enqueue_failure_marks_binding_failed(
 
 
 # ---------------------------------------------------------------------------
+# Force-sync endpoints (org admin + super-admin)
+# ---------------------------------------------------------------------------
+
+
+_SUPERADMIN = "superadmin"
+
+
+async def _put_org_binding(client: AsyncClient) -> None:
+    """Create the org-default binding the sync tests act on."""
+    await _setup_org(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+
+
+async def _put_project_binding(client: AsyncClient) -> None:
+    """Create the project-override binding the sync tests act on."""
+    await _setup_org_and_project(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/projects/{_PROJECT}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+
+
+async def _binding_id(*, project_slug: str | None = None) -> int:
+    """Return the binding id for the org-default or project-override row."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            ostore = OrganizationStore(session=session, logger=logger)
+            org = await ostore.get_by_slug(_ORG)
+            assert org is not None
+            bstore = DashboardGitHubTemplateBindingStore(
+                session=session, logger=logger
+            )
+            if project_slug is None:
+                binding = await bstore.get_org_default(org.id)
+            else:
+                pstore = ProjectStore(session=session, logger=logger)
+                project = await pstore.get_by_slug(
+                    org_id=org.id, slug=project_slug
+                )
+                assert project is not None
+                binding = await bstore.get_project_override(
+                    org_id=org.id, project_id=project.id
+                )
+            assert binding is not None
+            return binding.id
+    msg = "db_session_dependency yielded nothing"
+    raise AssertionError(msg)
+
+
+@pytest.mark.asyncio
+async def test_org_sync_enqueues_dashboard_sync(client: AsyncClient) -> None:
+    """Org admin POST enqueues a ``dashboard_sync`` for the org default."""
+    await _put_org_binding(client)
+    binding_id = await _binding_id()
+    mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
+    before = len(_dashboard_sync_enqueues(mock_arq))
+
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["binding_id"] == binding_id
+    assert body["queue_job_id"]
+    assert body["queue_job_url"].endswith(
+        f"/queue/jobs/{body['queue_job_id']}"
+    )
+
+    enqueues = _dashboard_sync_enqueues(mock_arq)
+    assert len(enqueues) == before + 1
+    payload = enqueues[-1].kwargs["payload"]
+    assert payload["binding_id"] == binding_id
+
+
+@pytest.mark.asyncio
+async def test_org_sync_allows_superadmin(client: AsyncClient) -> None:
+    """Super-admin escalation works through the existing role-resolver."""
+    await _put_org_binding(client)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _SUPERADMIN},
+    )
+    assert response.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_org_sync_returns_404_when_no_binding(
+    client: AsyncClient,
+) -> None:
+    """Sync on an org with no binding configured surfaces a 404."""
+    await _setup_org(client)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_org_sync_unknown_org_returns_404(client: AsyncClient) -> None:
+    """An unknown org slug surfaces a 404 from the auth dependency."""
+    response = await client.post(
+        "/docverse/orgs/no-such-org/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_org_sync_unauthenticated_returns_403(
+    client: AsyncClient,
+) -> None:
+    await _put_org_binding(client)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/dashboard-template/sync",
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_org_sync_non_admin_returns_403(client: AsyncClient) -> None:
+    await _put_org_binding(client)
+    await seed_member(_ORG, "reader-user", OrgRole.reader)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_project_sync_enqueues_dashboard_sync(
+    client: AsyncClient,
+) -> None:
+    """Project-override sync enqueues a ``dashboard_sync`` for that binding."""
+    await _put_project_binding(client)
+    binding_id = await _binding_id(project_slug=_PROJECT)
+    mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
+    before = len(_dashboard_sync_enqueues(mock_arq))
+
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/projects/{_PROJECT}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["binding_id"] == binding_id
+    assert body["queue_job_id"]
+    assert body["queue_job_url"].endswith(
+        f"/queue/jobs/{body['queue_job_id']}"
+    )
+
+    enqueues = _dashboard_sync_enqueues(mock_arq)
+    assert len(enqueues) == before + 1
+    payload = enqueues[-1].kwargs["payload"]
+    assert payload["binding_id"] == binding_id
+
+
+@pytest.mark.asyncio
+async def test_project_sync_allows_superadmin(client: AsyncClient) -> None:
+    await _put_project_binding(client)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/projects/{_PROJECT}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _SUPERADMIN},
+    )
+    assert response.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_project_sync_returns_404_when_no_binding(
+    client: AsyncClient,
+) -> None:
+    """Sync on a project with no override surfaces a 404."""
+    await _setup_org_and_project(client)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/projects/{_PROJECT}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_project_sync_unknown_project_returns_404(
+    client: AsyncClient,
+) -> None:
+    await _setup_org(client)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/projects/no-such-proj/dashboard-template/sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_project_sync_non_admin_returns_403(client: AsyncClient) -> None:
+    await _put_project_binding(client)
+    await seed_member(_ORG, "reader-user", OrgRole.reader)
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/projects/{_PROJECT}/dashboard-template/sync",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 403
+
+
+# ---------------------------------------------------------------------------
 # OpenAPI tag assignment
 # ---------------------------------------------------------------------------
 
@@ -933,8 +1148,9 @@ async def test_org_put_enqueue_failure_marks_binding_failed(
 async def test_dashboard_template_openapi_tags(client: AsyncClient) -> None:
     """Verify dashboard-template endpoints carry the right OpenAPI tags.
 
-    Org-default routes are tagged ``orgs``; project-override routes stay
-    tagged ``projects``.
+    Org-default routes (binding CRUD + sync) are tagged ``orgs``;
+    project-override routes (binding CRUD + sync) are tagged
+    ``projects``.
     """
     response = await client.get("/docverse/openapi.json")
     assert response.status_code == 200
@@ -946,6 +1162,11 @@ async def test_dashboard_template_openapi_tags(client: AsyncClient) -> None:
             f"Expected org-default {method.upper()} to be tagged 'orgs'"
         )
 
+    org_sync_path = paths["/docverse/orgs/{org}/dashboard-template/sync"]
+    assert org_sync_path["post"]["tags"] == ["orgs"], (
+        "Expected org-default sync POST to be tagged 'orgs'"
+    )
+
     project_path = paths[
         "/docverse/orgs/{org}/projects/{project}/dashboard-template"
     ]
@@ -954,3 +1175,14 @@ async def test_dashboard_template_openapi_tags(client: AsyncClient) -> None:
             f"Expected project-override {method.upper()} to be tagged "
             f"'projects'"
         )
+
+    project_sync_path = paths[
+        "/docverse/orgs/{org}/projects/{project}/dashboard-template/sync"
+    ]
+    assert project_sync_path["post"]["tags"] == ["projects"], (
+        "Expected project-override sync POST to be tagged 'projects'"
+    )
+
+    # The legacy admin force-sync route was replaced by the slug-keyed
+    # routes above; verify it is no longer registered.
+    assert "/docverse/admin/dashboard-templates/{binding_id}/sync" not in paths
