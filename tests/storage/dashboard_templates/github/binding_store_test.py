@@ -17,6 +17,9 @@ from docverse.domain.base32id import serialize_base32_id
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
+    DashboardGitHubTemplateStore,
+    GitHubTemplateFileInput,
+    GitHubTemplateKey,
 )
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
@@ -108,6 +111,60 @@ async def test_get_by_id_returns_none_public_id_when_no_queue_job(
         await db_session.rollback()
     assert fetched is not None
     assert fetched.last_sync_queue_job_public_id is None
+    assert fetched.commit_sha is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_materializes_commit_sha_from_template_join(
+    db_session: AsyncSession,
+) -> None:
+    """When ``github_template_id`` is set, the join surfaces ``commit_sha``.
+
+    Mirrors the queue-job join pattern: the read methods materialize the
+    template content's ``commit_sha`` so the response layer can show
+    "last synced at <sha>" without a second query.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        template_store = DashboardGitHubTemplateStore(
+            session=db_session, logger=logger
+        )
+        upserted = await template_store.upsert(
+            key=GitHubTemplateKey(
+                github_owner="acme",
+                github_repo="dashboard-templates",
+                github_ref="main",
+                root_path="/",
+            ),
+            commit_sha="cafebabe",
+            etag='W/"etag-cafebabe"',
+            template_toml=b"[meta]\nname='t'\n",
+            files=[
+                GitHubTemplateFileInput(
+                    relative_path="template.toml",
+                    is_text=True,
+                    data=b"[meta]\nname='t'\n",
+                )
+            ],
+        )
+        await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            github_template_id=upserted.template.id,
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        org_default = await store.get_org_default(org_id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.commit_sha == "cafebabe"
+    assert org_default is not None
+    assert org_default.commit_sha == "cafebabe"
 
 
 @pytest.mark.asyncio

@@ -75,9 +75,99 @@ async def test_org_put_creates_binding(client: AsyncClient) -> None:
     assert "date_created" in body
     assert "date_updated" in body
     assert body["self_url"].endswith(f"/orgs/{_ORG}/dashboard-template")
+    # ``web_url`` is derived from the binding source coordinates; ``/``
+    # root_path collapses to a bare ``/tree/{ref}`` URL with no trailing
+    # path segment.
+    assert (
+        body["web_url"]
+        == "https://github.com/lsst-sqre/docverse-templates/tree/main"
+    )
+    # ``commit_sha`` stays ``None`` until the first successful sync
+    # links a template content row.
+    assert body["commit_sha"] is None
     # The PUT enqueues an initial sync, so the URL points at that job.
     assert body["last_sync_queue_job_url"] is not None
     assert "/queue/jobs/" in body["last_sync_queue_job_url"]
+
+
+@pytest.mark.asyncio
+async def test_org_put_web_url_includes_subdirectory_root_path(
+    client: AsyncClient,
+) -> None:
+    """A non-``/`` root path appears as a path segment after the ref."""
+    await _setup_org(client)
+    body = {**_VALID_BODY, "root_path": "/themes/blue"}
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=body,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+    assert response.json()["web_url"] == (
+        "https://github.com/lsst-sqre/docverse-templates/tree/main/themes/blue"
+    )
+
+
+@pytest.mark.asyncio
+async def test_org_get_surfaces_commit_sha_after_sync(
+    client: AsyncClient,
+) -> None:
+    """``commit_sha`` flips from ``None`` to the synced commit on success."""
+    await _setup_org(client)
+    create_response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert create_response.status_code == 201
+    assert create_response.json()["commit_sha"] is None
+
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            template_store = DashboardGitHubTemplateStore(
+                session=session, logger=logger
+            )
+            upserted = await template_store.upsert(
+                key=GitHubTemplateKey(
+                    github_owner="lsst-sqre",
+                    github_repo="docverse-templates",
+                    github_ref="main",
+                    root_path="/",
+                ),
+                commit_sha="cafebabe",
+                etag='W/"etag-cafebabe"',
+                template_toml=b"[meta]\nname='t'\n",
+                files=[
+                    GitHubTemplateFileInput(
+                        relative_path="template.toml",
+                        is_text=True,
+                        data=b"[meta]\nname='t'\n",
+                    )
+                ],
+            )
+            ostore = OrganizationStore(session=session, logger=logger)
+            org = await ostore.get_by_slug(_ORG)
+            assert org is not None
+            bstore = DashboardGitHubTemplateBindingStore(
+                session=session, logger=logger
+            )
+            existing = await bstore.get_org_default(org.id)
+            assert existing is not None
+            await bstore.update_sync_state(
+                binding_id=existing.id,
+                last_sync_status="succeeded",
+                github_template_id=upserted.template.id,
+            )
+            await session.commit()
+        break
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json()["commit_sha"] == "cafebabe"
 
 
 @pytest.mark.asyncio
@@ -411,6 +501,12 @@ async def test_project_put_creates_binding(client: AsyncClient) -> None:
     assert body["github_owner"] == "lsst-sqre"
     assert body["root_path"] == "/"
     assert body["last_sync_status"] == "pending"
+    # Project-override response carries ``web_url`` + ``commit_sha`` too.
+    assert (
+        body["web_url"]
+        == "https://github.com/lsst-sqre/docverse-templates/tree/main"
+    )
+    assert body["commit_sha"] is None
 
 
 @pytest.mark.asyncio

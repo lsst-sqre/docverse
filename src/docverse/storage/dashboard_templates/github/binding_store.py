@@ -9,6 +9,9 @@ import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.dbschema.dashboard_github_template import (
+    SqlDashboardGitHubTemplate,
+)
 from docverse.dbschema.dashboard_github_template_binding import (
     SqlDashboardGitHubTemplateBinding,
 )
@@ -39,43 +42,61 @@ class DashboardGitHubTemplateBindingCreate:
     github_installation_id: int | None = None
 
 
-def _select_with_queue_job() -> Any:
-    """Return a SELECT that left-joins ``queue_jobs`` for the FK back-pointer.
+def _select_with_joins() -> Any:
+    """Return a SELECT that left-joins queue_jobs and template-content rows.
 
-    Materializing ``queue_jobs.public_id`` in the same query lets the
-    response layer build the ``last_sync_queue_job_url`` without a
-    second round-trip. The join is a left join because the FK is
-    nullable (pre-first-enqueue rows and rows whose job was pruned).
+    Two left joins materialize the read-side fields the response layer
+    needs without a second round-trip:
+
+    * ``queue_jobs.public_id`` → builds ``last_sync_queue_job_url``.
+    * ``dashboard_github_templates.commit_sha`` → exposes the latest
+      synced commit on the binding response.
+
+    Both joins are left joins because the FKs are nullable: pre-first-
+    enqueue rows have no queue job, and pre-first-sync (or sync-failed)
+    rows have no linked content row.
 
     The ``Any`` return type sidesteps SQLAlchemy's typed-Select claim
-    that ``public_id`` is ``int``: a left-join produces ``int | None``
-    when there is no matching ``queue_jobs`` row, which the type stub
-    cannot express.
+    that the joined columns are non-nullable: a left join produces
+    ``int | None`` / ``str | None`` for unmatched rows, which the type
+    stubs cannot express.
     """
-    return select(
-        SqlDashboardGitHubTemplateBinding, SqlQueueJob.public_id
-    ).outerjoin(
-        SqlQueueJob,
-        SqlDashboardGitHubTemplateBinding.last_sync_queue_job_id
-        == SqlQueueJob.id,
+    return (
+        select(
+            SqlDashboardGitHubTemplateBinding,
+            SqlQueueJob.public_id,
+            SqlDashboardGitHubTemplate.commit_sha,
+        )
+        .outerjoin(
+            SqlQueueJob,
+            SqlDashboardGitHubTemplateBinding.last_sync_queue_job_id
+            == SqlQueueJob.id,
+        )
+        .outerjoin(
+            SqlDashboardGitHubTemplate,
+            SqlDashboardGitHubTemplateBinding.github_template_id
+            == SqlDashboardGitHubTemplate.id,
+        )
     )
 
 
 def _to_domain(
     row: SqlDashboardGitHubTemplateBinding,
     queue_job_public_id: int | None,
+    commit_sha: str | None,
 ) -> DashboardGitHubTemplateBinding:
-    """Build the domain object from a row + joined queue-job public_id."""
+    """Build the domain object from a row + joined read-side columns."""
     binding = DashboardGitHubTemplateBinding.model_validate(row)
-    if queue_job_public_id is None:
+    updates: dict[str, Any] = {}
+    if queue_job_public_id is not None:
+        updates["last_sync_queue_job_public_id"] = serialize_base32_id(
+            queue_job_public_id
+        )
+    if commit_sha is not None:
+        updates["commit_sha"] = commit_sha
+    if not updates:
         return binding
-    return binding.model_copy(
-        update={
-            "last_sync_queue_job_public_id": serialize_base32_id(
-                queue_job_public_id
-            ),
-        }
-    )
+    return binding.model_copy(update=updates)
 
 
 class DashboardGitHubTemplateBindingStore:
@@ -116,22 +137,22 @@ class DashboardGitHubTemplateBindingStore:
     ) -> DashboardGitHubTemplateBinding | None:
         """Fetch a binding by internal ID."""
         result = await self._session.execute(
-            _select_with_queue_job().where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.id == binding_id,
             )
         )
         row = result.one_or_none()
         if row is None:
             return None
-        binding_row, public_id = row
-        return _to_domain(binding_row, public_id)
+        binding_row, public_id, commit_sha = row
+        return _to_domain(binding_row, public_id, commit_sha)
 
     async def get_org_default(
         self, org_id: int
     ) -> DashboardGitHubTemplateBinding | None:
         """Fetch the org-default binding (``project_id IS NULL``)."""
         result = await self._session.execute(
-            _select_with_queue_job().where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.org_id == org_id,
                 SqlDashboardGitHubTemplateBinding.project_id.is_(None),
             )
@@ -139,15 +160,15 @@ class DashboardGitHubTemplateBindingStore:
         row = result.one_or_none()
         if row is None:
             return None
-        binding_row, public_id = row
-        return _to_domain(binding_row, public_id)
+        binding_row, public_id, commit_sha = row
+        return _to_domain(binding_row, public_id, commit_sha)
 
     async def get_project_override(
         self, *, org_id: int, project_id: int
     ) -> DashboardGitHubTemplateBinding | None:
         """Fetch the project-specific binding for ``project_id``."""
         result = await self._session.execute(
-            _select_with_queue_job().where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.org_id == org_id,
                 SqlDashboardGitHubTemplateBinding.project_id == project_id,
             )
@@ -155,22 +176,22 @@ class DashboardGitHubTemplateBindingStore:
         row = result.one_or_none()
         if row is None:
             return None
-        binding_row, public_id = row
-        return _to_domain(binding_row, public_id)
+        binding_row, public_id, commit_sha = row
+        return _to_domain(binding_row, public_id, commit_sha)
 
     async def list_by_github_template_id(
         self, github_template_id: int
     ) -> list[DashboardGitHubTemplateBinding]:
         """List every binding that currently points at a template row."""
         result = await self._session.execute(
-            _select_with_queue_job().where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.github_template_id
                 == github_template_id,
             )
         )
         return [
-            _to_domain(binding_row, public_id)
-            for binding_row, public_id in result
+            _to_domain(binding_row, public_id, commit_sha)
+            for binding_row, public_id, commit_sha in result
         ]
 
     async def list_by_repo_ref(
@@ -189,15 +210,15 @@ class DashboardGitHubTemplateBindingStore:
         ``root_path``).
         """
         result = await self._session.execute(
-            _select_with_queue_job().where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.github_owner == github_owner,
                 SqlDashboardGitHubTemplateBinding.github_repo == github_repo,
                 SqlDashboardGitHubTemplateBinding.github_ref == github_ref,
             )
         )
         return [
-            _to_domain(binding_row, public_id)
-            for binding_row, public_id in result
+            _to_domain(binding_row, public_id, commit_sha)
+            for binding_row, public_id, commit_sha in result
         ]
 
     async def list_project_overrides_for_org(
@@ -205,14 +226,14 @@ class DashboardGitHubTemplateBindingStore:
     ) -> list[DashboardGitHubTemplateBinding]:
         """List every project-override binding within an organization."""
         result = await self._session.execute(
-            _select_with_queue_job().where(
+            _select_with_joins().where(
                 SqlDashboardGitHubTemplateBinding.org_id == org_id,
                 SqlDashboardGitHubTemplateBinding.project_id.is_not(None),
             )
         )
         return [
-            _to_domain(binding_row, public_id)
-            for binding_row, public_id in result
+            _to_domain(binding_row, public_id, commit_sha)
+            for binding_row, public_id, commit_sha in result
         ]
 
     async def update_source(

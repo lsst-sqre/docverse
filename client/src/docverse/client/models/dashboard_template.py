@@ -67,6 +67,15 @@ class DashboardTemplateBinding(BaseModel):
 
     self_url: str = Field(description="URL to this binding resource.")
 
+    web_url: str = Field(
+        description=(
+            "URL of the template's location in the GitHub browse UI. "
+            "Always present once a binding exists; derived from the "
+            "binding's source coordinates rather than the synced "
+            "content row, so it is meaningful before the first sync."
+        )
+    )
+
     github_owner: str = Field(description="GitHub owner (user or org).")
 
     github_repo: str = Field(description="GitHub repository name.")
@@ -75,6 +84,14 @@ class DashboardTemplateBinding(BaseModel):
 
     root_path: str = Field(
         description="Path within the repo where the template lives."
+    )
+
+    commit_sha: str | None = Field(
+        default=None,
+        description=(
+            "Commit SHA of the most-recently-synced template content. "
+            "``None`` until the first successful sync."
+        ),
     )
 
     last_sync_status: str = Field(

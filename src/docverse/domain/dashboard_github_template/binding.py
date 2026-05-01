@@ -80,6 +80,15 @@ class DashboardGitHubTemplateBinding(BaseModel):
             "after the referenced job has been pruned."
         ),
     )
+    commit_sha: str | None = Field(
+        default=None,
+        description=(
+            "Commit SHA of the most-recently-synced template content, "
+            "materialized via a join on ``dashboard_github_templates`` "
+            "from ``github_template_id``. ``None`` until the first "
+            "successful sync links a content row."
+        ),
+    )
 
     date_created: datetime = Field(
         description="Timestamp when the binding was created."

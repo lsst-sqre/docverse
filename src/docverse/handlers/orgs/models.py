@@ -56,6 +56,7 @@ from docverse.domain.published_url import (
     project_published_url,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
+from docverse.storage.github import build_github_browse_url
 
 
 class Organization(_OrganizationBase):
@@ -477,12 +478,20 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
             if queue_job_public_id is not None
             else None
         )
+        web_url = build_github_browse_url(
+            owner=domain.github_owner,
+            repo=domain.github_repo,
+            ref=domain.github_ref,
+            root_path=domain.root_path,
+        )
         return cls(
             self_url=self_url,
+            web_url=web_url,
             github_owner=domain.github_owner,
             github_repo=domain.github_repo,
             github_ref=domain.github_ref,
             root_path=domain.root_path,
+            commit_sha=domain.commit_sha,
             last_sync_status=domain.last_sync_status,
             last_sync_error=domain.last_sync_error,
             last_sync_queue_job_url=last_sync_queue_job_url,
