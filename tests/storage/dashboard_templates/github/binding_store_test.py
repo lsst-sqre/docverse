@@ -9,15 +9,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.queue_enums import JobKind
 from docverse.dbschema.dashboard_github_template_binding import (
     SqlDashboardGitHubTemplateBinding,
 )
+from docverse.domain.base32id import serialize_base32_id
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
 )
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_job_store import QueueJobStore
 
 
 async def _seed_org_and_project(
@@ -86,6 +89,94 @@ async def test_create_org_default_binding(
     assert binding.github_owner_id is None
     assert binding.github_repo_id is None
     assert binding.github_installation_id is None
+    assert binding.last_sync_queue_job_public_id is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_none_public_id_when_no_queue_job(
+    db_session: AsyncSession,
+) -> None:
+    """A newly-created binding's join with ``queue_jobs`` produces NULL."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.last_sync_queue_job_public_id is None
+
+
+@pytest.mark.asyncio
+async def test_set_last_sync_queue_job_materializes_public_id_via_join(
+    db_session: AsyncSession,
+) -> None:
+    """``set_last_sync_queue_job`` surfaces the FK's public_id via the join.
+
+    After setting the FK, every read method materializes the queue
+    job's base32 ``public_id`` so callers do not need a second query
+    to build a URL.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_sync, org_id=org_id
+        )
+        await store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=queue_job.id
+        )
+        await db_session.commit()
+    expected_public_id = serialize_base32_id(queue_job.public_id)
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        org_default = await store.get_org_default(org_id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.last_sync_queue_job_public_id == expected_public_id
+    assert org_default is not None
+    assert org_default.last_sync_queue_job_public_id == expected_public_id
+
+
+@pytest.mark.asyncio
+async def test_set_last_sync_queue_job_overwrites_prior_fk(
+    db_session: AsyncSession,
+) -> None:
+    """A second sync attempt overwrites the FK with the new job's id."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        first = await queue_job_store.create(
+            kind=JobKind.dashboard_sync, org_id=org_id
+        )
+        await store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=first.id
+        )
+        second = await queue_job_store.create(
+            kind=JobKind.dashboard_sync, org_id=org_id
+        )
+        await store.set_last_sync_queue_job(
+            binding_id=binding.id, queue_job_id=second.id
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        fetched = await store.get_by_id(binding.id)
+        await db_session.rollback()
+    assert fetched is not None
+    assert fetched.last_sync_queue_job_public_id == serialize_base32_id(
+        second.public_id
+    )
 
 
 @pytest.mark.asyncio

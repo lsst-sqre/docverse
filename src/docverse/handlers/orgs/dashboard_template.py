@@ -9,12 +9,40 @@ from fastapi import APIRouter, Depends, Response, status
 from docverse.client.models import DashboardTemplateBindingCreate
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.dashboard_github_template import (
+    DashboardGitHubTemplateBinding,
+)
+from docverse.domain.queue import QueueJob
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 from docverse.services.dashboard_templates.enqueue import (
     try_enqueue_dashboard_sync,
 )
 
 from .models import DashboardTemplateBindingResponse
+
+
+def _attach_queue_job(
+    binding: DashboardGitHubTemplateBinding, queue_job: QueueJob | None
+) -> DashboardGitHubTemplateBinding:
+    """Override the binding's queue-job public id from the just-enqueued job.
+
+    The binding object handed back by the service was loaded *before*
+    the enqueue ran, so its ``last_sync_queue_job_public_id`` reflects
+    the prior sync (if any). When the enqueue succeeds, surface the
+    new job's id so the response shows the just-enqueued URL without a
+    re-fetch.
+    """
+    if queue_job is None:
+        return binding
+    return binding.model_copy(
+        update={
+            "last_sync_queue_job_public_id": serialize_base32_id(
+                queue_job.public_id
+            ),
+        }
+    )
+
 
 org_default_router = APIRouter()
 project_override_router = APIRouter()
@@ -62,8 +90,9 @@ async def put_org_dashboard_template(
         result = await service.put_org_default(org_slug=org_slug, data=data)
         if result.changed:
             await context.session.commit()
+    queue_job: QueueJob | None = None
     if result.changed:
-        await try_enqueue_dashboard_sync(
+        queue_job = await try_enqueue_dashboard_sync(
             factory=context.factory,
             session=context.session,
             logger=context.logger,
@@ -73,7 +102,9 @@ async def put_org_dashboard_template(
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
     return DashboardTemplateBindingResponse.from_domain(
-        result.binding, context.request, org_slug=org_slug
+        _attach_queue_job(result.binding, queue_job),
+        context.request,
+        org_slug=org_slug,
     )
 
 
@@ -145,8 +176,9 @@ async def put_project_dashboard_template(  # noqa: PLR0913
         )
         if result.changed:
             await context.session.commit()
+    queue_job: QueueJob | None = None
     if result.changed:
-        await try_enqueue_dashboard_sync(
+        queue_job = await try_enqueue_dashboard_sync(
             factory=context.factory,
             session=context.session,
             logger=context.logger,
@@ -156,7 +188,7 @@ async def put_project_dashboard_template(  # noqa: PLR0913
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
     return DashboardTemplateBindingResponse.from_domain(
-        result.binding,
+        _attach_queue_job(result.binding, queue_job),
         context.request,
         org_slug=org_slug,
         project_slug=project_slug,

@@ -120,6 +120,9 @@ class DashboardTemplateSyncEnqueuedResponse(BaseModel):
     queue_job_id: str = Field(
         description="Base32 public ID of the enqueued ``dashboard_sync`` job."
     )
+    queue_job_url: str = Field(
+        description="URL of the enqueued ``dashboard_sync`` queue job."
+    )
 
 
 @router.post(
@@ -137,7 +140,11 @@ async def sync_dashboard_template(
         enqueuer = context.factory.create_dashboard_sync_enqueuer()
         queue_job = await enqueuer.enqueue(binding_id)
         await context.session.commit()
+    queue_job_id = serialize_base32_id(queue_job.public_id)
     return DashboardTemplateSyncEnqueuedResponse(
         binding_id=binding_id,
-        queue_job_id=serialize_base32_id(queue_job.public_id),
+        queue_job_id=queue_job_id,
+        queue_job_url=str(
+            context.request.url_for("get_queue_job", job=queue_job_id)
+        ),
     )

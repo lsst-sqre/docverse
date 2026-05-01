@@ -71,6 +71,15 @@ class DashboardGitHubTemplateBinding(BaseModel):
         default=None,
         description="Operator-readable error from the most recent sync.",
     )
+    last_sync_queue_job_public_id: str | None = Field(
+        default=None,
+        description=(
+            "Base32 ``public_id`` of the most-recently-enqueued "
+            "``dashboard_sync`` queue job, materialized via a join on "
+            "``queue_jobs``. ``None`` until the first enqueue runs or "
+            "after the referenced job has been pruned."
+        ),
+    )
 
     date_created: datetime = Field(
         description="Timestamp when the binding was created."

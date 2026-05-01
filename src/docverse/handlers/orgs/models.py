@@ -471,6 +471,12 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
                     project=project_slug,
                 )
             )
+        queue_job_public_id = domain.last_sync_queue_job_public_id
+        last_sync_queue_job_url = (
+            str(request.url_for("get_queue_job", job=queue_job_public_id))
+            if queue_job_public_id is not None
+            else None
+        )
         return cls(
             self_url=self_url,
             github_owner=domain.github_owner,
@@ -479,6 +485,7 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
             root_path=domain.root_path,
             last_sync_status=domain.last_sync_status,
             last_sync_error=domain.last_sync_error,
+            last_sync_queue_job_url=last_sync_queue_job_url,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )

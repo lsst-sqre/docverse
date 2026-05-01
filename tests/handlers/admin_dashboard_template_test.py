@@ -76,6 +76,9 @@ async def test_admin_sync_enqueues_dashboard_sync(
     body = response.json()
     assert body["binding_id"] == binding_id
     assert body["queue_job_id"]
+    assert body["queue_job_url"].endswith(
+        f"/queue/jobs/{body['queue_job_id']}"
+    )
 
     enqueues = _dashboard_sync_enqueues(mock_arq)
     assert len(enqueues) == before + 1

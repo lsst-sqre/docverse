@@ -75,6 +75,9 @@ async def test_org_put_creates_binding(client: AsyncClient) -> None:
     assert "date_created" in body
     assert "date_updated" in body
     assert body["self_url"].endswith(f"/orgs/{_ORG}/dashboard-template")
+    # The PUT enqueues an initial sync, so the URL points at that job.
+    assert body["last_sync_queue_job_url"] is not None
+    assert "/queue/jobs/" in body["last_sync_queue_job_url"]
 
 
 @pytest.mark.asyncio
@@ -672,6 +675,110 @@ async def test_project_put_enqueues_dashboard_sync(
 
     enqueues = _dashboard_sync_enqueues(mock_arq)
     assert len(enqueues) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_org_put_response_url_matches_enqueued_queue_job(
+    client: AsyncClient,
+) -> None:
+    """Response ``last_sync_queue_job_url`` ends in the enqueued job's id."""
+    await _setup_org(client)
+    mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+    enqueues = _dashboard_sync_enqueues(mock_arq)
+    queue_job_public_id = enqueues[-1].kwargs["payload"]["queue_job_public_id"]
+    body = response.json()
+    assert body["last_sync_queue_job_url"] is not None
+    assert body["last_sync_queue_job_url"].endswith(
+        f"/queue/jobs/{queue_job_public_id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_org_get_returns_same_queue_job_url_as_put(
+    client: AsyncClient,
+) -> None:
+    """GET surfaces the same ``last_sync_queue_job_url`` PUT returned.
+
+    The URL persists across reads until a follow-up sync overwrites it.
+    """
+    await _setup_org(client)
+    put_response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert put_response.status_code == 201
+    expected_url = put_response.json()["last_sync_queue_job_url"]
+    assert expected_url is not None
+    get_response = await client.get(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["last_sync_queue_job_url"] == expected_url
+
+
+@pytest.mark.asyncio
+async def test_org_put_overwrites_queue_job_url_on_resync(
+    client: AsyncClient,
+) -> None:
+    """A change-PUT enqueues a fresh sync; the URL flips to the new job."""
+    await _setup_org(client)
+    first = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert first.status_code == 201
+    first_url = first.json()["last_sync_queue_job_url"]
+
+    second = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_ref": "release"},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert second.status_code == 200
+    second_url = second.json()["last_sync_queue_job_url"]
+    assert second_url is not None
+    assert second_url != first_url
+
+
+@pytest.mark.asyncio
+async def test_org_put_enqueue_failure_leaves_url_null(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``try_enqueue_dashboard_sync`` fails, the URL stays ``null``.
+
+    Pairs with ``test_org_put_enqueue_failure_marks_binding_failed``: a
+    silently-dropped enqueue must surface ``last_sync_queue_job_url:
+    null`` so an operator does not chase a non-existent queue job.
+    """
+    await _setup_org(client)
+
+    boom_message = "arq down"
+
+    async def _boom(
+        self: DashboardSyncEnqueuer,
+        binding_id: int,
+    ) -> None:
+        raise RuntimeError(boom_message)
+
+    monkeypatch.setattr(DashboardSyncEnqueuer, "enqueue", _boom)
+
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+    assert response.json()["last_sync_queue_job_url"] is None
 
 
 @pytest.mark.asyncio
