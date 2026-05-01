@@ -535,6 +535,9 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
             last_sync_status=domain.last_sync_status,
             last_sync_error=domain.last_sync_error,
             last_sync_queue_job_url=last_sync_queue_job_url,
+            github_owner_id=domain.github_owner_id,
+            github_repo_id=domain.github_repo_id,
+            github_installation_id=domain.github_installation_id,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
         )

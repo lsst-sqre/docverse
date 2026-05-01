@@ -221,6 +221,62 @@ class DashboardGitHubTemplateBindingStore:
             for binding_row, public_id, commit_sha in result
         ]
 
+    async def list_by_repo_id_and_ref(
+        self,
+        *,
+        github_repo_id: int,
+        github_ref: str,
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """List every binding pinned to a stable GitHub repo ID + ref.
+
+        Backed by the
+        ``idx_dashboard_github_template_bindings_repo_id_ref`` composite
+        index. Used by the push event processor as the primary
+        rename-robust lookup: bindings keep matching their upstream
+        repository even after a GitHub rename or transfer because the
+        numeric ID is invariant.
+        """
+        result = await self._session.execute(
+            select(SqlDashboardGitHubTemplateBinding).where(
+                SqlDashboardGitHubTemplateBinding.github_repo_id
+                == github_repo_id,
+                SqlDashboardGitHubTemplateBinding.github_ref == github_ref,
+            )
+        )
+        return [
+            DashboardGitHubTemplateBinding.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
+    async def list_unsynced_by_repo_ref(
+        self,
+        *,
+        github_owner: str,
+        github_repo: str,
+        github_ref: str,
+    ) -> list[DashboardGitHubTemplateBinding]:
+        """List ``(owner, repo, ref)`` matches that have no captured repo ID.
+
+        The push event processor unions this with
+        :meth:`list_by_repo_id_and_ref` to cover bindings that have
+        never completed a successful sync (and therefore lack a
+        ``github_repo_id``). Already-synced bindings whose name
+        coincidentally matches a different repo are excluded — the
+        ID lookup is the authoritative match for those.
+        """
+        result = await self._session.execute(
+            select(SqlDashboardGitHubTemplateBinding).where(
+                SqlDashboardGitHubTemplateBinding.github_owner == github_owner,
+                SqlDashboardGitHubTemplateBinding.github_repo == github_repo,
+                SqlDashboardGitHubTemplateBinding.github_ref == github_ref,
+                SqlDashboardGitHubTemplateBinding.github_repo_id.is_(None),
+            )
+        )
+        return [
+            DashboardGitHubTemplateBinding.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
     async def list_project_overrides_for_org(
         self, org_id: int
     ) -> list[DashboardGitHubTemplateBinding]:

@@ -29,9 +29,16 @@ class InstallationAuth:
     ``base_url`` and attach ``Authorization: Bearer {token}`` on each
     request so the process-wide ``httpx.AsyncClient`` defaults stay
     untouched.
+
+    ``installation_id`` is GitHub's stable identifier for the
+    repository's app installation. The syncer captures it onto the
+    binding so future push events can reference the installation
+    directly without an extra ``/repos/{owner}/{repo}/installation``
+    round-trip.
     """
 
     token: str
+    installation_id: int
     base_url: str = GITHUB_API_BASE_URL
 
 
@@ -147,4 +154,4 @@ class GitHubAppClient:
         """
         installation_id = await self.get_installation_id(owner, repo)
         token = await self.exchange_installation_token(installation_id)
-        return InstallationAuth(token=token)
+        return InstallationAuth(token=token, installation_id=installation_id)

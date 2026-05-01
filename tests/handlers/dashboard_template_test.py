@@ -204,6 +204,61 @@ async def test_org_get_returns_existing_binding(client: AsyncClient) -> None:
     assert body["github_owner"] == "lsst-sqre"
     assert body["github_ref"] == "main"
     assert body["last_sync_status"] == "pending"
+    # Pre-sync the GitHub numeric IDs are unset; the response surfaces
+    # them as ``null`` so operators can see the binding has not yet
+    # captured them.
+    assert body["github_owner_id"] is None
+    assert body["github_repo_id"] is None
+    assert body["github_installation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_org_get_surfaces_captured_github_numeric_ids(
+    client: AsyncClient,
+) -> None:
+    """A populated binding's GitHub numeric IDs are visible to operators.
+
+    The public API stays name-keyed; the IDs are informational only,
+    surfaced for debugging the rename-robust internal lookup path.
+    """
+    await _setup_org(client)
+    await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json=_VALID_BODY,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(
+                session=session, logger=structlog.get_logger("test")
+            )
+            org = await org_store.get_by_slug(_ORG)
+            assert org is not None
+            binding_store = DashboardGitHubTemplateBindingStore(
+                session=session, logger=structlog.get_logger("test")
+            )
+            existing = await binding_store.get_org_default(org.id)
+            assert existing is not None
+            await binding_store.update_sync_state(
+                binding_id=existing.id,
+                last_sync_status="succeeded",
+                github_owner_id=111,
+                github_repo_id=222,
+                github_installation_id=333,
+            )
+            await session.commit()
+        break
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["github_owner_id"] == 111
+    assert body["github_repo_id"] == 222
+    assert body["github_installation_id"] == 333
 
 
 @pytest.mark.asyncio

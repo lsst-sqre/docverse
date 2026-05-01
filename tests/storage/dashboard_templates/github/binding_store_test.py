@@ -621,3 +621,127 @@ async def test_list_by_repo_ref_returns_empty_when_no_matches(
         )
         await db_session.rollback()
     assert matches == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_repo_id_and_ref_matches_synced_bindings(
+    db_session: AsyncSession,
+) -> None:
+    """ID-keyed lookup returns synced bindings; ignores name + null IDs."""
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug="repo-id-org"
+        )
+        store = _store(db_session)
+        synced_default = await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/",
+                github_repo_id=42,
+            )
+        )
+        synced_override = await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=project_id,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/themes/blue",
+                github_repo_id=42,
+            )
+        )
+        # Different repo id — should not match.
+        other_org_id, _ = await _seed_org_and_project(
+            db_session,
+            org_slug="repo-id-other-org",
+            project_slug="other-id-proj",
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=other_org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/",
+                github_repo_id=99,
+            )
+        )
+        # Unsynced binding (NULL repo_id) — should not match by ID.
+        third_org_id, _ = await _seed_org_and_project(
+            db_session,
+            org_slug="repo-id-unsynced-org",
+            project_slug="unsynced-proj",
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=third_org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        matches = await store.list_by_repo_id_and_ref(
+            github_repo_id=42, github_ref="main"
+        )
+        await db_session.rollback()
+    matched_ids = {m.id for m in matches}
+    assert matched_ids == {synced_default.id, synced_override.id}
+
+
+@pytest.mark.asyncio
+async def test_list_unsynced_by_repo_ref_excludes_synced_bindings(
+    db_session: AsyncSession,
+) -> None:
+    """Name lookup for the rename-fallback path skips populated IDs.
+
+    Only bindings with ``github_repo_id IS NULL`` count as un-synced;
+    populated rows belong to the ID-keyed lookup so the push processor
+    does not double-count them across the union.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug="unsynced-name-org"
+        )
+        store = _store(db_session)
+        unsynced = await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=None,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/",
+            )
+        )
+        await store.create(
+            DashboardGitHubTemplateBindingCreate(
+                org_id=org_id,
+                project_id=project_id,
+                github_owner="acme",
+                github_repo="templates",
+                github_ref="main",
+                root_path="/themes/blue",
+                github_repo_id=42,
+            )
+        )
+        await db_session.commit()
+    async with db_session.begin():
+        store = _store(db_session)
+        matches = await store.list_unsynced_by_repo_ref(
+            github_owner="acme",
+            github_repo="templates",
+            github_ref="main",
+        )
+        await db_session.rollback()
+    assert [m.id for m in matches] == [unsynced.id]

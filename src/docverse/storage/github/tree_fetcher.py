@@ -55,6 +55,12 @@ class FetchedTree:
     ``commit_sha`` is the resolved commit the ref pointed at when the
     tree was read, independent of whether ``ref`` was a branch, tag, or
     raw SHA.
+
+    ``repo_id`` and ``owner_id`` are GitHub's stable numeric IDs for
+    the repository and its owner. The syncer writes them to the
+    binding + content rows so the push event processor can match
+    incoming events by ID rather than by display name, which keeps
+    matching robust across GitHub repo / org renames.
     """
 
     owner: str
@@ -65,6 +71,8 @@ class FetchedTree:
     tree_sha: str
     etag: str | None
     files: tuple[FetchedTreeFile, ...]
+    repo_id: int
+    owner_id: int
 
 
 def _normalize_root(root_path: str) -> str:
@@ -101,10 +109,13 @@ class GitHubTreeFetcher:
     ) -> FetchedTree:
         """Fetch the tree under ``root_path`` at ``ref`` for ``owner/repo``.
 
-        Steps: resolve the ref to a commit (giving us ``commit_sha`` +
-        the top-level tree SHA), list the recursive tree, keep only
-        blobs inside ``root_path``, then fetch each blob's bytes.
+        Steps: fetch the repository metadata (for the stable
+        ``repo_id`` / ``owner_id``), resolve the ref to a commit
+        (giving us ``commit_sha`` + the top-level tree SHA), list the
+        recursive tree, keep only blobs inside ``root_path``, then
+        fetch each blob's bytes.
         """
+        repo_id, owner_id = await self._fetch_repo(owner, repo)
         commit_sha, tree_sha = await self._resolve_ref(owner, repo, ref)
         tree_entries, etag = await self._list_tree(owner, repo, tree_sha)
 
@@ -153,6 +164,8 @@ class GitHubTreeFetcher:
             tree_sha=tree_sha,
             etag=etag,
             files=tuple(cast("list[FetchedTreeFile]", files)),
+            repo_id=repo_id,
+            owner_id=owner_id,
         )
 
     def _auth_headers(self, accept: str) -> dict[str, str]:
@@ -160,6 +173,22 @@ class GitHubTreeFetcher:
             "Accept": accept,
             "Authorization": f"Bearer {self._auth.token}",
         }
+
+    async def _fetch_repo(self, owner: str, repo: str) -> tuple[int, int]:
+        """Fetch repository metadata, returning ``(repo_id, owner_id)``.
+
+        Reads ``GET /repos/{owner}/{repo}`` to capture GitHub's stable
+        numeric IDs for the repository and its owner. The syncer
+        writes these to the binding + content rows so push events
+        match by ID even after a GitHub repo or org rename.
+        """
+        response = await self._http_client.get(
+            f"{self._auth.base_url}/repos/{owner}/{repo}",
+            headers=self._auth_headers("application/vnd.github+json"),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return int(data["id"]), int(data["owner"]["id"])
 
     async def _resolve_ref(
         self, owner: str, repo: str, ref: str

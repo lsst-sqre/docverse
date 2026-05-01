@@ -57,6 +57,39 @@ async def test_tree_fetcher_scoped_to_root_path(
 
 
 @pytest.mark.asyncio
+async def test_tree_fetcher_captures_repo_and_owner_ids(
+    mock_github: GitHubMock,
+) -> None:
+    """``FetchedTree`` carries the GitHub numeric repo + owner IDs.
+
+    Pins the rename-robust capture path: the syncer reads these IDs
+    off ``FetchedTree`` and writes them onto the binding + content
+    rows so future push events can match by stable ID even after a
+    GitHub rename / transfer.
+    """
+    mock_github.seed_tree(
+        "acme",
+        "templates",
+        "main",
+        files={"template.toml": b"[dashboard]\n"},
+        repo_id=987654321,
+        owner_id=123456789,
+    )
+    auth = mock_github.installation_auth("acme", "templates")
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubTreeFetcher(
+            http_client=http_client, auth=auth, logger=_logger()
+        )
+        tree = await fetcher.fetch(
+            owner="acme", repo="templates", ref="main", root_path="/"
+        )
+
+    assert tree.repo_id == 987654321
+    assert tree.owner_id == 123456789
+
+
+@pytest.mark.asyncio
 async def test_tree_fetcher_captures_etag_and_commit_sha(
     mock_github: GitHubMock,
 ) -> None:
@@ -190,7 +223,7 @@ async def test_tree_fetcher_attaches_authorization_header(
         "main",
         files={"template.toml": b"[dashboard]\n"},
     )
-    auth = InstallationAuth(token="ghs_attach_test")
+    auth = InstallationAuth(token="ghs_attach_test", installation_id=99)
 
     async with httpx.AsyncClient() as http_client:
         # The shared client must not be configured with a base_url or an
@@ -230,10 +263,11 @@ async def test_tree_fetcher_raises_on_non_2xx_ref_resolution(
     The sync worker (#237) will layer typed exceptions on top; this
     test fences against an accidental swallow at the storage layer.
     """
+    mock_github.seed_repo("acme", "templates")
     mock_github.router.get(
         "https://api.github.com/repos/acme/templates/commits/main"
     ).mock(return_value=httpx.Response(status))
-    auth = InstallationAuth(token="ghs_test")
+    auth = InstallationAuth(token="ghs_test", installation_id=99)
 
     async with httpx.AsyncClient() as http_client:
         fetcher = GitHubTreeFetcher(

@@ -219,6 +219,8 @@ class DashboardTemplateSyncer:
             etag=etag,
             template_toml=template_toml,
             files=other_files,
+            github_owner_id=fetched.owner_id,
+            github_repo_id=fetched.repo_id,
         )
 
         updated = await self._binding_store.update_sync_state(
@@ -226,6 +228,9 @@ class DashboardTemplateSyncer:
             last_sync_status="succeeded",
             last_sync_error=None,
             github_template_id=upsert.template.id,
+            github_owner_id=fetched.owner_id,
+            github_repo_id=fetched.repo_id,
+            github_installation_id=auth.installation_id,
         )
         if updated is None:
             msg = (
