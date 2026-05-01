@@ -57,6 +57,11 @@ async def test_list_projects(client: AsyncClient) -> None:
     assert "proj-aa" in slugs
     assert "Link" in response.headers
     assert "X-Total-Count" in response.headers
+    proj = next(p for p in data if p["slug"] == "proj-aa")
+    assert proj["dashboard_template_url"].endswith(
+        "/orgs/proj-org/projects/proj-aa/dashboard-template"
+    )
+    assert proj["dashboard_template_url"].startswith("http")
 
 
 @pytest.mark.asyncio
@@ -76,7 +81,12 @@ async def test_get_project(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 200
-    assert response.json()["slug"] == "get-proj"
+    data = response.json()
+    assert data["slug"] == "get-proj"
+    assert data["dashboard_template_url"].endswith(
+        "/orgs/proj-org/projects/get-proj/dashboard-template"
+    )
+    assert data["dashboard_template_url"].startswith("http")
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,10 @@ async def test_get_organization(client: AsyncClient) -> None:
     assert data["self_url"].endswith("/orgs/test-org")
     assert data["projects_url"].endswith("/orgs/test-org/projects")
     assert data["members_url"].endswith("/orgs/test-org/members")
+    assert data["dashboard_template_url"].endswith(
+        "/orgs/test-org/dashboard-template"
+    )
+    assert data["dashboard_template_url"].startswith("http")
     assert "date_created" in data
     assert "date_updated" in data
 

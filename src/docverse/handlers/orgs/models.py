@@ -117,6 +117,9 @@ class Organization(_OrganizationBase):
             ),
             projects_url=str(request.url_for("get_projects", org=domain.slug)),
             members_url=str(request.url_for("get_members", org=domain.slug)),
+            dashboard_template_url=str(
+                request.url_for("get_org_dashboard_template", org=domain.slug)
+            ),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,
@@ -187,6 +190,13 @@ class Project(_ProjectBase):
             builds_url=str(
                 request.url_for(
                     "get_builds",
+                    org=org.slug,
+                    project=domain.slug,
+                )
+            ),
+            dashboard_template_url=str(
+                request.url_for(
+                    "get_project_dashboard_template",
                     org=org.slug,
                     project=domain.slug,
                 )
