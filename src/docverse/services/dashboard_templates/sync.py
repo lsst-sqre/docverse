@@ -8,6 +8,7 @@ from enum import StrEnum
 
 import gidgethub
 import httpx
+import jwt.exceptions
 import structlog
 
 from docverse.domain.dashboard_github_template import (
@@ -142,11 +143,15 @@ class DashboardTemplateSyncer:
             auth = await self._app_client.get_installation_auth(
                 owner=binding.github_owner, repo=binding.github_repo
             )
-        except (httpx.HTTPError, gidgethub.GitHubException) as exc:
+        except (
+            httpx.HTTPError,
+            gidgethub.GitHubException,
+            jwt.exceptions.InvalidKeyError,
+        ) as exc:
             return await self._record_failure(
                 binding=binding,
                 logger=logger,
-                message=f"GitHub App installation lookup failed: {exc}",
+                message=f"GitHub App authentication failed: {exc}",
             )
 
         fetcher = GitHubTreeFetcher(

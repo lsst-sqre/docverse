@@ -463,6 +463,67 @@ async def test_sync_unexpected_fetch_error_propagates(
 
 
 @pytest.mark.asyncio
+async def test_sync_invalid_app_private_key_records_failure(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A misconfigured GitHub App key lands as a recorded failure.
+
+    A bad PEM passed to ``GitHubAppClientFactory`` surfaces as
+    ``jwt.exceptions.InvalidKeyError`` from ``get_app_jwt`` deep inside
+    ``get_installation_auth``. The syncer must catch that alongside its
+    other expected GitHub-auth errors and write a friendly
+    ``last_sync_error`` instead of letting the exception propagate to
+    the worker's outer ``except Exception`` (which would leave the
+    binding stuck at ``last_sync_status="pending"``).
+    """
+    async with db_session.begin():
+        binding_id = await _seed_binding(db_session, org_slug="sync-bad-key")
+        await db_session.commit()
+
+    logger = _logger()
+    async with httpx.AsyncClient() as http_client:
+        bad_factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key="not-a-real-pem",
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        app_client = GitHubAppClient(
+            factory=bad_factory, http_client=http_client, logger=logger
+        )
+        syncer = DashboardTemplateSyncer(
+            binding_store=DashboardGitHubTemplateBindingStore(
+                session=db_session, logger=logger
+            ),
+            template_store=DashboardGitHubTemplateStore(
+                session=db_session, logger=logger
+            ),
+            app_client=app_client,
+            http_client=http_client,
+            logger=logger,
+        )
+        async with db_session.begin():
+            result = await syncer.sync(binding_id)
+            await db_session.commit()
+
+    assert result.status is DashboardSyncStatus.failed
+    assert result.error
+    assert "github app" in result.error.lower()
+
+    async with db_session.begin():
+        binding_store = DashboardGitHubTemplateBindingStore(
+            session=db_session, logger=_logger()
+        )
+        binding = await binding_store.get_by_id(binding_id)
+    assert binding is not None
+    assert binding.last_sync_status == "failed"
+    assert binding.last_sync_error
+    assert "github app" in binding.last_sync_error.lower()
+    assert binding.github_template_id is None
+
+
+@pytest.mark.asyncio
 async def test_sync_unexpected_parse_error_propagates(
     db_session: AsyncSession,
     mock_github: GitHubMock,

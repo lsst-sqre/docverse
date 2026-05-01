@@ -400,6 +400,84 @@ async def test_dashboard_sync_invalid_template_marks_job_failed(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_sync_unhandled_syncer_exception_marks_binding_failed(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unhandled syncer exception flips the binding to ``failed``.
+
+    The syncer's narrow ``except`` blocks deliberately let unexpected
+    exceptions (programming errors, library bugs the syncer doesn't
+    anticipate) propagate to the worker's outer ``except Exception``.
+    Without the safety-net binding update, the binding would remain at
+    its server-default ``last_sync_status="pending"`` forever — silently
+    lying about what happened. Assert the worker now also writes
+    ``failed`` to the binding so operators see the failure surface.
+    """
+    logger = _logger()
+    async with db_session.begin():
+        org_id, _ = await _setup_org_and_projects(
+            db_session, org_slug="sync-explode", project_slugs=("alpha",)
+        )
+        binding_id = await _create_binding(db_session, org_id=org_id)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_sync,
+            org_id=org_id,
+            backend_job_id="arq-explode",
+        )
+
+    async def _exploding_sync(self: object, binding_id: int) -> None:
+        msg = "unexpected syncer bug"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        "docverse.services.dashboard_templates.sync."
+        "DashboardTemplateSyncer.sync",
+        _exploding_sync,
+    )
+
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        payload = {
+            "binding_id": binding_id,
+            "queue_job_id": queue_job.id,
+            "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+        }
+        result = await dashboard_sync(ctx, payload)
+
+    assert result == "failed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert "unexpected syncer bug" in job.errors["message"]
+
+            binding_store = DashboardGitHubTemplateBindingStore(
+                session=session, logger=_logger()
+            )
+            binding = await binding_store.get_by_id(binding_id)
+            assert binding is not None
+            assert binding.last_sync_status == "failed"
+            assert binding.last_sync_error
+            assert "RuntimeError" in binding.last_sync_error
+            assert "unexpected syncer bug" in binding.last_sync_error
+
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
+
+
+@pytest.mark.asyncio
 async def test_dashboard_sync_missing_binding_fails_the_job(
     app: None,
     db_session: AsyncSession,
