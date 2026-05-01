@@ -31,15 +31,18 @@ class GitHubAppValidationState(Protocol):
     """
 
     @property
-    def github_app_enabled(self) -> bool: ...
+    def github_app_enabled(self) -> bool:
+        """Whether all three GitHub App secrets are set."""
 
     @property
-    def github_app_id(self) -> int | None: ...
+    def github_app_id(self) -> int | None:
+        """The configured GitHub App numeric ID, or ``None``."""
 
-    def set_github_app_validated(self, *, value: bool) -> None: ...
+    def set_github_app_validated(self, *, value: bool) -> None:
+        """Record the outcome of the startup-time validation."""
 
 
-async def validate_github_app(
+async def validate_github_app(  # noqa: PLR0913
     *,
     state: GitHubAppValidationState,
     app_id: int | None,
@@ -73,14 +76,18 @@ async def validate_github_app(
     )
     try:
         await client.validate()
-    except Exception as exc:
-        logger.error(
+    except Exception as exc:  # noqa: BLE001
+        # Validator must not crash the service. Known failure types
+        # are ``jwt.exceptions.InvalidKeyError`` (PEM parse) and
+        # ``gidgethub.GitHubException`` (non-2xx response), but
+        # underlying ``httpx`` errors and any future safir/pyjwt
+        # update can surface different types — narrowing the catch
+        # would trade a clear behaviour for a brittle list.
+        logger.error(  # noqa: TRY400
             "GitHub App config invalid; disabling feature",
             error=str(exc),
             error_type=type(exc).__name__,
         )
         state.set_github_app_validated(value=False)
     else:
-        logger.info(
-            "GitHub App config validated", app_id=state.github_app_id
-        )
+        logger.info("GitHub App config validated", app_id=state.github_app_id)

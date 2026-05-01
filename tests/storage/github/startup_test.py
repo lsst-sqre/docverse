@@ -135,9 +135,7 @@ async def test_disables_feature_on_unauthorized_app_response(
     mock_github: GitHubMock,
 ) -> None:
     """A 401 from ``GET /app`` flips the feature off and logs ERROR."""
-    mock_github.seed_app(
-        status_code=401, body={"message": "Bad credentials"}
-    )
+    mock_github.seed_app(status_code=401, body={"message": "Bad credentials"})
     state = _FakeState(enabled=True, app_id=mock_github.app_id)
 
     async with httpx.AsyncClient() as http_client:

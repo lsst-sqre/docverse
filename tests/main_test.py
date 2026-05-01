@@ -47,11 +47,11 @@ async def _reset_context_dependency() -> AsyncGenerator[None]:
     ``test_..._skips_validation_when_secrets_unset`` run.
     """
     saved_secrets = (
-        context_dependency._github_app_id,  # noqa: SLF001
-        context_dependency._github_app_private_key,  # noqa: SLF001
-        context_dependency._github_webhook_secret,  # noqa: SLF001
+        context_dependency._github_app_id,
+        context_dependency._github_app_private_key,
+        context_dependency._github_webhook_secret,
     )
-    saved_validated = context_dependency._github_app_validated  # noqa: SLF001
+    saved_validated = context_dependency._github_app_validated
     try:
         yield
     finally:
@@ -89,7 +89,7 @@ def _patch_github_secrets(
     *,
     app_id: int,
     private_key: str,
-    webhook_secret: str = "wh-secret",
+    webhook_secret: str = "wh-secret",  # noqa: S107
 ) -> None:
     monkeypatch.setattr(config, "github_app_id", app_id)
     monkeypatch.setattr(
@@ -107,10 +107,10 @@ def _override_arq_and_user_info() -> None:
     ``LifespanManager`` block; tests in this file run the lifespan
     themselves, so they must repeat the same overrides post-startup.
     """
-    arq_dependency._arq_queue = MockArqQueue(  # noqa: SLF001
+    arq_dependency._arq_queue = MockArqQueue(
         default_queue_name=config.arq_queue_name
     )
-    context_dependency._user_info_store = StubUserInfoStore()  # noqa: SLF001
+    context_dependency._user_info_store = StubUserInfoStore()
 
 
 @pytest.mark.asyncio
@@ -130,10 +130,7 @@ async def test_lifespan_validates_github_app_when_secrets_set(
     with capture_logs() as captured:
         async with LifespanManager(docverse_app):
             _override_arq_and_user_info()
-            assert (
-                context_dependency._github_app_validated  # noqa: SLF001
-                is True
-            )
+            assert context_dependency._github_app_validated is True
 
     info_events = [
         entry
@@ -163,10 +160,7 @@ async def test_lifespan_disables_github_app_on_invalid_key(
     with capture_logs() as captured:
         async with LifespanManager(docverse_app):
             _override_arq_and_user_info()
-            assert (
-                context_dependency._github_app_validated  # noqa: SLF001
-                is False
-            )
+            assert context_dependency._github_app_validated is False
             async with AsyncClient(
                 base_url="https://example.com/",
                 transport=ASGITransport(app=docverse_app),
@@ -210,10 +204,7 @@ async def test_lifespan_disables_github_app_on_unauthorized_app(
     with capture_logs() as captured:
         async with LifespanManager(docverse_app):
             _override_arq_and_user_info()
-            assert (
-                context_dependency._github_app_validated  # noqa: SLF001
-                is False
-            )
+            assert context_dependency._github_app_validated is False
 
     error_events = [
         entry
@@ -233,10 +224,7 @@ async def test_lifespan_skips_validation_when_secrets_unset(
         async with LifespanManager(docverse_app):
             _override_arq_and_user_info()
             assert context_dependency.github_app_enabled is False
-            assert (
-                context_dependency._github_app_validated  # noqa: SLF001
-                is True
-            )
+            assert context_dependency._github_app_validated is True
 
     validator_events = [
         entry
