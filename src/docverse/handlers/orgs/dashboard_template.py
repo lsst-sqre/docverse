@@ -16,7 +16,8 @@ from docverse.services.dashboard_templates.enqueue import (
 
 from .models import DashboardTemplateBindingResponse
 
-router = APIRouter()
+org_default_router = APIRouter()
+project_override_router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +25,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 
-@router.get(
+@org_default_router.get(
     "/orgs/{org}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Get the organization's default dashboard-template binding",
@@ -43,7 +44,7 @@ async def get_org_dashboard_template(
     )
 
 
-@router.put(
+@org_default_router.put(
     "/orgs/{org}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Create or update the org-default dashboard-template binding",
@@ -76,7 +77,7 @@ async def put_org_dashboard_template(
     )
 
 
-@router.delete(
+@org_default_router.delete(
     "/orgs/{org}/dashboard-template",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete the organization's default dashboard-template binding",
@@ -98,7 +99,7 @@ async def delete_org_dashboard_template(
 # ---------------------------------------------------------------------------
 
 
-@router.get(
+@project_override_router.get(
     "/orgs/{org}/projects/{project}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Get a project's dashboard-template binding override",
@@ -123,7 +124,7 @@ async def get_project_dashboard_template(
     )
 
 
-@router.put(
+@project_override_router.put(
     "/orgs/{org}/projects/{project}/dashboard-template",
     response_model=DashboardTemplateBindingResponse,
     summary="Create or update a project's dashboard-template binding override",
@@ -162,7 +163,7 @@ async def put_project_dashboard_template(  # noqa: PLR0913
     )
 
 
-@router.delete(
+@project_override_router.delete(
     "/orgs/{org}/projects/{project}/dashboard-template",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a project's dashboard-template binding override",

@@ -719,3 +719,35 @@ async def test_org_put_enqueue_failure_marks_binding_failed(
             assert binding.last_sync_error is not None
             assert "arq down" in binding.last_sync_error
         break
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI tag assignment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_template_openapi_tags(client: AsyncClient) -> None:
+    """Verify dashboard-template endpoints carry the right OpenAPI tags.
+
+    Org-default routes are tagged ``orgs``; project-override routes stay
+    tagged ``projects``.
+    """
+    response = await client.get("/docverse/openapi.json")
+    assert response.status_code == 200
+    paths = response.json()["paths"]
+
+    org_path = paths["/docverse/orgs/{org}/dashboard-template"]
+    for method in ("get", "put", "delete"):
+        assert org_path[method]["tags"] == ["orgs"], (
+            f"Expected org-default {method.upper()} to be tagged 'orgs'"
+        )
+
+    project_path = paths[
+        "/docverse/orgs/{org}/projects/{project}/dashboard-template"
+    ]
+    for method in ("get", "put", "delete"):
+        assert project_path[method]["tags"] == ["projects"], (
+            f"Expected project-override {method.upper()} to be tagged "
+            f"'projects'"
+        )
