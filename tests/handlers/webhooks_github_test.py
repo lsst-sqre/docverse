@@ -107,7 +107,7 @@ async def _seed_binding(
     *,
     owner: str = "acme",
     repo: str = "templates",
-    ref: str = "refs/heads/main",
+    ref: str = "main",
     root_path: str = "/",
 ) -> None:
     logger = structlog.get_logger("test")
@@ -219,6 +219,43 @@ async def test_post_signed_push_enqueues_dashboard_sync(
     arq_queue = arq_dependency._arq_queue
     assert isinstance(arq_queue, MockArqQueue)
     assert count_jobs_by_name(arq_queue, "dashboard_sync") >= 1
+
+
+@pytest.mark.asyncio
+async def test_post_signed_push_matches_bare_branch_binding(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A signed push with ``refs/heads/main`` matches a bare ``main`` binding.
+
+    Reproduces DM-54689: GitHub push payloads always carry the
+    fully-qualified ``refs/heads/<branch>`` form, but operators register
+    bindings with the bare branch name. The handler must enqueue exactly
+    one ``dashboard_sync`` for this asymmetric pair.
+    """
+    arq_queue = arq_dependency._arq_queue
+    assert isinstance(arq_queue, MockArqQueue)
+    before = count_jobs_by_name(arq_queue, "dashboard_sync")
+    await _seed_binding(ref="main", root_path="/")
+    payload = _push_payload(
+        ref="refs/heads/main",
+        changed_files=["templates/blue/dashboard.html.jinja"],
+    )
+    body = json.dumps(payload).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000004",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+    assert response.status_code == 200
+    after = count_jobs_by_name(arq_queue, "dashboard_sync")
+    assert after - before == 1
 
 
 @pytest.mark.asyncio

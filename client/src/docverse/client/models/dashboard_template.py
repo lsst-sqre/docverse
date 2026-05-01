@@ -5,12 +5,38 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
     "DashboardTemplateBinding",
     "DashboardTemplateBindingCreate",
+    "normalize_github_ref",
 ]
+
+_REF_PREFIXES = ("refs/heads/", "refs/tags/")
+
+
+def normalize_github_ref(value: str) -> str:
+    """Strip a leading ``refs/heads/`` or ``refs/tags/`` prefix from a ref.
+
+    GitHub push payloads carry refs in their fully-qualified form
+    (``refs/heads/main``, ``refs/tags/v1.0``), but operators register
+    bindings using the bare branch or tag name (``main``, ``v1.0``).
+    This helper is the canonical normalizer used at both write seams:
+    the ``DashboardTemplateBindingCreate`` validator (so PUT bodies
+    from operators land in canonical form) and the push-event processor
+    (so webhook lookups match bindings stored in canonical form).
+
+    Refs that don't start with one of the known prefixes — bare names,
+    commit SHAs, ``refs/pull/...``, ``refs/remotes/...`` — pass through
+    unchanged. ``refs/heads/`` or ``refs/tags/`` alone normalize to the
+    empty string, which fails the binding's ``min_length=1`` constraint
+    on the model side.
+    """
+    for prefix in _REF_PREFIXES:
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
 
 
 class DashboardTemplateBindingCreate(BaseModel):
@@ -43,9 +69,22 @@ class DashboardTemplateBindingCreate(BaseModel):
         Field(
             min_length=1,
             max_length=256,
-            description="Git ref (branch, tag, or commit SHA) to sync from.",
+            description=(
+                "Git ref (branch, tag, or commit SHA) to sync from."
+                " Stored in bare form (``main``, ``v1.0``); a leading"
+                " ``refs/heads/`` or ``refs/tags/`` prefix on input is"
+                " stripped automatically so GitHub push events match"
+                " operator-supplied bindings."
+            ),
         ),
     ]
+
+    @field_validator("github_ref", mode="before")
+    @classmethod
+    def _strip_ref_prefix(cls, value: object) -> object:
+        if isinstance(value, str):
+            return normalize_github_ref(value)
+        return value
 
     root_path: Annotated[
         str,

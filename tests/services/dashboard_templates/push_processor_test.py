@@ -157,7 +157,7 @@ async def test_process_filters_bindings_by_root_path_intersection(
                     project_id=None,
                     github_owner="acme",
                     github_repo="templates",
-                    github_ref="refs/heads/main",
+                    github_ref="main",
                     root_path="templates/blue",
                 ),
             ],
@@ -215,7 +215,7 @@ async def test_process_skips_bindings_with_no_intersecting_root_path(
                     project_id=None,
                     github_owner="acme",
                     github_repo="templates",
-                    github_ref="refs/heads/main",
+                    github_ref="main",
                     root_path="templates/red",
                 ),
             ],
@@ -268,7 +268,7 @@ async def test_process_returns_empty_when_no_bindings_match_repo_ref(
                     project_id=None,
                     github_owner="acme",
                     github_repo="templates",
-                    github_ref="refs/heads/main",
+                    github_ref="main",
                     root_path="/",
                 ),
             ],
@@ -321,7 +321,7 @@ async def test_process_root_path_slash_matches_any_change(
                     project_id=None,
                     github_owner="acme",
                     github_repo="templates",
-                    github_ref="refs/heads/main",
+                    github_ref="main",
                     root_path="/",
                 ),
             ],
@@ -336,6 +336,118 @@ async def test_process_root_path_slash_matches_any_change(
             {
                 "id": "after-sha",
                 "modified": ["docs/index.md"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=1,
+    )
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+        await db_session.commit()
+
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_matches_bare_branch_against_refs_heads_payload(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A binding stored as ``main`` matches a push with ``refs/heads/main``.
+
+    Reproduces DM-54689: GitHub push payloads always carry the
+    fully-qualified ``refs/heads/<branch>`` form, but bindings store the
+    bare branch name. Without per-side normalization the lookup misses
+    silently and the push is ignored.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        _, _ = await _seed_org_with_bindings(
+            db_session,
+            org_slug="push-bare-branch",
+            bindings=[
+                DashboardGitHubTemplateBindingCreate(
+                    org_id=0,
+                    project_id=None,
+                    github_owner="acme",
+                    github_repo="templates",
+                    github_ref="main",
+                    root_path="/",
+                ),
+            ],
+        )
+        await db_session.commit()
+
+    payload = _make_push_payload(
+        owner="acme",
+        repo="templates",
+        ref="refs/heads/main",
+        commits=[
+            {
+                "id": "after-sha",
+                "modified": ["templates/blue/dashboard.html.jinja"],
+                "added": [],
+                "removed": [],
+            }
+        ],
+        size=1,
+    )
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+        await db_session.commit()
+
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_matches_bare_tag_against_refs_tags_payload(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A binding stored as ``v1.0`` matches a push with ``refs/tags/v1.0``."""
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        _, _ = await _seed_org_with_bindings(
+            db_session,
+            org_slug="push-bare-tag",
+            bindings=[
+                DashboardGitHubTemplateBindingCreate(
+                    org_id=0,
+                    project_id=None,
+                    github_owner="acme",
+                    github_repo="templates",
+                    github_ref="v1.0",
+                    root_path="/",
+                ),
+            ],
+        )
+        await db_session.commit()
+
+    payload = _make_push_payload(
+        owner="acme",
+        repo="templates",
+        ref="refs/tags/v1.0",
+        commits=[
+            {
+                "id": "after-sha",
+                "modified": ["templates/blue/dashboard.html.jinja"],
                 "added": [],
                 "removed": [],
             }
@@ -380,7 +492,7 @@ async def test_process_falls_back_to_compare_api_when_payload_truncated(
                     project_id=None,
                     github_owner="acme",
                     github_repo="templates",
-                    github_ref="refs/heads/main",
+                    github_ref="main",
                     root_path="templates/blue",
                 ),
             ],
@@ -448,7 +560,7 @@ async def test_process_compare_fallback_filters_correctly(
                     project_id=None,
                     github_owner="acme",
                     github_repo="templates",
-                    github_ref="refs/heads/main",
+                    github_ref="main",
                     root_path="templates/red",
                 ),
             ],

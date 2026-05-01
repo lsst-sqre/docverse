@@ -485,6 +485,79 @@ async def test_put_accepts_valid_github_repo(
 
 
 # ---------------------------------------------------------------------------
+# github_ref normalization (DM-54689)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitted_ref", "stored_ref"),
+    [
+        ("refs/heads/main", "main"),
+        ("refs/tags/v1.0", "v1.0"),
+    ],
+)
+async def test_org_put_normalizes_refs_prefix(
+    client: AsyncClient, submitted_ref: str, stored_ref: str
+) -> None:
+    """``refs/heads/`` and ``refs/tags/`` prefixes round-trip as bare refs.
+
+    GitHub push payloads carry fully-qualified refs, but operators
+    register bindings with bare names. The validator strips the prefix
+    on input so bindings store the canonical bare form regardless of
+    which form the operator typed.
+    """
+    await _setup_org(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_ref": submitted_ref},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 201
+    assert response.json()["github_ref"] == stored_ref
+
+    # GET returns the same canonical form.
+    follow_up = await client.get(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert follow_up.status_code == 200
+    assert follow_up.json()["github_ref"] == stored_ref
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_ref", "second_ref"),
+    [
+        ("refs/heads/main", "main"),
+        ("refs/tags/v1.0", "v1.0"),
+    ],
+)
+async def test_org_put_bare_form_after_prefixed_is_idempotent(
+    client: AsyncClient, first_ref: str, second_ref: str
+) -> None:
+    """A re-PUT with the bare form after a prefixed form is a no-op."""
+    await _setup_org(client)
+    first = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_ref": first_ref},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert first.status_code == 201
+    first_body = first.json()
+
+    second = await client.put(
+        f"/docverse/orgs/{_ORG}/dashboard-template",
+        json={**_VALID_BODY, "github_ref": second_ref},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["github_ref"] == first_body["github_ref"]
+    assert second_body["date_updated"] == first_body["date_updated"]
+
+
+# ---------------------------------------------------------------------------
 # Project-override binding
 # ---------------------------------------------------------------------------
 

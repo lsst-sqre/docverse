@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 import structlog
 
+from docverse.client.models.dashboard_template import normalize_github_ref
 from docverse.domain.queue import QueueJob
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
@@ -93,15 +94,19 @@ class PushEventProcessor:
             )
             return []
 
+        normalized_ref = normalize_github_ref(ref)
         bindings = await self._binding_store.list_by_repo_ref(
-            github_owner=owner, github_repo=repo_name, github_ref=ref
+            github_owner=owner,
+            github_repo=repo_name,
+            github_ref=normalized_ref,
         )
         if not bindings:
-            self._logger.debug(
+            self._logger.info(
                 "No bindings match push event",
                 github_owner=owner,
                 github_repo=repo_name,
-                github_ref=ref,
+                github_ref_raw=ref,
+                github_ref=normalized_ref,
             )
             return []
 
