@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import httpx
 import structlog
 from pydantic import SecretStr
@@ -21,7 +23,9 @@ from .services.dashboard_templates import (
     DashboardSyncEnqueuer,
     DashboardTemplateBindingService,
     DashboardTemplateSyncer,
+    InstallationEventProcessor,
     PushEventProcessor,
+    RenameEventProcessor,
     TemplateResolver,
 )
 from .services.edition import EditionService
@@ -59,6 +63,23 @@ from .storage.queue_backend import (
 )
 from .storage.queue_job_store import QueueJobStore
 from .storage.user_info_store import UserInfoStore
+
+
+@dataclass(frozen=True)
+class WebhookDispatch:
+    """Bundle of objects the GitHub webhook handler needs per delivery.
+
+    The HMAC secret verifies ``x-hub-signature-256``; the three
+    processors handle the event types the dashboard-template feature
+    subscribes to. Created fresh per request inside
+    :meth:`Factory.create_webhook_dispatch` so each delivery binds to
+    the request's own DB session and logger.
+    """
+
+    webhook_secret: str
+    push: PushEventProcessor
+    rename: RenameEventProcessor
+    installation: InstallationEventProcessor
 
 
 class Factory:
@@ -449,14 +470,16 @@ class Factory:
             logger=self._logger,
         )
 
-    def create_webhook_dispatch(self) -> tuple[str, PushEventProcessor]:
-        """Return the GitHub webhook secret and a :class:`PushEventProcessor`.
+    def create_webhook_dispatch(self) -> WebhookDispatch:
+        """Return the webhook secret + every event-type processor.
 
-        The webhook handler needs both the HMAC secret (to verify
-        ``x-hub-signature-256``) and the processor (to fan a push out
-        to ``dashboard_sync`` enqueues). Bundling them into one
-        accessor gives the handler a single ``GitHubAppNotConfiguredError``
-        raise site to translate into its 404 feature-disabled response.
+        The webhook handler needs the HMAC secret (to verify
+        ``x-hub-signature-256``) and one processor per registered
+        event type. Bundling them into one accessor gives the handler
+        a single ``GitHubAppNotConfiguredError`` raise site to
+        translate into its 404 feature-disabled response, and the
+        gidgethub router dispatches the right processor by event +
+        action without per-handler factory plumbing.
 
         Raises
         ------
@@ -469,14 +492,32 @@ class Factory:
         if self._http_client is None:
             msg = "HTTP client is required to build a PushEventProcessor"
             raise RuntimeError(msg)
-        processor = PushEventProcessor(
-            binding_store=self.create_dashboard_github_template_binding_store(),
+        binding_store = self.create_dashboard_github_template_binding_store()
+        template_store = DashboardGitHubTemplateStore(
+            session=self._session, logger=self._logger
+        )
+        push = PushEventProcessor(
+            binding_store=binding_store,
             enqueuer=self.create_dashboard_sync_enqueuer(),
             app_client=self.create_github_app_client(),
             http_client=self._http_client,
             logger=self._logger,
         )
-        return webhook_secret.get_secret_value(), processor
+        rename = RenameEventProcessor(
+            binding_store=binding_store,
+            template_store=template_store,
+            logger=self._logger,
+        )
+        installation = InstallationEventProcessor(
+            binding_store=binding_store,
+            logger=self._logger,
+        )
+        return WebhookDispatch(
+            webhook_secret=webhook_secret.get_secret_value(),
+            push=push,
+            rename=rename,
+            installation=installation,
+        )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:
         """Create a DashboardPublisher for one render.

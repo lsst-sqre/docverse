@@ -8,7 +8,9 @@ from .binding import (
 )
 from .enqueue import DashboardSyncEnqueuer
 from .fanout import DashboardRebuildFanout
+from .installation_processor import InstallationEventProcessor
 from .push_processor import PushEventProcessor
+from .rename_processor import RenameEventProcessor
 from .resolver import (
     ResolvedTemplate,
     ResolvedTemplateOrigin,
@@ -23,7 +25,9 @@ __all__ = [
     "DashboardTemplateBindingService",
     "DashboardTemplateSyncError",
     "DashboardTemplateSyncer",
+    "InstallationEventProcessor",
     "PushEventProcessor",
+    "RenameEventProcessor",
     "ResolvedTemplate",
     "ResolvedTemplateOrigin",
     "TemplateResolver",
