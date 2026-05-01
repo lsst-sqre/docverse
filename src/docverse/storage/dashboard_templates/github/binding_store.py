@@ -389,6 +389,227 @@ class DashboardGitHubTemplateBindingStore:
         await self._session.flush()
         return True
 
+    async def rename_repo_by_repo_id(
+        self,
+        *,
+        github_repo_id: int,
+        new_repo: str,
+    ) -> list[int]:
+        """Rewrite ``github_repo`` on all bindings keyed by stable repo ID.
+
+        Used by the ``repository.renamed`` webhook handler: any binding
+        whose first sync captured ``github_repo_id`` matches here, even
+        when its display name is now stale. ``date_updated`` is
+        preserved because operator-visible source-coordinate writes
+        come through PUT, not through GitHub-side metadata sync.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_repo_id
+                == github_repo_id,
+            )
+            .values(
+                github_repo=new_repo,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def rename_repo_for_unsynced_by_old_name(
+        self,
+        *,
+        github_owner: str,
+        old_repo: str,
+        new_repo: str,
+    ) -> list[int]:
+        """Rewrite ``github_repo`` on un-synced bindings matching old name.
+
+        Fallback for bindings registered via PUT but never synced —
+        ``github_repo_id IS NULL``, so ID-keyed matching cannot reach
+        them. The owner-side filter pins the update to the namespace
+        where the rename actually happened so a same-name binding in
+        another GitHub owner is not collateral damage.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_owner == github_owner,
+                SqlDashboardGitHubTemplateBinding.github_repo == old_repo,
+                SqlDashboardGitHubTemplateBinding.github_repo_id.is_(None),
+            )
+            .values(
+                github_repo=new_repo,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def transfer_repo_by_repo_id(
+        self,
+        *,
+        github_repo_id: int,
+        new_owner: str,
+        new_owner_id: int,
+        new_repo: str,
+    ) -> list[int]:
+        """Rewrite owner + repo strings + ``github_owner_id`` on transfer.
+
+        ``repository.transferred`` payloads carry the same ``repository
+        .id`` but a new ``repository.owner`` (login + id) and may
+        carry a new ``repository.name`` if the transfer was followed by
+        a rename. All four columns flip together so a subsequent push
+        from the new namespace matches the binding by stable repo ID
+        and the display name does not lag.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_repo_id
+                == github_repo_id,
+            )
+            .values(
+                github_owner=new_owner,
+                github_owner_id=new_owner_id,
+                github_repo=new_repo,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def rename_owner_by_owner_id(
+        self,
+        *,
+        github_owner_id: int,
+        new_owner: str,
+    ) -> list[int]:
+        """Rewrite ``github_owner`` on all bindings keyed by owner ID.
+
+        The ``organization.renamed`` webhook handler uses this for
+        synced bindings. ``github_owner_id`` is the stable handle —
+        the org's display login is the only field that flips on a
+        rename.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_owner_id
+                == github_owner_id,
+            )
+            .values(
+                github_owner=new_owner,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def rename_owner_for_unsynced_by_old_login(
+        self,
+        *,
+        old_login: str,
+        new_owner: str,
+    ) -> list[int]:
+        """Rewrite ``github_owner`` on un-synced bindings matching old login.
+
+        Fallback for bindings whose ``github_owner_id`` was never
+        captured. Restricted to ``github_owner_id IS NULL`` so a
+        coincidentally-named org (different numeric id, same login at
+        some past point) cannot be moved by a rename event aimed at
+        a different namespace.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_owner == old_login,
+                SqlDashboardGitHubTemplateBinding.github_owner_id.is_(None),
+            )
+            .values(
+                github_owner=new_owner,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def mark_unreachable_by_installation_id(
+        self,
+        *,
+        github_installation_id: int,
+        reason: str,
+    ) -> list[int]:
+        """Mark all bindings under an installation as ``failed``.
+
+        Used for ``installation.deleted`` and ``installation.suspend``.
+        ``reason`` lands in ``last_sync_error`` as a machine-readable
+        tag (e.g. ``installation_suspended``) so the
+        ``installation.unsuspend`` clearer can target the same set of
+        rows. ``date_updated`` is preserved — installation-state flips
+        are not source-coordinate edits.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_installation_id
+                == github_installation_id,
+            )
+            .values(
+                last_sync_status="failed",
+                last_sync_error=reason,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def clear_failure_by_installation_id_and_reason(
+        self,
+        *,
+        github_installation_id: int,
+        reason: str,
+    ) -> list[int]:
+        """Clear a previously-recorded installation-failure flag.
+
+        ``installation.unsuspend`` uses this to reverse the
+        ``installation_suspended`` mark left by ``installation.suspend``.
+        The ``reason`` filter prevents the unsuspend from clobbering
+        a different failure (e.g. a real GitHub 5xx from the syncer)
+        that happened to land between the suspend and the unsuspend.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(
+                SqlDashboardGitHubTemplateBinding.github_installation_id
+                == github_installation_id,
+                SqlDashboardGitHubTemplateBinding.last_sync_status == "failed",
+                SqlDashboardGitHubTemplateBinding.last_sync_error == reason,
+            )
+            .values(
+                last_sync_status="pending",
+                last_sync_error=None,
+                date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
+            )
+            .returning(SqlDashboardGitHubTemplateBinding.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
     async def _get_row(
         self, binding_id: int
     ) -> SqlDashboardGitHubTemplateBinding | None:

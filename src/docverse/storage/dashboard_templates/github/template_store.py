@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.dbschema.dashboard_github_template import (
@@ -236,6 +236,80 @@ class DashboardGitHubTemplateStore:
         if row is None:
             return None
         return DashboardGitHubTemplateFile.model_validate(row)
+
+    async def rename_repo_by_repo_id(
+        self,
+        *,
+        github_repo_id: int,
+        new_repo: str,
+    ) -> list[int]:
+        """Rewrite ``github_repo`` on all content rows keyed by stable repo ID.
+
+        The synced bytes themselves don't change — only the dedup-key
+        component that carries the GitHub display name. Keeps the
+        binding's ETag short-circuit on the next sync from re-fetching
+        a tree it already has.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplate)
+            .where(
+                SqlDashboardGitHubTemplate.github_repo_id == github_repo_id,
+            )
+            .values(github_repo=new_repo)
+            .returning(SqlDashboardGitHubTemplate.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def transfer_repo_by_repo_id(
+        self,
+        *,
+        github_repo_id: int,
+        new_owner: str,
+        new_owner_id: int,
+        new_repo: str,
+    ) -> list[int]:
+        """Rewrite owner + repo strings + ``github_owner_id`` on transfer.
+
+        Mirror of :meth:`DashboardGitHubTemplateBindingStore
+        .transfer_repo_by_repo_id` for the synced content row whose
+        dedup key includes the owner login.
+        """
+        stmt = (
+            update(SqlDashboardGitHubTemplate)
+            .where(
+                SqlDashboardGitHubTemplate.github_repo_id == github_repo_id,
+            )
+            .values(
+                github_owner=new_owner,
+                github_owner_id=new_owner_id,
+                github_repo=new_repo,
+            )
+            .returning(SqlDashboardGitHubTemplate.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def rename_owner_by_owner_id(
+        self,
+        *,
+        github_owner_id: int,
+        new_owner: str,
+    ) -> list[int]:
+        """Rewrite ``github_owner`` on content rows keyed by owner ID."""
+        stmt = (
+            update(SqlDashboardGitHubTemplate)
+            .where(
+                SqlDashboardGitHubTemplate.github_owner_id == github_owner_id,
+            )
+            .values(github_owner=new_owner)
+            .returning(SqlDashboardGitHubTemplate.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
 
     async def _get_row_by_id(
         self, template_id: int

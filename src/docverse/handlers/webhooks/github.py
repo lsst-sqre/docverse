@@ -1,9 +1,9 @@
-"""GitHub webhook endpoint dispatching push events to the sync queue."""
+"""GitHub webhook endpoint dispatching events to per-event processors."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated
+from typing import Annotated, Any
 
 import gidgethub
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -11,7 +11,12 @@ from gidgethub import sansio
 from gidgethub.routing import Router as GidgethubRouter
 
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.services.dashboard_templates import PushEventProcessor
+from docverse.factory import WebhookDispatch
+from docverse.services.dashboard_templates import (
+    InstallationEventProcessor,
+    PushEventProcessor,
+    RenameEventProcessor,
+)
 from docverse.storage.github import GitHubAppNotConfiguredError
 
 __all__ = ["router"]
@@ -41,20 +46,82 @@ once, dispatch many.
 async def _handle_push(
     event: sansio.Event,
     *,
-    processor: PushEventProcessor,
+    push: PushEventProcessor,
     context: RequestContext,
+    **_unused: Any,
 ) -> None:
     """Translate a push event into ``dashboard_sync`` enqueues.
 
     The processor owns transaction-free DB writes through the
     enqueuer; the handler wraps both the binding lookup and the
     enqueue in a single ``session.begin()`` so a failure aborts the
-    whole webhook delivery cleanly.
+    whole webhook delivery cleanly. ``**_unused`` absorbs the
+    rename/installation processors that gidgethub's dispatcher passes
+    to every callback uniformly.
     """
     async with context.session.begin():
-        jobs = await processor.process(event.data)
+        jobs = await push.process(event.data)
         await context.session.commit()
     context.logger.info("Processed push webhook", enqueued=len(jobs))
+
+
+@_event_router.register("repository", action="renamed")
+async def _handle_repository_renamed(
+    event: sansio.Event,
+    *,
+    rename: RenameEventProcessor,
+    context: RequestContext,
+    **_unused: Any,
+) -> None:
+    """Rewrite display names on bindings + content rows for a renamed repo."""
+    async with context.session.begin():
+        await rename.process_repository_renamed(event.data)
+        await context.session.commit()
+
+
+@_event_router.register("repository", action="transferred")
+async def _handle_repository_transferred(
+    event: sansio.Event,
+    *,
+    rename: RenameEventProcessor,
+    context: RequestContext,
+    **_unused: Any,
+) -> None:
+    """Rewrite owner identity on rows for a transferred repo."""
+    async with context.session.begin():
+        await rename.process_repository_transferred(event.data)
+        await context.session.commit()
+
+
+@_event_router.register("organization", action="renamed")
+async def _handle_organization_renamed(
+    event: sansio.Event,
+    *,
+    rename: RenameEventProcessor,
+    context: RequestContext,
+    **_unused: Any,
+) -> None:
+    """Rewrite owner login on bindings + content rows for a renamed org."""
+    async with context.session.begin():
+        await rename.process_organization_renamed(event.data)
+        await context.session.commit()
+
+
+@_event_router.register("installation", action="created")
+@_event_router.register("installation", action="deleted")
+@_event_router.register("installation", action="suspend")
+@_event_router.register("installation", action="unsuspend")
+async def _handle_installation(
+    event: sansio.Event,
+    *,
+    installation: InstallationEventProcessor,
+    context: RequestContext,
+    **_unused: Any,
+) -> None:
+    """Update binding reachability for installation lifecycle events."""
+    async with context.session.begin():
+        await installation.process(event.data)
+        await context.session.commit()
 
 
 @router.post(
@@ -85,7 +152,7 @@ async def post_github_webhook(
     chosen not to act on.
     """
     try:
-        secret, processor = context.factory.create_webhook_dispatch()
+        dispatch: WebhookDispatch = context.factory.create_webhook_dispatch()
     except GitHubAppNotConfiguredError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -95,7 +162,9 @@ async def post_github_webhook(
     body = await request.body()
     try:
         event = sansio.Event.from_http(
-            _lowercase_headers(request.headers), body, secret=secret
+            _lowercase_headers(request.headers),
+            body,
+            secret=dispatch.webhook_secret,
         )
     except gidgethub.ValidationFailure as exc:
         raise HTTPException(
@@ -107,7 +176,13 @@ async def post_github_webhook(
         github_event=event.event, github_delivery_id=event.delivery_id
     )
 
-    await _event_router.dispatch(event, processor=processor, context=context)
+    await _event_router.dispatch(
+        event,
+        push=dispatch.push,
+        rename=dispatch.rename,
+        installation=dispatch.installation,
+        context=context,
+    )
 
     return {"status": "ok"}
 
