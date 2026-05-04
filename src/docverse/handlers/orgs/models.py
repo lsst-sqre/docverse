@@ -121,6 +121,9 @@ class Organization(_OrganizationBase):
             dashboard_template_url=str(
                 request.url_for("get_org_dashboard_template", org=domain.slug)
             ),
+            keeper_sync_url=str(
+                request.url_for("get_org_keeper_sync_config", org=domain.slug)
+            ),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,

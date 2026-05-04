@@ -166,6 +166,12 @@ class Organization(BaseModel):
         ),
     )
 
+    keeper_sync_url: str = Field(
+        description=(
+            "URL to the organization's LTD Keeper sync configuration."
+        ),
+    )
+
     slug: str = Field(description="URL-safe identifier for the organization.")
 
     title: str = Field(description="Display title for the organization.")

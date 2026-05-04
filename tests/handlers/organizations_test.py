@@ -27,6 +27,8 @@ async def test_get_organization(client: AsyncClient) -> None:
         "/orgs/test-org/dashboard-template"
     )
     assert data["dashboard_template_url"].startswith("http")
+    assert data["keeper_sync_url"].endswith("/orgs/test-org/keeper-sync")
+    assert data["keeper_sync_url"].startswith("http")
     assert "date_created" in data
     assert "date_updated" in data
 
