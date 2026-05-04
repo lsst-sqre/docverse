@@ -203,6 +203,53 @@ async def test_update_edition(
 
 
 @pytest.mark.asyncio
+async def test_update_tracking(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``update_tracking`` rewrites the tracking columns on an edition."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="track-ed",
+                title="Track",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        await edition_store.update_tracking(
+            edition_id=edition.id,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 2},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        refetched = await edition_store.get_by_slug(
+            project_id=project_id, slug="track-ed"
+        )
+    assert refetched is not None
+    assert refetched.tracking_mode == TrackingMode.semver_major
+    assert refetched.tracking_params == {"major_version": 2}
+
+
+@pytest.mark.asyncio
+async def test_update_tracking_missing_raises(
+    edition_store: EditionStore,
+) -> None:
+    """``update_tracking`` raises when the edition id is unknown."""
+    with pytest.raises(RuntimeError, match="Edition id=999999 not found"):
+        await edition_store.update_tracking(
+            edition_id=999999,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+
+
+@pytest.mark.asyncio
 async def test_set_current_build(
     db_session: AsyncSession,
     edition_store: EditionStore,

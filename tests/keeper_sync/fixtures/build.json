@@ -1,0 +1,17 @@
+{
+  "self_url": "https://keeper.lsst.codes/builds/42",
+  "product_url": "https://keeper.lsst.codes/products/pipelines",
+  "slug": "42",
+  "date_created": "2026-04-30T18:25:00.000000+00:00",
+  "date_ended": null,
+  "uploaded": true,
+  "bucket_name": "lsst-the-docs",
+  "bucket_root_dir": "pipelines/builds/42",
+  "git_refs": ["main"],
+  "github_requester": "jsick",
+  "published_url": "https://pipelines.lsst.io/builds/42",
+  "surrogate_key": "build42surrogate1234567890abcdef",
+  "queue_url": null,
+  "post_prefix_urls": null,
+  "post_dir_urls": null
+}

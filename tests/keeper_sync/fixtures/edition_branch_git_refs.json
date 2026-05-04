@@ -1,0 +1,16 @@
+{
+  "self_url": "https://keeper.lsst.codes/editions/2",
+  "product_url": "https://keeper.lsst.codes/products/pipelines",
+  "build_url": "https://keeper.lsst.codes/builds/43",
+  "published_url": "https://pipelines.lsst.io/v/u-jsick-feature",
+  "slug": "u-jsick-feature",
+  "title": "u/jsick/feature",
+  "date_created": "2026-04-20T09:15:00.000000+00:00",
+  "date_rebuilt": "2026-04-29T14:00:00.000000+00:00",
+  "date_ended": null,
+  "surrogate_key": "ed2surrogate12345ed2surrogate1234",
+  "pending_rebuild": false,
+  "tracked_refs": ["u/jsick/feature"],
+  "mode": "git_refs",
+  "queue_url": null
+}

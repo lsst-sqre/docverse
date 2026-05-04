@@ -1,0 +1,13 @@
+{
+  "self_url": "https://keeper.lsst.codes/products/pipelines",
+  "slug": "pipelines",
+  "doc_repo": "https://github.com/lsst/pipelines_lsst_io",
+  "title": "LSST Science Pipelines",
+  "root_domain": "lsst.io",
+  "root_fastly_domain": "global.ssl.fastly.net",
+  "domain": "pipelines.lsst.io",
+  "fastly_domain": "pipelines.lsst.io.global.ssl.fastly.net",
+  "bucket_name": "lsst-the-docs",
+  "published_url": "https://pipelines.lsst.io",
+  "surrogate_key": "abc123def456abc123def456abc123de"
+}

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 import structlog
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.factory import Factory
+from docverse.keeper_sync.client import LtdClient
+from docverse.keeper_sync.s3_source import LtdS3Source
 from docverse.storage.queue_backend import ArqQueueBackend, NullQueueBackend
 
 
@@ -41,3 +44,46 @@ async def test_factory_with_arq_queue_uses_arq_backend(
         default_queue_name="docverse:queue",
     )
     assert isinstance(factory.create_queue_backend(), ArqQueueBackend)
+
+
+@pytest.mark.asyncio
+async def test_factory_creates_ltd_client_when_http_client_set(
+    db_session: AsyncSession,
+) -> None:
+    """LtdClient construction needs the shared httpx.AsyncClient."""
+    async with httpx.AsyncClient() as http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            http_client=http_client,
+            default_queue_name="docverse:queue",
+        )
+        client = factory.create_ltd_client()
+        assert isinstance(client, LtdClient)
+
+
+@pytest.mark.asyncio
+async def test_factory_create_ltd_client_without_http_raises(
+    db_session: AsyncSession,
+) -> None:
+    """No HTTP client -> the LTD-side accessor must error early."""
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        default_queue_name="docverse:queue",
+    )
+    with pytest.raises(RuntimeError, match="HTTP client is required"):
+        factory.create_ltd_client()
+
+
+@pytest.mark.asyncio
+async def test_factory_create_ltd_s3_source_returns_unopened(
+    db_session: AsyncSession,
+) -> None:
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        default_queue_name="docverse:queue",
+    )
+    source = factory.create_ltd_s3_source()
+    assert isinstance(source, LtdS3Source)

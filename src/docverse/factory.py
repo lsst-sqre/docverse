@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -12,6 +14,11 @@ from safir.arq import ArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .keeper_sync.client import LtdClient
+from .keeper_sync.copier import BuildContentCopier, CopyResult
+from .keeper_sync.s3_source import LtdS3Source
+from .keeper_sync.service import KeeperSyncContext, KeeperSyncService
+from .keeper_sync.state_store import KeeperSyncStateStore
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.credential import CredentialService
@@ -642,6 +649,96 @@ class Factory:
             credentials=cred_payload,
             logger=self._logger,
             http_client=self._http_client,
+        )
+
+    def create_ltd_client(
+        self, *, base_url: str = "https://keeper.lsst.codes"
+    ) -> LtdClient:
+        """Create an :class:`LtdClient` over the shared HTTP client."""
+        if self._http_client is None:
+            msg = "HTTP client is required to build an LtdClient"
+            raise RuntimeError(msg)
+        return LtdClient(
+            http_client=self._http_client,
+            base_url=base_url,
+            logger=self._logger,
+        )
+
+    def create_ltd_s3_source(
+        self, *, bucket: str = "lsst-the-docs"
+    ) -> LtdS3Source:
+        """Create an unopened anonymous S3 source for ``bucket``."""
+        return LtdS3Source(bucket=bucket, logger=self._logger)
+
+    def create_build_content_copier_for_org(
+        self,
+        *,
+        org_id: int,
+        service_label: str,
+        max_concurrent: int = 8,
+    ) -> AbstractAsyncContextManager[BuildContentCopier]:
+        """Return an async-CM that yields a wired-up copier for ``org``.
+
+        Used as ``async with factory.create_build_content_copier_for_org(
+        org_id=..., service_label=...) as copier:``. Both the LTD source
+        and the per-org destination are opened on entry and closed on
+        exit so a sync slot's resource lifetime is tightly bounded.
+        """
+
+        @asynccontextmanager
+        async def _open() -> AsyncGenerator[BuildContentCopier]:
+            destination = await self.create_objectstore_for_org(
+                org_id=org_id, service_label=service_label
+            )
+            source = self.create_ltd_s3_source()
+            async with source, destination:
+                yield BuildContentCopier(
+                    source=source,
+                    destination=destination,
+                    logger=self._logger,
+                    max_concurrent=max_concurrent,
+                )
+
+        return _open()
+
+    def create_keeper_sync_state_store(self) -> KeeperSyncStateStore:
+        """Create a :class:`KeeperSyncStateStore`."""
+        return KeeperSyncStateStore(session=self._session, logger=self._logger)
+
+    def create_keeper_sync_service(
+        self,
+        *,
+        org_id: int,
+        service_label: str,
+        ltd_base_url: str = "https://keeper.lsst.codes",
+    ) -> KeeperSyncService:
+        """Create a :class:`KeeperSyncService` for one org's sync run."""
+        ltd_client = self.create_ltd_client(base_url=ltd_base_url)
+
+        async def copy_callable(
+            source_prefix: str, dest_prefix: str
+        ) -> CopyResult:
+            async with self.create_build_content_copier_for_org(
+                org_id=org_id, service_label=service_label
+            ) as copier:
+                return await copier.copy_build(
+                    source_prefix=source_prefix, dest_prefix=dest_prefix
+                )
+
+        context = KeeperSyncContext(
+            org_store=self.create_org_store(),
+            project_store=self.create_project_store(),
+            project_service=self.create_project_service(),
+            edition_store=self.create_edition_store(),
+            build_store=self.create_build_store(),
+            state_store=self.create_keeper_sync_state_store(),
+        )
+        return KeeperSyncService(
+            session=self._session,
+            context=context,
+            ltd_client=ltd_client,
+            copy_callable=copy_callable,
+            logger=self._logger,
         )
 
 

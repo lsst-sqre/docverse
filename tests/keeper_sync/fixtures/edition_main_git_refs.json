@@ -1,0 +1,16 @@
+{
+  "self_url": "https://keeper.lsst.codes/editions/1",
+  "product_url": "https://keeper.lsst.codes/products/pipelines",
+  "build_url": "https://keeper.lsst.codes/builds/42",
+  "published_url": "https://pipelines.lsst.io",
+  "slug": "main",
+  "title": "Main",
+  "date_created": "2024-01-15T10:00:00.000000+00:00",
+  "date_rebuilt": "2026-04-30T18:30:00.000000+00:00",
+  "date_ended": null,
+  "surrogate_key": "ed1surrogate12345ed1surrogate1234",
+  "pending_rebuild": false,
+  "tracked_refs": ["main"],
+  "mode": "git_refs",
+  "queue_url": null
+}
