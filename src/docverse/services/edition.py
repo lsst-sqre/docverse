@@ -80,10 +80,9 @@ class EditionService:
             If an edition with the same slug already exists.
         """
         org, project = await self._resolve_org_project(org_slug, project_slug)
-        existing = await self._store.get_by_slug(
+        if await self._store.slug_exists_case_insensitive(
             project_id=project.id, slug=data.slug
-        )
-        if existing is not None:
+        ):
             msg = f"Edition with slug {data.slug!r} already exists"
             raise ConflictError(msg)
         edition = await self._store.create(project_id=project.id, data=data)

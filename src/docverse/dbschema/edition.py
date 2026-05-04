@@ -13,7 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -87,8 +87,11 @@ class SqlEdition(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "project_id", "slug", name="uq_editions_project_slug"
+        Index(
+            "uq_editions_project_lower_slug",
+            "project_id",
+            text("lower(slug)"),
+            unique=True,
         ),
         CheckConstraint(
             "(kind = 'main') = (slug = '__main')",

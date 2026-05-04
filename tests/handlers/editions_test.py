@@ -260,6 +260,42 @@ async def test_user_cannot_create_dunder_edition(
 
 
 @pytest.mark.asyncio
+async def test_create_edition_rejects_case_only_duplicate(
+    client: AsyncClient,
+) -> None:
+    """Case-only duplicate slugs surface as a friendly ConflictError."""
+    await _setup(client)
+    first = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "DM-54112",
+            "title": "Ticket DM-54112",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/DM-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert first.status_code == 201
+
+    second = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "dm-54112",
+            "title": "Lowercase duplicate",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/dm-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert second.status_code == 409
+    # The conflict message preserves the request's slug casing so the
+    # caller can identify which input was rejected.
+    assert "'dm-54112'" in second.json()["detail"][0]["msg"]
+
+
+@pytest.mark.asyncio
 async def test_create_edition_with_uppercase_ticket_slug(
     client: AsyncClient,
 ) -> None:
