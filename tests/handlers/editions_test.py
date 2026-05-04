@@ -259,6 +259,42 @@ async def test_user_cannot_create_dunder_edition(
     assert response.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_create_edition_with_uppercase_ticket_slug(
+    client: AsyncClient,
+) -> None:
+    """Edition slugs preserve uppercase ticket-style identifiers end-to-end."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "DM-54112",
+            "title": "Ticket DM-54112",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/DM-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["slug"] == "DM-54112"
+    assert data["self_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/DM-54112"
+    )
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/DM-54112/"
+    )
+
+    # Round-trip via GET must preserve the original slug case.
+    fetched = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/DM-54112",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["slug"] == "DM-54112"
+
+
 async def _record_builds_in_history(
     db_session: AsyncSession,
     org_slug: str,
