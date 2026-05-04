@@ -96,11 +96,11 @@ class EditionCreate(BaseModel):
     slug: Annotated[
         str,
         Field(
-            pattern=r"^[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]$",
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$",
             min_length=2,
             max_length=128,
             description="URL-safe identifier for the edition.",
-            examples=["main", "v1", "DM-54112"],
+            examples=["main", "v1", "DM-54112", "v2.3.0", "foo_bar"],
         ),
     ]
 

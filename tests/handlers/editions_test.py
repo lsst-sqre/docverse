@@ -331,6 +331,41 @@ async def test_create_edition_with_uppercase_ticket_slug(
     assert fetched.json()["slug"] == "DM-54112"
 
 
+@pytest.mark.asyncio
+async def test_create_edition_with_dotted_slug(
+    client: AsyncClient,
+) -> None:
+    """Edition slugs round-trip dots and underscores end-to-end."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "v2.3.0",
+            "title": "v2.3.0",
+            "kind": "release",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "v2.3.0"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["slug"] == "v2.3.0"
+    assert data["self_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/v2.3.0"
+    )
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/v2.3.0/"
+    )
+
+    fetched = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/v2.3.0",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["slug"] == "v2.3.0"
+
+
 async def _record_builds_in_history(
     db_session: AsyncSession,
     org_slug: str,

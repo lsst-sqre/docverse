@@ -48,7 +48,7 @@ def test_edition_with_publish_status() -> None:
 
 @pytest.mark.parametrize(
     "slug",
-    ["main", "v1", "release-1", "dm-54112"],
+    ["main", "v1", "release-1", "dm-54112", "v2.3.0", "foo_bar"],
 )
 def test_edition_create_accepts_lowercase_slug(slug: str) -> None:
     edition = EditionCreate(
@@ -62,7 +62,12 @@ def test_edition_create_accepts_lowercase_slug(slug: str) -> None:
 
 @pytest.mark.parametrize(
     "slug",
-    ["DM-54112", "DM-54794-relax-edition-slug", "Mixed-Case-1"],
+    [
+        "DM-54112",
+        "DM-54794-relax-edition-slug",
+        "Mixed-Case-1",
+        "My.Branch_v1",
+    ],
 )
 def test_edition_create_accepts_uppercase_ticket_slug(slug: str) -> None:
     edition = EditionCreate(
@@ -76,7 +81,16 @@ def test_edition_create_accepts_uppercase_ticket_slug(slug: str) -> None:
 
 @pytest.mark.parametrize(
     "slug",
-    ["-leading", "trailing-", "with space", "with_underscore", "a"],
+    [
+        "-leading",
+        "trailing-",
+        "_foo",
+        "foo_",
+        ".foo",
+        "foo.",
+        "with space",
+        "a",
+    ],
 )
 def test_edition_create_rejects_invalid_slug(slug: str) -> None:
     with pytest.raises(ValidationError):
@@ -88,17 +102,25 @@ def test_edition_create_rejects_invalid_slug(slug: str) -> None:
         )
 
 
-def test_uppercase_slug_is_edition_only() -> None:
-    """Edition slug relaxation must not leak into project/org slugs."""
+@pytest.mark.parametrize(
+    "slug",
+    ["DM-54112", "v2.3.0", "foo_bar", "My.Branch_v1"],
+)
+def test_relaxed_edition_slug_chars_stay_edition_only(slug: str) -> None:
+    """Relaxed edition slug chars must not leak into project/org slugs.
+
+    Edition relaxation (uppercase, dots, underscores) is scoped to editions;
+    project and org slugs continue to reject these characters.
+    """
     with pytest.raises(ValidationError):
         ProjectCreate(
-            slug="DM-54112",
+            slug=slug,
             title="T",
             doc_repo="https://github.com/example/repo",
         )
     with pytest.raises(ValidationError):
         OrganizationCreate(
-            slug="LSST",
+            slug=slug,
             title="T",
             base_domain="lsst.io",
         )
