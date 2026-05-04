@@ -37,6 +37,7 @@ from .infrastructure import (
     ServiceCategory,
     ServiceProvider,
 )
+from .keeper_sync import KeeperSyncConfig
 from .memberships import (
     OrgMembership,
     OrgMembershipCreate,
@@ -84,6 +85,7 @@ __all__ = [
     "GcpCredentials",
     "JobKind",
     "JobStatus",
+    "KeeperSyncConfig",
     "OrgDashboardRebuildEntry",
     "OrgMembership",
     "OrgMembershipCreate",

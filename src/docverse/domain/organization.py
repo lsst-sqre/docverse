@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from docverse.client.models import UrlScheme
+from docverse.client.models import KeeperSyncConfig, UrlScheme
 
 
 class Organization(BaseModel):
@@ -45,6 +45,14 @@ class Organization(BaseModel):
         default=None,
         description=(
             "Default configuration for the __main edition on new projects."
+        ),
+    )
+
+    keeper_sync_config: KeeperSyncConfig | None = Field(
+        default=None,
+        description=(
+            "Persisted LTD Keeper sync configuration for the organization."
+            " ``None`` when the org has never had a config set."
         ),
     )
 

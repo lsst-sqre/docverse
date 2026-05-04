@@ -9,6 +9,8 @@ from .dashboard_github_template_binding import (
 from .dashboard_github_template_file import SqlDashboardGitHubTemplateFile
 from .edition import SqlEdition
 from .edition_build_history import SqlEditionBuildHistory
+from .keeper_sync_run import SqlKeeperSyncRun
+from .keeper_sync_state import SqlKeeperSyncState
 from .membership import SqlOrgMembership
 from .organization import SqlOrganization
 from .organization_credential import SqlOrganizationCredential
@@ -24,6 +26,8 @@ __all__ = [
     "SqlDashboardGitHubTemplateFile",
     "SqlEdition",
     "SqlEditionBuildHistory",
+    "SqlKeeperSyncRun",
+    "SqlKeeperSyncState",
     "SqlOrgMembership",
     "SqlOrganization",
     "SqlOrganizationCredential",
