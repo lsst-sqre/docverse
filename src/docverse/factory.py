@@ -35,6 +35,7 @@ from .services.edition_tracking import (
     EditionTrackingService,
 )
 from .services.infrastructure import InfrastructureService
+from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
@@ -151,6 +152,13 @@ class Factory:
         return OrganizationService(
             store=store,
             service_store=self.create_service_store(),
+            logger=self._logger,
+        )
+
+    def create_keeper_sync_config_service(self) -> KeeperSyncConfigService:
+        """Create a KeeperSyncConfigService."""
+        return KeeperSyncConfigService(
+            org_store=self.create_org_store(),
             logger=self._logger,
         )
 

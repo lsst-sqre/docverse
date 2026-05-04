@@ -16,7 +16,11 @@ This repository was originally created for LTD Keeper. During the codebase migra
 - **Type checking**: `uv run --only-group=nox nox -s typing`
 - **Server tests**: `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test`
 - **Client tests**: `uv run --only-group=nox nox -s client_test`
-- **Running specific tests**: pass pytest args after `--`, e.g. `uv run --only-group=nox nox -s test -- tests/path/to/test_file.py`
+- **Running specific tests**: pass pytest args after `--`, e.g. `uv run --only-group=nox nox -s test -- tests/path/to/file_test.py`
+
+## Test naming convention
+
+- Test modules use the `_test.py` **suffix** (e.g. `client_test.py`), not the `test_` prefix.
 
 ## Coding conventions
 

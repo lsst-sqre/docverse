@@ -6,7 +6,11 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, OrganizationUpdate
+from docverse.client.models import (
+    KeeperSyncConfig,
+    OrganizationCreate,
+    OrganizationUpdate,
+)
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.organization import Organization
 
@@ -83,6 +87,25 @@ class OrganizationStore:
         updates = data.model_dump(exclude_unset=True)
         for key, value in updates.items():
             setattr(row, key, value)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Organization.model_validate(row)
+
+    async def update_keeper_sync_config(
+        self, slug: str, config: KeeperSyncConfig
+    ) -> Organization | None:
+        """Replace an organization's ``keeper_sync_config`` JSONB column.
+
+        Returns the updated :class:`Organization`, or ``None`` if no row
+        with the given slug exists.
+        """
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.slug == slug)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        row.keeper_sync_config = config.model_dump(mode="json")
         await self._session.flush()
         await self._session.refresh(row)
         return Organization.model_validate(row)

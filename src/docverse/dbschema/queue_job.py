@@ -52,6 +52,12 @@ class SqlQueueJob(Base):
         nullable=True,
     )
 
+    keeper_sync_run_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("keeper_sync_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     progress: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True
     )
@@ -76,4 +82,5 @@ class SqlQueueJob(Base):
         Index("idx_queue_jobs_kind", "kind"),
         Index("idx_queue_jobs_status", "status"),
         Index("idx_queue_jobs_org_id", "org_id"),
+        Index("idx_queue_jobs_keeper_sync_run_id", "keeper_sync_run_id"),
     )
