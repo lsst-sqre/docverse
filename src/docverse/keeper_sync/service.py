@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -57,6 +57,7 @@ from .models import LtdEdition, LtdProduct
 from .state_store import KeeperSyncStateStore, ResourceType
 
 __all__ = [
+    "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",
     "BuildSyncOutcome",
     "CopyCallable",
     "EditionSyncOutcome",
@@ -64,6 +65,14 @@ __all__ = [
     "KeeperSyncService",
     "ProjectSyncResult",
 ]
+
+#: Default age threshold for treating a ``pending`` keeper-sync
+#: placeholder build as orphaned. The placeholder is created in the
+#: same flow that immediately copies bucket contents and finalizes the
+#: build; the whole cycle should complete in well under this. Anything
+#: older is assumed to be from a worker that crashed between the
+#: placeholder commit and the finalize commit.
+DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
 #: callable the service consumes. Tests inject a fake; the production
@@ -130,7 +139,7 @@ class KeeperSyncContext:
 class KeeperSyncService:
     """Orchestrate sync for one LTD product / edition / build path."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         session: AsyncSession,
@@ -138,6 +147,7 @@ class KeeperSyncService:
         ltd_client: LtdClient,
         copy_callable: CopyCallable,
         logger: structlog.stdlib.BoundLogger,
+        orphan_reclaim_max_age: timedelta = DEFAULT_ORPHAN_RECLAIM_MAX_AGE,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -149,6 +159,7 @@ class KeeperSyncService:
         self._ltd_client = ltd_client
         self._copy_callable = copy_callable
         self._logger = logger
+        self._orphan_reclaim_max_age = orphan_reclaim_max_age
 
     async def sync_project(
         self, *, org_id: int, ltd_slug: str
@@ -374,6 +385,9 @@ class KeeperSyncService:
             )
 
         async with self._session.begin():
+            await self._reclaim_orphan_placeholders(
+                project_id=project.id, ltd_edition=ltd_edition
+            )
             new_build = await self._create_synced_build(
                 project=project, ltd_edition=ltd_edition
             )
@@ -413,6 +427,48 @@ class KeeperSyncService:
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+        )
+
+    async def _reclaim_orphan_placeholders(
+        self, *, project_id: int, ltd_edition: LtdEdition
+    ) -> None:
+        """Fail stale ``pending`` placeholders left by a crashed prior run.
+
+        ``sync_build`` writes the placeholder build row in one
+        transaction, copies bucket content outside the database, then
+        finalizes the build in a second transaction. A worker that
+        crashes between those two commits leaves a ``pending`` build
+        row behind that will never advance. Without reclaim, every
+        retry simply adds another orphan. This finds prior orphans for
+        the same ``(project_id, git_ref)`` that were created with the
+        keeper-sync uploader more than
+        ``self._orphan_reclaim_max_age`` ago and transitions them to
+        ``failed`` so they stop showing up in the project's build
+        list.
+        """
+        if not ltd_edition.tracked_refs:
+            return
+        git_ref = ltd_edition.tracked_refs[0]
+        cutoff = _now() - self._orphan_reclaim_max_age
+        orphans = await self._build_store.list_pending_older_than(
+            project_id=project_id,
+            git_ref=git_ref,
+            uploader=_SYNC_UPLOADER,
+            older_than=cutoff,
+        )
+        if not orphans:
+            return
+        reclaimed_ids: list[int] = []
+        for orphan in orphans:
+            await self._build_store.transition_status(
+                build_id=orphan.id, new_status=BuildStatus.failed
+            )
+            reclaimed_ids.append(orphan.id)
+        self._logger.warning(
+            "Reclaimed orphaned keeper-sync placeholder builds",
+            reclaimed_build_ids=reclaimed_ids,
+            project_id=project_id,
+            git_ref=git_ref,
         )
 
     async def _create_synced_build(

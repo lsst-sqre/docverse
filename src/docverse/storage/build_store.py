@@ -99,6 +99,36 @@ class BuildStore:
             return None
         return Build.model_validate(row)
 
+    async def list_pending_older_than(
+        self,
+        *,
+        project_id: int,
+        git_ref: str,
+        uploader: str,
+        older_than: datetime,
+    ) -> list[Build]:
+        """Return stale ``pending`` builds matching the given filters.
+
+        Filters by ``(project_id, git_ref, uploader)`` and returns rows
+        whose ``date_created`` is strictly before ``older_than``. The
+        keeper-sync engine uses this to find placeholder builds left
+        behind by a run that crashed between placeholder creation and
+        finalize, so they can be transitioned to ``failed`` before a
+        retry creates a fresh placeholder. Soft-deleted rows are
+        excluded.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+                SqlBuild.uploader == uploader,
+                SqlBuild.status == BuildStatus.pending,
+                SqlBuild.date_created < older_than,
+                SqlBuild.date_deleted.is_(None),
+            )
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
+
     async def get_latest_build_id_for_ref(
         self, *, project_id: int, git_ref: str
     ) -> int | None:

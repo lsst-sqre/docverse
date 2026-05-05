@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -19,14 +19,17 @@ import pytest
 import pytest_asyncio
 import respx
 import structlog
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
+    BuildCreate,
     BuildStatus,
     EditionKind,
     OrganizationCreate,
     TrackingMode,
 )
+from docverse.dbschema.build import SqlBuild
 from docverse.keeper_sync.client import LtdClient
 from docverse.keeper_sync.copier import BuildContentCopier
 from docverse.keeper_sync.s3_source import LtdSourceProtocol
@@ -563,6 +566,201 @@ async def test_unsupported_ltd_mode_raises_not_implemented(
     service = _build_service(db_session, http_client, MockObjectStore(), {})
     with pytest.raises(NotImplementedError, match="#289"):
         await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reclaims_orphaned_pending_placeholder(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Stale orphans get reclaimed before the next placeholder is created.
+
+    Mimics a crashed prior run: a ``pending`` placeholder for the same
+    ``(project_id, git_ref)`` exists, backdated past the reclaim
+    window. The next sync must transition it to ``failed`` and still
+    complete its own build normally.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects_v1 = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v1
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    # Mimic a crashed prior run: a placeholder build was created for
+    # the same project/git_ref under the keeper-sync uploader, then
+    # the worker died before the finalize transaction. We backdate
+    # ``date_created`` so the default reclaim window catches it.
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        orphan = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:" + "0" * 64,
+            ),
+            uploader="keeper-sync",
+        )
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == orphan.id)
+            .values(date_created=_now() - timedelta(hours=2))
+        )
+    orphan_id = orphan.id
+
+    # LTD now reports a fresh build → sync re-runs the active path,
+    # which must reclaim the orphan before creating its placeholder.
+    edition_v2 = _load("edition_main_git_refs.json")
+    edition_v2["date_rebuilt"] = "2026-05-04T12:00:00.000000+00:00"
+    edition_v2["build_url"] = f"{LTD_BASE}/builds/43"
+    build_v2 = _load("build.json")
+    build_v2["self_url"] = f"{LTD_BASE}/builds/43"
+    build_v2["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.reset()
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition_v2)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_v2)
+    )
+
+    source_objects_v2 = {
+        "pipelines/builds/43/index.html": b"<html>v2</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v2
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    main_outcome = result.edition_outcomes[0]
+    assert main_outcome.build_outcome is not None
+    assert main_outcome.build_outcome.short_circuited is False
+    new_build_id = main_outcome.build_outcome.docverse_build_id
+    assert new_build_id is not None
+    assert new_build_id != orphan_id
+
+    async with db_session.begin():
+        orphan_after = await build_store.get_by_id(orphan_id)
+        assert orphan_after is not None
+        assert orphan_after.status == BuildStatus.failed
+        assert orphan_after.date_completed is not None
+
+        new_build = await build_store.get_by_id(new_build_id)
+        assert new_build is not None
+        assert new_build.status == BuildStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_sync_build_does_not_reclaim_recent_pending_placeholders(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Recent placeholders stay ``pending`` — they may belong to a peer.
+
+    A keeper-sync placeholder younger than the reclaim window must be
+    left alone; otherwise two concurrent syncs of the same edition
+    would cannibalize each other.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects_v1 = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v1
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    # A keeper-sync placeholder created moments ago — younger than the
+    # default one-hour reclaim window.
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        recent_orphan = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:" + "0" * 64,
+            ),
+            uploader="keeper-sync",
+        )
+
+    edition_v2 = _load("edition_main_git_refs.json")
+    edition_v2["date_rebuilt"] = "2026-05-04T12:00:00.000000+00:00"
+    edition_v2["build_url"] = f"{LTD_BASE}/builds/43"
+    build_v2 = _load("build.json")
+    build_v2["self_url"] = f"{LTD_BASE}/builds/43"
+    build_v2["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.reset()
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition_v2)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_v2)
+    )
+
+    source_objects_v2 = {
+        "pipelines/builds/43/index.html": b"<html>v2</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v2
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    async with db_session.begin():
+        recent = await build_store.get_by_id(recent_orphan.id)
+        assert recent is not None
+        assert recent.status == BuildStatus.pending
 
 
 @pytest.mark.asyncio
