@@ -195,24 +195,28 @@ async def test_get_default_edition(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_default_edition_blocked(client: AsyncClient) -> None:
-    """DELETE __main returns 403."""
+@pytest.mark.parametrize("slug", ["__main", "__MAIN", "__Main", "__mAiN"])
+async def test_delete_default_edition_blocked(
+    client: AsyncClient, slug: str
+) -> None:
+    """DELETE __main returns 403 regardless of slug case."""
     await _setup(client)
     response = await client.delete(
-        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        f"/docverse/orgs/ed-org/projects/ed-proj/editions/{slug}",
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 403
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slug", ["__main", "__MAIN", "__Main", "__mAiN"])
 async def test_patch_default_edition_kind_blocked(
-    client: AsyncClient,
+    client: AsyncClient, slug: str
 ) -> None:
-    """PATCH __main with kind returns 403."""
+    """PATCH __main with kind returns 403 regardless of slug case."""
     await _setup(client)
     response = await client.patch(
-        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        f"/docverse/orgs/ed-org/projects/ed-proj/editions/{slug}",
         json={"kind": "draft"},
         headers={"X-Auth-Request-User": "testuser"},
     )
