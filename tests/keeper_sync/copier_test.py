@@ -173,6 +173,30 @@ async def test_empty_source_prefix_produces_empty_manifest_hash() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relative_key_with_dotdot_segment_raises() -> None:
+    """A source key whose relative path contains ``..`` must be rejected."""
+    objects = {
+        "src/builds/1/ok.html": b"OK",
+        "src/builds/1/../escape.html": b"BAD",
+    }
+    dest = MockObjectStore()
+    copier = BuildContentCopier(
+        source=_FakeSource(objects),
+        destination=dest,
+        logger=_logger(),
+    )
+
+    with pytest.raises(RuntimeError, match=r"\.\."):
+        await copier.copy_build(
+            source_prefix="src/builds/1/", dest_prefix="dst/"
+        )
+
+    # The malicious key never reached the destination.
+    assert "dst/../escape.html" not in dest.objects
+    assert "../escape.html" not in dest.objects
+
+
+@pytest.mark.asyncio
 async def test_concurrency_observed_peak_does_not_exceed_limit() -> None:
     """Observe the peak via a custom source that records concurrency."""
     in_flight = 0

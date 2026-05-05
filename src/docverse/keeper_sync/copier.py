@@ -94,6 +94,12 @@ class BuildContentCopier:
 
         async def _copy_one(source_key: str) -> None:
             relative = source_key.removeprefix(normalized_source_prefix)
+            if ".." in relative.split("/"):
+                msg = (
+                    f"Refusing to copy source key {source_key!r}:"
+                    " relative path contains '..' segment"
+                )
+                raise RuntimeError(msg)
             dest_key = f"{normalized_dest_prefix}{relative}"
             content_type = (
                 mimetypes.guess_type(relative)[0] or "application/octet-stream"
