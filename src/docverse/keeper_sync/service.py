@@ -17,7 +17,6 @@ filled in by issue #289.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -216,7 +215,6 @@ class KeeperSyncService:
         await self._state_store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
-            ltd_id=_hash_slug_to_int(ltd_product.slug),
             ltd_slug=ltd_product.slug,
             docverse_id=project.id,
             date_last_synced=_now(),
@@ -531,17 +529,3 @@ def _now() -> datetime:
 
 def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
-
-
-def _hash_slug_to_int(slug: str) -> int:
-    """Stable per-org id for an LTD product whose ``ltd_id`` is its slug.
-
-    The ``keeper_sync_state.ltd_id`` column is :class:`BigInteger`; LTD
-    products are slug-keyed, not integer-keyed. To still satisfy the
-    ``(org_id, resource_type, ltd_id)`` uniqueness contract, we hash
-    the slug into a stable 63-bit integer. Different slugs map to
-    different ints with overwhelming probability, and within an org
-    the slug column on the state row is the authoritative identity.
-    """
-    digest = hashlib.sha256(slug.encode()).digest()
-    return int.from_bytes(digest[:8], byteorder="big") & ((1 << 63) - 1)

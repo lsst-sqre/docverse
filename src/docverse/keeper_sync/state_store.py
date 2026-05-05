@@ -1,9 +1,11 @@
 """Async data-access for the ``keeper_sync_state`` table.
 
 One row per LTD↔Docverse pairing for a project / edition / build. The
-``(org_id, resource_type, ltd_id)`` triple is the idempotency key the
-sync engine uses to either short-circuit a re-import (state matches
-LTD) or resume one (state differs).
+idempotency key the sync engine uses is per-resource: project rows are
+keyed on ``(org_id, ltd_slug)`` because LTD's product API has no
+integer id, while edition and build rows are keyed on
+``(org_id, resource_type, ltd_id)`` because LTD's edition / build
+slugs are only unique within a product.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import ColumnElement
 
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 
@@ -42,7 +45,7 @@ class KeeperSyncState(BaseModel):
     id: int
     org_id: int
     resource_type: str
-    ltd_id: int
+    ltd_id: int | None = None
     ltd_slug: str
     docverse_id: int | None = None
     date_last_synced: datetime | None = None
@@ -50,6 +53,44 @@ class KeeperSyncState(BaseModel):
     last_seen_etag: str | None = None
     content_hash: str | None = None
     annotations: dict[str, Any] | None = None
+
+
+def _key_clauses(
+    *,
+    org_id: int,
+    resource_type: ResourceType,
+    ltd_id: int | None,
+    ltd_slug: str | None,
+) -> list[ColumnElement[bool]]:
+    """Build the WHERE clause for the per-resource idempotency key.
+
+    Project rows are slug-keyed (LTD products have no integer id);
+    edition / build rows are id-keyed (LTD edition / build slugs are
+    only unique within a product, but ``keeper_sync_state`` rows are
+    org-scoped). Callers must supply ``ltd_slug`` for projects and
+    ``ltd_id`` for editions / builds; passing the other variant for a
+    given resource type is a programming error.
+    """
+    if resource_type is ResourceType.project:
+        if ltd_slug is None:
+            msg = "ltd_slug is required for project lookups"
+            raise ValueError(msg)
+        if ltd_id is not None:
+            msg = "ltd_id must be None for project lookups (slug-keyed)"
+            raise ValueError(msg)
+        return [
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == resource_type.value,
+            SqlKeeperSyncState.ltd_slug == ltd_slug,
+        ]
+    if ltd_id is None:
+        msg = f"ltd_id is required for {resource_type.value} lookups"
+        raise ValueError(msg)
+    return [
+        SqlKeeperSyncState.org_id == org_id,
+        SqlKeeperSyncState.resource_type == resource_type.value,
+        SqlKeeperSyncState.ltd_id == ltd_id,
+    ]
 
 
 class KeeperSyncStateStore:
@@ -68,14 +109,21 @@ class KeeperSyncStateStore:
         *,
         org_id: int,
         resource_type: ResourceType,
-        ltd_id: int,
+        ltd_id: int | None = None,
+        ltd_slug: str | None = None,
     ) -> KeeperSyncState | None:
-        """Fetch the row keyed by ``(org_id, resource_type, ltd_id)``."""
-        stmt = select(SqlKeeperSyncState).where(
-            SqlKeeperSyncState.org_id == org_id,
-            SqlKeeperSyncState.resource_type == resource_type.value,
-            SqlKeeperSyncState.ltd_id == ltd_id,
+        """Fetch a row by its per-resource idempotency key.
+
+        Pass ``ltd_slug`` for projects and ``ltd_id`` for editions /
+        builds; see :func:`_key_clauses`.
+        """
+        clauses = _key_clauses(
+            org_id=org_id,
+            resource_type=resource_type,
+            ltd_id=ltd_id,
+            ltd_slug=ltd_slug,
         )
+        stmt = select(SqlKeeperSyncState).where(*clauses)
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
@@ -87,8 +135,8 @@ class KeeperSyncStateStore:
         *,
         org_id: int,
         resource_type: ResourceType,
-        ltd_id: int,
         ltd_slug: str,
+        ltd_id: int | None = None,
         docverse_id: int | None = None,
         date_last_synced: datetime | None = None,
         date_rebuilt_seen: datetime | None = None,
@@ -96,17 +144,21 @@ class KeeperSyncStateStore:
         content_hash: str | None = None,
         annotations: dict[str, Any] | None = None,
     ) -> KeeperSyncState:
-        """Insert or update the row for ``(org_id, resource_type, ltd_id)``.
+        """Insert or update a row by its per-resource idempotency key.
 
-        On update, only non-``None`` fields overwrite the existing row;
+        The key is ``(org_id, ltd_slug)`` for projects and
+        ``(org_id, resource_type, ltd_id)`` for editions / builds. On
+        update, only non-``None`` fields overwrite the existing row;
         ``None`` arguments preserve whatever value is already stored.
         """
+        clauses = _key_clauses(
+            org_id=org_id,
+            resource_type=resource_type,
+            ltd_id=ltd_id,
+            ltd_slug=ltd_slug,
+        )
         existing = await self._session.execute(
-            select(SqlKeeperSyncState).where(
-                SqlKeeperSyncState.org_id == org_id,
-                SqlKeeperSyncState.resource_type == resource_type.value,
-                SqlKeeperSyncState.ltd_id == ltd_id,
-            )
+            select(SqlKeeperSyncState).where(*clauses)
         )
         row = existing.scalar_one_or_none()
         if row is None:

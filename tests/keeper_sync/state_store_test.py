@@ -34,7 +34,9 @@ async def test_get_returns_none_when_no_row(db_session: AsyncSession) -> None:
     store = KeeperSyncStateStore(session=db_session, logger=logger)
     async with db_session.begin():
         got = await store.get(
-            org_id=org_id, resource_type=ResourceType.project, ltd_id=99
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="missing",
         )
     assert got is None
 
@@ -79,7 +81,6 @@ async def test_upsert_updates_only_non_none_fields(
         await store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
-            ltd_id=1,
             ltd_slug="pipelines",
             docverse_id=11,
             content_hash="sha256:" + "b" * 64,
@@ -88,13 +89,44 @@ async def test_upsert_updates_only_non_none_fields(
         state = await store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
-            ltd_id=1,
             ltd_slug="pipelines",
             date_last_synced=datetime(2026, 5, 2, tzinfo=UTC),
         )
     assert state.docverse_id == 11
     assert state.content_hash == "sha256:" + "b" * 64
     assert state.date_last_synced is not None
+    assert state.ltd_id is None
+
+
+@pytest.mark.asyncio
+async def test_get_rejects_wrong_key_for_resource_type(
+    db_session: AsyncSession,
+) -> None:
+    """Passing the wrong key variant for a resource type raises ValueError."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        with pytest.raises(ValueError, match="ltd_slug is required"):
+            await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=1,
+            )
+        with pytest.raises(ValueError, match="ltd_id must be None"):
+            await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=1,
+                ltd_slug="pipelines",
+            )
+        with pytest.raises(ValueError, match="ltd_id is required"):
+            await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_slug="main",
+            )
 
 
 @pytest.mark.asyncio
