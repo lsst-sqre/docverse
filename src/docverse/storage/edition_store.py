@@ -141,10 +141,16 @@ class EditionStore:
     async def get_by_slug(
         self, *, project_id: int, slug: str
     ) -> Edition | None:
-        """Fetch an edition by project_id and slug."""
+        """Fetch an edition by project_id and slug.
+
+        Slug matching is case-insensitive: the row stores the canonical
+        creation-time casing, but any case from the caller resolves to
+        the same row. The returned ``Edition.slug`` is always the
+        canonical stored value, never the caller's input.
+        """
         stmt = self._base_query().where(
             SqlEdition.project_id == project_id,
-            SqlEdition.slug == slug,
+            func.lower(SqlEdition.slug) == slug.lower(),
             SqlEdition.date_deleted.is_(None),
         )
         result = await self._session.execute(stmt)
@@ -202,11 +208,14 @@ class EditionStore:
     async def update(
         self, *, project_id: int, slug: str, data: EditionUpdate
     ) -> Edition | None:
-        """Update an edition by project_id and slug."""
+        """Update an edition by project_id and slug.
+
+        Slug matching is case-insensitive (see :meth:`get_by_slug`).
+        """
         result = await self._session.execute(
             select(SqlEdition).where(
                 SqlEdition.project_id == project_id,
-                SqlEdition.slug == slug,
+                func.lower(SqlEdition.slug) == slug.lower(),
                 SqlEdition.date_deleted.is_(None),
             )
         )
@@ -219,7 +228,7 @@ class EditionStore:
         await self._session.flush()
         await self._session.refresh(row)
         # Re-query to get current_build_public_id via join
-        return await self.get_by_slug(project_id=project_id, slug=slug)
+        return await self.get_by_slug(project_id=project_id, slug=row.slug)
 
     async def set_current_build(
         self,
@@ -318,6 +327,8 @@ class EditionStore:
     async def soft_delete(self, *, project_id: int, slug: str) -> bool:
         """Soft-delete an edition by setting date_deleted.
 
+        Slug matching is case-insensitive (see :meth:`get_by_slug`).
+
         Returns
         -------
         bool
@@ -326,7 +337,7 @@ class EditionStore:
         result = await self._session.execute(
             select(SqlEdition).where(
                 SqlEdition.project_id == project_id,
-                SqlEdition.slug == slug,
+                func.lower(SqlEdition.slug) == slug.lower(),
                 SqlEdition.date_deleted.is_(None),
             )
         )

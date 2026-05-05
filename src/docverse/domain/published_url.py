@@ -32,7 +32,13 @@ def project_published_url(org: Organization, project: Project) -> str:
 
 
 def edition_published_url(project_url: str, edition: Edition) -> str:
-    """Public URL for one edition under its project's URL space."""
+    """Public URL for one edition under its project's URL space.
+
+    Callers must pass the canonical ``Edition`` row loaded from the
+    database, never an edition synthesized from a request-supplied
+    slug. The URL is built from ``edition.slug``, which is the
+    creation-time casing the store is case-preserving about.
+    """
     if edition.slug == MAIN_SLUG:
         return project_url
     return f"{project_url}v/{edition.slug}/"

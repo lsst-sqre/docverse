@@ -993,3 +993,87 @@ async def test_second_main_edition_rejected(
                 kind=EditionKind.main,
                 tracking_mode=TrackingMode.git_ref,
             )
+
+
+# ── Case-insensitive slug uniqueness ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_case_only_different_slugs_rejected_by_db(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Slugs differing only by case in one project violate the unique index."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="DM-54112",
+                title="Ticket",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+    with pytest.raises(IntegrityError):
+        async with db_session.begin():
+            await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug="dm-54112",
+                    title="Lowercase duplicate",
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+
+
+@pytest.mark.asyncio
+async def test_get_by_slug_case_insensitive(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """get_by_slug matches across case and skips soft-deleted rows."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="DM-54112",
+                title="Ticket",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        # Lowercase form resolves; canonical stored casing is returned.
+        edition = await edition_store.get_by_slug(
+            project_id=project_id, slug="dm-54112"
+        )
+        assert edition is not None
+        assert edition.slug == "DM-54112"
+        # Original case also resolves.
+        edition = await edition_store.get_by_slug(
+            project_id=project_id, slug="DM-54112"
+        )
+        assert edition is not None
+        assert edition.slug == "DM-54112"
+        # Different slug returns None.
+        assert (
+            await edition_store.get_by_slug(
+                project_id=project_id, slug="other-slug"
+            )
+            is None
+        )
+        await db_session.commit()
+
+    # Soft-deleting the row releases the slug for reuse.
+    async with db_session.begin():
+        await edition_store.soft_delete(project_id=project_id, slug="DM-54112")
+        assert (
+            await edition_store.get_by_slug(
+                project_id=project_id, slug="dm-54112"
+            )
+            is None
+        )
+        await db_session.commit()

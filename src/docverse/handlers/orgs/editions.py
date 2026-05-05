@@ -295,7 +295,7 @@ async def patch_edition(  # noqa: PLR0913
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> Edition:
-    if edition_slug == "__main" and data.kind is not None:
+    if edition_slug.lower() == "__main" and data.kind is not None:
         msg = "Cannot change the kind of the default '__main' edition"
         raise PermissionDeniedError(msg)
     async with context.session.begin():
@@ -337,7 +337,7 @@ async def delete_edition(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
 ) -> None:
-    if edition_slug == "__main":
+    if edition_slug.lower() == "__main":
         msg = "The default edition '__main' cannot be deleted"
         raise PermissionDeniedError(msg)
     async with context.session.begin():

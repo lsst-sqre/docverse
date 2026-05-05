@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildCreate
 from docverse.client.models.builds import BuildAnnotations
+from docverse.domain.base32id import serialize_base32_id
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -194,24 +195,28 @@ async def test_get_default_edition(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_default_edition_blocked(client: AsyncClient) -> None:
-    """DELETE __main returns 403."""
+@pytest.mark.parametrize("slug", ["__main", "__MAIN", "__Main", "__mAiN"])
+async def test_delete_default_edition_blocked(
+    client: AsyncClient, slug: str
+) -> None:
+    """DELETE __main returns 403 regardless of slug case."""
     await _setup(client)
     response = await client.delete(
-        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        f"/docverse/orgs/ed-org/projects/ed-proj/editions/{slug}",
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 403
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slug", ["__main", "__MAIN", "__Main", "__mAiN"])
 async def test_patch_default_edition_kind_blocked(
-    client: AsyncClient,
+    client: AsyncClient, slug: str
 ) -> None:
-    """PATCH __main with kind returns 403."""
+    """PATCH __main with kind returns 403 regardless of slug case."""
     await _setup(client)
     response = await client.patch(
-        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        f"/docverse/orgs/ed-org/projects/ed-proj/editions/{slug}",
         json={"kind": "draft"},
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -257,6 +262,232 @@ async def test_user_cannot_create_dunder_edition(
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_edition_rejects_case_only_duplicate(
+    client: AsyncClient,
+) -> None:
+    """Case-only duplicate slugs surface as a friendly ConflictError."""
+    await _setup(client)
+    first = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "DM-54112",
+            "title": "Ticket DM-54112",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/DM-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert first.status_code == 201
+
+    second = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "dm-54112",
+            "title": "Lowercase duplicate",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/dm-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert second.status_code == 409
+    # The conflict message preserves the request's slug casing so the
+    # caller can identify which input was rejected.
+    assert "'dm-54112'" in second.json()["detail"][0]["msg"]
+
+
+@pytest.mark.asyncio
+async def test_create_edition_with_uppercase_ticket_slug(
+    client: AsyncClient,
+) -> None:
+    """Edition slugs preserve uppercase ticket-style identifiers end-to-end."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "DM-54112",
+            "title": "Ticket DM-54112",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/DM-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["slug"] == "DM-54112"
+    assert data["self_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/DM-54112"
+    )
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/DM-54112/"
+    )
+
+    # Round-trip via GET must preserve the original slug case.
+    fetched = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/DM-54112",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["slug"] == "DM-54112"
+
+
+@pytest.mark.asyncio
+async def test_edition_lookup_is_case_insensitive(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Read/write handlers resolve edition slugs case-insensitively.
+
+    Like macOS HFS+: the row stores the creation-time casing, but any
+    case from the client resolves to the same row, and every response
+    echoes the canonical slug.
+    """
+    await _setup(client)
+    create = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "DM-54112",
+            "title": "Ticket DM-54112",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "tickets/DM-54112"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert create.status_code == 201
+
+    canonical_self = "/docverse/orgs/ed-org/projects/ed-proj/editions/DM-54112"
+    canonical_published = "https://ed-proj.ed-org.example.com/v/DM-54112/"
+
+    for cased in ("dm-54112", "Dm-54112"):
+        # GET resolves any case to the same canonical row.
+        fetched = await client.get(
+            f"/docverse/orgs/ed-org/projects/ed-proj/editions/{cased}",
+            headers={"X-Auth-Request-User": "testuser"},
+        )
+        assert fetched.status_code == 200, cased
+        body = fetched.json()
+        assert body["slug"] == "DM-54112"
+        assert body["self_url"].endswith(canonical_self)
+        assert body["history_url"].endswith(f"{canonical_self}/history")
+        assert body["rollback_url"].endswith(f"{canonical_self}/rollback")
+        assert body["published_url"] == canonical_published
+
+        # PATCH echoes the canonical slug regardless of request casing.
+        patched = await client.patch(
+            f"/docverse/orgs/ed-org/projects/ed-proj/editions/{cased}",
+            json={"title": f"Patched via {cased}"},
+            headers={"X-Auth-Request-User": "testuser"},
+        )
+        assert patched.status_code == 200, cased
+        patched_body = patched.json()
+        assert patched_body["slug"] == "DM-54112"
+        assert patched_body["title"] == f"Patched via {cased}"
+        assert patched_body["self_url"].endswith(canonical_self)
+        assert patched_body["published_url"] == canonical_published
+
+        # History endpoint resolves the slug case-insensitively too.
+        history = await client.get(
+            f"/docverse/orgs/ed-org/projects/ed-proj/editions/{cased}/history",
+            headers={"X-Auth-Request-User": "testuser"},
+        )
+        assert history.status_code == 200, cased
+
+    # Rollback resolves the slug case-insensitively and echoes canonical.
+    async with db_session.begin():
+        logger = structlog.get_logger("docverse")
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        proj_store = ProjectStore(session=db_session, logger=logger)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        build_store = BuildStore(session=db_session, logger=logger)
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        org = await org_store.get_by_slug("ed-org")
+        assert org is not None
+        project = await proj_store.get_by_slug(org_id=org.id, slug="ed-proj")
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="DM-54112"
+        )
+        assert edition is not None
+        build = await build_store.create(
+            project_id=project.id,
+            data=BuildCreate(
+                git_ref="tickets/DM-54112",
+                content_hash="sha256:" + "f" * 64,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        target_public_id = serialize_base32_id(build.public_id)
+        await history_store.record(edition_id=edition.id, build_id=build.id)
+        await db_session.commit()
+
+    rollback = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/Dm-54112/rollback",
+        json={"build": target_public_id},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback.status_code == 200
+    rollback_body = rollback.json()
+    assert rollback_body["slug"] == "DM-54112"
+    assert rollback_body["self_url"].endswith(canonical_self)
+    assert rollback_body["published_url"] == canonical_published
+
+    # DELETE resolves the slug case-insensitively; afterward, the
+    # canonical-cased row is gone too.
+    deleted = await client.delete(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/dm-54112",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert deleted.status_code == 204
+
+    gone = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/DM-54112",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert gone.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_edition_with_dotted_slug(
+    client: AsyncClient,
+) -> None:
+    """Edition slugs round-trip dots and underscores end-to-end."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "v2.3.0",
+            "title": "v2.3.0",
+            "kind": "release",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "v2.3.0"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["slug"] == "v2.3.0"
+    assert data["self_url"].endswith(
+        "/orgs/ed-org/projects/ed-proj/editions/v2.3.0"
+    )
+    assert data["published_url"] == (
+        "https://ed-proj.ed-org.example.com/v/v2.3.0/"
+    )
+
+    fetched = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/v2.3.0",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["slug"] == "v2.3.0"
 
 
 async def _record_builds_in_history(
