@@ -513,6 +513,30 @@ async def test_branch_edition_creates_new_draft_edition(
 
 
 @pytest.mark.asyncio
+async def test_sync_build_refuses_half_uploaded_build(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """LTD build with ``uploaded=False`` must raise rather than sync."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    half_uploaded_build = _load("build.json")
+    half_uploaded_build["uploaded"] = False
+    _seed_ltd(mock_discovery, build_payload=half_uploaded_build)
+
+    object_store = MockObjectStore()
+    service = _build_service(db_session, http_client, object_store, {})
+
+    with pytest.raises(RuntimeError, match="uploaded=False"):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Nothing was copied to the destination.
+    assert not object_store.objects
+
+
+@pytest.mark.asyncio
 async def test_unsupported_ltd_mode_raises_not_implemented(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,

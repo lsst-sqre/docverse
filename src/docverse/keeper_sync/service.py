@@ -333,6 +333,13 @@ class KeeperSyncService:
         ltd_build = await self._ltd_client.get_build_by_url(
             str(ltd_edition.build_url)
         )
+        if not ltd_build.uploaded:
+            msg = (
+                f"LTD build id={ltd_build.ltd_id} for edition"
+                f" {ltd_edition.slug!r} reports uploaded=False; refusing"
+                " to sync a half-uploaded build"
+            )
+            raise RuntimeError(msg)
 
         async with self._session.begin():
             existing_state = await self._state_store.get(
