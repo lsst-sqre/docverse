@@ -1030,11 +1030,11 @@ async def test_case_only_different_slugs_rejected_by_db(
 
 
 @pytest.mark.asyncio
-async def test_slug_exists_case_insensitive(
+async def test_get_by_slug_case_insensitive(
     db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
-    """slug_exists_case_insensitive matches across case and skips deletes."""
+    """get_by_slug matches across case and skips soft-deleted rows."""
     async with db_session.begin():
         project_id = await _create_project(db_session)
         await edition_store.create(
@@ -1046,24 +1046,34 @@ async def test_slug_exists_case_insensitive(
                 tracking_mode=TrackingMode.git_ref,
             ),
         )
-        # Same slug, lowercase form: matches.
-        assert await edition_store.slug_exists_case_insensitive(
+        # Lowercase form resolves; canonical stored casing is returned.
+        edition = await edition_store.get_by_slug(
             project_id=project_id, slug="dm-54112"
         )
-        # Same slug, original case: also matches.
-        assert await edition_store.slug_exists_case_insensitive(
+        assert edition is not None
+        assert edition.slug == "DM-54112"
+        # Original case also resolves.
+        edition = await edition_store.get_by_slug(
             project_id=project_id, slug="DM-54112"
         )
-        # Different slug: no match.
-        assert not await edition_store.slug_exists_case_insensitive(
-            project_id=project_id, slug="other-slug"
+        assert edition is not None
+        assert edition.slug == "DM-54112"
+        # Different slug returns None.
+        assert (
+            await edition_store.get_by_slug(
+                project_id=project_id, slug="other-slug"
+            )
+            is None
         )
         await db_session.commit()
 
     # Soft-deleting the row releases the slug for reuse.
     async with db_session.begin():
         await edition_store.soft_delete(project_id=project_id, slug="DM-54112")
-        assert not await edition_store.slug_exists_case_insensitive(
-            project_id=project_id, slug="dm-54112"
+        assert (
+            await edition_store.get_by_slug(
+                project_id=project_id, slug="dm-54112"
+            )
+            is None
         )
         await db_session.commit()

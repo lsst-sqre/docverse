@@ -160,23 +160,6 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
-    async def slug_exists_case_insensitive(
-        self, *, project_id: int, slug: str
-    ) -> bool:
-        """Return True iff a non-deleted edition's slug matches by ``lower()``.
-
-        Mirrors the ``(project_id, lower(slug))`` unique index so the
-        ``EditionService.create`` pre-check surfaces case-only duplicates
-        as a friendly ``ConflictError`` rather than a raw DB violation.
-        """
-        stmt = select(SqlEdition.id).where(
-            SqlEdition.project_id == project_id,
-            func.lower(SqlEdition.slug) == slug.lower(),
-            SqlEdition.date_deleted.is_(None),
-        )
-        result = await self._session.execute(stmt)
-        return result.first() is not None
-
     async def list_all_by_project(self, project_id: int) -> list[Edition]:
         """List every non-deleted edition for a project.
 
