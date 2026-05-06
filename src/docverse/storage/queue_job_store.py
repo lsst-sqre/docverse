@@ -37,6 +37,7 @@ class QueueJobStore:
         project_id: int | None = None,
         build_id: int | None = None,
         edition_id: int | None = None,
+        keeper_sync_run_id: int | None = None,
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
 
@@ -52,6 +53,7 @@ class QueueJobStore:
             project_id=project_id,
             build_id=build_id,
             edition_id=edition_id,
+            keeper_sync_run_id=keeper_sync_run_id,
         )
         self._session.add(row)
         await self._session.flush()

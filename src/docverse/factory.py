@@ -44,6 +44,7 @@ from .services.keeper_sync import (
     KeeperSyncService,
 )
 from .services.keeper_sync_config import KeeperSyncConfigService
+from .services.keeper_sync_run import KeeperSyncRunService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
@@ -60,7 +61,8 @@ from .storage.editionpublisher import (
 )
 from .storage.github import GitHubAppClient, GitHubAppNotConfiguredError
 from .storage.keeper_sync import KeeperSyncStateStore
-from .storage.ltd import LtdClient, LtdS3Source
+from .storage.keeper_sync_run_store import KeeperSyncRunStore
+from .storage.ltd import LtdClient, LtdProductsClient, LtdS3Source
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
@@ -169,6 +171,39 @@ class Factory:
         """Create a KeeperSyncConfigService."""
         return KeeperSyncConfigService(
             org_store=self.create_org_store(),
+            logger=self._logger,
+        )
+
+    def create_keeper_sync_run_store(self) -> KeeperSyncRunStore:
+        """Create a :class:`KeeperSyncRunStore`."""
+        return KeeperSyncRunStore(session=self._session, logger=self._logger)
+
+    def create_keeper_sync_run_service(self) -> KeeperSyncRunService:
+        """Create a :class:`KeeperSyncRunService`."""
+        return KeeperSyncRunService(
+            org_store=self.create_org_store(),
+            run_store=self.create_keeper_sync_run_store(),
+            queue_backend=self.create_queue_backend(),
+            queue_job_store=self.create_queue_job_store(),
+            logger=self._logger,
+        )
+
+    def create_ltd_products_client(
+        self, *, base_url: str
+    ) -> LtdProductsClient:
+        """Create a :class:`LtdProductsClient`.
+
+        Raises
+        ------
+        RuntimeError
+            If the shared HTTP client is not configured.
+        """
+        if self._http_client is None:
+            msg = "HTTP client is required to build an LtdProductsClient"
+            raise RuntimeError(msg)
+        return LtdProductsClient(
+            http_client=self._http_client,
+            base_url=base_url,
             logger=self._logger,
         )
 

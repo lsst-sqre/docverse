@@ -18,10 +18,12 @@ from sqlalchemy.orm import InstrumentedAttribute
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
+from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.project import SqlProject
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
+from docverse.domain.keeper_sync_run import KeeperSyncRun
 from docverse.domain.project import Project
 
 __all__ = [
@@ -29,6 +31,7 @@ __all__ = [
     "DEFAULT_PAGE_LIMIT",
     "EDITION_CURSOR_TYPES",
     "EDITION_HISTORY_CURSOR_TYPE",
+    "KEEPER_SYNC_RUN_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
     "BuildDateCreatedCursor",
@@ -37,6 +40,7 @@ __all__ = [
     "EditionDateUpdatedCursor",
     "EditionSlugCursor",
     "EditionSortOrder",
+    "KeeperSyncRunDateStartedCursor",
     "ProjectDateCreatedCursor",
     "ProjectSearchCursor",
     "ProjectSlugCursor",
@@ -248,6 +252,28 @@ class BuildDateCreatedCursor(DatetimeIdCursor[Build]):
         return cls(time=entry.date_created, id=entry.id, previous=reverse)
 
 
+@dataclass(slots=True)
+class KeeperSyncRunDateStartedCursor(DatetimeIdCursor[KeeperSyncRun]):
+    """Keyset cursor for runs ordered by date_started DESC, id DESC."""
+
+    @staticmethod
+    @override
+    def id_column() -> InstrumentedAttribute[int]:
+        return SqlKeeperSyncRun.id
+
+    @staticmethod
+    @override
+    def time_column() -> InstrumentedAttribute[datetime]:
+        return SqlKeeperSyncRun.date_started
+
+    @override
+    @classmethod
+    def from_entry(
+        cls, entry: KeeperSyncRun, *, reverse: bool = False
+    ) -> Self:
+        return cls(time=entry.date_started, id=entry.id, previous=reverse)
+
+
 # ---------------------------------------------------------------------------
 # Search cursor (score+id compound keyset)
 # ---------------------------------------------------------------------------
@@ -331,6 +357,10 @@ EDITION_CURSOR_TYPES: dict[
 }
 
 BUILD_CURSOR_TYPE: type[BuildDateCreatedCursor] = BuildDateCreatedCursor
+
+KEEPER_SYNC_RUN_CURSOR_TYPE: type[KeeperSyncRunDateStartedCursor] = (
+    KeeperSyncRunDateStartedCursor
+)
 
 
 # ---------------------------------------------------------------------------

@@ -22,12 +22,15 @@ from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.github import validate_github_app
 
 from .functions import (
     build_processing,
     dashboard_build,
     dashboard_sync,
+    keeper_sync_project,
+    keeper_sync_run_discovery,
     ping,
     publish_edition,
 )
@@ -212,7 +215,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    """arq WorkerSettings for Docverse."""
+    """arq WorkerSettings for the default Docverse queue."""
 
     functions = [
         build_processing,
@@ -223,5 +226,27 @@ class WorkerSettings:
     ]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
+    on_startup = startup
+    on_shutdown = shutdown
+
+
+class KeeperSyncWorkerSettings:
+    """arq WorkerSettings for the dedicated LTD-sync queue.
+
+    Bound to ``docverse:sync-queue`` (see :data:`KEEPER_SYNC_QUEUE_NAME`)
+    so a noisy backfill cannot starve ``build_processing`` and
+    ``publish_edition`` jobs on the default queue. Both classes share
+    the same ``startup`` / ``shutdown`` hooks and therefore the same
+    ``WorkerFactoryBuilder``, so all worker code paths see one
+    consistent dependency graph regardless of which queue the job
+    came in on.
+    """
+
+    functions = [
+        keeper_sync_run_discovery,
+        keeper_sync_project,
+    ]
+    redis_settings = config.arq_redis_settings
+    queue_name = KEEPER_SYNC_QUEUE_NAME
     on_startup = startup
     on_shutdown = shutdown

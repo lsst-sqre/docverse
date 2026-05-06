@@ -23,6 +23,8 @@ class JobKind(StrEnum):
     git_ref_audit = "git_ref_audit"
     purgatory_cleanup = "purgatory_cleanup"
     credential_reencrypt = "credential_reencrypt"
+    keeper_sync_run_discovery = "keeper_sync_run_discovery"
+    keeper_sync_project = "keeper_sync_project"
 
 
 class JobStatus(StrEnum):

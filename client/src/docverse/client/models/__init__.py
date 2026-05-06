@@ -37,7 +37,13 @@ from .infrastructure import (
     ServiceCategory,
     ServiceProvider,
 )
-from .keeper_sync import KeeperSyncConfig
+from .keeper_sync import (
+    KeeperSyncConfig,
+    KeeperSyncRun,
+    KeeperSyncRunCreated,
+    KeeperSyncRunKind,
+    KeeperSyncRunStatus,
+)
 from .memberships import (
     OrgMembership,
     OrgMembershipCreate,
@@ -86,6 +92,10 @@ __all__ = [
     "JobKind",
     "JobStatus",
     "KeeperSyncConfig",
+    "KeeperSyncRun",
+    "KeeperSyncRunCreated",
+    "KeeperSyncRunKind",
+    "KeeperSyncRunStatus",
     "OrgDashboardRebuildEntry",
     "OrgMembership",
     "OrgMembershipCreate",
