@@ -261,6 +261,30 @@ async def test_soft_delete_build(
 
 
 @pytest.mark.asyncio
+async def test_update_content_hash_rejects_non_pending(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """update_content_hash must refuse builds past the pending stage."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        with pytest.raises(InvalidBuildStateError):
+            await build_store.update_content_hash(
+                build_id=build.id, content_hash="sha256:" + "0" * 64
+            )
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
 async def test_update_inventory(
     db_session: AsyncSession,
     build_store: BuildStore,

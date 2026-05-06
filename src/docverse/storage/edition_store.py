@@ -296,6 +296,25 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = result2.one()
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def update_tracking(
+        self,
+        *,
+        edition_id: int,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any],
+    ) -> None:
+        """Set the tracking columns on an edition row."""
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.tracking_mode = tracking_mode
+        row.tracking_params = tracking_params
+        await self._session.flush()
+
     async def set_publish_status(
         self, *, edition_id: int, status: PublishStatus
     ) -> None:

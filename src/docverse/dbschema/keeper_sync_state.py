@@ -13,7 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,9 +25,11 @@ class SqlKeeperSyncState(Base):
     """ORM model for the ``keeper_sync_state`` table.
 
     One row per LTD ↔ Docverse pairing for a project, edition, or build.
-    Re-entering any sync function with the same payload looks up by the
-    ``(org_id, resource_type, ltd_id)`` unique key and either short-
-    circuits (state matches LTD) or resumes (state differs).
+    Project rows are keyed on ``(org_id, ltd_slug)`` because LTD products
+    are slug-only; edition and build rows are keyed on
+    ``(org_id, resource_type, ltd_id)`` because LTD edition / build
+    slugs are only unique within a product. The two partial unique
+    indexes below enforce these per-resource keys.
     """
 
     __tablename__ = "keeper_sync_state"
@@ -44,7 +46,7 @@ class SqlKeeperSyncState(Base):
 
     resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
 
-    ltd_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ltd_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     ltd_slug: Mapped[str] = mapped_column(String(256), nullable=False)
 
@@ -71,11 +73,20 @@ class SqlKeeperSyncState(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_keeper_sync_state_project_org_slug",
+            "org_id",
+            "ltd_slug",
+            unique=True,
+            postgresql_where=text("resource_type = 'project'"),
+        ),
+        Index(
+            "uq_keeper_sync_state_other_org_resource_ltd",
             "org_id",
             "resource_type",
             "ltd_id",
-            name="uq_keeper_sync_state_org_resource_ltd",
+            unique=True,
+            postgresql_where=text("resource_type IN ('edition', 'build')"),
         ),
         CheckConstraint(
             "resource_type IN ('project', 'edition', 'build')",

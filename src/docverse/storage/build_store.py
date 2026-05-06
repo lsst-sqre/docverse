@@ -99,6 +99,36 @@ class BuildStore:
             return None
         return Build.model_validate(row)
 
+    async def list_pending_older_than(
+        self,
+        *,
+        project_id: int,
+        git_ref: str,
+        uploader: str,
+        older_than: datetime,
+    ) -> list[Build]:
+        """Return stale ``pending`` builds matching the given filters.
+
+        Filters by ``(project_id, git_ref, uploader)`` and returns rows
+        whose ``date_created`` is strictly before ``older_than``. The
+        keeper-sync engine uses this to find placeholder builds left
+        behind by a run that crashed between placeholder creation and
+        finalize, so they can be transitioned to ``failed`` before a
+        retry creates a fresh placeholder. Soft-deleted rows are
+        excluded.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+                SqlBuild.uploader == uploader,
+                SqlBuild.status == BuildStatus.pending,
+                SqlBuild.date_created < older_than,
+                SqlBuild.date_deleted.is_(None),
+            )
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
+
     async def get_latest_build_id_for_ref(
         self, *, project_id: int, git_ref: str
     ) -> int | None:
@@ -196,6 +226,44 @@ class BuildStore:
             raise InvalidBuildStateError(msg)
         row.object_count = object_count
         row.total_size_bytes = total_size_bytes
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
+    async def update_content_hash(
+        self, *, build_id: int, content_hash: str
+    ) -> Build:
+        """Overwrite the content hash on a build row.
+
+        Used by the keeper-sync engine: the synced build is created
+        with a placeholder hash before the bucket-to-bucket copy runs,
+        then this method writes the deterministic manifest hash the
+        copier produces. The regular upload-signalling path never
+        needs this — the client supplies the hash up front.
+
+        Only permitted while the build is ``pending``; once it has
+        moved to ``processing`` or beyond, the hash is part of the
+        committed build identity and must not change.
+
+        Raises
+        ------
+        InvalidBuildStateError
+            If the build is not found or is not in ``pending`` status.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(SqlBuild.id == build_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Build {build_id} not found"
+            raise InvalidBuildStateError(msg)
+        if row.status != BuildStatus.pending:
+            msg = (
+                f"Cannot update content hash on build {build_id}: "
+                f"status is {row.status.value!r}, expected 'pending'"
+            )
+            raise InvalidBuildStateError(msg)
+        row.content_hash = content_hash
         await self._session.flush()
         await self._session.refresh(row)
         return Build.model_validate(row)
