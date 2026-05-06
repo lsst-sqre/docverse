@@ -13,8 +13,8 @@ import hashlib
 import pytest
 import structlog
 
-from docverse.keeper_sync.copier import BuildContentCopier
-from docverse.keeper_sync.s3_source import LtdSourceProtocol
+from docverse.services.keeper_sync.copier import BuildContentCopier
+from docverse.storage.ltd import LtdSourceProtocol
 from docverse.storage.objectstore import MockObjectStore
 
 

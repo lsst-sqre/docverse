@@ -30,23 +30,24 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.dbschema.build import SqlBuild
-from docverse.keeper_sync.client import LtdClient
-from docverse.keeper_sync.copier import BuildContentCopier
-from docverse.keeper_sync.s3_source import LtdSourceProtocol
-from docverse.keeper_sync.service import (
+from docverse.services.keeper_sync.copier import BuildContentCopier
+from docverse.services.keeper_sync.service import (
     KeeperSyncContext,
     KeeperSyncService,
     _now,
 )
-from docverse.keeper_sync.state_store import KeeperSyncStateStore, ResourceType
 from docverse.services.project import ProjectService
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.ltd import LtdClient, LtdSourceProtocol
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
+FIXTURES_DIR = (
+    Path(__file__).parent.parent.parent / "storage" / "ltd" / "fixtures"
+)
 LTD_BASE = "https://keeper.lsst.codes"
 
 

@@ -2,7 +2,7 @@
 
 The :class:`KeeperSyncService` is the tracer-bullet entry point that
 walks one project end-to-end: it fetches LTD's view of the resource
-through :class:`docverse.keeper_sync.client.LtdClient`, looks up or
+through :class:`docverse.storage.ltd.LtdClient`, looks up or
 creates the matching Docverse rows by delegating to the existing
 ``ProjectService`` / ``BuildStore`` / ``EditionStore``, and copies the
 build content into Docverse R2 via :class:`BuildContentCopier`. The
@@ -11,8 +11,8 @@ with unchanged LTD state short-circuits.
 
 This slice covers only the ``git_refs`` LTD edition mode; other modes
 raise :class:`NotImplementedError` from
-:func:`docverse.keeper_sync.mappers.map_edition_tracking` and are
-filled in by issue #289.
+:func:`docverse.services.keeper_sync.mappers.map_edition_tracking` and
+are filled in by issue #289.
 """
 
 from __future__ import annotations
@@ -42,18 +42,17 @@ from docverse.exceptions import NotFoundError
 from docverse.services.project import DEFAULT_EDITION_SLUG, ProjectService
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.ltd import LtdClient, LtdEdition, LtdProduct
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
-from .client import LtdClient
 from .copier import CopyResult
 from .mappers import (
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
 )
-from .models import LtdEdition, LtdProduct
-from .state_store import KeeperSyncStateStore, ResourceType
 
 __all__ = [
     "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",

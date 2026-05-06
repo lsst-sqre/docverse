@@ -1,8 +1,8 @@
 """Pure mappers from LTD edition fields onto Docverse counterparts.
 
 These are intentionally side-effect-free helpers so the
-:class:`docverse.keeper_sync.service.KeeperSyncService` orchestration
-can remain a thin wrapper over the existing
+:class:`docverse.services.keeper_sync.service.KeeperSyncService`
+orchestration can remain a thin wrapper over the existing
 :class:`docverse.services.edition.EditionService` and friends. Only
 ``git_refs`` is fully mapped here; the remaining LTD modes raise
 :class:`NotImplementedError` and are filled in by issue #289.
@@ -13,8 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from docverse.client.models import EditionKind, TrackingMode
-
-from .models import LtdEdition, LtdEditionMode
+from docverse.storage.ltd import LtdEdition, LtdEditionMode
 
 __all__ = [
     "LTD_MAIN_SLUG",

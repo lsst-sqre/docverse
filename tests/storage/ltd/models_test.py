@@ -1,4 +1,4 @@
-"""Tests for ``docverse.keeper_sync.models``.
+"""Tests for ``docverse.storage.ltd.models``.
 
 Round-trip captured ``keeper.lsst.codes`` JSON fixtures through the
 Pydantic models so a future schema drift on the LTD side surfaces here
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from docverse.keeper_sync.models import (
+from docverse.storage.ltd import (
     LtdBuild,
     LtdEdition,
     LtdEditionMode,

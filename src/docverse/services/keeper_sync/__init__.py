@@ -7,29 +7,22 @@ into a Docverse organization, copying build content from the public
 See SQR-112 and the parent PRD (#275) for the full design.
 """
 
-from .client import LtdClient, LtdClientError, LtdNotFoundError
+from __future__ import annotations
+
 from .copier import BuildContentCopier, CopyResult
 from .mappers import (
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
 )
-from .models import (
-    LtdBuild,
-    LtdEdition,
-    LtdEditionMode,
-    LtdProduct,
-    LtdProductsListing,
-)
-from .s3_source import LtdS3Source, LtdSourceProtocol
 from .service import (
     BuildSyncOutcome,
     CopyCallable,
     EditionSyncOutcome,
+    KeeperSyncContext,
     KeeperSyncService,
     ProjectSyncResult,
 )
-from .state_store import KeeperSyncState, KeeperSyncStateStore, ResourceType
 
 __all__ = [
     "BuildContentCopier",
@@ -37,21 +30,9 @@ __all__ = [
     "CopyCallable",
     "CopyResult",
     "EditionSyncOutcome",
+    "KeeperSyncContext",
     "KeeperSyncService",
-    "KeeperSyncState",
-    "KeeperSyncStateStore",
-    "LtdBuild",
-    "LtdClient",
-    "LtdClientError",
-    "LtdEdition",
-    "LtdEditionMode",
-    "LtdNotFoundError",
-    "LtdProduct",
-    "LtdProductsListing",
-    "LtdS3Source",
-    "LtdSourceProtocol",
     "ProjectSyncResult",
-    "ResourceType",
     "derive_edition_kind",
     "derive_edition_slug",
     "map_edition_tracking",

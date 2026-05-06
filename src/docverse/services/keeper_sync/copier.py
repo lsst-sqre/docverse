@@ -18,9 +18,8 @@ from dataclasses import dataclass
 
 import structlog
 
+from docverse.storage.ltd import LtdSourceProtocol
 from docverse.storage.objectstore import ObjectStore
-
-from .s3_source import LtdSourceProtocol
 
 __all__ = ["BuildContentCopier", "CopyResult"]
 

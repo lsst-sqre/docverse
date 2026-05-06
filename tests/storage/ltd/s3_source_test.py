@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import structlog
 
-from docverse.keeper_sync.s3_source import LtdS3Source, LtdSourceProtocol
+from docverse.storage.ltd import LtdS3Source, LtdSourceProtocol
 
 
 def test_implements_source_protocol() -> None:

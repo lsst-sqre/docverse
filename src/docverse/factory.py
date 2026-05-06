@@ -14,11 +14,6 @@ from safir.arq import ArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .keeper_sync.client import LtdClient
-from .keeper_sync.copier import BuildContentCopier, CopyResult
-from .keeper_sync.s3_source import LtdS3Source
-from .keeper_sync.service import KeeperSyncContext, KeeperSyncService
-from .keeper_sync.state_store import KeeperSyncStateStore
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.credential import CredentialService
@@ -42,6 +37,12 @@ from .services.edition_tracking import (
     EditionTrackingService,
 )
 from .services.infrastructure import InfrastructureService
+from .services.keeper_sync import (
+    BuildContentCopier,
+    CopyResult,
+    KeeperSyncContext,
+    KeeperSyncService,
+)
 from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
@@ -58,6 +59,8 @@ from .storage.editionpublisher import (
     create_edition_publisher,
 )
 from .storage.github import GitHubAppClient, GitHubAppNotConfiguredError
+from .storage.keeper_sync import KeeperSyncStateStore
+from .storage.ltd import LtdClient, LtdS3Source
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore

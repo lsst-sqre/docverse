@@ -1,4 +1,4 @@
-"""Tests for ``docverse.keeper_sync.mappers``.
+"""Tests for ``docverse.services.keeper_sync.mappers``.
 
 Pure-function table tests with no DB or HTTP. Intended to lock the
 mapping rules from PRD #275 ("Data model and state tracking — Mapping
@@ -13,12 +13,12 @@ import pytest
 from pydantic import HttpUrl
 
 from docverse.client.models import EditionKind, TrackingMode
-from docverse.keeper_sync.mappers import (
+from docverse.services.keeper_sync.mappers import (
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
 )
-from docverse.keeper_sync.models import LtdEdition
+from docverse.storage.ltd import LtdEdition
 
 
 def _edition(

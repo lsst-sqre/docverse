@@ -9,7 +9,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate
-from docverse.keeper_sync.state_store import KeeperSyncStateStore, ResourceType
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
 
 
