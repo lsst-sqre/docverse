@@ -237,6 +237,54 @@ async def test_get_run_404_for_run_in_other_org(
 
 
 @pytest.mark.asyncio
+async def test_list_runs_returns_per_run_counters(
+    client: AsyncClient,
+) -> None:
+    """``GET /runs`` returns correct counters scoped to each run."""
+    await _setup_org(client)
+    org_id = await _get_org_id()
+    # Seed two terminal runs directly — counter aggregation must scope
+    # per-run, not bleed across runs in the same org.
+    async for session in db_session_dependency():
+        async with session.begin():
+            row_a = SqlKeeperSyncRun(
+                org_id=org_id, kind="backfill", status="succeeded"
+            )
+            row_b = SqlKeeperSyncRun(
+                org_id=org_id, kind="backfill", status="failed"
+            )
+            session.add(row_a)
+            session.add(row_b)
+            await session.flush()
+            run_a_id = row_a.id
+            run_b_id = row_b.id
+            await session.commit()
+
+    await _seed_queue_job(
+        org_id=org_id, run_id=run_a_id, status=JobStatus.completed
+    )
+    await _seed_queue_job(
+        org_id=org_id, run_id=run_a_id, status=JobStatus.completed
+    )
+    await _seed_queue_job(
+        org_id=org_id, run_id=run_b_id, status=JobStatus.failed
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    runs = {r["id"]: r for r in response.json()}
+    assert runs[run_a_id]["succeeded_count"] == 2
+    assert runs[run_a_id]["failed_count"] == 0
+    assert runs[run_a_id]["total_count"] == 2
+    assert runs[run_b_id]["succeeded_count"] == 0
+    assert runs[run_b_id]["failed_count"] == 1
+    assert runs[run_b_id]["total_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_list_runs_returns_runs_newest_first(
     client: AsyncClient,
 ) -> None:

@@ -9,6 +9,7 @@ counter row.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import structlog
@@ -176,6 +177,63 @@ class KeeperSyncRunStore:
             failed_count=failed,
             total_count=total,
         )
+
+    async def aggregate_counters_for_runs(
+        self, *, run_ids: Sequence[int]
+    ) -> dict[int, KeeperSyncRunCounters]:
+        """Aggregate ``queue_jobs`` rows for many runs in a single query.
+
+        One ``GROUP BY keeper_sync_run_id, status`` instead of N
+        per-run queries — keeps ``GET /runs`` at O(1) round-trips
+        even at ``MAX_PAGE_LIMIT``. Runs in ``run_ids`` with no
+        attributed jobs come back with zeroed counters so callers
+        never have to handle missing keys.
+        """
+        if not run_ids:
+            return {}
+        zero = KeeperSyncRunCounters(
+            pending_count=0,
+            succeeded_count=0,
+            failed_count=0,
+            total_count=0,
+        )
+        result: dict[int, dict[str, int]] = {
+            run_id: {"pending": 0, "succeeded": 0, "failed": 0, "total": 0}
+            for run_id in run_ids
+        }
+        stmt = (
+            select(
+                SqlQueueJob.keeper_sync_run_id,
+                SqlQueueJob.status,
+                func.count(SqlQueueJob.id),
+            )
+            .where(SqlQueueJob.keeper_sync_run_id.in_(list(run_ids)))
+            .group_by(SqlQueueJob.keeper_sync_run_id, SqlQueueJob.status)
+        )
+        rows = await self._session.execute(stmt)
+        for run_id, status_value, count in rows.all():
+            bucket = result[run_id]
+            bucket["total"] += count
+            if status_value in (
+                JobStatus.queued.value,
+                JobStatus.in_progress.value,
+            ):
+                bucket["pending"] += count
+            elif status_value == JobStatus.completed.value:
+                bucket["succeeded"] += count
+            else:
+                bucket["failed"] += count
+        return {
+            run_id: KeeperSyncRunCounters(
+                pending_count=b["pending"],
+                succeeded_count=b["succeeded"],
+                failed_count=b["failed"],
+                total_count=b["total"],
+            )
+            if b["total"]
+            else zero
+            for run_id, b in result.items()
+        }
 
     async def _get_row(self, run_id: int) -> SqlKeeperSyncRun:
         result = await self._session.execute(

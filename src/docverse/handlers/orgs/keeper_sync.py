@@ -128,13 +128,11 @@ async def get_org_keeper_sync_runs(  # noqa: PLR0913
             limit=limit,
         )
         run_store = context.factory.create_keeper_sync_run_store()
-        # Aggregate counters once per row via the same store call so
-        # the list and detail endpoints return identical envelopes —
-        # cheaper than re-resolving the org per row.
-        counters_by_id = {
-            run.id: await run_store.aggregate_counters(run_id=run.id)
-            for run in result.entries
-        }
+        # One ``GROUP BY`` query covers every run in the page; avoids
+        # an N+1 round-trip pattern at ``MAX_PAGE_LIMIT``.
+        counters_by_id = await run_store.aggregate_counters_for_runs(
+            run_ids=[run.id for run in result.entries]
+        )
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
