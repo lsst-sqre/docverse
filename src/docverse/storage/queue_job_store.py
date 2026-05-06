@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -257,6 +257,53 @@ class QueueJobStore:
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
+
+    async def fail_orphaned_run_children(
+        self,
+        *,
+        run_id: int,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail child rows for a keeper-sync run that never got an arq job.
+
+        Reconciles the gap left by ``_enqueue_children`` in
+        ``docverse.worker.functions.keeper_sync``: the child ``queue_jobs``
+        row commits *before* ``arq_queue.enqueue`` is called, so a worker
+        crash in that window leaves an orphan — ``status='queued'``,
+        ``backend_job_id IS NULL``, no arq job ever scheduled — that
+        otherwise blocks run finalisation forever.
+
+        ``idle_after`` keeps in-flight rows safe: only orphans whose
+        ``date_created`` is older than ``now - idle_after`` are failed,
+        so a concurrently-running discovery worker's freshly-committed
+        rows are never reaped before it has a chance to write back the
+        backend job ID.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.keeper_sync_run_id == run_id,
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_(None),
+            SqlQueueJob.date_created < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        failed: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Orphaned: queue_jobs row committed without an arq "
+                    "backend_job_id (worker likely crashed mid-fanout)"
+                ),
+                "type": "OrphanedQueueJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
 
     async def _get_row(self, job_id: int) -> SqlQueueJob:
         """Fetch a SqlQueueJob row by id, raising if not found."""

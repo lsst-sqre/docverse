@@ -21,6 +21,7 @@ lifecycle in tests without depending on the deeper
 from __future__ import annotations
 
 import traceback
+from datetime import timedelta
 from typing import Any, Literal
 
 import httpx
@@ -38,6 +39,12 @@ from docverse.factory import Factory
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.queue_job_store import QueueJobStore
+
+# Window before a queued child with no ``backend_job_id`` is treated as
+# orphaned by ``_reconcile_orphan_children``. Long enough to never race
+# a healthy concurrent discovery worker that's mid-fanout, short enough
+# to free a stuck run on the next discovery attempt.
+_ORPHAN_IDLE_WINDOW = timedelta(minutes=5)
 
 __all__ = ["keeper_sync_project", "keeper_sync_run_discovery"]
 
@@ -79,6 +86,11 @@ async def keeper_sync_run_discovery(
 
         async with session.begin():
             await queue_job_store.start(queue_job_id)
+            await _reconcile_orphan_children(
+                queue_job_store=queue_job_store,
+                run_id=run_id,
+                logger=logger,
+            )
 
         try:
             config = await _load_config_snapshot(
@@ -267,6 +279,13 @@ async def _enqueue_children(  # noqa: PLR0913
     ``pending → in_progress`` run transition is atomic with the first
     child's queue-job row insert so any concurrent ``GET /runs/{id}``
     can never observe a run with children but still ``pending``.
+
+    The order leaves an orphan tail: if the worker dies between the
+    SQL commit and ``arq_queue.enqueue``, the row sits in ``queued``
+    with ``backend_job_id IS NULL`` and no arq job will ever pick it
+    up — pending forever, blocking finalisation. The next discovery
+    attempt sweeps these rows via ``_reconcile_orphan_children`` once
+    they age past ``_ORPHAN_IDLE_WINDOW``.
     """
     arq_queue = ctx["arq_queue"]
     for index, ltd_slug in enumerate(ltd_slugs):
@@ -282,7 +301,8 @@ async def _enqueue_children(  # noqa: PLR0913
                     new_status=KeeperSyncRunStatus.in_progress,
                 )
         # arq enqueue lives outside the session so the SQL transaction
-        # commits before redis sees a job id pointing at our row.
+        # commits before redis sees a job id pointing at our row. See
+        # the orphan-tail caveat in this function's docstring.
         metadata = await arq_queue.enqueue(
             "keeper_sync_project",
             _queue_name=KEEPER_SYNC_QUEUE_NAME,
@@ -300,6 +320,33 @@ async def _enqueue_children(  # noqa: PLR0913
             "Enqueued keeper_sync_project",
             ltd_slug=ltd_slug,
             queue_job_id=queue_job.id,
+        )
+
+
+async def _reconcile_orphan_children(
+    *,
+    queue_job_store: QueueJobStore,
+    run_id: int,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Fail any orphan child rows left by a previous discovery attempt.
+
+    ``_enqueue_children`` commits each child ``queue_jobs`` row before
+    calling ``arq_queue.enqueue``, so a worker crash in that window
+    leaves an orphan: ``status='queued'``, ``backend_job_id IS NULL``,
+    no arq job ever scheduled. Without reconciliation the orphan
+    counts toward ``pending_count`` forever and the run can never
+    finalise. We sweep them at the top of each discovery attempt so a
+    retried (or operator-replayed) discovery can finish cleanly.
+    """
+    failed = await queue_job_store.fail_orphaned_run_children(
+        run_id=run_id, idle_after=_ORPHAN_IDLE_WINDOW
+    )
+    if failed:
+        logger.warning(
+            "Reconciled orphan keeper-sync child queue jobs",
+            orphan_count=len(failed),
+            orphan_ids=[job.id for job in failed],
         )
 
 

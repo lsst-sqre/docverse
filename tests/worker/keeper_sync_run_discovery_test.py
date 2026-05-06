@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import httpx
@@ -301,3 +302,120 @@ async def test_discovery_marks_run_failed_when_disabled(
             disc = await queue_job_store.get(queue_job_id)
             assert disc is not None
             assert disc.status == JobStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_discovery_reconciles_orphan_children_from_prior_attempt(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An orphan child from a crashed prior discovery is failed at start.
+
+    Reproduces the race window where ``_enqueue_children`` committed a
+    child ``queue_jobs`` row but died before ``arq_queue.enqueue``: the
+    row is queued, has no ``backend_job_id``, and would block run
+    finalisation forever. The next discovery attempt should sweep it.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # Pre-seed an orphan child older than the 5-minute idle window.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        orphan = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+        )
+        orphan_row = await db_session.get(SqlQueueJob, orphan.id)
+        assert orphan_row is not None
+        orphan_row.date_created = datetime.now(tz=UTC) - timedelta(minutes=10)
+        await db_session.flush()
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            reaped = await queue_job_store.get(orphan.id)
+            assert reaped is not None
+            assert reaped.status == JobStatus.failed
+            assert reaped.errors is not None
+            assert "orphan" in reaped.errors["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_discovery_leaves_recent_unenqueued_children_alone(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A queued child younger than the idle window is not reaped.
+
+    Guards against a discovery worker reaping rows that a concurrent
+    healthy discovery worker just committed but hasn't yet had a chance
+    to write a ``backend_job_id`` back onto.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # Fresh child with no backend_job_id — within the idle window.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        recent = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+        )
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            untouched = await queue_job_store.get(recent.id)
+            assert untouched is not None
+            assert untouched.status == JobStatus.queued
