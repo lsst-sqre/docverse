@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import pytest
+import structlog
 from httpx import AsyncClient
+from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 
+from docverse.client.models import BuildCreate
+from docverse.storage.build_store import BuildStore
+from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (
@@ -247,6 +253,58 @@ async def test_build_pagination_forward(
     assert resp.headers["X-Total-Count"] == "4"
     links = PaginationLinkData.from_header(resp.headers.get("link"))
     assert links.next_url is not None
+
+
+@pytest.mark.asyncio
+async def test_build_pagination_with_tied_date_created(
+    client: AsyncClient,
+) -> None:
+    """Paginate through builds whose ``date_created`` is tied.
+
+    All three builds are inserted in a single transaction so they share
+    ``date_created`` from ``func.now()``. The cursor's tiebreak (id) must
+    advance pagination correctly even when the timestamp is identical
+    for every row — that path was broken in the safir base class because
+    it stripped ``tzinfo`` before comparing against ``timestamptz``.
+    """
+    await _setup(client)
+    await _create_project(client, "bld-tie-proj")
+    logger = structlog.get_logger("test")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org = await OrganizationStore(
+                session=session, logger=logger
+            ).get_by_slug("pag-org")
+            assert org is not None
+            project = await ProjectStore(
+                session=session, logger=logger
+            ).get_by_slug(org_id=org.id, slug="bld-tie-proj")
+            assert project is not None
+            store = BuildStore(session=session, logger=logger)
+            for _ in range(3):
+                await store.create(
+                    project_id=project.id,
+                    project_slug=project.slug,
+                    data=BuildCreate(
+                        git_ref="main", content_hash=CONTENT_HASH
+                    ),
+                    uploader="testuser",
+                )
+            await session.commit()
+
+    collected: list[int] = []
+    url: str | None = (
+        "/docverse/orgs/pag-org/projects/bld-tie-proj/builds?limit=2"
+    )
+    while url:
+        resp = await client.get(url, headers=AUTH)
+        assert resp.status_code == 200
+        collected.extend(b["id"] for b in resp.json())
+        links = PaginationLinkData.from_header(resp.headers.get("link"))
+        url = links.next_url
+
+    assert len(collected) == 3
+    assert len(set(collected)) == 3
 
 
 # ---------------------------------------------------------------------------

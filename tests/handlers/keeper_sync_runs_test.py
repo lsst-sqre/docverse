@@ -9,6 +9,7 @@ import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
+from safir.http import PaginationLinkData
 
 from docverse.client.models import OrgRole
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
@@ -312,14 +313,10 @@ async def test_list_runs_paginates_with_cursor(client: AsyncClient) -> None:
     assert first.status_code == 200
     page_one = first.json()
     assert len(page_one) == 2
-    link = first.headers.get("Link", "")
-    assert "next" in link
-
-    # Extract the next cursor from the Link header.
-    next_url = _extract_next_url(link)
-    assert next_url is not None
+    links = PaginationLinkData.from_header(first.headers.get("link"))
+    assert links.next_url is not None
     second = await client.get(
-        next_url, headers={"X-Auth-Request-User": _ADMIN}
+        links.next_url, headers={"X-Auth-Request-User": _ADMIN}
     )
     assert second.status_code == 200
     page_two = second.json()
@@ -327,16 +324,6 @@ async def test_list_runs_paginates_with_cursor(client: AsyncClient) -> None:
     page_one_ids = {r["id"] for r in page_one}
     page_two_ids = {r["id"] for r in page_two}
     assert page_one_ids.isdisjoint(page_two_ids)
-
-
-def _extract_next_url(link_header: str) -> str | None:
-    for part in link_header.split(","):
-        section = part.strip()
-        if section.endswith('rel="next"'):
-            url = section.split(";")[0].strip()
-            if url.startswith("<") and url.endswith(">"):
-                return url[1:-1]
-    return None
 
 
 @pytest.mark.asyncio
