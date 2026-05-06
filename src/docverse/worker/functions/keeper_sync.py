@@ -8,14 +8,13 @@ This module owns the ``docverse:sync-queue`` callable surface:
   product. It transitions its run from ``pending`` → ``in_progress``
   atomically with the first child enqueue.
 
-* ``keeper_sync_project`` — placeholder for the per-project sync,
-  which is delivered by #287. The slice keeps the function callable
-  end-to-end so child queue-job rows reach a terminal state and
-  ``GET /runs/{id}`` counter aggregation has something to count.
-
-The two together let an operator drive the full ``POST → GET``
-lifecycle in tests without depending on the deeper
-``KeeperSyncService`` from #287.
+* ``keeper_sync_project`` — orchestrates one LTD product into Docverse
+  by delegating to :class:`KeeperSyncService`. The worker bookends the
+  service call with two short transactions that own the
+  ``queue_jobs`` lifecycle (``start`` then ``complete`` / ``fail``) and
+  recompute run finalisation; the service itself manages the
+  state-row + Docverse-row commits inside its own ``session.begin()``
+  blocks.
 """
 
 from __future__ import annotations
@@ -123,6 +122,7 @@ async def keeper_sync_run_discovery(
                 org_id=org_id,
                 org_slug=org_slug,
                 run_id=run_id,
+                ltd_base_url=str(config.ltd_base_url),
                 ltd_slugs=in_scope,
                 logger=logger,
             )
@@ -173,18 +173,27 @@ async def keeper_sync_run_discovery(
 async def keeper_sync_project(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
-    """Stub per-project sync.
+    """Sync one LTD product into Docverse via :class:`KeeperSyncService`.
 
-    Marks the queue job complete and recomputes run finalisation.
-    Replaced wholesale by the deeper ``KeeperSyncService`` orchestration
-    from #287; this slice keeps the call site live so an operator can
-    drive ``POST /runs`` end-to-end and watch the aggregate counters
-    move through ``GET /runs/{id}``.
+    The worker brackets the service call with two short transactions:
+
+    1. Mark the ``queue_jobs`` row ``in_progress``.
+    2. Construct ``KeeperSyncService`` from the factory and invoke
+       :meth:`KeeperSyncService.sync_project`. The service runs outside
+       any outer ``session.begin()`` so it can manage its own commits
+       across LTD HTTP, content copy, and Docverse-side row writes.
+    3. On success, mark the queue job ``completed``; on a caught
+       exception, mark it ``failed`` with structured error details and
+       re-raise so arq records the job as failed. Both branches call
+       :func:`_maybe_finalise_run` so a terminal child cannot leave the
+       parent run stuck in ``in_progress``.
     """
+    org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
     run_id: int = payload["run_id"]
     queue_job_id: int = payload["queue_job_id"]
     ltd_slug: str = payload["ltd_slug"]
+    ltd_base_url: str = payload["ltd_base_url"]
     logger = structlog.get_logger("docverse.worker.keeper_sync_project").bind(
         org=org_slug, run_id=run_id, ltd_slug=ltd_slug
     )
@@ -196,12 +205,32 @@ async def keeper_sync_project(
 
         async with session.begin():
             await queue_job_store.start(queue_job_id)
+
+        service = factory.create_keeper_sync_service(
+            org_id=org_id,
+            service_label="keeper-sync",
+            ltd_base_url=ltd_base_url,
+        )
+        try:
+            await service.sync_project(org_id=org_id, ltd_slug=ltd_slug)
+        except Exception as exc:
+            logger.exception("Keeper-sync project failed")
+            async with session.begin():
+                await queue_job_store.fail(
+                    queue_job_id,
+                    errors={
+                        "message": str(exc),
+                        "type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+                await _maybe_finalise_run(run_store=run_store, run_id=run_id)
+            raise
+
+        async with session.begin():
             await queue_job_store.complete(queue_job_id)
-            await _maybe_finalise_run(
-                run_store=run_store,
-                run_id=run_id,
-            )
-        logger.info("Keeper-sync project stub completed")
+            await _maybe_finalise_run(run_store=run_store, run_id=run_id)
+        logger.info("Keeper-sync project completed")
         return "completed"
 
     msg = "No database session available"
@@ -267,6 +296,7 @@ async def _enqueue_children(  # noqa: PLR0913
     org_id: int,
     org_slug: str,
     run_id: int,
+    ltd_base_url: str,
     ltd_slugs: list[str],
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
@@ -312,6 +342,7 @@ async def _enqueue_children(  # noqa: PLR0913
                 "run_id": run_id,
                 "queue_job_id": queue_job.id,
                 "ltd_slug": ltd_slug,
+                "ltd_base_url": ltd_base_url,
             },
         )
         async with session.begin():

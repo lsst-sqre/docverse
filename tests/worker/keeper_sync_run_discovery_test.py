@@ -139,6 +139,14 @@ async def test_discovery_fans_out_intersected_slugs(
     )
     assert default_jobs == []
 
+    # Each child payload carries the snapshot ``ltd_base_url`` so the
+    # per-project worker can construct its KeeperSyncService without
+    # re-reading the org config (which may have changed mid-run).
+    payloads = [job.kwargs["payload"] for job in project_jobs]
+    assert {p["ltd_slug"] for p in payloads} == {"dmtn-001", "sqr-112"}
+    for payload in payloads:
+        assert payload["ltd_base_url"] == "https://keeper.lsst.codes/"
+
     async for session in db_session_dependency():
         async with session.begin():
             stmt = select(SqlQueueJob).where(
