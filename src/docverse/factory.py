@@ -725,9 +725,10 @@ class Factory:
 
         @asynccontextmanager
         async def _open() -> AsyncGenerator[BuildContentCopier]:
-            destination = await self.create_objectstore_for_org(
-                org_id=org_id, service_label=service_label
-            )
+            async with self._session.begin():
+                destination = await self.create_objectstore_for_org(
+                    org_id=org_id, service_label=service_label
+                )
             source = self.create_ltd_s3_source()
             async with source, destination:
                 yield BuildContentCopier(

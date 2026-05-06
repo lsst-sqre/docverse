@@ -22,6 +22,7 @@ import respx
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -32,6 +33,7 @@ from docverse.client.models import (
     OrganizationCreate,
 )
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
@@ -108,7 +110,11 @@ def _patch_factory_io(
     monkeypatch.setattr(Factory, "create_ltd_s3_source", _create_ltd_s3_source)
 
 
-async def _seed_org(db_session: AsyncSession) -> tuple[int, str]:
+async def _seed_org(
+    db_session: AsyncSession,
+    *,
+    publishing_store_label: str | None = "mock-store",
+) -> tuple[int, str]:
     logger = _logger()
     org_store = OrganizationStore(session=db_session, logger=logger)
     org = await org_store.create(
@@ -125,6 +131,13 @@ async def _seed_org(db_session: AsyncSession) -> tuple[int, str]:
             project_slugs=["pipelines"],
         ),
     )
+    if publishing_store_label is not None:
+        await db_session.execute(
+            update(SqlOrganization)
+            .where(SqlOrganization.id == org.id)
+            .values(publishing_store_label=publishing_store_label)
+        )
+        await db_session.flush()
     return org.id, org.slug
 
 
@@ -334,4 +347,140 @@ async def test_keeper_sync_project_failure_marks_queue_job_and_finalises_run(
             assert run.status == KeeperSyncRunStatus.partial_failure
 
     # Nothing was copied to the destination on the failure path.
+    assert object_store.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_objectstore_failure_marks_queue_job_failed(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Objectstore resolution raising → queue job ``failed``, no leaked txn.
+
+    Drives the failure deeper than the LTD-404 path: the service has
+    started copying and invokes the factory's copier closure, which calls
+    ``create_objectstore_for_org``. We make that raise, exercising the
+    worker's except branch after the factory has entered the autobegun
+    transaction region. Without the fix this reproduces
+    ``InvalidRequestError: A transaction is already begun on this Session``.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    async def _create_objectstore_for_org_raises(
+        self: Factory, *, org_id: int, service_label: str
+    ) -> MockObjectStore:
+        msg = f"Service {service_label!r} not found"
+        raise RuntimeError(msg)
+
+    def _create_ltd_s3_source(
+        self: Factory, *, bucket: str = "lsst-the-docs"
+    ) -> _FakeLtdSource:
+        return _FakeLtdSource({})
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _create_objectstore_for_org_raises,
+    )
+    monkeypatch.setattr(Factory, "create_ltd_s3_source", _create_ltd_s3_source)
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with pytest.raises(RuntimeError, match="Service 'mock-store' not found"):
+        await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert "Service 'mock-store' not found" in qj.errors["message"]
+
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_missing_publishing_store_label(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``publishing_store_label`` → worker fails fast with clear error."""
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, publishing_store_label=None
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    object_store = MockObjectStore()
+    _patch_factory_io(
+        monkeypatch, object_store=object_store, source_objects={}
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with pytest.raises(RuntimeError, match="publishing_store_label"):
+        await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert "publishing_store_label" in qj.errors["message"]
+
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+
+    # Nothing copied since the worker bailed before constructing the service.
     assert object_store.objects == {}

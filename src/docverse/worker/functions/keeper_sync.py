@@ -202,16 +202,30 @@ async def keeper_sync_project(
         factory = ctx["factory_builder"](session=session, logger=logger)
         queue_job_store = factory.create_queue_job_store()
         run_store = factory.create_keeper_sync_run_store()
+        org_store = factory.create_org_store()
 
         async with session.begin():
             await queue_job_store.start(queue_job_id)
+            org = await org_store.get_by_id(org_id)
 
-        service = factory.create_keeper_sync_service(
-            org_id=org_id,
-            service_label="keeper-sync",
-            ltd_base_url=ltd_base_url,
-        )
         try:
+            if org is None:
+                msg = f"Organization {org_id} not found"
+                raise RuntimeError(msg)  # noqa: TRY301
+            publishing_store_label = org.publishing_store_label
+            if publishing_store_label is None:
+                msg = (
+                    f"Org {org_id} has no publishing_store_label "
+                    "configured; keeper-sync requires a publishing "
+                    "object store"
+                )
+                raise RuntimeError(msg)  # noqa: TRY301
+
+            service = factory.create_keeper_sync_service(
+                org_id=org_id,
+                service_label=publishing_store_label,
+                ltd_base_url=ltd_base_url,
+            )
             await service.sync_project(org_id=org_id, ltd_slug=ltd_slug)
         except Exception as exc:
             logger.exception("Keeper-sync project failed")
