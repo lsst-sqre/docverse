@@ -49,9 +49,7 @@ from tests.support.arq_testing import register_queue
 from tests.worker.conftest import make_worker_ctx
 
 LTD_BASE = "https://keeper.lsst.codes"
-FIXTURES_DIR = (
-    Path(__file__).parent.parent / "storage" / "ltd" / "fixtures"
-)
+FIXTURES_DIR = Path(__file__).parent.parent / "storage" / "ltd" / "fixtures"
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -107,9 +105,7 @@ def _patch_factory_io(
     monkeypatch.setattr(
         Factory, "create_objectstore_for_org", _create_objectstore_for_org
     )
-    monkeypatch.setattr(
-        Factory, "create_ltd_s3_source", _create_ltd_s3_source
-    )
+    monkeypatch.setattr(Factory, "create_ltd_s3_source", _create_ltd_s3_source)
 
 
 async def _seed_org(db_session: AsyncSession) -> tuple[int, str]:
@@ -158,9 +154,7 @@ async def _seed_project_queue_job(
 def _seed_ltd(mock_discovery: respx.Router) -> None:
     """Stub the canonical LTD endpoints for the ``pipelines`` product."""
     mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
-        return_value=httpx.Response(
-            200, json=_load("product_pipelines.json")
-        )
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
     )
     mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
         return_value=httpx.Response(
@@ -263,9 +257,7 @@ async def test_keeper_sync_project_runs_service_and_finalises_run(
             assert build_state is not None
             assert build_state.docverse_id == build.id
 
-            queue_job_store = QueueJobStore(
-                session=session, logger=_logger()
-            )
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
             assert qj.status == JobStatus.completed
@@ -328,9 +320,7 @@ async def test_keeper_sync_project_failure_marks_queue_job_and_finalises_run(
 
     async for session in db_session_dependency():
         async with session.begin():
-            queue_job_store = QueueJobStore(
-                session=session, logger=_logger()
-            )
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
             assert qj.status == JobStatus.failed
