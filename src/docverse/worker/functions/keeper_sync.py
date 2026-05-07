@@ -15,16 +15,22 @@ This module owns the ``docverse:sync-queue`` callable surface:
   recompute run finalisation; the service itself manages the
   state-row + Docverse-row commits inside its own ``session.begin()``
   blocks.
+
+* ``keeper_sync_tier_main`` / ``_tier_discovery`` / ``_tier_other`` —
+  cron-driven steady-state reconcilers that enqueue ``keeper_sync_
+  project`` children with no run attribution. See PRD #275 §"
+  Reconciliation cadence (steady state, run-independent)".
 """
 
 from __future__ import annotations
 
 import traceback
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
 import structlog
+from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,12 +41,20 @@ from docverse.client.models import (
 )
 from docverse.config import config
 from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.organization import Organization
 from docverse.factory import Factory
+from docverse.services.keeper_sync.scheduler import (
+    is_unknown_resource,
+    should_refresh_main_edition,
+    should_refresh_other_edition,
+)
 from docverse.services.keeper_sync.service import ProjectSyncResult
 from docverse.services.keeper_sync_finalisation import maybe_finalise_run
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.services.publish_enqueue import enqueue_publish_for_edition
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse.storage.ltd import LtdClient, LtdClientError, LtdEdition
 from docverse.storage.queue_job_store import QueueJobStore
 
 # Window before a queued child with no ``backend_job_id`` is treated as
@@ -53,7 +67,14 @@ __all__ = [
     "keeper_sync_project",
     "keeper_sync_reaper",
     "keeper_sync_run_discovery",
+    "keeper_sync_tier_discovery",
+    "keeper_sync_tier_main",
+    "keeper_sync_tier_other",
 ]
+
+#: Slug LTD assigns to every product's primary edition. Tier_main owns
+#: refreshes for this slug; tier_other explicitly skips it.
+_LTD_MAIN_SLUG = "main"
 
 
 async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
@@ -267,7 +288,13 @@ async def keeper_sync_project(
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
-    run_id: int = payload["run_id"]
+    # ``run_id`` is absent from tier-cron-enqueued payloads (the
+    # continuous reconciliation loops attribute their work to no run);
+    # see PRD #275 "Reconciliation cadence (steady state, run-
+    # independent)". When ``None``, the worker skips the run-roll-up
+    # call so a tier-cron job cannot accidentally finalise some
+    # unrelated run.
+    run_id: int | None = payload.get("run_id")
     queue_job_id: int = payload["queue_job_id"]
     ltd_slug: str = payload["ltd_slug"]
     ltd_base_url: str = payload["ltd_base_url"]
@@ -326,12 +353,16 @@ async def keeper_sync_project(
                         "traceback": traceback.format_exc(),
                     },
                 )
-                await maybe_finalise_run(run_store=run_store, run_id=run_id)
+                if run_id is not None:
+                    await maybe_finalise_run(
+                        run_store=run_store, run_id=run_id
+                    )
             raise
 
         async with session.begin():
             await queue_job_store.complete(queue_job_id)
-            await maybe_finalise_run(run_store=run_store, run_id=run_id)
+            if run_id is not None:
+                await maybe_finalise_run(run_store=run_store, run_id=run_id)
         logger.info("Keeper-sync project completed")
         return "completed"
 
@@ -345,7 +376,7 @@ async def _enqueue_publish_for_finalized_builds(  # noqa: PLR0913
     session: AsyncSession,
     queue_job_store: QueueJobStore,
     org_id: int,
-    run_id: int,
+    run_id: int | None,
     sync_result: ProjectSyncResult,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
@@ -608,3 +639,459 @@ async def _reconcile_orphan_children(
             orphan_count=len(failed),
             orphan_ids=[job.id for job in failed],
         )
+
+
+async def keeper_sync_tier_main(ctx: dict[str, Any]) -> str:
+    """Cron (every 5 min): refresh ``main`` editions whose LTD rebuilt.
+
+    Walks every org with ``keeper_sync_config.enabled`` and intersects
+    its allowlist with LTD's product list; for each in-scope project
+    fetches the LTD ``main`` edition and consults the local
+    ``keeper_sync_state`` row. The pure
+    :func:`docverse.services.keeper_sync.scheduler.should_refresh_main_edition`
+    decides whether LTD's ``date_rebuilt`` has advanced past
+    ``state.date_rebuilt_seen``; when it has, the cron enqueues a
+    ``keeper_sync_project`` child with ``keeper_sync_run_id`` left
+    ``None`` so the steady-state pass does not pollute any operator-
+    triggered run's progress aggregation.
+
+    Per-org failures (LTD outage on one host, an unreadable config)
+    are logged and skipped so the cron stays best-effort across all
+    enabled orgs. Returns ``"completed"`` regardless of how many child
+    enqueues fired.
+    """
+    logger = structlog.get_logger("docverse.worker.keeper_sync_tier_main")
+    return await _run_tier(
+        ctx=ctx, logger=logger, processor=_tier_main_for_org, tier_name="main"
+    )
+
+
+async def keeper_sync_tier_discovery(ctx: dict[str, Any]) -> str:
+    """Cron (every 30 min): enqueue projects with unseen LTD resources.
+
+    For each in-scope LTD project the cron checks the project-level
+    ``keeper_sync_state`` row first; if missing it enqueues a
+    ``keeper_sync_project`` straight away. Otherwise it lists the
+    project's editions and asks
+    :func:`docverse.services.keeper_sync.scheduler.is_unknown_resource`
+    whether any edition lacks a state row. Discovery never enqueues
+    twice for the same project on a single tick — one
+    ``keeper_sync_project`` covers all of its editions.
+    """
+    logger = structlog.get_logger("docverse.worker.keeper_sync_tier_discovery")
+    return await _run_tier(
+        ctx=ctx,
+        logger=logger,
+        processor=_tier_discovery_for_org,
+        tier_name="discovery",
+    )
+
+
+async def keeper_sync_tier_other(ctx: dict[str, Any]) -> str:
+    """Cron (hourly): refresh non-``main`` editions older than the threshold.
+
+    Walks each in-scope project's LTD editions and consults
+    :func:`docverse.services.keeper_sync.scheduler.should_refresh_other_edition`
+    against the local state row's ``date_last_synced``. The first
+    stale non-``main`` edition for a project triggers one
+    ``keeper_sync_project`` enqueue (which re-syncs every edition),
+    so multiple stale editions do not produce duplicate children.
+    Editions with no state row are left to ``tier_discovery`` so the
+    two cron functions do not race for the same enqueue.
+    """
+    logger = structlog.get_logger("docverse.worker.keeper_sync_tier_other")
+    return await _run_tier(
+        ctx=ctx,
+        logger=logger,
+        processor=_tier_other_for_org,
+        tier_name="other",
+    )
+
+
+async def _run_tier(
+    *,
+    ctx: dict[str, Any],
+    logger: structlog.stdlib.BoundLogger,
+    processor: TierOrgProcessor,
+    tier_name: str,
+) -> str:
+    """Shared cron-tick driver: list enabled orgs, run a per-org processor.
+
+    The per-org loop is wrapped in a broad ``except`` because the cron
+    must keep visiting every enabled org even if one of them is mid-
+    incident (LTD down, malformed config, transient DB error). The
+    failure is logged with structured context for follow-up; the next
+    tick will retry naturally.
+    """
+    enqueued_total = 0
+    async for session in db_session_dependency():
+        factory = ctx["factory_builder"](session=session, logger=logger)
+        org_store = factory.create_org_store()
+        async with session.begin():
+            all_orgs = await org_store.list_all()
+        candidates = [
+            o
+            for o in all_orgs
+            if o.keeper_sync_config is not None
+            and o.keeper_sync_config.enabled
+        ]
+        for org in candidates:
+            try:
+                enqueued_total += await processor(
+                    ctx=ctx,
+                    session=session,
+                    factory=factory,
+                    org=org,
+                    logger=logger,
+                )
+            except Exception:
+                logger.exception(
+                    "Keeper-sync tier processor failed for org",
+                    tier=tier_name,
+                    org=org.slug,
+                )
+        logger.info(
+            "Keeper-sync tier pass complete",
+            tier=tier_name,
+            candidates=len(candidates),
+            enqueued=enqueued_total,
+        )
+        return "completed"
+
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+# Tier processors take the per-org context and return how many
+# ``keeper_sync_project`` children they enqueued. Defined as a callable
+# alias so ``_run_tier`` can be shared across all three cron functions.
+TierOrgProcessor = Any
+
+
+async def _tier_main_for_org(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    org: Organization,
+    logger: structlog.stdlib.BoundLogger,
+) -> int:
+    """Run one tier_main pass for a single enabled org."""
+    config_snapshot = org.keeper_sync_config
+    if config_snapshot is None:
+        return 0
+    in_scope = await _list_in_scope_slugs(
+        factory=factory, config=config_snapshot
+    )
+    if not in_scope:
+        return 0
+    ltd_client = factory.create_ltd_client(
+        base_url=str(config_snapshot.ltd_base_url)
+    )
+    state_store = factory.create_keeper_sync_state_store()
+    queue_job_store = factory.create_queue_job_store()
+    arq_queue = ctx["arq_queue"]
+    enqueued = 0
+    for ltd_slug in in_scope:
+        try:
+            main_edition = await _find_main_edition(
+                ltd_client=ltd_client, product_slug=ltd_slug
+            )
+        except LtdClientError:
+            logger.exception(
+                "Tier-main: failed to fetch main edition",
+                org=org.slug,
+                ltd_slug=ltd_slug,
+            )
+            continue
+        if main_edition is None:
+            continue
+        async with session.begin():
+            state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.edition,
+                ltd_id=main_edition.ltd_id,
+            )
+        if not should_refresh_main_edition(
+            state=state, ltd_date_rebuilt=main_edition.date_rebuilt
+        ):
+            continue
+        await _enqueue_tier_project_sync(
+            session=session,
+            queue_job_store=queue_job_store,
+            arq_queue=arq_queue,
+            org_id=org.id,
+            org_slug=org.slug,
+            ltd_slug=ltd_slug,
+            ltd_base_url=str(config_snapshot.ltd_base_url),
+        )
+        enqueued += 1
+    return enqueued
+
+
+async def _tier_discovery_for_org(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    org: Organization,
+    logger: structlog.stdlib.BoundLogger,
+) -> int:
+    """Run one tier_discovery pass for a single enabled org."""
+    config_snapshot = org.keeper_sync_config
+    if config_snapshot is None:
+        return 0
+    in_scope = await _list_in_scope_slugs(
+        factory=factory, config=config_snapshot
+    )
+    if not in_scope:
+        return 0
+    ltd_client = factory.create_ltd_client(
+        base_url=str(config_snapshot.ltd_base_url)
+    )
+    state_store = factory.create_keeper_sync_state_store()
+    queue_job_store = factory.create_queue_job_store()
+    arq_queue = ctx["arq_queue"]
+    enqueued = 0
+    for ltd_slug in in_scope:
+        try:
+            should_enqueue = await _project_needs_discovery(
+                session=session,
+                state_store=state_store,
+                ltd_client=ltd_client,
+                org_id=org.id,
+                ltd_slug=ltd_slug,
+            )
+        except LtdClientError:
+            logger.exception(
+                "Tier-discovery: failed to inspect project editions",
+                org=org.slug,
+                ltd_slug=ltd_slug,
+            )
+            continue
+        if not should_enqueue:
+            continue
+        await _enqueue_tier_project_sync(
+            session=session,
+            queue_job_store=queue_job_store,
+            arq_queue=arq_queue,
+            org_id=org.id,
+            org_slug=org.slug,
+            ltd_slug=ltd_slug,
+            ltd_base_url=str(config_snapshot.ltd_base_url),
+        )
+        enqueued += 1
+    return enqueued
+
+
+async def _tier_other_for_org(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    org: Organization,
+    logger: structlog.stdlib.BoundLogger,
+) -> int:
+    """Run one tier_other pass for a single enabled org."""
+    config_snapshot = org.keeper_sync_config
+    if config_snapshot is None:
+        return 0
+    in_scope = await _list_in_scope_slugs(
+        factory=factory, config=config_snapshot
+    )
+    if not in_scope:
+        return 0
+    ltd_client = factory.create_ltd_client(
+        base_url=str(config_snapshot.ltd_base_url)
+    )
+    state_store = factory.create_keeper_sync_state_store()
+    queue_job_store = factory.create_queue_job_store()
+    arq_queue = ctx["arq_queue"]
+    now = datetime.now(tz=UTC)
+    enqueued = 0
+    for ltd_slug in in_scope:
+        try:
+            ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
+        except LtdClientError:
+            logger.exception(
+                "Tier-other: failed to fetch project editions",
+                org=org.slug,
+                ltd_slug=ltd_slug,
+            )
+            continue
+        if not await _has_stale_non_main_edition(
+            session=session,
+            state_store=state_store,
+            org_id=org.id,
+            ltd_editions=ltd_editions,
+            now=now,
+        ):
+            continue
+        await _enqueue_tier_project_sync(
+            session=session,
+            queue_job_store=queue_job_store,
+            arq_queue=arq_queue,
+            org_id=org.id,
+            org_slug=org.slug,
+            ltd_slug=ltd_slug,
+            ltd_base_url=str(config_snapshot.ltd_base_url),
+        )
+        enqueued += 1
+    return enqueued
+
+
+async def _list_in_scope_slugs(
+    *, factory: Factory, config: KeeperSyncConfig
+) -> list[str]:
+    """Fetch LTD's product list and intersect it with the org's allowlist.
+
+    Wraps :class:`LtdProductsClient` so the three tier-cron processors
+    share the same list+filter pattern that ``keeper_sync_run_
+    discovery`` uses; lifting it here keeps the per-tier logic focused
+    on its decision rule.
+    """
+    products_client = factory.create_ltd_products_client(
+        base_url=str(config.ltd_base_url)
+    )
+    ltd_slugs = await products_client.list_product_slugs()
+    return _filter_to_allowlist(ltd_slugs, config.project_slugs)
+
+
+async def _find_main_edition(
+    *,
+    ltd_client: LtdClient,
+    product_slug: str,
+) -> LtdEdition | None:
+    """Locate the LTD ``main`` edition for ``product_slug``.
+
+    LTD has no slug-keyed edition lookup — every edition lives at
+    ``/editions/{integer_id}``. We pull the URL list (one cheap HTTP
+    call) and walk it in reverse: LTD orders the list newest-first
+    and the ``main`` edition is typically the first edition created
+    for a product (so it sits at the *end* of the listing), so this
+    loop terminates after one fetch in the common case. Returns
+    ``None`` when no ``main`` slug is found, which counts as "no main
+    edition to refresh" rather than an error.
+    """
+    edition_urls = await ltd_client.list_edition_urls_for_product(product_slug)
+    for url in reversed(edition_urls):
+        edition = await ltd_client.get_edition_by_url(url)
+        if edition.slug == _LTD_MAIN_SLUG:
+            return edition
+    return None
+
+
+async def _project_needs_discovery(
+    *,
+    session: AsyncSession,
+    state_store: KeeperSyncStateStore,
+    ltd_client: LtdClient,
+    org_id: int,
+    ltd_slug: str,
+) -> bool:
+    """Return True when an in-scope project has any unseen LTD resource.
+
+    The cheap check first: if the project itself has no state row,
+    enqueue immediately and skip the per-edition walk. Otherwise
+    list the editions and short-circuit on the first one without a
+    state row. Returning ``False`` means every LTD resource we know
+    about for this project is already paired with state.
+    """
+    async with session.begin():
+        project_state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
+        )
+    if is_unknown_resource(project_state):
+        return True
+    ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
+    for ltd_edition in ltd_editions:
+        async with session.begin():
+            edition_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_edition.ltd_id,
+            )
+        if is_unknown_resource(edition_state):
+            return True
+    return False
+
+
+async def _has_stale_non_main_edition(
+    *,
+    session: AsyncSession,
+    state_store: KeeperSyncStateStore,
+    org_id: int,
+    ltd_editions: list[LtdEdition],
+    now: datetime,
+) -> bool:
+    """Return True when any non-``main`` edition's state is past threshold.
+
+    Editions without a state row are deliberately ignored — they are
+    ``tier_discovery``'s job. This decoupling keeps the two cron
+    functions' decisions independent so a single missing-state row
+    cannot cause two tiers to enqueue for the same project on the
+    same hour.
+    """
+    for ltd_edition in ltd_editions:
+        if ltd_edition.slug == _LTD_MAIN_SLUG:
+            continue
+        async with session.begin():
+            state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_edition.ltd_id,
+            )
+        if state is None:
+            continue
+        if should_refresh_other_edition(state=state, now=now):
+            return True
+    return False
+
+
+async def _enqueue_tier_project_sync(  # noqa: PLR0913
+    *,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    arq_queue: ArqQueue,
+    org_id: int,
+    org_slug: str,
+    ltd_slug: str,
+    ltd_base_url: str,
+) -> None:
+    """Enqueue one ``keeper_sync_project`` child without run attribution.
+
+    Mirrors ``_enqueue_children``'s commit-then-enqueue split (so the
+    ``queue_jobs`` row exists before the arq job and a crash window
+    leaves a recoverable orphan rather than an arq job pointing at no
+    DB row). The two distinguishing details:
+
+    * ``keeper_sync_run_id`` is left ``None`` on the ``queue_jobs``
+      row — tier-cron jobs are continuous reconciliation, not
+      bounded operator runs, and must not pollute any run's progress
+      aggregate.
+    * The arq payload omits the ``run_id`` key. The receiving
+      ``keeper_sync_project`` worker reads it via ``payload.get("
+      run_id")`` and skips ``maybe_finalise_run`` when ``None``.
+    """
+    async with session.begin():
+        queue_job = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label=ltd_slug,
+        )
+    metadata = await arq_queue.enqueue(
+        "keeper_sync_project",
+        _queue_name=KEEPER_SYNC_QUEUE_NAME,
+        payload={
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "queue_job_id": queue_job.id,
+            "ltd_slug": ltd_slug,
+            "ltd_base_url": ltd_base_url,
+        },
+    )
+    async with session.begin():
+        await queue_job_store.set_backend_job_id(queue_job.id, metadata.id)

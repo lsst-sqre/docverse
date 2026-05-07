@@ -7,6 +7,9 @@ from .keeper_sync import (
     keeper_sync_project,
     keeper_sync_reaper,
     keeper_sync_run_discovery,
+    keeper_sync_tier_discovery,
+    keeper_sync_tier_main,
+    keeper_sync_tier_other,
 )
 from .ping import ping
 from .publish_edition import publish_edition
@@ -18,6 +21,9 @@ __all__ = [
     "keeper_sync_project",
     "keeper_sync_reaper",
     "keeper_sync_run_discovery",
+    "keeper_sync_tier_discovery",
+    "keeper_sync_tier_main",
+    "keeper_sync_tier_other",
     "ping",
     "publish_edition",
 ]

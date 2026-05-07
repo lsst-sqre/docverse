@@ -85,15 +85,30 @@ class LtdClient:
         this helper follows each URL and validates the result so the
         caller gets a flat list of :class:`LtdEdition` models.
         """
-        payload = await self._get_json(
-            self._url(f"/products/{product_slug}/editions/")
-        )
-        edition_urls = payload.get("editions", [])
+        edition_urls = await self.list_edition_urls_for_product(product_slug)
         results: list[LtdEdition] = []
         for url in edition_urls:
             edition_payload = await self._get_json(url)
             results.append(LtdEdition.model_validate(edition_payload))
         return results
+
+    async def list_edition_urls_for_product(
+        self, product_slug: str
+    ) -> list[str]:
+        """Fetch only the edition URL list for a product.
+
+        The cheap variant of :meth:`list_editions_for_product`: one HTTP
+        call returns every edition's resource URL, but this helper does
+        not follow them. Used by ``keeper_sync_tier_main`` where we
+        want to walk the URL list looking for the ``main`` edition
+        without paying a round-trip per non-``main`` edition along the
+        way.
+        """
+        payload = await self._get_json(
+            self._url(f"/products/{product_slug}/editions/")
+        )
+        urls = payload.get("editions", [])
+        return [url for url in urls if isinstance(url, str)]
 
     async def get_edition_by_url(self, url: str) -> LtdEdition:
         """Fetch an edition by its full ``self_url``."""

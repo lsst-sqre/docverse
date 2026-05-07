@@ -1,0 +1,806 @@
+"""Integration tests for the keeper-sync tier-cron worker functions.
+
+The three cron functions (``keeper_sync_tier_main``,
+``keeper_sync_tier_discovery``, ``keeper_sync_tier_other``) are the
+steady-state reconciliation pass that keeps Docverse in step with LTD
+between operator-triggered backfills (PRD #275 §"Reconciliation
+cadence (steady state, run-independent)"). Each test seeds an LTD
+fixture via ``respx``, calls one cron tick directly with a fake
+``ctx``, and asserts on the resulting queue-job rows + arq enqueues.
+
+The single shared invariant — verified across all three tiers — is
+that tier-cron-enqueued ``queue_jobs`` rows have
+``keeper_sync_run_id IS NULL`` and so do not pollute any operator-
+triggered run's progress aggregation.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import pytest
+import respx
+import structlog
+from arq.cron import CronJob
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from docverse.client.models import (
+    JobKind,
+    KeeperSyncConfig,
+    OrganizationCreate,
+)
+from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.organization_store import OrganizationStore
+from docverse.worker.functions.keeper_sync import (
+    keeper_sync_tier_discovery,
+    keeper_sync_tier_main,
+    keeper_sync_tier_other,
+)
+from docverse.worker.main import KeeperSyncWorkerSettings
+from tests.support.arq_testing import get_jobs_by_name, register_queue
+from tests.worker.conftest import make_worker_ctx
+
+LTD_BASE = "https://keeper.lsst.codes"
+
+#: ``date_rebuilt`` for the canonical ``main`` edition fixture. Used by
+#: tests that need to compare LTD's published timestamp against state.
+_FIXTURE_MAIN_DATE_REBUILT = datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+
+def _logger() -> structlog.stdlib.BoundLogger:
+    return structlog.get_logger("docverse")  # type: ignore[no-any-return]
+
+
+async def _seed_org(
+    db_session: AsyncSession,
+    *,
+    slug: str = "ks-tier",
+    project_slugs: list[str] | str = "*",
+    enabled: bool = True,
+) -> tuple[int, str]:
+    """Seed an org with the given keeper-sync config."""
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    org = await org_store.create(
+        OrganizationCreate(
+            slug=slug,
+            title=f"Tier {slug}",
+            base_domain=f"{slug}.example.com",
+        )
+    )
+    await org_store.update_keeper_sync_config(
+        slug=org.slug,
+        config=KeeperSyncConfig(
+            enabled=enabled,
+            project_slugs=project_slugs,  # type: ignore[arg-type]
+        ),
+    )
+    return org.id, org.slug
+
+
+def _stub_products(
+    mock_discovery: respx.Router, slugs: list[str], *, base_url: str = LTD_BASE
+) -> None:
+    """Stub ``GET /products/`` to return a flat list of product URLs."""
+    products = [f"{base_url}/products/{s}/" for s in slugs]
+    mock_discovery.get(f"{base_url}/products/").mock(
+        return_value=httpx.Response(
+            200,
+            content=json.dumps({"products": products}).encode(),
+            headers={"content-type": "application/json"},
+        )
+    )
+
+
+def _stub_editions_listing(
+    mock_discovery: respx.Router,
+    *,
+    product_slug: str,
+    edition_ids: list[int],
+    base_url: str = LTD_BASE,
+) -> None:
+    """Stub ``GET /products/<slug>/editions/`` to return edition URLs.
+
+    LTD lists editions newest-first (descending by id). ``main`` is
+    typically the oldest edition for a product, so it appears at the
+    end of the listing; ``tier_main`` iterates in reverse to hit it
+    first. Tests should pass ``edition_ids`` in newest-first order to
+    mirror LTD's behavior.
+    """
+    urls = [f"{base_url}/editions/{i}" for i in edition_ids]
+    mock_discovery.get(f"{base_url}/products/{product_slug}/editions/").mock(
+        return_value=httpx.Response(200, json={"editions": urls})
+    )
+
+
+def _stub_edition(
+    mock_discovery: respx.Router,
+    *,
+    edition_id: int,
+    slug: str,
+    date_rebuilt: datetime | None = None,
+    has_build: bool = True,
+    base_url: str = LTD_BASE,
+) -> None:
+    payload: dict[str, Any] = {
+        "self_url": f"{base_url}/editions/{edition_id}",
+        "product_url": f"{base_url}/products/pipelines",
+        "build_url": (
+            f"{base_url}/builds/{edition_id * 100}" if has_build else None
+        ),
+        "published_url": f"{base_url}/{slug}/",
+        "slug": slug,
+        "title": slug,
+        "date_created": "2024-01-01T00:00:00+00:00",
+        "date_rebuilt": (
+            date_rebuilt.isoformat() if date_rebuilt is not None else None
+        ),
+        "date_ended": None,
+        "tracked_refs": ["main" if slug == "main" else slug],
+        "mode": "git_refs",
+        "pending_rebuild": False,
+    }
+    mock_discovery.get(f"{base_url}/editions/{edition_id}").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+
+
+def _make_ctx(http_client: httpx.AsyncClient) -> dict[str, Any]:
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    return make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+
+async def _seed_state(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    resource_type: ResourceType,
+    ltd_id: int | None,
+    ltd_slug: str,
+    docverse_id: int | None = 99,
+    date_last_synced: datetime | None = None,
+    date_rebuilt_seen: datetime | None = None,
+) -> None:
+    state_store = KeeperSyncStateStore(session=db_session, logger=_logger())
+    await state_store.upsert(
+        org_id=org_id,
+        resource_type=resource_type,
+        ltd_id=ltd_id,
+        ltd_slug=ltd_slug,
+        docverse_id=docverse_id,
+        date_last_synced=date_last_synced,
+        date_rebuilt_seen=date_rebuilt_seen,
+    )
+
+
+# ---------------------------------------------------------------------------
+# tier_main
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tier_main_enqueues_when_ltd_rebuilt_advanced(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """LTD's ``date_rebuilt`` is newer than state — enqueue refresh.
+
+    Also locks the no-run-attribution invariant: the resulting
+    ``queue_jobs`` row has ``keeper_sync_run_id IS NULL`` and the arq
+    payload has no ``run_id`` key.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-main-1", project_slugs=["pipelines"]
+        )
+        # State row records an older date_rebuilt — LTD has moved on.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2),
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    arq_queue = ctx["arq_queue"]
+    children = get_jobs_by_name(
+        arq_queue, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert len(children) == 1
+    payload = children[0].kwargs["payload"]
+    assert payload["ltd_slug"] == "pipelines"
+    assert payload["org_id"] == org_id
+    # Key invariant: tier-cron payloads carry no run attribution.
+    assert "run_id" not in payload
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                SqlQueueJob.org_id == org_id,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            assert len(rows) == 1
+            row = rows[0]
+            # Acceptance criterion: tier-cron-enqueued queue_jobs rows
+            # have keeper_sync_run_id IS NULL.
+            assert row.keeper_sync_run_id is None
+            assert row.subject_label == "pipelines"
+            assert row.backend_job_id is not None
+
+
+@pytest.mark.asyncio
+async def test_tier_main_skips_when_state_matches_ltd(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """LTD's ``date_rebuilt`` equals state — no enqueue."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-main-2", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            # Identical to fixture: nothing for tier_main to chase.
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    arq_queue = ctx["arq_queue"]
+    assert (
+        get_jobs_by_name(
+            arq_queue,
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_enqueues_when_state_missing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """No state row for the main edition — discovery has not yet run."""
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-main-3", project_slugs=["pipelines"]
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    # tier_main walks the URL list in reverse looking for slug=="main".
+    # Fixture orders [2, 1] so the reverse iteration hits 1 first.
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    arq_queue = ctx["arq_queue"]
+    children = get_jobs_by_name(
+        arq_queue, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert len(children) == 1
+    assert children[0].kwargs["payload"]["ltd_slug"] == "pipelines"
+
+
+@pytest.mark.asyncio
+async def test_tier_main_skips_disabled_orgs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An org with ``keeper_sync_config.enabled=False`` is left alone."""
+    async with db_session.begin():
+        await _seed_org(
+            db_session,
+            slug="ks-tier-disabled",
+            project_slugs=["pipelines"],
+            enabled=False,
+        )
+
+    # LTD should not be queried at all when no orgs are enabled, but
+    # the cron tolerates either outcome — assert by counting enqueues.
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
+# ---------------------------------------------------------------------------
+# tier_discovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_enqueues_when_project_state_missing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """No project state row — enqueue immediately and skip edition walk."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-disc-1", project_slugs=["pipelines"]
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    # No editions listing stub — the project-state short-circuit must
+    # skip the edition walk entirely.
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert len(children) == 1
+    assert children[0].kwargs["payload"]["ltd_slug"] == "pipelines"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(SqlQueueJob).where(SqlQueueJob.org_id == org_id)
+                )
+            ).scalar_one()
+            assert row.keeper_sync_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_enqueues_when_edition_state_missing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Project known, but a child edition has no state row — enqueue."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-disc-2", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        # Edition 1 has state, edition 2 does not.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Single enqueue covers the project; the unseen edition gets
+    # imported as a side effect of ``KeeperSyncService.sync_project``.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_skips_fully_known_project(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Every LTD resource has a state row — no enqueue."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-disc-3", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
+# ---------------------------------------------------------------------------
+# tier_other
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tier_other_enqueues_for_stale_non_main_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A non-main edition past the threshold — enqueue refresh.
+
+    Also asserts the queue_jobs row carries ``keeper_sync_run_id IS
+    NULL`` and the payload lacks ``run_id``.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-other-1", project_slugs=["pipelines"]
+        )
+        # Branch edition (ltd_id=2): stale.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=stale,
+        )
+        # Main edition (ltd_id=1): tier_other ignores main entirely.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=stale,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert len(children) == 1
+    payload = children[0].kwargs["payload"]
+    assert "run_id" not in payload
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(SqlQueueJob).where(SqlQueueJob.org_id == org_id)
+                )
+            ).scalar_one()
+            assert row.keeper_sync_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_tier_other_skips_when_only_main_is_stale(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """``main`` editions belong to tier_main; tier_other ignores them."""
+    stale = datetime.now(tz=UTC) - timedelta(hours=4)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-other-2", project_slugs=["pipelines"]
+        )
+        # Only main is stale.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=stale,
+        )
+        # Branch edition is fresh.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=datetime.now(tz=UTC),
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 5, 7, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_other_skips_edition_with_no_state(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Editions without state are tier_discovery's domain.
+
+    Decoupling the two crons means a single missing-state row never
+    causes both tiers to enqueue for the same project on the same
+    hour. tier_other consults state only.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-other-3", project_slugs=["pipelines"]
+        )
+        # Only the main edition has state; the branch edition does not.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=datetime.now(tz=UTC),
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cron registration
+# ---------------------------------------------------------------------------
+
+
+def test_cron_registration_matches_documented_cadence() -> None:
+    """Lock the documented cadences: 5 min / 30 min / hourly.
+
+    PRD #275 §"Reconciliation cadence" defines:
+    * tier_main — every 5 min (user story 10's main-edition SLO)
+    * tier_discovery — every 30 min
+    * tier_other — hourly
+
+    A drift in either the cron registration or the docstring of the
+    relevant function should fail this test so the cadence stays
+    aligned with the user-visible SLO.
+    """
+    by_name: dict[str, CronJob] = {
+        cj.coroutine.__qualname__: cj
+        for cj in KeeperSyncWorkerSettings.cron_jobs
+    }
+    assert "keeper_sync_tier_main" in by_name
+    assert "keeper_sync_tier_discovery" in by_name
+    assert "keeper_sync_tier_other" in by_name
+
+    # tier_main fires every 5 min on the dot — each :MM that's a
+    # multiple of 5 from :00.
+    assert by_name["keeper_sync_tier_main"].minute == {
+        0,
+        5,
+        10,
+        15,
+        20,
+        25,
+        30,
+        35,
+        40,
+        45,
+        50,
+        55,
+    }
+    # tier_discovery fires twice an hour at :00 / :30.
+    assert by_name["keeper_sync_tier_discovery"].minute == {0, 30}
+    # tier_other fires once an hour at :00.
+    assert by_name["keeper_sync_tier_other"].minute == {0}

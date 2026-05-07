@@ -33,6 +33,9 @@ from .functions import (
     keeper_sync_project,
     keeper_sync_reaper,
     keeper_sync_run_discovery,
+    keeper_sync_tier_discovery,
+    keeper_sync_tier_main,
+    keeper_sync_tier_other,
     ping,
     publish_edition,
 )
@@ -267,11 +270,32 @@ class KeeperSyncWorkerSettings:
             max_tries=1,
         ),
         keeper_sync_reaper,
+        keeper_sync_tier_main,
+        keeper_sync_tier_discovery,
+        keeper_sync_tier_other,
     ]
     cron_jobs = [
         cron(
             keeper_sync_reaper,
             minute={0, 30},
+        ),
+        # Tier 1 — every 5 min — keeps the user-visible ``main``
+        # edition fresh per user story 10's ~5-minute SLO.
+        cron(
+            keeper_sync_tier_main,
+            minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
+        ),
+        # Tier 2 — every 30 min — discovers LTD resources without a
+        # ``keeper_sync_state`` row.
+        cron(
+            keeper_sync_tier_discovery,
+            minute={0, 30},
+        ),
+        # Tier 3 — hourly — catches non-``main`` editions whose state
+        # has aged past the threshold.
+        cron(
+            keeper_sync_tier_other,
+            minute={0},
         ),
     ]
     redis_settings = config.arq_redis_settings
