@@ -33,6 +33,7 @@ from docverse.client.models import (
     KeeperSyncConfig,
     KeeperSyncRunStatus,
 )
+from docverse.config import config
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
@@ -45,7 +46,70 @@ from docverse.storage.queue_job_store import QueueJobStore
 # to free a stuck run on the next discovery attempt.
 _ORPHAN_IDLE_WINDOW = timedelta(minutes=5)
 
-__all__ = ["keeper_sync_project", "keeper_sync_run_discovery"]
+__all__ = [
+    "keeper_sync_project",
+    "keeper_sync_reaper",
+    "keeper_sync_run_discovery",
+]
+
+
+async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
+    """Cron-driven backstop that finalises silently-stuck keeper-sync runs.
+
+    Mechanism #2 of the two-mechanism guarantee that a sync run always
+    reaches a terminal state. arq's per-function ``timeout`` covers the
+    common case (a job actually runs past the timeout and arq cancels
+    it), but a worker pod that's OOM-killed mid-job or a job that arq
+    itself loses leaves a child ``queue_jobs`` row stuck in
+    ``in_progress`` forever — and with it the parent ``keeper_sync_runs``
+    row, which can never finalise while ``pending_count > 0``.
+
+    The reaper:
+
+    1. Reads ``config.keeper_sync_reaper_threshold_seconds`` (default
+       6 h, env-overridable so test/staging environments can drive it
+       down to seconds for fast verification).
+    2. Calls ``QueueJobStore.fail_silent_run_children`` to mark every
+       keeper-sync child whose ``date_started`` is older than that
+       threshold (and which has no ``date_completed``) as ``failed``.
+    3. For each unique ``keeper_sync_run_id`` whose children were just
+       reaped, calls ``_maybe_finalise_run`` so the parent run rolls up
+       to ``partial_failure``.
+
+    Wired as a cron job on ``KeeperSyncWorkerSettings.cron_jobs``
+    (every 30 min). Returns a one-line status string for arq's result
+    log; the structured ``logger.info`` carries the detail.
+    """
+    logger = structlog.get_logger("docverse.worker.keeper_sync_reaper")
+    threshold = timedelta(seconds=config.keeper_sync_reaper_threshold_seconds)
+
+    async for session in db_session_dependency():
+        factory = ctx["factory_builder"](session=session, logger=logger)
+        queue_job_store = factory.create_queue_job_store()
+        run_store = factory.create_keeper_sync_run_store()
+
+        async with session.begin():
+            reaped = await queue_job_store.fail_silent_run_children(
+                idle_after=threshold
+            )
+            run_ids = {qj.keeper_sync_run_id for qj in reaped}
+            for run_id in run_ids:
+                if run_id is None:
+                    continue
+                await _maybe_finalise_run(run_store=run_store, run_id=run_id)
+
+        if reaped:
+            logger.warning(
+                "Reaped silent keeper-sync child queue jobs",
+                reaped_count=len(reaped),
+                run_ids=sorted(r for r in run_ids if r is not None),
+            )
+        else:
+            logger.debug("No silent keeper-sync child queue jobs to reap")
+        return "completed"
+
+    msg = "No database session available"
+    raise RuntimeError(msg)
 
 
 async def keeper_sync_run_discovery(

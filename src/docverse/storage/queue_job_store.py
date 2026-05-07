@@ -258,6 +258,55 @@ class QueueJobStore:
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def fail_silent_run_children(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail keeper-sync child rows that have been ``in_progress`` too long.
+
+        Backstop for the case where arq itself loses a job — typically a
+        worker pod OOM-killed mid-job that never gets to surface a
+        timeout. ``keeper_sync_project`` transitions its row to
+        ``in_progress`` *before* the long copy work begins, so a row
+        that has been ``in_progress`` past ``idle_after`` without ever
+        reaching ``date_completed`` indicates the worker died silently.
+
+        Scoped to rows attached to a keeper-sync run
+        (``keeper_sync_run_id IS NOT NULL``); unrelated long-running
+        ``build_processing`` jobs are not the reaper's concern. Queued
+        rows without ``date_started`` are left alone — those are the
+        ``fail_orphaned_run_children`` shape, swept by the next
+        discovery attempt instead.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.keeper_sync_run_id.is_not(None),
+            SqlQueueJob.status == JobStatus.in_progress.value,
+            SqlQueueJob.date_completed.is_(None),
+            SqlQueueJob.date_started.is_not(None),
+            SqlQueueJob.date_started < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        reaped: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Reaped by keeper_sync_reaper: worker went silent "
+                    "while job was in_progress (likely OOM-killed or "
+                    "lost by arq)"
+                ),
+                "type": "SilentWorker",
+            }
+            reaped.append(QueueJob.model_validate(row, from_attributes=True))
+        if reaped:
+            await self._session.flush()
+        return reaped
+
     async def fail_orphaned_run_children(
         self,
         *,

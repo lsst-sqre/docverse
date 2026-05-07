@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import structlog
+from arq import cron, func
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue, RedisArqQueue
@@ -30,6 +31,7 @@ from .functions import (
     dashboard_build,
     dashboard_sync,
     keeper_sync_project,
+    keeper_sync_reaper,
     keeper_sync_run_discovery,
     ping,
     publish_edition,
@@ -240,11 +242,37 @@ class KeeperSyncWorkerSettings:
     ``WorkerFactoryBuilder``, so all worker code paths see one
     consistent dependency graph regardless of which queue the job
     came in on.
+
+    The keeper-sync functions are wrapped with :func:`arq.func` so the
+    queue carries a per-job ``timeout`` (sourced from
+    ``Config.keeper_sync_job_timeout_seconds``) and ``max_tries=1``
+    instead of arq's 5-attempt default. A failure must surface
+    promptly so the existing per-function ``except Exception`` block
+    can route to ``queue_job_store.fail()`` and the parent
+    ``keeper_sync_runs`` row finalises via ``_maybe_finalise_run``.
+    The cron-driven :func:`keeper_sync_reaper` is the second backstop
+    — it covers the case where arq itself loses a job (e.g. an
+    OOM-killed worker pod) and no timeout ever fires.
     """
 
     functions = [
-        keeper_sync_run_discovery,
-        keeper_sync_project,
+        func(
+            keeper_sync_run_discovery,
+            timeout=config.keeper_sync_job_timeout_seconds,
+            max_tries=1,
+        ),
+        func(
+            keeper_sync_project,
+            timeout=config.keeper_sync_job_timeout_seconds,
+            max_tries=1,
+        ),
+        keeper_sync_reaper,
+    ]
+    cron_jobs = [
+        cron(
+            keeper_sync_reaper,
+            minute={0, 30},
+        ),
     ]
     redis_settings = config.arq_redis_settings
     queue_name = KEEPER_SYNC_QUEUE_NAME

@@ -425,6 +425,190 @@ async def test_fail_orphaned_run_children_skips_started_rows(
 
 
 @pytest.mark.asyncio
+async def test_fail_silent_run_children_fails_old_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An in_progress child past the idle threshold is reaped to failed."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(db_session)
+        stuck = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            backend_job_id="arq-job-stuck",
+        )
+        await store.start(stuck.id)
+        # Backdate date_started past the idle threshold.
+        row = await db_session.get(SqlQueueJob, stuck.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_run_children(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 1
+    assert reaped[0].id == stuck.id
+    assert reaped[0].status == JobStatus.failed
+    assert reaped[0].date_completed is not None
+    assert reaped[0].errors is not None
+    msg = reaped[0].errors["message"].lower()
+    assert "stuck" in msg or "reaper" in msg or "silent" in msg
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_run_children_skips_recent_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An in_progress child within the idle window is left alone."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(db_session)
+        recent = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            backend_job_id="arq-job-recent",
+        )
+        await store.start(recent.id)
+
+        reaped = await store.fail_silent_run_children(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_run_children_skips_completed_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A completed child is not reaped even when ``date_started`` is old."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(db_session)
+        done = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            backend_job_id="arq-job-done",
+        )
+        await store.start(done.id)
+        await store.complete(done.id)
+        row = await db_session.get(SqlQueueJob, done.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_run_children(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_run_children_skips_queued_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued (not-yet-started) child is left to ``fail_orphaned_*``.
+
+    The silent-run reaper only targets jobs that the worker actually
+    picked up and then went silent on. Orphans without ``date_started``
+    are reconciled by the discovery-time orphan sweep instead.
+    """
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(db_session)
+        await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            backend_job_id="arq-job-queued",
+        )
+
+        reaped = await store.fail_silent_run_children(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_run_children_skips_non_keeper_sync_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Reaper only touches rows attached to a keeper-sync run."""
+    async with db_session.begin():
+        unrelated = await store.create(
+            kind=JobKind.build_processing,
+            org_id=1,
+        )
+        await store.start(unrelated.id)
+        row = await db_session.get(SqlQueueJob, unrelated.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_run_children(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_run_children_returns_distinct_run_ids(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Reaper returns rows from each run so callers can finalise both."""
+    async with db_session.begin():
+        org_a_id, run_a_id = await _seed_org_and_run(db_session, slug="ks-aa")
+        _, run_b_id = await _seed_org_and_run(db_session, slug="ks-bb")
+        # Two stuck children on run A, one on run B.
+        for backend_id in ("arq-a1", "arq-a2"):
+            j = await store.create(
+                kind=JobKind.keeper_sync_project,
+                org_id=org_a_id,
+                keeper_sync_run_id=run_a_id,
+                backend_job_id=backend_id,
+            )
+            await store.start(j.id)
+            r = await db_session.get(SqlQueueJob, j.id)
+            assert r is not None
+            r.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        b_job = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_a_id,
+            keeper_sync_run_id=run_b_id,
+            backend_job_id="arq-b1",
+        )
+        await store.start(b_job.id)
+        r = await db_session.get(SqlQueueJob, b_job.id)
+        assert r is not None
+        r.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_run_children(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 3
+    reaped_run_ids = {qj.keeper_sync_run_id for qj in reaped}
+    assert reaped_run_ids == {run_a_id, run_b_id}
+
+
+@pytest.mark.asyncio
 async def test_fail_orphaned_run_children_scoped_to_run(
     db_session: AsyncSession,
     store: QueueJobStore,
