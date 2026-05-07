@@ -142,6 +142,28 @@ class Configuration(BaseSettings):
         title="Name of the arq queue",
     )
 
+    keeper_sync_job_timeout_seconds: int = Field(
+        3600,
+        title="Keeper-sync per-job timeout, in seconds",
+        description=(
+            "Wraps the keeper-sync arq functions on"
+            " ``KeeperSyncWorkerSettings``: arq cancels a job that runs"
+            " past this. Lower this in test/staging to surface"
+            " stuck-worker behaviour quickly."
+        ),
+    )
+
+    keeper_sync_reaper_threshold_seconds: int = Field(
+        21600,
+        title="Keeper-sync stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a job (e.g. an"
+            " OOM-killed worker pod). ``keeper_sync_reaper`` fails any"
+            " keeper-sync child ``queue_jobs`` row that has been"
+            " ``in_progress`` longer than this without ``date_completed``."
+        ),
+    )
+
     superadmin_usernames: Annotated[
         list[str], BeforeValidator(_parse_comma_separated)
     ] = Field(

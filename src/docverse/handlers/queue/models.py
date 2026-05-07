@@ -23,6 +23,8 @@ class QueueJob(_QueueJobBase):
             id=job_id_str,
             kind=domain.kind,
             status=domain.status,
+            keeper_sync_run_id=domain.keeper_sync_run_id,
+            subject_label=domain.subject_label,
             phase=domain.phase,
             progress=domain.progress,
             errors=domain.errors,

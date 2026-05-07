@@ -25,6 +25,22 @@ class QueueJob(BaseModel):
 
     status: JobStatus = Field(description="Current status of the job.")
 
+    keeper_sync_run_id: int | None = Field(
+        default=None,
+        description=(
+            "Identifier of the keeper-sync run this job is attributed to,"
+            " or ``null`` for jobs not part of a run."
+        ),
+    )
+
+    subject_label: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable identifier for the resource this job targets"
+            " (e.g. an LTD slug for keeper-sync project jobs)."
+        ),
+    )
+
     phase: str | None = Field(
         default=None,
         description=(

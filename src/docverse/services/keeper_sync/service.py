@@ -88,9 +88,17 @@ _SYNC_UPLOADER = "keeper-sync"
 
 @dataclass(frozen=True)
 class BuildSyncOutcome:
-    """What ``sync_build`` did with one LTD build."""
+    """What ``sync_build`` did with one LTD build.
+
+    ``docverse_build_public_id`` carries the public Base32 form of the
+    Docverse build's id so the keeper-sync worker can pass it into the
+    publish-enqueue helper without re-loading the build row.
+    """
 
     docverse_build_id: int | None
+    """``None`` when the call short-circuited (state matched LTD)."""
+
+    docverse_build_public_id: str | None
     """``None`` when the call short-circuited (state matched LTD)."""
 
     short_circuited: bool
@@ -375,6 +383,7 @@ class KeeperSyncService:
             )
             return BuildSyncOutcome(
                 docverse_build_id=existing_state.docverse_id,
+                docverse_build_public_id=None,
                 short_circuited=True,
                 content_hash=existing_state.content_hash,
                 object_count=None,
@@ -420,6 +429,7 @@ class KeeperSyncService:
         )
         return BuildSyncOutcome(
             docverse_build_id=new_build.id,
+            docverse_build_public_id=serialize_base32_id(new_build.public_id),
             short_circuited=False,
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,

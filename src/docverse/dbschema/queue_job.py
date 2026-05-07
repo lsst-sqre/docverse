@@ -5,7 +5,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -57,6 +65,8 @@ class SqlQueueJob(Base):
         ForeignKey("keeper_sync_runs.id", ondelete="SET NULL"),
         nullable=True,
     )
+
+    subject_label: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     progress: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True

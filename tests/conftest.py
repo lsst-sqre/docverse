@@ -38,12 +38,14 @@ from docverse.dbschema import Base
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id
 from docverse.main import app as docverse_app
+from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.build_store import BuildStore
 from docverse.storage.membership_store import OrgMembershipStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.user_info_store import StubUserInfoStore
 
+from .support.arq_testing import register_queue
 from .support.github_mock import GitHubMock, make_rsa_pem
 
 __all__ = [
@@ -120,9 +122,13 @@ async def app() -> AsyncGenerator[FastAPI]:
         context_dependency._superadmin_usernames = ["superadmin"]
         # Replace the MockArqQueue with one that uses the configured
         # queue name so ArqQueueBackend can enqueue to the right queue.
-        arq_dependency._arq_queue = MockArqQueue(
-            default_queue_name=config.arq_queue_name
-        )
+        # Register the dedicated keeper-sync queue too — MockArqQueue
+        # only auto-creates the slot for its ``default_queue_name``,
+        # so the ``POST /orgs/{org}/keeper-sync/runs`` enqueue would
+        # otherwise hit ``KeyError`` on first use.
+        arq_queue = MockArqQueue(default_queue_name=config.arq_queue_name)
+        register_queue(arq_queue, KEEPER_SYNC_QUEUE_NAME)
+        arq_dependency._arq_queue = arq_queue
         yield docverse_app
 
 

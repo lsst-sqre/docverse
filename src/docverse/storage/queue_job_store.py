@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +14,7 @@ from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse.storage.pagination import QueueJobDateCreatedCursor
 
 __all__ = ["QueueJobStore"]
 
@@ -37,6 +39,8 @@ class QueueJobStore:
         project_id: int | None = None,
         build_id: int | None = None,
         edition_id: int | None = None,
+        keeper_sync_run_id: int | None = None,
+        subject_label: str | None = None,
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
 
@@ -52,6 +56,8 @@ class QueueJobStore:
             project_id=project_id,
             build_id=build_id,
             edition_id=edition_id,
+            keeper_sync_run_id=keeper_sync_run_id,
+            subject_label=subject_label,
         )
         self._session.add(row)
         await self._session.flush()
@@ -255,6 +261,129 @@ class QueueJobStore:
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
+
+    async def list_by_keeper_sync_run(
+        self,
+        *,
+        run_id: int,
+        status: JobStatus | None = None,
+        cursor: QueueJobDateCreatedCursor | None = None,
+        limit: int,
+    ) -> CountedPaginatedList[QueueJob, QueueJobDateCreatedCursor]:
+        """List queue jobs attributed to a run, newest first.
+
+        Optional ``status`` narrows to a single :class:`JobStatus`.
+        Pagination uses the standard ``date_created`` DESC keyset cursor
+        so pages are stable across concurrent inserts.
+        """
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.keeper_sync_run_id == run_id
+        )
+        if status is not None:
+            stmt = stmt.where(SqlQueueJob.status == status.value)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=QueueJob,
+            cursor_type=QueueJobDateCreatedCursor,
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
+
+    async def fail_silent_run_children(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail keeper-sync child rows that have been ``in_progress`` too long.
+
+        Backstop for the case where arq itself loses a job — typically a
+        worker pod OOM-killed mid-job that never gets to surface a
+        timeout. ``keeper_sync_project`` transitions its row to
+        ``in_progress`` *before* the long copy work begins, so a row
+        that has been ``in_progress`` past ``idle_after`` without ever
+        reaching ``date_completed`` indicates the worker died silently.
+
+        Scoped to rows attached to a keeper-sync run
+        (``keeper_sync_run_id IS NOT NULL``); unrelated long-running
+        ``build_processing`` jobs are not the reaper's concern. Queued
+        rows without ``date_started`` are left alone — those are the
+        ``fail_orphaned_run_children`` shape, swept by the next
+        discovery attempt instead.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.keeper_sync_run_id.is_not(None),
+            SqlQueueJob.status == JobStatus.in_progress.value,
+            SqlQueueJob.date_completed.is_(None),
+            SqlQueueJob.date_started.is_not(None),
+            SqlQueueJob.date_started < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        reaped: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Reaped by keeper_sync_reaper: worker went silent "
+                    "while job was in_progress (likely OOM-killed or "
+                    "lost by arq)"
+                ),
+                "type": "SilentWorker",
+            }
+            reaped.append(QueueJob.model_validate(row, from_attributes=True))
+        if reaped:
+            await self._session.flush()
+        return reaped
+
+    async def fail_orphaned_run_children(
+        self,
+        *,
+        run_id: int,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail child rows for a keeper-sync run that never got an arq job.
+
+        Reconciles the gap left by ``_enqueue_children`` in
+        ``docverse.worker.functions.keeper_sync``: the child ``queue_jobs``
+        row commits *before* ``arq_queue.enqueue`` is called, so a worker
+        crash in that window leaves an orphan — ``status='queued'``,
+        ``backend_job_id IS NULL``, no arq job ever scheduled — that
+        otherwise blocks run finalisation forever.
+
+        ``idle_after`` keeps in-flight rows safe: only orphans whose
+        ``date_created`` is older than ``now - idle_after`` are failed,
+        so a concurrently-running discovery worker's freshly-committed
+        rows are never reaped before it has a chance to write back the
+        backend job ID.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.keeper_sync_run_id == run_id,
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_(None),
+            SqlQueueJob.date_created < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        failed: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Orphaned: queue_jobs row committed without an arq "
+                    "backend_job_id (worker likely crashed mid-fanout)"
+                ),
+                "type": "OrphanedQueueJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
 
     async def _get_row(self, job_id: int) -> SqlQueueJob:
         """Fetch a SqlQueueJob row by id, raising if not found."""

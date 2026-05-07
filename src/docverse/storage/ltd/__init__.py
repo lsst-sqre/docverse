@@ -10,6 +10,7 @@ from .models import (
     LtdProduct,
     LtdProductsListing,
 )
+from .products_client import LtdProductsClient
 from .s3_source import LtdS3Source, LtdSourceProtocol
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "LtdEditionMode",
     "LtdNotFoundError",
     "LtdProduct",
+    "LtdProductsClient",
     "LtdProductsListing",
     "LtdS3Source",
     "LtdSourceProtocol",

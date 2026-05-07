@@ -11,7 +11,6 @@ import asyncio
 import io
 import mimetypes
 import tarfile
-from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -19,16 +18,12 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildStatus
-from docverse.client.models.queue_enums import JobKind, PublishStatus
-from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
-from docverse.domain.edition_tracking import (
-    EditionTrackingOutcome,
-    EditionTrackingResult,
-)
+from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.services.lock_service import LockKey
+from docverse.services.publish_enqueue import enqueue_publish_for_edition
 from docverse.storage.build_store import BuildStore
 from docverse.storage.objectstore import ObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -376,15 +371,6 @@ async def _finalize_success(  # noqa: PLR0913
     logger.info("Build processing completed")
 
 
-@dataclass(frozen=True)
-class _PendingEnqueue:
-    """Child-job rows committed in phase A and awaiting arq enqueue."""
-
-    outcome: EditionTrackingOutcome
-    child_queue_job_id: int
-    child_public_id: str
-
-
 async def _enqueue_publish_jobs(  # noqa: PLR0913
     *,
     session: AsyncSession,
@@ -398,17 +384,13 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     build_public_id: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> list[dict[str, str]]:
-    """Create a publish_edition child job for each updated edition.
+    """Create a ``publish_edition`` child job for each updated edition.
 
-    Runs in two phases so the DB never holds partial ``pending`` state:
-
-    1. **Phase A** (one transaction): for each outcome, mark the edition
-       and its history entry ``pending`` and insert the child
-       ``QueueJob`` row. A failure here rolls back the whole batch.
-    2. **Phase B** (after commit): enqueue the ``publish_edition`` arq
-       task for each committed child job. A failure here leaves DB rows
-       that a future reconciliation loop can observe in a single
-       consistent shape.
+    Loops over ``tracking_result.updated`` and delegates each
+    ``(edition, build)`` pair to
+    :func:`docverse.services.publish_enqueue.enqueue_publish_for_edition`,
+    which owns the Phase A (DB writes) / Phase B (arq enqueue +
+    backend-job-id write-back) sequencing.
 
     Returns a list of ``{edition_slug, publish_queue_job_public_id}``
     entries suitable for embedding in the parent build job's progress.
@@ -417,73 +399,32 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
 
-    pending_enqueues: list[_PendingEnqueue] = []
-    async with session.begin():
-        for outcome in tracking_result.updated:
-            await edition_store.set_publish_status(
-                edition_id=outcome.edition_id,
-                status=PublishStatus.pending,
-            )
-            history = await history_store.get_by_edition_and_build(
-                edition_id=outcome.edition_id,
-                build_id=outcome.build_id,
-            )
-            if history is None:
-                msg = (
-                    f"EditionBuildHistory missing for edition "
-                    f"{outcome.edition_id}, build {outcome.build_id}"
-                )
-                raise RuntimeError(msg)
-            await history_store.set_publish_status(
-                history_id=history.id,
-                status=PublishStatus.pending,
-            )
-            child_job = await queue_job_store.create(
-                kind=JobKind.publish_edition,
-                org_id=org_id,
-                project_id=project_id,
-                build_id=build_id,
-                edition_id=outcome.edition_id,
-            )
-            pending_enqueues.append(
-                _PendingEnqueue(
-                    outcome=outcome,
-                    child_queue_job_id=child_job.id,
-                    child_public_id=serialize_base32_id(child_job.public_id),
-                )
-            )
-
     publish_jobs: list[dict[str, str]] = []
-    for pending in pending_enqueues:
-        outcome = pending.outcome
-        backend_job_id = await queue_backend.enqueue(
-            "publish_edition",
-            {
-                "org_id": org_id,
-                "project_slug": project_slug,
-                "edition_id": outcome.edition_id,
-                "edition_slug": outcome.slug,
-                "build_id": build_id,
-                "build_public_id": build_public_id,
-                "queue_job_id": pending.child_queue_job_id,
-                "queue_job_public_id": pending.child_public_id,
-            },
+    for outcome in tracking_result.updated:
+        result = await enqueue_publish_for_edition(
+            session=session,
+            edition_store=edition_store,
+            history_store=history_store,
+            queue_job_store=queue_job_store,
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=outcome.edition_id,
+            edition_slug=outcome.slug,
+            build_id=outcome.build_id,
+            build_public_id=build_public_id,
         )
-        async with session.begin():
-            await queue_job_store.set_backend_job_id(
-                pending.child_queue_job_id,
-                backend_job_id,
-            )
         publish_jobs.append(
             {
-                "edition_slug": outcome.slug,
-                "publish_queue_job_public_id": pending.child_public_id,
+                "edition_slug": result.edition_slug,
+                "publish_queue_job_public_id": result.queue_job_public_id,
             }
         )
         logger.info(
             "Enqueued publish_edition job",
-            edition_slug=outcome.slug,
-            publish_queue_job_public_id=pending.child_public_id,
+            edition_slug=result.edition_slug,
+            publish_queue_job_public_id=result.queue_job_public_id,
         )
     return publish_jobs
 
