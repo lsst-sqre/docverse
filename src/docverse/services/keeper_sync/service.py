@@ -43,7 +43,13 @@ from docverse.services.project import DEFAULT_EDITION_SLUG, ProjectService
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.ltd import LtdClient, LtdEdition, LtdProduct
+from docverse.storage.ltd import (
+    LtdBuild,
+    LtdClient,
+    LtdEdition,
+    LtdEditionMode,
+    LtdProduct,
+)
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
@@ -236,7 +242,22 @@ class KeeperSyncService:
         ltd_edition: LtdEdition,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse."""
-        tracking_mode, tracking_params = map_edition_tracking(ltd_edition)
+        # ``manual`` editions need the published build's git_refs to
+        # synthesize a Docverse ``git_ref`` tracking pair. Other modes
+        # ignore the build for mapping; we skip the extra fetch when we
+        # can.
+        ltd_build_for_mapping: LtdBuild | None = None
+        if (
+            ltd_edition.mode == LtdEditionMode.manual
+            and ltd_edition.build_url is not None
+        ):
+            ltd_build_for_mapping = await self._ltd_client.get_build_by_url(
+                str(ltd_edition.build_url)
+            )
+
+        tracking_mode, tracking_params = map_edition_tracking(
+            ltd_edition, build=ltd_build_for_mapping
+        )
         kind = derive_edition_kind(ltd_edition.slug)
         docverse_slug = derive_edition_slug(ltd_edition.slug)
 
@@ -270,6 +291,7 @@ class KeeperSyncService:
                 project=project,
                 edition=edition,
                 ltd_edition=ltd_edition,
+                ltd_build=ltd_build_for_mapping,
             )
 
         return EditionSyncOutcome(
@@ -337,18 +359,25 @@ class KeeperSyncService:
         project: Project,
         edition: Edition,
         ltd_edition: LtdEdition,
+        ltd_build: LtdBuild | None = None,
     ) -> BuildSyncOutcome:
         """Sync the LTD edition's current build into Docverse.
 
         Short-circuits when ``keeper_sync_state`` already records a
         Docverse build whose ``date_rebuilt_seen`` matches LTD's.
+
+        ``ltd_build`` may be passed in by callers that already fetched
+        the build (e.g. ``sync_edition`` does so for ``manual`` editions
+        to derive the tracking pair). Skipping the refetch saves a round
+        trip to LTD.
         """
         if ltd_edition.build_url is None:
             msg = "sync_build requires an edition with build_url set"
             raise ValueError(msg)
-        ltd_build = await self._ltd_client.get_build_by_url(
-            str(ltd_edition.build_url)
-        )
+        if ltd_build is None:
+            ltd_build = await self._ltd_client.get_build_by_url(
+                str(ltd_edition.build_url)
+            )
         if not ltd_build.uploaded:
             msg = (
                 f"LTD build id={ltd_build.ltd_id} for edition"

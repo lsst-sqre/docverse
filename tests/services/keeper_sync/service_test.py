@@ -541,32 +541,216 @@ async def test_sync_build_refuses_half_uploaded_build(
 
 
 @pytest.mark.asyncio
-async def test_unsupported_ltd_mode_raises_not_implemented(
+@pytest.mark.parametrize(
+    ("ltd_mode", "expected_tracking_mode"),
+    [
+        ("lsst_doc", TrackingMode.lsst_doc),
+        ("eups_major_release", TrackingMode.eups_major_release),
+        ("eups_weekly_release", TrackingMode.eups_weekly_release),
+        ("eups_daily_release", TrackingMode.eups_daily_release),
+    ],
+)
+async def test_sync_edition_round_trips_version_modes(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    ltd_mode: str,
+    expected_tracking_mode: TrackingMode,
+) -> None:
+    """Same-named LTD/Docverse version modes round-trip with no params.
+
+    ``lsst_doc`` and the three ``eups_*_release`` modes use Docverse
+    version parsers (no ``tracking_params`` needed), so the imported
+    edition row carries an empty params dict and the recorded LTD mode
+    survives in the state row's ``annotations``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    edition_payload = _load("edition_main_git_refs.json")
+    edition_payload["mode"] = ltd_mode
+    _seed_ltd(mock_discovery, edition_main=edition_payload)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+        assert edition.tracking_mode == expected_tracking_mode
+        assert edition.tracking_params == {}
+
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+        )
+        assert state is not None
+        assert state.annotations is not None
+        assert state.annotations["ltd_mode"] == ltd_mode
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_imports_lsst_doc_branch_edition(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """LTD modes other than ``git_refs`` cleanly raise NotImplementedError."""
+    """A non-main ``lsst_doc`` edition imports as a Docverse draft."""
     async with db_session.begin():
         org_id = await _seed_org(db_session)
 
-    edition = _load("edition_main_git_refs.json")
-    edition["mode"] = "lsst_doc"
+    branch_edition = _load("edition_branch_git_refs.json")
+    branch_edition["mode"] = "lsst_doc"
+    branch_build = _load("build.json")
+    branch_build["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build["bucket_root_dir"] = "pipelines/builds/43"
+    branch_edition["build_url"] = f"{LTD_BASE}/builds/43"
+
     mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
         return_value=httpx.Response(200, json=_load("product_pipelines.json"))
     )
     mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
         return_value=httpx.Response(
-            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+            200, json={"editions": [f"{LTD_BASE}/editions/2"]}
         )
     )
-    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
-        return_value=httpx.Response(200, json=edition)
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build)
     )
 
-    service = _build_service(db_session, http_client, MockObjectStore(), {})
-    with pytest.raises(NotImplementedError, match="#289"):
-        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        draft = await edition_store.get_by_slug(
+            project_id=project.id, slug="u-jsick-feature"
+        )
+        assert draft is not None
+        assert draft.kind == EditionKind.draft
+        assert draft.tracking_mode == TrackingMode.lsst_doc
+        assert draft.tracking_params == {}
+
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_slug == "u-jsick-feature"
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_imports_manual_as_pinned_git_ref(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """``manual`` LTD editions become ``git_ref`` pinned to the build's ref.
+
+    Docverse has no ``manual`` tracking mode (PRD #275 "Out of scope"),
+    so the importer collapses ``manual`` onto a pinned ``git_ref`` while
+    preserving the original LTD ``manual`` label in
+    ``keeper_sync_state.annotations`` for later reversibility.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    edition_payload = _load("edition_main_git_refs.json")
+    edition_payload["mode"] = "manual"
+    # Keep ``tracked_refs`` set so the existing ``_create_synced_build``
+    # path remains happy; the assertion on tracking_params below proves
+    # the mapper still pins to the BUILD's git_refs[0] rather than the
+    # edition's tracked_refs[0]. Hardening
+    # ``_create_synced_build`` to derive the Docverse build's git_ref
+    # from ``LtdBuild.git_refs[0]`` (so manual editions with
+    # ``tracked_refs is None`` round-trip cleanly) is tracked as
+    # follow-up — out of scope for this mapper-only slice.
+    edition_payload["tracked_refs"] = ["main"]
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = ["v22_0_0", "main"]
+    _seed_ltd(
+        mock_discovery,
+        edition_main=edition_payload,
+        build_payload=build_payload,
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v22</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+        assert edition.tracking_mode == TrackingMode.git_ref
+        # The build's first git_ref is pinned, NOT the edition's
+        # tracked_refs (which manual editions need not maintain).
+        assert edition.tracking_params == {"git_ref": "v22_0_0"}
+
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+        )
+        assert state is not None
+        assert state.annotations is not None
+        # Original LTD mode preserved for reversibility.
+        assert state.annotations["ltd_mode"] == "manual"
 
 
 @pytest.mark.asyncio
