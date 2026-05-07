@@ -67,6 +67,7 @@ __all__ = [
     "EditionSyncOutcome",
     "KeeperSyncContext",
     "KeeperSyncService",
+    "ManifestCallable",
     "ProjectSyncResult",
 ]
 
@@ -82,6 +83,12 @@ DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
 #: callable the service consumes. Tests inject a fake; the production
 #: factory wires it onto a real :class:`BuildContentCopier`.
 CopyCallable = Callable[[str, str], Awaitable[CopyResult]]
+
+#: Type alias for the ``(source_prefix) -> manifest_hash`` callable
+#: used for dual-upload convergence: the service computes the inbound
+#: LTD manifest hash via this callable, then short-circuits the upload
+#: when an existing Docverse build for the project already carries it.
+ManifestCallable = Callable[[str], Awaitable[str]]
 
 #: Placeholder hash on a freshly-created synced build row. Overwritten
 #: with the real manifest hash once the copier has run. The regex on
@@ -158,6 +165,7 @@ class KeeperSyncService:
         context: KeeperSyncContext,
         ltd_client: LtdClient,
         copy_callable: CopyCallable,
+        manifest_callable: ManifestCallable,
         logger: structlog.stdlib.BoundLogger,
         orphan_reclaim_max_age: timedelta = DEFAULT_ORPHAN_RECLAIM_MAX_AGE,
     ) -> None:
@@ -170,6 +178,7 @@ class KeeperSyncService:
         self._state_store = context.state_store
         self._ltd_client = ltd_client
         self._copy_callable = copy_callable
+        self._manifest_callable = manifest_callable
         self._logger = logger
         self._orphan_reclaim_max_age = orphan_reclaim_max_age
 
@@ -415,6 +424,59 @@ class KeeperSyncService:
                 docverse_build_public_id=None,
                 short_circuited=True,
                 content_hash=existing_state.content_hash,
+                object_count=None,
+                total_size_bytes=None,
+            )
+
+        manifest_hash = await self._manifest_callable(
+            _ensure_trailing_slash(ltd_build.bucket_root_dir)
+        )
+        async with self._session.begin():
+            existing_build = (
+                await self._build_store.get_completed_by_content_hash(
+                    project_id=project.id, content_hash=manifest_hash
+                )
+            )
+            if existing_build is not None:
+                if edition.current_build_id != existing_build.id:
+                    # Convergence intentionally targets the oldest
+                    # completed build with this content hash so the
+                    # canonical row is stable; bypass the date guard
+                    # because re-pointing the edition backwards to that
+                    # row is the de-duplicating choice when the user-
+                    # visible content is identical.
+                    await self._edition_store.set_current_build(
+                        edition_id=edition.id,
+                        build_id=existing_build.id,
+                        skip_date_guard=True,
+                    )
+                await self._state_store.upsert(
+                    org_id=org_id,
+                    resource_type=ResourceType.build,
+                    ltd_id=ltd_build.ltd_id,
+                    ltd_slug=ltd_build.slug,
+                    docverse_id=existing_build.id,
+                    date_last_synced=_now(),
+                    date_rebuilt_seen=ltd_edition.date_rebuilt,
+                    content_hash=manifest_hash,
+                )
+        if existing_build is not None:
+            self._logger.info(
+                "Sync converged on existing Docverse build",
+                ltd_build_id=ltd_build.ltd_id,
+                docverse_build_public_id=serialize_base32_id(
+                    existing_build.public_id
+                ),
+                edition_slug=edition.slug,
+                content_hash=manifest_hash,
+            )
+            return BuildSyncOutcome(
+                docverse_build_id=existing_build.id,
+                docverse_build_public_id=serialize_base32_id(
+                    existing_build.public_id
+                ),
+                short_circuited=True,
+                content_hash=manifest_hash,
                 object_count=None,
                 total_size_bytes=None,
             )

@@ -123,6 +123,9 @@ def _build_service(
             source_prefix=source_prefix, dest_prefix=dest_prefix
         )
 
+    async def manifest_callable(source_prefix: str) -> str:
+        return await copier.compute_manifest_hash(source_prefix=source_prefix)
+
     context = KeeperSyncContext(
         org_store=org_store,
         project_store=project_store,
@@ -136,6 +139,7 @@ def _build_service(
         context=context,
         ltd_client=ltd_client,
         copy_callable=copy_callable,  # type: ignore[arg-type]
+        manifest_callable=manifest_callable,
         logger=logger,
     )
 
@@ -946,6 +950,261 @@ async def test_sync_build_does_not_reclaim_recent_pending_placeholders(
         recent = await build_store.get_by_id(recent_orphan.id)
         assert recent is not None
         assert recent.status == BuildStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_dual_upload_convergence_links_existing_build_and_skips_copy(  # noqa: PLR0915
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Skip the copy and link state when content matches an existing build.
+
+    Models the dual-upload scenario from PRD #275 user story 12: a
+    project has cut over to direct Docverse uploads, so its current
+    Docverse build holds the canonical content; LTD CI is still pushing
+    the same content to LTD as well. Re-copying that content into a new
+    Docverse build row would have the two upload paths fight each other.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+        "pipelines/builds/42/assets/app.js": b"console.log(1)",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    existing_build_id = first.edition_outcomes[
+        0
+    ].build_outcome.docverse_build_id  # type: ignore[union-attr]
+    assert existing_build_id is not None
+    keys_after_first = set(object_store.objects.keys())
+    assert keys_after_first
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition_before = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition_before is not None
+        edition_date_updated_before = edition_before.date_updated
+
+    # Now LTD reports a *new* build (id 43) at a new bucket prefix, but
+    # the source content under that prefix is byte-identical to what's
+    # already in Docverse. The keeper-sync state has no row for ltd_id=43,
+    # so the existing date-based short-circuit cannot fire.
+    edition_v2 = _load("edition_main_git_refs.json")
+    edition_v2["date_rebuilt"] = "2026-05-04T12:00:00.000000+00:00"
+    edition_v2["build_url"] = f"{LTD_BASE}/builds/43"
+    build_v2 = _load("build.json")
+    build_v2["self_url"] = f"{LTD_BASE}/builds/43"
+    build_v2["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.reset()
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition_v2)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_v2)
+    )
+
+    # Same files under a different LTD bucket prefix → same manifest
+    # hash (the manifest is over relative key + content).
+    source_objects_v2 = {
+        "pipelines/builds/43/index.html": b"<html>v1</html>",
+        "pipelines/builds/43/assets/app.js": b"console.log(1)",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v2
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    main_outcome = result.edition_outcomes[0]
+    assert main_outcome.build_outcome is not None
+    assert main_outcome.build_outcome.short_circuited is True
+    assert main_outcome.build_outcome.docverse_build_id == existing_build_id
+    assert main_outcome.build_outcome.docverse_build_public_id is not None
+    # Object store unchanged: convergence skipped the upload entirely.
+    assert set(object_store.objects.keys()) == keys_after_first
+
+    async with db_session.begin():
+        # No new build row was created — only the original survives.
+        builds = await build_store.list_by_project(project.id, limit=10)
+        assert len(builds.entries) == 1
+        assert builds.entries[0].id == existing_build_id
+
+        # State for the new ltd_id points at the existing Docverse build.
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.build,
+            ltd_id=43,
+        )
+        assert state is not None
+        assert state.docverse_id == existing_build_id
+        assert state.content_hash is not None
+        assert state.content_hash.startswith("sha256:")
+
+        # Edition still points at the existing build and was not touched
+        # (date_updated unchanged).
+        edition_after = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition_after is not None
+        assert edition_after.current_build_id == existing_build_id
+        assert edition_after.date_updated == edition_date_updated_before
+
+
+@pytest.mark.asyncio
+async def test_dual_upload_convergence_repoints_edition_when_pointer_differs(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Convergence updates the edition pointer when it points elsewhere.
+
+    The edition currently points at a different build (e.g. a stale
+    keeper-sync row from an earlier resync). Discovering the matching-
+    hash build means the sync must atomically re-point the edition to
+    that build inside the same transaction that links the state row.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    matching_build_id = first.edition_outcomes[
+        0
+    ].build_outcome.docverse_build_id  # type: ignore[union-attr]
+    assert matching_build_id is not None
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    # Create a second Docverse build with a different content hash, then
+    # point the edition at it. Convergence should detect the matching-
+    # hash build above and re-point back.
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        other_build = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:" + "1" * 64,
+            ),
+            uploader="direct-upload",
+        )
+        # Walk it through to ``completed`` so set_current_build's stale
+        # guard sees a real ``date_created`` on the row.
+        await build_store.transition_status(
+            build_id=other_build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=other_build.id, new_status=BuildStatus.completed
+        )
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+        await edition_store.set_current_build(
+            edition_id=edition.id,
+            build_id=other_build.id,
+            skip_date_guard=True,
+        )
+
+    # LTD now reports a new build (id 43) whose content matches build_42
+    # (and thus the original Docverse build).
+    edition_v2 = _load("edition_main_git_refs.json")
+    edition_v2["date_rebuilt"] = "2026-05-04T12:00:00.000000+00:00"
+    edition_v2["build_url"] = f"{LTD_BASE}/builds/43"
+    build_v2 = _load("build.json")
+    build_v2["self_url"] = f"{LTD_BASE}/builds/43"
+    build_v2["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.reset()
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition_v2)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_v2)
+    )
+
+    keys_before = set(object_store.objects.keys())
+    source_objects_v2 = {
+        "pipelines/builds/43/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v2
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    main_outcome = result.edition_outcomes[0]
+    assert main_outcome.build_outcome is not None
+    assert main_outcome.build_outcome.docverse_build_id == matching_build_id
+    assert main_outcome.build_outcome.docverse_build_public_id is not None
+    # Skipped the copy.
+    assert set(object_store.objects.keys()) == keys_before
+
+    async with db_session.begin():
+        edition_after = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition_after is not None
+        assert edition_after.current_build_id == matching_build_id
 
 
 @pytest.mark.asyncio
