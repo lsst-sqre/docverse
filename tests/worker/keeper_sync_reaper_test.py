@@ -98,7 +98,7 @@ async def test_reaper_fails_stuck_child_and_finalises_run(
     app: None,
     db_session: AsyncSession,
 ) -> None:
-    """A child past the threshold is failed and the parent reaches partial_failure."""
+    """Child past the threshold is failed; parent reaches partial_failure."""
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-reaper-1")
         run_id = await _seed_run(db_session, org_id=org_id)
