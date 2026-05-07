@@ -22,7 +22,7 @@ from docverse.client.models import (
 )
 from docverse.domain.keeper_sync_run import (
     KeeperSyncRun,
-    KeeperSyncRunWithCounters,
+    KeeperSyncRunWithActivity,
 )
 from docverse.domain.organization import Organization
 from docverse.domain.queue import JobStatus, QueueJob
@@ -146,8 +146,8 @@ class KeeperSyncRunService:
         *,
         org_slug: str,
         run_id: int,
-    ) -> KeeperSyncRunWithCounters:
-        """Fetch a run by id, with derived ``queue_jobs`` counters."""
+    ) -> KeeperSyncRunWithActivity:
+        """Fetch a run by id, with derived ``queue_jobs`` activity."""
         org = await self._require_org(org_slug)
         run = await self._run_store.get(run_id)
         if run is None or run.org_id != org.id:
@@ -156,8 +156,8 @@ class KeeperSyncRunService:
                 f"{org_slug!r}"
             )
             raise NotFoundError(msg)
-        counters = await self._run_store.aggregate_counters(run_id=run.id)
-        return KeeperSyncRunWithCounters(run=run, counters=counters)
+        activity = await self._run_store.aggregate_activity(run_id=run.id)
+        return KeeperSyncRunWithActivity(run=run, activity=activity)
 
     async def list_runs(
         self,

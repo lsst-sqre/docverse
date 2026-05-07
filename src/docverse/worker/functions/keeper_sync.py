@@ -481,12 +481,12 @@ async def _maybe_finalise_run(
     of the race exits cleanly and lets the winning terminal status
     stand.
     """
-    counters = await run_store.aggregate_counters(run_id=run_id)
-    if counters.total_count == 0 or counters.pending_count > 0:
+    activity = await run_store.aggregate_activity(run_id=run_id)
+    if activity.total_count == 0 or activity.pending_count > 0:
         return
     new_status = (
         KeeperSyncRunStatus.partial_failure
-        if counters.failed_count > 0
+        if activity.failed_count > 0
         else KeeperSyncRunStatus.succeeded
     )
     run = await run_store.get(run_id)

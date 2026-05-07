@@ -161,10 +161,10 @@ async def test_get_run_returns_aggregate_counters(
         result = await service.get_run(org_slug=org_slug, run_id=run.id)
     # Discovery (queued) + 2 keeper_sync_project (queued) = 3 pending,
     # 1 completed, 0 failed, total 4.
-    assert result.counters.pending_count == 3
-    assert result.counters.succeeded_count == 1
-    assert result.counters.failed_count == 0
-    assert result.counters.total_count == 4
+    assert result.activity.pending_count == 3
+    assert result.activity.succeeded_count == 1
+    assert result.activity.failed_count == 0
+    assert result.activity.total_count == 4
 
 
 @pytest.mark.asyncio

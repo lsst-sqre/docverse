@@ -16,7 +16,7 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRun as KeeperSyncRunDomain,
 )
 from docverse.domain.keeper_sync_run import (
-    KeeperSyncRunCounters as KeeperSyncRunCountersDomain,
+    KeeperSyncRunActivity as KeeperSyncRunActivityDomain,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
 
@@ -30,11 +30,11 @@ class KeeperSyncRun(_KeeperSyncRunBase):
     def from_domain(
         cls,
         run: KeeperSyncRunDomain,
-        counters: KeeperSyncRunCountersDomain,
+        activity: KeeperSyncRunActivityDomain,
         request: Request,
         org_slug: str,
     ) -> Self:
-        """Compose the response from a run plus its derived counters."""
+        """Compose the response from a run plus its derived activity."""
         return cls(
             self_url=str(
                 request.url_for(
@@ -46,12 +46,13 @@ class KeeperSyncRun(_KeeperSyncRunBase):
             id=run.id,
             kind=KeeperSyncRunKind(run.kind),
             status=KeeperSyncRunStatus(run.status),
-            pending_count=counters.pending_count,
-            succeeded_count=counters.succeeded_count,
-            failed_count=counters.failed_count,
-            total_count=counters.total_count,
+            pending_count=activity.pending_count,
+            succeeded_count=activity.succeeded_count,
+            failed_count=activity.failed_count,
+            total_count=activity.total_count,
             date_started=run.date_started,
             date_finished=run.date_finished,
+            date_last_activity=activity.date_last_activity,
         )
 
 
@@ -62,7 +63,7 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
     def from_domain(
         cls,
         run: KeeperSyncRunDomain,
-        counters: KeeperSyncRunCountersDomain,
+        activity: KeeperSyncRunActivityDomain,
         queue_job: QueueJobDomain,
         request: Request,
         org_slug: str,
@@ -70,7 +71,7 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
         """Build the 202 envelope from the run + enqueued queue-job."""
         queue_job_id = serialize_base32_id(queue_job.public_id)
         return cls(
-            run=KeeperSyncRun.from_domain(run, counters, request, org_slug),
+            run=KeeperSyncRun.from_domain(run, activity, request, org_slug),
             queue_job_id=queue_job_id,
             queue_job_url=str(
                 request.url_for("get_queue_job", job=queue_job_id)

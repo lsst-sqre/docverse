@@ -10,6 +10,7 @@ import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
+from sqlalchemy import select
 
 from docverse.client.models import OrgRole
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
@@ -204,6 +205,125 @@ async def test_get_run_returns_aggregate_counters(
     assert body["succeeded_count"] == 2
     assert body["failed_count"] == 2
     assert body["total_count"] == 7
+    # date_last_activity reflects the MAX(coalesce(...)) across the
+    # children and is non-null because the run has attributed jobs.
+    assert body["date_last_activity"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_run_date_last_activity_matches_max_child_event(
+    client: AsyncClient,
+) -> None:
+    """``date_last_activity`` reflects the MAX coalesced child timestamp."""
+    await _setup_org(client)
+    org_id = await _get_org_id()
+    # Seed a run directly so the response shape doesn't depend on the
+    # discovery queue-job's auto-attributed timestamps.
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = SqlKeeperSyncRun(
+                org_id=org_id, kind="backfill", status="in_progress"
+            )
+            session.add(row)
+            await session.flush()
+            run_id = row.id
+            await session.commit()
+
+    # Three children, each completing at successively later instants.
+    # The MAX(coalesce(...)) post-condition picks the latest one.
+    completed_ids: list[int] = [
+        await _seed_queue_job(
+            org_id=org_id, run_id=run_id, status=JobStatus.completed
+        )
+        for _ in range(3)
+    ]
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    last_activity = datetime.fromisoformat(body["date_last_activity"])
+    # The third child's date_completed is the latest event the run has
+    # observed; the response surfaces it as the run's date_last_activity.
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlQueueJob.date_completed).where(
+                SqlQueueJob.id == completed_ids[-1]
+            )
+            latest = (await session.execute(stmt)).scalar_one()
+            assert latest is not None
+            assert last_activity == latest
+
+
+@pytest.mark.asyncio
+async def test_get_run_date_last_activity_null_when_no_children(
+    client: AsyncClient,
+) -> None:
+    """``date_last_activity`` is null on a run with no attributed jobs."""
+    await _setup_org(client)
+    org_id = await _get_org_id()
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = SqlKeeperSyncRun(
+                org_id=org_id, kind="backfill", status="pending"
+            )
+            session.add(row)
+            await session.flush()
+            run_id = row.id
+            await session.commit()
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_count"] == 0
+    assert body["date_last_activity"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_runs_surfaces_date_last_activity_per_row(
+    client: AsyncClient,
+) -> None:
+    """``GET /runs`` exposes ``date_last_activity`` per row.
+
+    A run with attributed children carries a non-null timestamp; a run
+    without children carries ``null``. Both must coexist in a single
+    page so the run-list aggregation is verified to keep its
+    one-round-trip per page guarantee even when child rows are sparse.
+    """
+    await _setup_org(client)
+    org_id = await _get_org_id()
+    async for session in db_session_dependency():
+        async with session.begin():
+            with_children = SqlKeeperSyncRun(
+                org_id=org_id, kind="backfill", status="succeeded"
+            )
+            without_children = SqlKeeperSyncRun(
+                org_id=org_id, kind="backfill", status="failed"
+            )
+            session.add(with_children)
+            session.add(without_children)
+            await session.flush()
+            with_id = with_children.id
+            without_id = without_children.id
+            await session.commit()
+
+    await _seed_queue_job(
+        org_id=org_id, run_id=with_id, status=JobStatus.completed
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    runs = {r["id"]: r for r in response.json()}
+    assert runs[with_id]["date_last_activity"] is not None
+    assert runs[without_id]["date_last_activity"] is None
 
 
 @pytest.mark.asyncio

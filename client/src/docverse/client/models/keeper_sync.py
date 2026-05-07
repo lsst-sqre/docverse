@@ -121,6 +121,16 @@ class KeeperSyncRun(BaseModel):
         description="Timestamp when the run reached a terminal status.",
     )
 
+    date_last_activity: datetime | None = Field(
+        default=None,
+        description=(
+            "Most-recent state-transition timestamp across the run's"
+            " attributed child queue jobs. Operators can poll this to"
+            " detect a stuck run without paginating its children."
+            " ``null`` while the run has no attributed queue jobs yet."
+        ),
+    )
+
 
 class KeeperSyncRunCreated(BaseModel):
     """Response body returned by ``POST /orgs/{org}/keeper-sync/runs``."""

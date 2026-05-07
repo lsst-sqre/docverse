@@ -78,13 +78,13 @@ async def post_org_keeper_sync_run(
         service = context.factory.create_keeper_sync_run_service()
         run, queue_job = await service.start_run(org_slug=org_slug)
         # The run was just created and the discovery queue-job is
-        # already attributed to it; derive counters via the same store
+        # already attributed to it; derive activity via the same store
         # call as ``GET`` so the response shape stays uniform.
         run_store = context.factory.create_keeper_sync_run_store()
-        counters = await run_store.aggregate_counters(run_id=run.id)
+        activity = await run_store.aggregate_activity(run_id=run.id)
         await context.session.commit()
     return KeeperSyncRunCreated.from_domain(
-        run, counters, queue_job, context.request, org_slug
+        run, activity, queue_job, context.request, org_slug
     )
 
 
@@ -136,14 +136,14 @@ async def get_org_keeper_sync_runs(  # noqa: PLR0913
         run_store = context.factory.create_keeper_sync_run_store()
         # One ``GROUP BY`` query covers every run in the page; avoids
         # an N+1 round-trip pattern at ``MAX_PAGE_LIMIT``.
-        counters_by_id = await run_store.aggregate_counters_for_runs(
+        activity_by_id = await run_store.aggregate_activity_for_runs(
             run_ids=[run.id for run in result.entries]
         )
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
         KeeperSyncRun.from_domain(
-            run, counters_by_id[run.id], context.request, org_slug
+            run, activity_by_id[run.id], context.request, org_slug
         )
         for run in result.entries
     ]
@@ -167,7 +167,7 @@ async def get_org_keeper_sync_run(
         service = context.factory.create_keeper_sync_run_service()
         result = await service.get_run(org_slug=org_slug, run_id=run_id)
     return KeeperSyncRun.from_domain(
-        result.run, result.counters, context.request, org_slug
+        result.run, result.activity, context.request, org_slug
     )
 
 

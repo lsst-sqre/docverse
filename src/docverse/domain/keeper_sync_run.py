@@ -10,10 +10,10 @@ from docverse.client.models import KeeperSyncRunKind, KeeperSyncRunStatus
 
 __all__ = [
     "KeeperSyncRun",
-    "KeeperSyncRunCounters",
+    "KeeperSyncRunActivity",
     "KeeperSyncRunKind",
     "KeeperSyncRunStatus",
-    "KeeperSyncRunWithCounters",
+    "KeeperSyncRunWithActivity",
 ]
 
 
@@ -35,11 +35,14 @@ class KeeperSyncRun(BaseModel):
     )
 
 
-class KeeperSyncRunCounters(BaseModel):
-    """Aggregate child-job counters for a single run.
+class KeeperSyncRunActivity(BaseModel):
+    """Aggregate child-job activity for a single run.
 
     Computed from ``queue_jobs`` rows filtered on ``keeper_sync_run_id``
-    so a row is never out of step with the underlying job state.
+    so a row is never out of step with the underlying job state. Carries
+    the four count buckets plus a ``date_last_activity`` timestamp so
+    operators have a single top-level signal for "is this run actually
+    making progress" without paginating through children.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -66,12 +69,21 @@ class KeeperSyncRunCounters(BaseModel):
     total_count: int = Field(
         description="Total number of attributed queue jobs."
     )
+    date_last_activity: datetime | None = Field(
+        default=None,
+        description=(
+            "Most-recent state-transition timestamp across the run's"
+            " attributed queue jobs, computed as ``MAX(coalesce("
+            "date_completed, date_started, date_created))``. ``None``"
+            " when the run has no attributed queue jobs yet."
+        ),
+    )
 
 
-class KeeperSyncRunWithCounters(BaseModel):
-    """Domain pair of a run plus its derived counters."""
+class KeeperSyncRunWithActivity(BaseModel):
+    """Domain pair of a run plus its derived activity."""
 
     model_config = ConfigDict(frozen=True)
 
     run: KeeperSyncRun
-    counters: KeeperSyncRunCounters
+    activity: KeeperSyncRunActivity
