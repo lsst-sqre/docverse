@@ -402,6 +402,7 @@ async def _enqueue_children(  # noqa: PLR0913
                 kind=JobKind.keeper_sync_project,
                 org_id=org_id,
                 keeper_sync_run_id=run_id,
+                subject_label=ltd_slug,
             )
             if index == 0:
                 await run_store.transition_status(

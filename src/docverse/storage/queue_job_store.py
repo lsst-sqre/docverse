@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +14,7 @@ from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse.storage.pagination import QueueJobDateCreatedCursor
 
 __all__ = ["QueueJobStore"]
 
@@ -38,6 +40,7 @@ class QueueJobStore:
         build_id: int | None = None,
         edition_id: int | None = None,
         keeper_sync_run_id: int | None = None,
+        subject_label: str | None = None,
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
 
@@ -54,6 +57,7 @@ class QueueJobStore:
             build_id=build_id,
             edition_id=edition_id,
             keeper_sync_run_id=keeper_sync_run_id,
+            subject_label=subject_label,
         )
         self._session.add(row)
         await self._session.flush()
@@ -257,6 +261,33 @@ class QueueJobStore:
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
+
+    async def list_by_keeper_sync_run(
+        self,
+        *,
+        run_id: int,
+        status: JobStatus | None = None,
+        cursor: QueueJobDateCreatedCursor | None = None,
+        limit: int,
+    ) -> CountedPaginatedList[QueueJob, QueueJobDateCreatedCursor]:
+        """List queue jobs attributed to a run, newest first.
+
+        Optional ``status`` narrows to a single :class:`JobStatus`.
+        Pagination uses the standard ``date_created`` DESC keyset cursor
+        so pages are stable across concurrent inserts.
+        """
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.keeper_sync_run_id == run_id
+        )
+        if status is not None:
+            stmt = stmt.where(SqlQueueJob.status == status.value)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=QueueJob,
+            cursor_type=QueueJobDateCreatedCursor,
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
 
     async def fail_silent_run_children(
         self,

@@ -20,11 +20,13 @@ from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.project import SqlProject
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.domain.keeper_sync_run import KeeperSyncRun
 from docverse.domain.project import Project
+from docverse.domain.queue import QueueJob
 
 __all__ = [
     "BUILD_CURSOR_TYPE",
@@ -34,6 +36,7 @@ __all__ = [
     "KEEPER_SYNC_RUN_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
+    "QUEUE_JOB_CURSOR_TYPE",
     "BuildDateCreatedCursor",
     "EditionBuildHistoryPositionCursor",
     "EditionDateCreatedCursor",
@@ -45,6 +48,7 @@ __all__ = [
     "ProjectSearchCursor",
     "ProjectSlugCursor",
     "ProjectSortOrder",
+    "QueueJobDateCreatedCursor",
 ]
 
 DEFAULT_PAGE_LIMIT = 25
@@ -308,6 +312,26 @@ class KeeperSyncRunDateStartedCursor(_TzAwareDatetimeIdCursor[KeeperSyncRun]):
         return cls(time=entry.date_started, id=entry.id, previous=reverse)
 
 
+@dataclass(slots=True)
+class QueueJobDateCreatedCursor(_TzAwareDatetimeIdCursor[QueueJob]):
+    """Keyset cursor for queue jobs ordered by date_created DESC, id DESC."""
+
+    @staticmethod
+    @override
+    def id_column() -> InstrumentedAttribute[int]:
+        return SqlQueueJob.id
+
+    @staticmethod
+    @override
+    def time_column() -> InstrumentedAttribute[datetime]:
+        return SqlQueueJob.date_created
+
+    @override
+    @classmethod
+    def from_entry(cls, entry: QueueJob, *, reverse: bool = False) -> Self:
+        return cls(time=entry.date_created, id=entry.id, previous=reverse)
+
+
 # ---------------------------------------------------------------------------
 # Search cursor (score+id compound keyset)
 # ---------------------------------------------------------------------------
@@ -394,6 +418,10 @@ BUILD_CURSOR_TYPE: type[BuildDateCreatedCursor] = BuildDateCreatedCursor
 
 KEEPER_SYNC_RUN_CURSOR_TYPE: type[KeeperSyncRunDateStartedCursor] = (
     KeeperSyncRunDateStartedCursor
+)
+
+QUEUE_JOB_CURSOR_TYPE: type[QueueJobDateCreatedCursor] = (
+    QueueJobDateCreatedCursor
 )
 
 

@@ -6,14 +6,20 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query, status
 
-from docverse.client.models import KeeperSyncConfig, KeeperSyncRunStatus
+from docverse.client.models import (
+    JobStatus,
+    KeeperSyncConfig,
+    KeeperSyncRunStatus,
+)
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam
+from docverse.handlers.queue.models import QueueJob
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     KEEPER_SYNC_RUN_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
+    QUEUE_JOB_CURSOR_TYPE,
 )
 
 from .keeper_sync_models import KeeperSyncRun, KeeperSyncRunCreated
@@ -163,3 +169,57 @@ async def get_org_keeper_sync_run(
     return KeeperSyncRun.from_domain(
         result.run, result.counters, context.request, org_slug
     )
+
+
+@router.get(
+    "/orgs/{org}/keeper-sync/runs/{run_id}/jobs",
+    response_model=list[QueueJob],
+    summary="List child queue jobs for an LTD Keeper sync run",
+    name="get_org_keeper_sync_run_jobs",
+)
+async def get_org_keeper_sync_run_jobs(  # noqa: PLR0913
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    run_id: Annotated[
+        int, Path(description="Numeric identifier for the run.")
+    ],
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    status_filter: Annotated[
+        JobStatus | None,
+        Query(alias="status", description="Filter jobs by status."),
+    ] = None,
+) -> list[QueueJob]:
+    parsed_cursor = (
+        QUEUE_JOB_CURSOR_TYPE.from_str(cursor) if cursor is not None else None
+    )
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_run_service()
+        result = await service.list_run_jobs(
+            org_slug=org_slug,
+            run_id=run_id,
+            status=status_filter,
+            cursor=parsed_cursor,
+            limit=limit,
+        )
+    context.response.headers["Link"] = result.link_header(context.request.url)
+    context.response.headers["X-Total-Count"] = str(result.count)
+    return [
+        QueueJob.from_domain(job, context.request) for job in result.entries
+    ]
