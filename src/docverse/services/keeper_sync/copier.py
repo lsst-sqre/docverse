@@ -53,6 +53,45 @@ class BuildContentCopier:
         self._logger = logger
         self._max_concurrent = max_concurrent
 
+    async def compute_manifest_hash(self, *, source_prefix: str) -> str:
+        """Compute the manifest hash for ``source_prefix`` without copying.
+
+        Performs the download-and-hash phase of :meth:`copy_build`
+        without writing anything to the destination, so the keeper-sync
+        engine can decide whether an existing Docverse build already
+        matches the inbound LTD content (dual-upload convergence) before
+        committing to an upload that would just duplicate it. Returns
+        the same ``sha256:<hex>`` shape :meth:`copy_build` produces.
+        """
+        normalized_source_prefix = _ensure_trailing_slash(source_prefix)
+        keys = sorted(
+            await self._source.list_keys(prefix=normalized_source_prefix)
+        )
+        if not keys:
+            return _empty_manifest_hash()
+
+        semaphore = asyncio.Semaphore(self._max_concurrent)
+        manifest_entries: list[tuple[str, str]] = []
+        manifest_lock = asyncio.Lock()
+
+        async def _hash_one(source_key: str) -> None:
+            relative = source_key.removeprefix(normalized_source_prefix)
+            if ".." in relative.split("/"):
+                msg = (
+                    f"Refusing to hash source key {source_key!r}:"
+                    " relative path contains '..' segment"
+                )
+                raise RuntimeError(msg)
+            async with semaphore:
+                data = await self._source.download_object(key=source_key)
+            digest = hashlib.sha256(data).hexdigest()
+            async with manifest_lock:
+                manifest_entries.append((relative, digest))
+
+        await asyncio.gather(*(_hash_one(k) for k in keys))
+        manifest_entries.sort(key=lambda e: e[0])
+        return _hash_manifest_pairs(manifest_entries)
+
     async def copy_build(
         self, *, source_prefix: str, dest_prefix: str
     ) -> CopyResult:
@@ -161,8 +200,15 @@ def _hash_manifest(entries: list[tuple[str, str, int]]) -> str:
     derivable from the data; including it would couple the hash to a
     second representation of the same fact and risk drift.
     """
+    return _hash_manifest_pairs(
+        [(relative, digest) for relative, digest, _ in entries]
+    )
+
+
+def _hash_manifest_pairs(entries: list[tuple[str, str]]) -> str:
+    r"""Compute ``sha256:`` over sorted ``relative\tdigest\n`` lines."""
     hasher = hashlib.sha256()
-    for relative, digest, _ in entries:
+    for relative, digest in entries:
         hasher.update(f"{relative}\t{digest}\n".encode())
     return f"sha256:{hasher.hexdigest()}"
 

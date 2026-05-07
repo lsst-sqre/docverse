@@ -129,6 +129,35 @@ class BuildStore:
         )
         return [Build.model_validate(row) for row in result.scalars().all()]
 
+    async def get_completed_by_content_hash(
+        self, *, project_id: int, content_hash: str
+    ) -> Build | None:
+        """Return the oldest non-deleted ``completed`` build with this hash.
+
+        Used by the keeper-sync engine for dual-upload convergence:
+        when an inbound LTD build's content hash matches a build that
+        already exists in Docverse for the same project (typically from
+        a direct Docverse upload), the sync links its state row to that
+        build instead of re-copying the same content into a fresh row.
+        Soft-deleted rows and builds that haven't reached ``completed``
+        are excluded so the linked-to row is canonical and stable.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.content_hash == content_hash,
+                SqlBuild.status == BuildStatus.completed,
+                SqlBuild.date_deleted.is_(None),
+            )
+            .order_by(SqlBuild.date_created.asc(), SqlBuild.id.asc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
     async def get_latest_build_id_for_ref(
         self, *, project_id: int, git_ref: str
     ) -> int | None:

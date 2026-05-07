@@ -764,6 +764,14 @@ class Factory:
                     source_prefix=source_prefix, dest_prefix=dest_prefix
                 )
 
+        async def manifest_callable(source_prefix: str) -> str:
+            async with self.create_build_content_copier_for_org(
+                org_id=org_id, service_label=service_label
+            ) as copier:
+                return await copier.compute_manifest_hash(
+                    source_prefix=source_prefix
+                )
+
         context = KeeperSyncContext(
             org_store=self.create_org_store(),
             project_store=self.create_project_store(),
@@ -777,6 +785,7 @@ class Factory:
             context=context,
             ltd_client=ltd_client,
             copy_callable=copy_callable,
+            manifest_callable=manifest_callable,
             logger=self._logger,
         )
 
