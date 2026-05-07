@@ -33,6 +33,7 @@ from docverse.client.models import (
     OrganizationCreate,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.queue import JobStatus
@@ -418,6 +419,132 @@ async def test_keeper_sync_project_short_circuit_skips_publish_enqueue(
     )
     # Still exactly one publish job — the second pass short-circuited.
     assert len(publish_after_second) == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heals_unpublished_short_circuit(  # noqa: PLR0915
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Short-circuited sync re-publishes an edition that was never published.
+
+    Simulates the staging shape from the first sync runs that landed
+    before the publish-enqueue path existed: an edition has its
+    ``current_build_id`` set, the build is ``completed``, and a
+    ``keeper_sync_state`` row matches LTD's ``date_rebuilt`` — but
+    ``publish_status`` is ``NULL`` because no publish was ever enqueued
+    against this build. On the next sync run the build sync still
+    short-circuits (no LTD-side change), but the worker must observe
+    the unpublished edition and enqueue a catch-up
+    ``publish_edition`` job so KV + dashboard come into sync.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+
+    first_result = await keeper_sync_project(ctx, payload)
+    assert first_result == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_first) == 1
+
+    # Reset the edition's publish_status to NULL to mimic data that
+    # landed before the publish-enqueue path existed.
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            main_edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="__main"
+            )
+            assert main_edition is not None
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == main_edition.id)
+                .values(publish_status=None)
+            )
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    second_result = await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert second_result == "completed"
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    # The second pass short-circuited but observed the unpublished edition,
+    # so a catch-up publish was enqueued.
+    assert len(publish_after_second) == 2
+
+    second_payload = publish_after_second[1].kwargs["payload"]
+    assert second_payload["edition_slug"] == "__main"
+    assert second_payload["project_slug"] == "pipelines"
+    assert second_payload["org_id"] == org_id
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="__main"
+            )
+            assert edition is not None
+            assert edition.publish_status == PublishStatus.pending
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            self_heal_qj = await queue_job_store.get_by_backend_job_id(
+                publish_after_second[1].id
+            )
+            assert self_heal_qj is not None
+            assert self_heal_qj.kind == JobKind.publish_edition
+            assert self_heal_qj.keeper_sync_run_id == run_id
 
 
 @pytest.mark.asyncio
