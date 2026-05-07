@@ -34,9 +34,11 @@ from docverse.client.models import (
     KeeperSyncRunStatus,
 )
 from docverse.config import config
-from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
+from docverse.services.keeper_sync.service import ProjectSyncResult
+from docverse.services.keeper_sync_finalisation import maybe_finalise_run
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse.services.publish_enqueue import enqueue_publish_for_edition
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.queue_job_store import QueueJobStore
 
@@ -73,7 +75,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
        keeper-sync child whose ``date_started`` is older than that
        threshold (and which has no ``date_completed``) as ``failed``.
     3. For each unique ``keeper_sync_run_id`` whose children were just
-       reaped, calls ``_maybe_finalise_run`` so the parent run rolls up
+       reaped, calls ``maybe_finalise_run`` so the parent run rolls up
        to ``partial_failure``.
 
     Wired as a cron job on ``KeeperSyncWorkerSettings.cron_jobs``
@@ -96,7 +98,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             for run_id in run_ids:
                 if run_id is None:
                     continue
-                await _maybe_finalise_run(run_store=run_store, run_id=run_id)
+                await maybe_finalise_run(run_store=run_store, run_id=run_id)
 
         if reaped:
             logger.warning(
@@ -246,10 +248,20 @@ async def keeper_sync_project(
        :meth:`KeeperSyncService.sync_project`. The service runs outside
        any outer ``session.begin()`` so it can manage its own commits
        across LTD HTTP, content copy, and Docverse-side row writes.
-    3. On success, mark the queue job ``completed``; on a caught
+    3. For each finalized ``(edition, build)`` pair the service
+       returned, call
+       :func:`docverse.services.publish_enqueue.enqueue_publish_for_edition`
+       so the publish path runs the same way it does after a normal
+       client upload — KV publish via ``EditionPublishingService.publish``
+       and a cascaded ``dashboard_build`` enqueue. The publish
+       ``QueueJob`` rows carry ``keeper_sync_run_id`` so they roll into
+       the parent run's progress counters and ``date_last_activity``.
+       Short-circuited builds (LTD ``date_rebuilt`` unchanged) are
+       skipped — there's no new state to publish.
+    4. On success, mark the queue job ``completed``; on a caught
        exception, mark it ``failed`` with structured error details and
        re-raise so arq records the job as failed. Both branches call
-       :func:`_maybe_finalise_run` so a terminal child cannot leave the
+       :func:`maybe_finalise_run` so a terminal child cannot leave the
        parent run stuck in ``in_progress``.
     """
     org_id: int = payload["org_id"]
@@ -290,7 +302,18 @@ async def keeper_sync_project(
                 service_label=publishing_store_label,
                 ltd_base_url=ltd_base_url,
             )
-            await service.sync_project(org_id=org_id, ltd_slug=ltd_slug)
+            sync_result = await service.sync_project(
+                org_id=org_id, ltd_slug=ltd_slug
+            )
+            await _enqueue_publish_for_finalized_builds(
+                factory=factory,
+                session=session,
+                queue_job_store=queue_job_store,
+                org_id=org_id,
+                run_id=run_id,
+                sync_result=sync_result,
+                logger=logger,
+            )
         except Exception as exc:
             logger.exception("Keeper-sync project failed")
             async with session.begin():
@@ -302,17 +325,79 @@ async def keeper_sync_project(
                         "traceback": traceback.format_exc(),
                     },
                 )
-                await _maybe_finalise_run(run_store=run_store, run_id=run_id)
+                await maybe_finalise_run(run_store=run_store, run_id=run_id)
             raise
 
         async with session.begin():
             await queue_job_store.complete(queue_job_id)
-            await _maybe_finalise_run(run_store=run_store, run_id=run_id)
+            await maybe_finalise_run(run_store=run_store, run_id=run_id)
         logger.info("Keeper-sync project completed")
         return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _enqueue_publish_for_finalized_builds(  # noqa: PLR0913
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int,
+    sync_result: ProjectSyncResult,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Run the publish path for every freshly-synced edition build.
+
+    Iterates ``sync_result.edition_outcomes`` and, for each edition
+    whose ``BuildSyncOutcome`` actually finalized a new build (i.e. the
+    sync did not short-circuit on unchanged LTD ``date_rebuilt``),
+    invokes
+    :func:`docverse.services.publish_enqueue.enqueue_publish_for_edition`
+    so KV publish + dashboard rebuild fire just like they do after a
+    normal client upload. Each helper call tags the publish ``QueueJob``
+    row with ``keeper_sync_run_id`` so the publish jobs roll into the
+    parent run's ``GET /runs/{id}/jobs`` listing and progress counters.
+
+    Short-circuited builds are skipped intentionally: their state is
+    unchanged, so no new publish is needed.
+    """
+    edition_store = factory.create_edition_store()
+    history_store = factory.create_edition_build_history_store()
+    queue_backend = factory.create_queue_backend()
+    project_slug = sync_result.docverse_project_slug
+    project_id = sync_result.docverse_project_id
+
+    for outcome in sync_result.edition_outcomes:
+        build_outcome = outcome.build_outcome
+        if build_outcome is None or build_outcome.short_circuited:
+            continue
+        if (
+            build_outcome.docverse_build_id is None
+            or build_outcome.docverse_build_public_id is None
+        ):
+            continue
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=edition_store,
+            history_store=history_store,
+            queue_job_store=queue_job_store,
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=outcome.docverse_edition_id,
+            edition_slug=outcome.docverse_slug,
+            build_id=build_outcome.docverse_build_id,
+            build_public_id=build_outcome.docverse_build_public_id,
+            keeper_sync_run_id=run_id,
+        )
+        logger.info(
+            "Enqueued publish_edition for synced build",
+            edition_slug=outcome.docverse_slug,
+            build_id=build_outcome.docverse_build_id,
+        )
 
 
 async def _load_config_snapshot(
@@ -458,45 +543,3 @@ async def _reconcile_orphan_children(
             orphan_count=len(failed),
             orphan_ids=[job.id for job in failed],
         )
-
-
-async def _maybe_finalise_run(
-    *,
-    run_store: KeeperSyncRunStore,
-    run_id: int,
-) -> None:
-    """Transition the run to a terminal status once all children are terminal.
-
-    Idempotent re-entry on the same terminal status is handled by
-    ``transition_status``'s same-status fast path. The explicit terminal
-    pre-check guards a different case: two child finalisers racing each
-    other can compute *different* terminal statuses (e.g. one sees all
-    children completed and picks ``succeeded`` just as another child's
-    failure commits, so the second finaliser picks ``partial_failure``).
-    Without the pre-check, the second caller would hit
-    ``transition_status``'s terminal→terminal guard and raise
-    ``InvalidJobStateError``, which would roll back the surrounding
-    ``session.begin()`` in ``keeper_sync_project`` and undo that
-    child's ``complete()``. We swallow the conflict here so the loser
-    of the race exits cleanly and lets the winning terminal status
-    stand.
-    """
-    activity = await run_store.aggregate_activity(run_id=run_id)
-    if activity.total_count == 0 or activity.pending_count > 0:
-        return
-    new_status = (
-        KeeperSyncRunStatus.partial_failure
-        if activity.failed_count > 0
-        else KeeperSyncRunStatus.succeeded
-    )
-    run = await run_store.get(run_id)
-    if run is None:
-        msg = f"Keeper sync run {run_id} not found"
-        raise NotFoundError(msg)
-    if run.status in {
-        KeeperSyncRunStatus.succeeded,
-        KeeperSyncRunStatus.partial_failure,
-        KeeperSyncRunStatus.failed,
-    }:
-        return
-    await run_store.transition_status(run_id=run_id, new_status=new_status)

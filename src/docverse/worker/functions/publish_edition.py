@@ -24,6 +24,7 @@ from docverse.factory import Factory
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
+from docverse.services.keeper_sync_finalisation import maybe_finalise_run
 from docverse.services.lock_service import LockKey
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -129,9 +130,15 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         queue_job_id=queue_job_id,
                         exc=exc,
                     )
+                    await _maybe_finalise_keeper_sync_run(
+                        factory=factory, queue_job_id=queue_job_id
+                    )
                 return "failed"
             async with session.begin():
                 await queue_job_store.complete(queue_job_id)
+                await _maybe_finalise_keeper_sync_run(
+                    factory=factory, queue_job_id=queue_job_id
+                )
             logger.info("Edition publish completed")
             await try_enqueue_dashboard_build_by_id(
                 factory=factory,
@@ -242,4 +249,36 @@ async def _mark_failed(  # noqa: PLR0913
             "type": type(exc).__name__,
             "traceback": traceback.format_exc(),
         },
+    )
+
+
+async def _maybe_finalise_keeper_sync_run(
+    *,
+    factory: Factory,
+    queue_job_id: int,
+) -> None:
+    """Roll up the parent keeper-sync run if this publish was attributed.
+
+    Publish jobs enqueued by ``keeper_sync_project`` (via the shared
+    ``enqueue_publish_for_edition`` helper) carry ``keeper_sync_run_id``
+    on their ``queue_jobs`` row so they roll into the run's progress
+    counters. Without an explicit hook here, a successfully-completed
+    publish would leave the parent run perpetually ``in_progress`` —
+    the keeper-sync reaper only fails *silent* ``in_progress`` rows,
+    not legitimately-completed ones. Calling
+    :func:`maybe_finalise_run` after each publish terminal transition
+    drives the run to ``succeeded`` / ``partial_failure`` once every
+    attributed child has reached terminal.
+
+    Publishes that were *not* attributed to a keeper-sync run (the
+    normal client-upload path) leave ``keeper_sync_run_id IS NULL``
+    and this helper returns without touching any run row.
+    """
+    queue_job_store = factory.create_queue_job_store()
+    run_store = factory.create_keeper_sync_run_store()
+    queue_job = await queue_job_store.get(queue_job_id)
+    if queue_job is None or queue_job.keeper_sync_run_id is None:
+        return
+    await maybe_finalise_run(
+        run_store=run_store, run_id=queue_job.keeper_sync_run_id
     )

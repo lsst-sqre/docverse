@@ -32,12 +32,16 @@ from docverse.client.models import (
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
+from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.build_store import BuildStore
+from docverse.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
@@ -47,7 +51,7 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.keeper_sync import keeper_sync_project
-from tests.support.arq_testing import register_queue
+from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 
 LTD_BASE = "https://keeper.lsst.codes"
@@ -152,14 +156,18 @@ async def _seed_run(db_session: AsyncSession, *, org_id: int) -> int:
 
 
 async def _seed_project_queue_job(
-    db_session: AsyncSession, *, org_id: int, run_id: int
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    run_id: int,
+    backend_job_id: str = "test-arq-project-1",
 ) -> int:
     queue_job_store = QueueJobStore(session=db_session, logger=_logger())
     queue_job = await queue_job_store.create(
         kind=JobKind.keeper_sync_project,
         org_id=org_id,
         keeper_sync_run_id=run_id,
-        backend_job_id="test-arq-project-1",
+        backend_job_id=backend_job_id,
     )
     return queue_job.id
 
@@ -185,13 +193,31 @@ def _seed_ltd(mock_discovery: respx.Router) -> None:
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_runs_service_and_finalises_run(
+async def test_keeper_sync_project_runs_service_and_enqueues_publish(  # noqa: PLR0915
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Happy path: project + edition + build + state rows, run -> succeeded."""
+    """Happy path: project + edition + build, publish_edition enqueued.
+
+    The keeper_sync_project worker must drive the synced edition's
+    finalized build through the same publish path as a normal client
+    upload. Asserts:
+
+    * Project / edition / build / state rows landed (the v1 sync
+      contract).
+    * The edition's ``publish_status`` is ``pending`` and a matching
+      ``EditionBuildHistory`` row exists with ``publish_status=pending``.
+    * A ``publish_edition`` ``QueueJob`` row was created carrying
+      ``keeper_sync_run_id`` so it rolls into the parent run's progress.
+    * A ``publish_edition`` arq job was enqueued on the *regular* queue
+      (``docverse:queue``), not the dedicated ``docverse:sync-queue``,
+      so the existing publish-edition worker pool picks it up.
+    * The parent run remains ``in_progress`` because the publish child
+      is still queued — finalisation cascades through the publish_edition
+      worker once it completes.
+    """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
         run_id = await _seed_run(db_session, org_id=org_id)
@@ -231,6 +257,15 @@ async def test_keeper_sync_project_runs_service_and_finalises_run(
     await ctx["http_client"].aclose()
     assert result == "completed"
 
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_jobs) == 1
+    publish_payload = publish_jobs[0].kwargs["payload"]
+    assert publish_payload["edition_slug"] == "__main"
+    assert publish_payload["project_slug"] == "pipelines"
+    assert publish_payload["org_id"] == org_id
+
     async for session in db_session_dependency():
         async with session.begin():
             project_store = ProjectStore(session=session, logger=_logger())
@@ -245,12 +280,22 @@ async def test_keeper_sync_project_runs_service_and_finalises_run(
             )
             assert main_edition is not None
             assert main_edition.current_build_id is not None
+            assert main_edition.publish_status == PublishStatus.pending
 
             build_store = BuildStore(session=session, logger=_logger())
             build = await build_store.get_by_id(main_edition.current_build_id)
             assert build is not None
             assert build.status == BuildStatus.completed
             assert build.uploader == "keeper-sync"
+
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            )
+            history = await history_store.get_by_edition_and_build(
+                edition_id=main_edition.id, build_id=build.id
+            )
+            assert history is not None
+            assert history.publish_status == PublishStatus.pending
 
             state_store = KeeperSyncStateStore(
                 session=session, logger=_logger()
@@ -275,14 +320,104 @@ async def test_keeper_sync_project_runs_service_and_finalises_run(
             assert qj is not None
             assert qj.status == JobStatus.completed
 
+            publish_qj = await queue_job_store.get_by_backend_job_id(
+                publish_jobs[0].id
+            )
+            assert publish_qj is not None
+            assert publish_qj.kind == JobKind.publish_edition
+            assert publish_qj.keeper_sync_run_id == run_id
+            assert publish_qj.edition_id == main_edition.id
+            assert publish_qj.build_id == build.id
+            assert publish_qj.org_id == org_id
+            assert publish_qj.project_id == project.id
+
             run_store = KeeperSyncRunStore(session=session, logger=_logger())
             run = await run_store.get(run_id)
             assert run is not None
-            assert run.status == KeeperSyncRunStatus.succeeded
+            # Publish child is still queued, so the run waits for it.
+            assert run.status == KeeperSyncRunStatus.in_progress
 
     # Build content actually landed in the destination object store.
     assert any(k.endswith("/index.html") for k in object_store.objects)
     assert any(k.endswith("/app.js") for k in object_store.objects)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_short_circuit_skips_publish_enqueue(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short-circuited sync (LTD ``date_rebuilt`` unchanged) skips publish.
+
+    Runs ``keeper_sync_project`` twice for the same product. The first
+    pass populates everything (project / edition / build / state rows
+    and a ``publish_edition`` arq job). The second pass observes the
+    ``keeper_sync_state`` row's ``date_rebuilt_seen`` matches LTD's
+    ``date_rebuilt`` and short-circuits inside ``KeeperSyncService.
+    sync_build``. It must NOT enqueue a redundant ``publish_edition``
+    arq job — re-publishing on every reconciliation tick would burn
+    KV writes without any state change.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+
+    first_result = await keeper_sync_project(ctx, payload)
+    assert first_result == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_first) == 1
+
+    # Second pass on the same LTD state — must short-circuit.
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    second_result = await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert second_result == "completed"
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    # Still exactly one publish job — the second pass short-circuited.
+    assert len(publish_after_second) == 1
 
 
 @pytest.mark.asyncio

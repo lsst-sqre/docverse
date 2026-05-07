@@ -637,17 +637,18 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Phase-A DB updates commit atomically even when phase-B arq fails.
+    """Phase-A DB writes commit per-pair before phase B raises.
 
     Two editions track ``main``. The first ``publish_edition`` arq enqueue
-    raises. Because ``_enqueue_publish_jobs`` commits all DB rows in one
-    transaction before enqueueing, both editions and history entries should
-    be ``pending`` and both child ``QueueJob`` rows should exist, even
-    though no arq job was successfully enqueued. This is the single
-    failure shape a future reconciliation loop has to handle — and the
-    red-green distinction from the per-edition-transaction structure,
-    which would leave edition 2 entirely untouched on a first-edition
-    enqueue failure.
+    raises while running Phase B for edition 1, after that pair's Phase A
+    has already committed. Because the publish enqueue helper splits
+    Phase A (DB writes) from Phase B (arq enqueue) per ``(edition, build)``
+    pair and the helper raises Phase B failures up the loop, edition 1
+    has its full Phase-A footprint (``publish_status=pending`` on both
+    edition + history, child ``QueueJob`` row present, ``backend_job_id``
+    still NULL) and edition 2 is entirely untouched until the next
+    reconciliation pass picks it up. This is the failure shape a future
+    reconciliation loop has to handle.
     """
     logger = _logger()
     mock_store = MockObjectStore()
@@ -738,8 +739,10 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
         == 0
     )
 
-    # Phase A committed atomically: both editions and both histories are
-    # pending, and both child QueueJob rows exist.
+    # The first iteration's Phase A commits before its Phase B raises, so
+    # exactly one of the two editions has its publish-pending footprint
+    # (and exactly one child QueueJob row) committed. The second edition
+    # was never reached by the loop.
     async for session in db_session_dependency():
         async with session.begin():
             edition_store = EditionStore(session=session, logger=_logger())
@@ -747,18 +750,30 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
                 session=session, logger=_logger()
             )
 
+            statuses: list[PublishStatus | None] = []
+            history_statuses: list[PublishStatus | None] = []
             for slug in ("main", "latest"):
                 edition = await edition_store.get_by_slug(
                     project_id=project.id, slug=slug
                 )
                 assert edition is not None
-                assert edition.publish_status == PublishStatus.pending
+                statuses.append(edition.publish_status)
 
                 history = await history_store.get_by_edition_and_build(
                     edition_id=edition.id, build_id=build.id
                 )
-                assert history is not None
-                assert history.publish_status == PublishStatus.pending
+                history_statuses.append(
+                    history.publish_status if history is not None else None
+                )
+
+            pending_editions = [
+                s for s in statuses if s == PublishStatus.pending
+            ]
+            assert len(pending_editions) == 1
+            pending_histories = [
+                s for s in history_statuses if s == PublishStatus.pending
+            ]
+            assert len(pending_histories) == 1
 
             child_rows = (
                 (
@@ -772,7 +787,8 @@ async def test_build_processing_publish_enqueue_failure_leaves_db_consistent(
                 .scalars()
                 .all()
             )
-            assert len(child_rows) == 2
+            assert len(child_rows) == 1
+            assert child_rows[0].backend_job_id is None
 
 
 @pytest.mark.asyncio
