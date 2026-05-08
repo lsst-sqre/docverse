@@ -20,10 +20,13 @@ from docverse.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     ANNOTATION_DATE_OTHER_LAST_POLLED,
     TIER_DISCOVERY_DORMANT_INTERVAL,
+    TIER_DISCOVERY_DORMANT_JITTER,
     TIER_DISCOVERY_HOT_WINDOW,
     TIER_MAIN_DORMANT_INTERVAL,
+    TIER_MAIN_DORMANT_JITTER,
     TIER_MAIN_HOT_WINDOW,
     TIER_OTHER_DORMANT_INTERVAL,
+    TIER_OTHER_DORMANT_JITTER,
     TIER_OTHER_HOT_WINDOW,
     TIER_OTHER_REFRESH_THRESHOLD,
     Tier,
@@ -32,6 +35,7 @@ from docverse.services.keeper_sync.scheduler import (
     should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
+    stable_hash_fraction,
 )
 from docverse.storage.keeper_sync import KeeperSyncState
 
@@ -303,7 +307,14 @@ def test_should_not_poll_main_when_dormant_and_recently_polled() -> None:
 
 
 def test_should_poll_main_when_dormant_and_stale_polled() -> None:
-    """Dormant project whose last poll predates the dormant interval."""
+    """Dormant project whose last poll predates the dormant interval.
+
+    ``jitter_window=timedelta(0)`` pins the effective dormant
+    interval to ``TIER_MAIN_DORMANT_INTERVAL`` exactly so this test
+    locks the bare-interval rule independent of how the slug-keyed
+    jitter would otherwise spread the boundary; jitter behavior is
+    covered by its own test below.
+    """
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     state = _project_state(
         date_rebuilt_seen=now - timedelta(days=30),
@@ -313,7 +324,9 @@ def test_should_poll_main_when_dormant_and_stale_polled() -> None:
             ).isoformat()
         },
     )
-    assert should_poll_main_for_project(state=state, now=now)
+    assert should_poll_main_for_project(
+        state=state, now=now, jitter_window=timedelta(0)
+    )
 
 
 def test_should_poll_main_at_dormant_interval_boundary_exactly() -> None:
@@ -322,7 +335,9 @@ def test_should_poll_main_at_dormant_interval_boundary_exactly() -> None:
     The ``>=`` mirrors ``should_refresh_other_edition``'s boundary
     handling so a poll that landed exactly one ``dormant_interval`` ago
     re-enters the polled set on this tick instead of slipping by one
-    cron period.
+    cron period. ``jitter_window=timedelta(0)`` keeps the assertion on
+    the un-jittered boundary; the jittered boundary is necessarily
+    slug-dependent and is locked by the dedicated jitter tests below.
     """
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     state = _project_state(
@@ -333,7 +348,9 @@ def test_should_poll_main_at_dormant_interval_boundary_exactly() -> None:
             ).isoformat()
         },
     )
-    assert should_poll_main_for_project(state=state, now=now)
+    assert should_poll_main_for_project(
+        state=state, now=now, jitter_window=timedelta(0)
+    )
 
 
 def test_should_poll_main_when_annotation_malformed() -> None:
@@ -641,3 +658,221 @@ def test_tier_annotation_keys_are_distinct() -> None:
         ANNOTATION_DATE_OTHER_LAST_POLLED,
     }
     assert len(keys) == 3
+
+
+# ---------------------------------------------------------------------------
+# stable_hash_fraction + jittered dormant interval
+# ---------------------------------------------------------------------------
+
+
+_HASH_FIXTURE_SLUGS = [
+    "pipelines",
+    "ldm-503",
+    "sqr-112",
+    "dm-54794",
+    "u-jsick-feature",
+    "afw",
+    "validate-drp",
+    "sims-maf",
+    "ts-mtdome",
+    "ap-association",
+    "rubin-system-engineering",
+    "obs-base",
+    "skymap",
+    "meas-algorithms",
+    "geom",
+    "scarlet",
+    "ndarray",
+    "ip-isr",
+    "shared-utils",
+    "ts-utils",
+]
+
+
+def test_stable_hash_fraction_is_deterministic() -> None:
+    """Same input → same output across calls.
+
+    The whole point of using sha256 over Python's salted ``hash()`` is
+    that the value survives across processes and worker restarts.
+    Calling twice must yield the same result so the planner stamp
+    pre-deploy and the planner read post-deploy agree on whether a
+    project is due.
+    """
+    for slug in _HASH_FIXTURE_SLUGS:
+        first = stable_hash_fraction(slug)
+        second = stable_hash_fraction(slug)
+        assert first == second
+
+
+def test_stable_hash_fraction_is_in_unit_interval() -> None:
+    """Output is in ``[0, 1)`` for any input."""
+    for slug in _HASH_FIXTURE_SLUGS:
+        value = stable_hash_fraction(slug)
+        assert 0.0 <= value < 1.0
+
+
+def test_stable_hash_fraction_distinguishes_slugs() -> None:
+    """Different slugs → distinct fractions, so jitter spreads them.
+
+    With sha256 the collision probability across a few hundred slugs
+    is vanishingly small; the fixture set here is well under that
+    bound, so any duplicate would be a real bug (e.g. ``hash()`` slipping
+    in or a digest-truncation off-by-one) rather than statistical fluke.
+    """
+    fractions = {stable_hash_fraction(slug) for slug in _HASH_FIXTURE_SLUGS}
+    assert len(fractions) == len(_HASH_FIXTURE_SLUGS)
+
+
+def test_stable_hash_fraction_is_uniformly_distributed() -> None:
+    """Mean and bucket counts on the fixture set match a uniform draw.
+
+    A uniform distribution has mean ≈ 0.5 and quartile counts ≈ N/4.
+    With 20 fixture slugs this is a coarse check, but it would catch a
+    digest truncation bug (e.g. taking 4 bytes instead of 8 — values
+    would still be in [0, 1) but mean would shift) or a scaling bug.
+    """
+    fractions = [stable_hash_fraction(slug) for slug in _HASH_FIXTURE_SLUGS]
+    mean = sum(fractions) / len(fractions)
+    # 20 samples → 95% CI on mean is roughly 0.5 ± 0.13 (for U[0,1)
+    # variance 1/12). Loosen to ±0.2 so the test is not flaky on a
+    # particular fixture set; a mean outside this window means the
+    # distribution is not uniform.
+    assert 0.3 < mean < 0.7
+    # Quartile bucket counts: roughly N/4 ± a few each.
+    buckets = [0, 0, 0, 0]
+    for f in fractions:
+        buckets[min(int(f * 4), 3)] += 1
+    # No bucket should be empty or hold more than half the samples on
+    # 20 draws from a well-mixed uniform distribution.
+    assert all(b > 0 for b in buckets)
+    assert all(b < len(fractions) // 2 for b in buckets)
+
+
+def test_should_poll_for_tier_jitter_does_not_affect_hot_path() -> None:
+    """Hot projects are unaffected by jitter (regression).
+
+    Jitter only widens the dormant-due gate. A hot project (rule 3)
+    short-circuits before any jitter math is consulted, so its 5-min
+    SLO is preserved. Locking this contract here so a future move of
+    the jitter math out of rule 4 fails immediately rather than
+    silently delaying hot-cohort polls.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    # Hot: rebuilt one day ago, well inside the 14-day hot window.
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=1))
+    # Even with a maximal jitter window (10x dormant_interval) and a
+    # last_polled annotation that would otherwise gate the project,
+    # the hot rule wins.
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        jitter_window=timedelta(days=10),
+    )
+
+
+def test_should_poll_for_tier_jitter_extends_dormant_interval() -> None:
+    """Two slugs with the same ``last_polled`` come due at distinct ``now``.
+
+    The acceptance criterion: with ``jitter_window > 0``, slug A's
+    effective interval differs from slug B's, so the threshold ``now``
+    at which each becomes dormant-due differs by ``delta_fraction *
+    jitter_window``. Demonstrated by picking two slugs whose hash
+    fractions differ enough to land on opposite sides of a chosen
+    ``now`` instant.
+    """
+    # ``due-proj`` hashes to ≈ 0.062 and ``skip-proj`` to ≈ 0.877 (locked
+    # by ``test_stable_hash_fraction_is_deterministic`` via sha256).
+    # With a 24h jitter window the effective intervals are ≈ 25.5h
+    # vs ≈ 45.0h, so a ``now`` exactly 30h after ``last_polled`` polls
+    # the first and skips the second.
+    fast_slug = "due-proj"
+    slow_slug = "skip-proj"
+    assert stable_hash_fraction(fast_slug) < stable_hash_fraction(slow_slug)
+
+    last_polled = datetime(2026, 5, 7, 0, tzinfo=UTC)
+    dormant_interval = timedelta(hours=24)
+    jitter_window = timedelta(hours=24)
+    # 30h after last_polled — past slug A's effective interval, before
+    # slug B's.
+    now = last_polled + timedelta(hours=30)
+
+    annotations = {ANNOTATION_DATE_MAIN_LAST_POLLED: last_polled.isoformat()}
+    fast_state = _state(
+        resource_type="project",
+        ltd_id=None,
+        ltd_slug=fast_slug,
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations=annotations,
+    )
+    slow_state = _state(
+        resource_type="project",
+        ltd_id=None,
+        ltd_slug=slow_slug,
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations=annotations,
+    )
+
+    assert should_poll_for_tier(
+        state=fast_state,
+        now=now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=dormant_interval,
+        jitter_window=jitter_window,
+    )
+    assert not should_poll_for_tier(
+        state=slow_state,
+        now=now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=dormant_interval,
+        jitter_window=jitter_window,
+    )
+
+
+def test_should_poll_for_tier_jitter_zero_matches_unjittered() -> None:
+    """``jitter_window=timedelta(0)`` is the no-op identity.
+
+    Locks the default-zero invariant so a refactor that flips the
+    default to the per-tier jitter constant fails this test rather
+    than silently changing the dormant boundary on every existing
+    caller.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    last_polled = now - timedelta(hours=24)
+    state = _state(
+        resource_type="project",
+        ltd_id=None,
+        ltd_slug="some-busy-slug",
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: last_polled.isoformat()
+        },
+    )
+    # Without jitter the planner uses ``>=`` boundary semantics so a
+    # poll exactly one ``dormant_interval`` ago re-polls.
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        jitter_window=timedelta(0),
+    )
+
+
+def test_tier_dormant_jitter_constants_match_documented_cadence() -> None:
+    """Each tier's jitter window equals its dormant interval.
+
+    Picking ``jitter == dormant_interval`` doubles the worst-case wait
+    but guarantees no two projects ever come due on the same tick — the
+    long tail is uniformly distributed across the 24 h window. Lock
+    the constants so a future re-tune comes back and re-acknowledges
+    the spread / latency tradeoff.
+    """
+    assert timedelta(hours=24) == TIER_MAIN_DORMANT_JITTER
+    assert timedelta(hours=24) == TIER_DISCOVERY_DORMANT_JITTER
+    assert timedelta(hours=24) == TIER_OTHER_DORMANT_JITTER

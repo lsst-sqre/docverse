@@ -48,8 +48,10 @@ from docverse.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     ANNOTATION_DATE_OTHER_LAST_POLLED,
     TIER_DISCOVERY_DORMANT_INTERVAL,
+    TIER_DISCOVERY_DORMANT_JITTER,
     TIER_DISCOVERY_HOT_WINDOW,
     TIER_OTHER_DORMANT_INTERVAL,
+    TIER_OTHER_DORMANT_JITTER,
     TIER_OTHER_HOT_WINDOW,
     Tier,
     is_unknown_resource,
@@ -960,6 +962,7 @@ async def _tier_discovery_for_org(
             tier=Tier.discovery,
             hot_window=TIER_DISCOVERY_HOT_WINDOW,
             dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
+            jitter_window=TIER_DISCOVERY_DORMANT_JITTER,
         ):
             continue
         try:
@@ -1062,6 +1065,7 @@ async def _tier_other_for_org(
             tier=Tier.other,
             hot_window=TIER_OTHER_HOT_WINDOW,
             dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
+            jitter_window=TIER_OTHER_DORMANT_JITTER,
         ):
             continue
         try:

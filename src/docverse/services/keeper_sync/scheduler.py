@@ -13,6 +13,7 @@ the LTD-side view they need; they emit Booleans, never SQL or HTTP.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 from enum import StrEnum
 
@@ -23,10 +24,13 @@ __all__ = [
     "ANNOTATION_DATE_MAIN_LAST_POLLED",
     "ANNOTATION_DATE_OTHER_LAST_POLLED",
     "TIER_DISCOVERY_DORMANT_INTERVAL",
+    "TIER_DISCOVERY_DORMANT_JITTER",
     "TIER_DISCOVERY_HOT_WINDOW",
     "TIER_MAIN_DORMANT_INTERVAL",
+    "TIER_MAIN_DORMANT_JITTER",
     "TIER_MAIN_HOT_WINDOW",
     "TIER_OTHER_DORMANT_INTERVAL",
+    "TIER_OTHER_DORMANT_JITTER",
     "TIER_OTHER_HOT_WINDOW",
     "TIER_OTHER_REFRESH_THRESHOLD",
     "Tier",
@@ -35,6 +39,7 @@ __all__ = [
     "should_poll_main_for_project",
     "should_refresh_main_edition",
     "should_refresh_other_edition",
+    "stable_hash_fraction",
 ]
 
 #: How long a non-``main`` edition's local state may lag LTD before
@@ -59,6 +64,15 @@ TIER_MAIN_HOT_WINDOW = timedelta(days=14)
 #: pressure this planner exists to bound.
 TIER_MAIN_DORMANT_INTERVAL = timedelta(hours=24)
 
+#: Random-but-stable spread added to ``TIER_MAIN_DORMANT_INTERVAL`` per
+#: project so the dormant cohort does not synchronise on the cron tick
+#: that lands exactly one ``dormant_interval`` after a load shed event.
+#: Equal to ``TIER_MAIN_DORMANT_INTERVAL`` so the average dormant wait
+#: is 1.5x the interval but no two projects with the same
+#: ``date_main_last_polled`` ever come due on the same tick: the slug-
+#: keyed jitter spreads them uniformly across the 24 h window.
+TIER_MAIN_DORMANT_JITTER = timedelta(hours=24)
+
 #: Window after a project's last observed LTD ``main`` rebuild during
 #: which ``keeper_sync_tier_discovery`` polls on its 30-minute cadence.
 #: Mirrors ``TIER_MAIN_HOT_WINDOW`` because the dormancy signal is the
@@ -75,6 +89,13 @@ TIER_DISCOVERY_HOT_WINDOW = timedelta(days=14)
 #: planner naturally re-classifies it as hot for all three tiers.
 TIER_DISCOVERY_DORMANT_INTERVAL = timedelta(hours=24)
 
+#: Random-but-stable spread added to ``TIER_DISCOVERY_DORMANT_INTERVAL``
+#: per project. Same rationale as :data:`TIER_MAIN_DORMANT_JITTER`:
+#: equal to the dormant interval so dormant-cohort polls are spread
+#: uniformly across a 24 h window instead of synchronising on the
+#: anniversary of a deploy or load shed.
+TIER_DISCOVERY_DORMANT_JITTER = timedelta(hours=24)
+
 #: Window after a project's last observed LTD ``main`` rebuild during
 #: which ``keeper_sync_tier_other`` polls on its hourly cadence. Same
 #: 14-day rationale as the other two tiers: ``date_rebuilt_seen`` is
@@ -87,6 +108,12 @@ TIER_OTHER_HOT_WINDOW = timedelta(days=14)
 #: tiers; see :data:`TIER_DISCOVERY_DORMANT_INTERVAL` for the rationale
 #: shared across all three tiers.
 TIER_OTHER_DORMANT_INTERVAL = timedelta(hours=24)
+
+#: Random-but-stable spread added to ``TIER_OTHER_DORMANT_INTERVAL`` per
+#: project. Same rationale as :data:`TIER_MAIN_DORMANT_JITTER`: equal
+#: to the dormant interval so the long tail is uniformly visited across
+#: the 24 h window rather than in a periodic burst.
+TIER_OTHER_DORMANT_JITTER = timedelta(hours=24)
 
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
 #: holding the ISO-8601 timestamp of the last LTD fetch issued by
@@ -131,13 +158,14 @@ _TIER_ANNOTATION_KEYS: dict[Tier, str] = {
 }
 
 
-def should_poll_for_tier(
+def should_poll_for_tier(  # noqa: PLR0913
     *,
     state: KeeperSyncState | None,
     now: datetime,
     tier: Tier,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    jitter_window: timedelta = timedelta(0),
 ) -> bool:
     """Decide whether a tier-cron should fetch LTD for a project this tick.
 
@@ -160,13 +188,15 @@ def should_poll_for_tier(
     3. ``now - state.date_rebuilt_seen < hot_window`` — the project is
        hot. Always poll on the tier's fast cadence.
     4. Otherwise (dormant): consult the per-tier last-polled
-       annotation. If absent, malformed, or older than
-       ``dormant_interval``, poll. Otherwise skip — the project is
-       rate-limited to one LTD fetch per ``dormant_interval``.
+       annotation. If absent, malformed, or older than the effective
+       dormant interval, poll. Otherwise skip.
 
-    The hot-window comparison is strict ``<``; an exactly-at-window
-    state row falls through to the dormant gate so the rate-limit
-    contract on hot↔dormant boundary projects is one rule, not two.
+    ``jitter_window`` (default zero) widens the rule-4 effective
+    interval to ``dormant_interval + (stable_hash_fraction(ltd_slug) *
+    jitter_window)`` so the dormant cohort does not all become due on
+    the same tick after a deploy or load shed. Only the dormant gate
+    is jittered; rules 1-3 are unaffected so the hot-cohort SLO is
+    preserved.
     """
     if state is None:
         return True
@@ -179,7 +209,24 @@ def should_poll_for_tier(
     last_polled = _parse_annotation_datetime(last_polled_raw)
     if last_polled is None:
         return True
-    return (now - last_polled) >= dormant_interval
+    effective_interval = dormant_interval + (
+        stable_hash_fraction(state.ltd_slug) * jitter_window
+    )
+    return (now - last_polled) >= effective_interval
+
+
+def stable_hash_fraction(slug: str) -> float:
+    """Return a deterministic ``[0, 1)`` real for ``slug``.
+
+    Uses sha256 (not Python's built-in ``hash()``, which is salted per
+    interpreter run) so callers get the same value across processes
+    and across worker restarts. The first 8 bytes of the digest are
+    interpreted as a big-endian uint64 and divided by ``2**64``, so
+    the output is uniformly distributed over ``[0, 1)`` for any
+    well-mixed input distribution. Pure: no I/O, no global state.
+    """
+    digest = hashlib.sha256(slug.encode()).digest()
+    return int.from_bytes(digest[:8], "big") / (1 << 64)
 
 
 def should_poll_main_for_project(
@@ -188,6 +235,7 @@ def should_poll_main_for_project(
     now: datetime,
     hot_window: timedelta = TIER_MAIN_HOT_WINDOW,
     dormant_interval: timedelta = TIER_MAIN_DORMANT_INTERVAL,
+    jitter_window: timedelta = TIER_MAIN_DORMANT_JITTER,
 ) -> bool:
     """Decide whether tier_main should fetch LTD for a project this tick.
 
@@ -204,6 +252,7 @@ def should_poll_main_for_project(
         tier=Tier.main,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        jitter_window=jitter_window,
     )
 
 

@@ -736,8 +736,10 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
                 ).isoformat(),
             },
         )
-        # Dormant-due: rebuilt 30 days ago, polled 25h ago — past the
-        # 24h dormant interval, so the planner re-polls.
+        # Dormant-due: rebuilt 30 days ago, polled 49h ago — past the
+        # full 48h jittered dormant ceiling (24h interval + up to 24h
+        # slug-keyed jitter), so the planner re-polls regardless of
+        # how the LTD slug hashes.
         await state_store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
@@ -748,7 +750,7 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
                 "main_edition_ltd_id": 3,
                 "main_edition_url": f"{LTD_BASE}/editions/3",
                 "date_main_last_polled": (
-                    now - timedelta(hours=25)
+                    now - timedelta(hours=49)
                 ).isoformat(),
             },
         )
@@ -917,7 +919,7 @@ async def test_tier_main_records_polled_annotation_on_ltd_error(
                 "main_edition_ltd_id": 9,
                 "main_edition_url": f"{LTD_BASE}/editions/9",
                 "date_main_last_polled": (
-                    now - timedelta(hours=25)
+                    now - timedelta(hours=49)
                 ).isoformat(),
             },
         )
@@ -952,7 +954,7 @@ async def test_tier_main_records_polled_annotation_on_ltd_error(
     raw = row.annotations["date_main_last_polled"]
     assert isinstance(raw, str)
     stamped = datetime.fromisoformat(raw)
-    # Update fired during this tick, not 25h ago.
+    # Update fired during this tick, not 49h ago.
     assert (now - stamped) < timedelta(minutes=5)
 
 
@@ -1304,8 +1306,10 @@ async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
                 ).isoformat()
             },
         )
-        # Dormant-due: rebuilt 30 days ago, polled 25h ago — past the
-        # 24h dormant interval, so the planner re-polls.
+        # Dormant-due: rebuilt 30 days ago, polled 49h ago — past the
+        # full 48h jittered dormant ceiling (24h interval + up to 24h
+        # slug-keyed jitter), so the planner re-polls regardless of
+        # how the LTD slug hashes.
         await state_store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
@@ -1314,7 +1318,7 @@ async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
             date_rebuilt_seen=old_rebuild,
             annotations={
                 "date_discovery_last_polled": (
-                    now - timedelta(hours=25)
+                    now - timedelta(hours=49)
                 ).isoformat()
             },
         )
@@ -1445,7 +1449,7 @@ async def test_tier_discovery_records_polled_annotation_on_ltd_error(
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
                 "date_discovery_last_polled": (
-                    now - timedelta(hours=25)
+                    now - timedelta(hours=49)
                 ).isoformat()
             },
         )
@@ -1476,7 +1480,7 @@ async def test_tier_discovery_records_polled_annotation_on_ltd_error(
     raw = row.annotations["date_discovery_last_polled"]
     assert isinstance(raw, str)
     stamped = datetime.fromisoformat(raw)
-    # Update fired during this tick, not 25h ago.
+    # Update fired during this tick, not 49h ago.
     assert (now - stamped) < timedelta(minutes=5)
 
 
@@ -1837,8 +1841,10 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
                 ).isoformat()
             },
         )
-        # Dormant-due: rebuilt 30 days ago, polled 25h ago — past the
-        # 24h dormant interval, so the planner re-polls.
+        # Dormant-due: rebuilt 30 days ago, polled 49h ago — past the
+        # full 48h jittered dormant ceiling (24h interval + up to 24h
+        # slug-keyed jitter), so the planner re-polls regardless of
+        # how the LTD slug hashes.
         await state_store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
@@ -1847,7 +1853,7 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
             date_rebuilt_seen=old_rebuild,
             annotations={
                 "date_other_last_polled": (
-                    now - timedelta(hours=25)
+                    now - timedelta(hours=49)
                 ).isoformat()
             },
         )
@@ -1985,7 +1991,7 @@ async def test_tier_other_records_polled_annotation_on_ltd_error(
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
                 "date_other_last_polled": (
-                    now - timedelta(hours=25)
+                    now - timedelta(hours=49)
                 ).isoformat()
             },
         )
@@ -2016,7 +2022,7 @@ async def test_tier_other_records_polled_annotation_on_ltd_error(
     raw = row.annotations["date_other_last_polled"]
     assert isinstance(raw, str)
     stamped = datetime.fromisoformat(raw)
-    # Update fired during this tick, not 25h ago.
+    # Update fired during this tick, not 49h ago.
     assert (now - stamped) < timedelta(minutes=5)
 
 
