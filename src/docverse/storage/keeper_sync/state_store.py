@@ -49,6 +49,14 @@ class KeeperSyncState(BaseModel):
         :func:`docverse.worker.functions.keeper_sync._tier_main_for_org`
         so subsequent ticks issue one ``GET /editions/<id>`` instead of
         walking the project's edition URL list.
+
+        ``date_main_last_polled`` — ISO-8601 timestamp of the last LTD
+        fetch issued by ``_tier_main_for_org`` for this project,
+        consumed by
+        :func:`docverse.services.keeper_sync.scheduler.should_poll_main_for_project`
+        so dormant projects (those whose LTD ``main`` rebuild predates
+        the hot window) cap their LTD load at one fetch per
+        ``TIER_MAIN_DORMANT_INTERVAL``.
     Edition-resource rows
         ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
         mode / refs preserved for reversibility (used by the ``manual``

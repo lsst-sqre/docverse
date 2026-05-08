@@ -11,10 +11,15 @@ test.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from docverse.services.keeper_sync.scheduler import (
+    ANNOTATION_DATE_MAIN_LAST_POLLED,
+    TIER_MAIN_DORMANT_INTERVAL,
+    TIER_MAIN_HOT_WINDOW,
     TIER_OTHER_REFRESH_THRESHOLD,
     is_unknown_resource,
+    should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
 )
@@ -26,17 +31,22 @@ def _state(
     docverse_id: int | None = 7,
     date_last_synced: datetime | None = None,
     date_rebuilt_seen: datetime | None = None,
+    annotations: dict[str, Any] | None = None,
+    resource_type: str = "edition",
+    ltd_id: int | None = 42,
+    ltd_slug: str = "main",
 ) -> KeeperSyncState:
     """Build a ``KeeperSyncState`` with sane defaults for assertions."""
     return KeeperSyncState(
         id=1,
         org_id=1,
-        resource_type="edition",
-        ltd_id=42,
-        ltd_slug="main",
+        resource_type=resource_type,
+        ltd_id=ltd_id,
+        ltd_slug=ltd_slug,
         docverse_id=docverse_id,
         date_last_synced=date_last_synced,
         date_rebuilt_seen=date_rebuilt_seen,
+        annotations=annotations,
     )
 
 
@@ -182,4 +192,167 @@ def test_should_refresh_other_respects_caller_threshold() -> None:
     # threshold flips that decision.
     assert should_refresh_other_edition(
         state=state, now=now, threshold=timedelta(minutes=15)
+    )
+
+
+# ---------------------------------------------------------------------------
+# should_poll_main_for_project
+# ---------------------------------------------------------------------------
+
+
+def _project_state(
+    *,
+    date_rebuilt_seen: datetime | None = None,
+    annotations: dict[str, Any] | None = None,
+) -> KeeperSyncState:
+    """Build a project-resource state row with the given dormancy fields."""
+    return _state(
+        resource_type="project",
+        ltd_id=None,
+        ltd_slug="pipelines",
+        date_rebuilt_seen=date_rebuilt_seen,
+        annotations=annotations,
+    )
+
+
+def test_should_poll_main_when_state_missing() -> None:
+    """No project state row at all — initial discovery, always poll."""
+    assert should_poll_main_for_project(
+        state=None, now=datetime(2026, 5, 7, tzinfo=UTC)
+    )
+
+
+def test_should_poll_main_when_date_rebuilt_seen_missing() -> None:
+    """Project row exists but has never recorded a rebuild — poll.
+
+    Common when a project was first synced via the operator-driven
+    backfill (which doesn't touch the project row's ``date_rebuilt_
+    seen``); the next tier_main tick must poll so dormancy gating has
+    a date to gate on going forward.
+    """
+    state = _project_state(date_rebuilt_seen=None)
+    assert should_poll_main_for_project(
+        state=state, now=datetime(2026, 5, 7, tzinfo=UTC)
+    )
+
+
+def test_should_poll_main_when_hot_inside_window() -> None:
+    """Rebuilt within the hot window — always poll on the 5-min cadence."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=7))
+    assert should_poll_main_for_project(state=state, now=now)
+
+
+def test_should_not_poll_main_at_hot_window_boundary_when_dormant_recent() -> (
+    None
+):
+    """Exactly-at-hot-window falls through to the dormant rate-limiter.
+
+    The strict ``<`` on the hot comparison means a rebuild ``date_re-
+    built_seen`` exactly ``hot_window`` ago is dormant; with a recent
+    last-polled annotation the planner skips. This locks the boundary
+    handling so future drift requires updating both the rule and this
+    test.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - TIER_MAIN_HOT_WINDOW,
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: (
+                now - timedelta(minutes=10)
+            ).isoformat()
+        },
+    )
+    assert not should_poll_main_for_project(state=state, now=now)
+
+
+def test_should_poll_main_when_dormant_and_never_polled() -> None:
+    """Dormant project with no last-polled annotation — poll on first sight."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=30))
+    assert should_poll_main_for_project(state=state, now=now)
+
+
+def test_should_not_poll_main_when_dormant_and_recently_polled() -> None:
+    """Dormant project polled within ``dormant_interval`` — skip.
+
+    The whole point: clamps a dormant project to ≤ 1 LTD fetch per
+    ``dormant_interval`` rather than firing every 5 min like a hot
+    project.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: (
+                now - timedelta(hours=1)
+            ).isoformat()
+        },
+    )
+    assert not should_poll_main_for_project(state=state, now=now)
+
+
+def test_should_poll_main_when_dormant_and_stale_polled() -> None:
+    """Dormant project whose last poll predates the dormant interval."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: (
+                now - timedelta(hours=25)
+            ).isoformat()
+        },
+    )
+    assert should_poll_main_for_project(state=state, now=now)
+
+
+def test_should_poll_main_at_dormant_interval_boundary_exactly() -> None:
+    """Dormant + last-polled exactly at the interval — poll (>= comparison).
+
+    The ``>=`` mirrors ``should_refresh_other_edition``'s boundary
+    handling so a poll that landed exactly one ``dormant_interval`` ago
+    re-enters the polled set on this tick instead of slipping by one
+    cron period.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: (
+                now - TIER_MAIN_DORMANT_INTERVAL
+            ).isoformat()
+        },
+    )
+    assert should_poll_main_for_project(state=state, now=now)
+
+
+def test_should_poll_main_when_annotation_malformed() -> None:
+    """A garbled annotation value re-polls (and rewrites) on the next tick."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={ANNOTATION_DATE_MAIN_LAST_POLLED: "not-a-datetime"},
+    )
+    assert should_poll_main_for_project(state=state, now=now)
+
+
+def test_tier_main_constants_match_documented_cadence() -> None:
+    """Hot window is 14 days; dormant interval is 24 hours.
+
+    Locking the constants so a future re-tune comes back and re-
+    acknowledges the SLO (hot SLO is the user-visible 5-min cadence;
+    the long-tail load-shed budget is the 24-h dormant ceiling).
+    """
+    assert timedelta(days=14) == TIER_MAIN_HOT_WINDOW
+    assert timedelta(hours=24) == TIER_MAIN_DORMANT_INTERVAL
+
+
+def test_should_poll_main_accepts_callable_overrides() -> None:
+    """Callers may override window/interval (used by tests today)."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=20))
+    # 20-day-old rebuild is dormant under the default 14-day window,
+    # but a 30-day caller override flips it back to hot.
+    assert should_poll_main_for_project(
+        state=state, now=now, hot_window=timedelta(days=30)
     )

@@ -44,7 +44,9 @@ from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.organization import Organization
 from docverse.factory import Factory
 from docverse.services.keeper_sync.scheduler import (
+    ANNOTATION_DATE_MAIN_LAST_POLLED,
     is_unknown_resource,
+    should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
 )
@@ -807,7 +809,14 @@ async def _tier_main_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
 ) -> int:
-    """Run one tier_main pass for a single enabled org."""
+    """Run one tier_main pass for a single enabled org.
+
+    Uses :func:`should_poll_main_for_project` to skip dormant projects
+    (those whose LTD ``main`` hasn't rebuilt within the hot window) on
+    most ticks, capping their LTD load at one fetch per
+    ``TIER_MAIN_DORMANT_INTERVAL`` instead of one per 5-minute cron
+    tick. Hot projects continue to poll on the 5-min SLO.
+    """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
         return 0
@@ -822,8 +831,17 @@ async def _tier_main_for_org(
     state_store = factory.create_keeper_sync_state_store()
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
+    now = datetime.now(tz=UTC)
     enqueued = 0
     for ltd_slug in in_scope:
+        async with session.begin():
+            project_state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+            )
+        if not should_poll_main_for_project(state=project_state, now=now):
+            continue
         try:
             main_edition = await _find_main_edition(
                 ltd_client=ltd_client,
@@ -838,20 +856,33 @@ async def _tier_main_for_org(
                 org=org.slug,
                 ltd_slug=ltd_slug,
             )
+            # Mark the visit polled even on error — otherwise a flaky
+            # LTD endpoint would defeat dormancy gating by re-polling
+            # every 5 min for dormant projects.
+            await _record_main_polled(
+                session=session,
+                state_store=state_store,
+                org_id=org.id,
+                ltd_slug=ltd_slug,
+                now=now,
+                main_edition=None,
+            )
             continue
-        if main_edition is None:
-            continue
-        # Refresh the cached pointer on every successful resolve — both
-        # cache hits (cheap re-write) and walk-discovered re-mappings
-        # (handles the rare case where a maintainer renamed ``main`` by
-        # recreating the edition under a new id).
-        await _cache_main_edition_pointer(
+        # Refresh the cached pointer + rate-limit annotation on every
+        # successful resolve. The merge-and-upsert handles the cold-
+        # cache case (no prior annotations), the steady-state hit case
+        # (re-write the same pointer), and the rare maintainer-rename
+        # case (walk discovered a different ltd_id than was cached).
+        await _record_main_polled(
             session=session,
             state_store=state_store,
             org_id=org.id,
             ltd_slug=ltd_slug,
+            now=now,
             main_edition=main_edition,
         )
+        if main_edition is None:
+            continue
         async with session.begin():
             state = await state_store.get(
                 org_id=org.id,
@@ -1100,21 +1131,37 @@ async def _cached_main_edition_url(
     return cached if isinstance(cached, str) else None
 
 
-async def _cache_main_edition_pointer(
+async def _record_main_polled(  # noqa: PLR0913
     *,
     session: AsyncSession,
     state_store: KeeperSyncStateStore,
     org_id: int,
     ltd_slug: str,
-    main_edition: LtdEdition,
+    now: datetime,
+    main_edition: LtdEdition | None,
 ) -> None:
-    """Persist the resolved ``main`` edition pointer on project state.
+    """Persist a tier_main poll outcome on the project state row.
 
-    Writes ``main_edition_ltd_id`` and ``main_edition_url`` into the
-    project-resource ``keeper_sync_state.annotations`` JSONB. Existing
-    annotations on the row are preserved by merge so unrelated keys
-    (none today, but a forward-compatible posture for future
-    project-state metadata) survive across ticks.
+    Two responsibilities, intentionally combined into one upsert so a
+    polled visit always lands as a single transaction:
+
+    * **Rate-limit bookkeeping.** ``date_main_last_polled`` is set to
+      ``now`` on every polled visit (success, miss, or LTD error) so
+      the dormancy planner clamps a project to ≤ 1 LTD fetch per
+      ``TIER_MAIN_DORMANT_INTERVAL``. Skipping this on errors would
+      let a flaky LTD endpoint defeat the rate limiter.
+    * **Cached pointer + ``date_rebuilt_seen``.** When ``main_edition``
+      is non-``None`` we additionally rewrite ``main_edition_ltd_id`` /
+      ``main_edition_url`` (so the next tick's
+      :func:`_find_main_edition` skips the URL walk) and write
+      ``date_rebuilt_seen`` on the project state row so the next
+      tick's :func:`should_poll_main_for_project` can decide hot vs
+      dormant from this same row.
+
+    Existing unrelated annotation keys are preserved by merge — no
+    other writers exist today on the project-resource state row's
+    annotations, but the forward-compatible posture costs nothing and
+    avoids a future drive-by writer being blindsided.
     """
     async with session.begin():
         existing = await state_store.get(
@@ -1129,14 +1176,19 @@ async def _cache_main_edition_pointer(
         )
         merged: dict[str, Any] = {
             **prior,
-            _MAIN_EDITION_LTD_ID_KEY: main_edition.ltd_id,
-            _MAIN_EDITION_URL_KEY: str(main_edition.self_url),
+            ANNOTATION_DATE_MAIN_LAST_POLLED: now.isoformat(),
         }
+        date_rebuilt_for_upsert: datetime | None = None
+        if main_edition is not None:
+            merged[_MAIN_EDITION_LTD_ID_KEY] = main_edition.ltd_id
+            merged[_MAIN_EDITION_URL_KEY] = str(main_edition.self_url)
+            date_rebuilt_for_upsert = main_edition.date_rebuilt
         await state_store.upsert(
             org_id=org_id,
             resource_type=ResourceType.project,
             ltd_slug=ltd_slug,
             annotations=merged,
+            date_rebuilt_seen=date_rebuilt_for_upsert,
         )
 
 

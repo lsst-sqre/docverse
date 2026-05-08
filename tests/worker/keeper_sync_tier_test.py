@@ -683,6 +683,280 @@ async def test_tier_main_falls_back_to_walk_on_slug_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_tier_main_polls_only_hot_and_due_dormant_projects(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Mixed cohort: hot, dormant-skippable, and dormant-due projects.
+
+    Acceptance criterion (issue #312): on a single tier_main tick the
+    cron must call ``_find_main_edition`` only for projects the
+    planner declares hot or dormant-due. The dormant-skippable project
+    keeps the same cached pointer it started with and the LTD edition
+    endpoint for it is never hit, verified by ``respx`` route counters.
+    """
+    now = datetime.now(tz=UTC)
+    fresh_main_rebuilt = now - timedelta(minutes=15)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-cohort",
+            project_slugs=["hot-proj", "skip-proj", "due-proj"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        # Hot: rebuilt 2 days ago. Planner returns True regardless of
+        # any last-polled annotation.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="hot-proj",
+            docverse_id=1,
+            date_rebuilt_seen=now - timedelta(days=2),
+            annotations={
+                "main_edition_ltd_id": 1,
+                "main_edition_url": f"{LTD_BASE}/editions/1",
+            },
+        )
+        # Dormant-skippable: rebuilt 30 days ago, polled 1h ago — well
+        # within the 24h dormant interval.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="skip-proj",
+            docverse_id=2,
+            date_rebuilt_seen=now - timedelta(days=30),
+            annotations={
+                "main_edition_ltd_id": 2,
+                "main_edition_url": f"{LTD_BASE}/editions/2",
+                "date_main_last_polled": (
+                    now - timedelta(hours=1)
+                ).isoformat(),
+            },
+        )
+        # Dormant-due: rebuilt 30 days ago, polled 25h ago — past the
+        # 24h dormant interval, so the planner re-polls.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="due-proj",
+            docverse_id=3,
+            date_rebuilt_seen=now - timedelta(days=30),
+            annotations={
+                "main_edition_ltd_id": 3,
+                "main_edition_url": f"{LTD_BASE}/editions/3",
+                "date_main_last_polled": (
+                    now - timedelta(hours=25)
+                ).isoformat(),
+            },
+        )
+        # Edition state for each polled project: date_rebuilt_seen older
+        # than what LTD will return so should_refresh_main_edition
+        # triggers an enqueue. Skip-proj's edition row is never read.
+        for ltd_id in (1, 2, 3):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="main",
+                date_rebuilt_seen=fresh_main_rebuilt - timedelta(hours=2),
+            )
+
+    _stub_products(mock_discovery, ["hot-proj", "skip-proj", "due-proj"])
+    # Per-project respx routes pinned to the cached edition URL each
+    # project advertises in its annotations. Cache-hit path means the
+    # listings endpoints are never touched.
+    hot_route = mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "self_url": f"{LTD_BASE}/editions/1",
+                "product_url": f"{LTD_BASE}/products/hot-proj",
+                "build_url": f"{LTD_BASE}/builds/100",
+                "published_url": f"{LTD_BASE}/main/",
+                "slug": "main",
+                "title": "main",
+                "date_created": "2024-01-01T00:00:00+00:00",
+                "date_rebuilt": fresh_main_rebuilt.isoformat(),
+                "date_ended": None,
+                "tracked_refs": ["main"],
+                "mode": "git_refs",
+                "pending_rebuild": False,
+            },
+        )
+    )
+    skip_route = mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "self_url": f"{LTD_BASE}/editions/2",
+                "product_url": f"{LTD_BASE}/products/skip-proj",
+                "build_url": f"{LTD_BASE}/builds/200",
+                "published_url": f"{LTD_BASE}/main/",
+                "slug": "main",
+                "title": "main",
+                "date_created": "2024-01-01T00:00:00+00:00",
+                "date_rebuilt": fresh_main_rebuilt.isoformat(),
+                "date_ended": None,
+                "tracked_refs": ["main"],
+                "mode": "git_refs",
+                "pending_rebuild": False,
+            },
+        )
+    )
+    due_route = mock_discovery.get(f"{LTD_BASE}/editions/3").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "self_url": f"{LTD_BASE}/editions/3",
+                "product_url": f"{LTD_BASE}/products/due-proj",
+                "build_url": f"{LTD_BASE}/builds/300",
+                "published_url": f"{LTD_BASE}/main/",
+                "slug": "main",
+                "title": "main",
+                "date_created": "2024-01-01T00:00:00+00:00",
+                "date_rebuilt": fresh_main_rebuilt.isoformat(),
+                "date_ended": None,
+                "tracked_refs": ["main"],
+                "mode": "git_refs",
+                "pending_rebuild": False,
+            },
+        )
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Acceptance: LTD HTTP fired exactly for the polled cohort.
+    assert hot_route.call_count == 1
+    assert skip_route.call_count == 0
+    assert due_route.call_count == 1
+
+    # Both polled projects' main editions advance state, so each
+    # enqueues one keeper_sync_project child. The skipped project does
+    # not.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    enqueued_slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
+    assert enqueued_slugs == {"hot-proj", "due-proj"}
+
+    # Acceptance: date_main_last_polled is updated on every polled
+    # visit. Verified via the project state row's annotations.
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            for slug, expected_polled in (
+                ("hot-proj", True),
+                ("due-proj", True),
+                ("skip-proj", False),
+            ):
+                row = await store.get(
+                    org_id=org_id,
+                    resource_type=ResourceType.project,
+                    ltd_slug=slug,
+                )
+                assert row is not None
+                assert row.annotations is not None
+                if expected_polled:
+                    # Stamp is "now-ish" (within a small slop), proving
+                    # the polled visit overwrote the stale value.
+                    raw = row.annotations["date_main_last_polled"]
+                    assert isinstance(raw, str)
+                    stamped = datetime.fromisoformat(raw)
+                    assert (now - stamped) < timedelta(minutes=5)
+                else:
+                    # Skipped project's annotation reflects the seeded
+                    # 1h-ago value, untouched by this tick.
+                    raw = row.annotations["date_main_last_polled"]
+                    assert isinstance(raw, str)
+                    stamped = datetime.fromisoformat(raw)
+                    assert timedelta(minutes=30) < (now - stamped)
+
+
+@pytest.mark.asyncio
+async def test_tier_main_records_polled_annotation_on_ltd_error(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """LtdClientError on a dormant-due project still updates the annotation.
+
+    Otherwise a flaky LTD endpoint would defeat the dormancy rate
+    limiter — the project would re-poll on every 5-min tick instead of
+    waiting out the dormant interval. The error is logged and the next
+    project continues, but the polled timestamp advances either way.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-error",
+            project_slugs=["flaky-proj"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="flaky-proj",
+            docverse_id=1,
+            date_rebuilt_seen=now - timedelta(days=30),
+            annotations={
+                "main_edition_ltd_id": 9,
+                "main_edition_url": f"{LTD_BASE}/editions/9",
+                "date_main_last_polled": (
+                    now - timedelta(hours=25)
+                ).isoformat(),
+            },
+        )
+
+    _stub_products(mock_discovery, ["flaky-proj"])
+    # The cached edition fetch fails, then the walk also fails.
+    mock_discovery.get(f"{LTD_BASE}/editions/9").mock(
+        return_value=httpx.Response(500)
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/flaky-proj/editions/").mock(
+        return_value=httpx.Response(500)
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            row = await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="flaky-proj",
+            )
+    assert row is not None
+    assert row.annotations is not None
+    raw = row.annotations["date_main_last_polled"]
+    assert isinstance(raw, str)
+    stamped = datetime.fromisoformat(raw)
+    # Update fired during this tick, not 25h ago.
+    assert (now - stamped) < timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
 async def test_tier_main_skips_disabled_orgs(
     app: None,
     db_session: AsyncSession,

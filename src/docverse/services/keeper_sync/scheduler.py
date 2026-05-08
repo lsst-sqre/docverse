@@ -18,8 +18,12 @@ from datetime import datetime, timedelta
 from docverse.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
+    "ANNOTATION_DATE_MAIN_LAST_POLLED",
+    "TIER_MAIN_DORMANT_INTERVAL",
+    "TIER_MAIN_HOT_WINDOW",
     "TIER_OTHER_REFRESH_THRESHOLD",
     "is_unknown_resource",
+    "should_poll_main_for_project",
     "should_refresh_main_edition",
     "should_refresh_other_edition",
 ]
@@ -30,6 +34,99 @@ __all__ = [
 #: module constant so the worker function and the unit tests pull from
 #: the same source of truth.
 TIER_OTHER_REFRESH_THRESHOLD = timedelta(hours=1)
+
+#: Window after a project's last observed LTD ``main`` rebuild during
+#: which ``keeper_sync_tier_main`` always polls on its 5-minute cadence.
+#: Set to two weeks so any project rebuilt in the recent past stays on
+#: the hot SLO; production LTD has ~1500 projects but the long tail
+#: hasn't rebuilt in months, and polling them every 5 min sustained
+#: ~5 RPS to LTD purely on this cron.
+TIER_MAIN_HOT_WINDOW = timedelta(days=14)
+
+#: Maximum interval between LTD fetches for a dormant project (one whose
+#: last observed ``date_rebuilt`` is older than ``TIER_MAIN_HOT_WINDOW``).
+#: Once-a-day is enough to discover late rebuilds without contributing
+#: meaningful load to LTD; shorter would re-create the long-tail
+#: pressure this planner exists to bound.
+TIER_MAIN_DORMANT_INTERVAL = timedelta(hours=24)
+
+#: ``keeper_sync_state.annotations`` key on a project-resource state row
+#: holding the ISO-8601 timestamp of the last LTD fetch issued by
+#: ``keeper_sync_tier_main`` for the project. Both the planner here and
+#: ``_tier_main_for_org`` reference the same string; lifting it to a
+#: module constant keeps writers and readers in lockstep.
+ANNOTATION_DATE_MAIN_LAST_POLLED = "date_main_last_polled"
+
+
+def should_poll_main_for_project(
+    *,
+    state: KeeperSyncState | None,
+    now: datetime,
+    hot_window: timedelta = TIER_MAIN_HOT_WINDOW,
+    dormant_interval: timedelta = TIER_MAIN_DORMANT_INTERVAL,
+) -> bool:
+    """Decide whether tier_main should fetch LTD for a project this tick.
+
+    Splits the in-scope project list into hot and dormant cohorts so
+    the long tail of never-rebuilt projects does not pin tier_main to
+    1500 LTD fetches every 5 min (PRD-scale).
+
+    Rules, in order:
+
+    1. ``state is None`` — no project state row at all; this is the
+       initial-discovery path. Poll.
+    2. ``state.date_rebuilt_seen is None`` — we have a row but
+       ``_tier_main_for_org`` has never recorded LTD's ``main`` rebuild
+       timestamp on it (typical for a project that's only been touched
+       by the operator-driven backfill). Poll so the next tick has a
+       date to gate on.
+    3. ``now - state.date_rebuilt_seen < hot_window`` — the project's
+       ``main`` edition rebuilt recently enough to count as hot. Always
+       poll on the hot cadence.
+    4. Otherwise (dormant): consult
+       ``state.annotations[ANNOTATION_DATE_MAIN_LAST_POLLED]``. If
+       absent, malformed, or older than ``dormant_interval``, poll.
+       Otherwise skip — the project is rate-limited to one LTD fetch
+       per ``dormant_interval``.
+
+    The hot-window comparison is strict ``<``; an exactly-at-window
+    state row falls through to the dormant gate so the rate-limit
+    contract on hot↔dormant boundary projects is one rule, not two.
+    """
+    if state is None:
+        return True
+    if state.date_rebuilt_seen is None:
+        return True
+    if (now - state.date_rebuilt_seen) < hot_window:
+        return True
+    annotations = state.annotations or {}
+    last_polled_raw = annotations.get(ANNOTATION_DATE_MAIN_LAST_POLLED)
+    last_polled = _parse_annotation_datetime(last_polled_raw)
+    if last_polled is None:
+        return True
+    return (now - last_polled) >= dormant_interval
+
+
+def _parse_annotation_datetime(raw: object) -> datetime | None:
+    """Return a datetime from a JSONB annotation value, or ``None``.
+
+    Annotation values round-trip through JSONB, which has no native
+    datetime type — they're stored as ISO-8601 strings. Pydantic's
+    in-memory representation can carry a real ``datetime`` (e.g. from a
+    direct upsert in tests). Accept both shapes; treat anything else
+    as missing so a malformed annotation re-polls instead of wedging
+    the planner.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    return None
 
 
 def should_refresh_main_edition(
