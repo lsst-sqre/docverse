@@ -14,8 +14,10 @@ the LTD-side view they need; they emit Booleans, never SQL or HTTP.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Literal
 
 from docverse.storage.keeper_sync import KeeperSyncState
 
@@ -34,6 +36,9 @@ __all__ = [
     "TIER_OTHER_HOT_WINDOW",
     "TIER_OTHER_REFRESH_THRESHOLD",
     "Tier",
+    "TierCohort",
+    "TierStatus",
+    "explain_tier_status",
     "is_unknown_resource",
     "should_poll_for_tier",
     "should_poll_main_for_project",
@@ -41,6 +46,15 @@ __all__ = [
     "should_refresh_other_edition",
     "stable_hash_fraction",
 ]
+
+
+#: Tier-cohort labels surfaced to operators by :func:`explain_tier_status`.
+#: ``hot`` mirrors the planner's rules 2 and 3 (no recorded rebuild yet, or
+#: rebuilt within ``hot_window``); ``dormant`` mirrors rule 4 (older than
+#: ``hot_window``); ``unseen`` is the explainer-only label for "no state row
+#: exists" — the planner returns True (poll) for that case but the operator
+#: cohort is "we have never observed this project on this tier".
+TierCohort = Literal["hot", "dormant", "unseen"]
 
 #: How long a non-``main`` edition's local state may lag LTD before
 #: ``keeper_sync_tier_other`` re-enqueues a refresh. One hour matches
@@ -343,3 +357,89 @@ def should_refresh_other_edition(
     if state.date_last_synced is None:
         return True
     return (now - state.date_last_synced) >= threshold
+
+
+@dataclass(frozen=True)
+class TierStatus:
+    """Operator-readable explanation of one tier's planner decision.
+
+    Surfaced to admins by ``GET /orgs/{org}/keeper-sync/projects/
+    {ltd_slug}`` so an operator can answer "why isn't this project
+    syncing?" without grep'ing worker logs. Lives next to the gate
+    planners because the cohort labels and ``next_due_at`` math must
+    stay byte-identical to :func:`should_poll_for_tier`'s rules — if
+    the gate skips a project, the explainer must agree on why.
+
+    ``cohort`` is the qualitative label; see :data:`TierCohort` for the
+    rules. ``last_polled_at`` is the parsed annotation if present and
+    well-formed, else ``None``. ``next_due_at`` is the wall-clock
+    timestamp at-or-after which the planner will next greenlight a
+    poll, or ``None`` when there is no calendar gate (i.e. the next
+    cron tick will poll).
+    """
+
+    cohort: TierCohort
+    last_polled_at: datetime | None
+    next_due_at: datetime | None
+
+
+def explain_tier_status(  # noqa: PLR0913
+    state: KeeperSyncState | None,
+    now: datetime,
+    *,
+    tier: Tier,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+    jitter_window: timedelta = timedelta(0),
+) -> TierStatus:
+    """Explain the planner's tier-cron decision for one project state row.
+
+    Pure read-side mirror of :func:`should_poll_for_tier`: the gate's
+    rules and the explainer's labels share the same constants and
+    annotation-key resolver so they cannot drift. Used by the org-
+    admin GET endpoint to project tier-cron decisions into a small,
+    serialisable shape.
+
+    Mapping from gate rules to explainer cohorts:
+
+    1. ``state is None`` → ``cohort='unseen'``: the cron has never
+       observed this project. ``next_due_at=None`` (next tick polls).
+    2. ``state.date_rebuilt_seen is None`` → ``cohort='hot'``: cold-
+       start row. The gate polls every tick until tier_main writes a
+       rebuild signal, so the cohort is hot for the operator's
+       purposes.
+    3. ``now - state.date_rebuilt_seen < hot_window`` → ``cohort=
+       'hot'``. ``next_due_at=None``.
+    4. Otherwise → ``cohort='dormant'``. ``next_due_at`` is
+       ``last_polled + (dormant_interval + stable_hash_fraction(slug)
+       * jitter_window)`` when the per-tier annotation parses, else
+       ``None`` (immediately due).
+    """
+    if state is None:
+        return TierStatus(
+            cohort="unseen", last_polled_at=None, next_due_at=None
+        )
+    annotations = state.annotations or {}
+    last_polled = _parse_annotation_datetime(
+        annotations.get(_TIER_ANNOTATION_KEYS[tier])
+    )
+    if state.date_rebuilt_seen is None:
+        return TierStatus(
+            cohort="hot", last_polled_at=last_polled, next_due_at=None
+        )
+    if (now - state.date_rebuilt_seen) < hot_window:
+        return TierStatus(
+            cohort="hot", last_polled_at=last_polled, next_due_at=None
+        )
+    if last_polled is None:
+        return TierStatus(
+            cohort="dormant", last_polled_at=None, next_due_at=None
+        )
+    effective_interval = dormant_interval + (
+        stable_hash_fraction(state.ltd_slug) * jitter_window
+    )
+    return TierStatus(
+        cohort="dormant",
+        last_polled_at=last_polled,
+        next_due_at=last_polled + effective_interval,
+    )

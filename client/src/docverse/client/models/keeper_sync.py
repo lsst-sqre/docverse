@@ -4,17 +4,24 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 __all__ = [
     "KeeperSyncConfig",
+    "KeeperSyncEditionDiff",
+    "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
+    "KeeperSyncProjectStateSummary",
+    "KeeperSyncProjectStatus",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
     "KeeperSyncRunKind",
     "KeeperSyncRunStatus",
+    "KeeperSyncTierCohort",
+    "KeeperSyncTierName",
+    "KeeperSyncTierStatus",
 ]
 
 
@@ -149,6 +156,235 @@ class KeeperSyncRunCreated(BaseModel):
 
     queue_job_url: str = Field(
         description="URL of the enqueued discovery queue job resource."
+    )
+
+
+KeeperSyncTierName = Literal["main", "discovery", "other"]
+"""Tier-cron identifier surfaced in the project-status response.
+
+Mirrors :class:`docverse.services.keeper_sync.scheduler.Tier` so the
+public schema does not depend on the server-side enum's import path.
+"""
+
+
+KeeperSyncTierCohort = Literal["hot", "dormant", "unseen"]
+"""Tier-cohort label surfaced in the project-status response.
+
+``hot`` — the project is polled on every tick of the tier's cadence.
+``dormant`` — the project is rate-limited to one poll per tier dormant
+interval. ``unseen`` — the tier has never observed this project.
+"""
+
+
+class KeeperSyncTierStatus(BaseModel):
+    """Per-tier cohort + jitter-aware schedule for a project.
+
+    Surfaced once per tier (``main`` / ``discovery`` / ``other``) in
+    the project-status response. The values come from the same pure
+    planner the tier-cron worker functions consult, so an operator can
+    read off the same decision the worker would make.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    tier: KeeperSyncTierName = Field(description="Tier-cron identifier.")
+
+    cohort: KeeperSyncTierCohort = Field(
+        description=(
+            "Cohort label: ``hot`` polls every tick, ``dormant`` is"
+            " rate-limited, ``unseen`` has no observation yet."
+        )
+    )
+
+    last_polled_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Wall-clock time of the most recent poll for this tier, as"
+            " recorded in the per-tier ``date_<tier>_last_polled``"
+            " annotation. ``null`` when the project has never been"
+            " polled by this tier or the annotation is missing /"
+            " malformed."
+        ),
+    )
+
+    next_due_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Wall-clock time at which the planner will next greenlight"
+            " a poll. ``null`` when the next cron tick will poll"
+            " unconditionally (hot, unseen, or dormant without a"
+            " last-polled annotation). Jitter-aware: dormant projects'"
+            " next-due timestamps are spread across the dormant"
+            " interval by stable_hash_fraction(slug)."
+        ),
+    )
+
+
+class KeeperSyncProjectStateSummary(BaseModel):
+    """Operator-readable subset of a project-resource ``keeper_sync_state``.
+
+    Only fields useful for diagnostics are exposed; internal columns
+    like ``last_seen_etag`` are omitted to keep the schema minimal.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    docverse_project_id: int | None = Field(
+        default=None,
+        description=(
+            "Numeric id of the corresponding Docverse project, or"
+            " ``null`` if no Docverse project has been created yet."
+        ),
+    )
+
+    ltd_slug: str = Field(description="LTD product slug for this project.")
+
+    date_last_synced: datetime | None = Field(
+        default=None,
+        description="Most recent successful sync timestamp.",
+    )
+
+    date_rebuilt_seen: datetime | None = Field(
+        default=None,
+        description=(
+            "Most recent ``date_rebuilt`` observed on the LTD ``main``"
+            " edition. Used by the dormancy gate."
+        ),
+    )
+
+    annotations: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Raw ``annotations`` JSONB from the state row. Includes"
+            " per-tier last-polled timestamps and the cached"
+            " ``main_edition_*`` pointer."
+        ),
+    )
+
+
+class KeeperSyncEditionStatus(BaseModel):
+    """One Docverse-side edition with its keeper-sync attribution.
+
+    Reflects a left-join from the Docverse ``editions`` table to
+    ``keeper_sync_state``: every Docverse edition appears, but the LTD
+    columns (``ltd_id`` / ``ltd_slug`` / ``date_last_synced``) are
+    populated only when keeper-sync has imported the edition.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    docverse_edition_id: int = Field(description="Docverse edition id.")
+
+    docverse_slug: str = Field(description="Docverse edition slug.")
+
+    docverse_kind: str = Field(
+        description="Docverse edition kind (``main``, ``draft``, ...)."
+    )
+
+    ltd_id: int | None = Field(
+        default=None,
+        description=(
+            "LTD edition id from the linked ``keeper_sync_state`` row,"
+            " or ``null`` when no row links this edition."
+        ),
+    )
+
+    ltd_slug: str | None = Field(
+        default=None,
+        description=(
+            "LTD edition slug from the linked state row, or ``null``"
+            " when no row links this edition."
+        ),
+    )
+
+    date_last_synced: datetime | None = Field(
+        default=None,
+        description=(
+            "Most recent successful sync timestamp for this edition,"
+            " or ``null`` if not yet synced."
+        ),
+    )
+
+
+class KeeperSyncEditionDiff(BaseModel):
+    """LTD vs Docverse edition reconciliation diff.
+
+    Populated only when the project-status endpoint is called with
+    ``?ltd=true``; otherwise omitted from the response. ``missing_in_
+    docverse`` lists LTD edition slugs visible to the live LTD API but
+    not represented by any ``keeper_sync_state`` row in this org;
+    ``missing_in_ltd`` lists keeper-sync-tracked LTD edition slugs that
+    the live LTD API no longer returns (candidates for soft-deletion).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    missing_in_docverse: list[str] = Field(
+        default_factory=list,
+        description=(
+            "LTD edition slugs visible to LTD but not represented by a"
+            " keeper-sync state row in this org."
+        ),
+    )
+
+    missing_in_ltd: list[str] = Field(
+        default_factory=list,
+        description=(
+            "LTD edition slugs tracked by keeper-sync state rows but no"
+            " longer returned by the live LTD edition listing."
+        ),
+    )
+
+
+class KeeperSyncProjectStatus(BaseModel):
+    """Operator-readable summary of one project's keeper-sync state.
+
+    Returned by ``GET /orgs/{org}/keeper-sync/projects/{ltd_slug}``.
+    Combines the project-resource state row, per-tier cohort
+    explanations, and a Docverse-side edition listing left-joined with
+    keeper-sync state. When the request includes ``?ltd=true`` the
+    response also carries an ``edition_diff`` with a live-LTD
+    reconciliation result.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    org_slug: str = Field(description="Slug of the Docverse organization.")
+
+    ltd_slug: str = Field(
+        description="LTD product slug the report is scoped to."
+    )
+
+    project_state: KeeperSyncProjectStateSummary | None = Field(
+        default=None,
+        description=(
+            "Project-resource ``keeper_sync_state`` row, or ``null``"
+            " when no row exists yet (never-seen project)."
+        ),
+    )
+
+    tier_status: list[KeeperSyncTierStatus] = Field(
+        description=(
+            "One entry per tier-cron in fixed order:"
+            " ``main``, ``discovery``, ``other``."
+        )
+    )
+
+    editions: list[KeeperSyncEditionStatus] = Field(
+        default_factory=list,
+        description=(
+            "Docverse-side editions of the project, left-joined with"
+            " ``keeper_sync_state`` rows on ``docverse_id``. Empty"
+            " when ``project_state`` is ``null``."
+        ),
+    )
+
+    edition_diff: KeeperSyncEditionDiff | None = Field(
+        default=None,
+        description=(
+            "Live-LTD reconciliation diff. Present only when the"
+            " request was made with ``?ltd=true``; otherwise omitted."
+        ),
     )
 
 

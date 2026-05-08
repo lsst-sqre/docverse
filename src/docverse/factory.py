@@ -44,6 +44,7 @@ from .services.keeper_sync import (
     KeeperSyncService,
 )
 from .services.keeper_sync_config import KeeperSyncConfigService
+from .services.keeper_sync_project import KeeperSyncProjectService
 from .services.keeper_sync_run import KeeperSyncRunService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
@@ -185,6 +186,18 @@ class Factory:
             run_store=self.create_keeper_sync_run_store(),
             queue_backend=self.create_queue_backend(),
             queue_job_store=self.create_queue_job_store(),
+            logger=self._logger,
+        )
+
+    def create_keeper_sync_project_service(
+        self,
+    ) -> KeeperSyncProjectService:
+        """Create a :class:`KeeperSyncProjectService`."""
+        return KeeperSyncProjectService(
+            org_store=self.create_org_store(),
+            edition_store=self.create_edition_store(),
+            state_store=self.create_keeper_sync_state_store(),
+            ltd_client_factory=self.create_ltd_client,
             logger=self._logger,
         )
 

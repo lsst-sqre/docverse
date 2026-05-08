@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Path, Query, status
 from docverse.client.models import (
     JobStatus,
     KeeperSyncConfig,
+    KeeperSyncProjectStatus,
     KeeperSyncRunStatus,
 )
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
@@ -90,6 +91,41 @@ async def post_org_keeper_sync_run(
     return KeeperSyncRunCreated.from_domain(
         run, activity, queue_job, context.request, org_slug
     )
+
+
+@router.get(
+    "/orgs/{org}/keeper-sync/projects/{ltd_slug}",
+    response_model=KeeperSyncProjectStatus,
+    summary="Get the keeper-sync status of one LTD project on this org",
+    name="get_org_keeper_sync_project_status",
+)
+async def get_org_keeper_sync_project_status(
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    ltd_slug: Annotated[
+        str,
+        Path(description="LTD project slug to inspect."),
+    ],
+    ltd: Annotated[  # noqa: FBT002
+        bool,
+        Query(
+            description=(
+                "When true, the response includes a live-LTD edition"
+                " reconciliation diff (``missing_in_docverse`` and"
+                " ``missing_in_ltd``). Default false to keep the"
+                " endpoint cheap for routine polling."
+            ),
+        ),
+    ] = False,
+) -> KeeperSyncProjectStatus:
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_project_service()
+        return await service.get_project_status(
+            org_slug=org_slug,
+            ltd_slug=ltd_slug,
+            include_ltd_diff=ltd,
+        )
 
 
 @router.post(

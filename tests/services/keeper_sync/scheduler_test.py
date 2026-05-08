@@ -30,6 +30,7 @@ from docverse.services.keeper_sync.scheduler import (
     TIER_OTHER_HOT_WINDOW,
     TIER_OTHER_REFRESH_THRESHOLD,
     Tier,
+    explain_tier_status,
     is_unknown_resource,
     should_poll_for_tier,
     should_poll_main_for_project,
@@ -876,3 +877,329 @@ def test_tier_dormant_jitter_constants_match_documented_cadence() -> None:
     assert timedelta(hours=24) == TIER_MAIN_DORMANT_JITTER
     assert timedelta(hours=24) == TIER_DISCOVERY_DORMANT_JITTER
     assert timedelta(hours=24) == TIER_OTHER_DORMANT_JITTER
+
+
+# ---------------------------------------------------------------------------
+# explain_tier_status (operator-readable mirror of should_poll_for_tier)
+# ---------------------------------------------------------------------------
+
+
+_EXPLAIN_TIER_PARAMS = _TIER_PARAMS
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_unseen_when_state_missing(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """No state row at all → cohort='unseen'."""
+    status = explain_tier_status(
+        None,
+        datetime(2026, 5, 7, tzinfo=UTC),
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert status.cohort == "unseen"
+    assert status.last_polled_at is None
+    assert status.next_due_at is None
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_hot_when_inside_window(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Rebuilt within the hot window → cohort='hot', no calendar gate."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=7))
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert status.cohort == "hot"
+    assert status.next_due_at is None
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_hot_when_no_rebuilt_seen(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """``date_rebuilt_seen=None`` (cold-start row) → cohort='hot'.
+
+    Mirrors gate rule 2: until tier_main writes ``date_rebuilt_seen``
+    the cron polls on every tick, so the cohort label is hot for the
+    operator's purposes (the project is being polled, not rate-limited).
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=None)
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert status.cohort == "hot"
+    assert status.next_due_at is None
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_dormant_not_yet_due(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Dormant + recently polled → next_due_at = last_polled + interval.
+
+    With ``jitter_window=timedelta(0)`` (default), the dormant gate's
+    effective interval equals ``dormant_interval`` exactly; the
+    explainer must surface that timestamp so an operator can read off
+    "next poll at ...".
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    last_polled = now - timedelta(hours=1)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={annotation_key: last_polled.isoformat()},
+    )
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert status.cohort == "dormant"
+    assert status.last_polled_at == last_polled
+    assert status.next_due_at == last_polled + dormant_interval
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_dormant_due(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Dormant + last poll older than the interval still surfaces a timestamp.
+
+    The explainer is purely descriptive — it does not flip the cohort
+    to ``hot`` just because the project happens to be due-now. The
+    consumer compares ``next_due_at`` against ``now`` to render
+    "due now" semantics.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    last_polled = now - timedelta(hours=25)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={annotation_key: last_polled.isoformat()},
+    )
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert status.cohort == "dormant"
+    assert status.last_polled_at == last_polled
+    assert status.next_due_at == last_polled + dormant_interval
+    assert status.next_due_at < now
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_dormant_no_annotation(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Dormant without a per-tier last-polled annotation → next_due_at=None.
+
+    The gate polls in this case (rule 4 "missing" branch), so the
+    explainer signals "no calendar gate; next tick polls" with
+    ``next_due_at=None``. Symmetrical with the hot/unseen cases.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={},
+    )
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert status.cohort == "dormant"
+    assert status.last_polled_at is None
+    assert status.next_due_at is None
+
+
+def test_explain_tier_status_dormant_jitter_offsets_next_due() -> None:
+    """``jitter_window > 0`` shifts ``next_due_at`` per stable_hash_fraction.
+
+    Two slugs with identical ``last_polled`` produce different
+    ``next_due_at`` values when jitter is in play, mirroring the gate
+    planner's slug-keyed spread (#315). Locks the contract that the
+    explainer sees the same effective interval the gate uses.
+    """
+    fast_slug = "due-proj"
+    slow_slug = "skip-proj"
+    last_polled = datetime(2026, 5, 7, 0, tzinfo=UTC)
+    state_fast = _state(
+        resource_type="project",
+        ltd_id=None,
+        ltd_slug=fast_slug,
+        date_rebuilt_seen=last_polled - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: last_polled.isoformat()
+        },
+    )
+    state_slow = _state(
+        resource_type="project",
+        ltd_id=None,
+        ltd_slug=slow_slug,
+        date_rebuilt_seen=last_polled - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: last_polled.isoformat()
+        },
+    )
+    now = last_polled + timedelta(hours=30)
+    fast = explain_tier_status(
+        state_fast,
+        now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        jitter_window=TIER_MAIN_DORMANT_JITTER,
+    )
+    slow = explain_tier_status(
+        state_slow,
+        now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        jitter_window=TIER_MAIN_DORMANT_JITTER,
+    )
+    assert fast.next_due_at is not None
+    assert slow.next_due_at is not None
+    # The slug whose hash fraction is smaller comes due sooner.
+    assert fast.next_due_at < slow.next_due_at
+
+
+def test_explain_tier_status_uses_per_tier_annotation_key() -> None:
+    """Each tier reads its own last-polled key, mirroring the gate planner.
+
+    A state row carrying only ``date_main_last_polled`` must produce a
+    ``last_polled_at`` value for tier_main and ``None`` for the other
+    two tiers' explanations — otherwise the GET endpoint's tier_status
+    would falsely report a discovery / other poll that never happened.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    last_polled_main = now - timedelta(hours=2)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: last_polled_main.isoformat()
+        },
+    )
+    main_status = explain_tier_status(
+        state,
+        now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+    )
+    discovery_status = explain_tier_status(
+        state,
+        now,
+        tier=Tier.discovery,
+        hot_window=TIER_DISCOVERY_HOT_WINDOW,
+        dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
+    )
+    other_status = explain_tier_status(
+        state,
+        now,
+        tier=Tier.other,
+        hot_window=TIER_OTHER_HOT_WINDOW,
+        dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
+    )
+    assert main_status.last_polled_at == last_polled_main
+    assert discovery_status.last_polled_at is None
+    assert other_status.last_polled_at is None
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_agrees_with_gate_at_dormant_boundary(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """When the gate polls, the explainer's next_due_at is in the past or now.
+
+    Anti-drift assertion: the gate decision and the explainer must
+    agree on dormant-due at the boundary. The explainer surfaces a
+    ``next_due_at <= now`` exactly when the gate returns True for the
+    dormant rule.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    # ``last_polled = now - dormant_interval`` is the gate boundary
+    # (>= comparison polls at exactly the interval).
+    last_polled = now - dormant_interval
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={annotation_key: last_polled.isoformat()},
+    )
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    gate = should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+    assert gate is True
+    assert status.next_due_at is not None
+    assert status.next_due_at <= now
