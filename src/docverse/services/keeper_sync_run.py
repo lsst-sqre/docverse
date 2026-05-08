@@ -26,7 +26,7 @@ from docverse.domain.keeper_sync_run import (
 )
 from docverse.domain.organization import Organization
 from docverse.domain.queue import JobStatus, QueueJob
-from docverse.exceptions import ConflictError, NotFoundError
+from docverse.exceptions import BadRequestError, ConflictError, NotFoundError
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import (
@@ -140,6 +140,78 @@ class KeeperSyncRunService:
             kind=kind.value,
         )
         return run, queue_job
+
+    async def refresh_project(
+        self,
+        *,
+        org_slug: str,
+        ltd_slug: str,
+    ) -> QueueJob:
+        """Enqueue a tier-cron-equivalent sync of one LTD project.
+
+        The refresh deliberately bypasses the tier_main dormancy gate
+        and the planner short-circuits — operators use it to push a
+        recently-resumed project to LTD-fresh state without waiting
+        for the next dormant-tier tick. ``keeper_sync_run_id`` is left
+        ``None`` so the enqueue does not pollute any operator-
+        triggered run's progress aggregate, mirroring the tier-cron
+        enqueue path.
+
+        Raises
+        ------
+        NotFoundError
+            If the org does not exist or LTD sync is not enabled on it.
+        BadRequestError
+            If ``ltd_slug`` is not in the org's ``project_slugs``
+            allowlist (and the allowlist is not ``"*"``).
+        """
+        org = await self._org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        config = org.keeper_sync_config
+        if config is None or not config.enabled:
+            msg = (
+                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
+            )
+            raise NotFoundError(msg)
+        if (
+            config.project_slugs != "*"
+            and ltd_slug not in config.project_slugs
+        ):
+            msg = (
+                f"LTD slug {ltd_slug!r} is not in the project_slugs"
+                f" allowlist for organization {org_slug!r}"
+            )
+            raise BadRequestError(msg)
+
+        queue_job = await self._queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org.id,
+            keeper_sync_run_id=None,
+            subject_label=ltd_slug,
+        )
+        backend_job_id = await self._queue_backend.enqueue(
+            "keeper_sync_project",
+            {
+                "org_id": org.id,
+                "org_slug": org.slug,
+                "queue_job_id": queue_job.id,
+                "ltd_slug": ltd_slug,
+                "ltd_base_url": str(config.ltd_base_url),
+            },
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        queue_job = await self._queue_job_store.set_backend_job_id(
+            queue_job.id, backend_job_id
+        )
+        self._logger.info(
+            "Enqueued keeper-sync project refresh",
+            org=org_slug,
+            ltd_slug=ltd_slug,
+            queue_job_id=queue_job.id,
+        )
+        return queue_job
 
     async def get_run(
         self,

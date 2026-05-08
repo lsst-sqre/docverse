@@ -6,6 +6,7 @@ from fastapi import status
 from safir.fastapi import ClientRequestError
 
 __all__ = [
+    "BadRequestError",
     "ConflictError",
     "InvalidBase32IdError",
     "InvalidBuildStateError",
@@ -15,6 +16,13 @@ __all__ = [
     "NotFoundError",
     "PermissionDeniedError",
 ]
+
+
+class BadRequestError(ClientRequestError):
+    """The request is malformed or fails domain-level validation."""
+
+    error = "bad_request"
+    status_code = status.HTTP_400_BAD_REQUEST
 
 
 class NotFoundError(ClientRequestError):

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 __all__ = [
     "KeeperSyncConfig",
+    "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
     "KeeperSyncRunKind",
@@ -148,4 +149,28 @@ class KeeperSyncRunCreated(BaseModel):
 
     queue_job_url: str = Field(
         description="URL of the enqueued discovery queue job resource."
+    )
+
+
+class KeeperSyncProjectRefreshAccepted(BaseModel):
+    """Response body returned by the per-project refresh endpoint.
+
+    Returned by
+    ``POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh``. The
+    refresh is a tier-cron-equivalent one-shot trigger — no run row is
+    created, only a ``keeper_sync_project`` queue job is enqueued, so
+    the envelope is a thin wrapper around the queue-job link.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    queue_job_id: str = Field(
+        description=(
+            "Public Base32 identifier for the enqueued"
+            " ``keeper_sync_project`` queue job."
+        )
+    )
+
+    queue_job_url: str = Field(
+        description="URL of the enqueued queue job resource."
     )

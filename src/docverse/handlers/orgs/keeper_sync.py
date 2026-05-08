@@ -22,7 +22,11 @@ from docverse.storage.pagination import (
     QUEUE_JOB_CURSOR_TYPE,
 )
 
-from .keeper_sync_models import KeeperSyncRun, KeeperSyncRunCreated
+from .keeper_sync_models import (
+    KeeperSyncProjectRefreshAccepted,
+    KeeperSyncRun,
+    KeeperSyncRunCreated,
+)
 
 router = APIRouter()
 
@@ -85,6 +89,33 @@ async def post_org_keeper_sync_run(
         await context.session.commit()
     return KeeperSyncRunCreated.from_domain(
         run, activity, queue_job, context.request, org_slug
+    )
+
+
+@router.post(
+    "/orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh",
+    response_model=KeeperSyncProjectRefreshAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Trigger an immediate sync of one LTD project",
+    name="post_org_keeper_sync_project_refresh",
+)
+async def post_org_keeper_sync_project_refresh(
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    ltd_slug: Annotated[
+        str,
+        Path(description="LTD project slug to refresh."),
+    ],
+) -> KeeperSyncProjectRefreshAccepted:
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_run_service()
+        queue_job = await service.refresh_project(
+            org_slug=org_slug, ltd_slug=ltd_slug
+        )
+        await context.session.commit()
+    return KeeperSyncProjectRefreshAccepted.from_domain(
+        queue_job, context.request
     )
 
 

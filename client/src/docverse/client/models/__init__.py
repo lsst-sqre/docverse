@@ -39,6 +39,7 @@ from .infrastructure import (
 )
 from .keeper_sync import (
     KeeperSyncConfig,
+    KeeperSyncProjectRefreshAccepted,
     KeeperSyncRun,
     KeeperSyncRunCreated,
     KeeperSyncRunKind,
@@ -92,6 +93,7 @@ __all__ = [
     "JobKind",
     "JobStatus",
     "KeeperSyncConfig",
+    "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
     "KeeperSyncRunKind",

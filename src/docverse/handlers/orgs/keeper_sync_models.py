@@ -6,6 +6,9 @@ from typing import Self
 
 from starlette.requests import Request
 
+from docverse.client.models import (
+    KeeperSyncProjectRefreshAccepted as _KeeperSyncProjectRefreshAcceptedBase,
+)
 from docverse.client.models import KeeperSyncRun as _KeeperSyncRunBase
 from docverse.client.models import (
     KeeperSyncRunCreated as _KeeperSyncRunCreatedBase,
@@ -20,7 +23,11 @@ from docverse.domain.keeper_sync_run import (
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
 
-__all__ = ["KeeperSyncRun", "KeeperSyncRunCreated"]
+__all__ = [
+    "KeeperSyncProjectRefreshAccepted",
+    "KeeperSyncRun",
+    "KeeperSyncRunCreated",
+]
 
 
 class KeeperSyncRun(_KeeperSyncRunBase):
@@ -72,6 +79,25 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
         queue_job_id = serialize_base32_id(queue_job.public_id)
         return cls(
             run=KeeperSyncRun.from_domain(run, activity, request, org_slug),
+            queue_job_id=queue_job_id,
+            queue_job_url=str(
+                request.url_for("get_queue_job", job=queue_job_id)
+            ),
+        )
+
+
+class KeeperSyncProjectRefreshAccepted(_KeeperSyncProjectRefreshAcceptedBase):
+    """``POST /projects/{ltd_slug}/refresh`` response envelope."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        queue_job: QueueJobDomain,
+        request: Request,
+    ) -> Self:
+        """Build the 202 envelope from the enqueued queue-job."""
+        queue_job_id = serialize_base32_id(queue_job.public_id)
+        return cls(
             queue_job_id=queue_job_id,
             queue_job_url=str(
                 request.url_for("get_queue_job", job=queue_job_id)
