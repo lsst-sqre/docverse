@@ -13,12 +13,22 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 from docverse.services.keeper_sync.scheduler import (
+    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
+    ANNOTATION_DATE_OTHER_LAST_POLLED,
+    TIER_DISCOVERY_DORMANT_INTERVAL,
+    TIER_DISCOVERY_HOT_WINDOW,
     TIER_MAIN_DORMANT_INTERVAL,
     TIER_MAIN_HOT_WINDOW,
+    TIER_OTHER_DORMANT_INTERVAL,
+    TIER_OTHER_HOT_WINDOW,
     TIER_OTHER_REFRESH_THRESHOLD,
+    Tier,
     is_unknown_resource,
+    should_poll_for_tier,
     should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
@@ -356,3 +366,278 @@ def test_should_poll_main_accepts_callable_overrides() -> None:
     assert should_poll_main_for_project(
         state=state, now=now, hot_window=timedelta(days=30)
     )
+
+
+# ---------------------------------------------------------------------------
+# should_poll_for_tier (parametric, covers main/discovery/other)
+# ---------------------------------------------------------------------------
+
+
+_TIER_PARAMS = [
+    pytest.param(
+        Tier.main,
+        ANNOTATION_DATE_MAIN_LAST_POLLED,
+        TIER_MAIN_HOT_WINDOW,
+        TIER_MAIN_DORMANT_INTERVAL,
+        id="main",
+    ),
+    pytest.param(
+        Tier.discovery,
+        ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+        TIER_DISCOVERY_HOT_WINDOW,
+        TIER_DISCOVERY_DORMANT_INTERVAL,
+        id="discovery",
+    ),
+    pytest.param(
+        Tier.other,
+        ANNOTATION_DATE_OTHER_LAST_POLLED,
+        TIER_OTHER_HOT_WINDOW,
+        TIER_OTHER_DORMANT_INTERVAL,
+        id="other",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_when_state_missing(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """No state row at all — cold-start, always poll regardless of tier."""
+    assert should_poll_for_tier(
+        state=None,
+        now=datetime(2026, 5, 7, tzinfo=UTC),
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_when_date_rebuilt_seen_missing(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Project row exists but no recorded rebuild — poll on every tier.
+
+    ``tier_main`` is the only writer of ``date_rebuilt_seen``; until it
+    has run for a project, ``tier_discovery`` / ``tier_other`` cannot
+    distinguish hot from dormant. The safe default is poll so the next
+    tick has a date to gate on, even if that means a few extra LTD
+    requests for cold-start projects.
+    """
+    state = _project_state(date_rebuilt_seen=None)
+    assert should_poll_for_tier(
+        state=state,
+        now=datetime(2026, 5, 7, tzinfo=UTC),
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_when_hot_inside_window(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Rebuilt within the hot window — every tier polls on its fast cadence."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=7))
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_dormant_and_never_polled(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Dormant project with no last-polled annotation — poll on first sight."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(date_rebuilt_seen=now - timedelta(days=30))
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_not_poll_for_tier_dormant_and_recently_polled(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Dormant project polled within ``dormant_interval`` — skip every tier."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={annotation_key: (now - timedelta(hours=1)).isoformat()},
+    )
+    assert not should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_dormant_at_interval_boundary(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """Dormant + last-polled exactly at the interval — poll (>= comparison)."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={annotation_key: (now - dormant_interval).isoformat()},
+    )
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+def test_should_poll_for_tier_uses_per_tier_annotation_key() -> None:
+    """Each tier's last-polled stamp is independent.
+
+    The dormancy gate is per-tier: a recent ``tier_main`` poll must
+    not silence ``tier_discovery``. Concretely, a state row carrying
+    only ``date_main_last_polled`` is dormant for tier_discovery (no
+    matching annotation -> rule 4 returns "missing" -> poll), and
+    vice versa. Locks the tier-independence contract.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            ANNOTATION_DATE_MAIN_LAST_POLLED: (
+                now - timedelta(hours=1)
+            ).isoformat()
+        },
+    )
+    # tier_main has its annotation — skip.
+    assert not should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=Tier.main,
+        hot_window=TIER_MAIN_HOT_WINDOW,
+        dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+    )
+    # tier_discovery has no annotation of its own — poll.
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=Tier.discovery,
+        hot_window=TIER_DISCOVERY_HOT_WINDOW,
+        dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
+    )
+    # tier_other has no annotation of its own — poll.
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=Tier.other,
+        hot_window=TIER_OTHER_HOT_WINDOW,
+        dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_when_annotation_malformed(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """A garbled annotation re-polls (and rewrites) on the next tick."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={annotation_key: "not-a-datetime"},
+    )
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+def test_tier_discovery_constants_match_documented_cadence() -> None:
+    """Hot window 14 d, dormant interval 24 h, mirroring tier_main.
+
+    Locking the constants so a future re-tune comes back and re-
+    acknowledges the SLO and load-shed budget shared across the three
+    tier crons.
+    """
+    assert timedelta(days=14) == TIER_DISCOVERY_HOT_WINDOW
+    assert timedelta(hours=24) == TIER_DISCOVERY_DORMANT_INTERVAL
+
+
+def test_tier_other_constants_match_documented_cadence() -> None:
+    """Hot window 14 d, dormant interval 24 h, mirroring tier_main."""
+    assert timedelta(days=14) == TIER_OTHER_HOT_WINDOW
+    assert timedelta(hours=24) == TIER_OTHER_DORMANT_INTERVAL
+
+
+def test_tier_annotation_keys_are_distinct() -> None:
+    """Three tiers, three distinct annotation keys.
+
+    A copy-paste typo that re-used ``date_main_last_polled`` for one of
+    the new tiers would silently break the rate-limit independence
+    asserted by ``test_should_poll_for_tier_uses_per_tier_annotation_
+    key``; the explicit-distinct check makes the failure mode
+    immediate.
+    """
+    keys = {
+        ANNOTATION_DATE_MAIN_LAST_POLLED,
+        ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+        ANNOTATION_DATE_OTHER_LAST_POLLED,
+    }
+    assert len(keys) == 3

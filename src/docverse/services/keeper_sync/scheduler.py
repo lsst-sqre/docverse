@@ -14,15 +14,24 @@ the LTD-side view they need; they emit Booleans, never SQL or HTTP.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 from docverse.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
+    "ANNOTATION_DATE_DISCOVERY_LAST_POLLED",
     "ANNOTATION_DATE_MAIN_LAST_POLLED",
+    "ANNOTATION_DATE_OTHER_LAST_POLLED",
+    "TIER_DISCOVERY_DORMANT_INTERVAL",
+    "TIER_DISCOVERY_HOT_WINDOW",
     "TIER_MAIN_DORMANT_INTERVAL",
     "TIER_MAIN_HOT_WINDOW",
+    "TIER_OTHER_DORMANT_INTERVAL",
+    "TIER_OTHER_HOT_WINDOW",
     "TIER_OTHER_REFRESH_THRESHOLD",
+    "Tier",
     "is_unknown_resource",
+    "should_poll_for_tier",
     "should_poll_main_for_project",
     "should_refresh_main_edition",
     "should_refresh_other_edition",
@@ -50,6 +59,35 @@ TIER_MAIN_HOT_WINDOW = timedelta(days=14)
 #: pressure this planner exists to bound.
 TIER_MAIN_DORMANT_INTERVAL = timedelta(hours=24)
 
+#: Window after a project's last observed LTD ``main`` rebuild during
+#: which ``keeper_sync_tier_discovery`` polls on its 30-minute cadence.
+#: Mirrors ``TIER_MAIN_HOT_WINDOW`` because the dormancy signal is the
+#: same ``date_rebuilt_seen`` predicate: a project whose ``main`` has
+#: rebuilt recently is the same project whose branch editions are most
+#: likely to have been added.
+TIER_DISCOVERY_HOT_WINDOW = timedelta(days=14)
+
+#: Maximum interval between LTD fetches for a dormant project on the
+#: ``tier_discovery`` cadence. Once-a-day matches ``TIER_MAIN_DORMANT_
+#: INTERVAL`` — the long-tail load-shed budget is shared across the
+#: three reconciliation tiers. Once a dormant project rebuilds, the
+#: next ``tier_main`` visit refreshes ``date_rebuilt_seen`` and the
+#: planner naturally re-classifies it as hot for all three tiers.
+TIER_DISCOVERY_DORMANT_INTERVAL = timedelta(hours=24)
+
+#: Window after a project's last observed LTD ``main`` rebuild during
+#: which ``keeper_sync_tier_other`` polls on its hourly cadence. Same
+#: 14-day rationale as the other two tiers: ``date_rebuilt_seen`` is
+#: shared dormancy state, so the hot/dormant cohorts agree across the
+#: three planners.
+TIER_OTHER_HOT_WINDOW = timedelta(days=14)
+
+#: Maximum interval between LTD fetches for a dormant project on the
+#: ``tier_other`` cadence. Once-a-day, matching the discovery and main
+#: tiers; see :data:`TIER_DISCOVERY_DORMANT_INTERVAL` for the rationale
+#: shared across all three tiers.
+TIER_OTHER_DORMANT_INTERVAL = timedelta(hours=24)
+
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
 #: holding the ISO-8601 timestamp of the last LTD fetch issued by
 #: ``keeper_sync_tier_main`` for the project. Both the planner here and
@@ -57,37 +95,74 @@ TIER_MAIN_DORMANT_INTERVAL = timedelta(hours=24)
 #: module constant keeps writers and readers in lockstep.
 ANNOTATION_DATE_MAIN_LAST_POLLED = "date_main_last_polled"
 
+#: Companion to :data:`ANNOTATION_DATE_MAIN_LAST_POLLED` for the
+#: discovery tier. ``_tier_discovery_for_org`` writes this stamp on
+#: every polled visit; :func:`should_poll_for_tier` (with
+#: ``tier=Tier.discovery``) reads it to clamp dormant projects to one
+#: pass per ``TIER_DISCOVERY_DORMANT_INTERVAL``.
+ANNOTATION_DATE_DISCOVERY_LAST_POLLED = "date_discovery_last_polled"
 
-def should_poll_main_for_project(
+#: Companion to :data:`ANNOTATION_DATE_MAIN_LAST_POLLED` for the
+#: ``tier_other`` cron. ``_tier_other_for_org`` writes this stamp on
+#: every polled visit; :func:`should_poll_for_tier` (with
+#: ``tier=Tier.other``) reads it to clamp dormant projects to one
+#: pass per ``TIER_OTHER_DORMANT_INTERVAL``.
+ANNOTATION_DATE_OTHER_LAST_POLLED = "date_other_last_polled"
+
+
+class Tier(StrEnum):
+    """Identifier for the three steady-state reconciliation tiers.
+
+    Threaded through :func:`should_poll_for_tier` so a single planner
+    body covers ``tier_main`` (5 min cadence), ``tier_discovery`` (30
+    min), and ``tier_other`` (hourly). The string values double as a
+    structlog key for cross-tier observability.
+    """
+
+    main = "main"
+    discovery = "discovery"
+    other = "other"
+
+
+_TIER_ANNOTATION_KEYS: dict[Tier, str] = {
+    Tier.main: ANNOTATION_DATE_MAIN_LAST_POLLED,
+    Tier.discovery: ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+    Tier.other: ANNOTATION_DATE_OTHER_LAST_POLLED,
+}
+
+
+def should_poll_for_tier(
     *,
     state: KeeperSyncState | None,
     now: datetime,
-    hot_window: timedelta = TIER_MAIN_HOT_WINDOW,
-    dormant_interval: timedelta = TIER_MAIN_DORMANT_INTERVAL,
+    tier: Tier,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
 ) -> bool:
-    """Decide whether tier_main should fetch LTD for a project this tick.
+    """Decide whether a tier-cron should fetch LTD for a project this tick.
 
-    Splits the in-scope project list into hot and dormant cohorts so
-    the long tail of never-rebuilt projects does not pin tier_main to
-    1500 LTD fetches every 5 min (PRD-scale).
+    Generalises :func:`should_poll_main_for_project` to all three
+    steady-state tiers. The dormancy signal (``state.date_rebuilt_seen``)
+    is shared across tiers — ``tier_main`` writes it on every successful
+    poll and the other two tiers read it — so a project that goes hot
+    on tier_main automatically goes hot on tier_discovery and
+    tier_other within the same hot window. The per-tier rate-limit
+    annotation (``date_<tier>_last_polled``) is independent so each
+    tier clamps its own dormant cadence without interfering.
 
     Rules, in order:
 
     1. ``state is None`` — no project state row at all; this is the
-       initial-discovery path. Poll.
-    2. ``state.date_rebuilt_seen is None`` — we have a row but
-       ``_tier_main_for_org`` has never recorded LTD's ``main`` rebuild
-       timestamp on it (typical for a project that's only been touched
-       by the operator-driven backfill). Poll so the next tick has a
+       cold-start path. Poll.
+    2. ``state.date_rebuilt_seen is None`` — we have a row but no
+       observed LTD ``main`` rebuild yet. Poll so the next tick has a
        date to gate on.
-    3. ``now - state.date_rebuilt_seen < hot_window`` — the project's
-       ``main`` edition rebuilt recently enough to count as hot. Always
-       poll on the hot cadence.
-    4. Otherwise (dormant): consult
-       ``state.annotations[ANNOTATION_DATE_MAIN_LAST_POLLED]``. If
-       absent, malformed, or older than ``dormant_interval``, poll.
-       Otherwise skip — the project is rate-limited to one LTD fetch
-       per ``dormant_interval``.
+    3. ``now - state.date_rebuilt_seen < hot_window`` — the project is
+       hot. Always poll on the tier's fast cadence.
+    4. Otherwise (dormant): consult the per-tier last-polled
+       annotation. If absent, malformed, or older than
+       ``dormant_interval``, poll. Otherwise skip — the project is
+       rate-limited to one LTD fetch per ``dormant_interval``.
 
     The hot-window comparison is strict ``<``; an exactly-at-window
     state row falls through to the dormant gate so the rate-limit
@@ -100,11 +175,36 @@ def should_poll_main_for_project(
     if (now - state.date_rebuilt_seen) < hot_window:
         return True
     annotations = state.annotations or {}
-    last_polled_raw = annotations.get(ANNOTATION_DATE_MAIN_LAST_POLLED)
+    last_polled_raw = annotations.get(_TIER_ANNOTATION_KEYS[tier])
     last_polled = _parse_annotation_datetime(last_polled_raw)
     if last_polled is None:
         return True
     return (now - last_polled) >= dormant_interval
+
+
+def should_poll_main_for_project(
+    *,
+    state: KeeperSyncState | None,
+    now: datetime,
+    hot_window: timedelta = TIER_MAIN_HOT_WINDOW,
+    dormant_interval: timedelta = TIER_MAIN_DORMANT_INTERVAL,
+) -> bool:
+    """Decide whether tier_main should fetch LTD for a project this tick.
+
+    Thin wrapper around :func:`should_poll_for_tier` with
+    ``tier=Tier.main`` baked in and tier_main's defaults applied.
+    Preserves the original call shape for ``_tier_main_for_org`` and
+    its tests; new callers should prefer :func:`should_poll_for_tier`
+    with an explicit tier so the call site documents which tier's
+    rate-limit annotation is in play.
+    """
+    return should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=Tier.main,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
 
 
 def _parse_annotation_datetime(raw: object) -> datetime | None:

@@ -1186,10 +1186,14 @@ async def test_tier_discovery_batches_edition_state_lookups(
         )
         == []
     )
-    # One ``get`` for the project-state short-circuit, one
+    # Two ``get`` calls: one for the dormancy planner / project-state
+    # short-circuit (now shared between :func:`should_poll_for_tier`
+    # and :func:`_project_needs_discovery`), and one inside
+    # :func:`_record_tier_polled` to merge with prior annotations
+    # before stamping ``date_discovery_last_polled``. One
     # ``list_for_org`` for the batched edition lookup. Five-edition
     # fixture proves the count is independent of edition cardinality.
-    assert recorder.get_calls == 1
+    assert recorder.get_calls == 2
     assert recorder.list_for_org_calls == 1
 
 
@@ -1245,6 +1249,235 @@ async def test_tier_discovery_skips_fully_known_project(
         )
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Mixed cohort: hot, dormant-skippable, and dormant-due projects.
+
+    Acceptance criterion: on a single tier_discovery tick the cron must
+    issue ``GET /products/<slug>/editions/`` only for projects the
+    planner declares hot or dormant-due. The dormant-skippable
+    project's listing endpoint is never hit, verified by ``respx``
+    route counters; its ``date_discovery_last_polled`` annotation is
+    untouched. Polled projects (hot + due) write a fresh stamp
+    regardless of whether ``_project_needs_discovery`` decided to
+    enqueue, matching :func:`_record_tier_polled`'s clamp shape.
+    """
+    now = datetime.now(tz=UTC)
+    fresh_rebuild = now - timedelta(days=2)
+    old_rebuild = now - timedelta(days=30)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-cohort",
+            project_slugs=["hot-proj", "skip-proj", "due-proj"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        # Hot: rebuilt 2 days ago. Planner returns True regardless of
+        # any last-polled annotation; LTD HTTP fires.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="hot-proj",
+            docverse_id=1,
+            date_rebuilt_seen=fresh_rebuild,
+        )
+        # Dormant-skippable: rebuilt 30 days ago, polled 1h ago — well
+        # within the 24h dormant interval. Planner skips, so the
+        # listing endpoint must not be touched.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="skip-proj",
+            docverse_id=2,
+            date_rebuilt_seen=old_rebuild,
+            annotations={
+                "date_discovery_last_polled": (
+                    now - timedelta(hours=1)
+                ).isoformat()
+            },
+        )
+        # Dormant-due: rebuilt 30 days ago, polled 25h ago — past the
+        # 24h dormant interval, so the planner re-polls.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="due-proj",
+            docverse_id=3,
+            date_rebuilt_seen=old_rebuild,
+            annotations={
+                "date_discovery_last_polled": (
+                    now - timedelta(hours=25)
+                ).isoformat()
+            },
+        )
+        # No edition state for any project — polled projects enqueue
+        # because LTD lists an edition we have not seen.
+
+    _stub_products(mock_discovery, ["hot-proj", "skip-proj", "due-proj"])
+    hot_listing = mock_discovery.get(
+        f"{LTD_BASE}/products/hot-proj/editions/"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    skip_listing = mock_discovery.get(
+        f"{LTD_BASE}/products/skip-proj/editions/"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/2"]}
+        )
+    )
+    due_listing = mock_discovery.get(
+        f"{LTD_BASE}/products/due-proj/editions/"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/3"]}
+        )
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=3,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Acceptance: LTD HTTP fired exactly for the polled cohort.
+    assert hot_listing.call_count == 1
+    assert skip_listing.call_count == 0
+    assert due_listing.call_count == 1
+
+    # Hot and due both have unseen editions, so each enqueues one
+    # ``keeper_sync_project`` child. Skip-proj is not visited.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    enqueued_slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
+    assert enqueued_slugs == {"hot-proj", "due-proj"}
+
+    # Acceptance: ``date_discovery_last_polled`` is stamped on every
+    # polled visit, regardless of enqueue. The skipped project's
+    # annotation reflects its seeded value, untouched by this tick.
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            for slug, expected_polled in (
+                ("hot-proj", True),
+                ("due-proj", True),
+                ("skip-proj", False),
+            ):
+                row = await store.get(
+                    org_id=org_id,
+                    resource_type=ResourceType.project,
+                    ltd_slug=slug,
+                )
+                assert row is not None
+                assert row.annotations is not None
+                raw = row.annotations["date_discovery_last_polled"]
+                assert isinstance(raw, str)
+                stamped = datetime.fromisoformat(raw)
+                if expected_polled:
+                    assert (now - stamped) < timedelta(minutes=5)
+                else:
+                    assert timedelta(minutes=30) < (now - stamped)
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_records_polled_annotation_on_ltd_error(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """LtdClientError still updates ``date_discovery_last_polled``.
+
+    Mirrors :func:`test_tier_main_records_polled_annotation_on_ltd_error`:
+    a flaky LTD endpoint must not defeat the dormancy rate-limiter for
+    the discovery tier. The error is logged and the loop continues to
+    the next project, but the polled timestamp advances either way so
+    the project waits out ``TIER_DISCOVERY_DORMANT_INTERVAL`` instead
+    of re-polling on every 30-min tick.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-error",
+            project_slugs=["flaky-proj"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="flaky-proj",
+            docverse_id=1,
+            date_rebuilt_seen=now - timedelta(days=30),
+            annotations={
+                "date_discovery_last_polled": (
+                    now - timedelta(hours=25)
+                ).isoformat()
+            },
+        )
+
+    _stub_products(mock_discovery, ["flaky-proj"])
+    mock_discovery.get(f"{LTD_BASE}/products/flaky-proj/editions/").mock(
+        return_value=httpx.Response(500)
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            row = await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="flaky-proj",
+            )
+    assert row is not None
+    assert row.annotations is not None
+    raw = row.annotations["date_discovery_last_polled"]
+    assert isinstance(raw, str)
+    stamped = datetime.fromisoformat(raw)
+    # Update fired during this tick, not 25h ago.
+    assert (now - stamped) < timedelta(minutes=5)
 
 
 # ---------------------------------------------------------------------------
@@ -1545,11 +1778,246 @@ async def test_tier_other_batches_edition_state_lookups(
         )
         == []
     )
-    # Zero ``get`` calls — tier_other does not need a project-state
-    # short-circuit. Exactly one ``list_for_org`` regardless of LTD's
-    # edition cardinality.
-    assert recorder.get_calls == 0
+    # Two ``get`` calls per project per tick: one for the dormancy
+    # planner read at the top of the loop and one inside
+    # :func:`_record_tier_polled` to merge with prior annotations
+    # before stamping ``date_other_last_polled``. Exactly one
+    # ``list_for_org`` regardless of LTD's edition cardinality —
+    # the per-project edition-state cost stays independent of the
+    # branch count.
+    assert recorder.get_calls == 2
     assert recorder.list_for_org_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_other_polls_only_hot_and_due_dormant_projects(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Mixed cohort for tier_other: only the polled cohort hits LTD.
+
+    Acceptance criterion (issue #314): tier_other must skip dormant
+    projects whose ``date_other_last_polled`` is within the dormant
+    interval, and must stamp the annotation fresh on every polled
+    visit even when the staleness check decides not to enqueue.
+    """
+    now = datetime.now(tz=UTC)
+    fresh_rebuild = now - timedelta(days=2)
+    old_rebuild = now - timedelta(days=30)
+    stale_synced = now - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-cohort",
+            project_slugs=["hot-proj", "skip-proj", "due-proj"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        # Hot: rebuilt 2 days ago, no last_polled annotation.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="hot-proj",
+            docverse_id=1,
+            date_rebuilt_seen=fresh_rebuild,
+        )
+        # Dormant-skippable: rebuilt 30 days ago, polled 1h ago — well
+        # within the 24h dormant interval.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="skip-proj",
+            docverse_id=2,
+            date_rebuilt_seen=old_rebuild,
+            annotations={
+                "date_other_last_polled": (
+                    now - timedelta(hours=1)
+                ).isoformat()
+            },
+        )
+        # Dormant-due: rebuilt 30 days ago, polled 25h ago — past the
+        # 24h dormant interval, so the planner re-polls.
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="due-proj",
+            docverse_id=3,
+            date_rebuilt_seen=old_rebuild,
+            annotations={
+                "date_other_last_polled": (
+                    now - timedelta(hours=25)
+                ).isoformat()
+            },
+        )
+        # Stale branch edition state for hot and due so each
+        # ``_has_stale_non_main_edition`` call returns True and
+        # triggers an enqueue. Skip-proj's edition state would also
+        # be stale, but the planner skips before LTD is even queried.
+        for ltd_id in (10, 20, 30):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="u-jsick-feature",
+                date_last_synced=stale_synced,
+            )
+
+    _stub_products(mock_discovery, ["hot-proj", "skip-proj", "due-proj"])
+    hot_listing = mock_discovery.get(
+        f"{LTD_BASE}/products/hot-proj/editions/"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/10"]}
+        )
+    )
+    skip_listing = mock_discovery.get(
+        f"{LTD_BASE}/products/skip-proj/editions/"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/20"]}
+        )
+    )
+    due_listing = mock_discovery.get(
+        f"{LTD_BASE}/products/due-proj/editions/"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/30"]}
+        )
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=10,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=20,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=30,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Acceptance: LTD HTTP fired exactly for the polled cohort.
+    assert hot_listing.call_count == 1
+    assert skip_listing.call_count == 0
+    assert due_listing.call_count == 1
+
+    # Hot and due each enqueue one ``keeper_sync_project`` child.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    enqueued_slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
+    assert enqueued_slugs == {"hot-proj", "due-proj"}
+
+    # Acceptance: ``date_other_last_polled`` is stamped on every polled
+    # visit. The skipped project's annotation is untouched.
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            for slug, expected_polled in (
+                ("hot-proj", True),
+                ("due-proj", True),
+                ("skip-proj", False),
+            ):
+                row = await store.get(
+                    org_id=org_id,
+                    resource_type=ResourceType.project,
+                    ltd_slug=slug,
+                )
+                assert row is not None
+                assert row.annotations is not None
+                raw = row.annotations["date_other_last_polled"]
+                assert isinstance(raw, str)
+                stamped = datetime.fromisoformat(raw)
+                if expected_polled:
+                    assert (now - stamped) < timedelta(minutes=5)
+                else:
+                    assert timedelta(minutes=30) < (now - stamped)
+
+
+@pytest.mark.asyncio
+async def test_tier_other_records_polled_annotation_on_ltd_error(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """LtdClientError still updates ``date_other_last_polled``.
+
+    Same rationale as the tier_main and tier_discovery error tests:
+    if we skipped the annotation update on errors, a flaky LTD endpoint
+    would re-poll on every cron tick instead of waiting out the
+    dormant interval.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-error",
+            project_slugs=["flaky-proj"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="flaky-proj",
+            docverse_id=1,
+            date_rebuilt_seen=now - timedelta(days=30),
+            annotations={
+                "date_other_last_polled": (
+                    now - timedelta(hours=25)
+                ).isoformat()
+            },
+        )
+
+    _stub_products(mock_discovery, ["flaky-proj"])
+    mock_discovery.get(f"{LTD_BASE}/products/flaky-proj/editions/").mock(
+        return_value=httpx.Response(500)
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            row = await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="flaky-proj",
+            )
+    assert row is not None
+    assert row.annotations is not None
+    raw = row.annotations["date_other_last_polled"]
+    assert isinstance(raw, str)
+    stamped = datetime.fromisoformat(raw)
+    # Update fired during this tick, not 25h ago.
+    assert (now - stamped) < timedelta(minutes=5)
 
 
 # ---------------------------------------------------------------------------

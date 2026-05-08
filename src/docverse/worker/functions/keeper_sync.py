@@ -44,8 +44,16 @@ from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.organization import Organization
 from docverse.factory import Factory
 from docverse.services.keeper_sync.scheduler import (
+    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
+    ANNOTATION_DATE_OTHER_LAST_POLLED,
+    TIER_DISCOVERY_DORMANT_INTERVAL,
+    TIER_DISCOVERY_HOT_WINDOW,
+    TIER_OTHER_DORMANT_INTERVAL,
+    TIER_OTHER_HOT_WINDOW,
+    Tier,
     is_unknown_resource,
+    should_poll_for_tier,
     should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
@@ -914,62 +922,15 @@ async def _tier_discovery_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
 ) -> int:
-    """Run one tier_discovery pass for a single enabled org."""
-    config_snapshot = org.keeper_sync_config
-    if config_snapshot is None:
-        return 0
-    in_scope = await _list_in_scope_slugs(
-        factory=factory, config=config_snapshot
-    )
-    if not in_scope:
-        return 0
-    ltd_client = factory.create_ltd_client(
-        base_url=str(config_snapshot.ltd_base_url)
-    )
-    state_store = factory.create_keeper_sync_state_store()
-    queue_job_store = factory.create_queue_job_store()
-    arq_queue = ctx["arq_queue"]
-    enqueued = 0
-    for ltd_slug in in_scope:
-        try:
-            should_enqueue = await _project_needs_discovery(
-                session=session,
-                state_store=state_store,
-                ltd_client=ltd_client,
-                org_id=org.id,
-                ltd_slug=ltd_slug,
-            )
-        except LtdClientError:
-            logger.exception(
-                "Tier-discovery: failed to inspect project editions",
-                org=org.slug,
-                ltd_slug=ltd_slug,
-            )
-            continue
-        if not should_enqueue:
-            continue
-        await _enqueue_tier_project_sync(
-            session=session,
-            queue_job_store=queue_job_store,
-            arq_queue=arq_queue,
-            org_id=org.id,
-            org_slug=org.slug,
-            ltd_slug=ltd_slug,
-            ltd_base_url=str(config_snapshot.ltd_base_url),
-        )
-        enqueued += 1
-    return enqueued
+    """Run one tier_discovery pass for a single enabled org.
 
-
-async def _tier_other_for_org(
-    *,
-    ctx: dict[str, Any],
-    session: AsyncSession,
-    factory: Factory,
-    org: Organization,
-    logger: structlog.stdlib.BoundLogger,
-) -> int:
-    """Run one tier_other pass for a single enabled org."""
+    Uses :func:`should_poll_for_tier` (with ``tier=Tier.discovery``) to
+    skip dormant projects so the long tail does not pin the cron to
+    ~1500 ``GET /products/<slug>/editions/`` calls every 30 min. Hot
+    projects (LTD ``main`` rebuilt within ``TIER_DISCOVERY_HOT_WINDOW``)
+    keep the 30-min cadence; dormant projects fall back to one pass per
+    ``TIER_DISCOVERY_DORMANT_INTERVAL``.
+    """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
         return 0
@@ -987,6 +948,122 @@ async def _tier_other_for_org(
     now = datetime.now(tz=UTC)
     enqueued = 0
     for ltd_slug in in_scope:
+        async with session.begin():
+            project_state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+            )
+        if not should_poll_for_tier(
+            state=project_state,
+            now=now,
+            tier=Tier.discovery,
+            hot_window=TIER_DISCOVERY_HOT_WINDOW,
+            dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
+        ):
+            continue
+        try:
+            should_enqueue = await _project_needs_discovery(
+                session=session,
+                state_store=state_store,
+                ltd_client=ltd_client,
+                org_id=org.id,
+                ltd_slug=ltd_slug,
+                project_state=project_state,
+            )
+        except LtdClientError:
+            logger.exception(
+                "Tier-discovery: failed to inspect project editions",
+                org=org.slug,
+                ltd_slug=ltd_slug,
+            )
+            # Stamp the polled annotation even on error — otherwise a
+            # flaky LTD endpoint defeats the dormancy rate-limiter.
+            await _record_tier_polled(
+                session=session,
+                state_store=state_store,
+                org_id=org.id,
+                ltd_slug=ltd_slug,
+                tier=Tier.discovery,
+                now=now,
+            )
+            continue
+        if should_enqueue:
+            await _enqueue_tier_project_sync(
+                session=session,
+                queue_job_store=queue_job_store,
+                arq_queue=arq_queue,
+                org_id=org.id,
+                org_slug=org.slug,
+                ltd_slug=ltd_slug,
+                ltd_base_url=str(config_snapshot.ltd_base_url),
+            )
+            enqueued += 1
+        # Stamp the polled annotation regardless of enqueue so the
+        # planner clamps a project to one LTD pass per dormant
+        # interval; if we only stamped on enqueue, a fully-known
+        # dormant project would re-poll (and re-list editions) on
+        # every tick.
+        await _record_tier_polled(
+            session=session,
+            state_store=state_store,
+            org_id=org.id,
+            ltd_slug=ltd_slug,
+            tier=Tier.discovery,
+            now=now,
+        )
+    return enqueued
+
+
+async def _tier_other_for_org(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    org: Organization,
+    logger: structlog.stdlib.BoundLogger,
+) -> int:
+    """Run one tier_other pass for a single enabled org.
+
+    Uses :func:`should_poll_for_tier` (with ``tier=Tier.other``) to
+    skip dormant projects before the per-project
+    ``GET /products/<slug>/editions/`` listing, so a project whose
+    branches haven't been touched in months stops driving an hourly
+    LTD fetch. Hot and dormant-due projects continue to fetch the
+    edition list and re-enqueue when state lags past
+    :data:`TIER_OTHER_REFRESH_THRESHOLD`.
+    """
+    config_snapshot = org.keeper_sync_config
+    if config_snapshot is None:
+        return 0
+    in_scope = await _list_in_scope_slugs(
+        factory=factory, config=config_snapshot
+    )
+    if not in_scope:
+        return 0
+    ltd_client = factory.create_ltd_client(
+        base_url=str(config_snapshot.ltd_base_url)
+    )
+    state_store = factory.create_keeper_sync_state_store()
+    queue_job_store = factory.create_queue_job_store()
+    arq_queue = ctx["arq_queue"]
+    now = datetime.now(tz=UTC)
+    enqueued = 0
+    for ltd_slug in in_scope:
+        async with session.begin():
+            project_state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+            )
+        if not should_poll_for_tier(
+            state=project_state,
+            now=now,
+            tier=Tier.other,
+            hot_window=TIER_OTHER_HOT_WINDOW,
+            dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
+        ):
+            continue
         try:
             ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
         except LtdClientError:
@@ -995,25 +1072,40 @@ async def _tier_other_for_org(
                 org=org.slug,
                 ltd_slug=ltd_slug,
             )
+            await _record_tier_polled(
+                session=session,
+                state_store=state_store,
+                org_id=org.id,
+                ltd_slug=ltd_slug,
+                tier=Tier.other,
+                now=now,
+            )
             continue
-        if not await _has_stale_non_main_edition(
+        if await _has_stale_non_main_edition(
             session=session,
             state_store=state_store,
             org_id=org.id,
             ltd_editions=ltd_editions,
             now=now,
         ):
-            continue
-        await _enqueue_tier_project_sync(
+            await _enqueue_tier_project_sync(
+                session=session,
+                queue_job_store=queue_job_store,
+                arq_queue=arq_queue,
+                org_id=org.id,
+                org_slug=org.slug,
+                ltd_slug=ltd_slug,
+                ltd_base_url=str(config_snapshot.ltd_base_url),
+            )
+            enqueued += 1
+        await _record_tier_polled(
             session=session,
-            queue_job_store=queue_job_store,
-            arq_queue=arq_queue,
+            state_store=state_store,
             org_id=org.id,
-            org_slug=org.slug,
             ltd_slug=ltd_slug,
-            ltd_base_url=str(config_snapshot.ltd_base_url),
+            tier=Tier.other,
+            now=now,
         )
-        enqueued += 1
     return enqueued
 
 
@@ -1192,13 +1284,64 @@ async def _record_main_polled(  # noqa: PLR0913
         )
 
 
-async def _project_needs_discovery(
+async def _record_tier_polled(  # noqa: PLR0913
+    *,
+    session: AsyncSession,
+    state_store: KeeperSyncStateStore,
+    org_id: int,
+    ltd_slug: str,
+    tier: Tier,
+    now: datetime,
+) -> None:
+    """Stamp ``date_<tier>_last_polled`` on the project state row.
+
+    Used by ``_tier_discovery_for_org`` and ``_tier_other_for_org`` to
+    clamp dormant projects to one LTD pass per tier-specific
+    ``dormant_interval``. Read-modify-write inside one transaction so
+    other writers' annotation keys (the cached ``main_edition_*`` /
+    ``date_main_last_polled``) are preserved by merge.
+
+    Unlike :func:`_record_main_polled`, this helper does *not* update
+    ``date_rebuilt_seen``; ``tier_main`` is the only writer of that
+    field and the discovery / other tiers must not pretend they have
+    observed an LTD rebuild.
+    """
+    annotation_key = _TIER_POLLED_ANNOTATION_KEYS[tier]
+    async with session.begin():
+        existing = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
+        )
+        prior = (
+            existing.annotations
+            if existing is not None and existing.annotations is not None
+            else {}
+        )
+        merged: dict[str, Any] = {**prior, annotation_key: now.isoformat()}
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
+            annotations=merged,
+        )
+
+
+_TIER_POLLED_ANNOTATION_KEYS: dict[Tier, str] = {
+    Tier.main: ANNOTATION_DATE_MAIN_LAST_POLLED,
+    Tier.discovery: ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+    Tier.other: ANNOTATION_DATE_OTHER_LAST_POLLED,
+}
+
+
+async def _project_needs_discovery(  # noqa: PLR0913
     *,
     session: AsyncSession,
     state_store: KeeperSyncStateStore,
     ltd_client: LtdClient,
     org_id: int,
     ltd_slug: str,
+    project_state: Any,
 ) -> bool:
     """Return True when an in-scope project has any unseen LTD resource.
 
@@ -1209,13 +1352,12 @@ async def _project_needs_discovery(
     With 1500 in-scope LTD projects and an average ~10 editions each,
     the batched read replaces ~15 000 round-trips per discovery tick
     with ~1500.
+
+    ``project_state`` is the state row already fetched by the caller
+    (so the dormancy planner and this helper share one read). Pass
+    ``None`` for "no row exists yet"; the cheap-path short-circuit
+    will return ``True`` without touching LTD.
     """
-    async with session.begin():
-        project_state = await state_store.get(
-            org_id=org_id,
-            resource_type=ResourceType.project,
-            ltd_slug=ltd_slug,
-        )
     if is_unknown_resource(project_state):
         return True
     ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
