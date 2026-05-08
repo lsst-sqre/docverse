@@ -388,6 +388,301 @@ async def test_tier_main_enqueues_when_state_missing(
 
 
 @pytest.mark.asyncio
+async def test_tier_main_caches_main_edition_pointer_after_walk(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """First successful resolve writes the cached pointer onto project state.
+
+    Locks the cold-cache half of the contract: after ``_find_main_edition``
+    walks the URL list to locate ``main``, the project-resource state row
+    carries ``main_edition_url`` / ``main_edition_ltd_id`` annotations so
+    the next tick can skip the walk.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-cache-cold",
+            project_slugs=["pipelines"],
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert project_state.annotations["main_edition_ltd_id"] == 1
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_uses_cached_pointer_to_skip_walk(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Cached pointer resolves to ``main`` — only the cached fetch fires.
+
+    Acceptance criterion: in the steady-state common case
+    ``_find_main_edition`` issues exactly **one** LTD HTTP call per
+    project per tick. Verified by ``respx`` route counters: the
+    editions-listing endpoint is never hit, only the cached
+    ``/editions/1`` URL is.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-cache-hit",
+            project_slugs=["pipelines"],
+        )
+        # Project state seeded with a cached pointer at ltd_id=1.
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=99,
+            annotations={
+                "main_edition_ltd_id": 1,
+                "main_edition_url": f"{LTD_BASE}/editions/1",
+            },
+        )
+        # Edition state lags LTD: triggers an enqueue on cache hit.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2),
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    listing_route = mock_discovery.get(
+        f"{LTD_BASE}/products/pipelines/editions/"
+    ).mock(return_value=httpx.Response(200, json={"editions": []}))
+    edition_route = mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "self_url": f"{LTD_BASE}/editions/1",
+                "product_url": f"{LTD_BASE}/products/pipelines",
+                "build_url": f"{LTD_BASE}/builds/100",
+                "published_url": f"{LTD_BASE}/main/",
+                "slug": "main",
+                "title": "main",
+                "date_created": "2024-01-01T00:00:00+00:00",
+                "date_rebuilt": _FIXTURE_MAIN_DATE_REBUILT.isoformat(),
+                "date_ended": None,
+                "tracked_refs": ["main"],
+                "mode": "git_refs",
+                "pending_rebuild": False,
+            },
+        )
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # The cached path bypasses the URL listing entirely.
+    assert listing_route.call_count == 0
+    assert edition_route.call_count == 1
+
+    # And the lagging edition state still triggers an enqueue.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_main_falls_back_to_walk_on_cached_404(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Cached pointer 404s — walk runs, annotation is overwritten."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-cache-404",
+            project_slugs=["pipelines"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=99,
+            annotations={
+                "main_edition_ltd_id": 99,
+                "main_edition_url": f"{LTD_BASE}/editions/99",
+            },
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    cached_route = mock_discovery.get(f"{LTD_BASE}/editions/99").mock(
+        return_value=httpx.Response(404)
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert cached_route.call_count == 1
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert project_state.annotations["main_edition_ltd_id"] == 1
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_falls_back_to_walk_on_slug_mismatch(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Cached edition exists but is no longer ``main`` — walk + rewrite."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-cache-slug",
+            project_slugs=["pipelines"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=99,
+            annotations={
+                "main_edition_ltd_id": 99,
+                "main_edition_url": f"{LTD_BASE}/editions/99",
+            },
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    # Cached edition still exists, but its slug has been changed by a
+    # maintainer: the cache is stale and must be rewritten.
+    _stub_edition(
+        mock_discovery,
+        edition_id=99,
+        slug="renamed-edition",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert project_state.annotations["main_edition_ltd_id"] == 1
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_tier_main_skips_disabled_orgs(
     app: None,
     db_session: AsyncSession,

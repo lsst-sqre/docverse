@@ -54,7 +54,12 @@ from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.services.publish_enqueue import enqueue_publish_for_edition
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.ltd import LtdClient, LtdClientError, LtdEdition
+from docverse.storage.ltd import (
+    LtdClient,
+    LtdClientError,
+    LtdEdition,
+    LtdNotFoundError,
+)
 from docverse.storage.queue_job_store import QueueJobStore
 
 # Window before a queued child with no ``backend_job_id`` is treated as
@@ -75,6 +80,19 @@ __all__ = [
 #: Slug LTD assigns to every product's primary edition. Tier_main owns
 #: refreshes for this slug; tier_other explicitly skips it.
 _LTD_MAIN_SLUG = "main"
+
+#: ``keeper_sync_state.annotations`` key on a project-resource state row
+#: holding the resolved LTD ``main`` edition's full ``self_url``. Owned
+#: by ``_tier_main_for_org`` so subsequent ticks bypass the
+#: ``GET /products/<slug>/editions/`` walk and go straight to
+#: ``GET /editions/<id>``.
+_MAIN_EDITION_URL_KEY = "main_edition_url"
+
+#: Companion to :data:`_MAIN_EDITION_URL_KEY`: the integer LTD edition
+#: id that ``main_edition_url`` resolves to. Stored alongside the URL
+#: so log lines and future reverse lookups have the id without needing
+#: to re-parse the URL.
+_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
 
 async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
@@ -808,7 +826,11 @@ async def _tier_main_for_org(
     for ltd_slug in in_scope:
         try:
             main_edition = await _find_main_edition(
-                ltd_client=ltd_client, product_slug=ltd_slug
+                ltd_client=ltd_client,
+                state_store=state_store,
+                session=session,
+                org_id=org.id,
+                ltd_slug=ltd_slug,
             )
         except LtdClientError:
             logger.exception(
@@ -819,6 +841,17 @@ async def _tier_main_for_org(
             continue
         if main_edition is None:
             continue
+        # Refresh the cached pointer on every successful resolve — both
+        # cache hits (cheap re-write) and walk-discovered re-mappings
+        # (handles the rare case where a maintainer renamed ``main`` by
+        # recreating the edition under a new id).
+        await _cache_main_edition_pointer(
+            session=session,
+            state_store=state_store,
+            org_id=org.id,
+            ltd_slug=ltd_slug,
+            main_edition=main_edition,
+        )
         async with session.begin():
             state = await state_store.get(
                 org_id=org.id,
@@ -973,9 +1006,62 @@ async def _list_in_scope_slugs(
 async def _find_main_edition(
     *,
     ltd_client: LtdClient,
+    state_store: KeeperSyncStateStore,
+    session: AsyncSession,
+    org_id: int,
+    ltd_slug: str,
+) -> LtdEdition | None:
+    """Locate the LTD ``main`` edition for ``ltd_slug``.
+
+    Uses a per-project cache persisted on the project-resource state
+    row's ``annotations`` (``main_edition_url`` / ``main_edition_ltd_id``)
+    so the steady-state common case is one ``GET /editions/<id>`` per
+    project per tier_main tick instead of the
+    ``GET /products/<slug>/editions/`` listing plus an
+    ``GET /editions/<id>`` per non-``main`` edition. With ~1500 in-
+    scope LTD products each carrying many ticket-branch editions, the
+    walk path was the dominant load on the LTD API; the cache reduces
+    it to one HTTP call per project.
+
+    Cache invalidation:
+
+    * Cached fetch returns 404 (the edition was deleted on LTD) —
+      discard the pointer and walk.
+    * Cached fetch returns 200 but the slug is no longer ``"main"`` —
+      a maintainer renamed the edition; discard the pointer and walk.
+
+    The caller (:func:`_tier_main_for_org`) re-writes the cache
+    annotations on every successful resolve, so the pointer self-heals
+    in the rare case where the walk discovers a different ``ltd_id``
+    than was cached.
+    """
+    cached_url = await _cached_main_edition_url(
+        state_store=state_store,
+        session=session,
+        org_id=org_id,
+        ltd_slug=ltd_slug,
+    )
+    if cached_url is not None:
+        try:
+            edition = await ltd_client.get_edition_by_url(cached_url)
+        except LtdNotFoundError:
+            # Stale pointer: edition was deleted on LTD. Fall through to
+            # the walk so we can rediscover ``main`` and overwrite.
+            pass
+        else:
+            if edition.slug == _LTD_MAIN_SLUG:
+                return edition
+    return await _walk_for_main_edition(
+        ltd_client=ltd_client, product_slug=ltd_slug
+    )
+
+
+async def _walk_for_main_edition(
+    *,
+    ltd_client: LtdClient,
     product_slug: str,
 ) -> LtdEdition | None:
-    """Locate the LTD ``main`` edition for ``product_slug``.
+    """Walk LTD's edition URL list looking for ``slug == "main"``.
 
     LTD has no slug-keyed edition lookup — every edition lives at
     ``/editions/{integer_id}``. We pull the URL list (one cheap HTTP
@@ -992,6 +1078,66 @@ async def _find_main_edition(
         if edition.slug == _LTD_MAIN_SLUG:
             return edition
     return None
+
+
+async def _cached_main_edition_url(
+    *,
+    state_store: KeeperSyncStateStore,
+    session: AsyncSession,
+    org_id: int,
+    ltd_slug: str,
+) -> str | None:
+    """Return the project's cached ``main`` edition URL, if any."""
+    async with session.begin():
+        project_state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
+        )
+    if project_state is None or project_state.annotations is None:
+        return None
+    cached = project_state.annotations.get(_MAIN_EDITION_URL_KEY)
+    return cached if isinstance(cached, str) else None
+
+
+async def _cache_main_edition_pointer(
+    *,
+    session: AsyncSession,
+    state_store: KeeperSyncStateStore,
+    org_id: int,
+    ltd_slug: str,
+    main_edition: LtdEdition,
+) -> None:
+    """Persist the resolved ``main`` edition pointer on project state.
+
+    Writes ``main_edition_ltd_id`` and ``main_edition_url`` into the
+    project-resource ``keeper_sync_state.annotations`` JSONB. Existing
+    annotations on the row are preserved by merge so unrelated keys
+    (none today, but a forward-compatible posture for future
+    project-state metadata) survive across ticks.
+    """
+    async with session.begin():
+        existing = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
+        )
+        prior = (
+            existing.annotations
+            if existing is not None and existing.annotations is not None
+            else {}
+        )
+        merged: dict[str, Any] = {
+            **prior,
+            _MAIN_EDITION_LTD_ID_KEY: main_edition.ltd_id,
+            _MAIN_EDITION_URL_KEY: str(main_edition.self_url),
+        }
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
+            annotations=merged,
+        )
 
 
 async def _project_needs_discovery(

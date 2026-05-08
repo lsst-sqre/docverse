@@ -39,7 +39,21 @@ class ResourceType(StrEnum):
 
 
 class KeeperSyncState(BaseModel):
-    """Domain representation of a ``keeper_sync_state`` row."""
+    """Domain representation of a ``keeper_sync_state`` row.
+
+    Documented ``annotations`` keys
+    -------------------------------
+    Project-resource rows
+        ``main_edition_url`` / ``main_edition_ltd_id`` — the resolved
+        LTD ``main`` edition pointer cached by
+        :func:`docverse.worker.functions.keeper_sync._tier_main_for_org`
+        so subsequent ticks issue one ``GET /editions/<id>`` instead of
+        walking the project's edition URL list.
+    Edition-resource rows
+        ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
+        mode / refs preserved for reversibility (used by the ``manual``
+        mapper path).
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
