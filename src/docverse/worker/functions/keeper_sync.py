@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import traceback
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import httpx
 import structlog
@@ -762,10 +762,23 @@ async def _run_tier(
     raise RuntimeError(msg)
 
 
-# Tier processors take the per-org context and return how many
-# ``keeper_sync_project`` children they enqueued. Defined as a callable
-# alias so ``_run_tier`` can be shared across all three cron functions.
-TierOrgProcessor = Any
+class TierOrgProcessor(Protocol):
+    """Per-org tier processor callable shared by ``_run_tier``.
+
+    Each tier cron (``main`` / ``discovery`` / ``other``) supplies a
+    function matching this signature; it returns the number of
+    ``keeper_sync_project`` children it enqueued for the org.
+    """
+
+    async def __call__(
+        self,
+        *,
+        ctx: dict[str, Any],
+        session: AsyncSession,
+        factory: Factory,
+        org: Organization,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> int: ...
 
 
 async def _tier_main_for_org(
