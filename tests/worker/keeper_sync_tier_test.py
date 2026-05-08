@@ -59,6 +59,42 @@ def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
 
+class _StateStoreCallRecorder:
+    """Records ``KeeperSyncStateStore`` method calls per tier-cron tick.
+
+    The batched-read refactor (issue #310) replaces N per-edition
+    ``get`` round-trips with one ``list_for_org`` call. The recorder is
+    installed via ``monkeypatch`` on the class, so every store created
+    by the factory shares the same counters.
+    """
+
+    def __init__(self) -> None:
+        self.list_for_org_calls = 0
+        self.get_calls = 0
+
+
+def _install_state_store_recorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _StateStoreCallRecorder:
+    recorder = _StateStoreCallRecorder()
+    real_list = KeeperSyncStateStore.list_for_org
+    real_get = KeeperSyncStateStore.get
+
+    async def counting_list(
+        self: KeeperSyncStateStore, **kwargs: Any
+    ) -> list[Any]:
+        recorder.list_for_org_calls += 1
+        return await real_list(self, **kwargs)
+
+    async def counting_get(self: KeeperSyncStateStore, **kwargs: Any) -> Any:
+        recorder.get_calls += 1
+        return await real_get(self, **kwargs)
+
+    monkeypatch.setattr(KeeperSyncStateStore, "list_for_org", counting_list)
+    monkeypatch.setattr(KeeperSyncStateStore, "get", counting_get)
+    return recorder
+
+
 async def _seed_org(
     db_session: AsyncSession,
     *,
@@ -497,6 +533,98 @@ async def test_tier_discovery_enqueues_when_edition_state_missing(
 
 
 @pytest.mark.asyncio
+async def test_tier_discovery_batches_edition_state_lookups(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One ``list_for_org`` call per project regardless of edition count.
+
+    Replaces the prior N-per-edition ``get`` round-trips so a project
+    with 5 editions issues exactly one batched read for the
+    edition-state dictionary plus one ``get`` for the project-state
+    short-circuit. Locks the new contract from issue #310.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-disc-batch", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        # Every LTD edition has a state row — ``is_unknown_resource``
+        # returns ``False`` for each, so the loop must consult every
+        # one before deciding not to enqueue. With per-edition ``get``
+        # this would be 5 round-trips; with the batched read it is 1.
+        for ltd_id, slug in (
+            (1, "main"),
+            (2, "branch-a"),
+            (3, "branch-b"),
+            (4, "branch-c"),
+            (5, "branch-d"),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+            )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[5, 4, 3, 2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    for edition_id, slug in (
+        (2, "branch-a"),
+        (3, "branch-b"),
+        (4, "branch-c"),
+        (5, "branch-d"),
+    ):
+        _stub_edition(
+            mock_discovery,
+            edition_id=edition_id,
+            slug=slug,
+            date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+        )
+
+    recorder = _install_state_store_recorder(monkeypatch)
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Fully-known project — no enqueue.
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+    # One ``get`` for the project-state short-circuit, one
+    # ``list_for_org`` for the batched edition lookup. Five-edition
+    # fixture proves the count is independent of edition cardinality.
+    assert recorder.get_calls == 1
+    assert recorder.list_for_org_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_tier_discovery_skips_fully_known_project(
     app: None,
     db_session: AsyncSession,
@@ -757,6 +885,102 @@ async def test_tier_other_skips_edition_with_no_state(
         )
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_tier_other_batches_edition_state_lookups(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One ``list_for_org`` per project; no per-edition ``get`` calls.
+
+    Issue #310: tier_other walks every non-``main`` edition LTD lists.
+    With per-edition ``get`` the cost grew with edition count; the
+    batched read makes it constant per project. The fixture lists five
+    branch editions plus ``main`` so a regression to the old shape would
+    show up as ``get_calls == 5``.
+    """
+    fresh = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-other-batch", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=fresh,
+        )
+        # All branch editions are fresh — no enqueue, but every state
+        # row must be consulted before that decision.
+        for ltd_id, slug in (
+            (2, "branch-a"),
+            (3, "branch-b"),
+            (4, "branch-c"),
+            (5, "branch-d"),
+            (6, "branch-e"),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+                date_last_synced=fresh,
+            )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery,
+        product_slug="pipelines",
+        edition_ids=[6, 5, 4, 3, 2, 1],
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    for edition_id, slug in (
+        (2, "branch-a"),
+        (3, "branch-b"),
+        (4, "branch-c"),
+        (5, "branch-d"),
+        (6, "branch-e"),
+    ):
+        _stub_edition(
+            mock_discovery,
+            edition_id=edition_id,
+            slug=slug,
+            date_rebuilt=datetime(2026, 5, 7, tzinfo=UTC),
+        )
+
+    recorder = _install_state_store_recorder(monkeypatch)
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+    # Zero ``get`` calls — tier_other does not need a project-state
+    # short-circuit. Exactly one ``list_for_org`` regardless of LTD's
+    # edition cardinality.
+    assert recorder.get_calls == 0
+    assert recorder.list_for_org_calls == 1
 
 
 # ---------------------------------------------------------------------------

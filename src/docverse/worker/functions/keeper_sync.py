@@ -1005,10 +1005,12 @@ async def _project_needs_discovery(
     """Return True when an in-scope project has any unseen LTD resource.
 
     The cheap check first: if the project itself has no state row,
-    enqueue immediately and skip the per-edition walk. Otherwise
-    list the editions and short-circuit on the first one without a
-    state row. Returning ``False`` means every LTD resource we know
-    about for this project is already paired with state.
+    enqueue immediately and skip the per-edition walk. Otherwise read
+    every edition state row for the org in one batched query, then
+    walk LTD's edition list checking presence in the in-memory dict.
+    With 1500 in-scope LTD projects and an average ~10 editions each,
+    the batched read replaces ~15 000 round-trips per discovery tick
+    with ~1500.
     """
     async with session.begin():
         project_state = await state_store.get(
@@ -1019,14 +1021,13 @@ async def _project_needs_discovery(
     if is_unknown_resource(project_state):
         return True
     ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
+    async with session.begin():
+        edition_states = await state_store.list_for_org(
+            org_id=org_id, resource_type=ResourceType.edition
+        )
+    by_ltd_id = {s.ltd_id: s for s in edition_states if s.ltd_id is not None}
     for ltd_edition in ltd_editions:
-        async with session.begin():
-            edition_state = await state_store.get(
-                org_id=org_id,
-                resource_type=ResourceType.edition,
-                ltd_id=ltd_edition.ltd_id,
-            )
-        if is_unknown_resource(edition_state):
+        if is_unknown_resource(by_ltd_id.get(ltd_edition.ltd_id)):
             return True
     return False
 
@@ -1046,21 +1047,24 @@ async def _has_stale_non_main_edition(
     functions' decisions independent so a single missing-state row
     cannot cause two tiers to enqueue for the same project on the
     same hour.
+
+    The state-row read is one batched ``list_for_org`` scoped to the
+    LTD ids the caller already lists, replacing N per-edition ``get``
+    round-trips. Memory cost stays bounded because the result set is
+    capped by LTD's edition count for the project.
     """
-    for ltd_edition in ltd_editions:
-        if ltd_edition.slug == _LTD_MAIN_SLUG:
-            continue
-        async with session.begin():
-            state = await state_store.get(
-                org_id=org_id,
-                resource_type=ResourceType.edition,
-                ltd_id=ltd_edition.ltd_id,
-            )
-        if state is None:
-            continue
-        if should_refresh_other_edition(state=state, now=now):
-            return True
-    return False
+    non_main_ltd_ids = [
+        e.ltd_id for e in ltd_editions if e.slug != _LTD_MAIN_SLUG
+    ]
+    if not non_main_ltd_ids:
+        return False
+    async with session.begin():
+        states = await state_store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_ids=non_main_ltd_ids,
+        )
+    return any(should_refresh_other_edition(state=s, now=now) for s in states)
 
 
 async def _enqueue_tier_project_sync(  # noqa: PLR0913

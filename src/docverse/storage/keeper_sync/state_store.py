@@ -10,6 +10,7 @@ slugs are only unique within a product.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -129,6 +130,42 @@ class KeeperSyncStateStore:
         if row is None:
             return None
         return KeeperSyncState.model_validate(row)
+
+    async def list_for_org(
+        self,
+        *,
+        org_id: int,
+        resource_type: ResourceType,
+        ltd_ids: Iterable[int] | None = None,
+    ) -> list[KeeperSyncState]:
+        """Return every state row for ``(org_id, resource_type)``.
+
+        Replaces the per-edition ``get`` round-trips the tier-cron
+        worker functions used to make: callers fetch the org's rows
+        once and resolve presence / staleness via an in-memory dict
+        keyed on ``ltd_id``. Pass ``ltd_ids`` to scope the query to a
+        known LTD-side id set (used by tier_other so the WHERE clause
+        only spans editions LTD currently lists). Passing an empty
+        ``ltd_ids`` returns ``[]`` without hitting the database.
+        """
+        if ltd_ids is not None:
+            ltd_id_list = list(ltd_ids)
+            if not ltd_id_list:
+                return []
+        else:
+            ltd_id_list = None
+        clauses: list[ColumnElement[bool]] = [
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == resource_type.value,
+        ]
+        if ltd_id_list is not None:
+            clauses.append(SqlKeeperSyncState.ltd_id.in_(ltd_id_list))
+        stmt = select(SqlKeeperSyncState).where(*clauses)
+        result = await self._session.execute(stmt)
+        return [
+            KeeperSyncState.model_validate(row)
+            for row in result.scalars().all()
+        ]
 
     async def upsert(  # noqa: PLR0913
         self,
