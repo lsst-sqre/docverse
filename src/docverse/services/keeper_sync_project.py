@@ -64,13 +64,14 @@ class LtdClientFactory(Protocol):
     this shape; the indirection lets unit tests pass a fake client.
     """
 
-    def __call__(self, *, base_url: str) -> LtdClient: ...
+    def __call__(self, *, base_url: str) -> LtdClient:
+        """Return an :class:`LtdClient` for ``base_url``."""
 
 
 class KeeperSyncProjectService:
     """Read-only project-status service for the org-admin GET endpoint."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         org_store: OrganizationStore,
@@ -253,9 +254,7 @@ class KeeperSyncProjectService:
             for state in product_state_rows
             if state.ltd_id is not None
         }
-        missing_in_docverse_ids = (
-            set(ltd_slugs_by_id) - set(state_slugs_by_id)
-        )
+        missing_in_docverse_ids = set(ltd_slugs_by_id) - set(state_slugs_by_id)
         missing_in_ltd_ids = set(state_slugs_by_id) - set(ltd_slugs_by_id)
         return KeeperSyncEditionDiff(
             missing_in_docverse=sorted(
@@ -331,7 +330,7 @@ def _explain_all_tiers(
     ]
 
 
-def _build_tier_status(  # noqa: PLR0913
+def _build_tier_status(
     *,
     tier: Tier,
     tier_name: KeeperSyncTierName,

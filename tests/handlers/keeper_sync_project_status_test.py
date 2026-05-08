@@ -115,7 +115,7 @@ async def _get_main_edition_id(project_id: int) -> int:
     raise AssertionError(msg)
 
 
-async def _seed_state(  # noqa: PLR0913
+async def _seed_state(
     *,
     org_id: int,
     resource_type: ResourceType,
@@ -280,7 +280,11 @@ async def test_get_status_stub_when_no_state_row(
     assert body["editions"] == []
     assert body.get("edition_diff") is None
     cohorts = {entry["tier"]: entry["cohort"] for entry in body["tier_status"]}
-    assert cohorts == {"main": "unseen", "discovery": "unseen", "other": "unseen"}
+    assert cohorts == {
+        "main": "unseen",
+        "discovery": "unseen",
+        "other": "unseen",
+    }
     for entry in body["tier_status"]:
         assert entry["last_polled_at"] is None
         assert entry["next_due_at"] is None
@@ -330,17 +334,13 @@ async def test_get_status_full_body_for_synced_project(
     assert body["project_state"]["docverse_project_id"] == project_id
     assert body["project_state"]["ltd_slug"] == _LTD_SLUG
     assert (
-        body["project_state"]["annotations"][
-            ANNOTATION_DATE_MAIN_LAST_POLLED
-        ]
+        body["project_state"]["annotations"][ANNOTATION_DATE_MAIN_LAST_POLLED]
         == last_polled.isoformat()
     )
 
     cohorts = {entry["tier"]: entry["cohort"] for entry in body["tier_status"]}
     assert cohorts["main"] == "dormant"
-    main_status = next(
-        e for e in body["tier_status"] if e["tier"] == "main"
-    )
+    main_status = next(e for e in body["tier_status"] if e["tier"] == "main")
     assert main_status["last_polled_at"] is not None
     assert main_status["next_due_at"] is not None
     next_due = datetime.fromisoformat(main_status["next_due_at"])
@@ -406,12 +406,15 @@ async def test_get_status_edition_left_joins_state_row(
     assert status_response.status_code == 200
     body = status_response.json()
     main_edition = next(
-        e for e in body["editions"]
+        e
+        for e in body["editions"]
         if e["docverse_edition_id"] == main_edition_id
     )
     assert main_edition["ltd_id"] == 42
     assert main_edition["ltd_slug"] == "main"
-    assert datetime.fromisoformat(main_edition["date_last_synced"]) == sync_time
+    assert (
+        datetime.fromisoformat(main_edition["date_last_synced"]) == sync_time
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -513,9 +516,9 @@ async def test_get_status_ltd_diff_handles_ltd_error(
     await _setup_org(client)
     await _enable_sync(client, project_slugs=[_LTD_SLUG])
     await _create_project(client, slug=_LTD_SLUG)
-    mock_discovery.get(
-        f"{_LTD_BASE}/products/{_LTD_SLUG}/editions/"
-    ).mock(return_value=httpx.Response(500, json={"error": "boom"}))
+    mock_discovery.get(f"{_LTD_BASE}/products/{_LTD_SLUG}/editions/").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
 
     response = await client.get(
         f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}?ltd=true",
