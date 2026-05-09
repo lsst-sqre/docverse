@@ -7,6 +7,7 @@ from typing import Literal
 import pytest
 import structlog
 from safir.arq import MockArqQueue
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -254,6 +255,81 @@ async def test_refresh_project_400_when_slug_outside_allowlist(
         with pytest.raises(BadRequestError):
             await service.refresh_project(
                 org_slug=org_slug, ltd_slug="not-allowed"
+            )
+
+
+@pytest.mark.asyncio
+async def test_refresh_project_409_when_active_job_exists(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A second ``refresh_project`` for the same slug returns 409.
+
+    Locks the QA-driven mutex: an in-flight ``keeper_sync_project``
+    for ``(org, ltd_slug)`` must block a second operator-triggered
+    refresh; the operator already has a job running.
+    """
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    async with db_session.begin():
+        _, org_slug = await _seed_org(db_session, project_slugs=["pipelines"])
+        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        # First call enqueues, leaves a queued row.
+        await service.refresh_project(org_slug=org_slug, ltd_slug="pipelines")
+        await db_session.commit()
+
+    async with db_session.begin():
+        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        with pytest.raises(ConflictError):
+            await service.refresh_project(
+                org_slug=org_slug, ltd_slug="pipelines"
+            )
+
+    # Still exactly one row — no duplicate inserted by the failed call.
+    async with db_session.begin():
+        rows = (
+            (
+                await db_session.execute(
+                    select(SqlQueueJob).where(
+                        SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                        SqlQueueJob.subject_label == "pipelines",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_project_409_when_tier_cron_job_already_active(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A tier-cron-attributed active row also blocks the operator refresh."""
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["pipelines"]
+        )
+        # Pre-seed a tier-cron-style row (no run attribution).
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="pipelines",
+            backend_job_id="arq-job-tier-cron",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        with pytest.raises(ConflictError):
+            await service.refresh_project(
+                org_slug=org_slug, ltd_slug="pipelines"
             )
 
 

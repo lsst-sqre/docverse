@@ -232,7 +232,7 @@ async def keeper_sync_run_discovery(
                 in_scope_count=len(in_scope),
             )
 
-            await _enqueue_children(
+            enqueued_count = await _enqueue_children(
                 ctx=ctx,
                 session=session,
                 queue_job_store=queue_job_store,
@@ -252,12 +252,14 @@ async def keeper_sync_run_discovery(
                     progress={
                         "message": "Discovery complete",
                         "in_scope_count": len(in_scope),
+                        "enqueued_count": enqueued_count,
                     },
                 )
                 await queue_job_store.complete(queue_job_id)
-                # Empty fan-out: nothing for ``keeper_sync_project`` to
-                # finalise on the run, so terminate it here.
-                if not in_scope:
+                # Empty fan-out OR all-skipped fan-out: no children
+                # attributed to this run, so the parent will never
+                # finalise on a child terminal. Terminate it here.
+                if enqueued_count == 0:
                     await run_store.transition_status(
                         run_id=run_id,
                         new_status=KeeperSyncRunStatus.succeeded,
@@ -588,7 +590,7 @@ async def _enqueue_children(  # noqa: PLR0913
     ltd_base_url: str,
     ltd_slugs: list[str],
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> int:
     """Fan out one child ``keeper_sync_project`` job per slug.
 
     Each iteration creates the ``queue_jobs`` row tagged with
@@ -596,8 +598,21 @@ async def _enqueue_children(  # noqa: PLR0913
     queued rows that progress aggregation can still see — then
     enqueues the arq job and writes the backend job ID back. The
     ``pending → in_progress`` run transition is atomic with the first
-    child's queue-job row insert so any concurrent ``GET /runs/{id}``
-    can never observe a run with children but still ``pending``.
+    successful child create so any concurrent ``GET /runs/{id}`` can
+    never observe a run with children but still ``pending``.
+
+    Per-slug mutual exclusion: before each create, the function
+    pre-checks ``QueueJobStore.has_active_for_subject`` for the same
+    ``(org_id, kind=keeper_sync_project, subject_label=ltd_slug)``.
+    When an active row already exists (the typical case is a tier-
+    cron-enqueued job that has not yet been picked up), the discovery
+    skips the slug and logs at ``info``. The in-flight job stays
+    unattributed (``keeper_sync_run_id IS NULL``); it will not count
+    toward this run's ``total_count`` aggregate, so the run's progress
+    counters can be smaller than the in-scope project list. Skipping
+    prevents two concurrent ``keeper_sync_project`` jobs for the same
+    slug from racing through ``_ensure_edition`` and losing the
+    ``uq_editions_project_lower_slug`` race.
 
     The order leaves an orphan tail: if the worker dies between the
     SQL commit and ``arq_queue.enqueue``, the row sits in ``queued``
@@ -605,17 +620,35 @@ async def _enqueue_children(  # noqa: PLR0913
     up — pending forever, blocking finalisation. The next discovery
     attempt sweeps these rows via ``_reconcile_orphan_children`` once
     they age past ``_ORPHAN_IDLE_WINDOW``.
+
+    Returns the number of slugs that were enqueued (skipped slugs do
+    not count). Callers use this to terminate a run whose entire
+    fan-out was skipped, the same way an empty in-scope list does.
     """
     arq_queue = ctx["arq_queue"]
-    for index, ltd_slug in enumerate(ltd_slugs):
+    enqueued = 0
+    for ltd_slug in ltd_slugs:
         async with session.begin():
+            if await queue_job_store.has_active_for_subject(
+                org_id=org_id,
+                kind=JobKind.keeper_sync_project,
+                subject_label=ltd_slug,
+            ):
+                logger.info(
+                    "Skipping keeper_sync_project enqueue: "
+                    "an active job for this project already exists",
+                    org=org_slug,
+                    ltd_slug=ltd_slug,
+                    source="run_discovery",
+                )
+                continue
             queue_job = await queue_job_store.create(
                 kind=JobKind.keeper_sync_project,
                 org_id=org_id,
                 keeper_sync_run_id=run_id,
                 subject_label=ltd_slug,
             )
-            if index == 0:
+            if enqueued == 0:
                 await run_store.transition_status(
                     run_id=run_id,
                     new_status=KeeperSyncRunStatus.in_progress,
@@ -637,11 +670,13 @@ async def _enqueue_children(  # noqa: PLR0913
         )
         async with session.begin():
             await queue_job_store.set_backend_job_id(queue_job.id, metadata.id)
+        enqueued += 1
         logger.debug(
             "Enqueued keeper_sync_project",
             ltd_slug=ltd_slug,
             queue_job_id=queue_job.id,
         )
+    return enqueued
 
 
 async def _reconcile_orphan_children(
@@ -903,7 +938,7 @@ async def _tier_main_for_org(
             state=state, ltd_date_rebuilt=main_edition.date_rebuilt
         ):
             continue
-        await _enqueue_tier_project_sync(
+        if await _enqueue_tier_project_sync(
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -911,8 +946,10 @@ async def _tier_main_for_org(
             org_slug=org.slug,
             ltd_slug=ltd_slug,
             ltd_base_url=str(config_snapshot.ltd_base_url),
-        )
-        enqueued += 1
+            logger=logger,
+            tier="main",
+        ):
+            enqueued += 1
     return enqueued
 
 
@@ -991,16 +1028,17 @@ async def _tier_discovery_for_org(
                 now=now,
             )
             continue
-        if should_enqueue:
-            await _enqueue_tier_project_sync(
-                session=session,
-                queue_job_store=queue_job_store,
-                arq_queue=arq_queue,
-                org_id=org.id,
-                org_slug=org.slug,
-                ltd_slug=ltd_slug,
-                ltd_base_url=str(config_snapshot.ltd_base_url),
-            )
+        if should_enqueue and await _enqueue_tier_project_sync(
+            session=session,
+            queue_job_store=queue_job_store,
+            arq_queue=arq_queue,
+            org_id=org.id,
+            org_slug=org.slug,
+            ltd_slug=ltd_slug,
+            ltd_base_url=str(config_snapshot.ltd_base_url),
+            logger=logger,
+            tier="discovery",
+        ):
             enqueued += 1
         # Stamp the polled annotation regardless of enqueue so the
         # planner clamps a project to one LTD pass per dormant
@@ -1091,16 +1129,17 @@ async def _tier_other_for_org(
             org_id=org.id,
             ltd_editions=ltd_editions,
             now=now,
+        ) and await _enqueue_tier_project_sync(
+            session=session,
+            queue_job_store=queue_job_store,
+            arq_queue=arq_queue,
+            org_id=org.id,
+            org_slug=org.slug,
+            ltd_slug=ltd_slug,
+            ltd_base_url=str(config_snapshot.ltd_base_url),
+            logger=logger,
+            tier="other",
         ):
-            await _enqueue_tier_project_sync(
-                session=session,
-                queue_job_store=queue_job_store,
-                arq_queue=arq_queue,
-                org_id=org.id,
-                org_slug=org.slug,
-                ltd_slug=ltd_slug,
-                ltd_base_url=str(config_snapshot.ltd_base_url),
-            )
             enqueued += 1
         await _record_tier_polled(
             session=session,
@@ -1420,7 +1459,9 @@ async def _enqueue_tier_project_sync(  # noqa: PLR0913
     org_slug: str,
     ltd_slug: str,
     ltd_base_url: str,
-) -> None:
+    logger: structlog.stdlib.BoundLogger,
+    tier: str,
+) -> bool:
     """Enqueue one ``keeper_sync_project`` child without run attribution.
 
     Mirrors ``_enqueue_children``'s commit-then-enqueue split (so the
@@ -1435,8 +1476,32 @@ async def _enqueue_tier_project_sync(  # noqa: PLR0913
     * The arq payload omits the ``run_id`` key. The receiving
       ``keeper_sync_project`` worker reads it via ``payload.get("
       run_id")`` and skips ``maybe_finalise_run`` when ``None``.
+
+    Per-slug mutual exclusion: pre-checks
+    :meth:`docverse.storage.queue_job_store.QueueJobStore.has_active_for_subject`
+    and skips on duplicate. Tier ticks overlap (a 5-min tier_main and
+    a 30-min tier_discovery both fire on :00 / :30) and a previous
+    tick's job may not have started yet; skipping prevents two
+    concurrent ``keeper_sync_project`` jobs from racing through
+    ``_ensure_edition`` and losing the
+    ``uq_editions_project_lower_slug`` race. Returns ``True`` on
+    enqueue, ``False`` on skip so the caller can update its
+    ``enqueued`` counter accurately.
     """
     async with session.begin():
+        if await queue_job_store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label=ltd_slug,
+        ):
+            logger.info(
+                "Skipping keeper_sync_project enqueue: "
+                "an active job for this project already exists",
+                org=org_slug,
+                ltd_slug=ltd_slug,
+                tier=tier,
+            )
+            return False
         queue_job = await queue_job_store.create(
             kind=JobKind.keeper_sync_project,
             org_id=org_id,
@@ -1456,3 +1521,4 @@ async def _enqueue_tier_project_sync(  # noqa: PLR0913
     )
     async with session.begin():
         await queue_job_store.set_backend_job_id(queue_job.id, metadata.id)
+    return True

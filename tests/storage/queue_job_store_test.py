@@ -609,6 +609,154 @@ async def test_fail_silent_run_children_returns_distinct_run_ids(
 
 
 @pytest.mark.asyncio
+async def test_has_active_for_subject_returns_true_for_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row matching ``(org_id, kind, subject_label)`` is active."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_true_for_in_progress_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` row also counts as active."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.start(job.id)
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_false_for_terminal_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Completed / failed / cancelled rows are not active."""
+    async with db_session.begin():
+        completed = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.start(completed.id)
+        await store.complete(completed.id)
+
+        failed = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.start(failed.id)
+        await store.fail(failed.id)
+
+        cancelled = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.cancel(cancelled.id)
+
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_false_when_no_rows_match(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """No matching rows for ``(org, kind, subject)`` → not active."""
+    async with db_session.begin():
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_filters_by_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row of a different ``kind`` does not count."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.publish_edition,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_filters_by_org_and_subject(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Differing ``org_id`` or ``subject_label`` excludes the row."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        # Same kind+subject but different org → not active for org=99.
+        cross_org = await store.has_active_for_subject(
+            org_id=99,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        # Same kind+org but different subject → not active for "other".
+        cross_subject = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="other",
+        )
+        await db_session.commit()
+    assert cross_org is False
+    assert cross_subject is False
+
+
+@pytest.mark.asyncio
 async def test_fail_orphaned_run_children_scoped_to_run(
     db_session: AsyncSession,
     store: QueueJobStore,

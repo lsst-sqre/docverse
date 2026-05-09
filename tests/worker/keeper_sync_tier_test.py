@@ -39,6 +39,7 @@ from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.keeper_sync import (
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
@@ -991,6 +992,86 @@ async def test_tier_main_skips_disabled_orgs(
         )
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_skips_when_active_keeper_sync_project_exists(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An active ``keeper_sync_project`` row blocks tier_main's enqueue.
+
+    Reproduces the QA race: a prior unattributed ``keeper_sync_project``
+    is still queued (or a discovery fan-out attributed one). Tier_main's
+    pre-check must skip rather than enqueue a duplicate, even when
+    ``should_refresh_main_edition`` says LTD has advanced — the in-
+    flight job will catch up.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-main-mux", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2),
+        )
+        # Pre-seed an active ``keeper_sync_project`` row for the same
+        # subject_label. tier_main's pre-check must observe this and
+        # skip the enqueue.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        existing = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="pipelines",
+            backend_job_id="arq-job-prior-tier",
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # No new arq enqueues — the pre-check fired.
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+    # Exactly one ``pipelines`` row in the DB — the original. No duplicate.
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                SqlQueueJob.subject_label == "pipelines",
+                SqlQueueJob.org_id == org_id,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].id == existing.id
 
 
 # ---------------------------------------------------------------------------

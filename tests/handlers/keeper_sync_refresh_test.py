@@ -142,6 +142,45 @@ async def test_post_refresh_returns_400_when_slug_not_in_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_post_refresh_returns_409_when_active_job_exists(
+    client: AsyncClient,
+) -> None:
+    """A second ``POST /refresh`` for the same slug returns 409.
+
+    The first ``POST`` enqueues an active ``keeper_sync_project`` row
+    (status='queued'). The mutex pre-check on the second ``POST``
+    surfaces as ``ConflictError`` → HTTP 409, mirroring the per-org
+    run-uniqueness translation on ``POST /runs``.
+    """
+    await _setup_org(client)
+    await _enable_sync(client, project_slugs=[_LTD_SLUG])
+
+    first = await client.post(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/refresh",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert first.status_code == 202
+
+    second = await client.post(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/refresh",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert second.status_code == 409
+
+    org_id = await _get_org_id()
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                SqlQueueJob.org_id == org_id,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            # Only the first POST left a row; the 409 short-circuited
+            # before any insert.
+            assert len(rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_post_refresh_403_for_non_admin(client: AsyncClient) -> None:
     """A reader-role user gets 403."""
     await _setup_org(client)

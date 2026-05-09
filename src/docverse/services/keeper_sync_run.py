@@ -164,6 +164,14 @@ class KeeperSyncRunService:
         BadRequestError
             If ``ltd_slug`` is not in the org's ``project_slugs``
             allowlist (and the allowlist is not ``"*"``).
+        ConflictError
+            If a ``keeper_sync_project`` job for this ``(org, ltd_slug)``
+            is already queued or in progress. Per-project mutual
+            exclusion: two concurrent ``keeper_sync_project`` jobs for
+            the same slug race through ``_ensure_edition`` and one
+            loses the ``uq_editions_project_lower_slug`` race, so the
+            operator-facing API surfaces the conflict as 409 instead
+            of a worker-side IntegrityError.
         """
         org = await self._org_store.get_by_slug(org_slug)
         if org is None:
@@ -184,6 +192,25 @@ class KeeperSyncRunService:
                 f" allowlist for organization {org_slug!r}"
             )
             raise BadRequestError(msg)
+
+        # Mirrors the per-org run-uniqueness check above (lines
+        # 105-115 for runs): pre-check the per-(org, ltd_slug)
+        # uniqueness before the create, so the caller gets a clean 409
+        # without burning an auto-incremented ID inside a savepoint.
+        # The DB-side partial unique index added in migration
+        # ``add_queue_jobs_keeper_sync_project_active_uq`` is the
+        # authoritative backstop for the rare race where two concurrent
+        # callers both pass this pre-check.
+        if await self._queue_job_store.has_active_for_subject(
+            org_id=org.id,
+            kind=JobKind.keeper_sync_project,
+            subject_label=ltd_slug,
+        ):
+            msg = (
+                f"A keeper-sync job is already running for project "
+                f"{ltd_slug!r}"
+            )
+            raise ConflictError(msg)
 
         queue_job = await self._queue_job_store.create(
             kind=JobKind.keeper_sync_project,

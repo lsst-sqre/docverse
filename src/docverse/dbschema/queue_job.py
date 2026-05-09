@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -93,4 +94,18 @@ class SqlQueueJob(Base):
         Index("idx_queue_jobs_status", "status"),
         Index("idx_queue_jobs_org_id", "org_id"),
         Index("idx_queue_jobs_keeper_sync_run_id", "keeper_sync_run_id"),
+        # Per-project mutex for keeper_sync_project jobs: at most one
+        # queued or in_progress row per (org_id, subject_label). The
+        # partial WHERE means terminal rows do not participate, so a
+        # finished job never blocks a fresh enqueue.
+        Index(
+            "idx_queue_jobs_keeper_sync_project_active_uq",
+            "org_id",
+            "subject_label",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'keeper_sync_project' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
     )

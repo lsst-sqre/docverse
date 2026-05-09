@@ -262,6 +262,37 @@ class QueueJobStore:
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def has_active_for_subject(
+        self,
+        *,
+        org_id: int,
+        kind: JobKind,
+        subject_label: str,
+    ) -> bool:
+        """Return True when an active job for the subject already exists.
+
+        "Active" means ``status IN ('queued', 'in_progress')``. The
+        primary caller is the keeper-sync per-project mutual exclusion
+        gate: ``_enqueue_children`` (run-discovery fan-out),
+        ``_enqueue_tier_project_sync`` (tier crons), and
+        ``KeeperSyncRunService.refresh_project`` (operator-triggered
+        single-project refresh) each pre-check this before enqueuing a
+        ``keeper_sync_project`` job, so two concurrent jobs cannot
+        race through the per-edition INSERT path inside
+        ``_ensure_edition`` and lose the
+        ``uq_editions_project_lower_slug`` race.
+        """
+        stmt = select(SqlQueueJob.id).where(
+            SqlQueueJob.org_id == org_id,
+            SqlQueueJob.kind == kind.value,
+            SqlQueueJob.subject_label == subject_label,
+            SqlQueueJob.status.in_(
+                [JobStatus.queued.value, JobStatus.in_progress.value]
+            ),
+        )
+        result = await self._session.execute(stmt)
+        return result.first() is not None
+
     async def list_by_keeper_sync_run(
         self,
         *,
