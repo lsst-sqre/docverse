@@ -40,8 +40,7 @@ def upgrade() -> None:
         ["org_id", "project_id"],
         unique=True,
         postgresql_where=sa.text(
-            "kind = 'dashboard_build' "
-            "AND status IN ('queued', 'in_progress')"
+            "kind = 'dashboard_build' AND status IN ('queued', 'in_progress')"
         ),
     )
 
