@@ -22,7 +22,7 @@ import respx
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -36,8 +36,10 @@ from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
+from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -50,6 +52,7 @@ from docverse.storage.ltd import LtdNotFoundError
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_backend import ArqQueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
@@ -871,6 +874,113 @@ async def test_keeper_sync_project_publishes_each_edition_per_iteration(
                 assert qj is not None
                 assert qj.kind == JobKind.publish_edition
                 assert qj.keeper_sync_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_dedups_dashboard_build_cascade(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N-edition keeper-sync produces exactly one ``dashboard_build`` row.
+
+    The cascade in ``publish_edition`` calls
+    ``try_enqueue_dashboard_build_by_id`` after every successful publish.
+    Without dedup, an N-edition keeper-sync project would produce N
+    ``dashboard_build`` rows for the same project — one per publish
+    cascade. The per-project gate keyed on ``(org_id, project_id)``
+    collapses the burst to one. This test runs the real
+    ``keeper_sync_project`` worker against a 2-edition fixture and then
+    drives the cascade by calling ``try_enqueue_dashboard_build_by_id``
+    once per publish_edition arq job that the worker enqueued — the
+    same call ``publish_edition`` makes at the end of its success path.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_two_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_jobs) == 2
+
+    # Simulate the per-publish cascade: every publish_edition success
+    # path runs ``try_enqueue_dashboard_build_by_id`` once. The dedup
+    # gate at the service level collapses the burst of N attempts into
+    # exactly one ``dashboard_build`` row.
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            project_id = project.id
+
+        enqueuer = DashboardBuildEnqueuer(
+            org_store=OrganizationStore(session=session, logger=_logger()),
+            project_store=ProjectStore(session=session, logger=_logger()),
+            queue_backend=ArqQueueBackend(
+                arq_queue=mock_arq, default_queue_name="docverse:queue"
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            logger=_logger(),
+        )
+
+        for _ in range(len(publish_jobs)):
+            async with session.begin():
+                await enqueuer.enqueue_for_project(
+                    org_id=org_id, project_id=project_id
+                )
+                await session.commit()
+
+        async with session.begin():
+            rows = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value,
+                    SqlQueueJob.org_id == org_id,
+                    SqlQueueJob.project_id == project_id,
+                )
+            )
+            dashboard_rows = list(rows.scalars().all())
+
+    assert len(dashboard_rows) == 1
 
 
 @pytest.mark.asyncio

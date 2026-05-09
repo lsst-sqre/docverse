@@ -293,6 +293,45 @@ class QueueJobStore:
         result = await self._session.execute(stmt)
         return result.first() is not None
 
+    async def has_active_dashboard_build(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+    ) -> bool:
+        """Return True if an active ``dashboard_build`` exists for the project.
+
+        "Active" means ``kind='dashboard_build'`` and
+        ``status IN ('queued', 'in_progress')`` for the given
+        ``(org_id, project_id)``. Used by
+        :meth:`DashboardBuildEnqueuer.enqueue_for_project` to dedup
+        cascading enqueues — e.g. a keeper-sync project sync that
+        publishes 1000 editions cascades through ``publish_edition``'s
+        post-success ``try_enqueue_dashboard_build_by_id`` and would
+        otherwise produce 1000 redundant ``dashboard_build`` rows for
+        the same project. Once one is queued or in_progress, the gate
+        skips subsequent enqueues until that row reaches a terminal
+        state.
+
+        Sibling to :meth:`has_active_for_subject`, which keys on
+        ``subject_label`` for ``keeper_sync_project`` jobs that have no
+        ``project_id`` foreign key for the LTD-side product. The two
+        methods stay separate rather than a single generalised helper:
+        ``dashboard_build`` rows have a real ``project_id`` column, so
+        keying on it directly is cleaner than going through
+        ``subject_label``.
+        """
+        stmt = select(SqlQueueJob.id).where(
+            SqlQueueJob.kind == JobKind.dashboard_build.value,
+            SqlQueueJob.org_id == org_id,
+            SqlQueueJob.project_id == project_id,
+            SqlQueueJob.status.in_(
+                [JobStatus.queued.value, JobStatus.in_progress.value]
+            ),
+        )
+        result = await self._session.execute(stmt)
+        return result.first() is not None
+
     async def list_by_keeper_sync_run(
         self,
         *,

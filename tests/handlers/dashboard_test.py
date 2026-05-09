@@ -42,6 +42,25 @@ async def test_dashboard_rebuild_returns_202_with_queue_id(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_rebuild_409_when_active_job_exists(
+    client: AsyncClient,
+) -> None:
+    """A second rebuild while one is queued or in flight returns 409."""
+    await _setup(client)
+    first = await client.post(
+        "/docverse/orgs/dash-org/projects/dash-proj/dashboard/rebuild",
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert first.status_code == 202
+
+    second = await client.post(
+        "/docverse/orgs/dash-org/projects/dash-proj/dashboard/rebuild",
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_dashboard_rebuild_404_for_unknown_project(
     client: AsyncClient,
 ) -> None:
@@ -117,6 +136,38 @@ async def test_org_dashboard_rebuild_returns_one_job_per_project(
         assert entry["queue_job_url"].endswith(
             f"/queue/jobs/{entry['queue_job_id']}"
         )
+
+
+@pytest.mark.asyncio
+async def test_org_dashboard_rebuild_skips_projects_with_active_jobs(
+    client: AsyncClient,
+) -> None:
+    """Projects with an active dashboard_build are filtered from the result.
+
+    Operator-facing UX: rebuilding the whole org while one project
+    already has a dashboard_build queued returns N-1 entries (one per
+    project that actually got an enqueue), not N (with one duplicate).
+    """
+    await seed_org_with_admin(client, "dash-org", "admin-user")
+    for slug in ("alpha", "beta", "gamma"):
+        await _create_project(client, "dash-org", slug, admin="admin-user")
+
+    # Pre-seed an active dashboard_build for one project.
+    pre_seed = await client.post(
+        "/docverse/orgs/dash-org/projects/beta/dashboard/rebuild",
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert pre_seed.status_code == 202
+
+    response = await client.post(
+        "/docverse/orgs/dash-org/dashboard/rebuild",
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert isinstance(body, list)
+    slugs = {entry["project_slug"] for entry in body}
+    assert slugs == {"alpha", "gamma"}
 
 
 @pytest.mark.asyncio

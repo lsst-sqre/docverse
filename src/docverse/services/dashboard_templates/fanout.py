@@ -89,6 +89,12 @@ class DashboardRebuildFanout:
             job = await self._enqueuer.enqueue_for_project(
                 org_id=org_id, project_id=project_id
             )
+            if job is None:
+                # Dedup: a dashboard_build is already queued or in
+                # progress for this project. Skip the duplicate; the
+                # in-flight job picks up the new template state when
+                # it runs.
+                continue
             jobs.append(job)
         self._logger.info(
             "Fanned out dashboard rebuilds",

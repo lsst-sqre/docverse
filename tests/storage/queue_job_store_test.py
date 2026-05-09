@@ -757,6 +757,138 @@ async def test_has_active_for_subject_filters_by_org_and_subject(
 
 
 @pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_true_for_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued ``dashboard_build`` matching ``(org, project)`` is active."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_true_for_in_progress_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` ``dashboard_build`` row also counts as active."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.start(job.id)
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_false_for_terminal_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Completed / failed / cancelled rows are not active."""
+    async with db_session.begin():
+        completed = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.start(completed.id)
+        await store.complete(completed.id)
+
+        failed = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.start(failed.id)
+        await store.fail(failed.id)
+
+        cancelled = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.cancel(cancelled.id)
+
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_false_with_no_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """No matching rows for ``(org, project)`` → not active."""
+    async with db_session.begin():
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_filters_by_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row of a different ``kind`` does not count."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.publish_edition,
+            org_id=42,
+            project_id=7,
+        )
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_filters_by_org_and_project(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Differing ``org_id`` or ``project_id`` excludes the row."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        cross_org = await store.has_active_dashboard_build(
+            org_id=99, project_id=7
+        )
+        cross_project = await store.has_active_dashboard_build(
+            org_id=42, project_id=8
+        )
+        await db_session.commit()
+    assert cross_org is False
+    assert cross_project is False
+
+
+@pytest.mark.asyncio
 async def test_fail_orphaned_run_children_scoped_to_run(
     db_session: AsyncSession,
     store: QueueJobStore,

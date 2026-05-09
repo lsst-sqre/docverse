@@ -108,4 +108,19 @@ class SqlQueueJob(Base):
                 "AND status IN ('queued', 'in_progress')"
             ),
         ),
+        # Per-project mutex for dashboard_build jobs: at most one
+        # queued or in_progress row per (org_id, project_id). Backstops
+        # the application-side ``has_active_dashboard_build`` pre-check
+        # in ``DashboardBuildEnqueuer.enqueue_for_project`` against any
+        # race that slips between read and create.
+        Index(
+            "idx_queue_jobs_dashboard_build_active_uq",
+            "org_id",
+            "project_id",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'dashboard_build' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
     )
