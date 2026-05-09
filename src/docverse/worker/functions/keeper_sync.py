@@ -14,7 +14,11 @@ This module owns the ``docverse:sync-queue`` callable surface:
   ``queue_jobs`` lifecycle (``start`` then ``complete`` / ``fail``) and
   recompute run finalisation; the service itself manages the
   state-row + Docverse-row commits inside its own ``session.begin()``
-  blocks.
+  blocks. The publish-enqueue path runs per-edition via an
+  ``on_edition_synced`` callback so a partial-failure mid-sync still
+  publishes everything that succeeded; a tail-end self-heal pass
+  catches editions whose build was already imported but never made it
+  through the publish path.
 
 * ``keeper_sync_tier_main`` / ``_tier_discovery`` / ``_tier_other`` —
   cron-driven steady-state reconcilers that enqueue ``keeper_sync_
@@ -25,6 +29,7 @@ This module owns the ``docverse:sync-queue`` callable surface:
 from __future__ import annotations
 
 import traceback
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
@@ -60,7 +65,10 @@ from docverse.services.keeper_sync.scheduler import (
     should_refresh_main_edition,
     should_refresh_other_edition,
 )
-from docverse.services.keeper_sync.service import ProjectSyncResult
+from docverse.services.keeper_sync.service import (
+    EditionSyncOutcome,
+    ProjectSyncResult,
+)
 from docverse.services.keeper_sync_finalisation import maybe_finalise_run
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.services.publish_enqueue import enqueue_publish_for_edition
@@ -302,16 +310,26 @@ async def keeper_sync_project(
        :meth:`KeeperSyncService.sync_project`. The service runs outside
        any outer ``session.begin()`` so it can manage its own commits
        across LTD HTTP, content copy, and Docverse-side row writes.
-    3. For each finalized ``(edition, build)`` pair the service
-       returned, call
+       The worker passes an ``on_edition_synced`` callback that fires
+       after each :meth:`KeeperSyncService.sync_edition` returns; for
+       freshly-synced (non-short-circuited) builds the callback calls
        :func:`docverse.services.publish_enqueue.enqueue_publish_for_edition`
-       so the publish path runs the same way it does after a normal
-       client upload — KV publish via ``EditionPublishingService.publish``
-       and a cascaded ``dashboard_build`` enqueue. The publish
+       immediately so the publish path runs the same way it does
+       after a normal client upload — KV publish via
+       ``EditionPublishingService.publish`` and a cascaded
+       ``dashboard_build`` enqueue. The publish
        ``QueueJob`` rows carry ``keeper_sync_run_id`` so they roll into
        the parent run's progress counters and ``date_last_activity``.
-       Short-circuited builds (LTD ``date_rebuilt`` unchanged) are
-       skipped — there's no new state to publish.
+       Running publish per-edition (rather than after the entire
+       project sync returns) bounds the blast radius of a mid-sync
+       failure to the edition that was being synced when the failure
+       fired; editions 1..M-1 still get published.
+    3. After the service returns, run the tail-end self-heal pass
+       :func:`_self_heal_unpublished_editions` to catch editions whose
+       short-circuited build is sitting on ``publish_status IS NULL``
+       (e.g. they were imported before this enqueue logic landed). The
+       freshly-synced branch is no longer needed here — it's handled
+       by the per-edition callback.
     4. On success, mark the queue job ``completed``; on a caught
        exception, mark it ``failed`` with structured error details and
        re-raise so arq records the job as failed. Both branches call
@@ -362,10 +380,22 @@ async def keeper_sync_project(
                 service_label=publishing_store_label,
                 ltd_base_url=ltd_base_url,
             )
-            sync_result = await service.sync_project(
-                org_id=org_id, ltd_slug=ltd_slug
+
+            on_edition_synced = _build_on_edition_synced(
+                factory=factory,
+                session=session,
+                queue_job_store=queue_job_store,
+                org_id=org_id,
+                run_id=run_id,
+                logger=logger,
             )
-            await _enqueue_publish_for_finalized_builds(
+
+            sync_result = await service.sync_project(
+                org_id=org_id,
+                ltd_slug=ltd_slug,
+                on_edition_synced=on_edition_synced,
+            )
+            await _self_heal_unpublished_editions(
                 factory=factory,
                 session=session,
                 queue_job_store=queue_job_store,
@@ -402,7 +432,101 @@ async def keeper_sync_project(
     raise RuntimeError(msg)
 
 
-async def _enqueue_publish_for_finalized_builds(  # noqa: PLR0913
+def _build_on_edition_synced(  # noqa: PLR0913
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    logger: structlog.stdlib.BoundLogger,
+) -> Callable[[EditionSyncOutcome], Awaitable[None]]:
+    """Build the ``on_edition_synced`` callback for ``sync_project``.
+
+    Lifting the closure out of ``keeper_sync_project``'s
+    ``async for session in db_session_dependency():`` body sidesteps
+    ruff B023 (the worker function does not actually iterate the
+    generator more than once, but the closure-over-loop-var rule
+    fires anyway).
+    """
+
+    async def callback(outcome: EditionSyncOutcome) -> None:
+        await _enqueue_publish_for_synced_edition(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            outcome=outcome,
+            logger=logger,
+        )
+
+    return callback
+
+
+async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    outcome: EditionSyncOutcome,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Enqueue a publish for one freshly-synced edition's build.
+
+    Runs as the ``on_edition_synced`` callback for
+    :meth:`KeeperSyncService.sync_project`: each successful sync_edition
+    return triggers an immediate publish enqueue so a partial-failure
+    mid-project still publishes the editions that already succeeded.
+
+    Skips when the build was short-circuited (LTD ``date_rebuilt``
+    unchanged) — those editions are handled by
+    :func:`_self_heal_unpublished_editions` on the tail-end pass when
+    their ``publish_status`` is still ``NULL``. Skips when the build
+    outcome is missing or carries no Docverse build id (a no-op edition
+    or a convergence outcome that did not point at a publishable row).
+    """
+    build_outcome = outcome.build_outcome
+    if build_outcome is None:
+        return
+    if build_outcome.short_circuited:
+        return
+    if (
+        build_outcome.docverse_build_id is None
+        or build_outcome.docverse_build_public_id is None
+    ):
+        return
+
+    edition_store = factory.create_edition_store()
+    history_store = factory.create_edition_build_history_store()
+    queue_backend = factory.create_queue_backend()
+
+    await enqueue_publish_for_edition(
+        session=session,
+        edition_store=edition_store,
+        history_store=history_store,
+        queue_job_store=queue_job_store,
+        queue_backend=queue_backend,
+        org_id=org_id,
+        project_id=outcome.docverse_project_id,
+        project_slug=outcome.docverse_project_slug,
+        edition_id=outcome.docverse_edition_id,
+        edition_slug=outcome.docverse_slug,
+        build_id=build_outcome.docverse_build_id,
+        build_public_id=build_outcome.docverse_build_public_id,
+        keeper_sync_run_id=run_id,
+    )
+    logger.info(
+        "Enqueued publish_edition for synced build",
+        edition_slug=outcome.docverse_slug,
+        build_id=build_outcome.docverse_build_id,
+        phase="synced",
+    )
+
+
+async def _self_heal_unpublished_editions(  # noqa: PLR0913
     *,
     factory: Factory,
     session: AsyncSession,
@@ -412,33 +536,31 @@ async def _enqueue_publish_for_finalized_builds(  # noqa: PLR0913
     sync_result: ProjectSyncResult,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Run the publish path for every edition that needs publishing.
+    """Tail-end pass: publish short-circuited editions still unpublished.
 
-    Iterates ``sync_result.edition_outcomes`` and decides per-edition
-    whether to invoke
-    :func:`docverse.services.publish_enqueue.enqueue_publish_for_edition`
-    so KV publish + dashboard rebuild fire just like they do after a
-    normal client upload. Each helper call tags the publish ``QueueJob``
-    row with ``keeper_sync_run_id`` so the publish jobs roll into the
-    parent run's ``GET /runs/{id}/jobs`` listing and progress counters.
+    Iterates ``sync_result.edition_outcomes`` looking for editions whose
+    sync short-circuited (``build_outcome.short_circuited`` is ``True``)
+    *and* whose Docverse-side ``publish_status`` is still ``NULL``. The
+    freshly-synced branch is now handled by
+    :func:`_enqueue_publish_for_synced_edition` as an
+    ``on_edition_synced`` callback — running that path here too would
+    double-publish.
 
-    Two branches:
+    A short-circuit + ``publish_status IS NULL`` edition can arise when:
 
-    * **Freshly-synced build** (``build_outcome.short_circuited`` is
-      ``False``). The sync just finalized a new build for the edition,
-      so a publish must follow.
-    * **Self-heal on short-circuit**. When sync short-circuits on
-      unchanged LTD ``date_rebuilt`` we'd normally skip, but if the
-      edition is sitting on a ``current_build_id`` with
-      ``publish_status IS NULL`` it never made it through the publish
-      path (e.g. the build pre-dates this enqueue logic landing, or a
-      prior publish enqueue was lost). In that case we enqueue a
-      catch-up publish using the edition's already-pointed-at build.
-      Editions whose ``publish_status`` is already ``pending`` /
-      ``published`` / ``failed`` are left alone — a stuck pending
-      publish is the in-flight publisher's problem to resolve, not
-      ours, and a successful or failed prior publish does not need
-      re-running on every reconciliation tick.
+    * The build pre-dates this enqueue logic landing (i.e. it was
+      synced before the per-edition publish path existed).
+    * A prior publish enqueue was lost (Phase B failure between the
+      ``QueueJob`` insert and the arq enqueue).
+
+    Editions whose ``publish_status`` is already ``pending`` /
+    ``published`` / ``failed`` are left alone — a stuck pending publish
+    is the in-flight publisher's problem to resolve, not ours, and a
+    successful or failed prior publish does not need re-running on
+    every reconciliation tick. The tail-end position keeps this pass
+    cheap on the steady-state common case (almost every edition either
+    short-circuited and is already published, or was freshly synced and
+    just got published by the per-edition callback).
     """
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
@@ -450,27 +572,18 @@ async def _enqueue_publish_for_finalized_builds(  # noqa: PLR0913
         build_outcome = outcome.build_outcome
         if build_outcome is None:
             continue
+        if not build_outcome.short_circuited:
+            continue
 
-        if build_outcome.short_circuited:
-            target = await _resolve_self_heal_target(
-                session=session,
-                edition_store=edition_store,
-                project_id=project_id,
-                edition_slug=outcome.docverse_slug,
-            )
-            if target is None:
-                continue
-            build_id, build_public_id = target
-            log_phase = "self_heal"
-        else:
-            if (
-                build_outcome.docverse_build_id is None
-                or build_outcome.docverse_build_public_id is None
-            ):
-                continue
-            build_id = build_outcome.docverse_build_id
-            build_public_id = build_outcome.docverse_build_public_id
-            log_phase = "synced"
+        target = await _resolve_self_heal_target(
+            session=session,
+            edition_store=edition_store,
+            project_id=project_id,
+            edition_slug=outcome.docverse_slug,
+        )
+        if target is None:
+            continue
+        build_id, build_public_id = target
 
         await enqueue_publish_for_edition(
             session=session,
@@ -491,7 +604,7 @@ async def _enqueue_publish_for_finalized_builds(  # noqa: PLR0913
             "Enqueued publish_edition for synced build",
             edition_slug=outcome.docverse_slug,
             build_id=build_id,
-            phase=log_phase,
+            phase="self_heal",
         )
 
 
