@@ -11,6 +11,7 @@ from safir.database import (
     PaginationCursor,
 )
 from sqlalchemy import Select, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -122,21 +123,45 @@ class EditionStore:
         Used for system-created editions like ``__main`` where the slug
         does not conform to the user-facing pattern constraints in
         ``EditionCreate``.
+
+        Race-tolerant: a concurrent transaction that already inserted
+        the same ``(project_id, lower(slug))`` makes this insert a
+        no-op via ``ON CONFLICT DO NOTHING`` against
+        ``uq_editions_project_lower_slug``. The lost-race branch
+        re-fetches the winning row so callers always observe a
+        non-``None`` :class:`Edition`. A naive
+        ``try/except IntegrityError`` would poison the surrounding
+        ``session.begin()`` transaction, so the savepoint-free
+        ``ON CONFLICT`` is the right primitive here.
         """
-        row = SqlEdition(
-            slug=slug,
-            title=title,
-            project_id=project_id,
-            kind=kind,
-            tracking_mode=tracking_mode,
-            tracking_params=tracking_params,
-            alternate_name=alternate_name,
-            lifecycle_exempt=lifecycle_exempt,
+        stmt = (
+            pg_insert(SqlEdition)
+            .values(
+                slug=slug,
+                title=title,
+                project_id=project_id,
+                kind=kind,
+                tracking_mode=tracking_mode,
+                tracking_params=tracking_params,
+                alternate_name=alternate_name,
+                lifecycle_exempt=lifecycle_exempt,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    SqlEdition.project_id,
+                    func.lower(SqlEdition.slug),
+                ],
+            )
         )
-        self._session.add(row)
-        await self._session.flush()
-        await self._session.refresh(row)
-        return self._validate(row, None)
+        await self._session.execute(stmt)
+        existing = await self.get_by_slug(project_id=project_id, slug=slug)
+        if existing is None:
+            msg = (
+                "create_internal lost ON CONFLICT race but no existing "
+                f"edition found for project_id={project_id} slug={slug!r}"
+            )
+            raise RuntimeError(msg)
+        return existing
 
     async def get_by_slug(
         self, *, project_id: int, slug: str
