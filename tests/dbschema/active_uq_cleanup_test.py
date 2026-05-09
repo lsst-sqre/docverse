@@ -26,7 +26,6 @@ from collections.abc import AsyncGenerator
 import pytest
 import pytest_asyncio
 import structlog
-from alembic import command
 from alembic.config import Config
 from safir.database import (
     create_database_engine,
@@ -37,6 +36,7 @@ from safir.database import (
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from alembic import command
 from docverse.config import config
 from docverse.dbschema import Base
 
@@ -71,9 +71,7 @@ async def fresh_engine() -> AsyncGenerator[AsyncEngine]:
         # a state subsequent tests' ``app`` fixtures can reset cleanly.
         await drop_database(engine, Base.metadata)
         async with engine.begin() as conn:
-            await conn.execute(
-                text("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-            )
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await initialize_database(
             engine, logger, schema=Base.metadata, reset=True
         )
@@ -336,10 +334,7 @@ async def test_active_uq_migrations_no_op_on_clean_db(
     async with fresh_engine.connect() as conn:
         failed_count = (
             await conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM queue_jobs"
-                    " WHERE status = 'failed'"
-                )
+                text("SELECT COUNT(*) FROM queue_jobs WHERE status = 'failed'")
             )
         ).scalar_one()
         assert failed_count == 0
@@ -355,7 +350,5 @@ async def test_active_uq_migrations_no_op_on_clean_db(
                 )
             ).all()
         }
-        assert (
-            "idx_queue_jobs_keeper_sync_project_active_uq" in idx_names
-        )
+        assert "idx_queue_jobs_keeper_sync_project_active_uq" in idx_names
         assert "idx_queue_jobs_dashboard_build_active_uq" in idx_names
