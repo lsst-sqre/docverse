@@ -17,6 +17,16 @@ which carries final state. The pre-check in ``enqueue_for_project`` is
 the primary gate; this index is the hard backstop for any race that
 slips between read and create.
 
+Embeds a one-shot data cleanup before the ``CREATE INDEX`` for the same
+reason as ``t8u9v0w1x2y3``: any duplicate active rows that accumulated
+under the pre-dedup code path would otherwise block the
+``CREATE UNIQUE INDEX`` with ``UniqueViolationError``. The cleanup keeps
+``MAX(id)`` per ``(org_id, project_id)`` group and marks the older
+siblings ``status='failed', date_completed=NOW()``, mirroring the
+reaper's failure semantics in ``QueueJobStore.fail_job``. Idempotent: on
+a clean DB the ``UPDATE`` matches zero rows. ``downgrade()`` only drops
+the index — the ``UPDATE`` is non-reversible.
+
 Revision ID: u9v0w1x2y3z4
 Revises: t8u9v0w1x2y3
 Create Date: 2026-05-09 00:00:00.000000+00:00
@@ -34,6 +44,26 @@ depends_on: str | None = None
 
 
 def upgrade() -> None:
+    op.execute(
+        """
+        WITH dups AS (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY org_id, project_id
+                       ORDER BY id DESC
+                   ) AS rn
+              FROM queue_jobs
+             WHERE kind = 'dashboard_build'
+               AND status IN ('queued', 'in_progress')
+        )
+        UPDATE queue_jobs
+           SET status = 'failed',
+               date_completed = NOW()
+          FROM dups
+         WHERE queue_jobs.id = dups.id
+           AND dups.rn > 1
+        """
+    )
     op.create_index(
         "idx_queue_jobs_dashboard_build_active_uq",
         "queue_jobs",

@@ -15,6 +15,19 @@ pre-checks at the three enqueue sites (``_enqueue_children``,
 are the primary gate; this index is the hard backstop in case a race
 slips between pre-check and create.
 
+Embeds a one-shot data cleanup before the ``CREATE INDEX``: any
+duplicate active rows that accumulated under the pre-mutex code path —
+the staging deploy at revision ``s7t8u9v0w1x2`` failed creating this
+index because two ``(org_id=2, subject_label='phalanx')`` rows were
+already in flight — would otherwise block the ``CREATE UNIQUE INDEX``
+with ``UniqueViolationError``. The cleanup keeps ``MAX(id)`` per
+``(org_id, subject_label)`` group and marks the older siblings
+``status='failed', date_completed=NOW()``, mirroring the reaper's
+failure semantics in ``QueueJobStore.fail_job``. Idempotent: on a clean
+DB the ``UPDATE`` matches zero rows. ``downgrade()`` only drops the
+index — the ``UPDATE`` is non-reversible (the original ``in_progress``
+state is gone the moment a worker actually picked the row up).
+
 Revision ID: t8u9v0w1x2y3
 Revises: s7t8u9v0w1x2
 Create Date: 2026-05-09 00:00:00.000000+00:00
@@ -32,6 +45,26 @@ depends_on: str | None = None
 
 
 def upgrade() -> None:
+    op.execute(
+        """
+        WITH dups AS (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY org_id, subject_label
+                       ORDER BY id DESC
+                   ) AS rn
+              FROM queue_jobs
+             WHERE kind = 'keeper_sync_project'
+               AND status IN ('queued', 'in_progress')
+        )
+        UPDATE queue_jobs
+           SET status = 'failed',
+               date_completed = NOW()
+          FROM dups
+         WHERE queue_jobs.id = dups.id
+           AND dups.rn > 1
+        """
+    )
     op.create_index(
         "idx_queue_jobs_keeper_sync_project_active_uq",
         "queue_jobs",
