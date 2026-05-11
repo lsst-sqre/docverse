@@ -91,6 +91,15 @@ class KeeperSyncRun(BaseModel):
 
     self_url: str = Field(description="URL to this run resource.")
 
+    jobs_url: HttpUrl = Field(
+        description=(
+            "URL to ``GET`` for the run's child queue-job listing"
+            " (``get_org_keeper_sync_run_jobs``). Always present so"
+            " clients can paginate the run's children without"
+            " constructing the URL by hand."
+        )
+    )
+
     id: int = Field(description="Numeric identifier for the run.")
 
     kind: KeeperSyncRunKind = Field(description="Kind of run.")

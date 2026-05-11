@@ -62,6 +62,15 @@ class KeeperSyncRun(_KeeperSyncRunBase):
                     run_id=run.id,
                 )
             ),
+            jobs_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "get_org_keeper_sync_run_jobs",
+                        org=org_slug,
+                        run_id=run.id,
+                    )
+                )
+            ),
             id=run.id,
             kind=KeeperSyncRunKind(run.kind),
             status=KeeperSyncRunStatus(run.status),

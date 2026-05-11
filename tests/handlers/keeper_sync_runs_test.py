@@ -118,6 +118,11 @@ async def test_post_run_returns_202_with_run_and_queue_job_link(
     assert body["run"]["failed_count"] == 0
     assert body["run"]["total_count"] == 1
     assert "self_url" in body["run"]
+    assert body["run"]["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{body['run']['id']}/jobs"
+        )
+    )
     assert "queue_job_url" in body
     assert body["queue_job_id"]
     assert body["queue_job_url"].endswith(
@@ -208,6 +213,11 @@ async def test_get_run_returns_aggregate_counters(
     # date_last_activity reflects the MAX(coalesce(...)) across the
     # children and is non-null because the run has attributed jobs.
     assert body["date_last_activity"] is not None
+    assert body["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs"
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -412,6 +422,16 @@ async def test_list_runs_returns_per_run_counters(
     assert runs[run_b_id]["succeeded_count"] == 0
     assert runs[run_b_id]["failed_count"] == 1
     assert runs[run_b_id]["total_count"] == 1
+    assert runs[run_a_id]["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_a_id}/jobs"
+        )
+    )
+    assert runs[run_b_id]["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b_id}/jobs"
+        )
+    )
 
 
 @pytest.mark.asyncio
