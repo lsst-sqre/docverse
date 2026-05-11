@@ -17,12 +17,14 @@ from docverse.handlers.params import OrgSlugParam
 from docverse.handlers.queue.models import QueueJob
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
+    KEEPER_SYNC_EDITION_CURSOR_TYPE,
     KEEPER_SYNC_RUN_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
     QUEUE_JOB_CURSOR_TYPE,
 )
 
 from .keeper_sync_models import (
+    KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
     KeeperSyncProjectStatus,
     KeeperSyncRun,
@@ -127,6 +129,67 @@ async def get_org_keeper_sync_project_status(
             include_ltd_diff=ltd,
         )
     return KeeperSyncProjectStatus.from_domain(result, context.request)
+
+
+@router.get(
+    "/orgs/{org}/keeper-sync/projects/{ltd_slug}/editions",
+    response_model=list[KeeperSyncEditionStatus],
+    summary="List Docverse editions for one keeper-sync project",
+    name="get_org_keeper_sync_project_editions",
+)
+async def get_org_keeper_sync_project_editions(  # noqa: PLR0913
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    ltd_slug: Annotated[
+        str,
+        Path(description="LTD project slug to list editions for."),
+    ],
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+) -> list[KeeperSyncEditionStatus]:
+    parsed_cursor = (
+        KEEPER_SYNC_EDITION_CURSOR_TYPE.from_str(cursor)
+        if cursor is not None
+        else None
+    )
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_project_service()
+        result = await service.list_project_editions(
+            org_slug=org_slug,
+            ltd_slug=ltd_slug,
+            cursor=parsed_cursor,
+            limit=limit,
+        )
+    context.response.headers["Link"] = result.page.link_header(
+        context.request.url
+    )
+    context.response.headers["X-Total-Count"] = str(result.page.count)
+    return [
+        KeeperSyncEditionStatus.from_domain(
+            edition,
+            result.state_by_docverse_id.get(edition.id),
+            context.request,
+            result.org_slug,
+            result.docverse_project_slug,
+        )
+        for edition in result.page.entries
+    ]
 
 
 @router.post(

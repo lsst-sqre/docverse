@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import structlog
+from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.client.models import (
     KeeperSyncEditionDiff,
@@ -56,9 +57,11 @@ from docverse.storage.keeper_sync import (
 )
 from docverse.storage.ltd.client import LtdClient, LtdClientError
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.pagination import KeeperSyncEditionSlugCursor
 from docverse.storage.project_store import ProjectStore
 
 __all__ = [
+    "KeeperSyncEditionListResult",
     "KeeperSyncEditionStatusRow",
     "KeeperSyncProjectService",
     "KeeperSyncProjectStatusResult",
@@ -86,7 +89,10 @@ class KeeperSyncProjectStatusResult:
 
     Carries everything the handler needs to compose the API response —
     including the resolved Docverse project slug so the handler can
-    build per-edition URLs without re-issuing a project lookup.
+    build per-edition URLs without re-issuing a project lookup. The
+    full edition list is intentionally not embedded; operators
+    paginate through it via the
+    ``get_org_keeper_sync_project_editions`` endpoint.
     """
 
     org_slug: str
@@ -94,8 +100,23 @@ class KeeperSyncProjectStatusResult:
     docverse_project_slug: str | None
     project_state: KeeperSyncProjectStateSummary | None
     tier_status: list[KeeperSyncTierStatus]
-    edition_rows: list[KeeperSyncEditionStatusRow]
+    main_edition_row: KeeperSyncEditionStatusRow | None
     edition_diff: KeeperSyncEditionDiff | None
+
+
+@dataclass(frozen=True, slots=True)
+class KeeperSyncEditionListResult:
+    """Handler-agnostic result for the paginated editions collection.
+
+    Wraps the storage layer's ``CountedPaginatedList`` plus the
+    resolved Docverse project slug so the handler can mint per-edition
+    URLs without re-issuing a project lookup.
+    """
+
+    org_slug: str
+    docverse_project_slug: str
+    page: CountedPaginatedList[Edition, PaginationCursor[Edition]]
+    state_by_docverse_id: dict[int, KeeperSyncState]
 
 
 class LtdClientFactory(Protocol):
@@ -178,10 +199,7 @@ class KeeperSyncProjectService:
         )
         tier_status = _explain_all_tiers(state=project_state, now=now)
 
-        # ``keeper_sync_state`` has no project_id column, so scope the
-        # edition state rows by walking through Docverse's editions
-        # for this project (whose ``project_id`` is the linkage).
-        edition_rows: list[KeeperSyncEditionStatusRow] = []
+        main_edition_row: KeeperSyncEditionStatusRow | None = None
         product_state_rows: list[KeeperSyncState] = []
         docverse_project_slug: str | None = None
         docverse_project_id = (
@@ -191,13 +209,20 @@ class KeeperSyncProjectService:
             project = await self._project_store.get_by_id(docverse_project_id)
             if project is not None:
                 docverse_project_slug = project.slug
-                (
-                    edition_rows,
-                    product_state_rows,
-                ) = await self._list_edition_rows_and_state(
+                main_edition_row = await self._lookup_main_edition_row(
                     org_id=org.id,
                     docverse_project_id=docverse_project_id,
                 )
+                # The LTD diff path scopes state rows to this project
+                # via the editions.project_id linkage, so walk the
+                # full edition list only when ``?ltd=true`` actually
+                # needs it. The default response no longer pays this
+                # cost.
+                if include_ltd_diff:
+                    product_state_rows = await self._scoped_edition_states(
+                        org_id=org.id,
+                        docverse_project_id=docverse_project_id,
+                    )
 
         edition_diff: KeeperSyncEditionDiff | None = None
         if include_ltd_diff:
@@ -213,47 +238,160 @@ class KeeperSyncProjectService:
             docverse_project_slug=docverse_project_slug,
             project_state=_summarise_project_state(project_state),
             tier_status=tier_status,
-            edition_rows=edition_rows,
+            main_edition_row=main_edition_row,
             edition_diff=edition_diff,
         )
 
-    async def _list_edition_rows_and_state(
+    async def list_project_editions(
         self,
         *,
-        org_id: int,
-        docverse_project_id: int,
-    ) -> tuple[list[KeeperSyncEditionStatusRow], list[KeeperSyncState]]:
-        """Return raw Docverse editions paired with their state rows.
+        org_slug: str,
+        ltd_slug: str,
+        cursor: KeeperSyncEditionSlugCursor | None,
+        limit: int,
+    ) -> KeeperSyncEditionListResult:
+        """Return a paginated page of editions for one keeper-sync project.
 
-        Single batched ``list_for_org`` query plus an in-memory map
-        keyed on ``docverse_id`` keeps this O(1) round-trip on the
-        keeper-sync side rather than O(N) per edition. Also returns
-        the scoped state rows so the caller can compute an LTD diff
-        without re-issuing the query.
+        Backs ``GET /orgs/{org}/keeper-sync/projects/{ltd_slug}/
+        editions``. Enforces the same enable/allowlist 404 gate as
+        :meth:`get_project_status`. When the Docverse project does not
+        yet exist for the LTD slug, returns an empty page (rather than
+        404) — the slug is sync-eligible, it just has no editions yet.
+
+        Raises
+        ------
+        NotFoundError
+            If the org does not exist, LTD sync is disabled on it, or
+            ``ltd_slug`` is not in the configured ``project_slugs``
+            allowlist (and the allowlist is not ``"*"``).
         """
-        editions = await self._edition_store.list_all_by_project(
-            docverse_project_id
+        org = await self._org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        config = org.keeper_sync_config
+        if config is None or not config.enabled:
+            msg = (
+                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
+            )
+            raise NotFoundError(msg)
+        if (
+            config.project_slugs != "*"
+            and ltd_slug not in config.project_slugs
+        ):
+            msg = (
+                f"LTD slug {ltd_slug!r} is not in the project_slugs"
+                f" allowlist for organization {org_slug!r}"
+            )
+            raise NotFoundError(msg)
+
+        project_state = await self._state_store.get(
+            org_id=org.id,
+            resource_type=ResourceType.project,
+            ltd_slug=ltd_slug,
         )
-        if not editions:
-            return [], []
+        docverse_project_id = (
+            project_state.docverse_id if project_state else None
+        )
+        docverse_project_slug: str | None = None
+        if docverse_project_id is not None:
+            project = await self._project_store.get_by_id(docverse_project_id)
+            if project is not None:
+                docverse_project_slug = project.slug
+        if docverse_project_id is None or docverse_project_slug is None:
+            return KeeperSyncEditionListResult(
+                org_slug=org_slug,
+                docverse_project_slug="",
+                page=CountedPaginatedList(
+                    entries=[],
+                    next_cursor=None,
+                    prev_cursor=None,
+                    count=0,
+                ),
+                state_by_docverse_id={},
+            )
+
+        page = await self._edition_store.list_by_project(
+            docverse_project_id,
+            cursor_type=KeeperSyncEditionSlugCursor,
+            cursor=cursor,
+            limit=limit,
+        )
         edition_states = await self._state_store.list_for_org(
-            org_id=org_id, resource_type=ResourceType.edition
+            org_id=org.id, resource_type=ResourceType.edition
         )
         state_by_docverse_id: dict[int, KeeperSyncState] = {
             state.docverse_id: state
             for state in edition_states
             if state.docverse_id is not None
         }
-        results: list[KeeperSyncEditionStatusRow] = []
-        scoped_state_rows: list[KeeperSyncState] = []
-        for edition in editions:
-            state = state_by_docverse_id.get(edition.id)
-            if state is not None:
-                scoped_state_rows.append(state)
-            results.append(
-                KeeperSyncEditionStatusRow(edition=edition, state=state)
-            )
-        return results, scoped_state_rows
+        return KeeperSyncEditionListResult(
+            org_slug=org_slug,
+            docverse_project_slug=docverse_project_slug,
+            page=page,
+            state_by_docverse_id=state_by_docverse_id,
+        )
+
+    async def _lookup_main_edition_row(
+        self,
+        *,
+        org_id: int,
+        docverse_project_id: int,
+    ) -> KeeperSyncEditionStatusRow | None:
+        """Return the project's ``__main`` edition + its state row.
+
+        The ``ck_editions_main_slug_kind`` constraint makes ``kind ==
+        EditionKind.main`` <=> ``slug == "__main"``, so a single slug
+        lookup is sufficient. Returns ``None`` when no main edition
+        has been created yet for the project (atypical — every
+        project gets an auto-created ``__main`` on creation, but the
+        method tolerates the gap defensively). The state-row lookup
+        scans the org-wide edition state rows once and filters
+        in-memory to avoid adding a single-purpose
+        ``get_by_docverse_id`` to the state store.
+        """
+        edition = await self._edition_store.get_by_slug(
+            project_id=docverse_project_id, slug="__main"
+        )
+        if edition is None:
+            return None
+        edition_states = await self._state_store.list_for_org(
+            org_id=org_id, resource_type=ResourceType.edition
+        )
+        state = next(
+            (row for row in edition_states if row.docverse_id == edition.id),
+            None,
+        )
+        return KeeperSyncEditionStatusRow(edition=edition, state=state)
+
+    async def _scoped_edition_states(
+        self,
+        *,
+        org_id: int,
+        docverse_project_id: int,
+    ) -> list[KeeperSyncState]:
+        """Return keeper-sync edition state rows scoped to one project.
+
+        ``keeper_sync_state`` has no ``project_id`` column, so scope
+        the rows by walking through Docverse's editions for this
+        project (whose ``project_id`` is the linkage) and filtering
+        the org-wide state rows by ``docverse_id``. Only called on
+        the ``?ltd=true`` path so the default GET stays cheap.
+        """
+        editions = await self._edition_store.list_all_by_project(
+            docverse_project_id
+        )
+        if not editions:
+            return []
+        edition_ids = {edition.id for edition in editions}
+        edition_states = await self._state_store.list_for_org(
+            org_id=org_id, resource_type=ResourceType.edition
+        )
+        return [
+            state
+            for state in edition_states
+            if state.docverse_id in edition_ids
+        ]
 
     async def _compute_edition_diff(
         self,

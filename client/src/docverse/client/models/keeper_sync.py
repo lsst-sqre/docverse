@@ -382,6 +382,16 @@ class KeeperSyncProjectStatus(BaseModel):
         )
     )
 
+    editions_sync_url: HttpUrl = Field(
+        description=(
+            "URL to ``GET`` for the paginated keeper-sync editions"
+            " collection for this project"
+            " (``get_org_keeper_sync_project_editions``). Always"
+            " present so operators can scan the full edition list"
+            " without constructing the URL by hand."
+        )
+    )
+
     ltd_slug: str = Field(
         description="LTD product slug the report is scoped to."
     )
@@ -401,12 +411,15 @@ class KeeperSyncProjectStatus(BaseModel):
         )
     )
 
-    editions: list[KeeperSyncEditionStatus] = Field(
-        default_factory=list,
+    main_edition: KeeperSyncEditionStatus | None = Field(
+        default=None,
         description=(
-            "Docverse-side editions of the project, left-joined with"
-            " ``keeper_sync_state`` rows on ``docverse_id``. Empty"
-            " when ``project_state`` is ``null``."
+            "Embedded summary of the project's ``__main`` edition"
+            " (``kind=main``), left-joined with its keeper-sync state"
+            " row. ``null`` when no Docverse project exists yet for"
+            " this LTD slug, or when the project has not yet been"
+            " auto-created with a ``__main`` edition. The full"
+            " edition list is paginated via ``editions_sync_url``."
         ),
     )
 

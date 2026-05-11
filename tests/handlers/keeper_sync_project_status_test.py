@@ -275,6 +275,7 @@ async def test_get_status_stub_when_no_state_row(
     assert response.status_code == 200
     body = response.json()
     assert "org_slug" not in body
+    assert "editions" not in body
     assert body["org_url"] == str(
         client.base_url.join(f"/docverse/orgs/{_ORG}")
     )
@@ -284,9 +285,14 @@ async def test_get_status_stub_when_no_state_row(
             f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/refresh"
         )
     )
+    assert body["editions_sync_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/editions"
+        )
+    )
     assert body["ltd_slug"] == _LTD_SLUG
     assert body["project_state"] is None
-    assert body["editions"] == []
+    assert body["main_edition"] is None
     assert body.get("edition_diff") is None
     cohorts = {entry["tier"]: entry["cohort"] for entry in body["tier_status"]}
     assert cohorts == {
@@ -374,14 +380,18 @@ async def test_get_status_full_body_for_synced_project(
             f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/refresh"
         )
     )
-    assert "org_slug" not in body
-
-    # Editions list should at least include the auto-created __main.
-    assert len(body["editions"]) >= 1
-    main_edition = next(
-        (e for e in body["editions"] if e["kind"] == "main"), None
+    assert body["editions_sync_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/editions"
+        )
     )
+    assert "org_slug" not in body
+    assert "editions" not in body
+
+    # The embedded ``__main`` summary replaces the old editions list.
+    main_edition = body["main_edition"]
     assert main_edition is not None
+    assert main_edition["kind"] == "main"
     assert "docverse_edition_id" not in main_edition
     assert "docverse_slug" not in main_edition
     assert "docverse_kind" not in main_edition
@@ -446,9 +456,9 @@ async def test_get_status_edition_left_joins_state_row(
             f"/docverse/orgs/{_ORG}/projects/{_LTD_SLUG}/editions/__main"
         )
     )
-    main_edition = next(
-        e for e in body["editions"] if e["edition_url"] == expected_main_url
-    )
+    main_edition = body["main_edition"]
+    assert main_edition is not None
+    assert main_edition["edition_url"] == expected_main_url
     assert main_edition["kind"] == "main"
     assert main_edition["slug"] == "__main"
     assert main_edition["ltd_id"] == 42

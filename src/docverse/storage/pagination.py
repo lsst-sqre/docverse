@@ -33,6 +33,7 @@ __all__ = [
     "DEFAULT_PAGE_LIMIT",
     "EDITION_CURSOR_TYPES",
     "EDITION_HISTORY_CURSOR_TYPE",
+    "KEEPER_SYNC_EDITION_CURSOR_TYPE",
     "KEEPER_SYNC_RUN_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
@@ -43,6 +44,7 @@ __all__ = [
     "EditionDateUpdatedCursor",
     "EditionSlugCursor",
     "EditionSortOrder",
+    "KeeperSyncEditionSlugCursor",
     "KeeperSyncRunDateStartedCursor",
     "ProjectDateCreatedCursor",
     "ProjectSearchCursor",
@@ -169,6 +171,83 @@ class EditionSlugCursor(PaginationCursor[Edition]):
     def __str__(self) -> str:  # noqa: D105
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.slug}"
+
+
+@dataclass(slots=True)
+class KeeperSyncEditionSlugCursor(PaginationCursor[Edition]):
+    """Keyset cursor for editions ordered by slug ASC, id ASC.
+
+    Used by the keeper-sync per-project editions collection so an
+    operator paginating with the default lexicographic ordering can
+    scan through `__main` first, then alphabetically. The id tiebreaker
+    is defensive: ``uq_editions_project_lower_slug`` makes the slug
+    unique per project today, but the composite keeps pagination
+    stable if that invariant is ever relaxed (e.g. case-sensitive
+    duplicates).
+    """
+
+    slug: str
+    id: int
+
+    @override
+    @classmethod
+    def from_entry(cls, entry: Edition, *, reverse: bool = False) -> Self:
+        return cls(slug=entry.slug, id=entry.id, previous=reverse)
+
+    @override
+    @classmethod
+    def from_str(cls, cursor: str) -> Self:
+        try:
+            previous = cursor.startswith("p__")
+            raw = cursor[3:] if previous else cursor
+            slug, id_str = raw.rsplit(":", 1)
+            return cls(slug=slug, id=int(id_str), previous=previous)
+        except (ValueError, TypeError) as exc:
+            msg = f"Invalid cursor: {cursor!r}"
+            raise InvalidCursorError(msg) from exc
+
+    @override
+    @classmethod
+    def apply_order(
+        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[tuple[Any, ...]]:
+        if reverse:
+            return stmt.order_by(SqlEdition.slug.desc(), SqlEdition.id.desc())
+        return stmt.order_by(SqlEdition.slug, SqlEdition.id)
+
+    @override
+    def apply_cursor(
+        self, stmt: Select[tuple[Any, ...]]
+    ) -> Select[tuple[Any, ...]]:
+        if self.previous:
+            return stmt.where(
+                or_(
+                    SqlEdition.slug < self.slug,
+                    and_(
+                        SqlEdition.slug == self.slug,
+                        SqlEdition.id < self.id,
+                    ),
+                )
+            )
+        return stmt.where(
+            or_(
+                SqlEdition.slug > self.slug,
+                and_(
+                    SqlEdition.slug == self.slug,
+                    SqlEdition.id >= self.id,
+                ),
+            )
+        )
+
+    @override
+    def invert(self) -> Self:
+        return type(self)(
+            slug=self.slug, id=self.id, previous=not self.previous
+        )
+
+    def __str__(self) -> str:  # noqa: D105
+        prefix = "p__" if self.previous else ""
+        return f"{prefix}{self.slug}:{self.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +494,10 @@ EDITION_CURSOR_TYPES: dict[
 }
 
 BUILD_CURSOR_TYPE: type[BuildDateCreatedCursor] = BuildDateCreatedCursor
+
+KEEPER_SYNC_EDITION_CURSOR_TYPE: type[KeeperSyncEditionSlugCursor] = (
+    KeeperSyncEditionSlugCursor
+)
 
 KEEPER_SYNC_RUN_CURSOR_TYPE: type[KeeperSyncRunDateStartedCursor] = (
     KeeperSyncRunDateStartedCursor

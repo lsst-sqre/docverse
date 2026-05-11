@@ -174,10 +174,12 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
         ``project_url`` is ``None`` when no Docverse project has been
         imported yet for this LTD slug — i.e. when the project-resource
         ``keeper_sync_state`` row is missing or its ``docverse_id`` is
-        ``None``. ``org_url`` and ``sync_refresh_url`` are always
-        populated.
+        ``None``. ``main_edition`` is ``None`` under the same condition
+        and also when the project has no ``__main`` edition yet.
+        ``org_url``, ``sync_refresh_url``, and ``editions_sync_url``
+        are always populated.
         """
-        editions: list[_KeeperSyncEditionStatusBase] = []
+        main_edition: _KeeperSyncEditionStatusBase | None = None
         project_url: HttpUrl | None = None
         if result.docverse_project_slug is not None:
             project_url = HttpUrl(
@@ -189,16 +191,14 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
                     )
                 )
             )
-            editions = [
-                KeeperSyncEditionStatus.from_domain(
-                    row.edition,
-                    row.state,
+            if result.main_edition_row is not None:
+                main_edition = KeeperSyncEditionStatus.from_domain(
+                    result.main_edition_row.edition,
+                    result.main_edition_row.state,
                     request,
                     result.org_slug,
                     result.docverse_project_slug,
                 )
-                for row in result.edition_rows
-            ]
         return cls(
             org_url=HttpUrl(
                 str(request.url_for("get_organization", org=result.org_slug))
@@ -213,9 +213,18 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
                     )
                 )
             ),
+            editions_sync_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "get_org_keeper_sync_project_editions",
+                        org=result.org_slug,
+                        ltd_slug=result.ltd_slug,
+                    )
+                )
+            ),
             ltd_slug=result.ltd_slug,
             project_state=result.project_state,
             tier_status=result.tier_status,
-            editions=editions,
+            main_edition=main_edition,
             edition_diff=result.edition_diff,
         )
