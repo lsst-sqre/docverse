@@ -167,6 +167,146 @@ async def test_reaper_skips_runs_with_recent_activity(
             assert run.status == KeeperSyncRunStatus.in_progress
 
 
+async def _seed_silent_tier_cron(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    subject_label: str,
+    started_minutes_ago: int,
+) -> int:
+    """Create a run-less keeper_sync_project row stuck ``in_progress``."""
+    queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+    job = await queue_job_store.create(
+        kind=JobKind.keeper_sync_project,
+        org_id=org_id,
+        keeper_sync_run_id=None,
+        subject_label=subject_label,
+        backend_job_id=f"arq-tc-silent-{subject_label}",
+    )
+    await queue_job_store.start(job.id)
+    row = await db_session.get(SqlQueueJob, job.id)
+    assert row is not None
+    row.date_started = datetime.now(tz=UTC) - timedelta(
+        minutes=started_minutes_ago
+    )
+    await db_session.flush()
+    return job.id
+
+
+async def _seed_orphan_tier_cron(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    subject_label: str,
+    created_minutes_ago: int,
+) -> int:
+    """Create a run-less keeper_sync_project orphan (queued, no backend id)."""
+    queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+    job = await queue_job_store.create(
+        kind=JobKind.keeper_sync_project,
+        org_id=org_id,
+        keeper_sync_run_id=None,
+        subject_label=subject_label,
+    )
+    row = await db_session.get(SqlQueueJob, job.id)
+    assert row is not None
+    row.date_created = datetime.now(tz=UTC) - timedelta(
+        minutes=created_minutes_ago
+    )
+    await db_session.flush()
+    return job.id
+
+
+@pytest.mark.asyncio
+async def test_reaper_handles_tier_cron_and_run_attributed_rows_together(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """One reaper tick reaps tier-cron silent, tier-cron orphan, and run rows.
+
+    Models the production wedge observed on phalanx: tier-cron-enqueued
+    ``keeper_sync_project`` rows (no run attribution) stuck in
+    ``in_progress`` or ``queued`` indefinitely, alongside the existing
+    run-attributed silent path. All three must transition to ``failed``
+    with the right ``errors.type`` tag in a single transaction.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-reaper-tc")
+        run_id = await _seed_run(db_session, org_id=org_id)
+        # Run-attributed stuck child (existing path).
+        run_attrib_id = await _seed_stuck_child(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="arq-stuck-run",
+            started_minutes_ago=600,
+        )
+        # Tier-cron silent (in_progress, no run).
+        silent_id = await _seed_silent_tier_cron(
+            db_session,
+            org_id=org_id,
+            subject_label="phalanx",
+            started_minutes_ago=600,
+        )
+        # Tier-cron orphan (queued, no run, no backend id).
+        orphan_id = await _seed_orphan_tier_cron(
+            db_session,
+            org_id=org_id,
+            subject_label="pipelines",
+            created_minutes_ago=10,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        await keeper_sync_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+
+            run_attrib = await qj_store.get(run_attrib_id)
+            assert run_attrib is not None
+            assert run_attrib.status == JobStatus.failed
+            assert run_attrib.errors is not None
+            assert run_attrib.errors["type"] == "SilentWorker"
+
+            silent = await qj_store.get(silent_id)
+            assert silent is not None
+            assert silent.status == JobStatus.failed
+            assert silent.errors is not None
+            assert silent.errors["type"] == "SilentTierCronJob"
+
+            orphan = await qj_store.get(orphan_id)
+            assert orphan is not None
+            assert orphan.status == JobStatus.failed
+            assert orphan.errors is not None
+            assert orphan.errors["type"] == "OrphanedTierCronJob"
+
+            # Run-attributed reap still rolls the parent up.
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+
+            # Per-subject mutex unblocked for both tier-cron subjects, so
+            # the next tier-cron tick can enqueue a fresh job.
+            silent_active = await qj_store.has_active_for_subject(
+                org_id=org_id,
+                kind=JobKind.keeper_sync_project,
+                subject_label="phalanx",
+            )
+            orphan_active = await qj_store.has_active_for_subject(
+                org_id=org_id,
+                kind=JobKind.keeper_sync_project,
+                subject_label="pipelines",
+            )
+            assert silent_active is False
+            assert orphan_active is False
+
+
 @pytest.mark.asyncio
 async def test_reaper_finalises_each_distinct_parent_run(
     app: None,

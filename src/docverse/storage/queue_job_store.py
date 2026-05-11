@@ -408,6 +408,113 @@ class QueueJobStore:
             await self._session.flush()
         return reaped
 
+    async def fail_silent_tier_cron_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail run-less ``keeper_sync_project`` rows stuck ``in_progress``.
+
+        Tier-cron-enqueued ``keeper_sync_project`` rows
+        (``keeper_sync_run_id IS NULL``) have no run finalisation hook
+        to roll them up, so :meth:`fail_silent_run_children` (which is
+        scoped to ``keeper_sync_run_id IS NOT NULL``) cannot reach
+        them. A worker that's OOM-killed mid-job leaves the row stuck
+        in ``in_progress`` indefinitely, and the
+        :meth:`has_active_for_subject` mutex consulted by
+        ``_enqueue_tier_project_sync`` keeps observing the stale row
+        and skips enqueue forever — wedging that project's tier-cron
+        sync. This method is the matching reaper.
+
+        Scoped narrowly: ``kind='keeper_sync_project'``,
+        ``keeper_sync_run_id IS NULL``, ``status='in_progress'``,
+        ``date_completed IS NULL``, and ``date_started`` older than
+        ``now - idle_after``. Run-attributed rows are explicitly out
+        of scope (handled by :meth:`fail_silent_run_children`).
+        Reaped rows carry ``errors.type='SilentTierCronJob'`` so
+        postmortems can distinguish tier-cron reaps from
+        run-attributed reaps.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+            SqlQueueJob.keeper_sync_run_id.is_(None),
+            SqlQueueJob.status == JobStatus.in_progress.value,
+            SqlQueueJob.date_completed.is_(None),
+            SqlQueueJob.date_started.is_not(None),
+            SqlQueueJob.date_started < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        reaped: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Reaped by keeper_sync_reaper: tier-cron "
+                    "keeper_sync_project worker went silent while job "
+                    "was in_progress (likely OOM-killed or lost by arq)"
+                ),
+                "type": "SilentTierCronJob",
+            }
+            reaped.append(QueueJob.model_validate(row, from_attributes=True))
+        if reaped:
+            await self._session.flush()
+        return reaped
+
+    async def fail_orphaned_tier_cron_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail run-less ``keeper_sync_project`` rows that never reached arq.
+
+        Sibling of :meth:`fail_orphaned_run_children` for tier-cron
+        enqueues. ``_enqueue_tier_project_sync`` commits the
+        ``queue_jobs`` row before calling ``arq_queue.enqueue``, so a
+        worker crash in that window leaves an orphan
+        (``status='queued'``, ``backend_job_id IS NULL``). Without a
+        ``keeper_sync_run_id``, the run-scoped orphan reaper can't see
+        it, and the :meth:`has_active_for_subject` mutex keeps the
+        stale row alive so the next tick skips enqueue.
+
+        Scoped narrowly: ``kind='keeper_sync_project'``,
+        ``keeper_sync_run_id IS NULL``, ``status='queued'``,
+        ``backend_job_id IS NULL``, and ``date_created`` older than
+        ``now - idle_after``. Reaped rows carry
+        ``errors.type='OrphanedTierCronJob'``.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+            SqlQueueJob.keeper_sync_run_id.is_(None),
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_(None),
+            SqlQueueJob.date_created < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        failed: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Orphaned tier-cron keeper_sync_project: queue_jobs "
+                    "row committed without an arq backend_job_id "
+                    "(worker likely crashed between SQL commit and "
+                    "arq_queue.enqueue)"
+                ),
+                "type": "OrphanedTierCronJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
+
     async def fail_orphaned_run_children(
         self,
         *,

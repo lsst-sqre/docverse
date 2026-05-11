@@ -116,7 +116,7 @@ _MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
 
 async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
-    """Cron-driven backstop that finalises silently-stuck keeper-sync runs.
+    """Cron-driven backstop that finalises silently-stuck keeper-sync rows.
 
     Mechanism #2 of the two-mechanism guarantee that a sync run always
     reaches a terminal state. arq's per-function ``timeout`` covers the
@@ -126,17 +126,29 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     ``in_progress`` forever — and with it the parent ``keeper_sync_runs``
     row, which can never finalise while ``pending_count > 0``.
 
-    The reaper:
+    Tier-cron-enqueued ``keeper_sync_project`` jobs do not carry a
+    ``keeper_sync_run_id`` so they have no run finalisation hook, but
+    the same OOM / orphan windows wedge their per-subject
+    :meth:`~QueueJobStore.has_active_for_subject` mutex. The reaper
+    therefore sweeps three populations in one transaction:
 
-    1. Reads ``config.keeper_sync_reaper_threshold_seconds`` (default
-       6 h, env-overridable so test/staging environments can drive it
-       down to seconds for fast verification).
-    2. Calls ``QueueJobStore.fail_silent_run_children`` to mark every
-       keeper-sync child whose ``date_started`` is older than that
-       threshold (and which has no ``date_completed``) as ``failed``.
-    3. For each unique ``keeper_sync_run_id`` whose children were just
-       reaped, calls ``maybe_finalise_run`` so the parent run rolls up
-       to ``partial_failure``.
+    1. Run-attributed silent rows
+       (:meth:`QueueJobStore.fail_silent_run_children`) — followed by
+       :func:`maybe_finalise_run` per distinct run.
+    2. Tier-cron silent rows
+       (:meth:`QueueJobStore.fail_silent_tier_cron_jobs`) — frees the
+       subject mutex so the next tier tick can re-enqueue.
+    3. Tier-cron orphans
+       (:meth:`QueueJobStore.fail_orphaned_tier_cron_jobs`) — same
+       outcome for queued rows whose worker crashed between the SQL
+       commit and ``arq_queue.enqueue``.
+
+    Thresholds: the silent paths use
+    ``config.keeper_sync_reaper_threshold_seconds`` (default 6 h,
+    env-overridable so test/staging environments can drive it down to
+    seconds for fast verification). The orphan path uses
+    :data:`_ORPHAN_IDLE_WINDOW` (5 min) so the staleness check matches
+    the existing discovery-side orphan sweep.
 
     Wired as a cron job on ``KeeperSyncWorkerSettings.cron_jobs``
     (every 30 min). Returns a one-line status string for arq's result
@@ -154,20 +166,30 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             reaped = await queue_job_store.fail_silent_run_children(
                 idle_after=threshold
             )
+            tier_silent = await queue_job_store.fail_silent_tier_cron_jobs(
+                idle_after=threshold
+            )
+            tier_orphans = await queue_job_store.fail_orphaned_tier_cron_jobs(
+                idle_after=_ORPHAN_IDLE_WINDOW
+            )
             run_ids = {qj.keeper_sync_run_id for qj in reaped}
             for run_id in run_ids:
                 if run_id is None:
                     continue
                 await maybe_finalise_run(run_store=run_store, run_id=run_id)
 
-        if reaped:
+        total_reaped = len(reaped) + len(tier_silent) + len(tier_orphans)
+        if total_reaped:
             logger.warning(
-                "Reaped silent keeper-sync child queue jobs",
-                reaped_count=len(reaped),
+                "Reaped stuck keeper-sync queue jobs",
+                reaped_count=total_reaped,
+                run_attributed_silent_count=len(reaped),
+                tier_cron_silent_count=len(tier_silent),
+                tier_cron_orphan_count=len(tier_orphans),
                 run_ids=sorted(r for r in run_ids if r is not None),
             )
         else:
-            logger.debug("No silent keeper-sync child queue jobs to reap")
+            logger.debug("No stuck keeper-sync queue jobs to reap")
         return "completed"
 
     msg = "No database session available"
