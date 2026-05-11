@@ -195,6 +195,7 @@ class Factory:
         """Create a :class:`KeeperSyncProjectService`."""
         return KeeperSyncProjectService(
             org_store=self.create_org_store(),
+            project_store=self.create_project_store(),
             edition_store=self.create_edition_store(),
             state_store=self.create_keeper_sync_state_store(),
             ltd_client_factory=self.create_ltd_client,

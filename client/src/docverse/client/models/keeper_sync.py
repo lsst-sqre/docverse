@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from .editions import EditionKind
+
 __all__ = [
     "KeeperSyncConfig",
     "KeeperSyncEditionDiff",
@@ -229,14 +231,6 @@ class KeeperSyncProjectStateSummary(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    docverse_project_id: int | None = Field(
-        default=None,
-        description=(
-            "Numeric id of the corresponding Docverse project, or"
-            " ``null`` if no Docverse project has been created yet."
-        ),
-    )
-
     ltd_slug: str = Field(description="LTD product slug for this project.")
 
     date_last_synced: datetime | None = Field(
@@ -273,11 +267,16 @@ class KeeperSyncEditionStatus(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    docverse_edition_id: int = Field(description="Docverse edition id.")
+    edition_url: HttpUrl = Field(
+        description=(
+            "Canonical ``GET /orgs/{org}/projects/{project}/editions/"
+            "{edition}`` URL for this edition."
+        )
+    )
 
-    docverse_slug: str = Field(description="Docverse edition slug.")
+    slug: str = Field(description="Docverse edition slug.")
 
-    docverse_kind: str = Field(
+    kind: EditionKind = Field(
         description="Docverse edition kind (``main``, ``draft``, ...)."
     )
 

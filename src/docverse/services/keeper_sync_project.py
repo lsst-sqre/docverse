@@ -12,10 +12,16 @@ editions left-joined with their state rows. When called with
 ``include_ltd_diff=True`` it additionally fetches LTD's live edition
 listing and emits ``missing_in_docverse`` / ``missing_in_ltd`` arrays
 for deeper diagnostics.
+
+The service is request-agnostic: it returns a
+:class:`KeeperSyncProjectStatusResult` carrying raw domain rows so the
+HTTP handler can mint URL-bearing response fields via FastAPI's
+``request.url_for``.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -23,12 +29,11 @@ import structlog
 
 from docverse.client.models import (
     KeeperSyncEditionDiff,
-    KeeperSyncEditionStatus,
     KeeperSyncProjectStateSummary,
-    KeeperSyncProjectStatus,
     KeeperSyncTierName,
     KeeperSyncTierStatus,
 )
+from docverse.domain.edition import Edition
 from docverse.exceptions import NotFoundError
 from docverse.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -51,8 +56,46 @@ from docverse.storage.keeper_sync import (
 )
 from docverse.storage.ltd.client import LtdClient, LtdClientError
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 
-__all__ = ["KeeperSyncProjectService", "LtdClientFactory"]
+__all__ = [
+    "KeeperSyncEditionStatusRow",
+    "KeeperSyncProjectService",
+    "KeeperSyncProjectStatusResult",
+    "LtdClientFactory",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class KeeperSyncEditionStatusRow:
+    """Raw ``(Edition, KeeperSyncState | None)`` row for handler composition.
+
+    The handler turns this into a
+    :class:`docverse.handlers.orgs.keeper_sync_models.KeeperSyncEditionStatus`
+    via ``from_domain``, minting the canonical ``edition_url`` from
+    ``request.url_for("get_edition", ...)``.
+    """
+
+    edition: Edition
+    state: KeeperSyncState | None
+
+
+@dataclass(frozen=True, slots=True)
+class KeeperSyncProjectStatusResult:
+    """Handler-agnostic result returned by ``get_project_status``.
+
+    Carries everything the handler needs to compose the API response —
+    including the resolved Docverse project slug so the handler can
+    build per-edition URLs without re-issuing a project lookup.
+    """
+
+    org_slug: str
+    ltd_slug: str
+    docverse_project_slug: str | None
+    project_state: KeeperSyncProjectStateSummary | None
+    tier_status: list[KeeperSyncTierStatus]
+    edition_rows: list[KeeperSyncEditionStatusRow]
+    edition_diff: KeeperSyncEditionDiff | None
 
 
 class LtdClientFactory(Protocol):
@@ -71,16 +114,18 @@ class LtdClientFactory(Protocol):
 class KeeperSyncProjectService:
     """Read-only project-status service for the org-admin GET endpoint."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         org_store: OrganizationStore,
+        project_store: ProjectStore,
         edition_store: EditionStore,
         state_store: KeeperSyncStateStore,
         ltd_client_factory: LtdClientFactory,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
+        self._project_store = project_store
         self._edition_store = edition_store
         self._state_store = state_store
         self._ltd_client_factory = ltd_client_factory
@@ -92,7 +137,7 @@ class KeeperSyncProjectService:
         org_slug: str,
         ltd_slug: str,
         include_ltd_diff: bool,
-    ) -> KeeperSyncProjectStatus:
+    ) -> KeeperSyncProjectStatusResult:
         """Return an operator-readable status of one project's sync state.
 
         Raises
@@ -136,19 +181,23 @@ class KeeperSyncProjectService:
         # ``keeper_sync_state`` has no project_id column, so scope the
         # edition state rows by walking through Docverse's editions
         # for this project (whose ``project_id`` is the linkage).
-        editions: list[KeeperSyncEditionStatus] = []
+        edition_rows: list[KeeperSyncEditionStatusRow] = []
         product_state_rows: list[KeeperSyncState] = []
+        docverse_project_slug: str | None = None
         docverse_project_id = (
             project_state.docverse_id if project_state else None
         )
         if docverse_project_id is not None:
-            (
-                editions,
-                product_state_rows,
-            ) = await self._list_edition_status_and_state(
-                org_id=org.id,
-                docverse_project_id=docverse_project_id,
-            )
+            project = await self._project_store.get_by_id(docverse_project_id)
+            if project is not None:
+                docverse_project_slug = project.slug
+                (
+                    edition_rows,
+                    product_state_rows,
+                ) = await self._list_edition_rows_and_state(
+                    org_id=org.id,
+                    docverse_project_id=docverse_project_id,
+                )
 
         edition_diff: KeeperSyncEditionDiff | None = None
         if include_ltd_diff:
@@ -158,22 +207,23 @@ class KeeperSyncProjectService:
                 ltd_base_url=str(config.ltd_base_url),
             )
 
-        return KeeperSyncProjectStatus(
+        return KeeperSyncProjectStatusResult(
             org_slug=org_slug,
             ltd_slug=ltd_slug,
+            docverse_project_slug=docverse_project_slug,
             project_state=_summarise_project_state(project_state),
             tier_status=tier_status,
-            editions=editions,
+            edition_rows=edition_rows,
             edition_diff=edition_diff,
         )
 
-    async def _list_edition_status_and_state(
+    async def _list_edition_rows_and_state(
         self,
         *,
         org_id: int,
         docverse_project_id: int,
-    ) -> tuple[list[KeeperSyncEditionStatus], list[KeeperSyncState]]:
-        """Return Docverse-side editions left-joined with sync state.
+    ) -> tuple[list[KeeperSyncEditionStatusRow], list[KeeperSyncState]]:
+        """Return raw Docverse editions paired with their state rows.
 
         Single batched ``list_for_org`` query plus an in-memory map
         keyed on ``docverse_id`` keeps this O(1) round-trip on the
@@ -194,23 +244,14 @@ class KeeperSyncProjectService:
             for state in edition_states
             if state.docverse_id is not None
         }
-        results: list[KeeperSyncEditionStatus] = []
+        results: list[KeeperSyncEditionStatusRow] = []
         scoped_state_rows: list[KeeperSyncState] = []
         for edition in editions:
             state = state_by_docverse_id.get(edition.id)
             if state is not None:
                 scoped_state_rows.append(state)
             results.append(
-                KeeperSyncEditionStatus(
-                    docverse_edition_id=edition.id,
-                    docverse_slug=edition.slug,
-                    docverse_kind=str(edition.kind),
-                    ltd_id=state.ltd_id if state else None,
-                    ltd_slug=state.ltd_slug if state else None,
-                    date_last_synced=(
-                        state.date_last_synced if state else None
-                    ),
-                )
+                KeeperSyncEditionStatusRow(edition=edition, state=state)
             )
         return results, scoped_state_rows
 
@@ -273,7 +314,6 @@ def _summarise_project_state(
     if state is None:
         return None
     return KeeperSyncProjectStateSummary(
-        docverse_project_id=state.docverse_id,
         ltd_slug=state.ltd_slug,
         date_last_synced=state.date_last_synced,
         date_rebuilt_seen=state.date_rebuilt_seen,

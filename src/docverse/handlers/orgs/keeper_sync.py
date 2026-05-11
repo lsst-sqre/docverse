@@ -12,6 +12,9 @@ from docverse.client.models import (
     KeeperSyncProjectStatus,
     KeeperSyncRunStatus,
 )
+from docverse.client.models import (
+    KeeperSyncEditionStatus as KeeperSyncEditionStatusBase,
+)
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam
@@ -24,6 +27,7 @@ from docverse.storage.pagination import (
 )
 
 from .keeper_sync_models import (
+    KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
     KeeperSyncRun,
     KeeperSyncRunCreated,
@@ -121,11 +125,32 @@ async def get_org_keeper_sync_project_status(
 ) -> KeeperSyncProjectStatus:
     async with context.session.begin():
         service = context.factory.create_keeper_sync_project_service()
-        return await service.get_project_status(
+        result = await service.get_project_status(
             org_slug=org_slug,
             ltd_slug=ltd_slug,
             include_ltd_diff=ltd,
         )
+    editions: list[KeeperSyncEditionStatusBase] = []
+    project_slug = result.docverse_project_slug
+    if project_slug is not None:
+        editions = [
+            KeeperSyncEditionStatus.from_domain(
+                row.edition,
+                row.state,
+                context.request,
+                result.org_slug,
+                project_slug,
+            )
+            for row in result.edition_rows
+        ]
+    return KeeperSyncProjectStatus(
+        org_slug=result.org_slug,
+        ltd_slug=result.ltd_slug,
+        project_state=result.project_state,
+        tier_status=result.tier_status,
+        editions=editions,
+        edition_diff=result.edition_diff,
+    )
 
 
 @router.post(

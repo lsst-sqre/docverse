@@ -331,7 +331,7 @@ async def test_get_status_full_body_for_synced_project(
     assert response.status_code == 200
     body = response.json()
     assert body["project_state"] is not None
-    assert body["project_state"]["docverse_project_id"] == project_id
+    assert "docverse_project_id" not in body["project_state"]
     assert body["project_state"]["ltd_slug"] == _LTD_SLUG
     assert (
         body["project_state"]["annotations"][ANNOTATION_DATE_MAIN_LAST_POLLED]
@@ -353,9 +353,19 @@ async def test_get_status_full_body_for_synced_project(
     # Editions list should at least include the auto-created __main.
     assert len(body["editions"]) >= 1
     main_edition = next(
-        (e for e in body["editions"] if e["docverse_kind"] == "main"), None
+        (e for e in body["editions"] if e["kind"] == "main"), None
     )
     assert main_edition is not None
+    assert "docverse_edition_id" not in main_edition
+    assert "docverse_slug" not in main_edition
+    assert "docverse_kind" not in main_edition
+    expected_main_url = str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/projects/{_LTD_SLUG}/editions/__main"
+        )
+    )
+    assert main_edition["edition_url"] == expected_main_url
+    assert main_edition["slug"] == "__main"
     # No edition state row was seeded — the LTD-side join is null.
     assert main_edition["ltd_id"] is None
     assert main_edition["ltd_slug"] is None
@@ -405,11 +415,16 @@ async def test_get_status_edition_left_joins_state_row(
     )
     assert status_response.status_code == 200
     body = status_response.json()
-    main_edition = next(
-        e
-        for e in body["editions"]
-        if e["docverse_edition_id"] == main_edition_id
+    expected_main_url = str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/projects/{_LTD_SLUG}/editions/__main"
+        )
     )
+    main_edition = next(
+        e for e in body["editions"] if e["edition_url"] == expected_main_url
+    )
+    assert main_edition["kind"] == "main"
+    assert main_edition["slug"] == "__main"
     assert main_edition["ltd_id"] == 42
     assert main_edition["ltd_slug"] == "main"
     assert (

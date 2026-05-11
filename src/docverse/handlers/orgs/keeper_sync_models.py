@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from typing import Self
 
+from pydantic import HttpUrl
 from starlette.requests import Request
 
+from docverse.client.models import (
+    KeeperSyncEditionStatus as _KeeperSyncEditionStatusBase,
+)
 from docverse.client.models import (
     KeeperSyncProjectRefreshAccepted as _KeeperSyncProjectRefreshAcceptedBase,
 )
@@ -15,6 +19,7 @@ from docverse.client.models import (
 )
 from docverse.client.models import KeeperSyncRunKind, KeeperSyncRunStatus
 from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.edition import Edition as EditionDomain
 from docverse.domain.keeper_sync_run import (
     KeeperSyncRun as KeeperSyncRunDomain,
 )
@@ -22,8 +27,10 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunActivity as KeeperSyncRunActivityDomain,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
+from docverse.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
+    "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
@@ -82,6 +89,40 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
             queue_job_id=queue_job_id,
             queue_job_url=str(
                 request.url_for("get_queue_job", job=queue_job_id)
+            ),
+        )
+
+
+class KeeperSyncEditionStatus(_KeeperSyncEditionStatusBase):
+    """Edition-status entry with HATEOAS ``edition_url``."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        edition: EditionDomain,
+        state: KeeperSyncState | None,
+        request: Request,
+        org_slug: str,
+        project_slug: str,
+    ) -> Self:
+        """Compose the entry from a Docverse edition + optional state row."""
+        return cls(
+            edition_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "get_edition",
+                        org=org_slug,
+                        project=project_slug,
+                        edition=edition.slug,
+                    )
+                )
+            ),
+            slug=edition.slug,
+            kind=edition.kind,
+            ltd_id=state.ltd_id if state is not None else None,
+            ltd_slug=state.ltd_slug if state is not None else None,
+            date_last_synced=(
+                state.date_last_synced if state is not None else None
             ),
         )
 
