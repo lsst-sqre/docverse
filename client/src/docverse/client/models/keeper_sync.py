@@ -89,7 +89,7 @@ class KeeperSyncRun(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this run resource.")
+    self_url: HttpUrl = Field(description="URL to this run resource.")
 
     jobs_url: HttpUrl = Field(
         description=(
@@ -165,7 +165,7 @@ class KeeperSyncRunCreated(BaseModel):
         )
     )
 
-    queue_job_url: str = Field(
+    queue_job_url: HttpUrl = Field(
         description="URL of the enqueued discovery queue job resource."
     )
 
@@ -465,6 +465,6 @@ class KeeperSyncProjectRefreshAccepted(BaseModel):
         )
     )
 
-    queue_job_url: str = Field(
+    queue_job_url: HttpUrl = Field(
         description="URL of the enqueued queue job resource."
     )

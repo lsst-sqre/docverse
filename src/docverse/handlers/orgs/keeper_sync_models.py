@@ -55,11 +55,13 @@ class KeeperSyncRun(_KeeperSyncRunBase):
     ) -> Self:
         """Compose the response from a run plus its derived activity."""
         return cls(
-            self_url=str(
-                request.url_for(
-                    "get_org_keeper_sync_run",
-                    org=org_slug,
-                    run_id=run.id,
+            self_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "get_org_keeper_sync_run",
+                        org=org_slug,
+                        run_id=run.id,
+                    )
                 )
             ),
             jobs_url=HttpUrl(
@@ -101,8 +103,8 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
         return cls(
             run=KeeperSyncRun.from_domain(run, activity, request, org_slug),
             queue_job_id=queue_job_id,
-            queue_job_url=str(
-                request.url_for("get_queue_job", job=queue_job_id)
+            queue_job_url=HttpUrl(
+                str(request.url_for("get_queue_job", job=queue_job_id))
             ),
         )
 
@@ -154,8 +156,8 @@ class KeeperSyncProjectRefreshAccepted(_KeeperSyncProjectRefreshAcceptedBase):
         queue_job_id = serialize_base32_id(queue_job.public_id)
         return cls(
             queue_job_id=queue_job_id,
-            queue_job_url=str(
-                request.url_for("get_queue_job", job=queue_job_id)
+            queue_job_url=HttpUrl(
+                str(request.url_for("get_queue_job", job=queue_job_id))
             ),
         )
 
