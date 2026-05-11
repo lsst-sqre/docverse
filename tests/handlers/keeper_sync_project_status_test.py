@@ -274,7 +274,16 @@ async def test_get_status_stub_when_no_state_row(
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["org_slug"] == _ORG
+    assert "org_slug" not in body
+    assert body["org_url"] == str(
+        client.base_url.join(f"/docverse/orgs/{_ORG}")
+    )
+    assert body["project_url"] is None
+    assert body["sync_refresh_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/refresh"
+        )
+    )
     assert body["ltd_slug"] == _LTD_SLUG
     assert body["project_state"] is None
     assert body["editions"] == []
@@ -286,8 +295,10 @@ async def test_get_status_stub_when_no_state_row(
         "other": "unseen",
     }
     for entry in body["tier_status"]:
-        assert entry["last_polled_at"] is None
-        assert entry["next_due_at"] is None
+        assert "last_polled_at" not in entry
+        assert "next_due_at" not in entry
+        assert entry["date_last_polled"] is None
+        assert entry["date_next_due"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -341,14 +352,29 @@ async def test_get_status_full_body_for_synced_project(
     cohorts = {entry["tier"]: entry["cohort"] for entry in body["tier_status"]}
     assert cohorts["main"] == "dormant"
     main_status = next(e for e in body["tier_status"] if e["tier"] == "main")
-    assert main_status["last_polled_at"] is not None
-    assert main_status["next_due_at"] is not None
-    next_due = datetime.fromisoformat(main_status["next_due_at"])
+    assert main_status["date_last_polled"] is not None
+    assert main_status["date_next_due"] is not None
+    next_due = datetime.fromisoformat(main_status["date_next_due"])
     last_polled_response = datetime.fromisoformat(
-        main_status["last_polled_at"]
+        main_status["date_last_polled"]
     )
     # next_due >= last_polled + dormant_interval (jitter only widens).
     assert next_due >= last_polled_response + TIER_MAIN_DORMANT_INTERVAL
+
+    # Project URL should resolve to the Docverse project resource.
+    expected_project_url = str(
+        client.base_url.join(f"/docverse/orgs/{_ORG}/projects/{_LTD_SLUG}")
+    )
+    assert body["project_url"] == expected_project_url
+    assert body["org_url"] == str(
+        client.base_url.join(f"/docverse/orgs/{_ORG}")
+    )
+    assert body["sync_refresh_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}/refresh"
+        )
+    )
+    assert "org_slug" not in body
 
     # Editions list should at least include the auto-created __main.
     assert len(body["editions"]) >= 1

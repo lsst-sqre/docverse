@@ -391,6 +391,6 @@ def _build_tier_status(
     return KeeperSyncTierStatus(
         tier=tier_name,
         cohort=explanation.cohort,
-        last_polled_at=explanation.last_polled_at,
-        next_due_at=explanation.next_due_at,
+        date_last_polled=explanation.last_polled_at,
+        date_next_due=explanation.next_due_at,
     )

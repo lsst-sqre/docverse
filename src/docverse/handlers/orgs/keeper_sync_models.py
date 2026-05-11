@@ -13,6 +13,9 @@ from docverse.client.models import (
 from docverse.client.models import (
     KeeperSyncProjectRefreshAccepted as _KeeperSyncProjectRefreshAcceptedBase,
 )
+from docverse.client.models import (
+    KeeperSyncProjectStatus as _KeeperSyncProjectStatusBase,
+)
 from docverse.client.models import KeeperSyncRun as _KeeperSyncRunBase
 from docverse.client.models import (
     KeeperSyncRunCreated as _KeeperSyncRunCreatedBase,
@@ -27,11 +30,13 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunActivity as KeeperSyncRunActivityDomain,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
+from docverse.services.keeper_sync_project import KeeperSyncProjectStatusResult
 from docverse.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
+    "KeeperSyncProjectStatus",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
 ]
@@ -143,4 +148,65 @@ class KeeperSyncProjectRefreshAccepted(_KeeperSyncProjectRefreshAcceptedBase):
             queue_job_url=str(
                 request.url_for("get_queue_job", job=queue_job_id)
             ),
+        )
+
+
+class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
+    """Project-status response wrapper that mints HATEOAS URLs."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        result: KeeperSyncProjectStatusResult,
+        request: Request,
+    ) -> Self:
+        """Compose the response from the service result + request URLs.
+
+        ``project_url`` is ``None`` when no Docverse project has been
+        imported yet for this LTD slug — i.e. when the project-resource
+        ``keeper_sync_state`` row is missing or its ``docverse_id`` is
+        ``None``. ``org_url`` and ``sync_refresh_url`` are always
+        populated.
+        """
+        editions: list[_KeeperSyncEditionStatusBase] = []
+        project_url: HttpUrl | None = None
+        if result.docverse_project_slug is not None:
+            project_url = HttpUrl(
+                str(
+                    request.url_for(
+                        "get_project",
+                        org=result.org_slug,
+                        project=result.docverse_project_slug,
+                    )
+                )
+            )
+            editions = [
+                KeeperSyncEditionStatus.from_domain(
+                    row.edition,
+                    row.state,
+                    request,
+                    result.org_slug,
+                    result.docverse_project_slug,
+                )
+                for row in result.edition_rows
+            ]
+        return cls(
+            org_url=HttpUrl(
+                str(request.url_for("get_organization", org=result.org_slug))
+            ),
+            project_url=project_url,
+            sync_refresh_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "post_org_keeper_sync_project_refresh",
+                        org=result.org_slug,
+                        ltd_slug=result.ltd_slug,
+                    )
+                )
+            ),
+            ltd_slug=result.ltd_slug,
+            project_state=result.project_state,
+            tier_status=result.tier_status,
+            editions=editions,
+            edition_diff=result.edition_diff,
         )

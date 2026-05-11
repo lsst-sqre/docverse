@@ -198,7 +198,7 @@ class KeeperSyncTierStatus(BaseModel):
         )
     )
 
-    last_polled_at: datetime | None = Field(
+    date_last_polled: datetime | None = Field(
         default=None,
         description=(
             "Wall-clock time of the most recent poll for this tier, as"
@@ -209,7 +209,7 @@ class KeeperSyncTierStatus(BaseModel):
         ),
     )
 
-    next_due_at: datetime | None = Field(
+    date_next_due: datetime | None = Field(
         default=None,
         description=(
             "Wall-clock time at which the planner will next greenlight"
@@ -348,7 +348,30 @@ class KeeperSyncProjectStatus(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    org_slug: str = Field(description="Slug of the Docverse organization.")
+    org_url: HttpUrl = Field(
+        description=(
+            "Canonical ``GET /orgs/{org}`` URL for the Docverse"
+            " organization this report is scoped to."
+        )
+    )
+
+    project_url: HttpUrl | None = Field(
+        default=None,
+        description=(
+            "Canonical ``GET /orgs/{org}/projects/{project}`` URL for"
+            " the Docverse project, or ``null`` when no Docverse"
+            " project has been imported yet for this LTD slug."
+        ),
+    )
+
+    sync_refresh_url: HttpUrl = Field(
+        description=(
+            "URL to ``POST`` for an immediate one-shot sync of this"
+            " project (``post_org_keeper_sync_project_refresh``). Always"
+            " present so operators can trigger a refresh from the"
+            " status response without constructing the URL by hand."
+        )
+    )
 
     ltd_slug: str = Field(
         description="LTD product slug the report is scoped to."
