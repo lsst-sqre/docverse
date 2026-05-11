@@ -1120,6 +1120,18 @@ async def _tier_discovery_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
+    # Hoist the org-wide edition-state read out of the per-slug loop.
+    # The previous shape called ``list_for_org`` from inside
+    # ``_project_needs_discovery``, so a 1500-slug discovery tick
+    # scanned the org's ~15 000 edition state rows 1500 times per
+    # tick. The map is consulted in memory per slug.
+    async with session.begin():
+        edition_states = await state_store.list_for_org(
+            org_id=org.id, resource_type=ResourceType.edition
+        )
+    edition_state_by_ltd_id = {
+        s.ltd_id: s for s in edition_states if s.ltd_id is not None
+    }
     enqueued = 0
     for ltd_slug in in_scope:
         async with session.begin():
@@ -1139,12 +1151,10 @@ async def _tier_discovery_for_org(
             continue
         try:
             should_enqueue = await _project_needs_discovery(
-                session=session,
-                state_store=state_store,
                 ltd_client=ltd_client,
-                org_id=org.id,
                 ltd_slug=ltd_slug,
                 project_state=project_state,
+                edition_state_by_ltd_id=edition_state_by_ltd_id,
             )
         except LtdClientError:
             logger.exception(
@@ -1512,24 +1522,23 @@ _TIER_POLLED_ANNOTATION_KEYS: dict[Tier, str] = {
 }
 
 
-async def _project_needs_discovery(  # noqa: PLR0913
+async def _project_needs_discovery(
     *,
-    session: AsyncSession,
-    state_store: KeeperSyncStateStore,
     ltd_client: LtdClient,
-    org_id: int,
     ltd_slug: str,
     project_state: Any,
+    edition_state_by_ltd_id: dict[int, Any],
 ) -> bool:
     """Return True when an in-scope project has any unseen LTD resource.
 
     The cheap check first: if the project itself has no state row,
-    enqueue immediately and skip the per-edition walk. Otherwise read
-    every edition state row for the org in one batched query, then
-    walk LTD's edition list checking presence in the in-memory dict.
-    With 1500 in-scope LTD projects and an average ~10 editions each,
-    the batched read replaces ~15 000 round-trips per discovery tick
-    with ~1500.
+    enqueue immediately and skip the per-edition walk. Otherwise
+    consult the pre-loaded org-wide edition-state map and walk LTD's
+    edition list checking presence in memory. The caller hoists the
+    ``list_for_org(resource_type=edition)`` read out of the per-slug
+    loop and passes the resulting map in: with 1500 in-scope projects
+    that flips ~1500 ``list_for_org`` round-trips per discovery tick
+    into one.
 
     ``project_state`` is the state row already fetched by the caller
     (so the dormancy planner and this helper share one read). Pass
@@ -1539,13 +1548,10 @@ async def _project_needs_discovery(  # noqa: PLR0913
     if is_unknown_resource(project_state):
         return True
     ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
-    async with session.begin():
-        edition_states = await state_store.list_for_org(
-            org_id=org_id, resource_type=ResourceType.edition
-        )
-    by_ltd_id = {s.ltd_id: s for s in edition_states if s.ltd_id is not None}
     for ltd_edition in ltd_editions:
-        if is_unknown_resource(by_ltd_id.get(ltd_edition.ltd_id)):
+        if is_unknown_resource(
+            edition_state_by_ltd_id.get(ltd_edition.ltd_id)
+        ):
             return True
     return False
 

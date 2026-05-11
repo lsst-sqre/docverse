@@ -342,7 +342,9 @@ class KeeperSyncProjectService:
             limit=limit,
         )
         edition_states = await self._state_store.list_for_org(
-            org_id=org.id, resource_type=ResourceType.edition
+            org_id=org.id,
+            resource_type=ResourceType.edition,
+            docverse_ids=[edition.id for edition in page.entries],
         )
         state_by_docverse_id: dict[int, KeeperSyncState] = {
             state.docverse_id: state
@@ -467,21 +469,19 @@ class KeeperSyncProjectService:
         has been created yet for the project (atypical — every
         project gets an auto-created ``__main`` on creation, but the
         method tolerates the gap defensively). The state-row lookup
-        scans the org-wide edition state rows once and filters
-        in-memory to avoid adding a single-purpose
-        ``get_by_docverse_id`` to the state store.
+        is an indexed single-row read keyed on ``docverse_id`` so the
+        per-project GET no longer scans every edition state row for
+        the org.
         """
         edition = await self._edition_store.get_by_slug(
             project_id=docverse_project_id, slug="__main"
         )
         if edition is None:
             return None
-        edition_states = await self._state_store.list_for_org(
-            org_id=org_id, resource_type=ResourceType.edition
-        )
-        state = next(
-            (row for row in edition_states if row.docverse_id == edition.id),
-            None,
+        state = await self._state_store.get_by_docverse_id(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            docverse_id=edition.id,
         )
         return KeeperSyncEditionStatusRow(edition=edition, state=state)
 
@@ -495,24 +495,23 @@ class KeeperSyncProjectService:
 
         ``keeper_sync_state`` has no ``project_id`` column, so scope
         the rows by walking through Docverse's editions for this
-        project (whose ``project_id`` is the linkage) and filtering
-        the org-wide state rows by ``docverse_id``. Only called on
-        the ``?ltd=true`` path so the default GET stays cheap.
+        project (whose ``project_id`` is the linkage) and pushing the
+        ``docverse_id`` set into ``list_for_org``'s WHERE clause.
+        Only called on the ``?ltd=true`` path so the default GET
+        stays cheap, but the ``docverse_ids`` filter still pulls the
+        per-call cost from the org-wide row count down to this
+        project's edition count.
         """
         editions = await self._edition_store.list_all_by_project(
             docverse_project_id
         )
         if not editions:
             return []
-        edition_ids = {edition.id for edition in editions}
-        edition_states = await self._state_store.list_for_org(
-            org_id=org_id, resource_type=ResourceType.edition
+        return await self._state_store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            docverse_ids=[edition.id for edition in editions],
         )
-        return [
-            state
-            for state in edition_states
-            if state.docverse_id in edition_ids
-        ]
 
     async def _compute_edition_diff(
         self,

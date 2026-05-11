@@ -72,6 +72,7 @@ class _StateStoreCallRecorder:
     def __init__(self) -> None:
         self.list_for_org_calls = 0
         self.get_calls = 0
+        self.list_for_org_edition_calls = 0
 
 
 def _install_state_store_recorder(
@@ -85,6 +86,8 @@ def _install_state_store_recorder(
         self: KeeperSyncStateStore, **kwargs: Any
     ) -> list[Any]:
         recorder.list_for_org_calls += 1
+        if kwargs.get("resource_type") is ResourceType.edition:
+            recorder.list_for_org_edition_calls += 1
         return await real_list(self, **kwargs)
 
     async def counting_get(self: KeeperSyncStateStore, **kwargs: Any) -> Any:
@@ -1274,10 +1277,101 @@ async def test_tier_discovery_batches_edition_state_lookups(
     # and :func:`_project_needs_discovery`), and one inside
     # :func:`_record_tier_polled` to merge with prior annotations
     # before stamping ``date_discovery_last_polled``. One
-    # ``list_for_org`` for the batched edition lookup. Five-edition
-    # fixture proves the count is independent of edition cardinality.
+    # ``list_for_org`` for the edition lookup, now hoisted out of
+    # :func:`_project_needs_discovery` and called once before the
+    # per-slug loop (see
+    # :func:`test_tier_discovery_batches_edition_state_lookups_across_slugs`
+    # for the cross-slug lock). Five-edition fixture still proves the
+    # count is independent of edition cardinality.
     assert recorder.get_calls == 2
     assert recorder.list_for_org_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_batches_edition_state_lookups_across_slugs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One ``list_for_org(resource_type=edition)`` per tick, not per slug.
+
+    Locks the org-wide edition-state read out of the per-slug loop.
+    Before this contract, ``_project_needs_discovery`` issued one
+    ``list_for_org`` per in-scope slug, so 1500 in-scope projects ran
+    1500 unscoped scans of ~15 000 rows each. After, the cron loads
+    the org's edition rows once before the loop and consults the
+    indexed dict in memory per slug.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-batch-org",
+            project_slugs=["proj-a", "proj-b", "proj-c"],
+        )
+        for slug in ("proj-a", "proj-b", "proj-c"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        # Every LTD edition has a state row, so each project's
+        # ``_project_needs_discovery`` walks the full per-LTD-id dict
+        # before deciding not to enqueue. Without the hoist this is
+        # three unscoped ``list_for_org`` calls; with the hoist, one.
+        for ltd_id, slug in (
+            (1, "main-a"),
+            (2, "main-b"),
+            (3, "main-c"),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+            )
+
+    _stub_products(mock_discovery, ["proj-a", "proj-b", "proj-c"])
+    for slug, edition_id in (
+        ("proj-a", 1),
+        ("proj-b", 2),
+        ("proj-c", 3),
+    ):
+        _stub_editions_listing(
+            mock_discovery, product_slug=slug, edition_ids=[edition_id]
+        )
+        _stub_edition(
+            mock_discovery,
+            edition_id=edition_id,
+            slug=f"main-{slug[-1]}",
+            date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+        )
+
+    recorder = _install_state_store_recorder(monkeypatch)
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Fully-known: no enqueues across all three slugs.
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+    # The acceptance criterion: exactly one
+    # ``list_for_org(resource_type=edition)`` per tier_discovery
+    # tick, regardless of how many in-scope slugs the tick processes.
+    assert recorder.list_for_org_edition_calls == 1
 
 
 @pytest.mark.asyncio

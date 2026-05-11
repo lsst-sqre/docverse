@@ -157,12 +157,41 @@ class KeeperSyncStateStore:
             return None
         return KeeperSyncState.model_validate(row)
 
+    async def get_by_docverse_id(
+        self,
+        *,
+        org_id: int,
+        resource_type: ResourceType,
+        docverse_id: int,
+    ) -> KeeperSyncState | None:
+        """Fetch a row by ``(org_id, resource_type, docverse_id)``.
+
+        ``keeper_sync_state.docverse_id`` is the Docverse-side row id
+        for the paired project / edition / build. Callers that already
+        know the Docverse id (e.g. the per-project status endpoint
+        looking up the ``__main`` edition's state row) can use this
+        indexed single-row lookup instead of scanning every state row
+        for the org with :meth:`list_for_org` and filtering in memory.
+        Returns ``None`` when no matching row exists.
+        """
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == resource_type.value,
+            SqlKeeperSyncState.docverse_id == docverse_id,
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncState.model_validate(row)
+
     async def list_for_org(
         self,
         *,
         org_id: int,
         resource_type: ResourceType,
         ltd_ids: Iterable[int] | None = None,
+        docverse_ids: Iterable[int] | None = None,
     ) -> list[KeeperSyncState]:
         """Return every state row for ``(org_id, resource_type)``.
 
@@ -171,8 +200,13 @@ class KeeperSyncStateStore:
         once and resolve presence / staleness via an in-memory dict
         keyed on ``ltd_id``. Pass ``ltd_ids`` to scope the query to a
         known LTD-side id set (used by tier_other so the WHERE clause
-        only spans editions LTD currently lists). Passing an empty
-        ``ltd_ids`` returns ``[]`` without hitting the database.
+        only spans editions LTD currently lists). Pass ``docverse_ids``
+        to scope to a known Docverse-side id set (used by the
+        per-project read paths whose scope is "this project's
+        editions" — ``keeper_sync_state`` has no ``project_id``
+        column, so the Docverse edition ids are the natural project
+        scope). Passing an empty ``ltd_ids`` or ``docverse_ids``
+        returns ``[]`` without hitting the database.
         """
         if ltd_ids is not None:
             ltd_id_list = list(ltd_ids)
@@ -180,12 +214,22 @@ class KeeperSyncStateStore:
                 return []
         else:
             ltd_id_list = None
+        if docverse_ids is not None:
+            docverse_id_list = list(docverse_ids)
+            if not docverse_id_list:
+                return []
+        else:
+            docverse_id_list = None
         clauses: list[ColumnElement[bool]] = [
             SqlKeeperSyncState.org_id == org_id,
             SqlKeeperSyncState.resource_type == resource_type.value,
         ]
         if ltd_id_list is not None:
             clauses.append(SqlKeeperSyncState.ltd_id.in_(ltd_id_list))
+        if docverse_id_list is not None:
+            clauses.append(
+                SqlKeeperSyncState.docverse_id.in_(docverse_id_list)
+            )
         stmt = select(SqlKeeperSyncState).where(*clauses)
         result = await self._session.execute(stmt)
         return [
