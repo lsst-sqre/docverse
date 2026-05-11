@@ -49,9 +49,8 @@ from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.organization import Organization
 from docverse.factory import Factory
 from docverse.services.keeper_sync.scheduler import (
-    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+    _TIER_ANNOTATION_KEYS,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
-    ANNOTATION_DATE_OTHER_LAST_POLLED,
     TIER_DISCOVERY_DORMANT_INTERVAL,
     TIER_DISCOVERY_DORMANT_JITTER,
     TIER_DISCOVERY_HOT_WINDOW,
@@ -1494,7 +1493,7 @@ async def _record_tier_polled(  # noqa: PLR0913
     field and the discovery / other tiers must not pretend they have
     observed an LTD rebuild.
     """
-    annotation_key = _TIER_POLLED_ANNOTATION_KEYS[tier]
+    annotation_key = _TIER_ANNOTATION_KEYS[tier]
     async with session.begin():
         existing = await state_store.get(
             org_id=org_id,
@@ -1513,13 +1512,6 @@ async def _record_tier_polled(  # noqa: PLR0913
             ltd_slug=ltd_slug,
             annotations=merged,
         )
-
-
-_TIER_POLLED_ANNOTATION_KEYS: dict[Tier, str] = {
-    Tier.main: ANNOTATION_DATE_MAIN_LAST_POLLED,
-    Tier.discovery: ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
-    Tier.other: ANNOTATION_DATE_OTHER_LAST_POLLED,
-}
 
 
 async def _project_needs_discovery(
