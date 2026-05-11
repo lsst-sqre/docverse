@@ -214,9 +214,10 @@ async def test_get_status_returns_404_when_slug_not_in_allowlist(
 ) -> None:
     """A slug outside the configured allowlist is treated as 404.
 
-    Distinct from the refresh endpoint's 400: GET-side, the resource
-    "a sync-eligible project on this org" does not exist for an
-    out-of-allowlist slug, so 404 is the appropriate semantic.
+    Both this GET and the sibling ``POST .../refresh`` translate an
+    out-of-allowlist slug to 404 — the resource ("a sync-eligible
+    project on this org") simply does not exist for that slug, so the
+    inspection and trigger paths agree on the same status code.
     """
     await _setup_org(client)
     await _enable_sync(client, project_slugs=[_LTD_SLUG])

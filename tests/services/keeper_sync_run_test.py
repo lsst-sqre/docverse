@@ -18,7 +18,7 @@ from docverse.client.models import (
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind
-from docverse.exceptions import BadRequestError, ConflictError, NotFoundError
+from docverse.exceptions import ConflictError, NotFoundError
 from docverse.services.keeper_sync_run import (
     KEEPER_SYNC_QUEUE_NAME,
     KeeperSyncRunService,
@@ -242,17 +242,17 @@ async def test_refresh_project_404_when_disabled(
 
 
 @pytest.mark.asyncio
-async def test_refresh_project_400_when_slug_outside_allowlist(
+async def test_refresh_project_404_when_slug_outside_allowlist(
     app: None,
     db_session: AsyncSession,
 ) -> None:
-    """A slug not in the org's allowlist raises BadRequestError."""
+    """A slug not in the org's allowlist raises NotFoundError."""
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, project_slugs=["pipelines"])
         service = _make_service(db_session=db_session, mock_arq=mock_arq)
-        with pytest.raises(BadRequestError):
+        with pytest.raises(NotFoundError):
             await service.refresh_project(
                 org_slug=org_slug, ltd_slug="not-allowed"
             )

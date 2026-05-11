@@ -26,7 +26,7 @@ from docverse.domain.keeper_sync_run import (
 )
 from docverse.domain.organization import Organization
 from docverse.domain.queue import JobStatus, QueueJob
-from docverse.exceptions import BadRequestError, ConflictError, NotFoundError
+from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import (
@@ -160,9 +160,8 @@ class KeeperSyncRunService:
         Raises
         ------
         NotFoundError
-            If the org does not exist or LTD sync is not enabled on it.
-        BadRequestError
-            If ``ltd_slug`` is not in the org's ``project_slugs``
+            If the org does not exist, LTD sync is not enabled on it,
+            or ``ltd_slug`` is not in the org's ``project_slugs``
             allowlist (and the allowlist is not ``"*"``).
         ConflictError
             If a ``keeper_sync_project`` job for this ``(org, ltd_slug)``
@@ -191,7 +190,7 @@ class KeeperSyncRunService:
                 f"LTD slug {ltd_slug!r} is not in the project_slugs"
                 f" allowlist for organization {org_slug!r}"
             )
-            raise BadRequestError(msg)
+            raise NotFoundError(msg)
 
         # Mirrors the per-org run-uniqueness check above (lines
         # 105-115 for runs): pre-check the per-(org, ltd_slug)

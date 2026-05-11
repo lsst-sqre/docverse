@@ -127,10 +127,10 @@ async def test_post_refresh_returns_404_when_sync_disabled(
 
 
 @pytest.mark.asyncio
-async def test_post_refresh_returns_400_when_slug_not_in_allowlist(
+async def test_post_refresh_returns_404_when_slug_not_in_allowlist(
     client: AsyncClient,
 ) -> None:
-    """A slug outside the configured allowlist returns 400."""
+    """A slug outside the configured allowlist returns 404."""
     await _setup_org(client)
     await _enable_sync(client, project_slugs=[_LTD_SLUG])
 
@@ -138,7 +138,7 @@ async def test_post_refresh_returns_400_when_slug_not_in_allowlist(
         f"/docverse/orgs/{_ORG}/keeper-sync/projects/not-allowed/refresh",
         headers={"X-Auth-Request-User": _ADMIN},
     )
-    assert response.status_code == 400
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
