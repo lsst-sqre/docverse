@@ -25,12 +25,15 @@ __all__ = [
     "ANNOTATION_DATE_DISCOVERY_LAST_POLLED",
     "ANNOTATION_DATE_MAIN_LAST_POLLED",
     "ANNOTATION_DATE_OTHER_LAST_POLLED",
+    "TIER_DISCOVERY_CRON_INTERVAL",
     "TIER_DISCOVERY_DORMANT_INTERVAL",
     "TIER_DISCOVERY_DORMANT_JITTER",
     "TIER_DISCOVERY_HOT_WINDOW",
+    "TIER_MAIN_CRON_INTERVAL",
     "TIER_MAIN_DORMANT_INTERVAL",
     "TIER_MAIN_DORMANT_JITTER",
     "TIER_MAIN_HOT_WINDOW",
+    "TIER_OTHER_CRON_INTERVAL",
     "TIER_OTHER_DORMANT_INTERVAL",
     "TIER_OTHER_DORMANT_JITTER",
     "TIER_OTHER_HOT_WINDOW",
@@ -40,6 +43,7 @@ __all__ = [
     "TierStatus",
     "explain_tier_status",
     "is_unknown_resource",
+    "next_cron_tick_at_or_after",
     "should_poll_for_tier",
     "should_poll_main_for_project",
     "should_refresh_main_edition",
@@ -62,6 +66,25 @@ TierCohort = Literal["hot", "dormant", "unseen"]
 #: module constant so the worker function and the unit tests pull from
 #: the same source of truth.
 TIER_OTHER_REFRESH_THRESHOLD = timedelta(hours=1)
+
+#: Wall-clock cadence at which ``keeper_sync_tier_main`` fires. Matches
+#: PRD #275 user story 10's ~5-minute SLO for the user-visible ``main``
+#: edition. The single source of truth for the ``cron(...)``
+#: declaration in :mod:`docverse.worker.main` and for the cron-tick
+#: surfaced by :func:`explain_tier_status` for non-dormant cohorts.
+TIER_MAIN_CRON_INTERVAL = timedelta(minutes=5)
+
+#: Wall-clock cadence at which ``keeper_sync_tier_discovery`` fires.
+#: Bounded discovery of LTD resources without a ``keeper_sync_state``
+#: row; 30 minutes leaves room for the ``tier_main`` fan-out without
+#: doubling up on its work.
+TIER_DISCOVERY_CRON_INTERVAL = timedelta(minutes=30)
+
+#: Wall-clock cadence at which ``keeper_sync_tier_other`` fires. Hourly
+#: catches non-``main`` editions whose state has aged past
+#: :data:`TIER_OTHER_REFRESH_THRESHOLD`; the SLO is also hourly so the
+#: cron and the threshold are intentionally identical.
+TIER_OTHER_CRON_INTERVAL = timedelta(hours=1)
 
 #: Window after a project's last observed LTD ``main`` rebuild during
 #: which ``keeper_sync_tier_main`` always polls on its 5-minute cadence.
@@ -229,6 +252,30 @@ def should_poll_for_tier(  # noqa: PLR0913
     return (now - last_polled) >= effective_interval
 
 
+def next_cron_tick_at_or_after(now: datetime, interval: timedelta) -> datetime:
+    """Round ``now`` up to the next cron-tick boundary.
+
+    The tier crons fire on wall-clock minute boundaries anchored on UTC
+    midnight (arq's ``cron(..., minute={...})`` takes a set of wall-
+    clock minutes within each hour). Given a cadence ``interval``, this
+    returns the earliest ``datetime`` ``>= now`` that lies on an
+    interval boundary measured from midnight of ``now``'s date.
+
+    Pure; no I/O, no globals. Used by :func:`explain_tier_status` to
+    surface a deterministic next-poll time for the hot, unseen, and
+    dormant-without-last-polled cohorts where there is no per-project
+    rate-limit gate — the next cron tick is what polls. ``now`` already
+    on a boundary returns ``now`` itself (``at_or_after``).
+    """
+    anchor = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = now - anchor
+    n_floor = elapsed // interval
+    candidate = anchor + n_floor * interval
+    if candidate == now:
+        return now
+    return anchor + (n_floor + 1) * interval
+
+
 def stable_hash_fraction(slug: str) -> float:
     """Return a deterministic ``[0, 1)`` real for ``slug``.
 
@@ -373,9 +420,13 @@ class TierStatus:
     ``cohort`` is the qualitative label; see :data:`TierCohort` for the
     rules. ``last_polled_at`` is the parsed annotation if present and
     well-formed, else ``None``. ``next_due_at`` is the wall-clock
-    timestamp at-or-after which the planner will next greenlight a
-    poll, or ``None`` when there is no calendar gate (i.e. the next
-    cron tick will poll).
+    timestamp at which the planner will next greenlight a poll: for
+    hot, unseen, and dormant-without-last-polled cohorts that's the
+    next cron tick (the only thing gating them); for dormant cohorts
+    with a recorded last-polled it's ``last_polled + effective
+    interval``. The value is the next *poll* time, not necessarily an
+    enqueue time — change-detection and mutex gates downstream may
+    still suppress the actual enqueue.
     """
 
     cohort: TierCohort
@@ -390,6 +441,7 @@ def explain_tier_status(  # noqa: PLR0913
     tier: Tier,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
     jitter_window: timedelta = timedelta(0),
 ) -> TierStatus:
     """Explain the planner's tier-cron decision for one project state row.
@@ -403,21 +455,31 @@ def explain_tier_status(  # noqa: PLR0913
     Mapping from gate rules to explainer cohorts:
 
     1. ``state is None`` → ``cohort='unseen'``: the cron has never
-       observed this project. ``next_due_at=None`` (next tick polls).
+       observed this project. ``next_due_at`` is the next cron tick
+       — the next tier-cron firing is what polls.
     2. ``state.date_rebuilt_seen is None`` → ``cohort='hot'``: cold-
        start row. The gate polls every tick until tier_main writes a
        rebuild signal, so the cohort is hot for the operator's
-       purposes.
+       purposes. ``next_due_at`` is the next cron tick.
     3. ``now - state.date_rebuilt_seen < hot_window`` → ``cohort=
-       'hot'``. ``next_due_at=None``.
-    4. Otherwise → ``cohort='dormant'``. ``next_due_at`` is
-       ``last_polled + (dormant_interval + stable_hash_fraction(slug)
-       * jitter_window)`` when the per-tier annotation parses, else
-       ``None`` (immediately due).
+       'hot'``. ``next_due_at`` is the next cron tick.
+    4. Dormant without a per-tier last-polled annotation →
+       ``cohort='dormant'``. ``next_due_at`` is the next cron tick
+       — the gate's "missing annotation" branch polls on first sight.
+    5. Dormant with a parsed last-polled annotation → ``cohort=
+       'dormant'``. ``next_due_at`` is ``last_polled + (dormant_
+       interval + stable_hash_fraction(slug) * jitter_window)`` —
+       the calendar-gated deadline.
+
+    ``next_due_at`` is the next *poll* time, not necessarily an
+    enqueue time: a hot poll may still no-op via change-detection or
+    mutex gates downstream of the planner.
     """
     if state is None:
         return TierStatus(
-            cohort="unseen", last_polled_at=None, next_due_at=None
+            cohort="unseen",
+            last_polled_at=None,
+            next_due_at=next_cron_tick_at_or_after(now, cron_interval),
         )
     annotations = state.annotations or {}
     last_polled = _parse_annotation_datetime(
@@ -425,15 +487,21 @@ def explain_tier_status(  # noqa: PLR0913
     )
     if state.date_rebuilt_seen is None:
         return TierStatus(
-            cohort="hot", last_polled_at=last_polled, next_due_at=None
+            cohort="hot",
+            last_polled_at=last_polled,
+            next_due_at=next_cron_tick_at_or_after(now, cron_interval),
         )
     if (now - state.date_rebuilt_seen) < hot_window:
         return TierStatus(
-            cohort="hot", last_polled_at=last_polled, next_due_at=None
+            cohort="hot",
+            last_polled_at=last_polled,
+            next_due_at=next_cron_tick_at_or_after(now, cron_interval),
         )
     if last_polled is None:
         return TierStatus(
-            cohort="dormant", last_polled_at=None, next_due_at=None
+            cohort="dormant",
+            last_polled_at=None,
+            next_due_at=next_cron_tick_at_or_after(now, cron_interval),
         )
     effective_interval = dormant_interval + (
         stable_hash_fraction(state.ltd_slug) * jitter_window

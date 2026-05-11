@@ -5,6 +5,7 @@ Launch with: ``arq docverse.worker.main.WorkerSettings``
 
 from __future__ import annotations
 
+from datetime import timedelta
 from importlib.metadata import version
 from typing import Any
 
@@ -23,6 +24,11 @@ from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.factory import Factory
 from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse.services.keeper_sync.scheduler import (
+    TIER_DISCOVERY_CRON_INTERVAL,
+    TIER_MAIN_CRON_INTERVAL,
+    TIER_OTHER_CRON_INTERVAL,
+)
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.github import validate_github_app
 
@@ -41,6 +47,35 @@ from .functions import (
 )
 
 config = Configuration()
+
+
+_SECONDS_PER_HOUR = 3600
+
+
+def _cron_minutes_for_tier_interval(interval: timedelta) -> set[int]:
+    """Wall-clock minute set for ``cron(...)`` from a tier-cron interval.
+
+    Tier cron intervals are anchored on UTC midnight, divide one hour
+    cleanly, and are at most one hour, so the arq ``minute={...}``
+    argument is exactly the set of within-the-hour boundaries. Keeps
+    the cron declarations and the cadence constants in
+    :mod:`docverse.services.keeper_sync.scheduler` in lockstep — change
+    the constant and the cron schedule follows.
+    """
+    seconds = int(interval.total_seconds())
+    if (
+        seconds <= 0
+        or seconds % 60 != 0
+        or seconds > _SECONDS_PER_HOUR
+        or _SECONDS_PER_HOUR % seconds != 0
+    ):
+        msg = (
+            f"Tier cron interval must be a positive divisor of one hour"
+            f" in whole minutes, got {interval!r}"
+        )
+        raise ValueError(msg)
+    minutes = seconds // 60
+    return set(range(0, 60, minutes))
 
 
 class WorkerFactoryBuilder:
@@ -274,28 +309,34 @@ class KeeperSyncWorkerSettings:
         keeper_sync_tier_discovery,
         keeper_sync_tier_other,
     ]
+    # Tier-cron cadences come from the constants in
+    # ``services/keeper_sync/scheduler.py`` so the planner's next-tick
+    # math (``explain_tier_status``) and the cron's actual firing
+    # schedule cannot drift.
     cron_jobs = [
         cron(
             keeper_sync_reaper,
             minute={0, 30},
         ),
-        # Tier 1 — every 5 min — keeps the user-visible ``main``
-        # edition fresh per user story 10's ~5-minute SLO.
+        # Tier 1 — keeps the user-visible ``main`` edition fresh per
+        # user story 10's SLO.
         cron(
             keeper_sync_tier_main,
-            minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
+            minute=_cron_minutes_for_tier_interval(TIER_MAIN_CRON_INTERVAL),
         ),
-        # Tier 2 — every 30 min — discovers LTD resources without a
+        # Tier 2 — discovers LTD resources without a
         # ``keeper_sync_state`` row.
         cron(
             keeper_sync_tier_discovery,
-            minute={0, 30},
+            minute=_cron_minutes_for_tier_interval(
+                TIER_DISCOVERY_CRON_INTERVAL
+            ),
         ),
-        # Tier 3 — hourly — catches non-``main`` editions whose state
-        # has aged past the threshold.
+        # Tier 3 — catches non-``main`` editions whose state has aged
+        # past the threshold.
         cron(
             keeper_sync_tier_other,
-            minute={0},
+            minute=_cron_minutes_for_tier_interval(TIER_OTHER_CRON_INTERVAL),
         ),
     ]
     redis_settings = config.arq_redis_settings

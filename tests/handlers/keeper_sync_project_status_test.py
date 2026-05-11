@@ -27,7 +27,10 @@ from safir.dependencies.db_session import db_session_dependency
 from docverse.client.models import OrgRole
 from docverse.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_MAIN_LAST_POLLED,
+    TIER_DISCOVERY_CRON_INTERVAL,
+    TIER_MAIN_CRON_INTERVAL,
     TIER_MAIN_DORMANT_INTERVAL,
+    TIER_OTHER_CRON_INTERVAL,
 )
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
@@ -300,11 +303,25 @@ async def test_get_status_stub_when_no_state_row(
         "discovery": "unseen",
         "other": "unseen",
     }
+    cron_intervals = {
+        "main": TIER_MAIN_CRON_INTERVAL,
+        "discovery": TIER_DISCOVERY_CRON_INTERVAL,
+        "other": TIER_OTHER_CRON_INTERVAL,
+    }
     for entry in body["tier_status"]:
         assert "last_polled_at" not in entry
         assert "next_due_at" not in entry
         assert entry["date_last_polled"] is None
-        assert entry["date_next_due"] is None
+        # ``date_next_due`` is the upcoming cron tick for unseen
+        # cohorts: the next tier-cron firing is what polls. The clock
+        # must round up to that boundary and never be ``null``.
+        assert entry["date_next_due"] is not None
+        next_due = datetime.fromisoformat(entry["date_next_due"])
+        interval = cron_intervals[entry["tier"]]
+        # The minted timestamp lies on an interval boundary anchored on
+        # UTC midnight and is at most one interval ahead of "now-ish".
+        anchor = next_due.replace(hour=0, minute=0, second=0, microsecond=0)
+        assert (next_due - anchor) % interval == timedelta(0)
 
 
 # ---------------------------------------------------------------------------

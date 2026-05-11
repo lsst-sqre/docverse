@@ -19,12 +19,15 @@ from docverse.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     ANNOTATION_DATE_OTHER_LAST_POLLED,
+    TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
     TIER_DISCOVERY_DORMANT_JITTER,
     TIER_DISCOVERY_HOT_WINDOW,
+    TIER_MAIN_CRON_INTERVAL,
     TIER_MAIN_DORMANT_INTERVAL,
     TIER_MAIN_DORMANT_JITTER,
     TIER_MAIN_HOT_WINDOW,
+    TIER_OTHER_CRON_INTERVAL,
     TIER_OTHER_DORMANT_INTERVAL,
     TIER_OTHER_DORMANT_JITTER,
     TIER_OTHER_HOT_WINDOW,
@@ -32,6 +35,7 @@ from docverse.services.keeper_sync.scheduler import (
     Tier,
     explain_tier_status,
     is_unknown_resource,
+    next_cron_tick_at_or_after,
     should_poll_for_tier,
     should_poll_main_for_project,
     should_refresh_main_edition,
@@ -884,11 +888,47 @@ def test_tier_dormant_jitter_constants_match_documented_cadence() -> None:
 # ---------------------------------------------------------------------------
 
 
-_EXPLAIN_TIER_PARAMS = _TIER_PARAMS
+# Same shape as ``_TIER_PARAMS`` but extended with each tier's
+# ``cron_interval``. ``explain_tier_status`` now surfaces the next cron
+# tick for hot, unseen, and dormant-without-last-polled cohorts so the
+# explainer tests must thread the per-tier cadence through to the
+# helper.
+_EXPLAIN_TIER_PARAMS = [
+    pytest.param(
+        Tier.main,
+        ANNOTATION_DATE_MAIN_LAST_POLLED,
+        TIER_MAIN_HOT_WINDOW,
+        TIER_MAIN_DORMANT_INTERVAL,
+        TIER_MAIN_CRON_INTERVAL,
+        id="main",
+    ),
+    pytest.param(
+        Tier.discovery,
+        ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+        TIER_DISCOVERY_HOT_WINDOW,
+        TIER_DISCOVERY_DORMANT_INTERVAL,
+        TIER_DISCOVERY_CRON_INTERVAL,
+        id="discovery",
+    ),
+    pytest.param(
+        Tier.other,
+        ANNOTATION_DATE_OTHER_LAST_POLLED,
+        TIER_OTHER_HOT_WINDOW,
+        TIER_OTHER_DORMANT_INTERVAL,
+        TIER_OTHER_CRON_INTERVAL,
+        id="other",
+    ),
+]
 
 
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_unseen_when_state_missing(
@@ -896,22 +936,31 @@ def test_explain_tier_status_unseen_when_state_missing(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
-    """No state row at all → cohort='unseen'."""
+    """No state row at all → cohort='unseen' with the next cron tick."""
+    now = datetime(2026, 5, 7, tzinfo=UTC)
     status = explain_tier_status(
         None,
-        datetime(2026, 5, 7, tzinfo=UTC),
+        now,
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     assert status.cohort == "unseen"
     assert status.last_polled_at is None
-    assert status.next_due_at is None
+    assert status.next_due_at == next_cron_tick_at_or_after(now, cron_interval)
 
 
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_hot_when_inside_window(
@@ -919,8 +968,14 @@ def test_explain_tier_status_hot_when_inside_window(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
-    """Rebuilt within the hot window → cohort='hot', no calendar gate."""
+    """Rebuilt within the hot window → cohort='hot' with the next cron tick.
+
+    Hot cohorts have no per-project calendar gate, so the ``next_due_at``
+    operators see is the next tier-cron firing — a deterministic clock
+    time, not ``null``.
+    """
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     state = _project_state(date_rebuilt_seen=now - timedelta(days=7))
     status = explain_tier_status(
@@ -929,13 +984,20 @@ def test_explain_tier_status_hot_when_inside_window(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     assert status.cohort == "hot"
-    assert status.next_due_at is None
+    assert status.next_due_at == next_cron_tick_at_or_after(now, cron_interval)
 
 
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_hot_when_no_rebuilt_seen(
@@ -943,12 +1005,15 @@ def test_explain_tier_status_hot_when_no_rebuilt_seen(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
-    """``date_rebuilt_seen=None`` (cold-start row) → cohort='hot'.
+    """``date_rebuilt_seen=None`` → cohort='hot' with the next cron tick.
 
     Mirrors gate rule 2: until tier_main writes ``date_rebuilt_seen``
     the cron polls on every tick, so the cohort label is hot for the
     operator's purposes (the project is being polled, not rate-limited).
+    The cold-start row has no calendar gate so ``next_due_at`` is the
+    next cron tick.
     """
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     state = _project_state(date_rebuilt_seen=None)
@@ -958,13 +1023,20 @@ def test_explain_tier_status_hot_when_no_rebuilt_seen(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     assert status.cohort == "hot"
-    assert status.next_due_at is None
+    assert status.next_due_at == next_cron_tick_at_or_after(now, cron_interval)
 
 
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_dormant_not_yet_due(
@@ -972,6 +1044,7 @@ def test_explain_tier_status_dormant_not_yet_due(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
     """Dormant + recently polled → next_due_at = last_polled + interval.
 
@@ -992,6 +1065,7 @@ def test_explain_tier_status_dormant_not_yet_due(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     assert status.cohort == "dormant"
     assert status.last_polled_at == last_polled
@@ -999,7 +1073,13 @@ def test_explain_tier_status_dormant_not_yet_due(
 
 
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_dormant_due(
@@ -1007,6 +1087,7 @@ def test_explain_tier_status_dormant_due(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
     """Dormant + last poll older than the interval still surfaces a timestamp.
 
@@ -1027,6 +1108,7 @@ def test_explain_tier_status_dormant_due(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     assert status.cohort == "dormant"
     assert status.last_polled_at == last_polled
@@ -1035,7 +1117,13 @@ def test_explain_tier_status_dormant_due(
 
 
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_dormant_no_annotation(
@@ -1043,12 +1131,15 @@ def test_explain_tier_status_dormant_no_annotation(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
-    """Dormant without a per-tier last-polled annotation → next_due_at=None.
+    """Dormant without a per-tier last-polled annotation → next cron tick.
 
-    The gate polls in this case (rule 4 "missing" branch), so the
-    explainer signals "no calendar gate; next tick polls" with
-    ``next_due_at=None``. Symmetrical with the hot/unseen cases.
+    The gate polls in this case (rule 4 "missing" branch). Without a
+    parsed last-polled annotation there is no calendar deadline to
+    surface, so the explainer falls back to the next cron tick —
+    symmetrical with the hot and unseen cohorts (all three have no
+    per-project calendar gate, only the cron's wall-clock cadence).
     """
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     state = _project_state(
@@ -1061,10 +1152,11 @@ def test_explain_tier_status_dormant_no_annotation(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     assert status.cohort == "dormant"
     assert status.last_polled_at is None
-    assert status.next_due_at is None
+    assert status.next_due_at == next_cron_tick_at_or_after(now, cron_interval)
 
 
 def test_explain_tier_status_dormant_jitter_offsets_next_due() -> None:
@@ -1103,6 +1195,7 @@ def test_explain_tier_status_dormant_jitter_offsets_next_due() -> None:
         tier=Tier.main,
         hot_window=TIER_MAIN_HOT_WINDOW,
         dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        cron_interval=TIER_MAIN_CRON_INTERVAL,
         jitter_window=TIER_MAIN_DORMANT_JITTER,
     )
     slow = explain_tier_status(
@@ -1111,6 +1204,7 @@ def test_explain_tier_status_dormant_jitter_offsets_next_due() -> None:
         tier=Tier.main,
         hot_window=TIER_MAIN_HOT_WINDOW,
         dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        cron_interval=TIER_MAIN_CRON_INTERVAL,
         jitter_window=TIER_MAIN_DORMANT_JITTER,
     )
     assert fast.next_due_at is not None
@@ -1141,6 +1235,7 @@ def test_explain_tier_status_uses_per_tier_annotation_key() -> None:
         tier=Tier.main,
         hot_window=TIER_MAIN_HOT_WINDOW,
         dormant_interval=TIER_MAIN_DORMANT_INTERVAL,
+        cron_interval=TIER_MAIN_CRON_INTERVAL,
     )
     discovery_status = explain_tier_status(
         state,
@@ -1148,6 +1243,7 @@ def test_explain_tier_status_uses_per_tier_annotation_key() -> None:
         tier=Tier.discovery,
         hot_window=TIER_DISCOVERY_HOT_WINDOW,
         dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
+        cron_interval=TIER_DISCOVERY_CRON_INTERVAL,
     )
     other_status = explain_tier_status(
         state,
@@ -1155,14 +1251,106 @@ def test_explain_tier_status_uses_per_tier_annotation_key() -> None:
         tier=Tier.other,
         hot_window=TIER_OTHER_HOT_WINDOW,
         dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
+        cron_interval=TIER_OTHER_CRON_INTERVAL,
     )
     assert main_status.last_polled_at == last_polled_main
     assert discovery_status.last_polled_at is None
     assert other_status.last_polled_at is None
 
 
+# ---------------------------------------------------------------------------
+# next_cron_tick_at_or_after
+# ---------------------------------------------------------------------------
+
+
+def test_next_cron_tick_returns_now_when_on_boundary() -> None:
+    """``now`` exactly on an interval boundary returns ``now`` itself.
+
+    ``at_or_after`` is inclusive of the boundary so the explainer
+    surfaces "due now" (the next cron tick is this instant) instead of
+    pushing the tick one interval into the future.
+    """
+    now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    assert next_cron_tick_at_or_after(now, timedelta(minutes=5)) == now
+    assert next_cron_tick_at_or_after(now, timedelta(minutes=30)) == now
+    assert next_cron_tick_at_or_after(now, timedelta(hours=1)) == now
+
+
+def test_next_cron_tick_rounds_up_when_between_boundaries() -> None:
+    """``now`` between boundaries returns the next interval anchor.
+
+    Locks the rounding direction (ceiling, not floor) so an operator
+    reading the GET response sees the *upcoming* tick, not the most
+    recent past tick.
+    """
+    # 12:03 with a 5-min cadence anchored at midnight: next tick is 12:05.
+    now = datetime(2026, 5, 7, 12, 3, tzinfo=UTC)
+    assert next_cron_tick_at_or_after(now, timedelta(minutes=5)) == datetime(
+        2026, 5, 7, 12, 5, tzinfo=UTC
+    )
+
+    # 12:03 with a 30-min cadence: next tick is 12:30.
+    assert next_cron_tick_at_or_after(now, timedelta(minutes=30)) == datetime(
+        2026, 5, 7, 12, 30, tzinfo=UTC
+    )
+
+    # 12:03 with an hourly cadence: next tick is 13:00.
+    assert next_cron_tick_at_or_after(now, timedelta(hours=1)) == datetime(
+        2026, 5, 7, 13, tzinfo=UTC
+    )
+
+
+def test_next_cron_tick_handles_sub_second_offsets() -> None:
+    """Sub-second offsets count as off-boundary; round up.
+
+    ``now`` at 12:00:00.000001 is *not* on the 12:00 boundary by ``==``
+    so the helper must return the next boundary, not 12:00 itself. The
+    microsecond-precision case mirrors what production callers pass
+    (datetime.now(tz=UTC) carries microseconds).
+    """
+    now = datetime(2026, 5, 7, 12, 0, 0, 1, tzinfo=UTC)
+    assert next_cron_tick_at_or_after(now, timedelta(minutes=5)) == datetime(
+        2026, 5, 7, 12, 5, tzinfo=UTC
+    )
+
+
+def test_next_cron_tick_anchors_on_utc_midnight() -> None:
+    """The rounding anchor is midnight of ``now``'s date, not an epoch.
+
+    Cron's ``minute={...}`` is wall-clock minutes within each hour, so
+    a 30-min cadence fires at HH:00 and HH:30 of every hour. The helper
+    must agree with that calendar at the start of the day — 00:01 with
+    a 30-min interval rounds to 00:30, not "30 minutes after some
+    arbitrary epoch start".
+    """
+    now = datetime(2026, 5, 7, 0, 1, tzinfo=UTC)
+    assert next_cron_tick_at_or_after(now, timedelta(minutes=30)) == datetime(
+        2026, 5, 7, 0, 30, tzinfo=UTC
+    )
+
+
+def test_tier_cron_interval_constants_match_documented_cadence() -> None:
+    """Tier crons fire at 5 min / 30 min / 1 h respectively.
+
+    Locks the constants so a future re-tune comes back and re-
+    acknowledges the SLOs (main-tier 5-min cadence is the user-visible
+    SLO from PRD #275 user story 10; discovery and other tiers stay on
+    their documented schedules so the load-shed budget against LTD
+    stays bounded).
+    """
+    assert timedelta(minutes=5) == TIER_MAIN_CRON_INTERVAL
+    assert timedelta(minutes=30) == TIER_DISCOVERY_CRON_INTERVAL
+    assert timedelta(hours=1) == TIER_OTHER_CRON_INTERVAL
+
+
 @pytest.mark.parametrize(
-    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
     _EXPLAIN_TIER_PARAMS,
 )
 def test_explain_tier_status_agrees_with_gate_at_dormant_boundary(
@@ -1170,6 +1358,7 @@ def test_explain_tier_status_agrees_with_gate_at_dormant_boundary(
     annotation_key: str,
     hot_window: timedelta,
     dormant_interval: timedelta,
+    cron_interval: timedelta,
 ) -> None:
     """When the gate polls, the explainer's next_due_at is in the past or now.
 
@@ -1192,6 +1381,7 @@ def test_explain_tier_status_agrees_with_gate_at_dormant_boundary(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
     )
     gate = should_poll_for_tier(
         state=state,

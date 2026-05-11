@@ -221,12 +221,17 @@ class KeeperSyncTierStatus(BaseModel):
     date_next_due: datetime | None = Field(
         default=None,
         description=(
-            "Wall-clock time at which the planner will next greenlight"
-            " a poll. ``null`` when the next cron tick will poll"
-            " unconditionally (hot, unseen, or dormant without a"
-            " last-polled annotation). Jitter-aware: dormant projects'"
+            "Earliest wall-clock time at which the next *poll* (not"
+            " necessarily an enqueue) for this tier may run. For hot,"
+            " unseen, and dormant-without-last-polled cohorts this is"
+            " the next tier-cron tick — there is no per-project"
+            " calendar gate. For dormant cohorts with a recorded"
+            " last-polled annotation this is ``last_polled +"
+            " dormant_interval`` (jitter-aware: dormant projects'"
             " next-due timestamps are spread across the dormant"
-            " interval by stable_hash_fraction(slug)."
+            " interval by stable_hash_fraction(slug)). Change-"
+            " detection and per-subject mutex gates downstream of the"
+            " planner may still suppress the actual enqueue."
         ),
     )
 

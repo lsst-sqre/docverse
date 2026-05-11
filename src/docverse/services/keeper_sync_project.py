@@ -38,12 +38,15 @@ from docverse.client.models import (
 from docverse.domain.edition import Edition
 from docverse.exceptions import NotFoundError
 from docverse.services.keeper_sync.scheduler import (
+    TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
     TIER_DISCOVERY_DORMANT_JITTER,
     TIER_DISCOVERY_HOT_WINDOW,
+    TIER_MAIN_CRON_INTERVAL,
     TIER_MAIN_DORMANT_INTERVAL,
     TIER_MAIN_DORMANT_JITTER,
     TIER_MAIN_HOT_WINDOW,
+    TIER_OTHER_CRON_INTERVAL,
     TIER_OTHER_DORMANT_INTERVAL,
     TIER_OTHER_DORMANT_JITTER,
     TIER_OTHER_HOT_WINDOW,
@@ -600,6 +603,7 @@ def _explain_all_tiers(
                 TIER_MAIN_DORMANT_INTERVAL,
                 TIER_MAIN_DORMANT_JITTER,
             ),
+            cron_interval=TIER_MAIN_CRON_INTERVAL,
         ),
         _build_tier_status(
             tier=Tier.discovery,
@@ -611,6 +615,7 @@ def _explain_all_tiers(
                 TIER_DISCOVERY_DORMANT_INTERVAL,
                 TIER_DISCOVERY_DORMANT_JITTER,
             ),
+            cron_interval=TIER_DISCOVERY_CRON_INTERVAL,
         ),
         _build_tier_status(
             tier=Tier.other,
@@ -622,17 +627,19 @@ def _explain_all_tiers(
                 TIER_OTHER_DORMANT_INTERVAL,
                 TIER_OTHER_DORMANT_JITTER,
             ),
+            cron_interval=TIER_OTHER_CRON_INTERVAL,
         ),
     ]
 
 
-def _build_tier_status(
+def _build_tier_status(  # noqa: PLR0913
     *,
     tier: Tier,
     tier_name: KeeperSyncTierName,
     state: KeeperSyncState | None,
     now: datetime,
     hot_window_dormant_jitter: tuple[timedelta, timedelta, timedelta],
+    cron_interval: timedelta,
 ) -> KeeperSyncTierStatus:
     """Compose a :class:`KeeperSyncTierStatus` from the planner output."""
     hot_window, dormant_interval, jitter_window = hot_window_dormant_jitter
@@ -642,6 +649,7 @@ def _build_tier_status(
         tier=tier,
         hot_window=hot_window,
         dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
         jitter_window=jitter_window,
     )
     return KeeperSyncTierStatus(
