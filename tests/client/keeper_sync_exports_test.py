@@ -1,5 +1,4 @@
-"""Assert that the keeper-sync handler response surface is closed under
-``docverse.client.models.__all__``.
+"""Lock the keeper-sync handler response surface to ``__all__``.
 
 Every Pydantic model used as ``response_model=`` in
 ``docverse.handlers.orgs.keeper_sync.router`` — and every Pydantic
@@ -67,9 +66,11 @@ def _collect_route_response_models() -> list[type[BaseModel]]:
             continue
         origin = get_origin(response_model)
         if origin is not None:
-            for arg in get_args(response_model):
-                if isinstance(arg, type) and issubclass(arg, BaseModel):
-                    out.append(arg)
+            out.extend(
+                arg
+                for arg in get_args(response_model)
+                if isinstance(arg, type) and issubclass(arg, BaseModel)
+            )
         elif isinstance(response_model, type) and issubclass(
             response_model, BaseModel
         ):
@@ -97,14 +98,14 @@ def test_every_response_model_is_in_client_export_surface() -> None:
     for model in _collect_route_response_models():
         _walk_type(model, seen=set(), acc=reachable)
 
-    assert reachable, "expected the handler module to expose some response_models"
+    assert reachable, (
+        "expected the handler module to expose some response_models"
+    )
 
     missing = sorted(
-        (
-            f"{t.__module__}.{t.__qualname__}"
-            for t in reachable
-            if not _reachable_via_export(t, exported)
-        )
+        f"{t.__module__}.{t.__qualname__}"
+        for t in reachable
+        if not _reachable_via_export(t, exported)
     )
     assert missing == [], (
         "These types are referenced (directly or transitively) by"
@@ -133,9 +134,9 @@ def test_handler_side_subclasses_are_not_exported() -> None:
     }
     for cls in handler_subclasses:
         exported = getattr(client_models, cls.__name__, None)
-        assert (
-            cls.__name__ in exported_names
-        ), f"expected base class {cls.__name__!r} to be exported"
+        assert cls.__name__ in exported_names, (
+            f"expected base class {cls.__name__!r} to be exported"
+        )
         assert exported is not cls, (
             f"{cls.__module__}.{cls.__name__} is a handler-side"
             " subclass; ``docverse.client.models`` must export the"
