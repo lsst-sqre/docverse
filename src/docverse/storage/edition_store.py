@@ -185,6 +185,38 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def list_by_project_ids_and_kind(
+        self, *, project_ids: list[int], kind: EditionKind
+    ) -> list[Edition]:
+        """Return non-deleted editions for the given projects + kind.
+
+        Single-query batch that callers use to resolve "the ``main``
+        edition for each of these N projects" without issuing N
+        separate ``get_by_slug`` round-trips. Returns editions ordered
+        by ``project_id`` for stable iteration; the
+        ``ck_editions_main_slug_kind`` constraint guarantees at most
+        one row per ``project_id`` when ``kind == EditionKind.main``.
+        Passing an empty ``project_ids`` returns ``[]`` without hitting
+        the database.
+        """
+        if not project_ids:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id.in_(project_ids),
+                SqlEdition.kind == kind,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.project_id)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
     async def list_all_by_project(self, project_id: int) -> list[Edition]:
         """List every non-deleted edition for a project.
 

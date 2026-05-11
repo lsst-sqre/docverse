@@ -18,6 +18,7 @@ from docverse.handlers.queue.models import QueueJob
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     KEEPER_SYNC_EDITION_CURSOR_TYPE,
+    KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE,
     KEEPER_SYNC_RUN_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
     QUEUE_JOB_CURSOR_TYPE,
@@ -93,6 +94,54 @@ async def post_org_keeper_sync_run(
     return KeeperSyncRunCreated.from_domain(
         run, activity, queue_job, context.request, org_slug
     )
+
+
+@router.get(
+    "/orgs/{org}/keeper-sync/projects",
+    response_model=list[KeeperSyncProjectStatus],
+    summary="List keeper-sync projects on an organization",
+    name="get_org_keeper_sync_projects",
+)
+async def get_org_keeper_sync_projects(
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+) -> list[KeeperSyncProjectStatus]:
+    parsed_cursor = (
+        KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE.from_str(cursor)
+        if cursor is not None
+        else None
+    )
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_project_service()
+        result = await service.list_project_statuses(
+            org_slug=org_slug, cursor=parsed_cursor, limit=limit
+        )
+    context.response.headers["Link"] = result.page.link_header(
+        context.request.url
+    )
+    context.response.headers["X-Total-Count"] = str(result.page.count)
+    return [
+        KeeperSyncProjectStatus.from_domain(entry, context.request)
+        for entry in result.entries
+    ]
 
 
 @router.get(

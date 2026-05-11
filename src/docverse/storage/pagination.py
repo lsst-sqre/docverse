@@ -19,6 +19,7 @@ from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.dbschema.project import SqlProject
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.build import Build
@@ -27,6 +28,7 @@ from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.domain.keeper_sync_run import KeeperSyncRun
 from docverse.domain.project import Project
 from docverse.domain.queue import QueueJob
+from docverse.storage.keeper_sync.state_store import KeeperSyncState
 
 __all__ = [
     "BUILD_CURSOR_TYPE",
@@ -34,6 +36,7 @@ __all__ = [
     "EDITION_CURSOR_TYPES",
     "EDITION_HISTORY_CURSOR_TYPE",
     "KEEPER_SYNC_EDITION_CURSOR_TYPE",
+    "KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE",
     "KEEPER_SYNC_RUN_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
@@ -45,6 +48,7 @@ __all__ = [
     "EditionSlugCursor",
     "EditionSortOrder",
     "KeeperSyncEditionSlugCursor",
+    "KeeperSyncProjectStateIdCursor",
     "KeeperSyncRunDateStartedCursor",
     "ProjectDateCreatedCursor",
     "ProjectSearchCursor",
@@ -171,6 +175,64 @@ class EditionSlugCursor(PaginationCursor[Edition]):
     def __str__(self) -> str:  # noqa: D105
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.slug}"
+
+
+@dataclass(slots=True)
+class KeeperSyncProjectStateIdCursor(PaginationCursor[KeeperSyncState]):
+    """Keyset cursor for ``keeper_sync_state`` project rows by id DESC.
+
+    Project-resource state rows are inserted as the sync discovers new
+    LTD products, so the row id is monotonic in discovery order. Paging
+    by ``id DESC`` therefore surfaces newest-discovered projects first,
+    matching the operator-facing "what's freshest?" expectation without
+    paying the NULL-handling cost a ``date_last_synced``-keyed cursor
+    would carry for rows the sync has not yet stamped.
+    """
+
+    id: int
+
+    @override
+    @classmethod
+    def from_entry(
+        cls, entry: KeeperSyncState, *, reverse: bool = False
+    ) -> Self:
+        return cls(id=entry.id, previous=reverse)
+
+    @override
+    @classmethod
+    def from_str(cls, cursor: str) -> Self:
+        try:
+            if cursor.startswith("p__"):
+                return cls(id=int(cursor[3:]), previous=True)
+            return cls(id=int(cursor), previous=False)
+        except (ValueError, TypeError) as exc:
+            msg = f"Invalid cursor: {cursor!r}"
+            raise InvalidCursorError(msg) from exc
+
+    @override
+    @classmethod
+    def apply_order(
+        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[tuple[Any, ...]]:
+        if reverse:
+            return stmt.order_by(SqlKeeperSyncState.id.asc())
+        return stmt.order_by(SqlKeeperSyncState.id.desc())
+
+    @override
+    def apply_cursor(
+        self, stmt: Select[tuple[Any, ...]]
+    ) -> Select[tuple[Any, ...]]:
+        if self.previous:
+            return stmt.where(SqlKeeperSyncState.id > self.id)
+        return stmt.where(SqlKeeperSyncState.id <= self.id)
+
+    @override
+    def invert(self) -> Self:
+        return type(self)(id=self.id, previous=not self.previous)
+
+    def __str__(self) -> str:  # noqa: D105
+        prefix = "p__" if self.previous else ""
+        return f"{prefix}{self.id}"
 
 
 @dataclass(slots=True)
@@ -501,6 +563,10 @@ KEEPER_SYNC_EDITION_CURSOR_TYPE: type[KeeperSyncEditionSlugCursor] = (
 
 KEEPER_SYNC_RUN_CURSOR_TYPE: type[KeeperSyncRunDateStartedCursor] = (
     KeeperSyncRunDateStartedCursor
+)
+
+KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE: type[KeeperSyncProjectStateIdCursor] = (
+    KeeperSyncProjectStateIdCursor
 )
 
 QUEUE_JOB_CURSOR_TYPE: type[QueueJobDateCreatedCursor] = (

@@ -13,15 +13,19 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
+
+if TYPE_CHECKING:
+    from docverse.storage.pagination import KeeperSyncProjectStateIdCursor
 
 __all__ = [
     "KeeperSyncState",
@@ -188,6 +192,36 @@ class KeeperSyncStateStore:
             KeeperSyncState.model_validate(row)
             for row in result.scalars().all()
         ]
+
+    async def list_project_resources_for_org(
+        self,
+        *,
+        org_id: int,
+        cursor: KeeperSyncProjectStateIdCursor | None,
+        limit: int,
+    ) -> CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]:
+        """Return a paginated page of project-resource rows for an org.
+
+        Used by the org-scoped paginated keeper-sync projects listing.
+        Ordered by ``id DESC`` via
+        :class:`docverse.storage.pagination.KeeperSyncProjectStateIdCursor`
+        so newest-discovered projects appear first.
+        """
+        from docverse.storage.pagination import (  # noqa: PLC0415
+            KeeperSyncProjectStateIdCursor,
+        )
+
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == ResourceType.project.value,
+        )
+        runner = CountedPaginatedQueryRunner(
+            entry_type=KeeperSyncState,
+            cursor_type=KeeperSyncProjectStateIdCursor,
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
 
     async def upsert(  # noqa: PLR0913
         self,

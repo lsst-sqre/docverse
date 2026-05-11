@@ -29,6 +29,7 @@ import structlog
 from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.client.models import (
+    EditionKind,
     KeeperSyncEditionDiff,
     KeeperSyncProjectStateSummary,
     KeeperSyncTierName,
@@ -57,12 +58,16 @@ from docverse.storage.keeper_sync import (
 )
 from docverse.storage.ltd.client import LtdClient, LtdClientError
 from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.pagination import KeeperSyncEditionSlugCursor
+from docverse.storage.pagination import (
+    KeeperSyncEditionSlugCursor,
+    KeeperSyncProjectStateIdCursor,
+)
 from docverse.storage.project_store import ProjectStore
 
 __all__ = [
     "KeeperSyncEditionListResult",
     "KeeperSyncEditionStatusRow",
+    "KeeperSyncProjectListResult",
     "KeeperSyncProjectService",
     "KeeperSyncProjectStatusResult",
     "LtdClientFactory",
@@ -102,6 +107,22 @@ class KeeperSyncProjectStatusResult:
     tier_status: list[KeeperSyncTierStatus]
     main_edition_row: KeeperSyncEditionStatusRow | None
     edition_diff: KeeperSyncEditionDiff | None
+
+
+@dataclass(frozen=True, slots=True)
+class KeeperSyncProjectListResult:
+    """Handler-agnostic result for the paginated keeper-sync projects listing.
+
+    Wraps the page of fully-composed
+    :class:`KeeperSyncProjectStatusResult` entries plus the underlying
+    paginated state-row page so the handler can emit ``Link`` and
+    ``X-Total-Count`` headers from one place. The entries are
+    pre-composed at the service layer so the handler only has to mint
+    HATEOAS URLs via ``request.url_for``.
+    """
+
+    entries: list[KeeperSyncProjectStatusResult]
+    page: CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +352,103 @@ class KeeperSyncProjectService:
             page=page,
             state_by_docverse_id=state_by_docverse_id,
         )
+
+    async def list_project_statuses(
+        self,
+        *,
+        org_slug: str,
+        cursor: KeeperSyncProjectStateIdCursor | None,
+        limit: int,
+    ) -> KeeperSyncProjectListResult:
+        """Return a paginated page of every keeper-sync project for an org.
+
+        Only projects with a ``keeper_sync_state`` row of
+        ``resource_type=project`` for this org appear. Never-seen-but-
+        allowlisted slugs are intentionally excluded: operators can
+        still inspect them via :meth:`get_project_status`.
+
+        Per-page cost is O(1) round-trips regardless of page size:
+        Docverse projects and ``__main`` editions for the page are
+        batch-loaded, and the org-wide edition state rows are fetched
+        once and indexed in-memory for the main-edition left-join.
+
+        Raises
+        ------
+        NotFoundError
+            If the org does not exist or LTD sync is not enabled on it.
+        """
+        org = await self._org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        config = org.keeper_sync_config
+        if config is None or not config.enabled:
+            msg = (
+                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
+            )
+            raise NotFoundError(msg)
+
+        page = await self._state_store.list_project_resources_for_org(
+            org_id=org.id, cursor=cursor, limit=limit
+        )
+        project_ids = [
+            row.docverse_id
+            for row in page.entries
+            if row.docverse_id is not None
+        ]
+        projects_by_id = {
+            project.id: project
+            for project in await self._project_store.list_by_ids(project_ids)
+        }
+        main_editions = await self._edition_store.list_by_project_ids_and_kind(
+            project_ids=list(projects_by_id),
+            kind=EditionKind.main,
+        )
+        main_edition_by_project_id = {
+            edition.project_id: edition for edition in main_editions
+        }
+        edition_states = await self._state_store.list_for_org(
+            org_id=org.id, resource_type=ResourceType.edition
+        )
+        edition_state_by_docverse_id: dict[int, KeeperSyncState] = {
+            state.docverse_id: state
+            for state in edition_states
+            if state.docverse_id is not None
+        }
+        now = datetime.now(tz=UTC)
+
+        entries: list[KeeperSyncProjectStatusResult] = []
+        for state_row in page.entries:
+            project = (
+                projects_by_id.get(state_row.docverse_id)
+                if state_row.docverse_id is not None
+                else None
+            )
+            docverse_project_slug = (
+                project.slug if project is not None else None
+            )
+            main_edition_row: KeeperSyncEditionStatusRow | None = None
+            if project is not None:
+                main_edition = main_edition_by_project_id.get(project.id)
+                if main_edition is not None:
+                    main_edition_row = KeeperSyncEditionStatusRow(
+                        edition=main_edition,
+                        state=edition_state_by_docverse_id.get(
+                            main_edition.id
+                        ),
+                    )
+            entries.append(
+                KeeperSyncProjectStatusResult(
+                    org_slug=org_slug,
+                    ltd_slug=state_row.ltd_slug,
+                    docverse_project_slug=docverse_project_slug,
+                    project_state=_summarise_project_state(state_row),
+                    tier_status=_explain_all_tiers(state=state_row, now=now),
+                    main_edition_row=main_edition_row,
+                    edition_diff=None,
+                )
+            )
+        return KeeperSyncProjectListResult(entries=entries, page=page)
 
     async def _lookup_main_edition_row(
         self,

@@ -357,6 +357,15 @@ class KeeperSyncProjectStatus(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    self_url: HttpUrl = Field(
+        description=(
+            "Canonical ``GET /orgs/{org}/keeper-sync/projects/{ltd_slug}``"
+            " URL for this project's keeper-sync status. Lets clients"
+            " paginating the org-wide project listing drill into a"
+            " single project without constructing the URL by hand."
+        )
+    )
+
     org_url: HttpUrl = Field(
         description=(
             "Canonical ``GET /orgs/{org}`` URL for the Docverse"

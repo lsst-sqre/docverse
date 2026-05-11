@@ -200,6 +200,15 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
                     result.docverse_project_slug,
                 )
         return cls(
+            self_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "get_org_keeper_sync_project_status",
+                        org=result.org_slug,
+                        ltd_slug=result.ltd_slug,
+                    )
+                )
+            ),
             org_url=HttpUrl(
                 str(request.url_for("get_organization", org=result.org_slug))
             ),
