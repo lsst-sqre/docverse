@@ -293,9 +293,7 @@ async def test_list_editions_returns_main_plus_drafts_with_state(
     assert branch_a["kind"] == "draft"
     assert branch_a["ltd_id"] == 99
     assert branch_a["ltd_slug"] == "branch-a"
-    assert (
-        datetime.fromisoformat(branch_a["date_last_synced"]) == sync_time
-    )
+    assert datetime.fromisoformat(branch_a["date_last_synced"]) == sync_time
     expected_url = str(
         client.base_url.join(
             f"/docverse/orgs/{_ORG}/projects/{_LTD_SLUG}/editions/branch-a"
@@ -358,7 +356,9 @@ async def test_list_editions_paginates_with_cursor(
     # The combined ordering is slug ASC under the DB's default
     # collation (en_US.UTF-8): letters before underscore-prefixed
     # tokens, so ``__main`` lands at the end.
-    assert (
-        page_one_slugs + page_two_slugs
-        == ["alpha", "beta", "gamma", "__main"]
-    )
+    assert page_one_slugs + page_two_slugs == [
+        "alpha",
+        "beta",
+        "gamma",
+        "__main",
+    ]
