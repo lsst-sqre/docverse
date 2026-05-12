@@ -32,6 +32,7 @@ class QueueJob(BaseModel):
     build_id: int | None = None
     edition_id: int | None = None
     keeper_sync_run_id: int | None = None
+    lifecycle_eval_run_id: int | None = None
     subject_label: str | None = None
     progress: dict[str, Any] | None = None
     errors: dict[str, Any] | None = None

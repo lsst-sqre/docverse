@@ -67,6 +67,12 @@ class SqlQueueJob(Base):
         nullable=True,
     )
 
+    lifecycle_eval_run_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("lifecycle_eval_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     subject_label: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     progress: Mapped[dict[str, Any] | None] = mapped_column(
@@ -94,6 +100,10 @@ class SqlQueueJob(Base):
         Index("idx_queue_jobs_status", "status"),
         Index("idx_queue_jobs_org_id", "org_id"),
         Index("idx_queue_jobs_keeper_sync_run_id", "keeper_sync_run_id"),
+        Index(
+            "idx_queue_jobs_lifecycle_eval_run_id",
+            "lifecycle_eval_run_id",
+        ),
         # Per-project mutex for keeper_sync_project jobs: at most one
         # queued or in_progress row per (org_id, subject_label). The
         # partial WHERE means terminal rows do not participate, so a
@@ -105,6 +115,23 @@ class SqlQueueJob(Base):
             unique=True,
             postgresql_where=text(
                 "kind = 'keeper_sync_project' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
+        # Per-org mutex for ``lifecycle_eval`` per-org child jobs: at
+        # most one queued or in_progress row per (org_id,
+        # subject_label). The dispatcher writes
+        # ``subject_label = str(org_id)`` so this is effectively one
+        # row per org while the per-org evaluator is running. The
+        # partial WHERE means terminal rows do not participate, so a
+        # finished tick never blocks the next.
+        Index(
+            "idx_queue_jobs_lifecycle_eval_active_uq",
+            "org_id",
+            "subject_label",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'lifecycle_eval' "
                 "AND status IN ('queued', 'in_progress')"
             ),
         ),

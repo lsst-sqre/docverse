@@ -6,10 +6,18 @@ rule schema is a tagged union discriminated on ``type`` so operators
 get an early 422 with a discriminator-aware error message when a
 PATCH payload names an unknown rule kind or omits a required field
 for a known one.
+
+The dispatcher cron writes one ``lifecycle_eval_runs`` aggregate row per
+tick, fans out per-org work onto ``queue_jobs``, and finalises the run
+when every child job is terminal. ``LifecycleEvalRunStatus`` is the
+lifecycle of that aggregate row; it shares the five-state shape of
+``KeeperSyncRunStatus`` so the dispatcher / per-org / reaper pattern
+transfers between the two subsystems without operator re-training.
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import (
@@ -24,6 +32,7 @@ from pydantic import (
 __all__ = [
     "BuildHistoryOrphanRule",
     "DraftInactivityRule",
+    "LifecycleEvalRunStatus",
     "LifecycleRule",
     "LifecycleRuleSet",
     "RefDeletedRule",
@@ -138,3 +147,20 @@ class LifecycleRuleSet(RootModel[list[LifecycleRule]]):
                 raise ValueError(msg)
             seen.add(rule.type)
         return self
+
+
+class LifecycleEvalRunStatus(StrEnum):
+    """Lifecycle status of a ``lifecycle_eval_runs`` aggregate row.
+
+    ``pending`` — the dispatcher has created the run row but has not yet
+    enqueued any per-org child jobs. ``in_progress`` — at least one
+    per-org child has been enqueued. ``succeeded`` /
+    ``partial_failure`` / ``failed`` are terminal states set by
+    ``maybe_finalise_lifecycle_run`` when every child is terminal.
+    """
+
+    pending = "pending"
+    in_progress = "in_progress"
+    succeeded = "succeeded"
+    partial_failure = "partial_failure"
+    failed = "failed"
