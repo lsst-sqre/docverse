@@ -82,17 +82,21 @@ def test_lifecycle_rule_rejects_unknown_type() -> None:
         _lifecycle_rule_adapter.validate_python(
             {"type": "purgatory_eviction", "enabled": True}
         )
-    # The discriminator-aware error message names the failing tag.
-    assert "purgatory_eviction" in str(exc_info.value) or (
-        "union_tag_invalid" in str(exc_info.value)
-    )
+    errors = exc_info.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "union_tag_invalid"
+    assert errors[0]["input"] == {
+        "type": "purgatory_eviction",
+        "enabled": True,
+    }
 
 
 def test_lifecycle_rule_rejects_missing_discriminator() -> None:
     with pytest.raises(ValidationError) as exc_info:
         _lifecycle_rule_adapter.validate_python({"max_days_inactive": 30})
-    # The discriminator-aware error message names the missing tag.
-    assert "type" in str(exc_info.value)
+    errors = exc_info.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "union_tag_not_found"
 
 
 def test_lifecycle_rule_rejects_missing_required_field() -> None:

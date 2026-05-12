@@ -18,7 +18,6 @@ from pydantic import (
     Discriminator,
     Field,
     RootModel,
-    Tag,
     model_validator,
 )
 
@@ -113,9 +112,7 @@ class RefDeletedRule(BaseModel):
 
 
 LifecycleRule = Annotated[
-    Annotated[DraftInactivityRule, Tag("draft_inactivity")]
-    | Annotated[BuildHistoryOrphanRule, Tag("build_history_orphan")]
-    | Annotated[RefDeletedRule, Tag("ref_deleted")],
+    DraftInactivityRule | BuildHistoryOrphanRule | RefDeletedRule,
     Discriminator("type"),
 ]
 """Discriminated union of all lifecycle-rule variants."""
