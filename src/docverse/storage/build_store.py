@@ -99,6 +99,29 @@ class BuildStore:
             return None
         return Build.model_validate(row)
 
+    async def list_all_by_project_ids(
+        self, project_ids: list[int]
+    ) -> list[Build]:
+        """List every non-deleted build across the given projects.
+
+        Single-query batch over multiple projects, ordered by
+        ``(project_id, id)`` for stable iteration. Used by the
+        ``lifecycle_eval`` per-org worker to load every project's
+        builds in one round-trip rather than N. Passing an empty
+        ``project_ids`` returns ``[]`` without hitting the database.
+        """
+        if not project_ids:
+            return []
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id.in_(project_ids),
+                SqlBuild.date_deleted.is_(None),
+            )
+            .order_by(SqlBuild.project_id, SqlBuild.id)
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
+
     async def list_pending_older_than(
         self,
         *,

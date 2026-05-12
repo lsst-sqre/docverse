@@ -106,6 +106,33 @@ class EditionBuildHistoryStore:
             EditionBuildHistory.model_validate(r) for r in result.scalars()
         ]
 
+    async def list_by_edition_ids(
+        self, edition_ids: list[int]
+    ) -> list[EditionBuildHistory]:
+        """List history rows for the given editions in a single round-trip.
+
+        Ordered by ``(edition_id, position)`` so callers that group by
+        edition see each edition's history sorted oldest-position-first.
+        Used by the ``lifecycle_eval`` per-org worker to load every
+        edition's rollback history in one query rather than N. Passing
+        an empty ``edition_ids`` returns ``[]`` without hitting the
+        database.
+        """
+        if not edition_ids:
+            return []
+        stmt = (
+            select(SqlEditionBuildHistory)
+            .where(SqlEditionBuildHistory.edition_id.in_(edition_ids))
+            .order_by(
+                SqlEditionBuildHistory.edition_id,
+                SqlEditionBuildHistory.position.asc(),
+            )
+        )
+        result = await self._session.execute(stmt)
+        return [
+            EditionBuildHistory.model_validate(r) for r in result.scalars()
+        ]
+
     async def list_by_edition_with_build_info(
         self,
         edition_id: int,
