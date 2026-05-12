@@ -13,14 +13,13 @@ from docverse.client.models import (
 )
 from docverse.client.models.lifecycle import LifecycleRule
 
-
 _lifecycle_rule_adapter: TypeAdapter[object] = TypeAdapter(LifecycleRule)
 
 
 def test_draft_inactivity_rule_validates_minimum() -> None:
     rule = DraftInactivityRule(max_days_inactive=30)
     assert rule.type == "draft_inactivity"
-    assert rule.max_days_inactive == 30
+    assert rule.max_days_inactive == 30  # noqa: PLR2004
 
 
 def test_draft_inactivity_rule_rejects_non_positive_days() -> None:
@@ -31,8 +30,8 @@ def test_draft_inactivity_rule_rejects_non_positive_days() -> None:
 def test_build_history_orphan_rule_validates() -> None:
     rule = BuildHistoryOrphanRule(min_position=5, min_age_days=30)
     assert rule.type == "build_history_orphan"
-    assert rule.min_position == 5
-    assert rule.min_age_days == 30
+    assert rule.min_position == 5  # noqa: PLR2004
+    assert rule.min_age_days == 30  # noqa: PLR2004
 
 
 def test_build_history_orphan_rule_rejects_non_positive_position() -> None:
@@ -115,7 +114,11 @@ def test_lifecycle_rule_rejects_extra_field() -> None:
 def test_lifecycle_rule_set_accepts_multiple_distinct_types() -> None:
     payload = [
         {"type": "draft_inactivity", "max_days_inactive": 30},
-        {"type": "build_history_orphan", "min_position": 5, "min_age_days": 30},
+        {
+            "type": "build_history_orphan",
+            "min_position": 5,
+            "min_age_days": 30,
+        },
         {"type": "ref_deleted", "enabled": True},
     ]
     rule_set = LifecycleRuleSet.model_validate(payload)
@@ -140,7 +143,11 @@ def test_lifecycle_rule_set_accepts_empty_list() -> None:
 def test_lifecycle_rule_set_dumps_to_json_friendly_list() -> None:
     payload = [
         {"type": "draft_inactivity", "max_days_inactive": 30},
-        {"type": "build_history_orphan", "min_position": 5, "min_age_days": 30},
+        {
+            "type": "build_history_orphan",
+            "min_position": 5,
+            "min_age_days": 30,
+        },
     ]
     rule_set = LifecycleRuleSet.model_validate(payload)
     dumped = rule_set.model_dump(mode="json")
