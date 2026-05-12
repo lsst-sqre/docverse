@@ -56,6 +56,11 @@ class ProjectCreate(BaseModel):
         ),
     )
 
+    lifecycle_rules: LifecycleRuleSet | None = Field(
+        default=None,
+        description="Rules governing build lifecycle.",
+    )
+
 
 class Project(BaseModel):
     """Response model for a project."""

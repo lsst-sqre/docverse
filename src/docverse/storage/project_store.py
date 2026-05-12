@@ -34,11 +34,15 @@ class ProjectStore:
 
     async def create(self, *, org_id: int, data: ProjectCreate) -> Project:
         """Insert a new project row."""
+        lifecycle_rules = None
+        if data.lifecycle_rules is not None:
+            lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
         row = SqlProject(
             slug=data.slug,
             title=data.title,
             org_id=org_id,
             doc_repo=data.doc_repo,
+            lifecycle_rules=lifecycle_rules,
         )
         self._session.add(row)
         await self._session.flush()

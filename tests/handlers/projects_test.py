@@ -36,6 +36,37 @@ async def test_create_project(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_project_with_lifecycle_rules(
+    client: AsyncClient,
+) -> None:
+    """POST persists typed lifecycle_rules; GET round-trips them."""
+    await _setup(client)
+    rules = [
+        {"type": "draft_inactivity", "max_days_inactive": 14},
+        {"type": "ref_deleted", "enabled": True},
+    ]
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "lifecycle-create",
+            "title": "Lifecycle Create",
+            "doc_repo": "https://github.com/example/lifecycle-create",
+            "lifecycle_rules": rules,
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    assert response.json()["lifecycle_rules"] == rules
+
+    get_response = await client.get(
+        "/docverse/orgs/proj-org/projects/lifecycle-create",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["lifecycle_rules"] == rules
+
+
+@pytest.mark.asyncio
 async def test_list_projects(client: AsyncClient) -> None:
     await _setup(client)
     await client.post(

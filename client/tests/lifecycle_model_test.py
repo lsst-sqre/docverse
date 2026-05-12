@@ -9,6 +9,7 @@ from docverse.client.models import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     LifecycleRuleSet,
+    ProjectCreate,
     RefDeletedRule,
 )
 from docverse.client.models.lifecycle import LifecycleRule
@@ -156,3 +157,42 @@ def test_lifecycle_rule_set_dumps_to_json_friendly_list() -> None:
     rule_set = LifecycleRuleSet.model_validate(payload)
     dumped = rule_set.model_dump(mode="json")
     assert dumped == payload
+
+
+def test_project_create_accepts_typed_lifecycle_rules() -> None:
+    payload = ProjectCreate(
+        slug="pipelines",
+        title="Pipelines",
+        doc_repo="https://github.com/example/pipelines",
+        lifecycle_rules=[  # type: ignore[arg-type]
+            {"type": "draft_inactivity", "max_days_inactive": 30},
+            {"type": "ref_deleted", "enabled": True},
+        ],
+    )
+    assert isinstance(payload.lifecycle_rules, LifecycleRuleSet)
+    assert len(payload.lifecycle_rules.root) == 2  # noqa: PLR2004
+
+
+def test_project_create_rejects_unknown_lifecycle_rule_type() -> None:
+    with pytest.raises(ValidationError):
+        ProjectCreate(
+            slug="pipelines",
+            title="Pipelines",
+            doc_repo="https://github.com/example/pipelines",
+            lifecycle_rules=[  # type: ignore[arg-type]
+                {"type": "purgatory_eviction", "enabled": True},
+            ],
+        )
+
+
+def test_project_create_rejects_duplicate_lifecycle_rule_types() -> None:
+    with pytest.raises(ValidationError):
+        ProjectCreate(
+            slug="pipelines",
+            title="Pipelines",
+            doc_repo="https://github.com/example/pipelines",
+            lifecycle_rules=[  # type: ignore[arg-type]
+                {"type": "draft_inactivity", "max_days_inactive": 30},
+                {"type": "draft_inactivity", "max_days_inactive": 60},
+            ],
+        )
