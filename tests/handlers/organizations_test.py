@@ -192,7 +192,7 @@ async def test_patch_organization_lifecycle_rules_valid(
             "min_position": 5,
             "min_age_days": 30,
         },
-        {"type": "ref_deleted", "enabled": True},
+        {"type": "ref_deleted"},
     ]
     response = await client.patch(
         "/docverse/orgs/patch-lifecycle-org",

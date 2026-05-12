@@ -43,7 +43,7 @@ async def test_create_project_with_lifecycle_rules(
     await _setup(client)
     rules = [
         {"type": "draft_inactivity", "max_days_inactive": 14},
-        {"type": "ref_deleted", "enabled": True},
+        {"type": "ref_deleted"},
     ]
     response = await client.post(
         "/docverse/orgs/proj-org/projects",
@@ -263,8 +263,8 @@ async def test_patch_project_lifecycle_rules_duplicate_types(
         "/docverse/orgs/proj-org/projects/dup-lifecycle-proj",
         json={
             "lifecycle_rules": [
-                {"type": "ref_deleted", "enabled": True},
-                {"type": "ref_deleted", "enabled": False},
+                {"type": "ref_deleted"},
+                {"type": "ref_deleted"},
             ],
         },
         headers={"X-Auth-Request-User": "testuser"},

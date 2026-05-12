@@ -91,9 +91,11 @@ class BuildHistoryOrphanRule(BaseModel):
 class RefDeletedRule(BaseModel):
     """Soft-delete editions whose source git ref no longer exists.
 
-    The evaluator branch for this rule is owned by DM-54913; the schema
-    is defined here so operators can configure the rule in advance and
-    the eventual evaluator only needs to swap in the predicate.
+    Carries no parameters: the rule's presence in a ``LifecycleRuleSet``
+    is the toggle that activates the check. The evaluator branch for
+    this rule is owned by DM-54913; the schema is defined here so
+    operators can configure the rule in advance and the eventual
+    evaluator only needs to swap in the predicate.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -101,13 +103,6 @@ class RefDeletedRule(BaseModel):
     type: Literal["ref_deleted"] = Field(
         default="ref_deleted",
         description="Discriminator tag for this rule kind.",
-    )
-
-    enabled: bool = Field(
-        default=True,
-        description=(
-            "Whether the ref-deleted check is active for this rule set."
-        ),
     )
 
 

@@ -45,15 +45,14 @@ def test_build_history_orphan_rule_rejects_negative_age() -> None:
         BuildHistoryOrphanRule(min_position=1, min_age_days=-1)
 
 
-def test_ref_deleted_rule_defaults_enabled() -> None:
+def test_ref_deleted_rule_has_no_parameters() -> None:
     rule = RefDeletedRule()
     assert rule.type == "ref_deleted"
-    assert rule.enabled is True
 
 
-def test_ref_deleted_rule_accepts_explicit_disabled() -> None:
-    rule = RefDeletedRule(enabled=False)
-    assert rule.enabled is False
+def test_ref_deleted_rule_rejects_extra_field() -> None:
+    with pytest.raises(ValidationError):
+        RefDeletedRule(enabled=True)  # type: ignore[call-arg]
 
 
 def test_lifecycle_rule_discriminator_routes_to_draft_inactivity() -> None:
@@ -73,7 +72,7 @@ def test_lifecycle_rule_discriminator_routes_to_build_history_orphan() -> None:
 
 
 def test_lifecycle_rule_discriminator_routes_to_ref_deleted() -> None:
-    payload = {"type": "ref_deleted", "enabled": True}
+    payload = {"type": "ref_deleted"}
     rule = _lifecycle_rule_adapter.validate_python(payload)
     assert isinstance(rule, RefDeletedRule)
 
@@ -124,7 +123,7 @@ def test_lifecycle_rule_set_accepts_multiple_distinct_types() -> None:
             "min_position": 5,
             "min_age_days": 30,
         },
-        {"type": "ref_deleted", "enabled": True},
+        {"type": "ref_deleted"},
     ]
     rule_set = LifecycleRuleSet.model_validate(payload)
     assert len(rule_set.root) == 3  # noqa: PLR2004
@@ -166,7 +165,7 @@ def test_project_create_accepts_typed_lifecycle_rules() -> None:
         doc_repo="https://github.com/example/pipelines",
         lifecycle_rules=[  # type: ignore[arg-type]
             {"type": "draft_inactivity", "max_days_inactive": 30},
-            {"type": "ref_deleted", "enabled": True},
+            {"type": "ref_deleted"},
         ],
     )
     assert isinstance(payload.lifecycle_rules, LifecycleRuleSet)

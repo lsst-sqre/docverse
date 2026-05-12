@@ -92,7 +92,7 @@ def test_organization_create_accepts_typed_lifecycle_rules() -> None:
         base_domain="lsst.io",
         lifecycle_rules=[  # type: ignore[arg-type]
             {"type": "draft_inactivity", "max_days_inactive": 30},
-            {"type": "ref_deleted", "enabled": True},
+            {"type": "ref_deleted"},
         ],
     )
     assert isinstance(payload.lifecycle_rules, LifecycleRuleSet)
