@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .editions import DefaultEditionConfig
 from .editions import Edition as EditionResponse
+from .lifecycle import LifecycleRuleSet
 
 
 class ProjectCreate(BaseModel):
@@ -90,7 +91,7 @@ class Project(BaseModel):
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: list[dict[str, Any]] | None = Field(
+    lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )
@@ -132,7 +133,7 @@ class ProjectUpdate(BaseModel):
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: list[dict[str, Any]] | None = Field(
+    lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )

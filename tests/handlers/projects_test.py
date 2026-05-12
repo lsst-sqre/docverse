@@ -121,6 +121,127 @@ async def test_update_project(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_patch_project_lifecycle_rules_valid(
+    client: AsyncClient,
+) -> None:
+    """Valid lifecycle_rules PATCH persists the typed JSONB payload."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "lifecycle-proj",
+            "title": "Lifecycle",
+            "doc_repo": "https://github.com/example/lifecycle",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    rules = [
+        {"type": "draft_inactivity", "max_days_inactive": 14},
+        {
+            "type": "build_history_orphan",
+            "min_position": 3,
+            "min_age_days": 15,
+        },
+    ]
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/lifecycle-proj",
+        json={"lifecycle_rules": rules},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["lifecycle_rules"] == rules
+
+    get_response = await client.get(
+        "/docverse/orgs/proj-org/projects/lifecycle-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["lifecycle_rules"] == rules
+
+
+@pytest.mark.asyncio
+async def test_patch_project_lifecycle_rules_unknown_type(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when a rule names an unknown discriminator tag."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "bad-lifecycle-proj",
+            "title": "Bad",
+            "doc_repo": "https://github.com/example/bad",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/bad-lifecycle-proj",
+        json={
+            "lifecycle_rules": [
+                {"type": "purgatory_eviction", "enabled": True},
+            ],
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_project_lifecycle_rules_missing_field(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when a known rule omits a required field."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "missing-field-proj",
+            "title": "Missing",
+            "doc_repo": "https://github.com/example/missing",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/missing-field-proj",
+        json={
+            "lifecycle_rules": [
+                {"type": "build_history_orphan", "min_position": 5},
+            ],
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_project_lifecycle_rules_duplicate_types(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when the same rule type appears twice."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "dup-lifecycle-proj",
+            "title": "Dup",
+            "doc_repo": "https://github.com/example/dup",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/dup-lifecycle-proj",
+        json={
+            "lifecycle_rules": [
+                {"type": "ref_deleted", "enabled": True},
+                {"type": "ref_deleted", "enabled": False},
+            ],
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_delete_project(client: AsyncClient) -> None:
     await _setup(client)
     await client.post(
