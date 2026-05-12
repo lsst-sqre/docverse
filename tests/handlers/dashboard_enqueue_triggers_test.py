@@ -36,6 +36,7 @@ from docverse.storage.edition_build_history_store import (
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_job_store import QueueJobStore
 from tests.conftest import seed_org_with_admin
 from tests.support.arq_testing import count_jobs_by_name
 
@@ -119,8 +120,16 @@ async def test_edition_patch_enqueues_dashboard_build(
 async def test_edition_delete_enqueues_dashboard_build(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """DELETE /editions/{slug} enqueues exactly one dashboard_build job."""
+    """DELETE /editions/{slug} enqueues exactly one dashboard_build job.
+
+    Drives the create's dashboard_build row to ``completed`` before the
+    delete so the per-project dedup gate does not collapse the two
+    lifecycle events into one row — this test verifies the *delete* path
+    independently enqueues, not the dedup behavior (which has its own
+    coverage in :mod:`tests.services.dashboard.enqueue_test`).
+    """
     await _setup(client)
+    logger = structlog.get_logger("docverse")
 
     # Create a non-__main edition to delete (the default __main cannot
     # be deleted).
@@ -137,9 +146,21 @@ async def test_edition_delete_enqueues_dashboard_build(
     )
     assert create_response.status_code == 201
 
-    # The create itself enqueued one dashboard_build job.
+    # The create itself enqueued one dashboard_build job. Drive it to
+    # completed so the delete's enqueue is not deduped against it.
     async with db_session.begin():
         before = await _count_dashboard_jobs(db_session)
+        result = await db_session.execute(
+            select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.dashboard_build.value
+            )
+        )
+        existing = list(result.scalars().all())
+        assert len(existing) == 1
+        store = QueueJobStore(session=db_session, logger=logger)
+        await store.start(existing[0].id)
+        await store.complete(existing[0].id)
+        await db_session.commit()
     assert before == 1
 
     response = await client.delete(

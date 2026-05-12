@@ -57,8 +57,20 @@ class DashboardBuildEnqueuer:
         *,
         org_id: int,
         project_id: int,
-    ) -> QueueJob:
+    ) -> QueueJob | None:
         """Enqueue one ``dashboard_build`` job for a single project.
+
+        Returns the new :class:`QueueJob` on success, or ``None`` when a
+        ``dashboard_build`` row keyed on ``(org_id, project_id)`` is
+        already ``queued`` or ``in_progress`` — the cascade in
+        :func:`docverse.worker.functions.publish_edition` fires once per
+        successful publish, so a 1000-edition keeper-sync project would
+        otherwise produce 1000 redundant ``dashboard_build`` rows for
+        the same project. The first publish in the burst wins; later
+        cascades that race past it (e.g. across worker restarts) get a
+        fresh row once the active one terminates, matching the
+        "at most one *queued* dashboard_build" semantics, not "at most
+        one ever".
 
         Raises
         ------
@@ -73,6 +85,16 @@ class DashboardBuildEnqueuer:
         if project is None:
             msg = f"Project {project_id} not found"
             raise NotFoundError(msg)
+
+        if await self._queue_job_store.has_active_dashboard_build(
+            org_id=org_id, project_id=project_id
+        ):
+            self._logger.info(
+                "Skipping dashboard_build enqueue: active job exists",
+                org_id=org_id,
+                project_id=project_id,
+            )
+            return None
 
         queue_job = await self._queue_job_store.create(
             kind=JobKind.dashboard_build,
@@ -101,8 +123,11 @@ class DashboardBuildEnqueuer:
         *,
         org_slug: str,
         project_slug: str,
-    ) -> QueueJob:
+    ) -> QueueJob | None:
         """Resolve org+project slugs and enqueue a single job.
+
+        Returns ``None`` on the same dedup-skip condition as
+        :meth:`enqueue_for_project`.
 
         Raises
         ------
@@ -131,8 +156,14 @@ class DashboardBuildEnqueuer:
         """Enqueue one ``dashboard_build`` per non-deleted project in an org.
 
         Returns a list of ``(project, queue_job)`` pairs in the order
-        projects were enumerated (slug ascending). An empty list is
-        returned for orgs with no non-deleted projects.
+        projects were enumerated (slug ascending). Projects that already
+        have an active ``dashboard_build`` row are filtered out, so the
+        returned list may be shorter than the project count for the org
+        — the operator sees "rebuilt N of M projects; the rest already
+        have a dashboard_build queued or in flight" rather than getting
+        a duplicate row per project. An empty list is returned for orgs
+        with no non-deleted projects (or when every project is already
+        deduplicated).
 
         Raises
         ------
@@ -149,6 +180,8 @@ class DashboardBuildEnqueuer:
             queue_job = await self.enqueue_for_project(
                 org_id=org_id, project_id=project.id
             )
+            if queue_job is None:
+                continue
             results.append((project, queue_job))
         return results
 

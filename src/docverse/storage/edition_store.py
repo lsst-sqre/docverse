@@ -11,6 +11,7 @@ from safir.database import (
     PaginationCursor,
 )
 from sqlalchemy import Select, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -122,21 +123,45 @@ class EditionStore:
         Used for system-created editions like ``__main`` where the slug
         does not conform to the user-facing pattern constraints in
         ``EditionCreate``.
+
+        Race-tolerant: a concurrent transaction that already inserted
+        the same ``(project_id, lower(slug))`` makes this insert a
+        no-op via ``ON CONFLICT DO NOTHING`` against
+        ``uq_editions_project_lower_slug``. The lost-race branch
+        re-fetches the winning row so callers always observe a
+        non-``None`` :class:`Edition`. A naive
+        ``try/except IntegrityError`` would poison the surrounding
+        ``session.begin()`` transaction, so the savepoint-free
+        ``ON CONFLICT`` is the right primitive here.
         """
-        row = SqlEdition(
-            slug=slug,
-            title=title,
-            project_id=project_id,
-            kind=kind,
-            tracking_mode=tracking_mode,
-            tracking_params=tracking_params,
-            alternate_name=alternate_name,
-            lifecycle_exempt=lifecycle_exempt,
+        stmt = (
+            pg_insert(SqlEdition)
+            .values(
+                slug=slug,
+                title=title,
+                project_id=project_id,
+                kind=kind,
+                tracking_mode=tracking_mode,
+                tracking_params=tracking_params,
+                alternate_name=alternate_name,
+                lifecycle_exempt=lifecycle_exempt,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    SqlEdition.project_id,
+                    func.lower(SqlEdition.slug),
+                ],
+            )
         )
-        self._session.add(row)
-        await self._session.flush()
-        await self._session.refresh(row)
-        return self._validate(row, None)
+        await self._session.execute(stmt)
+        existing = await self.get_by_slug(project_id=project_id, slug=slug)
+        if existing is None:
+            msg = (
+                "create_internal lost ON CONFLICT race but no existing "
+                f"edition found for project_id={project_id} slug={slug!r}"
+            )
+            raise RuntimeError(msg)
+        return existing
 
     async def get_by_slug(
         self, *, project_id: int, slug: str
@@ -159,6 +184,38 @@ class EditionStore:
             return None
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def list_by_project_ids_and_kind(
+        self, *, project_ids: list[int], kind: EditionKind
+    ) -> list[Edition]:
+        """Return non-deleted editions for the given projects + kind.
+
+        Single-query batch that callers use to resolve "the ``main``
+        edition for each of these N projects" without issuing N
+        separate ``get_by_slug`` round-trips. Returns editions ordered
+        by ``project_id`` for stable iteration; the
+        ``ck_editions_main_slug_kind`` constraint guarantees at most
+        one row per ``project_id`` when ``kind == EditionKind.main``.
+        Passing an empty ``project_ids`` returns ``[]`` without hitting
+        the database.
+        """
+        if not project_ids:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id.in_(project_ids),
+                SqlEdition.kind == kind,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.project_id)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
 
     async def list_all_by_project(self, project_id: int) -> list[Edition]:
         """List every non-deleted edition for a project.

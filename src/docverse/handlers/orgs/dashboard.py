@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, status
 
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
+from docverse.exceptions import ConflictError
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 
 from .models import DashboardRebuildResponse, OrgDashboardRebuildEntry
@@ -35,6 +36,9 @@ async def post_dashboard_rebuild(
         )
         await context.session.commit()
 
+    if queue_job is None:
+        msg = f"dashboard_build already queued for project {project_slug!r}"
+        raise ConflictError(msg)
     return DashboardRebuildResponse.from_queue_job(queue_job, context.request)
 
 

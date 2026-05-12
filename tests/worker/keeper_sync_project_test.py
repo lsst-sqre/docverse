@@ -22,7 +22,7 @@ import respx
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -36,8 +36,10 @@ from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
+from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -50,6 +52,7 @@ from docverse.storage.ltd import LtdNotFoundError
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_backend import ArqQueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
@@ -746,3 +749,485 @@ async def test_keeper_sync_project_missing_publishing_store_label(
 
     # Nothing copied since the worker bailed before constructing the service.
     assert object_store.objects == {}
+
+
+def _seed_two_edition_ltd(mock_discovery: respx.Router) -> None:
+    """Stub LTD with the main edition + one ticket-branch edition."""
+    branch_edition = _load("edition_branch_git_refs.json")
+    branch_build = _load("build.json")
+    branch_build["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build["bucket_root_dir"] = "pipelines/builds/43"
+    branch_edition["build_url"] = f"{LTD_BASE}/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build)
+    )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_publishes_each_edition_per_iteration(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-success multi-edition: per-edition callback fires N times.
+
+    Locks the new contract: every freshly-synced edition gets a
+    publish_edition enqueued via the on_edition_synced callback. The
+    tail-end self-heal pass observes ``publish_status=pending`` on
+    every edition and enqueues nothing extra — guarding against
+    double-publish.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_two_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    # Exactly N=2 publish_edition jobs, one per edition; self-heal
+    # found nothing to do at the tail end.
+    assert len(publish_jobs) == 2
+    publish_slugs = sorted(
+        job.kwargs["payload"]["edition_slug"] for job in publish_jobs
+    )
+    assert publish_slugs == ["__main", "u-jsick-feature"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            for slug in ("__main", "u-jsick-feature"):
+                edition = await edition_store.get_by_slug(
+                    project_id=project.id, slug=slug
+                )
+                assert edition is not None
+                assert edition.publish_status == PublishStatus.pending
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            for arq_job in publish_jobs:
+                qj = await queue_job_store.get_by_backend_job_id(arq_job.id)
+                assert qj is not None
+                assert qj.kind == JobKind.publish_edition
+                assert qj.keeper_sync_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_dedups_dashboard_build_cascade(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N-edition keeper-sync produces exactly one ``dashboard_build`` row.
+
+    The cascade in ``publish_edition`` calls
+    ``try_enqueue_dashboard_build_by_id`` after every successful publish.
+    Without dedup, an N-edition keeper-sync project would produce N
+    ``dashboard_build`` rows for the same project — one per publish
+    cascade. The per-project gate keyed on ``(org_id, project_id)``
+    collapses the burst to one. This test runs the real
+    ``keeper_sync_project`` worker against a 2-edition fixture and then
+    drives the cascade by calling ``try_enqueue_dashboard_build_by_id``
+    once per publish_edition arq job that the worker enqueued — the
+    same call ``publish_edition`` makes at the end of its success path.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_two_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_jobs) == 2
+
+    # Simulate the per-publish cascade: every publish_edition success
+    # path runs ``try_enqueue_dashboard_build_by_id`` once. The dedup
+    # gate at the service level collapses the burst of N attempts into
+    # exactly one ``dashboard_build`` row.
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            project_id = project.id
+
+        enqueuer = DashboardBuildEnqueuer(
+            org_store=OrganizationStore(session=session, logger=_logger()),
+            project_store=ProjectStore(session=session, logger=_logger()),
+            queue_backend=ArqQueueBackend(
+                arq_queue=mock_arq, default_queue_name="docverse:queue"
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            logger=_logger(),
+        )
+
+        for _ in range(len(publish_jobs)):
+            async with session.begin():
+                await enqueuer.enqueue_for_project(
+                    org_id=org_id, project_id=project_id
+                )
+                await session.commit()
+
+        async with session.begin():
+            rows = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value,
+                    SqlQueueJob.org_id == org_id,
+                    SqlQueueJob.project_id == project_id,
+                )
+            )
+            dashboard_rows = list(rows.scalars().all())
+
+    assert len(dashboard_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial-failure mid-sync: editions 1..M-1 publish; M..N untouched.
+
+    Edition 1 (``__main``, build 42) syncs cleanly and the per-edition
+    callback enqueues a publish. Edition 2 (the branch edition, build
+    43) raises mid-``sync_edition`` because its LTD build reports
+    ``uploaded=False`` — the exception propagates out of sync_project
+    and the worker marks the queue_jobs row failed. Locks the new
+    contract: a partial mid-sync failure leaves the editions that
+    already succeeded fully published, instead of stranding all of
+    them on ``publish_status IS NULL`` until the next reconciliation
+    tick (the issue #320 regression).
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    # Build 42 succeeds; build 43 reports uploaded=False so sync_edition
+    # raises RuntimeError mid-iteration.
+    branch_edition = _load("edition_branch_git_refs.json")
+    branch_edition["build_url"] = f"{LTD_BASE}/builds/43"
+    half_uploaded = _load("build.json")
+    half_uploaded["self_url"] = f"{LTD_BASE}/builds/43"
+    half_uploaded["bucket_root_dir"] = "pipelines/builds/43"
+    half_uploaded["uploaded"] = False
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=half_uploaded)
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with pytest.raises(RuntimeError, match="uploaded=False"):
+        await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    # Exactly M-1 = 1 publish_edition arq job: the per-edition
+    # callback fired for the first edition before sync_project raised
+    # on the second.
+    assert len(publish_jobs) == 1
+    assert publish_jobs[0].kwargs["payload"]["edition_slug"] == "__main"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            main_edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="__main"
+            )
+            assert main_edition is not None
+            assert main_edition.publish_status == PublishStatus.pending
+
+            # The branch edition's row exists (the ensure-edition
+            # transaction committed before sync_build raised) but its
+            # publish_status is still NULL because the callback never
+            # ran for it.
+            branch = await edition_store.get_by_slug(
+                project_id=project.id, slug="u-jsick-feature"
+            )
+            assert branch is not None
+            assert branch.publish_status is None
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+
+            publish_qj = await queue_job_store.get_by_backend_job_id(
+                publish_jobs[0].id
+            )
+            assert publish_qj is not None
+            assert publish_qj.kind == JobKind.publish_edition
+            assert publish_qj.keeper_sync_run_id == run_id
+            assert publish_qj.edition_id == main_edition.id
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-run with N short-circuits + N null publish_status → N self-heals.
+
+    Locks the tail-end self-heal pass: when every edition's build
+    short-circuits but every edition is sitting on
+    ``publish_status IS NULL`` (e.g. their builds pre-date the publish
+    enqueue path), the second pass enqueues N publishes via
+    :func:`_self_heal_unpublished_editions` since the per-edition
+    callback skips short-circuited builds.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_two_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    first_result = await keeper_sync_project(ctx, payload)
+    assert first_result == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_first) == 2
+
+    # Null out publish_status on both editions so a re-run that
+    # short-circuits has work to do at the tail end.
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.project_id == project.id)
+                .values(publish_status=None)
+            )
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    second_result = await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert second_result == "completed"
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    # Two more publishes — one per short-circuited edition — enqueued
+    # by the tail-end self-heal pass.
+    assert len(publish_after_second) == 4
+    self_heal_slugs = sorted(
+        job.kwargs["payload"]["edition_slug"]
+        for job in publish_after_second[2:]
+    )
+    assert self_heal_slugs == ["__main", "u-jsick-feature"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            for slug in ("__main", "u-jsick-feature"):
+                edition = await edition_store.get_by_slug(
+                    project_id=project.id, slug=slug
+                )
+                assert edition is not None
+                assert edition.publish_status == PublishStatus.pending

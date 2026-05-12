@@ -19,6 +19,7 @@ from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.dbschema.project import SqlProject
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.build import Build
@@ -27,12 +28,15 @@ from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.domain.keeper_sync_run import KeeperSyncRun
 from docverse.domain.project import Project
 from docverse.domain.queue import QueueJob
+from docverse.storage.keeper_sync.state_store import KeeperSyncState
 
 __all__ = [
     "BUILD_CURSOR_TYPE",
     "DEFAULT_PAGE_LIMIT",
     "EDITION_CURSOR_TYPES",
     "EDITION_HISTORY_CURSOR_TYPE",
+    "KEEPER_SYNC_EDITION_CURSOR_TYPE",
+    "KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE",
     "KEEPER_SYNC_RUN_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
@@ -43,6 +47,8 @@ __all__ = [
     "EditionDateUpdatedCursor",
     "EditionSlugCursor",
     "EditionSortOrder",
+    "KeeperSyncEditionSlugCursor",
+    "KeeperSyncProjectStateIdCursor",
     "KeeperSyncRunDateStartedCursor",
     "ProjectDateCreatedCursor",
     "ProjectSearchCursor",
@@ -169,6 +175,141 @@ class EditionSlugCursor(PaginationCursor[Edition]):
     def __str__(self) -> str:  # noqa: D105
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.slug}"
+
+
+@dataclass(slots=True)
+class KeeperSyncProjectStateIdCursor(PaginationCursor[KeeperSyncState]):
+    """Keyset cursor for ``keeper_sync_state`` project rows by id DESC.
+
+    Project-resource state rows are inserted as the sync discovers new
+    LTD products, so the row id is monotonic in discovery order. Paging
+    by ``id DESC`` therefore surfaces newest-discovered projects first,
+    matching the operator-facing "what's freshest?" expectation without
+    paying the NULL-handling cost a ``date_last_synced``-keyed cursor
+    would carry for rows the sync has not yet stamped.
+    """
+
+    id: int
+
+    @override
+    @classmethod
+    def from_entry(
+        cls, entry: KeeperSyncState, *, reverse: bool = False
+    ) -> Self:
+        return cls(id=entry.id, previous=reverse)
+
+    @override
+    @classmethod
+    def from_str(cls, cursor: str) -> Self:
+        try:
+            if cursor.startswith("p__"):
+                return cls(id=int(cursor[3:]), previous=True)
+            return cls(id=int(cursor), previous=False)
+        except (ValueError, TypeError) as exc:
+            msg = f"Invalid cursor: {cursor!r}"
+            raise InvalidCursorError(msg) from exc
+
+    @override
+    @classmethod
+    def apply_order(
+        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[tuple[Any, ...]]:
+        if reverse:
+            return stmt.order_by(SqlKeeperSyncState.id.asc())
+        return stmt.order_by(SqlKeeperSyncState.id.desc())
+
+    @override
+    def apply_cursor(
+        self, stmt: Select[tuple[Any, ...]]
+    ) -> Select[tuple[Any, ...]]:
+        if self.previous:
+            return stmt.where(SqlKeeperSyncState.id > self.id)
+        return stmt.where(SqlKeeperSyncState.id <= self.id)
+
+    @override
+    def invert(self) -> Self:
+        return type(self)(id=self.id, previous=not self.previous)
+
+    def __str__(self) -> str:  # noqa: D105
+        prefix = "p__" if self.previous else ""
+        return f"{prefix}{self.id}"
+
+
+@dataclass(slots=True)
+class KeeperSyncEditionSlugCursor(PaginationCursor[Edition]):
+    """Keyset cursor for editions ordered by slug ASC, id ASC.
+
+    Used by the keeper-sync per-project editions collection so an
+    operator paginating with the default lexicographic ordering can
+    scan through `__main` first, then alphabetically. The id tiebreaker
+    is defensive: ``uq_editions_project_lower_slug`` makes the slug
+    unique per project today, but the composite keeps pagination
+    stable if that invariant is ever relaxed (e.g. case-sensitive
+    duplicates).
+    """
+
+    slug: str
+    id: int
+
+    @override
+    @classmethod
+    def from_entry(cls, entry: Edition, *, reverse: bool = False) -> Self:
+        return cls(slug=entry.slug, id=entry.id, previous=reverse)
+
+    @override
+    @classmethod
+    def from_str(cls, cursor: str) -> Self:
+        try:
+            previous = cursor.startswith("p__")
+            raw = cursor[3:] if previous else cursor
+            slug, id_str = raw.rsplit(":", 1)
+            return cls(slug=slug, id=int(id_str), previous=previous)
+        except (ValueError, TypeError) as exc:
+            msg = f"Invalid cursor: {cursor!r}"
+            raise InvalidCursorError(msg) from exc
+
+    @override
+    @classmethod
+    def apply_order(
+        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[tuple[Any, ...]]:
+        if reverse:
+            return stmt.order_by(SqlEdition.slug.desc(), SqlEdition.id.desc())
+        return stmt.order_by(SqlEdition.slug, SqlEdition.id)
+
+    @override
+    def apply_cursor(
+        self, stmt: Select[tuple[Any, ...]]
+    ) -> Select[tuple[Any, ...]]:
+        if self.previous:
+            return stmt.where(
+                or_(
+                    SqlEdition.slug < self.slug,
+                    and_(
+                        SqlEdition.slug == self.slug,
+                        SqlEdition.id < self.id,
+                    ),
+                )
+            )
+        return stmt.where(
+            or_(
+                SqlEdition.slug > self.slug,
+                and_(
+                    SqlEdition.slug == self.slug,
+                    SqlEdition.id >= self.id,
+                ),
+            )
+        )
+
+    @override
+    def invert(self) -> Self:
+        return type(self)(
+            slug=self.slug, id=self.id, previous=not self.previous
+        )
+
+    def __str__(self) -> str:  # noqa: D105
+        prefix = "p__" if self.previous else ""
+        return f"{prefix}{self.slug}:{self.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +557,16 @@ EDITION_CURSOR_TYPES: dict[
 
 BUILD_CURSOR_TYPE: type[BuildDateCreatedCursor] = BuildDateCreatedCursor
 
+KEEPER_SYNC_EDITION_CURSOR_TYPE: type[KeeperSyncEditionSlugCursor] = (
+    KeeperSyncEditionSlugCursor
+)
+
 KEEPER_SYNC_RUN_CURSOR_TYPE: type[KeeperSyncRunDateStartedCursor] = (
     KeeperSyncRunDateStartedCursor
+)
+
+KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE: type[KeeperSyncProjectStateIdCursor] = (
+    KeeperSyncProjectStateIdCursor
 )
 
 QUEUE_JOB_CURSOR_TYPE: type[QueueJobDateCreatedCursor] = (

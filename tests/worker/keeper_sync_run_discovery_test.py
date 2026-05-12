@@ -375,6 +375,90 @@ async def test_discovery_reconciles_orphan_children_from_prior_attempt(
 
 
 @pytest.mark.asyncio
+async def test_discovery_skips_slug_with_active_keeper_sync_project(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An active ``keeper_sync_project`` row blocks the per-slug enqueue.
+
+    Reproduces the QA race: a tier-cron-enqueued (run-less) job for
+    ``pipelines`` is already queued; a subsequent operator-triggered
+    backfill discovery must not enqueue a second job for the same slug,
+    because the two would race through ``_ensure_edition`` and one
+    would lose the ``uq_editions_project_lower_slug`` race.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["pipelines", "dmtn-001"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # Pre-seed a tier-cron-style active row (no run attribution) for
+        # ``pipelines``. Discovery must skip this slug.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        existing = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="pipelines",
+            backend_job_id="arq-job-tier-cron",
+        )
+
+    _mock_ltd_products(mock_discovery, ["pipelines", "dmtn-001"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Only ``dmtn-001`` got enqueued; ``pipelines`` was skipped.
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert len(project_jobs) == 1
+    assert project_jobs[0].kwargs["payload"]["ltd_slug"] == "dmtn-001"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                SqlQueueJob.subject_label == "pipelines",
+                SqlQueueJob.org_id == org_id,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            # Exactly one active ``pipelines`` row — the tier-cron's
+            # original — survives. Discovery did not insert a duplicate.
+            assert len(rows) == 1
+            assert rows[0].id == existing.id
+            assert rows[0].keeper_sync_run_id is None
+
+            # The skipped slug does NOT count toward the run's progress
+            # (its row stays attached to no run). Run-attributed children
+            # = 1 (just dmtn-001).
+            run_stmt = select(SqlQueueJob).where(
+                SqlQueueJob.keeper_sync_run_id == run_id,
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+            )
+            attributed = (await session.execute(run_stmt)).scalars().all()
+            assert len(attributed) == 1
+
+
+@pytest.mark.asyncio
 async def test_discovery_leaves_recent_unenqueued_children_alone(
     app: None,
     db_session: AsyncSession,

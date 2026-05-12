@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 import structlog
-from sqlalchemy import select
+from fastapi import FastAPI
+from safir.database import create_database_engine
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.client.models import (
     BuildCreate,
@@ -21,6 +24,7 @@ from docverse.client.models import (
     PublishStatus,
     TrackingMode,
 )
+from docverse.config import config
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.storage.build_store import BuildStore
@@ -1016,14 +1020,20 @@ async def test_main_slug_requires_main_kind(
 
 
 @pytest.mark.asyncio
-async def test_second_main_edition_rejected(
+async def test_second_main_edition_returns_existing(
     db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
-    """Only one kind=main edition per project (via UNIQUE + CHECK)."""
+    """A second ``__main`` insert resolves to the existing row, no raise.
+
+    ``create_internal`` is race-tolerant via ``ON CONFLICT DO NOTHING``
+    on ``uq_editions_project_lower_slug``: the unique-slug invariant is
+    still preserved (only one row exists), but the contract is "return
+    the existing edition" rather than "raise IntegrityError".
+    """
     async with db_session.begin():
         project_id = await _create_project(db_session)
-        await edition_store.create_internal(
+        first = await edition_store.create_internal(
             project_id=project_id,
             slug="__main",
             title="Main",
@@ -1031,15 +1041,17 @@ async def test_second_main_edition_rejected(
             tracking_mode=TrackingMode.git_ref,
         )
         await db_session.commit()
-    with pytest.raises(IntegrityError):
-        async with db_session.begin():
-            await edition_store.create_internal(
-                project_id=project_id,
-                slug="__main",
-                title="Main duplicate",
-                kind=EditionKind.main,
-                tracking_mode=TrackingMode.git_ref,
-            )
+    async with db_session.begin():
+        second = await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main duplicate",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+        )
+        await db_session.commit()
+    assert second.id == first.id
+    assert second.title == "Main"  # original title preserved on conflict
 
 
 # ── Case-insensitive slug uniqueness ───────────────────────────────────────
@@ -1124,3 +1136,171 @@ async def test_get_by_slug_case_insensitive(
             is None
         )
         await db_session.commit()
+
+
+# ── Race-tolerant create_internal (uq_editions_project_lower_slug) ─────────
+
+
+@pytest.mark.asyncio
+async def test_create_internal_returns_existing_when_row_exists(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A second ``create_internal`` resolves to the existing row.
+
+    Maps the storage-layer guarantee that backs ``KeeperSyncService.
+    _ensure_edition`` called twice back-to-back for an already-existing
+    edition: the second call must return the existing row without
+    raising ``IntegrityError`` from ``uq_editions_project_lower_slug``.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        first = await edition_store.create_internal(
+            project_id=project_id,
+            slug="DM-28900",
+            title="DM-28900",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "tickets/DM-28900"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        second = await edition_store.create_internal(
+            project_id=project_id,
+            slug="DM-28900",
+            title="DM-28900 (retry)",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "tickets/DM-28900"},
+        )
+        await db_session.commit()
+
+    assert second.id == first.id
+
+    async with db_session.begin():
+        result = await db_session.execute(
+            select(SqlEdition).where(SqlEdition.project_id == project_id)
+        )
+        rows = result.scalars().all()
+        await db_session.commit()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_internal_concurrent_same_slug(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Two concurrent ``create_internal`` calls converge on one row.
+
+    Reproduces the QA failure addressed by this issue: two
+    ``keeper_sync_project`` workers racing through ``_ensure_edition``
+    for the same ``(project_id, slug)``. Without ``ON CONFLICT DO
+    NOTHING`` on ``uq_editions_project_lower_slug``, one INSERT loses
+    the race and crashes with ``IntegrityError``. With it, both
+    transactions succeed: the loser silently re-fetches the winning
+    row.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await db_session.commit()
+
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def insert() -> int:
+            async with maker() as session:
+                store = EditionStore(session=session, logger=logger)
+                async with session.begin():
+                    edition = await store.create_internal(
+                        project_id=project_id,
+                        slug="DM-28900",
+                        title="DM-28900",
+                        kind=EditionKind.draft,
+                        tracking_mode=TrackingMode.git_ref,
+                        tracking_params={"git_ref": "tickets/DM-28900"},
+                    )
+                    await session.commit()
+                return edition.id
+
+        edition_id_a, edition_id_b = await asyncio.gather(insert(), insert())
+    finally:
+        await engine.dispose()
+
+    assert edition_id_a == edition_id_b
+
+    async with db_session.begin():
+        result = await db_session.execute(
+            select(SqlEdition).where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug) == "dm-28900",
+            )
+        )
+        rows = result.scalars().all()
+        await db_session.commit()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_internal_concurrent_mixed_case_slug(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Concurrent inserts with mixed-case slugs converge on one row.
+
+    ``get_by_slug`` and ``uq_editions_project_lower_slug`` are both
+    case-insensitive, so two callers passing ``DM-28900`` and
+    ``dm-28900`` for the same project must collapse onto one edition
+    row regardless of insert order.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await db_session.commit()
+
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def insert(slug: str) -> int:
+            async with maker() as session:
+                store = EditionStore(session=session, logger=logger)
+                async with session.begin():
+                    edition = await store.create_internal(
+                        project_id=project_id,
+                        slug=slug,
+                        title=slug,
+                        kind=EditionKind.draft,
+                        tracking_mode=TrackingMode.git_ref,
+                        tracking_params={"git_ref": f"tickets/{slug}"},
+                    )
+                    await session.commit()
+                return edition.id
+
+        edition_id_upper, edition_id_lower = await asyncio.gather(
+            insert("DM-28900"), insert("dm-28900")
+        )
+    finally:
+        await engine.dispose()
+
+    assert edition_id_upper == edition_id_lower
+
+    async with db_session.begin():
+        result = await db_session.execute(
+            select(SqlEdition).where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug) == "dm-28900",
+            )
+        )
+        rows = result.scalars().all()
+        await db_session.commit()
+    assert len(rows) == 1

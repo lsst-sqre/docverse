@@ -1213,3 +1213,174 @@ async def test_now_helper_returns_aware_datetime() -> None:
     value = _now()
     assert isinstance(value, datetime)
     assert value.tzinfo == UTC
+
+
+@pytest.mark.asyncio
+async def test_sync_project_invokes_on_edition_synced_per_outcome(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The callback fires once per edition with the same outcome objects.
+
+    Locks the contract worker code relies on: ``on_edition_synced``
+    sees every successful ``sync_edition`` outcome before
+    ``sync_project`` returns, and each outcome's
+    ``docverse_project_id`` / ``docverse_project_slug`` is populated
+    so the publish-enqueue closure has the project context the helper
+    needs.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    main_edition_payload = _load("edition_main_git_refs.json")
+    branch_edition_payload = _load("edition_branch_git_refs.json")
+    branch_edition_payload["build_url"] = f"{LTD_BASE}/builds/43"
+    branch_build_payload = _load("build.json")
+    branch_build_payload["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build_payload["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=main_edition_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build_payload)
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    seen: list[tuple[str, int, str]] = []
+
+    async def on_edition_synced(outcome: object) -> None:
+        # Cast for type checker convenience; the runtime object is an
+        # EditionSyncOutcome.
+        seen.append(
+            (
+                outcome.docverse_slug,  # type: ignore[attr-defined]
+                outcome.docverse_project_id,  # type: ignore[attr-defined]
+                outcome.docverse_project_slug,  # type: ignore[attr-defined]
+            )
+        )
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        on_edition_synced=on_edition_synced,
+    )
+
+    assert len(seen) == 2
+    callback_slugs = [s for s, _, _ in seen]
+    assert "__main" in callback_slugs
+    assert "u-jsick-feature" in callback_slugs
+    for _, project_id, project_slug in seen:
+        assert project_id == result.docverse_project_id
+        assert project_slug == result.docverse_project_slug
+
+
+@pytest.mark.asyncio
+async def test_sync_project_continues_when_callback_raises(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A raising callback on edition N must not stop edition N+1's sync.
+
+    The worker's tail-end self-heal pass picks up any edition the
+    callback failed on, but only if ``sync_project`` keeps walking the
+    edition list past the failure. Lock that contract here.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    main_edition_payload = _load("edition_main_git_refs.json")
+    branch_edition_payload = _load("edition_branch_git_refs.json")
+    branch_edition_payload["build_url"] = f"{LTD_BASE}/builds/43"
+    branch_build_payload = _load("build.json")
+    branch_build_payload["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build_payload["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=main_edition_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build_payload)
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    invocations: list[str] = []
+
+    async def on_edition_synced(outcome: object) -> None:
+        slug: str = outcome.docverse_slug  # type: ignore[attr-defined]
+        invocations.append(slug)
+        if slug == "__main":
+            msg = "boom"
+            raise RuntimeError(msg)
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        on_edition_synced=on_edition_synced,
+    )
+
+    # Both editions were walked and both produced outcomes; the
+    # callback ran for both even though the first raised.
+    assert invocations == ["__main", "u-jsick-feature"]
+    assert len(result.edition_outcomes) == 2
+    outcome_slugs = [o.docverse_slug for o in result.edition_outcomes]
+    assert "__main" in outcome_slugs
+    assert "u-jsick-feature" in outcome_slugs

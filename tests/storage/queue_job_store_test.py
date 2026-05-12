@@ -608,6 +608,699 @@ async def test_fail_silent_run_children_returns_distinct_run_ids(
     assert reaped_run_ids == {run_a_id, run_b_id}
 
 
+async def _seed_org_only(
+    db_session: AsyncSession, *, slug: str = "ks-tc-org"
+) -> int:
+    logger = structlog.get_logger("docverse")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    org = await org_store.create(
+        OrganizationCreate(
+            slug=slug,
+            title="KS TC Org",
+            base_domain=f"{slug}.example.com",
+        )
+    )
+    return org.id
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_tier_cron_jobs_fails_old_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A run-less keeper_sync_project past the idle threshold is reaped."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session)
+        stuck = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+            backend_job_id="arq-tc-stuck",
+        )
+        await store.start(stuck.id)
+        row = await db_session.get(SqlQueueJob, stuck.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_tier_cron_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 1
+    assert reaped[0].id == stuck.id
+    assert reaped[0].status == JobStatus.failed
+    assert reaped[0].date_completed is not None
+    assert reaped[0].errors is not None
+    assert reaped[0].errors["type"] == "SilentTierCronJob"
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_tier_cron_jobs_skips_recent_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A run-less in_progress row within the idle window is left alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-recent")
+        recent = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+            backend_job_id="arq-tc-recent",
+        )
+        await store.start(recent.id)
+
+        reaped = await store.fail_silent_tier_cron_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_tier_cron_jobs_skips_run_attributed_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Run-attributed silent rows are reaped by fail_silent_run_children."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-tc-with-run"
+        )
+        run_attrib = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            backend_job_id="arq-with-run",
+        )
+        await store.start(run_attrib.id)
+        row = await db_session.get(SqlQueueJob, run_attrib.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_tier_cron_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_tier_cron_jobs_skips_non_keeper_sync_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Only ``keeper_sync_project`` rows are in scope."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-kind")
+        unrelated = await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            backend_job_id="arq-build",
+        )
+        await store.start(unrelated.id)
+        row = await db_session.get(SqlQueueJob, unrelated.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_tier_cron_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_tier_cron_jobs_skips_completed_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A terminal row is not reaped even when ``date_started`` is old."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-done")
+        done = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+            backend_job_id="arq-tc-done",
+        )
+        await store.start(done.id)
+        await store.complete(done.id)
+        row = await db_session.get(SqlQueueJob, done.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_tier_cron_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_tier_cron_jobs_unblocks_has_active_for_subject(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """After a reap, the subject mutex frees up for the next tier tick."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-unblock")
+        stuck = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+            backend_job_id="arq-tc-unblock",
+        )
+        await store.start(stuck.id)
+        row = await db_session.get(SqlQueueJob, stuck.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        # Before the reap, the subject mutex is engaged.
+        before = await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="phalanx",
+        )
+        assert before is True
+
+        reaped = await store.fail_silent_tier_cron_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 1
+    async with db_session.begin():
+        after = await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="phalanx",
+        )
+    assert after is False
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_fails_old_orphan(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An old run-less queued row with no ``backend_job_id`` is reaped."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-orphan")
+        orphan = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+        )
+        row = await db_session.get(SqlQueueJob, orphan.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(minutes=10)
+        await db_session.flush()
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert len(failed) == 1
+    assert failed[0].id == orphan.id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "OrphanedTierCronJob"
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_skips_recent_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Run-less queued rows newer than the idle window are left alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-orphan-recent")
+        # Created "now" — younger than the 5-minute window.
+        await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+        )
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_skips_rows_with_backend_id(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Rows that already have a backend_job_id are not orphans."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-orphan-backend")
+        job = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+            backend_job_id="arq-real",
+        )
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
+        await db_session.flush()
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_skips_run_attributed_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Run-attributed orphans are reaped by ``fail_orphaned_run_children``."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-tc-orphan-run"
+        )
+        run_attrib = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            subject_label="phalanx",
+        )
+        row = await db_session.get(SqlQueueJob, run_attrib.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
+        await db_session.flush()
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_skips_non_keeper_sync_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Only ``keeper_sync_project`` rows are in scope for orphan reaps."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-orphan-kind")
+        unrelated = await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+        )
+        row = await db_session.get(SqlQueueJob, unrelated.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
+        await db_session.flush()
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_skips_started_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A run-less in_progress row is not an orphan: silent path owns it."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-orphan-started")
+        job = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+        )
+        await store.start(job.id)
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
+        await db_session.flush()
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_tier_cron_jobs_unblocks_has_active_for_subject(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """After a reap, the subject mutex frees up for the next tier tick."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-orphan-unblock")
+        orphan = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="phalanx",
+        )
+        row = await db_session.get(SqlQueueJob, orphan.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(minutes=10)
+        await db_session.flush()
+
+        before = await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="phalanx",
+        )
+        assert before is True
+
+        failed = await store.fail_orphaned_tier_cron_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert len(failed) == 1
+    async with db_session.begin():
+        after = await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="phalanx",
+        )
+    assert after is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_true_for_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row matching ``(org_id, kind, subject_label)`` is active."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_true_for_in_progress_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` row also counts as active."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.start(job.id)
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_false_for_terminal_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Completed / failed / cancelled rows are not active."""
+    async with db_session.begin():
+        completed = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.start(completed.id)
+        await store.complete(completed.id)
+
+        failed = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.start(failed.id)
+        await store.fail(failed.id)
+
+        cancelled = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        await store.cancel(cancelled.id)
+
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_returns_false_when_no_rows_match(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """No matching rows for ``(org, kind, subject)`` → not active."""
+    async with db_session.begin():
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_filters_by_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row of a different ``kind`` does not count."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.publish_edition,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        active = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_for_subject_filters_by_org_and_subject(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Differing ``org_id`` or ``subject_label`` excludes the row."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=42,
+            subject_label="pipelines",
+        )
+        # Same kind+subject but different org → not active for org=99.
+        cross_org = await store.has_active_for_subject(
+            org_id=99,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        # Same kind+org but different subject → not active for "other".
+        cross_subject = await store.has_active_for_subject(
+            org_id=42,
+            kind=JobKind.keeper_sync_project,
+            subject_label="other",
+        )
+        await db_session.commit()
+    assert cross_org is False
+    assert cross_subject is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_true_for_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued ``dashboard_build`` matching ``(org, project)`` is active."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_true_for_in_progress_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` ``dashboard_build`` row also counts as active."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.start(job.id)
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_false_for_terminal_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Completed / failed / cancelled rows are not active."""
+    async with db_session.begin():
+        completed = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.start(completed.id)
+        await store.complete(completed.id)
+
+        failed = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.start(failed.id)
+        await store.fail(failed.id)
+
+        cancelled = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        await store.cancel(cancelled.id)
+
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_returns_false_with_no_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """No matching rows for ``(org, project)`` → not active."""
+    async with db_session.begin():
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_filters_by_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row of a different ``kind`` does not count."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.publish_edition,
+            org_id=42,
+            project_id=7,
+        )
+        active = await store.has_active_dashboard_build(
+            org_id=42, project_id=7
+        )
+        await db_session.commit()
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_dashboard_build_filters_by_org_and_project(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Differing ``org_id`` or ``project_id`` excludes the row."""
+    async with db_session.begin():
+        await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=42,
+            project_id=7,
+        )
+        cross_org = await store.has_active_dashboard_build(
+            org_id=99, project_id=7
+        )
+        cross_project = await store.has_active_dashboard_build(
+            org_id=42, project_id=8
+        )
+        await db_session.commit()
+    assert cross_org is False
+    assert cross_project is False
+
+
 @pytest.mark.asyncio
 async def test_fail_orphaned_run_children_scoped_to_run(
     db_session: AsyncSession,

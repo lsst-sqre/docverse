@@ -10,17 +10,22 @@ slugs are only unique within a product.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
+
+if TYPE_CHECKING:
+    from docverse.storage.pagination import KeeperSyncProjectStateIdCursor
 
 __all__ = [
     "KeeperSyncState",
@@ -38,7 +43,29 @@ class ResourceType(StrEnum):
 
 
 class KeeperSyncState(BaseModel):
-    """Domain representation of a ``keeper_sync_state`` row."""
+    """Domain representation of a ``keeper_sync_state`` row.
+
+    Documented ``annotations`` keys
+    -------------------------------
+    Project-resource rows
+        ``main_edition_url`` / ``main_edition_ltd_id`` — the resolved
+        LTD ``main`` edition pointer cached by
+        :func:`docverse.worker.functions.keeper_sync._tier_main_for_org`
+        so subsequent ticks issue one ``GET /editions/<id>`` instead of
+        walking the project's edition URL list.
+
+        ``date_main_last_polled`` — ISO-8601 timestamp of the last LTD
+        fetch issued by ``_tier_main_for_org`` for this project,
+        consumed by
+        :func:`docverse.services.keeper_sync.scheduler.should_poll_main_for_project`
+        so dormant projects (those whose LTD ``main`` rebuild predates
+        the hot window) cap their LTD load at one fetch per
+        ``TIER_MAIN_DORMANT_INTERVAL``.
+    Edition-resource rows
+        ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
+        mode / refs preserved for reversibility (used by the ``manual``
+        mapper path).
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -129,6 +156,116 @@ class KeeperSyncStateStore:
         if row is None:
             return None
         return KeeperSyncState.model_validate(row)
+
+    async def get_by_docverse_id(
+        self,
+        *,
+        org_id: int,
+        resource_type: ResourceType,
+        docverse_id: int,
+    ) -> KeeperSyncState | None:
+        """Fetch a row by ``(org_id, resource_type, docverse_id)``.
+
+        ``keeper_sync_state.docverse_id`` is the Docverse-side row id
+        for the paired project / edition / build. Callers that already
+        know the Docverse id (e.g. the per-project status endpoint
+        looking up the ``__main`` edition's state row) can use this
+        indexed single-row lookup instead of scanning every state row
+        for the org with :meth:`list_for_org` and filtering in memory.
+        Returns ``None`` when no matching row exists.
+        """
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == resource_type.value,
+            SqlKeeperSyncState.docverse_id == docverse_id,
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncState.model_validate(row)
+
+    async def list_for_org(
+        self,
+        *,
+        org_id: int,
+        resource_type: ResourceType,
+        ltd_ids: Iterable[int] | None = None,
+        docverse_ids: Iterable[int] | None = None,
+    ) -> list[KeeperSyncState]:
+        """Return every state row for ``(org_id, resource_type)``.
+
+        Replaces the per-edition ``get`` round-trips the tier-cron
+        worker functions used to make: callers fetch the org's rows
+        once and resolve presence / staleness via an in-memory dict
+        keyed on ``ltd_id``. Pass ``ltd_ids`` to scope the query to a
+        known LTD-side id set (used by tier_other so the WHERE clause
+        only spans editions LTD currently lists). Pass ``docverse_ids``
+        to scope to a known Docverse-side id set (used by the
+        per-project read paths whose scope is "this project's
+        editions" — ``keeper_sync_state`` has no ``project_id``
+        column, so the Docverse edition ids are the natural project
+        scope). Passing an empty ``ltd_ids`` or ``docverse_ids``
+        returns ``[]`` without hitting the database.
+        """
+        if ltd_ids is not None:
+            ltd_id_list = list(ltd_ids)
+            if not ltd_id_list:
+                return []
+        else:
+            ltd_id_list = None
+        if docverse_ids is not None:
+            docverse_id_list = list(docverse_ids)
+            if not docverse_id_list:
+                return []
+        else:
+            docverse_id_list = None
+        clauses: list[ColumnElement[bool]] = [
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == resource_type.value,
+        ]
+        if ltd_id_list is not None:
+            clauses.append(SqlKeeperSyncState.ltd_id.in_(ltd_id_list))
+        if docverse_id_list is not None:
+            clauses.append(
+                SqlKeeperSyncState.docverse_id.in_(docverse_id_list)
+            )
+        stmt = select(SqlKeeperSyncState).where(*clauses)
+        result = await self._session.execute(stmt)
+        return [
+            KeeperSyncState.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
+    async def list_project_resources_for_org(
+        self,
+        *,
+        org_id: int,
+        cursor: KeeperSyncProjectStateIdCursor | None,
+        limit: int,
+    ) -> CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]:
+        """Return a paginated page of project-resource rows for an org.
+
+        Used by the org-scoped paginated keeper-sync projects listing.
+        Ordered by ``id DESC`` via
+        :class:`docverse.storage.pagination.KeeperSyncProjectStateIdCursor`
+        so newest-discovered projects appear first.
+        """
+        from docverse.storage.pagination import (  # noqa: PLC0415
+            KeeperSyncProjectStateIdCursor,
+        )
+
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.resource_type == ResourceType.project.value,
+        )
+        runner = CountedPaginatedQueryRunner(
+            entry_type=KeeperSyncState,
+            cursor_type=KeeperSyncProjectStateIdCursor,
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
 
     async def upsert(  # noqa: PLR0913
         self,

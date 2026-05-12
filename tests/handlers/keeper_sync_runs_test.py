@@ -118,6 +118,11 @@ async def test_post_run_returns_202_with_run_and_queue_job_link(
     assert body["run"]["failed_count"] == 0
     assert body["run"]["total_count"] == 1
     assert "self_url" in body["run"]
+    assert body["run"]["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{body['run']['id']}/jobs"
+        )
+    )
     assert "queue_job_url" in body
     assert body["queue_job_id"]
     assert body["queue_job_url"].endswith(
@@ -208,6 +213,11 @@ async def test_get_run_returns_aggregate_counters(
     # date_last_activity reflects the MAX(coalesce(...)) across the
     # children and is non-null because the run has attributed jobs.
     assert body["date_last_activity"] is not None
+    assert body["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs"
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -412,6 +422,16 @@ async def test_list_runs_returns_per_run_counters(
     assert runs[run_b_id]["succeeded_count"] == 0
     assert runs[run_b_id]["failed_count"] == 1
     assert runs[run_b_id]["total_count"] == 1
+    assert runs[run_a_id]["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_a_id}/jobs"
+        )
+    )
+    assert runs[run_b_id]["jobs_url"] == str(
+        client.base_url.join(
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b_id}/jobs"
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -724,3 +744,53 @@ async def test_get_run_jobs_403_for_non_admin(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "reader-user"},
     )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_url_fields_report_format_uri(
+    client: AsyncClient,
+) -> None:
+    """The three HATEOAS URL fields advertise ``format: uri`` in OpenAPI.
+
+    ``KeeperSyncRun.self_url``, ``KeeperSyncRunCreated.queue_job_url``,
+    and ``KeeperSyncProjectRefreshAccepted.queue_job_url`` are typed
+    ``HttpUrl`` on the client mirror so Pydantic emits the standard
+    URL format string in the generated schema. The peer fields on the
+    same models (``KeeperSyncRun.jobs_url`` and the URL fields on
+    ``KeeperSyncProjectStatus``) are already ``HttpUrl``; this test
+    locks the three formerly-``str`` fields into the same shape so a
+    regression to plain ``str`` is caught at schema generation.
+
+    The handler-side and client-side ``KeeperSyncRun`` schemas share a
+    class name so FastAPI emits them under module-qualified keys; both
+    must agree on ``format: uri`` because both are reachable from the
+    public OpenAPI schema.
+    """
+    response = await client.get("/docverse/openapi.json")
+    assert response.status_code == 200
+    schemas = response.json()["components"]["schemas"]
+
+    keeper_sync_run_schema_names = [
+        name
+        for name in schemas
+        if name == "KeeperSyncRun" or name.endswith("__KeeperSyncRun")
+    ]
+    assert keeper_sync_run_schema_names, (
+        "expected at least one KeeperSyncRun schema in OpenAPI"
+    )
+
+    targets: list[tuple[str, str]] = [
+        *((name, "self_url") for name in keeper_sync_run_schema_names),
+        ("KeeperSyncRunCreated", "queue_job_url"),
+        ("KeeperSyncProjectRefreshAccepted", "queue_job_url"),
+    ]
+    for model_name, field_name in targets:
+        field_schema = schemas[model_name]["properties"][field_name]
+        assert field_schema.get("type") == "string", (
+            f"{model_name}.{field_name} expected type=string,"
+            f" got {field_schema!r}"
+        )
+        assert field_schema.get("format") == "uri", (
+            f"{model_name}.{field_name} expected format=uri,"
+            f" got {field_schema!r}"
+        )

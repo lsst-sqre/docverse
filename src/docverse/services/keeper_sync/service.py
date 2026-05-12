@@ -122,10 +122,19 @@ class BuildSyncOutcome:
 
 @dataclass(frozen=True)
 class EditionSyncOutcome:
-    """What ``sync_edition`` did with one LTD edition."""
+    """What ``sync_edition`` did with one LTD edition.
+
+    ``docverse_project_id`` / ``docverse_project_slug`` are carried on
+    every outcome so per-edition consumers (e.g. the worker's
+    ``on_edition_synced`` publish-enqueue callback) have the project
+    context the publish helper needs without re-querying the project
+    store from the closure.
+    """
 
     docverse_edition_id: int
     docverse_slug: str
+    docverse_project_id: int
+    docverse_project_slug: str
     build_outcome: BuildSyncOutcome | None
 
 
@@ -183,9 +192,25 @@ class KeeperSyncService:
         self._orphan_reclaim_max_age = orphan_reclaim_max_age
 
     async def sync_project(
-        self, *, org_id: int, ltd_slug: str
+        self,
+        *,
+        org_id: int,
+        ltd_slug: str,
+        on_edition_synced: (
+            Callable[[EditionSyncOutcome], Awaitable[None]] | None
+        ) = None,
     ) -> ProjectSyncResult:
-        """Sync one LTD product (and all its editions) into Docverse."""
+        """Sync one LTD product (and all its editions) into Docverse.
+
+        ``on_edition_synced`` runs once per :meth:`sync_edition` return,
+        before the next iteration begins. Callbacks fire after each
+        edition's ``session.begin()`` blocks have committed, so they
+        may open their own transactions safely. Exceptions raised by
+        the callback are caught and logged so a single failure does not
+        stop the rest of the project sync; the tail-end self-heal pass
+        in the worker picks up any edition the callback failed to act
+        on. The default ``None`` preserves all non-worker call sites.
+        """
         ltd_product = await self._ltd_client.get_product(ltd_slug)
         async with self._session.begin():
             org, project = await self._ensure_project(
@@ -202,6 +227,14 @@ class KeeperSyncService:
                 ltd_edition=ltd_edition,
             )
             outcomes.append(outcome)
+            if on_edition_synced is not None:
+                try:
+                    await on_edition_synced(outcome)
+                except Exception:
+                    self._logger.exception(
+                        "on_edition_synced callback raised; continuing",
+                        docverse_slug=outcome.docverse_slug,
+                    )
         return ProjectSyncResult(
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
@@ -306,6 +339,8 @@ class KeeperSyncService:
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
             docverse_slug=docverse_slug,
+            docverse_project_id=project.id,
+            docverse_project_slug=project.slug,
             build_outcome=build_outcome,
         )
 

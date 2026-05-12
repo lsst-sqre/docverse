@@ -72,6 +72,25 @@ class ProjectStore:
             return None
         return Project.model_validate(row)
 
+    async def list_by_ids(self, project_ids: list[int]) -> list[Project]:
+        """Return non-deleted projects with ids in ``project_ids``.
+
+        Used by callers that already have a small set of project ids
+        (e.g. a paginated keeper-sync state-row window) and want to
+        resolve them to projects in a single round-trip instead of N
+        per-id ``get_by_id`` calls. Passing an empty list returns
+        ``[]`` without hitting the database.
+        """
+        if not project_ids:
+            return []
+        result = await self._session.execute(
+            select(SqlProject).where(
+                SqlProject.id.in_(project_ids),
+                SqlProject.date_deleted.is_(None),
+            )
+        )
+        return [Project.model_validate(row) for row in result.scalars().all()]
+
     async def list_all_by_org(self, org_id: int) -> list[Project]:
         """List every non-deleted project for an organization.
 
