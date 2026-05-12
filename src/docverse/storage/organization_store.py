@@ -30,7 +30,9 @@ class OrganizationStore:
         """Insert a new organization row."""
         default_edition_config = None
         if data.default_edition_config is not None:
-            default_edition_config = data.default_edition_config.model_dump()
+            default_edition_config = data.default_edition_config.model_dump(
+                mode="json"
+            )
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
             lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
@@ -87,7 +89,7 @@ class OrganizationStore:
         row = result.scalar_one_or_none()
         if row is None:
             return None
-        updates = data.model_dump(exclude_unset=True)
+        updates = data.model_dump(mode="json", exclude_unset=True)
         for key, value in updates.items():
             setattr(row, key, value)
         await self._session.flush()

@@ -261,7 +261,7 @@ class ProjectStore:
         row = result.scalar_one_or_none()
         if row is None:
             return None
-        updates = data.model_dump(exclude_unset=True)
+        updates = data.model_dump(mode="json", exclude_unset=True)
         for key, value in updates.items():
             setattr(row, key, value)
         await self._session.flush()
