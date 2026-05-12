@@ -21,8 +21,9 @@ from safir.logging import configure_logging
 
 from .config import config
 from .database import check_database_state, get_current_revision, init_database
+from .sentry import initialize_sentry
 
-__all__ = ["help", "main"]
+__all__ = ["help", "main", "main_with_sentry"]
 
 # Add -h as a help shortcut option
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
@@ -40,6 +41,18 @@ def main() -> None:
         log_level=config.log_level,
         name="docverse",
     )
+
+
+def main_with_sentry() -> None:
+    """Console-script entry point that initializes Sentry before Click.
+
+    The ``docverse-admin`` script in ``pyproject.toml`` points here so a
+    failed admin invocation (e.g. ``update-db-schema``) reports to the
+    same Sentry project as runtime errors. No-op when ``SENTRY_DSN`` is
+    unset.
+    """
+    initialize_sentry(component="cli")
+    main()
 
 
 @main.command()

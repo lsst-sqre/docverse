@@ -27,6 +27,7 @@ from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
 from .handlers.webhooks import webhook_router
+from .sentry import initialize_sentry
 from .services.credential_encryptor import CredentialEncryptor
 from .storage.github import validate_github_app
 from .storage.user_info_store import GafaelfawrUserInfoStore
@@ -39,6 +40,9 @@ configure_logging(
     name="docverse",
 )
 configure_uvicorn_logging(config.log_level)
+# Initialize at module import time, outside ``lifespan``, so app-construction
+# errors are captured too (matches gafaelfawr's pattern).
+initialize_sentry(component="api")
 
 
 @asynccontextmanager

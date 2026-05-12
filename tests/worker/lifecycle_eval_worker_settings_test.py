@@ -25,7 +25,7 @@ from docverse.worker.main import (
     LifecycleEvalWorkerSettings,
     WorkerSettings,
     shutdown,
-    startup,
+    startup_lifecycle_eval,
 )
 
 _config = Configuration()
@@ -68,8 +68,17 @@ def test_lifecycle_eval_worker_settings_registers_functions() -> None:
 
 
 def test_lifecycle_eval_worker_settings_share_lifecycle_hooks() -> None:
-    """All three WorkerSettings classes share startup/shutdown."""
-    assert LifecycleEvalWorkerSettings.on_startup is startup
+    """Lifecycle queue has its own ``on_startup`` (per-component Sentry tag).
+
+    The lifecycle wrapper funnels through the same ``_startup`` body as
+    the default and keeper-sync queues so the factory-builder shape stays
+    uniform; the only intentional divergence is the Sentry ``component``
+    tag (``worker-lifecycle-eval``). ``on_shutdown`` is fully shared.
+    """
+    assert LifecycleEvalWorkerSettings.on_startup is startup_lifecycle_eval
+    assert (
+        LifecycleEvalWorkerSettings.on_startup is not WorkerSettings.on_startup
+    )
     assert LifecycleEvalWorkerSettings.on_shutdown is shutdown
 
 

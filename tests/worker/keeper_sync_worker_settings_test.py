@@ -16,7 +16,8 @@ from docverse.worker.main import (
     KeeperSyncWorkerSettings,
     WorkerSettings,
     shutdown,
-    startup,
+    startup_default,
+    startup_keeper_sync,
 )
 
 _config = Configuration()
@@ -70,10 +71,17 @@ def test_default_worker_does_not_register_keeper_sync_functions() -> None:
 
 
 def test_keeper_sync_worker_settings_share_lifecycle_hooks() -> None:
-    """Both classes share startup/shutdown for one factory builder."""
-    assert KeeperSyncWorkerSettings.on_startup is startup
+    """Each queue has its own ``on_startup`` (per-component Sentry tag).
+
+    Both wrappers funnel through the same ``_startup`` body so the
+    factory-builder shape stays uniform across the two queues; the only
+    intentional divergence is the Sentry ``component`` tag (``worker``
+    vs. ``worker-keeper-sync``). ``on_shutdown`` is fully shared.
+    """
+    assert WorkerSettings.on_startup is startup_default
+    assert KeeperSyncWorkerSettings.on_startup is startup_keeper_sync
+    assert KeeperSyncWorkerSettings.on_startup is not WorkerSettings.on_startup
     assert KeeperSyncWorkerSettings.on_shutdown is shutdown
-    assert KeeperSyncWorkerSettings.on_startup is WorkerSettings.on_startup
     assert KeeperSyncWorkerSettings.on_shutdown is WorkerSettings.on_shutdown
 
 
