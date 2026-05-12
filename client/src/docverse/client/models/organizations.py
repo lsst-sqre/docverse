@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .editions import DefaultEditionConfig
+from .lifecycle import LifecycleRuleSet
 from .memberships import OrgMembershipCreate
 from .services import OrganizationServiceSummary
 
@@ -105,7 +106,7 @@ class OrganizationCreate(BaseModel):
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: list[dict[str, Any]] | None = Field(
+    lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )
@@ -192,7 +193,7 @@ class Organization(BaseModel):
         description="Rules for rewriting project slugs in URLs."
     )
 
-    lifecycle_rules: list[dict[str, Any]] | None = Field(
+    lifecycle_rules: LifecycleRuleSet | None = Field(
         description="Rules governing build lifecycle."
     )
 
@@ -282,7 +283,7 @@ class OrganizationUpdate(BaseModel):
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: list[dict[str, Any]] | None = Field(
+    lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )

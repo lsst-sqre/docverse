@@ -177,3 +177,115 @@ async def test_patch_organization_not_found(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "admin"},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_lifecycle_rules_valid(
+    client: AsyncClient,
+) -> None:
+    """Valid lifecycle_rules PATCH persists the typed JSONB payload."""
+    await seed_org_with_admin(client, "patch-lifecycle-org", "admin")
+    rules = [
+        {"type": "draft_inactivity", "max_days_inactive": 30},
+        {
+            "type": "build_history_orphan",
+            "min_position": 5,
+            "min_age_days": 30,
+        },
+        {"type": "ref_deleted"},
+    ]
+    response = await client.patch(
+        "/docverse/orgs/patch-lifecycle-org",
+        json={"lifecycle_rules": rules},
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 200
+    assert response.json()["lifecycle_rules"] == rules
+
+    # Round-trips through GET as well.
+    get_response = await client.get(
+        "/docverse/orgs/patch-lifecycle-org",
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["lifecycle_rules"] == rules
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_lifecycle_rules_unknown_type(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when a rule names an unknown discriminator tag."""
+    await seed_org_with_admin(client, "patch-bad-lifecycle-org", "admin")
+    response = await client.patch(
+        "/docverse/orgs/patch-bad-lifecycle-org",
+        json={
+            "lifecycle_rules": [
+                {"type": "purgatory_eviction", "enabled": True},
+            ],
+        },
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    # The discriminator-aware error names both the field and the bad tag.
+    assert any("lifecycle_rules" in str(err.get("loc", [])) for err in detail)
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_lifecycle_rules_missing_field(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when a known rule omits a required field."""
+    await seed_org_with_admin(
+        client, "patch-missing-field-lifecycle-org", "admin"
+    )
+    response = await client.patch(
+        "/docverse/orgs/patch-missing-field-lifecycle-org",
+        json={
+            "lifecycle_rules": [
+                {"type": "draft_inactivity"},
+            ],
+        },
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_lifecycle_rules_duplicate_types(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when the same rule type appears twice."""
+    await seed_org_with_admin(client, "patch-dup-lifecycle-org", "admin")
+    response = await client.patch(
+        "/docverse/orgs/patch-dup-lifecycle-org",
+        json={
+            "lifecycle_rules": [
+                {"type": "draft_inactivity", "max_days_inactive": 30},
+                {"type": "draft_inactivity", "max_days_inactive": 60},
+            ],
+        },
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_lifecycle_rules_missing_discriminator(
+    client: AsyncClient,
+) -> None:
+    """A 422 is returned when a rule omits the ``type`` discriminator."""
+    await seed_org_with_admin(
+        client, "patch-no-discriminator-lifecycle-org", "admin"
+    )
+    response = await client.patch(
+        "/docverse/orgs/patch-no-discriminator-lifecycle-org",
+        json={
+            "lifecycle_rules": [
+                {"max_days_inactive": 30},
+            ],
+        },
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 422

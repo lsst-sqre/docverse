@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import OrganizationCreate, OrganizationUpdate
+from docverse.client.models import (
+    LifecycleRuleSet,
+    OrganizationCreate,
+    OrganizationUpdate,
+)
 from docverse.client.models.organizations import normalize_base_domain
 
 
@@ -79,3 +83,44 @@ def test_organization_update_allows_none_base_domain() -> None:
 def test_organization_update_rejects_whitespace() -> None:
     with pytest.raises(ValidationError):
         OrganizationUpdate(base_domain="lsst .io")
+
+
+def test_organization_create_accepts_typed_lifecycle_rules() -> None:
+    payload = OrganizationCreate(
+        slug="lsst",
+        title="Rubin Observatory",
+        base_domain="lsst.io",
+        lifecycle_rules=[  # type: ignore[arg-type]
+            {"type": "draft_inactivity", "max_days_inactive": 30},
+            {"type": "ref_deleted"},
+        ],
+    )
+    assert isinstance(payload.lifecycle_rules, LifecycleRuleSet)
+    assert len(payload.lifecycle_rules.root) == 2  # noqa: PLR2004
+
+
+def test_organization_create_rejects_unknown_lifecycle_rule_type() -> None:
+    with pytest.raises(ValidationError):
+        OrganizationCreate(
+            slug="lsst",
+            title="Rubin Observatory",
+            base_domain="lsst.io",
+            lifecycle_rules=[  # type: ignore[arg-type]
+                {"type": "purgatory_eviction", "enabled": True},
+            ],
+        )
+
+
+def test_organization_update_rejects_duplicate_lifecycle_rule_types() -> None:
+    with pytest.raises(ValidationError):
+        OrganizationUpdate(
+            lifecycle_rules=[  # type: ignore[arg-type]
+                {"type": "draft_inactivity", "max_days_inactive": 30},
+                {"type": "draft_inactivity", "max_days_inactive": 60},
+            ],
+        )
+
+
+def test_organization_update_accepts_none_lifecycle_rules() -> None:
+    payload = OrganizationUpdate(lifecycle_rules=None)
+    assert payload.lifecycle_rules is None

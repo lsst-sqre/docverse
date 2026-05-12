@@ -63,7 +63,7 @@ class BuildStore:
             storage_prefix=storage_prefix,
             uploader=uploader,
             annotations=(
-                data.annotations.model_dump(exclude_none=True)
+                data.annotations.model_dump(mode="json", exclude_none=True)
                 if data.annotations is not None
                 else None
             ),

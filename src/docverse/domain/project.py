@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .lifecycle import LifecycleRuleSet
+
 
 class Project(BaseModel):
     """Domain representation of a project."""
@@ -32,7 +34,7 @@ class Project(BaseModel):
         description="Rules for rewriting project slugs in URLs.",
     )
 
-    lifecycle_rules: list[dict[str, Any]] | None = Field(
+    lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
     )

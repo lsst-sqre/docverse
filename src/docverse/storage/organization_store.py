@@ -30,7 +30,12 @@ class OrganizationStore:
         """Insert a new organization row."""
         default_edition_config = None
         if data.default_edition_config is not None:
-            default_edition_config = data.default_edition_config.model_dump()
+            default_edition_config = data.default_edition_config.model_dump(
+                mode="json"
+            )
+        lifecycle_rules = None
+        if data.lifecycle_rules is not None:
+            lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
         row = SqlOrganization(
             slug=data.slug,
             title=data.title,
@@ -38,7 +43,7 @@ class OrganizationStore:
             url_scheme=data.url_scheme,
             root_path_prefix=data.root_path_prefix,
             slug_rewrite_rules=data.slug_rewrite_rules,
-            lifecycle_rules=data.lifecycle_rules,
+            lifecycle_rules=lifecycle_rules,
             default_edition_config=default_edition_config,
             purgatory_retention=data.purgatory_retention,
         )
@@ -84,7 +89,7 @@ class OrganizationStore:
         row = result.scalar_one_or_none()
         if row is None:
             return None
-        updates = data.model_dump(exclude_unset=True)
+        updates = data.model_dump(mode="json", exclude_unset=True)
         for key, value in updates.items():
             setattr(row, key, value)
         await self._session.flush()
