@@ -71,26 +71,30 @@ def evaluate_lifecycle(
     rule_match_counts: dict[str, int] = {}
 
     for rule in rule_set.root:
-        if isinstance(rule, DraftInactivityRule):
-            matches = _eval_draft_inactivity(
-                rule=rule, editions=editions_list, now=now
-            )
-            matched_edition_ids.update(matches)
-            rule_match_counts[rule.type] = len(matches)
-        elif isinstance(rule, BuildHistoryOrphanRule):
-            matches = _eval_build_history_orphan(
-                rule=rule,
-                editions=editions_list,
-                builds=builds_list,
-                history=history_list,
-                now=now,
-            )
-            matched_build_ids.update(matches)
-            rule_match_counts[rule.type] = len(matches)
-        elif isinstance(rule, RefDeletedRule):
-            # DM-54913 will swap in the real predicate; until then the
-            # rule is recognized but matches nothing.
-            rule_match_counts[rule.type] = 0
+        match rule:
+            case DraftInactivityRule():
+                matches = _eval_draft_inactivity(
+                    rule=rule, editions=editions_list, now=now
+                )
+                matched_edition_ids.update(matches)
+                rule_match_counts[rule.type] = len(matches)
+            case BuildHistoryOrphanRule():
+                matches = _eval_build_history_orphan(
+                    rule=rule,
+                    editions=editions_list,
+                    builds=builds_list,
+                    history=history_list,
+                    now=now,
+                )
+                matched_build_ids.update(matches)
+                rule_match_counts[rule.type] = len(matches)
+            case RefDeletedRule():
+                # DM-54913 will swap in the real predicate; until then the
+                # rule is recognized but matches nothing.
+                rule_match_counts[rule.type] = 0
+            case _:
+                msg = f"unknown lifecycle rule type {rule.type!r}"
+                raise RuntimeError(msg)
 
     return LifecycleDecision(
         edition_ids=frozenset(matched_edition_ids),
