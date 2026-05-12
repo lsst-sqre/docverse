@@ -55,6 +55,7 @@ from .keeper_sync import (
 from .lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
+    LifecycleEvalRunStatus,
     LifecycleRule,
     LifecycleRuleSet,
     RefDeletedRule,
@@ -121,6 +122,7 @@ __all__ = [
     "KeeperSyncTierCohort",
     "KeeperSyncTierName",
     "KeeperSyncTierStatus",
+    "LifecycleEvalRunStatus",
     "LifecycleRule",
     "LifecycleRuleSet",
     "OrgDashboardRebuildEntry",
