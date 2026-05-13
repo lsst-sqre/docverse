@@ -32,6 +32,7 @@ from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.lifecycle_eval_dispatcher import (
     LIFECYCLE_EVAL_QUEUE_NAME,
+    _create_run_with_children,
     lifecycle_eval_dispatcher,
 )
 from tests.support.arq_testing import get_jobs_by_name, register_queue
@@ -166,6 +167,11 @@ async def test_dispatcher_fans_out_per_in_scope_org(
                 SqlQueueJob.kind == JobKind.lifecycle_eval.value
             )
             queue_jobs = (await session.execute(qj_stmt)).scalars().all()
+            # The run row and its full set of per-org children are
+            # created in the same transaction by
+            # ``_create_run_with_children``; the run is never visible
+            # without its children, so the reaper never has to chase
+            # a partially-fanned-out parent.
             assert len(queue_jobs) == 2
             assert {qj.org_id for qj in queue_jobs} == {org_a_id, org_b_id}
             assert {qj.subject_label for qj in queue_jobs} == {
@@ -358,3 +364,94 @@ async def test_dispatcher_skips_tick_when_prior_run_in_flight(
             # remains.
             assert len(runs) == 1
             assert runs[0].id == existing_run.id
+
+
+@pytest.mark.asyncio
+async def test_create_run_with_children_is_atomic(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash mid-fanout rolls back the run row and every child row.
+
+    ``_create_run_with_children`` writes the ``lifecycle_eval_runs``
+    row, its ``summary``, every per-org ``queue_jobs`` child, and the
+    ``pending → in_progress`` transition inside a single
+    ``session.begin()`` block. If any child insert fails, the whole
+    transaction must roll back — leaving neither a partial run row
+    (which would wedge the next tick's ``has_non_terminal_run``
+    pre-flight) nor an orphan ``queue_jobs`` row (which would mislead
+    ``lifecycle_reaper``).
+
+    Simulated by stubbing ``QueueJobStore.create`` to raise on the
+    second per-org insert. The dispatcher's helper must propagate the
+    exception and leave the database exactly as it was before the
+    call.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session,
+            slug="org-a-atomic",
+            lifecycle_rules=_ORG_RULES,
+        )
+        await _seed_org(
+            db_session,
+            slug="org-b-atomic",
+            lifecycle_rules=_ORG_RULES,
+        )
+
+    class _BoomError(RuntimeError):
+        """Sentinel exception raised mid-fanout to trigger rollback."""
+
+    original_create = QueueJobStore.create
+    call_count = 0
+
+    async def _flaky_create(self: QueueJobStore, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            msg = "simulated mid-fanout crash"
+            raise _BoomError(msg)
+        return await original_create(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(QueueJobStore, "create", _flaky_create)
+
+    async for session in db_session_dependency():
+        run_store = LifecycleEvalRunStore(session=session, logger=_logger())
+        queue_job_store = QueueJobStore(session=session, logger=_logger())
+        org_store = OrganizationStore(session=session, logger=_logger())
+        async with session.begin():
+            orgs = await org_store.list_all()
+        assert len(orgs) == 2
+
+        with pytest.raises(_BoomError):
+            await _create_run_with_children(
+                session=session,
+                run_store=run_store,
+                queue_job_store=queue_job_store,
+                orgs=orgs,
+                orgs_skipped=0,
+            )
+
+    # The whole transaction must have rolled back: no runs row and no
+    # queue_jobs row should be visible from a fresh session.
+    async for session in db_session_dependency():
+        async with session.begin():
+            runs = (
+                (await session.execute(select(SqlLifecycleEvalRun)))
+                .scalars()
+                .all()
+            )
+            assert runs == []
+            queue_jobs = (
+                (
+                    await session.execute(
+                        select(SqlQueueJob).where(
+                            SqlQueueJob.kind == JobKind.lifecycle_eval.value
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert queue_jobs == []

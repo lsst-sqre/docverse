@@ -7,32 +7,35 @@ job. On each firing the dispatcher:
    OR any non-deleted project with non-empty rules. Orgs with no rules
    anywhere are skipped — no ``queue_jobs`` row, no per-org pass.
 
-2. Creates one ``lifecycle_eval_runs`` row in ``pending`` status. The
-   partial-unique non-terminal index on that table is the DB-level
-   backstop against two ticks racing; the dispatcher pre-checks
-   ``has_non_terminal_run`` *and* catches the ``IntegrityError`` from
-   the index (the pre-check and the insert are in separate
-   transactions, so two ticks can both clear the pre-check) so a
-   slow prior tick surfaces as a clean ``"skipped"`` result rather
-   than an ``IntegrityError`` traceback.
+2. Inserts the ``lifecycle_eval_runs`` row, its ``summary`` JSONB
+   (``orgs_enqueued`` / ``orgs_skipped``), the per-org ``queue_jobs``
+   children, and — when there is at least one child — the
+   ``pending → in_progress`` transition, **all in a single
+   transaction**. Either every row is durable together or none of
+   them are: there is no window in which a ``lifecycle_eval_runs``
+   row can exist without its children, so the
+   ``has_non_terminal_run`` pre-flight cannot get wedged by a
+   partial fan-out. The partial-unique non-terminal index on
+   ``lifecycle_eval_runs`` is the DB-level backstop against two
+   ticks racing; the dispatcher pre-checks ``has_non_terminal_run``
+   *and* catches the ``IntegrityError`` from the index so a slow
+   prior tick surfaces as a clean ``"skipped"`` result rather than
+   an ``IntegrityError`` traceback. The per-org mutex partial-unique
+   index on ``queue_jobs`` keeps concurrent ticks from doubling up
+   on a single org.
 
-3. Inserts one ``queue_jobs`` row per in-scope org with
-   ``kind='lifecycle_eval'``, ``subject_label=org.slug``, and
-   ``lifecycle_eval_run_id`` set to the new run. The per-org mutex
-   partial-unique index keeps concurrent ticks from doubling up.
+3. For the all-skipped case (zero in-scope orgs) the same
+   transaction transitions the run straight to ``succeeded`` — no
+   children exist to finalise the run later.
 
-4. Writes the ``summary`` JSONB on the run row with ``orgs_enqueued``
-   and ``orgs_skipped`` counts, then transitions the run from
-   ``pending`` to ``in_progress`` once the fan-out commits — or
-   straight to ``succeeded`` when the all-skipped path leaves no
-   children to finalise the run later.
-
-5. Enqueues the actual arq jobs outside the SQL transaction (so the
-   queue_jobs row commits before any worker can pick it up) and
-   writes the arq backend job id back onto each row. The orphan-tail
-   window — row committed, ``backend_job_id IS NULL`` — is the
-   reaper's responsibility, mirroring ``keeper_sync_run_discovery``'s
-   shape.
+4. Enqueues the actual arq jobs outside the SQL transaction (so the
+   ``queue_jobs`` rows commit before any worker can pick them up)
+   and writes the arq ``backend_job_id`` back onto each row. The
+   orphan-tail window — row committed, ``backend_job_id IS NULL`` —
+   is the responsibility of ``lifecycle_reaper``, the second
+   durability backstop. The per-job arq ``timeout`` configured on
+   ``LifecycleEvalWorkerSettings`` is the first backstop (cancels a
+   runaway evaluator long before the reaper window).
 """
 
 from __future__ import annotations
@@ -47,8 +50,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.client.models import JobKind, LifecycleEvalRunStatus
 from docverse.domain.lifecycle_eval_run import LifecycleEvalRun
 from docverse.domain.organization import Organization
+from docverse.domain.queue import QueueJob
 from docverse.factory import Factory
 from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
+from docverse.storage.queue_job_store import QueueJobStore
 
 __all__ = ["LIFECYCLE_EVAL_QUEUE_NAME", "lifecycle_eval_dispatcher"]
 
@@ -77,6 +82,7 @@ async def lifecycle_eval_dispatcher(ctx: dict[str, Any]) -> str:
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
         run_store = factory.create_lifecycle_eval_run_store()
+        queue_job_store = factory.create_queue_job_store()
 
         async with session.begin():
             if await run_store.has_non_terminal_run():
@@ -89,26 +95,23 @@ async def lifecycle_eval_dispatcher(ctx: dict[str, Any]) -> str:
         in_scope, skipped_count = await _resolve_in_scope_orgs(
             session=session, factory=factory
         )
-        run = await _create_run_with_summary(
+        creation = await _create_run_with_children(
             session=session,
             run_store=run_store,
-            orgs_enqueued=len(in_scope),
+            queue_job_store=queue_job_store,
+            orgs=in_scope,
             orgs_skipped=skipped_count,
         )
-        if run is None:
+        if creation is None:
             logger.info(
                 "Skipping lifecycle_eval dispatcher tick: another tick "
                 "won the create race"
             )
             return "skipped"
+        run, queue_jobs = creation
         logger = logger.bind(lifecycle_eval_run_id=run.id)
 
         if not in_scope:
-            async with session.begin():
-                await run_store.transition_status(
-                    run_id=run.id,
-                    new_status=LifecycleEvalRunStatus.succeeded,
-                )
             logger.info(
                 "Lifecycle_eval dispatcher tick completed with no in-scope "
                 "orgs",
@@ -116,13 +119,13 @@ async def lifecycle_eval_dispatcher(ctx: dict[str, Any]) -> str:
             )
             return "completed"
 
-        await _enqueue_children(
+        await _enqueue_arq_jobs(
             ctx=ctx,
             session=session,
-            factory=factory,
-            run_store=run_store,
+            queue_job_store=queue_job_store,
             run_id=run.id,
             orgs=in_scope,
+            queue_jobs=queue_jobs,
             logger=logger,
         )
         logger.info(
@@ -165,24 +168,32 @@ async def _resolve_in_scope_orgs(
     return in_scope, skipped
 
 
-async def _create_run_with_summary(
+async def _create_run_with_children(
     *,
     session: AsyncSession,
     run_store: LifecycleEvalRunStore,
-    orgs_enqueued: int,
+    queue_job_store: QueueJobStore,
+    orgs: list[Organization],
     orgs_skipped: int,
-) -> LifecycleEvalRun | None:
-    """Insert the run row in one transaction and write its summary.
+) -> tuple[LifecycleEvalRun, list[QueueJob]] | None:
+    """Insert the run row, summary, all child ``queue_jobs`` atomically.
 
-    Split from the fan-out write so the run row is durable even if
-    the per-child enqueue loop dies mid-fanout — the reaper can then
-    finalise the partially-fanned-out run from the children that did
-    commit.
+    Either every row commits together or none of them do, so the
+    ``has_non_terminal_run`` pre-flight cannot get wedged by a
+    partial fan-out: a committed run row is always accompanied by
+    its full set of child ``queue_jobs`` rows (or, in the
+    all-skipped case, transitions straight to ``succeeded``). A
+    crash later — during the arq enqueue loop — degenerates to the
+    existing orphan-queued case (``backend_job_id IS NULL``) that
+    ``lifecycle_reaper`` already handles.
 
-    Returns ``None`` if the partial-unique non-terminal index rejected
-    the insert — another dispatcher tick raced past the pre-flight
-    ``has_non_terminal_run`` check and won the create. The caller
-    translates this into a clean ``"skipped"`` tick.
+    Returns ``None`` if the partial-unique non-terminal index
+    rejected the insert — another dispatcher tick raced past the
+    pre-flight ``has_non_terminal_run`` check and won the create.
+    The caller translates this into a clean ``"skipped"`` tick.
+    Returns ``(run, queue_jobs)`` otherwise; ``queue_jobs`` is in
+    the same order as ``orgs`` so the arq enqueue loop can pair
+    them up.
     """
     try:
         async with session.begin():
@@ -190,49 +201,55 @@ async def _create_run_with_summary(
             await run_store.set_summary(
                 run_id=run.id,
                 summary={
-                    "orgs_enqueued": orgs_enqueued,
+                    "orgs_enqueued": len(orgs),
                     "orgs_skipped": orgs_skipped,
                 },
             )
+            queue_jobs: list[QueueJob] = []
+            for org in orgs:
+                queue_job = await queue_job_store.create(
+                    kind=JobKind.lifecycle_eval,
+                    org_id=org.id,
+                    lifecycle_eval_run_id=run.id,
+                    subject_label=org.slug,
+                )
+                queue_jobs.append(queue_job)
+            if orgs:
+                await run_store.transition_status(
+                    run_id=run.id,
+                    new_status=LifecycleEvalRunStatus.in_progress,
+                )
+            else:
+                await run_store.transition_status(
+                    run_id=run.id,
+                    new_status=LifecycleEvalRunStatus.succeeded,
+                )
     except IntegrityError:
         return None
-    return run
+    return run, queue_jobs
 
 
-async def _enqueue_children(  # noqa: PLR0913
+async def _enqueue_arq_jobs(  # noqa: PLR0913
     *,
     ctx: dict[str, Any],
     session: AsyncSession,
-    factory: Factory,
-    run_store: LifecycleEvalRunStore,
+    queue_job_store: QueueJobStore,
     run_id: int,
     orgs: list[Organization],
+    queue_jobs: list[QueueJob],
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Fan out one per-org ``queue_jobs`` row + arq enqueue per org.
+    """Enqueue one arq job per pre-created ``queue_jobs`` row.
 
-    Each iteration commits the ``queue_jobs`` row *before* enqueuing
-    the arq job so a crash between the SQL commit and ``arq_queue.
-    enqueue`` leaves an orphan-tail row (``backend_job_id IS NULL``)
-    the reaper can sweep — mirrors ``_enqueue_children`` in
-    ``keeper_sync.py``. The run's ``pending → in_progress`` transition
-    is atomic with the first successful child create.
+    The ``queue_jobs`` rows are already committed by
+    :func:`_create_run_with_children`, so a crash between the
+    arq enqueue and the ``backend_job_id`` write leaves an
+    orphan-queued row (``backend_job_id IS NULL``) the
+    ``lifecycle_reaper`` will sweep — mirrors the orphan-tail
+    contract documented on ``KeeperSyncWorkerSettings``.
     """
     arq_queue = ctx["arq_queue"]
-    queue_job_store = factory.create_queue_job_store()
-    for index, org in enumerate(orgs):
-        async with session.begin():
-            queue_job = await queue_job_store.create(
-                kind=JobKind.lifecycle_eval,
-                org_id=org.id,
-                lifecycle_eval_run_id=run_id,
-                subject_label=org.slug,
-            )
-            if index == 0:
-                await run_store.transition_status(
-                    run_id=run_id,
-                    new_status=LifecycleEvalRunStatus.in_progress,
-                )
+    for org, queue_job in zip(orgs, queue_jobs, strict=True):
         metadata = await arq_queue.enqueue(
             "lifecycle_eval",
             _queue_name=LIFECYCLE_EVAL_QUEUE_NAME,

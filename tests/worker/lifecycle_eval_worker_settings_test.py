@@ -11,6 +11,7 @@ from __future__ import annotations
 from arq.cron import CronJob
 from arq.worker import Function
 
+from docverse.config import Configuration
 from docverse.worker.functions import lifecycle_eval, lifecycle_eval_dispatcher
 from docverse.worker.functions.lifecycle_eval_dispatcher import (
     LIFECYCLE_EVAL_QUEUE_NAME,
@@ -22,6 +23,8 @@ from docverse.worker.main import (
     shutdown,
     startup,
 )
+
+_config = Configuration()
 
 
 def _function_by_coroutine(coro: object) -> Function:
@@ -43,9 +46,19 @@ def test_lifecycle_eval_worker_settings_uses_dedicated_queue() -> None:
 
 
 def test_lifecycle_eval_worker_settings_registers_functions() -> None:
-    """Dispatcher and per-org worker are both registered, single-attempt."""
+    """Dispatcher and per-org worker are both registered, single-attempt.
+
+    Both are wrapped with :func:`arq.func` carrying the configured
+    per-job ``timeout`` so a runaway evaluator or wedged dispatcher
+    tick is cancelled by arq long before the cron-driven
+    ``lifecycle_reaper`` window — the timeout is the first
+    durability backstop and the reaper is the second.
+    """
     dispatcher = _function_by_coroutine(lifecycle_eval_dispatcher)
     per_org = _function_by_coroutine(lifecycle_eval)
+    expected_timeout = float(_config.lifecycle_eval_job_timeout_seconds)
+    assert dispatcher.timeout_s == expected_timeout
+    assert per_org.timeout_s == expected_timeout
     assert dispatcher.max_tries == 1
     assert per_org.max_tries == 1
 

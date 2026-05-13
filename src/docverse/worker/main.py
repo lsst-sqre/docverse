@@ -360,13 +360,16 @@ class LifecycleEvalWorkerSettings:
     is the binding.
 
     Both the dispatcher and the per-org worker are wrapped with
-    :func:`arq.func` so the dedicated queue inherits a single-attempt
-    policy. A failure must surface promptly so the per-org worker's
-    ``except Exception`` block can route to ``queue_job_store.fail()``
-    and the parent ``lifecycle_eval_runs`` row finalises via
-    :func:`maybe_finalise_lifecycle_run` — arq's default 5-attempt
-    retry would otherwise delay finalisation and obscure the
-    underlying error in logs.
+    :func:`arq.func` so the dedicated queue inherits a per-job
+    ``timeout`` (sourced from ``Config.lifecycle_eval_job_timeout_seconds``)
+    and a single-attempt policy. A failure must surface promptly so
+    the per-org worker's ``except Exception`` block can route to
+    ``queue_job_store.fail()`` and the parent ``lifecycle_eval_runs``
+    row finalises via :func:`maybe_finalise_lifecycle_run` — arq's
+    default 5-attempt retry would otherwise delay finalisation and
+    obscure the underlying error in logs. The cron-driven
+    ``lifecycle_reaper`` (sibling task) is the second backstop for
+    the case where arq itself loses a job and no timeout ever fires.
 
     The hourly dispatcher cron is registered here; the
     ``lifecycle_reaper`` cron (sibling task) will be appended to this
@@ -376,10 +379,12 @@ class LifecycleEvalWorkerSettings:
     functions = [
         func(
             lifecycle_eval_dispatcher,
+            timeout=config.lifecycle_eval_job_timeout_seconds,
             max_tries=1,
         ),
         func(
             lifecycle_eval,
+            timeout=config.lifecycle_eval_job_timeout_seconds,
             max_tries=1,
         ),
     ]

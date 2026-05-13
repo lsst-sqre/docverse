@@ -164,6 +164,21 @@ class Configuration(BaseSettings):
         ),
     )
 
+    lifecycle_eval_job_timeout_seconds: int = Field(
+        3600,
+        title="Lifecycle-eval per-job timeout, in seconds",
+        description=(
+            "Wraps the ``lifecycle_eval_dispatcher`` and per-org"
+            " ``lifecycle_eval`` arq functions on"
+            " ``LifecycleEvalWorkerSettings``: arq cancels a job that"
+            " runs past this. The cron-driven ``lifecycle_reaper`` is"
+            " the second backstop (covers OOM-killed workers / arq"
+            " losing a job), so this should sit well below"
+            " ``lifecycle_reaper_threshold_seconds``. Lower this in"
+            " test/staging to surface stuck-worker behaviour quickly."
+        ),
+    )
+
     superadmin_usernames: Annotated[
         list[str], BeforeValidator(_parse_comma_separated)
     ] = Field(
