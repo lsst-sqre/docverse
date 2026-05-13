@@ -128,10 +128,12 @@ class LifecycleEvalRunStore:
         """Replace the run row's JSONB ``summary`` column.
 
         Called by the dispatcher to record per-tick metadata
-        (``orgs_enqueued``, ``orgs_skipped``) once the fan-out commits.
-        Distinct from ``transition_status`` so the summary can be
-        written from inside the dispatcher's fan-out transaction
-        without coupling the status state machine to summary writes.
+        (``orgs_enqueued``, ``orgs_skipped``) in the same transaction
+        as the run-row insert, so the counts represent the dispatcher's
+        intent and are captured atomically with the run — the summary
+        is never missing, even if the per-child fan-out dies later.
+        Distinct from ``transition_status`` so the summary write does
+        not couple the status state machine to summary writes.
         """
         row = await self._get_row(run_id)
         row.summary = summary
