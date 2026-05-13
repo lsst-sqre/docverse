@@ -17,6 +17,7 @@ from docverse.client.models import (
 )
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.exceptions import InvalidJobStateError
 from docverse.storage.edition_store import EditionStore
@@ -1332,3 +1333,198 @@ async def test_fail_orphaned_run_children_scoped_to_run(
         refetched = await store.get(orphan_b.id)
     assert refetched is not None
     assert refetched.status == JobStatus.queued
+
+
+# ---------------------------------------------------------------------
+# lifecycle_eval reaper helpers
+# ---------------------------------------------------------------------
+
+
+async def _seed_lifecycle_eval_row(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    status: JobStatus,
+    backend_job_id: str | None,
+    date_started: datetime | None = None,
+    date_created_offset: timedelta | None = None,
+) -> int:
+    """Insert one ``kind='lifecycle_eval'`` row with explicit timestamps.
+
+    The store's ``create`` does not expose ``lifecycle_eval_run_id`` (the
+    dispatcher sibling task adds that), and ``status`` defaults to
+    ``queued``. The reaper-helper tests drive every field that the
+    sweep predicates consult, so direct ``SqlQueueJob`` construction is
+    cleaner than threading two-step setup through ``create`` +
+    ``start``.
+    """
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        backend_job_id=backend_job_id,
+        kind=JobKind.lifecycle_eval.value,
+        status=status.value,
+        org_id=org_id,
+        date_started=date_started,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    if date_created_offset is not None:
+        row.date_created = datetime.now(tz=UTC) - date_created_offset
+        await db_session.flush()
+    return row.id
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_lifecycle_eval_jobs_reaps_old_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` lifecycle_eval row past the threshold is failed."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="lce-reap-1")
+        stuck_id = await _seed_lifecycle_eval_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id="arq-lce-stuck",
+            date_started=datetime.now(tz=UTC) - timedelta(hours=10),
+        )
+
+        reaped = await store.fail_silent_lifecycle_eval_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 1
+    assert reaped[0].id == stuck_id
+    assert reaped[0].status == JobStatus.failed
+    assert reaped[0].errors is not None
+    assert reaped[0].errors["type"] == "SilentWorker"
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_lifecycle_eval_jobs_skips_recent(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` row within the idle window is left alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="lce-reap-2")
+        await _seed_lifecycle_eval_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id="arq-lce-fresh",
+            date_started=datetime.now(tz=UTC),
+        )
+
+        reaped = await store.fail_silent_lifecycle_eval_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_lifecycle_eval_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Other ``kind`` values stay out of scope, mirroring keeper-sync split."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="lce-reap-3")
+        unrelated = await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            backend_job_id="arq-build",
+        )
+        await store.start(unrelated.id)
+        row = await db_session.get(SqlQueueJob, unrelated.id)
+        assert row is not None
+        row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
+        await db_session.flush()
+
+        reaped = await store.fail_silent_lifecycle_eval_jobs(
+            idle_after=timedelta(hours=6)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_lifecycle_eval_jobs_reaps_old_orphan(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A ``queued`` lifecycle_eval row with no ``backend_job_id`` is failed."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="lce-orphan-1")
+        orphan_id = await _seed_lifecycle_eval_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=timedelta(minutes=10),
+        )
+
+        failed = await store.fail_orphaned_lifecycle_eval_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert len(failed) == 1
+    assert failed[0].id == orphan_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "OrphanedQueueJob"
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_lifecycle_eval_jobs_skips_rows_with_backend_id(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row that already has a backend_job_id is not an orphan."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="lce-orphan-2")
+        await _seed_lifecycle_eval_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-lce-enqueued",
+            date_created_offset=timedelta(minutes=30),
+        )
+
+        failed = await store.fail_orphaned_lifecycle_eval_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_lifecycle_eval_jobs_skips_started_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` row is not an orphan; silent sweep owns it."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="lce-orphan-3")
+        await _seed_lifecycle_eval_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=None,
+            date_started=datetime.now(tz=UTC) - timedelta(hours=1),
+            date_created_offset=timedelta(minutes=30),
+        )
+
+        failed = await store.fail_orphaned_lifecycle_eval_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []

@@ -179,6 +179,22 @@ class Configuration(BaseSettings):
         ),
     )
 
+    lifecycle_reaper_threshold_seconds: int = Field(
+        21600,
+        title="Lifecycle_eval stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``lifecycle_eval``"
+            " per-org job (e.g. an OOM-killed worker pod)."
+            " ``lifecycle_reaper`` fails any ``kind='lifecycle_eval'``"
+            " ``queue_jobs`` row that has been ``in_progress`` longer"
+            " than this without ``date_completed``. Mirrors"
+            " ``keeper_sync_reaper_threshold_seconds`` so the operator"
+            " knob shape is identical across the two reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
     superadmin_usernames: Annotated[
         list[str], BeforeValidator(_parse_comma_separated)
     ] = Field(
