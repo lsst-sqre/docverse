@@ -40,6 +40,7 @@ class QueueJobStore:
         build_id: int | None = None,
         edition_id: int | None = None,
         keeper_sync_run_id: int | None = None,
+        lifecycle_eval_run_id: int | None = None,
         subject_label: str | None = None,
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
@@ -57,6 +58,7 @@ class QueueJobStore:
             build_id=build_id,
             edition_id=edition_id,
             keeper_sync_run_id=keeper_sync_run_id,
+            lifecycle_eval_run_id=lifecycle_eval_run_id,
             subject_label=subject_label,
         )
         self._session.add(row)

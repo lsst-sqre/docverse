@@ -42,9 +42,12 @@ from .functions import (
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
     keeper_sync_tier_other,
+    lifecycle_eval,
+    lifecycle_eval_dispatcher,
     ping,
     publish_edition,
 )
+from .functions.lifecycle_eval_dispatcher import LIFECYCLE_EVAL_QUEUE_NAME
 
 config = Configuration()
 
@@ -341,5 +344,57 @@ class KeeperSyncWorkerSettings:
     ]
     redis_settings = config.arq_redis_settings
     queue_name = KEEPER_SYNC_QUEUE_NAME
+    on_startup = startup
+    on_shutdown = shutdown
+
+
+class LifecycleEvalWorkerSettings:
+    """arq WorkerSettings for the dedicated ``lifecycle_eval`` queue.
+
+    Bound to ``docverse:lifecycle-queue`` (see
+    :data:`LIFECYCLE_EVAL_QUEUE_NAME`) so a slow lifecycle pass cannot
+    starve the default queue's ``build_processing`` and
+    ``publish_edition`` jobs or the keeper-sync queue's
+    ``keeper_sync_project`` jobs. The PRD §"Orchestration" specifies a
+    third pool alongside the default and keeper-sync pools; this class
+    is the binding.
+
+    Both the dispatcher and the per-org worker are wrapped with
+    :func:`arq.func` so the dedicated queue inherits a per-job
+    ``timeout`` (sourced from ``Config.lifecycle_eval_job_timeout_seconds``)
+    and a single-attempt policy. A failure must surface promptly so
+    the per-org worker's ``except Exception`` block can route to
+    ``queue_job_store.fail()`` and the parent ``lifecycle_eval_runs``
+    row finalises via :func:`maybe_finalise_lifecycle_run` — arq's
+    default 5-attempt retry would otherwise delay finalisation and
+    obscure the underlying error in logs. The cron-driven
+    ``lifecycle_reaper`` (sibling task) is the second backstop for
+    the case where arq itself loses a job and no timeout ever fires.
+
+    The hourly dispatcher cron is registered here; the
+    ``lifecycle_reaper`` cron (sibling task) will be appended to this
+    class's ``cron_jobs`` list when it lands.
+    """
+
+    functions = [
+        func(
+            lifecycle_eval_dispatcher,
+            timeout=config.lifecycle_eval_job_timeout_seconds,
+            max_tries=1,
+        ),
+        func(
+            lifecycle_eval,
+            timeout=config.lifecycle_eval_job_timeout_seconds,
+            max_tries=1,
+        ),
+    ]
+    cron_jobs = [
+        cron(
+            lifecycle_eval_dispatcher,
+            minute={0},
+        ),
+    ]
+    redis_settings = config.arq_redis_settings
+    queue_name = LIFECYCLE_EVAL_QUEUE_NAME
     on_startup = startup
     on_shutdown = shutdown

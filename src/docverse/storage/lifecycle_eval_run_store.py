@@ -10,6 +10,7 @@ pattern transfers between subsystems.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from sqlalchemy import func, select
@@ -117,6 +118,25 @@ class LifecycleEvalRunStore:
         row.status = new_status.value
         if new_status not in _NON_TERMINAL_STATUSES:
             row.date_finished = datetime.now(tz=UTC)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return LifecycleEvalRun.model_validate(row)
+
+    async def set_summary(
+        self, *, run_id: int, summary: dict[str, Any]
+    ) -> LifecycleEvalRun:
+        """Replace the run row's JSONB ``summary`` column.
+
+        Called by the dispatcher to record per-tick metadata
+        (``orgs_enqueued``, ``orgs_skipped``) in the same transaction
+        as the run-row insert, so the counts represent the dispatcher's
+        intent and are captured atomically with the run — the summary
+        is never missing, even if the per-child fan-out dies later.
+        Distinct from ``transition_status`` so the summary write does
+        not couple the status state machine to summary writes.
+        """
+        row = await self._get_row(run_id)
+        row.summary = summary
         await self._session.flush()
         await self._session.refresh(row)
         return LifecycleEvalRun.model_validate(row)
