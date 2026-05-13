@@ -23,7 +23,9 @@ def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
 
-async def _seed_org(db_session: AsyncSession, *, slug: str = "ler-org") -> int:
+async def _seed_org(
+    db_session: AsyncSession, *, slug: str = "ler-org"
+) -> tuple[int, str]:
     org_store = OrganizationStore(session=db_session, logger=_logger())
     org = await org_store.create(
         OrganizationCreate(
@@ -32,7 +34,7 @@ async def _seed_org(db_session: AsyncSession, *, slug: str = "ler-org") -> int:
             base_domain=f"{slug}.example.com",
         )
     )
-    return org.id
+    return org.id, org.slug
 
 
 def _seed_queue_job(
@@ -117,14 +119,14 @@ async def test_queue_jobs_lifecycle_eval_per_org_mutex(
 ) -> None:
     """Two active ``lifecycle_eval`` queue_jobs for one org collide."""
     async with db_session.begin():
-        org_id = await _seed_org(db_session)
+        org_id, org_slug = await _seed_org(db_session)
         db_session.add(
             SqlQueueJob(
                 public_id=validate_base32_id(generate_base32_id()),
                 kind=JobKind.lifecycle_eval.value,
                 status=JobStatus.queued.value,
                 org_id=org_id,
-                subject_label=str(org_id),
+                subject_label=org_slug,
             )
         )
 
@@ -136,7 +138,43 @@ async def test_queue_jobs_lifecycle_eval_per_org_mutex(
                     kind=JobKind.lifecycle_eval.value,
                     status=JobStatus.in_progress.value,
                     org_id=org_id,
-                    subject_label=str(org_id),
+                    subject_label=org_slug,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_queue_jobs_lifecycle_eval_mutex_ignores_subject_label(
+    db_session: AsyncSession,
+) -> None:
+    """Mutex is keyed on ``org_id`` alone — divergent labels still collide.
+
+    The previous mutex shape included ``subject_label``; the index is
+    now single-column on ``org_id``. This test pins that property so a
+    future revision cannot silently restore ``subject_label`` to the
+    index without flagging itself here.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(db_session)
+        db_session.add(
+            SqlQueueJob(
+                public_id=validate_base32_id(generate_base32_id()),
+                kind=JobKind.lifecycle_eval.value,
+                status=JobStatus.queued.value,
+                org_id=org_id,
+                subject_label="ler-org",
+            )
+        )
+
+    with pytest.raises(IntegrityError):
+        async with db_session.begin():
+            db_session.add(
+                SqlQueueJob(
+                    public_id=validate_base32_id(generate_base32_id()),
+                    kind=JobKind.lifecycle_eval.value,
+                    status=JobStatus.in_progress.value,
+                    org_id=org_id,
+                    subject_label="some-other-label",
                 )
             )
 
@@ -147,14 +185,14 @@ async def test_queue_jobs_lifecycle_eval_mutex_terminal_alongside_active(
 ) -> None:
     """A terminal sibling does not block a fresh active row for the org."""
     async with db_session.begin():
-        org_id = await _seed_org(db_session)
+        org_id, org_slug = await _seed_org(db_session)
         db_session.add(
             SqlQueueJob(
                 public_id=validate_base32_id(generate_base32_id()),
                 kind=JobKind.lifecycle_eval.value,
                 status=JobStatus.completed.value,
                 org_id=org_id,
-                subject_label=str(org_id),
+                subject_label=org_slug,
             )
         )
         db_session.add(
@@ -163,7 +201,7 @@ async def test_queue_jobs_lifecycle_eval_mutex_terminal_alongside_active(
                 kind=JobKind.lifecycle_eval.value,
                 status=JobStatus.failed.value,
                 org_id=org_id,
-                subject_label=str(org_id),
+                subject_label=org_slug,
             )
         )
 
@@ -174,7 +212,7 @@ async def test_queue_jobs_lifecycle_eval_mutex_terminal_alongside_active(
                 kind=JobKind.lifecycle_eval.value,
                 status=JobStatus.queued.value,
                 org_id=org_id,
-                subject_label=str(org_id),
+                subject_label=org_slug,
             )
         )
 
@@ -185,15 +223,15 @@ async def test_queue_jobs_lifecycle_eval_mutex_distinct_orgs_coexist(
 ) -> None:
     """Two distinct orgs may each hold an active lifecycle_eval row."""
     async with db_session.begin():
-        first_org = await _seed_org(db_session, slug="ler-org-a")
-        second_org = await _seed_org(db_session, slug="ler-org-b")
+        first_org, first_slug = await _seed_org(db_session, slug="ler-org-a")
+        second_org, second_slug = await _seed_org(db_session, slug="ler-org-b")
         db_session.add(
             SqlQueueJob(
                 public_id=validate_base32_id(generate_base32_id()),
                 kind=JobKind.lifecycle_eval.value,
                 status=JobStatus.queued.value,
                 org_id=first_org,
-                subject_label=str(first_org),
+                subject_label=first_slug,
             )
         )
         db_session.add(
@@ -202,7 +240,7 @@ async def test_queue_jobs_lifecycle_eval_mutex_distinct_orgs_coexist(
                 kind=JobKind.lifecycle_eval.value,
                 status=JobStatus.queued.value,
                 org_id=second_org,
-                subject_label=str(second_org),
+                subject_label=second_slug,
             )
         )
 
@@ -425,7 +463,6 @@ async def test_aggregate_activity_groups_jobs_by_status(
     distinguishes from clean success.
     """
     async with db_session.begin():
-        org_id = await _seed_org(db_session)
         store = LifecycleEvalRunStore(session=db_session, logger=_logger())
         run = await store.create()
         all_statuses = [
@@ -437,16 +474,19 @@ async def test_aggregate_activity_groups_jobs_by_status(
             JobStatus.completed_with_errors,
         ]
         for index, status in enumerate(all_statuses):
-            # Per-row distinct ``subject_label`` so the per-org
-            # active-status mutex does not block the two non-terminal
-            # rows from coexisting. The test exercises the aggregator's
+            # One org per row so the per-``org_id`` active-status
+            # mutex does not block the two non-terminal rows from
+            # coexisting. The test exercises the aggregator's
             # bucketing, not the mutex.
+            row_org_id, row_org_slug = await _seed_org(
+                db_session, slug=f"ler-org-bucket-{index}"
+            )
             _seed_queue_job(
                 db_session,
-                org_id=org_id,
+                org_id=row_org_id,
                 run_id=run.id,
                 status=status,
-                subject_label=f"org-{org_id}-{index}",
+                subject_label=row_org_slug,
             )
         await db_session.commit()
 
@@ -484,36 +524,45 @@ async def test_aggregate_activity_picks_max_coalesced_timestamp(
     """``date_last_activity`` is MAX(coalesce(completed, started, created))."""
     base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     async with db_session.begin():
-        org_id = await _seed_org(db_session)
+        # One org per row so the two non-terminal rows (queued +
+        # in_progress) do not collide on the per-``org_id`` mutex;
+        # the test exercises the timestamp coalescer, not the mutex.
+        alpha_id, alpha_slug = await _seed_org(
+            db_session, slug="ler-org-alpha"
+        )
+        beta_id, beta_slug = await _seed_org(db_session, slug="ler-org-beta")
+        gamma_id, gamma_slug = await _seed_org(
+            db_session, slug="ler-org-gamma"
+        )
         store = LifecycleEvalRunStore(session=db_session, logger=_logger())
         run = await store.create()
         _seed_queue_job(
             db_session,
-            org_id=org_id,
+            org_id=alpha_id,
             run_id=run.id,
             status=JobStatus.queued,
             date_created=base,
-            subject_label="alpha",
+            subject_label=alpha_slug,
         )
         _seed_queue_job(
             db_session,
-            org_id=org_id,
+            org_id=beta_id,
             run_id=run.id,
             status=JobStatus.in_progress,
             date_created=base,
             date_started=base + timedelta(minutes=10),
-            subject_label="beta",
+            subject_label=beta_slug,
         )
         latest = base + timedelta(minutes=30)
         _seed_queue_job(
             db_session,
-            org_id=org_id,
+            org_id=gamma_id,
             run_id=run.id,
             status=JobStatus.completed,
             date_created=base,
             date_started=base + timedelta(minutes=5),
             date_completed=latest,
-            subject_label="gamma",
+            subject_label=gamma_slug,
         )
         await db_session.commit()
 

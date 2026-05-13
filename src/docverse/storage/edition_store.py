@@ -239,6 +239,34 @@ class EditionStore:
             for edition_row, build_public_id, build_git_ref in rows
         ]
 
+    async def list_all_by_project_ids(
+        self, project_ids: list[int]
+    ) -> list[Edition]:
+        """List every non-deleted edition across the given projects.
+
+        Single-query batch over multiple projects, ordered by
+        ``(project_id, slug)`` for stable iteration. Used by the
+        ``lifecycle_eval`` per-org worker to load every project's
+        editions in one round-trip rather than N. Passing an empty
+        ``project_ids`` returns ``[]`` without hitting the database.
+        """
+        if not project_ids:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id.in_(project_ids),
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.project_id, SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
     async def list_by_project(
         self,
         project_id: int,

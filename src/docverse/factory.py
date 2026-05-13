@@ -63,6 +63,7 @@ from .storage.editionpublisher import (
 from .storage.github import GitHubAppClient, GitHubAppNotConfiguredError
 from .storage.keeper_sync import KeeperSyncStateStore
 from .storage.keeper_sync_run_store import KeeperSyncRunStore
+from .storage.lifecycle_eval_run_store import LifecycleEvalRunStore
 from .storage.ltd import LtdClient, LtdProductsClient, LtdS3Source
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
@@ -178,6 +179,12 @@ class Factory:
     def create_keeper_sync_run_store(self) -> KeeperSyncRunStore:
         """Create a :class:`KeeperSyncRunStore`."""
         return KeeperSyncRunStore(session=self._session, logger=self._logger)
+
+    def create_lifecycle_eval_run_store(self) -> LifecycleEvalRunStore:
+        """Create a :class:`LifecycleEvalRunStore`."""
+        return LifecycleEvalRunStore(
+            session=self._session, logger=self._logger
+        )
 
     def create_keeper_sync_run_service(self) -> KeeperSyncRunService:
         """Create a :class:`KeeperSyncRunService`."""
