@@ -95,6 +95,25 @@ class ProjectStore:
         )
         return [Project.model_validate(row) for row in result.scalars().all()]
 
+    async def list_org_ids_with_lifecycle_rules(self) -> set[int]:
+        """Return every ``org_id`` that owns a project with lifecycle rules.
+
+        The ``lifecycle_eval_dispatcher`` pre-flight uses the union of
+        this set with orgs whose own ``lifecycle_rules`` column is
+        non-null to decide which orgs are in-scope for the tick.
+        Soft-deleted projects are excluded so an org whose only
+        rule-bearing project has been deleted is correctly classified
+        as "no rules anywhere" — otherwise the dispatcher would burn a
+        queue slot on a per-org pass that the evaluator would short-
+        circuit anyway.
+        """
+        stmt = select(SqlProject.org_id).where(
+            SqlProject.lifecycle_rules.is_not(None),
+            SqlProject.date_deleted.is_(None),
+        )
+        result = await self._session.execute(stmt)
+        return set(result.scalars().all())
+
     async def list_all_by_org(self, org_id: int) -> list[Project]:
         """List every non-deleted project for an organization.
 
