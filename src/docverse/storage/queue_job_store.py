@@ -517,6 +517,105 @@ class QueueJobStore:
             await self._session.flush()
         return failed
 
+    async def fail_silent_lifecycle_eval_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail ``lifecycle_eval`` rows stuck ``in_progress`` past the window.
+
+        ``lifecycle_reaper``'s silent-row sweep. Mirrors
+        :meth:`fail_silent_run_children` but scoped to
+        ``kind='lifecycle_eval'`` rather than the keeper-sync row's
+        ``keeper_sync_run_id IS NOT NULL`` filter, because the dispatcher
+        always writes a ``lifecycle_eval_run_id`` so the run attribution
+        is implied by ``kind`` alone. Rows that the worker actually
+        picked up but never finished (``status='in_progress'``,
+        ``date_completed IS NULL``, ``date_started`` older than
+        ``now - idle_after``) are reaped here; ``queued`` rows whose
+        worker crashed before arq enqueue go to
+        :meth:`fail_orphaned_lifecycle_eval_jobs`.
+
+        Reaped rows carry ``errors.type='SilentWorker'`` matching the
+        keeper-sync precedent so postmortem queries that group by
+        ``errors.type`` can compare the two subsystems on the same axis.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.lifecycle_eval.value,
+            SqlQueueJob.status == JobStatus.in_progress.value,
+            SqlQueueJob.date_completed.is_(None),
+            SqlQueueJob.date_started.is_not(None),
+            SqlQueueJob.date_started < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        reaped: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Reaped by lifecycle_reaper: worker went silent "
+                    "while job was in_progress (likely OOM-killed or "
+                    "lost by arq)"
+                ),
+                "type": "SilentWorker",
+            }
+            reaped.append(QueueJob.model_validate(row, from_attributes=True))
+        if reaped:
+            await self._session.flush()
+        return reaped
+
+    async def fail_orphaned_lifecycle_eval_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail ``lifecycle_eval`` rows that never reached arq.
+
+        ``lifecycle_reaper``'s orphan sweep. The dispatcher commits the
+        per-org ``queue_jobs`` row *before* calling ``arq_queue.enqueue``,
+        so a worker crash in that window leaves an orphan
+        (``status='queued'``, ``backend_job_id IS NULL``). Without
+        reconciliation the orphan would wedge the per-org mutex
+        ``idx_queue_jobs_lifecycle_eval_active_uq`` and block subsequent
+        dispatcher ticks from enqueueing fresh work for that org.
+
+        Scoped narrowly: ``kind='lifecycle_eval'``, ``status='queued'``,
+        ``backend_job_id IS NULL``, ``date_created`` older than
+        ``now - idle_after``. Reaped rows carry
+        ``errors.type='OrphanedQueueJob'`` matching the keeper-sync
+        precedent for run-attributed orphans.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.lifecycle_eval.value,
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_(None),
+            SqlQueueJob.date_created < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        failed: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Orphaned lifecycle_eval: queue_jobs row committed "
+                    "without an arq backend_job_id (worker likely "
+                    "crashed between SQL commit and arq_queue.enqueue)"
+                ),
+                "type": "OrphanedQueueJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
+
     async def fail_orphaned_run_children(
         self,
         *,

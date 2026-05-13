@@ -13,6 +13,7 @@ from .keeper_sync import (
 )
 from .lifecycle_eval import lifecycle_eval
 from .lifecycle_eval_dispatcher import lifecycle_eval_dispatcher
+from .lifecycle_reaper import lifecycle_reaper
 from .ping import ping
 from .publish_edition import publish_edition
 
@@ -28,6 +29,7 @@ __all__ = [
     "keeper_sync_tier_other",
     "lifecycle_eval",
     "lifecycle_eval_dispatcher",
+    "lifecycle_reaper",
     "ping",
     "publish_edition",
 ]
