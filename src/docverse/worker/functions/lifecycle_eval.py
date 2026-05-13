@@ -2,10 +2,13 @@
 
 The dispatcher cron (sibling task) writes one ``lifecycle_eval_runs``
 row per tick, then fans out one ``queue_jobs`` row per in-scope org
-with ``kind='lifecycle_eval'`` and ``subject_label=str(org_id)``. This
-worker is the per-org body of that fan-out: for one org it loads the
-org row, every non-deleted project, every project's editions, builds,
-and rollback-history rows in batched reads (no N+1), evaluates the
+with ``kind='lifecycle_eval'`` and ``subject_label=org.slug`` (the
+human-readable org slug — never the internal database id, mirroring
+``keeper_sync_project``'s ``subject_label=ltd_slug`` convention so an
+operator inspecting the queue sees a meaningful subject). This worker
+is the per-org body of that fan-out: for one org it loads the org row,
+every non-deleted project, every project's editions, builds, and
+rollback-history rows in batched reads (no N+1), evaluates the
 effective lifecycle rule set per project via the pure
 :func:`docverse.services.lifecycle.evaluator.evaluate_lifecycle`
 function, soft-deletes matched editions and builds, and emits one

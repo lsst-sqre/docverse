@@ -160,9 +160,16 @@ async def _seed_build(
 
 
 async def _seed_run_and_queue_job(
-    db_session: AsyncSession, *, org_id: int
+    db_session: AsyncSession, *, org_id: int, org_slug: str
 ) -> tuple[int, int]:
-    """Create one ``lifecycle_eval_runs`` row + a per-org queue_jobs row."""
+    """Create one ``lifecycle_eval_runs`` row + a per-org queue_jobs row.
+
+    Mirrors the dispatcher contract documented on
+    :mod:`docverse.worker.functions.lifecycle_eval`: ``subject_label``
+    is the org's slug so the per-org mutex stays human-meaningful for
+    operators inspecting ``queue_jobs`` and the internal ``org_id``
+    is never reused as the queue's user-visible subject.
+    """
     run_store = LifecycleEvalRunStore(session=db_session, logger=_logger())
     run = await run_store.create()
     await run_store.transition_status(
@@ -174,7 +181,7 @@ async def _seed_run_and_queue_job(
         status=JobStatus.queued.value,
         org_id=org_id,
         lifecycle_eval_run_id=run.id,
-        subject_label=str(org_id),
+        subject_label=org_slug,
     )
     db_session.add(queue_job_row)
     await db_session.flush()
@@ -283,7 +290,7 @@ async def test_lifecycle_eval_soft_deletes_stale_drafts_and_orphan_builds(
         )
 
         run_id, queue_job_id = await _seed_run_and_queue_job(
-            db_session, org_id=org_id
+            db_session, org_id=org_id, org_slug=org_slug
         )
 
     http_client = httpx.AsyncClient()
@@ -380,7 +387,7 @@ async def test_lifecycle_eval_no_rules_is_a_noop(
             date_updated=NOW - timedelta(days=365),
         )
         run_id, queue_job_id = await _seed_run_and_queue_job(
-            db_session, org_id=org_id
+            db_session, org_id=org_id, org_slug=org_slug
         )
 
     http_client = httpx.AsyncClient()
@@ -458,7 +465,7 @@ async def test_lifecycle_eval_project_rules_replace_org_rules(
         )
 
         run_id, queue_job_id = await _seed_run_and_queue_job(
-            db_session, org_id=org_id
+            db_session, org_id=org_id, org_slug=org_slug
         )
 
     http_client = httpx.AsyncClient()
@@ -515,7 +522,7 @@ async def test_lifecycle_eval_failure_marks_queue_job_and_finalises_run(
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session, slug="lce-fail-org")
         run_id, queue_job_id = await _seed_run_and_queue_job(
-            db_session, org_id=org_id
+            db_session, org_id=org_id, org_slug=org_slug
         )
 
     async def _raise(*args: object, **kwargs: object) -> None:
@@ -618,7 +625,7 @@ async def test_lifecycle_eval_protects_shared_build_referenced_elsewhere(
         )
 
         run_id, queue_job_id = await _seed_run_and_queue_job(
-            db_session, org_id=org_id
+            db_session, org_id=org_id, org_slug=org_slug
         )
 
     http_client = httpx.AsyncClient()

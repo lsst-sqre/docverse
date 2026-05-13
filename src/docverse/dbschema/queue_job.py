@@ -119,16 +119,24 @@ class SqlQueueJob(Base):
             ),
         ),
         # Per-org mutex for ``lifecycle_eval`` per-org child jobs: at
-        # most one queued or in_progress row per (org_id,
-        # subject_label). The dispatcher writes
-        # ``subject_label = str(org_id)`` so this is effectively one
-        # row per org while the per-org evaluator is running. The
-        # partial WHERE means terminal rows do not participate, so a
-        # finished tick never blocks the next.
+        # most one queued or in_progress row per ``org_id`` for
+        # ``kind='lifecycle_eval'``. ``subject_label`` is deliberately
+        # **not** part of the mutex identity here, which diverges from
+        # the ``keeper_sync_project_active_uq`` shape just above. The
+        # divergence is intentional: keeper_sync_project is
+        # per-project within an org and needs ``subject_label`` (set
+        # to the LTD slug) to distinguish concurrent project syncs;
+        # lifecycle_eval is per-org by design (SQR-112) and has no
+        # sub-key under ``org_id``, so adding ``subject_label`` to the
+        # index would only make the two indexes look superficially
+        # similar without encoding any additional identity. The row
+        # itself still carries ``subject_label = org.slug`` for
+        # operator readability of the queue — it just isn't part of
+        # the mutex. The partial WHERE means terminal rows do not
+        # participate, so a finished tick never blocks the next.
         Index(
             "idx_queue_jobs_lifecycle_eval_active_uq",
             "org_id",
-            "subject_label",
             unique=True,
             postgresql_where=text(
                 "kind = 'lifecycle_eval' "
