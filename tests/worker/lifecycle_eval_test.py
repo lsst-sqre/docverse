@@ -16,7 +16,7 @@ import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import update
+from sqlalchemy.sql import select, update
 
 from docverse.client.models import (
     BuildCreate,
@@ -335,10 +335,9 @@ async def test_lifecycle_eval_soft_deletes_stale_drafts_and_orphan_builds(
             # Lookup soft-deleted edition row directly to verify
             # date_deleted set.
             sql = await session.execute(
-                update(SqlEdition)
-                .where(SqlEdition.id == stale_draft_id)
-                .returning(SqlEdition.date_deleted)
-                .values()
+                select(SqlEdition.date_deleted).where(
+                    SqlEdition.id == stale_draft_id
+                )
             )
             assert sql.scalar_one() is not None
 
@@ -492,10 +491,9 @@ async def test_lifecycle_eval_project_rules_replace_org_rules(
             assert inheriting_victim is None
             # Confirm via direct row lookup that date_deleted is set.
             row_result = await session.execute(
-                update(SqlEdition)
-                .where(SqlEdition.id == inheriting_draft_id)
-                .returning(SqlEdition.date_deleted)
-                .values()
+                select(SqlEdition.date_deleted).where(
+                    SqlEdition.id == inheriting_draft_id
+                )
             )
             assert row_result.scalar_one() is not None
 

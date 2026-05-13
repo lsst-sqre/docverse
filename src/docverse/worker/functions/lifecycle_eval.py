@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
-from docverse.domain.lifecycle import LifecycleRuleSet
+from docverse.domain.lifecycle import LifecycleRule, LifecycleRuleSet
 from docverse.domain.project import Project
 from docverse.factory import Factory
 from docverse.services.lifecycle.evaluator import (
@@ -43,6 +43,8 @@ from docverse.services.lifecycle.evaluator import (
 from docverse.services.lifecycle_finalisation import (
     maybe_finalise_lifecycle_run,
 )
+from docverse.storage.build_store import BuildStore
+from docverse.storage.edition_store import EditionStore
 
 __all__ = ["lifecycle_eval"]
 
@@ -169,7 +171,7 @@ async def _evaluate_org(
             edition_build_history=history_by_project.get(project.id, []),
             now=now,
         )
-        if decision.edition_ids or decision.build_ids:
+        if decision.edition_matches or decision.build_matches:
             decisions.append((project, rule_set, decision))
 
     if not decisions:
@@ -282,8 +284,8 @@ def _index_builds_by_id(
 
 async def _apply_decision(  # noqa: PLR0913
     *,
-    edition_store: Any,
-    build_store: Any,
+    edition_store: EditionStore,
+    build_store: BuildStore,
     project: Project,
     rule_set: LifecycleRuleSet,
     decision: LifecycleDecision,
@@ -299,16 +301,22 @@ async def _apply_decision(  # noqa: PLR0913
     ``delete_reason`` columns are deferred to DM-54914 per the PRD).
     Each event identifies the entity type and id, the project's
     ``(org_id, org_slug, project_id, project_slug)`` for cross-row
-    correlation, the matched rule's ``type`` discriminator, and the
-    rule's resolved parameter dict so an operator can audit *why* a
-    row was deleted from logs alone.
+    correlation, the matched rule's ``type`` discriminator (read from
+    ``decision.edition_matches`` / ``decision.build_matches`` so any
+    future rule that matches editions or builds attributes correctly
+    without code changes here), and the rule's resolved parameter
+    dict so an operator can audit *why* a row was deleted from logs
+    alone.
     """
-    rules_by_type = {rule.type: rule for rule in rule_set.root}
-    for edition_id in sorted(decision.edition_ids):
+    rules_by_type: dict[str, LifecycleRule] = {
+        rule.type: rule for rule in rule_set.root
+    }
+    for edition_id in sorted(decision.edition_matches):
         edition = edition_index.get(edition_id)
         if edition is None:
             continue
-        rule = rules_by_type.get("draft_inactivity")
+        rule_type = decision.edition_matches[edition_id]
+        rule = rules_by_type.get(rule_type)
         deleted = await edition_store.soft_delete(
             project_id=project.id, slug=edition.slug
         )
@@ -323,16 +331,17 @@ async def _apply_decision(  # noqa: PLR0913
             org=org_slug,
             project_id=project.id,
             project=project.slug,
-            rule_type=rule.type if rule is not None else None,
+            rule_type=rule_type,
             rule_params=(
                 rule.model_dump(exclude={"type"}) if rule is not None else None
             ),
         )
-    for build_id in sorted(decision.build_ids):
+    for build_id in sorted(decision.build_matches):
         build = build_index.get(build_id)
         if build is None:
             continue
-        rule = rules_by_type.get("build_history_orphan")
+        rule_type = decision.build_matches[build_id]
+        rule = rules_by_type.get(rule_type)
         deleted = await build_store.soft_delete(build_id=build.id)
         if not deleted:
             continue
@@ -344,7 +353,7 @@ async def _apply_decision(  # noqa: PLR0913
             org=org_slug,
             project_id=project.id,
             project=project.slug,
-            rule_type=rule.type if rule is not None else None,
+            rule_type=rule_type,
             rule_params=(
                 rule.model_dump(exclude={"type"}) if rule is not None else None
             ),

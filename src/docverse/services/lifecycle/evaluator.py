@@ -23,28 +23,49 @@ __all__ = ["LifecycleDecision", "evaluate_lifecycle", "resolve_rule_set"]
 class LifecycleDecision(BaseModel):
     """Decision returned by :func:`evaluate_lifecycle`.
 
-    ``edition_ids`` and ``build_ids`` are the soft-delete candidates.
-    ``rule_match_counts`` maps each rule ``type`` present in the rule
-    set to the number of entities that rule matched, for structured
-    logging by the per-org worker.
+    ``edition_matches`` and ``build_matches`` map each matched entity
+    id to the ``type`` discriminator of the rule that matched it, so
+    the per-org worker can attribute each soft-delete to the right
+    rule (and emit it in the audit-trail log) without re-deriving the
+    mapping from entity type. ``edition_ids`` / ``build_ids`` expose
+    the same id sets as frozensets for callers that only need the
+    soft-delete candidates. ``rule_match_counts`` maps each rule
+    ``type`` present in the rule set to the number of entities that
+    rule matched.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    edition_ids: frozenset[int] = Field(
-        default_factory=frozenset,
-        description="Edition ids to soft-delete.",
+    edition_matches: Mapping[int, str] = Field(
+        default_factory=dict,
+        description=(
+            "Edition ids to soft-delete, keyed on the ``type``"
+            " discriminator of the rule that matched them."
+        ),
     )
 
-    build_ids: frozenset[int] = Field(
-        default_factory=frozenset,
-        description="Build ids to soft-delete.",
+    build_matches: Mapping[int, str] = Field(
+        default_factory=dict,
+        description=(
+            "Build ids to soft-delete, keyed on the ``type``"
+            " discriminator of the rule that matched them."
+        ),
     )
 
     rule_match_counts: Mapping[str, int] = Field(
         default_factory=dict,
         description="Per-rule match count keyed on the rule's ``type``.",
     )
+
+    @property
+    def edition_ids(self) -> frozenset[int]:
+        """Edition ids to soft-delete (derived from ``edition_matches``)."""
+        return frozenset(self.edition_matches)
+
+    @property
+    def build_ids(self) -> frozenset[int]:
+        """Build ids to soft-delete (derived from ``build_matches``)."""
+        return frozenset(self.build_matches)
 
 
 def evaluate_lifecycle(
@@ -60,14 +81,15 @@ def evaluate_lifecycle(
     No database access. The caller hands in already-loaded editions,
     builds, and per-edition build-history rows; the function returns
     a :class:`LifecycleDecision` listing the entities the rule set
-    has matched for soft-delete.
+    has matched for soft-delete, each tagged with the matching rule's
+    ``type`` discriminator.
     """
     editions_list = list(editions)
     builds_list = list(builds)
     history_list = list(edition_build_history)
 
-    matched_edition_ids: set[int] = set()
-    matched_build_ids: set[int] = set()
+    edition_matches: dict[int, str] = {}
+    build_matches: dict[int, str] = {}
     rule_match_counts: dict[str, int] = {}
 
     for rule in rule_set.root:
@@ -76,7 +98,8 @@ def evaluate_lifecycle(
                 matches = _eval_draft_inactivity(
                     rule=rule, editions=editions_list, now=now
                 )
-                matched_edition_ids.update(matches)
+                for edition_id in matches:
+                    edition_matches.setdefault(edition_id, rule.type)
                 rule_match_counts[rule.type] = len(matches)
             case BuildHistoryOrphanRule():
                 matches = _eval_build_history_orphan(
@@ -86,7 +109,8 @@ def evaluate_lifecycle(
                     history=history_list,
                     now=now,
                 )
-                matched_build_ids.update(matches)
+                for build_id in matches:
+                    build_matches.setdefault(build_id, rule.type)
                 rule_match_counts[rule.type] = len(matches)
             case RefDeletedRule():
                 # DM-54913 will swap in the real predicate; until then the
@@ -97,8 +121,8 @@ def evaluate_lifecycle(
                 raise RuntimeError(msg)
 
     return LifecycleDecision(
-        edition_ids=frozenset(matched_edition_ids),
-        build_ids=frozenset(matched_build_ids),
+        edition_matches=edition_matches,
+        build_matches=build_matches,
         rule_match_counts=rule_match_counts,
     )
 
