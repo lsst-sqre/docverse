@@ -237,6 +237,76 @@ async def test_dispatcher_with_no_in_scope_orgs_terminates_run_succeeded(
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_skips_when_create_loses_race(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The IntegrityError from a lost create race surfaces as ``"skipped"``.
+
+    The pre-flight ``has_non_terminal_run`` check and the
+    ``create`` insert run in separate transactions, so two cron
+    firings can both clear the pre-check and both attempt the
+    insert. The partial-unique non-terminal index rejects one of
+    them with ``IntegrityError``. The dispatcher must catch that
+    and return ``"skipped"`` — the run_store docstring promises
+    the caller will translate the IntegrityError into a clean skip.
+
+    Simulated by stubbing ``has_non_terminal_run`` to return False
+    even though a non-terminal run already exists, which is the
+    state a racing tick would observe between its pre-check commit
+    and the other tick's create commit.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="org-race", lifecycle_rules=_ORG_RULES
+        )
+        run_store = LifecycleEvalRunStore(session=db_session, logger=_logger())
+        existing_run = await run_store.create()
+        await run_store.transition_status(
+            run_id=existing_run.id,
+            new_status=LifecycleEvalRunStatus.in_progress,
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        await queue_job_store.create(
+            kind=JobKind.lifecycle_eval,
+            org_id=org_id,
+            subject_label="org-race",
+            lifecycle_eval_run_id=existing_run.id,
+        )
+
+    async def _pretend_no_run_in_flight(self: LifecycleEvalRunStore) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        LifecycleEvalRunStore,
+        "has_non_terminal_run",
+        _pretend_no_run_in_flight,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, LIFECYCLE_EVAL_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await lifecycle_eval_dispatcher(ctx)
+    await http_client.aclose()
+    assert result == "skipped"
+
+    eval_jobs = get_jobs_by_name(
+        mock_arq, "lifecycle_eval", queue_name=LIFECYCLE_EVAL_QUEUE_NAME
+    )
+    assert eval_jobs == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_stmt = select(SqlLifecycleEvalRun)
+            runs = (await session.execute(run_stmt)).scalars().all()
+            assert len(runs) == 1
+            assert runs[0].id == existing_run.id
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_skips_tick_when_prior_run_in_flight(
     app: None,
     db_session: AsyncSession,

@@ -9,9 +9,12 @@ job. On each firing the dispatcher:
 
 2. Creates one ``lifecycle_eval_runs`` row in ``pending`` status. The
    partial-unique non-terminal index on that table is the DB-level
-   backstop against two ticks racing; the dispatcher also pre-checks
-   ``has_non_terminal_run`` so a slow prior tick surfaces as a clean
-   ``"skipped"`` result rather than an ``IntegrityError`` traceback.
+   backstop against two ticks racing; the dispatcher pre-checks
+   ``has_non_terminal_run`` *and* catches the ``IntegrityError`` from
+   the index (the pre-check and the insert are in separate
+   transactions, so two ticks can both clear the pre-check) so a
+   slow prior tick surfaces as a clean ``"skipped"`` result rather
+   than an ``IntegrityError`` traceback.
 
 3. Inserts one ``queue_jobs`` row per in-scope org with
    ``kind='lifecycle_eval'``, ``subject_label=org.slug``, and
@@ -38,6 +41,7 @@ from typing import Any
 
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import JobKind, LifecycleEvalRunStatus
@@ -91,6 +95,12 @@ async def lifecycle_eval_dispatcher(ctx: dict[str, Any]) -> str:
             orgs_enqueued=len(in_scope),
             orgs_skipped=skipped_count,
         )
+        if run is None:
+            logger.info(
+                "Skipping lifecycle_eval dispatcher tick: another tick "
+                "won the create race"
+            )
+            return "skipped"
         logger = logger.bind(lifecycle_eval_run_id=run.id)
 
         if not in_scope:
@@ -161,23 +171,31 @@ async def _create_run_with_summary(
     run_store: LifecycleEvalRunStore,
     orgs_enqueued: int,
     orgs_skipped: int,
-) -> LifecycleEvalRun:
+) -> LifecycleEvalRun | None:
     """Insert the run row in one transaction and write its summary.
 
     Split from the fan-out write so the run row is durable even if
     the per-child enqueue loop dies mid-fanout — the reaper can then
     finalise the partially-fanned-out run from the children that did
     commit.
+
+    Returns ``None`` if the partial-unique non-terminal index rejected
+    the insert — another dispatcher tick raced past the pre-flight
+    ``has_non_terminal_run`` check and won the create. The caller
+    translates this into a clean ``"skipped"`` tick.
     """
-    async with session.begin():
-        run = await run_store.create()
-        await run_store.set_summary(
-            run_id=run.id,
-            summary={
-                "orgs_enqueued": orgs_enqueued,
-                "orgs_skipped": orgs_skipped,
-            },
-        )
+    try:
+        async with session.begin():
+            run = await run_store.create()
+            await run_store.set_summary(
+                run_id=run.id,
+                summary={
+                    "orgs_enqueued": orgs_enqueued,
+                    "orgs_skipped": orgs_skipped,
+                },
+            )
+    except IntegrityError:
+        return None
     return run
 
 
