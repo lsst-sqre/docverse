@@ -123,6 +123,62 @@ class EditionPublishingService:
             cdn_service_label=org.cdn_service_label,
         )
 
+    async def unpublish(
+        self,
+        *,
+        org_id: int,
+        project_slug: str,
+        edition_slug: str,
+    ) -> None:
+        """Remove an edition pointer via the org's configured CDN.
+
+        Mirrors :meth:`publish`'s resolver: loads the org, checks for a
+        configured ``cdn_service_label``, resolves the publisher via
+        ``publisher_provider``, and calls ``unpublish`` inside its async
+        context. If the org has no CDN configured the call is a no-op so
+        callers can invoke ``unpublish`` unconditionally without first
+        inspecting the org row.
+
+        The underlying publisher's ``unpublish`` is required to be
+        idempotent (e.g. Cloudflare KV treats a 404 as success), so this
+        method is safe to call against editions that were never
+        published.
+
+        Raises
+        ------
+        RuntimeError
+            If the organization cannot be found.
+        """
+        org = await self._org_store.get_by_id(org_id)
+        if org is None:
+            msg = f"Organization id={org_id} not found"
+            raise RuntimeError(msg)
+
+        if org.cdn_service_label is None:
+            self._logger.info(
+                "Edition unpublish skipped (no cdn_service_label)",
+                org_id=org_id,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+            )
+            return
+
+        publisher = await self._publisher_provider(
+            org_id=org_id, service_label=org.cdn_service_label
+        )
+        async with publisher:
+            await publisher.unpublish(
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+            )
+        self._logger.info(
+            "Unpublished edition",
+            org_id=org_id,
+            project_slug=project_slug,
+            edition_slug=edition_slug,
+            cdn_service_label=org.cdn_service_label,
+        )
+
     async def _mark_published(
         self, *, edition_id: int, history_id: int
     ) -> None:

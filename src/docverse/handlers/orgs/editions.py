@@ -342,12 +342,29 @@ async def delete_edition(
         raise PermissionDeniedError(msg)
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        await service.soft_delete(
+        org = await service.soft_delete(
             org_slug=org_slug,
             project_slug=project_slug,
             slug=edition_slug,
         )
         await context.session.commit()
+    # Remove the CDN pointer after the soft-delete commit so the public
+    # URL stops resolving once the row is gone. ``unpublish`` is
+    # idempotent and a no-op for orgs without a configured CDN, so it
+    # can be called unconditionally. Wrapped in its own ``begin()``
+    # block because the publishing service reads the org row (and may
+    # read service config + credentials) — without an explicit
+    # transaction SQLAlchemy auto-begins an implicit one that would
+    # then conflict with the dashboard enqueue's own ``session.begin()``.
+    async with context.session.begin():
+        publishing_service = (
+            context.factory.create_edition_publishing_service()
+        )
+        await publishing_service.unpublish(
+            org_id=org.id,
+            project_slug=project_slug,
+            edition_slug=edition_slug,
+        )
     await try_enqueue_dashboard_build_by_slug(
         factory=context.factory,
         session=context.session,

@@ -52,3 +52,24 @@ class EditionPublisher(Protocol):
             (e.g. an R2 or S3 prefix).
         """
         ...
+
+    async def unpublish(
+        self,
+        *,
+        project_slug: str,
+        edition_slug: str,
+    ) -> None:
+        """Remove an edition pointer from the backing store.
+
+        Implementations must be idempotent: a call against an edition
+        that has no pointer (or one that was already removed) must
+        succeed without raising.
+
+        Parameters
+        ----------
+        project_slug
+            Slug of the project the edition belongs to.
+        edition_slug
+            Slug of the edition whose pointer should be removed.
+        """
+        ...

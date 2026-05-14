@@ -91,3 +91,56 @@ async def test_publish_raises_on_5xx() -> None:
                 build_public_id="B",
                 object_key_prefix="p/__builds/B/",
             )
+
+
+@pytest.mark.asyncio
+async def test_unpublish_issues_delete_to_kv_endpoint() -> None:
+    seen: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = request
+        return httpx.Response(200, json={"success": True})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        await pub.unpublish(
+            project_slug="myproject",
+            edition_slug="main",
+        )
+
+    request = seen["request"]
+    assert request.method == "DELETE"
+    assert str(request.url) == (
+        "https://api.cloudflare.com/client/v4"
+        "/accounts/acct-123"
+        "/storage/kv/namespaces/ns-456"
+        "/values/myproject/main"
+    )
+    assert request.headers["Authorization"] == "Bearer token-789"
+
+
+@pytest.mark.asyncio
+async def test_unpublish_treats_404_as_success() -> None:
+    """A missing KV key must not raise — unpublish is idempotent."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(404, json={"errors": ["not found"]})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        # Should not raise.
+        await pub.unpublish(project_slug="p", edition_slug="e")
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unpublish_raises_on_5xx() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"errors": ["boom"]})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        with pytest.raises(httpx.HTTPStatusError):
+            await pub.unpublish(project_slug="p", edition_slug="e")

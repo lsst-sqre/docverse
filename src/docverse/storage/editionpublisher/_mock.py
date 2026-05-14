@@ -8,7 +8,7 @@ from typing import Self
 
 import structlog
 
-__all__ = ["MockEditionPublisher", "PublishCall"]
+__all__ = ["MockEditionPublisher", "PublishCall", "UnpublishCall"]
 
 
 @dataclass(frozen=True)
@@ -21,11 +21,19 @@ class PublishCall:
     object_key_prefix: str
 
 
+@dataclass(frozen=True)
+class UnpublishCall:
+    """A single recorded call to ``MockEditionPublisher.unpublish``."""
+
+    project_slug: str
+    edition_slug: str
+
+
 class MockEditionPublisher:
     """In-memory implementation of the ``EditionPublisher`` protocol.
 
-    Records every call to ``publish`` in order so tests can assert
-    against the recorded arguments.
+    Records every call to ``publish`` and ``unpublish`` in order so
+    tests can assert against the recorded arguments.
     """
 
     def __init__(
@@ -34,6 +42,7 @@ class MockEditionPublisher:
         logger: structlog.stdlib.BoundLogger | None = None,  # noqa: ARG002
     ) -> None:
         self._calls: list[PublishCall] = []
+        self._unpublish_calls: list[UnpublishCall] = []
 
     async def __aenter__(self) -> Self:
         return self
@@ -51,6 +60,11 @@ class MockEditionPublisher:
         """Recorded publish calls in order."""
         return list(self._calls)
 
+    @property
+    def unpublish_calls(self) -> list[UnpublishCall]:
+        """Recorded unpublish calls in order."""
+        return list(self._unpublish_calls)
+
     async def publish(
         self,
         *,
@@ -66,5 +80,19 @@ class MockEditionPublisher:
                 edition_slug=edition_slug,
                 build_public_id=build_public_id,
                 object_key_prefix=object_key_prefix,
+            )
+        )
+
+    async def unpublish(
+        self,
+        *,
+        project_slug: str,
+        edition_slug: str,
+    ) -> None:
+        """Record an unpublish call."""
+        self._unpublish_calls.append(
+            UnpublishCall(
+                project_slug=project_slug,
+                edition_slug=edition_slug,
             )
         )

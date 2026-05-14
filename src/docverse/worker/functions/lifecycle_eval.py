@@ -41,6 +41,7 @@ from docverse.factory import Factory
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse.services.edition_publishing import EditionPublishingService
 from docverse.services.lifecycle.evaluator import (
     LifecycleDecision,
     evaluate_lifecycle,
@@ -191,10 +192,12 @@ async def _evaluate_org(
     async with session.begin():
         edition_store = factory.create_edition_store()
         build_store = factory.create_build_store()
+        publishing_service = factory.create_edition_publishing_service()
         for project, rule_set, decision in decisions:
             editions_deleted = await _apply_decision(
                 edition_store=edition_store,
                 build_store=build_store,
+                publishing_service=publishing_service,
                 project=project,
                 rule_set=rule_set,
                 decision=decision,
@@ -311,6 +314,7 @@ async def _apply_decision(  # noqa: PLR0913
     *,
     edition_store: EditionStore,
     build_store: BuildStore,
+    publishing_service: EditionPublishingService,
     project: Project,
     rule_set: LifecycleRuleSet,
     decision: LifecycleDecision,
@@ -355,6 +359,17 @@ async def _apply_decision(  # noqa: PLR0913
         if not deleted:
             continue
         editions_deleted += 1
+        # Remove the CDN pointer for the soft-deleted edition so the
+        # public URL stops resolving. ``unpublish`` is idempotent and a
+        # no-op when the org has no CDN configured, so this is safe to
+        # call unconditionally. A failure here propagates and rolls back
+        # the soft-deletes in this batch; the next dispatcher tick will
+        # re-evaluate from a consistent state.
+        await publishing_service.unpublish(
+            org_id=org_id,
+            project_slug=project.slug,
+            edition_slug=edition.slug,
+        )
         logger.info(
             "Soft-deleted entity by lifecycle rule",
             entity_type="edition",
