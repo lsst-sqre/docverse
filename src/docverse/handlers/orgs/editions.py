@@ -356,6 +356,18 @@ async def delete_edition(
     # read service config + credentials) — without an explicit
     # transaction SQLAlchemy auto-begins an implicit one that would
     # then conflict with the dashboard enqueue's own ``session.begin()``.
+    #
+    # Failure semantics: if ``unpublish`` raises, the soft-delete is
+    # already committed and is not rolled back — the client sees a 5xx
+    # but the edition row stays soft-deleted, and the dashboard rebuild
+    # below is skipped because the exception unwinds before reaching it.
+    # The stale CDN pointer is then cleaned up on the next lifecycle
+    # pass (``unpublish`` is idempotent, so re-running is safe). This is
+    # the opposite of the lifecycle worker, which runs ``unpublish``
+    # inside the DB transaction so a CDN failure rolls back the batch;
+    # the asymmetry is deliberate because the handler path is driven by
+    # a single user action with no automatic retry, while the worker
+    # path is re-driven on every dispatcher tick.
     async with context.session.begin():
         publishing_service = (
             context.factory.create_edition_publishing_service()
