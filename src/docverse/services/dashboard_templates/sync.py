@@ -14,7 +14,7 @@ import structlog
 from docverse.domain.dashboard_github_template import (
     DashboardGitHubTemplateBinding,
 )
-from docverse.exceptions import NotFoundError
+from docverse.exceptions import DocverseSlackException, NotFoundError
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
@@ -48,7 +48,7 @@ class DashboardSyncStatus(StrEnum):
     failed = "failed"
 
 
-class DashboardTemplateSyncError(Exception):
+class DashboardTemplateSyncError(DocverseSlackException):
     """Convenience exception for callers that prefer to propagate failure.
 
     The syncer's :meth:`DashboardTemplateSyncer.sync` method itself

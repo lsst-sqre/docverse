@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from fastapi import status
 from safir.fastapi import ClientRequestError
+from safir.slack.blockkit import SlackException
 
 __all__ = [
     "BadRequestError",
     "ConflictError",
+    "DocverseSlackException",
     "InvalidBase32IdError",
     "InvalidBuildStateError",
     "InvalidJobStateError",
@@ -16,6 +18,17 @@ __all__ = [
     "NotFoundError",
     "PermissionDeniedError",
 ]
+
+
+class DocverseSlackException(SlackException):
+    """Shared base for non-``ClientRequestError`` server-side exceptions.
+
+    Every Docverse exception that should be routed to Slack and Sentry
+    (i.e. anything that is not a 4xx user error) derives from this class.
+    Future slices will override :meth:`to_sentry` on individual
+    subclasses to surface API-facing identifiers as tags and contexts;
+    this base exists so those overrides have one place to layer on.
+    """
 
 
 class BadRequestError(ClientRequestError):
@@ -60,7 +73,7 @@ class PermissionDeniedError(ClientRequestError):
     status_code = status.HTTP_403_FORBIDDEN
 
 
-class InvalidJobStateError(Exception):
+class InvalidJobStateError(DocverseSlackException):
     """A queue job state transition is invalid.
 
     This is a non-HTTP exception because it may be raised from worker
@@ -68,7 +81,7 @@ class InvalidJobStateError(Exception):
     """
 
 
-class InvalidBuildStateError(Exception):
+class InvalidBuildStateError(DocverseSlackException):
     """A build status transition is invalid.
 
     This is a non-HTTP exception because it may be raised from worker
@@ -76,7 +89,7 @@ class InvalidBuildStateError(Exception):
     """
 
 
-class JobNotFoundError(Exception):
+class JobNotFoundError(DocverseSlackException):
     """A queue job was not found in the database.
 
     This is a non-HTTP exception because it may be raised from worker
