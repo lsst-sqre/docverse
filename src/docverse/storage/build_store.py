@@ -344,7 +344,6 @@ class BuildStore:
         row = result.scalar_one_or_none()
         if row is None:
             raise InvalidBuildStateError(
-                target_state=BuildStatus.pending.value,
                 org_slug=org_slug,
                 project_slug=project_slug,
                 edition_slug=edition_slug,
