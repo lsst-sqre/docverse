@@ -2,8 +2,8 @@
 
 Pins the contract introduced in PRD #338 / slice #340 that every
 non-``ClientRequestError`` server-side exception inherits from
-``DocverseSlackException`` — itself a ``safir.slack.blockkit.SlackException``
-subclass — so future enrichment slices (#341–#344) can override
+``DocverseSlackException`` -- itself a ``safir.slack.blockkit.SlackException``
+subclass -- so future enrichment slices (#341-#344) can override
 ``to_sentry()`` against a single shared base.
 
 The unit tests here assert membership in both bases and that the
