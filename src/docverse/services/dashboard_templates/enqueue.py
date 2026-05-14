@@ -17,6 +17,8 @@ from docverse.storage.dashboard_templates.github import (
 from docverse.storage.queue_backend import QueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 
+from ._sync_failure import mark_dashboard_sync_failed
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -127,16 +129,16 @@ async def try_enqueue_dashboard_sync(
             "Failed to enqueue dashboard_sync", binding_id=binding_id
         )
         try:
-            async with session.begin():
-                binding_store = (
-                    factory.create_dashboard_github_template_binding_store()
-                )
-                await binding_store.update_sync_state(
-                    binding_id=binding_id,
-                    last_sync_status="failed",
-                    last_sync_error=f"Enqueue failed: {exc}",
-                )
-                await session.commit()
+            binding_store = (
+                factory.create_dashboard_github_template_binding_store()
+            )
+            await mark_dashboard_sync_failed(
+                session=session,
+                binding_store=binding_store,
+                binding_id=binding_id,
+                exc=exc,
+                error_message=f"Enqueue failed: {exc}",
+            )
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
             logger.exception(
