@@ -655,3 +655,171 @@ async def test_lifecycle_eval_protects_shared_build_referenced_elsewhere(
             )
             assert protector is not None
             assert protector.id == protector_edition_id
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_enqueues_dashboard_build_for_affected_projects(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Edition soft-delete triggers one ``dashboard_build`` per project.
+
+    Mirrors the user-initiated DELETE handler's post-commit
+    ``try_enqueue_dashboard_build_by_slug`` call so the cached
+    dashboard artifact does not keep showing editions whose
+    ``date_deleted`` is set.
+
+    Seeds two projects under one org with the same
+    ``draft_inactivity`` rule:
+
+    * ``with-stale`` has a stale draft that the worker will
+      soft-delete, so it must get one ``dashboard_build`` row.
+    * ``no-stale`` has only a fresh draft, so it must not get a
+      ``dashboard_build`` row.
+
+    The assertion checks the global count of ``dashboard_build`` rows
+    is exactly one and that the row is scoped to ``with-stale`` —
+    not ``no-stale`` and not some other org. The
+    ``has_active_dashboard_build`` helper on ``QueueJobStore`` is
+    used to confirm the per-project scoping the cached dashboard
+    consumer relies on.
+    """
+    org_rules = LifecycleRuleSet(
+        root=[DraftInactivityRule(max_days_inactive=30)]
+    )
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session,
+            slug="lce-dash-enq-org",
+            lifecycle_rules=org_rules,
+        )
+        affected_project_id = await _seed_project(
+            db_session, org_id=org_id, slug="with-stale"
+        )
+        untouched_project_id = await _seed_project(
+            db_session, org_id=org_id, slug="no-stale"
+        )
+        await _seed_edition(
+            db_session,
+            project_id=affected_project_id,
+            slug="stale-draft",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=60),
+        )
+        await _seed_edition(
+            db_session,
+            project_id=untouched_project_id,
+            slug="fresh-draft",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=5),
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            dash_rows = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value
+                )
+            )
+            rows = list(dash_rows.scalars().all())
+            assert len(rows) == 1
+            assert rows[0].org_id == org_id
+            assert rows[0].project_id == affected_project_id
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            assert await queue_job_store.has_active_dashboard_build(
+                org_id=org_id, project_id=affected_project_id
+            )
+            assert not await queue_job_store.has_active_dashboard_build(
+                org_id=org_id, project_id=untouched_project_id
+            )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_skips_dashboard_build_for_build_only_deletes(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A project whose only deletion is a build does not get a dashboard_build.
+
+    The cached dashboard artifact is rebuilt from the edition list,
+    not the build list — soft-deleting an orphan build does not
+    change what the dashboard renders, so an enqueue would be wasted
+    work. Only projects with at least one edition soft-delete should
+    get a ``dashboard_build`` row.
+    """
+    org_rules = LifecycleRuleSet(
+        root=[BuildHistoryOrphanRule(min_position=1, min_age_days=30)]
+    )
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session,
+            slug="lce-build-only-org",
+            lifecycle_rules=org_rules,
+        )
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="build-only"
+        )
+        current_build_id = await _seed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="build-only",
+            date_completed=NOW - timedelta(days=40),
+        )
+        await _seed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="build-only",
+            date_completed=NOW - timedelta(days=40),
+        )
+        await _seed_edition(
+            db_session,
+            project_id=project_id,
+            slug="main",
+            kind=EditionKind.release,
+            date_updated=NOW,
+            current_build_id=current_build_id,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            dash_rows = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value
+                )
+            )
+            assert list(dash_rows.scalars().all()) == []
