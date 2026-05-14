@@ -679,39 +679,31 @@ async def test_keeper_sync_project_failure_captures_to_sentry(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    try:
-        with sentry_init_fixture():
-            initialize_sentry(component="worker-keeper-sync")
-            captured = capture_events_fixture(monkeypatch)()
+    with sentry_init_fixture():
+        initialize_sentry(component="worker-keeper-sync")
+        captured = capture_events_fixture(monkeypatch)()
 
-            with pytest.raises(LtdNotFoundError):
-                await keeper_sync_project(
-                    ctx,
-                    {
-                        "org_id": org_id,
-                        "org_slug": org_slug,
-                        "run_id": run_id,
-                        "queue_job_id": queue_job_id,
-                        "ltd_slug": "pipelines",
-                        "ltd_base_url": LTD_BASE,
-                    },
-                )
+        with pytest.raises(LtdNotFoundError):
+            await keeper_sync_project(
+                ctx,
+                {
+                    "org_id": org_id,
+                    "org_slug": org_slug,
+                    "run_id": run_id,
+                    "queue_job_id": queue_job_id,
+                    "ltd_slug": "pipelines",
+                    "ltd_base_url": LTD_BASE,
+                },
+            )
 
-            assert len(captured.errors) == 1
-            event = captured.errors[0]
-            assert event["release"] == pkg_version("docverse")
-            assert event["tags"]["service"] == "docverse"
-            assert event["tags"]["component"] == "worker-keeper-sync"
-            exc_values = event["exception"]["values"]
-            assert any(exc["type"] == "LtdNotFoundError" for exc in exc_values)
-    finally:
-        # ``initialize_sentry`` writes ``service`` and ``component`` to
-        # the global scope; strip them so this test does not bleed tags
-        # into any later test that asserts their absence.
-        scope = sentry_sdk.get_global_scope()
-        scope.remove_tag("service")
-        scope.remove_tag("component")
-        await ctx["http_client"].aclose()
+        assert len(captured.errors) == 1
+        event = captured.errors[0]
+        assert event["release"] == pkg_version("docverse")
+        assert event["tags"]["service"] == "docverse"
+        assert event["tags"]["component"] == "worker-keeper-sync"
+        exc_values = event["exception"]["values"]
+        assert any(exc["type"] == "LtdNotFoundError" for exc in exc_values)
+    await ctx["http_client"].aclose()
 
     # The failure transitions the queue-job + run row are still in place
     # — Sentry is additive to the existing finalisation contract.

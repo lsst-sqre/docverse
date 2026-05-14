@@ -10,6 +10,7 @@ import httpx
 import pytest
 import pytest_asyncio
 import respx
+import sentry_sdk
 import structlog
 from asgi_lifespan import LifespanManager
 from fastapi import FastAPI
@@ -57,6 +58,33 @@ __all__ = [
 ]
 
 _DISCOVERY_FIXTURE = Path(__file__).parent / "data" / "discovery.json"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sentry_global_scope() -> Iterator[None]:
+    """Snapshot and restore global-scope Sentry tags around every test.
+
+    ``safir.testing.sentry.sentry_init_fixture`` saves and restores the
+    Sentry *client* on the global scope, but it does not touch tags.
+    :func:`docverse.sentry.initialize_sentry` (and any other code that
+    writes to ``sentry_sdk.get_global_scope()``) leaves ``service`` /
+    ``component`` (and potentially other) tags on that scope, which
+    would otherwise persist across tests in the session and bleed into
+    any later test that asserts tag absence. Snapshotting all tags on
+    entry and restoring on exit isolates every test regardless of
+    which tags it sets.
+    """
+    scope = sentry_sdk.get_global_scope()
+    saved_tags = dict(scope._tags)
+    try:
+        yield
+    finally:
+        scope = sentry_sdk.get_global_scope()
+        for key in list(scope._tags):
+            if key not in saved_tags:
+                scope.remove_tag(key)
+        for key, value in saved_tags.items():
+            scope.set_tag(key, value)
 
 
 @pytest.fixture(autouse=True)

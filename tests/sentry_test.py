@@ -8,7 +8,6 @@ on the real Docverse app's lifespan, DB, or GitHub validator.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from importlib.metadata import version
 from typing import Any
 
@@ -48,26 +47,6 @@ async def _stub_context_dependency() -> _StubContext:
 
 async def _stub_require_superadmin() -> None:
     return None
-
-
-@pytest.fixture(autouse=True)
-def _isolate_sentry_global_scope() -> Iterator[None]:
-    """Strip ``initialize_sentry``'s global-scope tags around each test.
-
-    ``sentry_init_fixture`` saves and restores the *client* on the
-    global scope, but ``initialize_sentry`` also writes ``service`` and
-    ``component`` tags directly to that scope, which would otherwise
-    persist across tests in the session. Running on both sides isolates
-    this file from prior Sentry state and prevents tag bleed into any
-    later test that asserts tag absence.
-    """
-    scope = sentry_sdk.get_global_scope()
-    scope.remove_tag("service")
-    scope.remove_tag("component")
-    yield
-    scope = sentry_sdk.get_global_scope()
-    scope.remove_tag("service")
-    scope.remove_tag("component")
 
 
 def _patch_sentry_init_with_test_transport(
