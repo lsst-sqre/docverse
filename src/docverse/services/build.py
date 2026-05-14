@@ -118,7 +118,10 @@ class BuildService:
         build = await self._resolve_build(project.id, build_id)
 
         build = await self._store.transition_status(
-            build_id=build.id, new_status=BuildStatus.processing
+            build_id=build.id,
+            new_status=BuildStatus.processing,
+            org_slug=org_slug,
+            project_slug=project_slug,
         )
         self._logger.info(
             "Build upload complete, transitioning to processing",
@@ -179,10 +182,19 @@ class BuildService:
             project.id, cursor=cursor, limit=limit, status=status
         )
 
-    async def complete(self, *, build_id: int) -> Build:
+    async def complete(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build:
         """Mark a build as completed."""
         build = await self._store.transition_status(
-            build_id=build_id, new_status=BuildStatus.completed
+            build_id=build_id,
+            new_status=BuildStatus.completed,
+            org_slug=org_slug,
+            project_slug=project_slug,
         )
         self._logger.info(
             "Build completed",
@@ -190,10 +202,19 @@ class BuildService:
         )
         return build
 
-    async def fail(self, *, build_id: int) -> Build:
+    async def fail(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build:
         """Mark a build as failed."""
         build = await self._store.transition_status(
-            build_id=build_id, new_status=BuildStatus.failed
+            build_id=build_id,
+            new_status=BuildStatus.failed,
+            org_slug=org_slug,
+            project_slug=project_slug,
         )
         self._logger.info(
             "Build failed", build=serialize_base32_id(build.public_id)

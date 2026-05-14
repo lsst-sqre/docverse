@@ -98,6 +98,7 @@ async def build_processing(
             return await _process_build_locked(
                 session=session,
                 factory=factory,
+                org_slug=org_slug,
                 build_store=build_store,
                 org_store=org_store,
                 queue_job_store=queue_job_store,
@@ -165,6 +166,7 @@ async def _process_build_locked(  # noqa: PLR0913
     ctx: dict[str, Any],
     build: Build,
     org_id: int,
+    org_slug: str,
     project_slug: str,
     build_id: int,
     build_public_id: str,
@@ -208,6 +210,8 @@ async def _process_build_locked(  # noqa: PLR0913
                 object_store=object_store,
                 build=build,
                 build_store=build_store,
+                org_slug=org_slug,
+                project_slug=project_slug,
                 logger=logger,
             )
     except Exception:
@@ -215,7 +219,11 @@ async def _process_build_locked(  # noqa: PLR0913
         logger.exception("Build processing failed")
         async with session.begin():
             build_service = factory.create_build_service()
-            await build_service.fail(build_id=build_id)
+            await build_service.fail(
+                build_id=build_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
+            )
             if queue_job_id is not None:
                 await queue_job_store.fail(queue_job_id)
         return "failed"
@@ -475,11 +483,13 @@ async def _track_editions(  # noqa: PLR0913
         return tracking_result
 
 
-async def _process_build(
+async def _process_build(  # noqa: PLR0913
     *,
     object_store: ObjectStore,
     build: Build,
     build_store: BuildStore,
+    org_slug: str,
+    project_slug: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> tuple[int, int]:
     """Download, unpack, and upload build files.
@@ -548,10 +558,15 @@ async def _process_build(
         build_id=build.id,
         object_count=object_count,
         total_size_bytes=total_size,
+        org_slug=org_slug,
+        project_slug=project_slug,
     )
 
     await build_store.transition_status(
-        build_id=build.id, new_status=BuildStatus.completed
+        build_id=build.id,
+        new_status=BuildStatus.completed,
+        org_slug=org_slug,
+        project_slug=project_slug,
     )
 
     try:

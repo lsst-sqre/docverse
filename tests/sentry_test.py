@@ -212,7 +212,7 @@ async def test_docverse_slack_exception_subclass_captures_with_release(
 
         @app.get("/raise-docverse-slack-exception")
         async def raise_exc() -> None:
-            raise InvalidBuildStateError(boom_message)
+            raise InvalidBuildStateError(message=boom_message)
 
         async with AsyncClient(
             base_url="https://example.com",
