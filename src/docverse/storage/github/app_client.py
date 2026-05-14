@@ -3,22 +3,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Literal, override
 
 import httpx
 import structlog
 from gidgethub.apps import get_installation_access_token
 from gidgethub.httpx import GitHubAPI
 from safir.github import GitHubAppClientFactory
+from safir.slack.sentry import SentryEventInfo
+
+from docverse.exceptions import DocverseSlackException
 
 __all__ = [
     "GITHUB_API_BASE_URL",
     "GitHubAppClient",
     "GitHubAppNotConfiguredError",
     "InstallationAuth",
+    "MissingGitHubAppSecret",
 ]
 
 
 GITHUB_API_BASE_URL = "https://api.github.com"
+
+#: GitHub App name surfaced in Sentry's ``github_app`` context so a
+#: triager looking at a misconfigured-tenant event can find the App in
+#: the GitHub admin UI without grepping config. Matches the
+#: ``Factory.__init__`` default for ``github_app_name``.
+_GITHUB_APP_NAME = "lsst-sqre/docverse"
+
+#: The three secret names that gate the GitHub App feature. Carried on
+#: :class:`GitHubAppNotConfiguredError` as a structured field so Sentry
+#: triagers can route the event to the kind of operator who can fix
+#: each ("missing app id" vs "stale private key" vs "rotated webhook
+#: secret") without unpacking the rendered message.
+MissingGitHubAppSecret = Literal["app_id", "private_key", "webhook_secret"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,15 +60,68 @@ class InstallationAuth:
     base_url: str = GITHUB_API_BASE_URL
 
 
-class GitHubAppNotConfiguredError(Exception):
+class GitHubAppNotConfiguredError(DocverseSlackException):
     """The GitHub App feature is not configured in ``Config``.
 
     Raised when ``Factory.create_github_app_client()`` is called but any
     of ``github_app_id``, ``github_app_private_key``, or
-    ``github_webhook_secret`` is unset. Callers at HTTP boundaries
-    translate this to a feature-disabled response (503 for admin
-    endpoints, 404 for the webhook endpoint).
+    ``github_webhook_secret`` is unset, or when the startup-time
+    credential validator has recorded the credentials as failing.
+    Callers at HTTP boundaries translate this to a feature-disabled
+    response (503 for admin endpoints, 404 for the webhook endpoint).
+
+    Carries an indicator of *which* GitHub App secret is the cause
+    (``app_id`` / ``private_key`` / ``webhook_secret``) plus the
+    API-facing org slug (when known by the caller) and the
+    installation id (when known). ``to_sentry`` surfaces ``org_slug``
+    and ``missing_secret`` as low-cardinality Sentry tags so an
+    on-call operator can route the event to the kind of maintainer
+    who can fix it; the non-secret ``installation_id`` and the static
+    app name go into the ``github_app`` Sentry context.
     """
+
+    def __init__(
+        self,
+        *,
+        missing_secret: MissingGitHubAppSecret,
+        org_slug: str | None = None,
+        installation_id: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        if message is None:
+            message = _format_github_app_not_configured_message(
+                missing_secret=missing_secret,
+                org_slug=org_slug,
+            )
+        super().__init__(message)
+        self.missing_secret: MissingGitHubAppSecret = missing_secret
+        self.org_slug = org_slug
+        self.installation_id = installation_id
+
+    @override
+    def to_sentry(self) -> SentryEventInfo:
+        info = super().to_sentry()
+        info.tags["missing_secret"] = self.missing_secret
+        if self.org_slug is not None:
+            info.tags["org_slug"] = self.org_slug
+        context: dict[str, Any] = {
+            "installation_id": self.installation_id,
+            "app_name": _GITHUB_APP_NAME,
+        }
+        info.contexts["github_app"] = context
+        return info
+
+
+def _format_github_app_not_configured_message(
+    *,
+    missing_secret: MissingGitHubAppSecret,
+    org_slug: str | None,
+) -> str:
+    """Render a default message for :class:`GitHubAppNotConfiguredError`."""
+    org_part = f" for org {org_slug!r}" if org_slug is not None else ""
+    return (
+        f"GitHub App is not configured{org_part}: missing {missing_secret!r}"
+    )
 
 
 class GitHubAppClient:
