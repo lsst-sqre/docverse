@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import sentry_sdk
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -231,7 +232,8 @@ class KeeperSyncService:
             if on_edition_synced is not None:
                 try:
                     await on_edition_synced(outcome)
-                except Exception:
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
                     self._logger.exception(
                         "on_edition_synced callback raised; continuing",
                         docverse_slug=outcome.docverse_slug,

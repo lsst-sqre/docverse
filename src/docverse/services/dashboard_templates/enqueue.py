@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sentry_sdk
 import structlog
 
 from docverse.client.models.queue_enums import JobKind
@@ -121,6 +122,7 @@ async def try_enqueue_dashboard_sync(
             queue_job = await service.enqueue(binding_id)
             await session.commit()
     except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         logger.exception(
             "Failed to enqueue dashboard_sync", binding_id=binding_id
         )
@@ -135,7 +137,8 @@ async def try_enqueue_dashboard_sync(
                     last_sync_error=f"Enqueue failed: {exc}",
                 )
                 await session.commit()
-        except Exception:
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
             logger.exception(
                 "Failed to mark binding as enqueue-failed",
                 binding_id=binding_id,

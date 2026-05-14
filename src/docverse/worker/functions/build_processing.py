@@ -13,6 +13,7 @@ import mimetypes
 import tarfile
 from typing import Any
 
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -214,8 +215,9 @@ async def _process_build_locked(  # noqa: PLR0913
                 project_slug=project_slug,
                 logger=logger,
             )
-    except Exception:
+    except Exception as exc:
         # Phase 3a: Mark build and queue job as failed
+        sentry_sdk.capture_exception(exc)
         logger.exception("Build processing failed")
         async with session.begin():
             build_service = factory.create_build_service()
@@ -476,7 +478,8 @@ async def _track_editions(  # noqa: PLR0913
             editions_updated=len(tracking_result.updated),
             editions_skipped=len(tracking_result.skipped),
         )
-    except Exception:
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         logger.exception("Edition tracking failed")
         return None
     else:

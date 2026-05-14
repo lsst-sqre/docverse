@@ -10,6 +10,7 @@ import traceback
 from datetime import UTC, datetime
 from typing import Any
 
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
@@ -107,6 +108,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         resolved=resolved,
                     )
             except Exception as exc:
+                sentry_sdk.capture_exception(exc)
                 logger.exception("Dashboard build failed")
                 async with session.begin():
                     await queue_job_store.fail(

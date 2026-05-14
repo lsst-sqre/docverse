@@ -10,6 +10,7 @@ from __future__ import annotations
 import traceback
 from typing import Any
 
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
@@ -18,7 +19,9 @@ from docverse.services.dashboard_templates.sync import DashboardSyncStatus
 from docverse.services.lock_service import LockKey
 
 
-async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
+async def dashboard_sync(  # noqa: PLR0915
+    ctx: dict[str, Any], payload: dict[str, Any]
+) -> str:
     """Sync one dashboard-template binding from GitHub.
 
     Parameters
@@ -105,6 +108,7 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     syncer = factory.create_dashboard_template_syncer()
                     sync_result = await syncer.sync(binding_id)
             except Exception as exc:
+                sentry_sdk.capture_exception(exc)
                 logger.exception("Dashboard sync failed unexpectedly")
                 error_message = f"{type(exc).__name__}: {exc}"
                 async with session.begin():

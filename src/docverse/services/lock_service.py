@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+import sentry_sdk
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -254,7 +255,7 @@ class LockService:
                         {"lock_id": lock_key.lock_id},
                     )
                     await lock_conn.commit()
-                except Exception:
+                except Exception as exc:
                     # A stuck unlock leaks the lock onto this pooled
                     # connection; invalidate so the pool discards it
                     # and the DB releases the lock on close. Raising
@@ -264,6 +265,7 @@ class LockService:
                     # exception from the lock body (if any) still
                     # propagates because this branch swallows only
                     # the unlock failure.
+                    sentry_sdk.capture_exception(exc)
                     self._logger.exception(
                         "Failed to release advisory lock",
                         lock_id=lock_key.lock_id,

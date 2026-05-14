@@ -12,6 +12,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any
 
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
@@ -120,6 +121,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         history_entry=resources.history_entry,
                     )
             except Exception as exc:
+                sentry_sdk.capture_exception(exc)
                 logger.exception("Edition publish failed")
                 async with session.begin():
                     await _mark_failed(
