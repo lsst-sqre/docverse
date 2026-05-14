@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.factory import Factory
+from docverse.sentry import DocverseSentryComponent, initialize_sentry
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
@@ -162,8 +163,16 @@ class WorkerFactoryBuilder:
         )
 
 
-async def startup(ctx: dict[str, Any]) -> None:
-    """Initialize resources for the arq worker process."""
+async def _startup(
+    ctx: dict[str, Any], *, component: DocverseSentryComponent
+) -> None:
+    """Initialize resources for the arq worker process.
+
+    ``component`` distinguishes the three queues on Sentry: all worker
+    settings share this body, so the per-startup wrappers below pick the
+    right tag.
+    """
+    initialize_sentry(component=component)
     configure_logging(
         profile=config.log_profile,
         log_level=config.log_level,
@@ -245,6 +254,21 @@ async def startup(ctx: dict[str, Any]) -> None:
     logger.info("Worker startup complete")
 
 
+async def startup_default(ctx: dict[str, Any]) -> None:
+    """on_startup for the default Docverse arq queue."""
+    await _startup(ctx, component="worker")
+
+
+async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
+    """on_startup for the dedicated keeper-sync arq queue."""
+    await _startup(ctx, component="worker-keeper-sync")
+
+
+async def startup_lifecycle_eval(ctx: dict[str, Any]) -> None:
+    """on_startup for the dedicated lifecycle-eval arq queue."""
+    await _startup(ctx, component="worker-lifecycle-eval")
+
+
 async def shutdown(ctx: dict[str, Any]) -> None:
     """Clean up resources for the arq worker process."""
     arq_queue = ctx.get("arq_queue")
@@ -270,7 +294,7 @@ class WorkerSettings:
     ]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
-    on_startup = startup
+    on_startup = startup_default
     on_shutdown = shutdown
 
 
@@ -345,7 +369,7 @@ class KeeperSyncWorkerSettings:
     ]
     redis_settings = config.arq_redis_settings
     queue_name = KEEPER_SYNC_QUEUE_NAME
-    on_startup = startup
+    on_startup = startup_keeper_sync
     on_shutdown = shutdown
 
 
@@ -400,5 +424,5 @@ class LifecycleEvalWorkerSettings:
     ]
     redis_settings = config.arq_redis_settings
     queue_name = LIFECYCLE_EVAL_QUEUE_NAME
-    on_startup = startup
+    on_startup = startup_lifecycle_eval
     on_shutdown = shutdown

@@ -281,3 +281,24 @@ async def test_admin_requires_superadmin(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "regular-user"},
     )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_sentry_test_requires_superadmin(client: AsyncClient) -> None:
+    """``/admin/sentry/test`` inherits the router's superadmin gate.
+
+    The deliberate-error endpoint must short-circuit on auth before reaching
+    the handler so that an unauthenticated or non-superadmin caller cannot
+    pollute the Sentry tenant with bogus validation events.
+    """
+    # No auth header — rejected before the RuntimeError fires
+    response = await client.post("/docverse/admin/sentry/test", json={})
+    assert response.status_code == 403
+
+    # Authenticated as a non-superadmin user — same rejection path
+    response = await client.post(
+        "/docverse/admin/sentry/test",
+        json={},
+        headers={"X-Auth-Request-User": "regular-user"},
+    )
+    assert response.status_code == 403
