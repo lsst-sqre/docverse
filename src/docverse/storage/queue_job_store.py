@@ -11,7 +11,11 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
+from docverse.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse.storage.pagination import QueueJobDateCreatedCursor
@@ -110,11 +114,12 @@ class QueueJobStore:
         """
         row = await self._get_row(job_id)
         if row.status != JobStatus.queued.value:
-            msg = (
-                f"Cannot start job {job_id}: "
-                f"expected 'queued', got '{row.status}'"
+            raise InvalidJobStateError(
+                current_state=row.status,
+                target_state=JobStatus.in_progress.value,
+                job_public_id=serialize_base32_id(row.public_id),
+                job_function=row.kind,
             )
-            raise InvalidJobStateError(msg)
         row.status = JobStatus.in_progress.value
         row.date_started = datetime.now(tz=UTC)
         await self._session.flush()
@@ -196,11 +201,17 @@ class QueueJobStore:
         """
         row = await self._get_row(job_id)
         if row.status != JobStatus.in_progress.value:
-            msg = (
-                f"Cannot complete job {job_id}: "
-                f"expected 'in_progress', got '{row.status}'"
+            target = (
+                JobStatus.completed_with_errors.value
+                if has_errors
+                else JobStatus.completed.value
             )
-            raise InvalidJobStateError(msg)
+            raise InvalidJobStateError(
+                current_state=row.status,
+                target_state=target,
+                job_public_id=serialize_base32_id(row.public_id),
+                job_function=row.kind,
+            )
         row.status = (
             JobStatus.completed_with_errors.value
             if has_errors
@@ -227,12 +238,12 @@ class QueueJobStore:
         row = await self._get_row(job_id)
         allowed = {JobStatus.queued.value, JobStatus.in_progress.value}
         if row.status not in allowed:
-            msg = (
-                f"Cannot fail job {job_id}: "
-                f"expected 'queued'/'in_progress', "
-                f"got '{row.status}'"
+            raise InvalidJobStateError(
+                current_state=row.status,
+                target_state=JobStatus.failed.value,
+                job_public_id=serialize_base32_id(row.public_id),
+                job_function=row.kind,
             )
-            raise InvalidJobStateError(msg)
         row.status = JobStatus.failed.value
         row.date_completed = datetime.now(tz=UTC)
         if errors is not None:
@@ -252,12 +263,12 @@ class QueueJobStore:
         row = await self._get_row(job_id)
         allowed = {JobStatus.queued.value, JobStatus.in_progress.value}
         if row.status not in allowed:
-            msg = (
-                f"Cannot cancel job {job_id}: "
-                f"expected 'queued'/'in_progress', "
-                f"got '{row.status}'"
+            raise InvalidJobStateError(
+                current_state=row.status,
+                target_state=JobStatus.cancelled.value,
+                job_public_id=serialize_base32_id(row.public_id),
+                job_function=row.kind,
             )
-            raise InvalidJobStateError(msg)
         row.status = JobStatus.cancelled.value
         row.date_completed = datetime.now(tz=UTC)
         await self._session.flush()
@@ -670,6 +681,8 @@ class QueueJobStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            msg = f"Queue job {job_id} not found"
-            raise JobNotFoundError(msg)
+            raise JobNotFoundError(
+                job_function="QueueJobStore._get_row",
+                message=f"Queue job {job_id} not found",
+            )
         return row

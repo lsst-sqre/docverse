@@ -46,10 +46,28 @@ def _make_invalid_build_state() -> InvalidBuildStateError:
     )
 
 
+def _make_invalid_job_state() -> InvalidJobStateError:
+    return InvalidJobStateError(
+        current_state="queued",
+        target_state="in_progress",
+        job_public_id="ABCD-EFGH-1234",
+        queue_name="docverse:queue",
+        job_function="build_processing",
+    )
+
+
+def _make_job_not_found() -> JobNotFoundError:
+    return JobNotFoundError(
+        job_public_id="ABCD-EFGH-1234",
+        queue_name="docverse:queue",
+        job_function="build_processing",
+    )
+
+
 _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
-    ("InvalidJobStateError", lambda: InvalidJobStateError("queued -> queued")),
+    ("InvalidJobStateError", _make_invalid_job_state),
     ("InvalidBuildStateError", _make_invalid_build_state),
-    ("JobNotFoundError", lambda: JobNotFoundError("job ABC123 not found")),
+    ("JobNotFoundError", _make_job_not_found),
     ("InvalidSlugError", _make_invalid_slug),
     (
         "DashboardTemplateSyncError",
@@ -223,3 +241,234 @@ def test_invalid_build_state_explicit_message_wins() -> None:
         message="Build id=42 not found",
     )
     assert str(exc) == "Build id=42 not found"
+
+
+_JOB_STATE_CASES: list[
+    tuple[str, Callable[[], InvalidJobStateError], dict[str, str]]
+] = [
+    (
+        "full-transition",
+        lambda: InvalidJobStateError(
+            current_state="queued",
+            target_state="in_progress",
+            job_public_id="ABCD-EFGH-1234",
+            queue_name="docverse:queue",
+            job_function="build_processing",
+        ),
+        {
+            "queue_name": "docverse:queue",
+            "job_function": "build_processing",
+            "job_current_state": "queued",
+            "job_target_state": "in_progress",
+        },
+    ),
+    (
+        "keeper-sync-run-transition",
+        lambda: InvalidJobStateError(
+            current_state="succeeded",
+            target_state="in_progress",
+            queue_name="docverse:sync-queue",
+            message=(
+                "Cannot transition keeper sync run 42 from"
+                " 'succeeded' to 'in_progress'"
+            ),
+        ),
+        {
+            "queue_name": "docverse:sync-queue",
+            "job_current_state": "succeeded",
+            "job_target_state": "in_progress",
+        },
+    ),
+    (
+        "run-not-found",
+        lambda: InvalidJobStateError(
+            queue_name="docverse:lifecycle-queue",
+            message="Lifecycle eval run 99 not found",
+        ),
+        {
+            "queue_name": "docverse:lifecycle-queue",
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "factory", "expected_tags"),
+    _JOB_STATE_CASES,
+    ids=[case for case, _, _ in _JOB_STATE_CASES],
+)
+def test_invalid_job_state_to_sentry_tags(
+    case: str,
+    factory: Callable[[], InvalidJobStateError],
+    expected_tags: dict[str, str],
+) -> None:
+    """``to_sentry`` surfaces queue name, function, and states as tags.
+
+    Tags are low-cardinality (queue name, function name, state enum
+    values) so they can be aggregated in the Sentry UI. ``job_public_id``
+    is intentionally a context value (high cardinality), not a tag.
+    """
+    info = factory().to_sentry()
+    assert info.tags == expected_tags
+    assert "job_public_id" not in info.tags
+
+
+@pytest.mark.parametrize(
+    ("case", "factory", "expected_tags"),
+    _JOB_STATE_CASES,
+    ids=[case for case, _, _ in _JOB_STATE_CASES],
+)
+def test_invalid_job_state_to_sentry_context(
+    case: str,
+    factory: Callable[[], InvalidJobStateError],
+    expected_tags: dict[str, str],
+) -> None:
+    """``to_sentry`` exposes the full transition snapshot as a context.
+
+    The ``queue_job_transition`` context carries every API-facing
+    identifier the exception was constructed with (even ``None``s) so a
+    triager can paste ``job_public_id`` straight into a ``/queue/{id}``
+    URL without translating internal row ids.
+    """
+    exc = factory()
+    info = exc.to_sentry()
+    context = info.contexts["queue_job_transition"]
+    assert context["job_public_id"] == exc.job_public_id
+    assert context["queue_name"] == exc.queue_name
+    assert context["job_function"] == exc.job_function
+    assert context["current_state"] == exc.current_state
+    assert context["target_state"] == exc.target_state
+
+
+def test_invalid_job_state_default_message_is_useful() -> None:
+    """Without an explicit ``message`` the default summarises the transition.
+
+    The summary names both states and the API-facing job slug so a log
+    line or Slack alert is actionable without unpacking the structured
+    fields.
+    """
+    exc = InvalidJobStateError(
+        current_state="in_progress",
+        target_state="queued",
+        job_public_id="ABCD-EFGH-1234",
+        queue_name="docverse:queue",
+        job_function="build_processing",
+    )
+    rendered = str(exc)
+    assert "in_progress" in rendered
+    assert "queued" in rendered
+    assert "ABCD-EFGH-1234" in rendered
+
+
+def test_invalid_job_state_explicit_message_wins() -> None:
+    """Passing ``message`` overrides the auto-generated default."""
+    exc = InvalidJobStateError(
+        current_state="succeeded",
+        target_state="in_progress",
+        queue_name="docverse:sync-queue",
+        message="Cannot transition keeper sync run 42 backwards",
+    )
+    assert str(exc) == "Cannot transition keeper sync run 42 backwards"
+
+
+_JOB_NOT_FOUND_CASES: list[
+    tuple[str, Callable[[], JobNotFoundError], dict[str, str]]
+] = [
+    (
+        "fully-known",
+        lambda: JobNotFoundError(
+            job_public_id="ABCD-EFGH-1234",
+            queue_name="docverse:queue",
+            job_function="build_processing",
+        ),
+        {"queue_name": "docverse:queue"},
+    ),
+    (
+        "lookup-by-internal-id",
+        lambda: JobNotFoundError(
+            queue_name="docverse:queue",
+            job_function="QueueJobStore._get_row",
+            message="Queue job 42 not found",
+        ),
+        {"queue_name": "docverse:queue"},
+    ),
+    (
+        "queue-unknown",
+        lambda: JobNotFoundError(job_public_id="ABCD-EFGH-1234"),
+        {},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "factory", "expected_tags"),
+    _JOB_NOT_FOUND_CASES,
+    ids=[case for case, _, _ in _JOB_NOT_FOUND_CASES],
+)
+def test_job_not_found_to_sentry_tags(
+    case: str,
+    factory: Callable[[], JobNotFoundError],
+    expected_tags: dict[str, str],
+) -> None:
+    """``to_sentry`` surfaces only the queue name as a tag.
+
+    The ``job_public_id`` and ``job_function`` are high-cardinality and
+    live in the ``queue_job_lookup`` context instead. ``queue_name``
+    earns its place as a tag for aggregation across one queue.
+    """
+    info = factory().to_sentry()
+    assert info.tags == expected_tags
+    assert "job_public_id" not in info.tags
+    assert "job_function" not in info.tags
+
+
+@pytest.mark.parametrize(
+    ("case", "factory", "expected_tags"),
+    _JOB_NOT_FOUND_CASES,
+    ids=[case for case, _, _ in _JOB_NOT_FOUND_CASES],
+)
+def test_job_not_found_to_sentry_context(
+    case: str,
+    factory: Callable[[], JobNotFoundError],
+    expected_tags: dict[str, str],
+) -> None:
+    """``to_sentry`` exposes the lookup site as a context.
+
+    The ``queue_job_lookup`` context carries every API-facing
+    identifier the exception was constructed with (even ``None``s) so a
+    triager can paste ``job_public_id`` straight into a ``/queue/{id}``
+    URL without translating internal row ids.
+    """
+    exc = factory()
+    info = exc.to_sentry()
+    context = info.contexts["queue_job_lookup"]
+    assert context["job_public_id"] == exc.job_public_id
+    assert context["queue_name"] == exc.queue_name
+    assert context["job_function"] == exc.job_function
+
+
+def test_job_not_found_default_message_uses_public_id() -> None:
+    """The default message names the API-facing ``public_id`` when known."""
+    exc = JobNotFoundError(
+        job_public_id="ABCD-EFGH-1234",
+        queue_name="docverse:queue",
+    )
+    rendered = str(exc)
+    assert "ABCD-EFGH-1234" in rendered
+    assert "not found" in rendered
+
+
+def test_job_not_found_explicit_message_wins() -> None:
+    """Passing ``message`` overrides the auto-generated default.
+
+    The store layer queries by internal row id and has no
+    ``public_id`` to surface; the ``message`` override path lets the
+    log/Slack rendering carry the internal id without leaking it into
+    Sentry tags or contexts.
+    """
+    exc = JobNotFoundError(
+        queue_name="docverse:queue",
+        job_function="QueueJobStore._get_row",
+        message="Queue job 42 not found",
+    )
+    assert str(exc) == "Queue job 42 not found"
