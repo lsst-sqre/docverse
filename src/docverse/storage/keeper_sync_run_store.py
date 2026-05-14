@@ -26,7 +26,7 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunActivity,
 )
 from docverse.domain.queue import JobStatus
-from docverse.exceptions import InvalidJobStateError
+from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse.storage.pagination import KeeperSyncRunDateStartedCursor
 
 __all__ = ["KeeperSyncRunStore"]
@@ -283,7 +283,7 @@ class KeeperSyncRunStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            raise InvalidJobStateError(
+            raise JobNotFoundError(
                 job_function="KeeperSyncRunStore._get_row",
                 message=f"Keeper sync run {run_id} not found",
             )

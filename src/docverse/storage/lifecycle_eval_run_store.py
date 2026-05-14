@@ -24,7 +24,7 @@ from docverse.domain.lifecycle_eval_run import (
     LifecycleEvalRunActivity,
 )
 from docverse.domain.queue import JobStatus
-from docverse.exceptions import InvalidJobStateError
+from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 
 __all__ = ["LifecycleEvalRunStore"]
 
@@ -205,7 +205,7 @@ class LifecycleEvalRunStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            raise InvalidJobStateError(
+            raise JobNotFoundError(
                 job_function="LifecycleEvalRunStore._get_row",
                 message=f"Lifecycle eval run {run_id} not found",
             )

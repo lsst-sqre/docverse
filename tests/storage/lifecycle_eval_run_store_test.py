@@ -14,7 +14,7 @@ from docverse.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus
-from docverse.exceptions import InvalidJobStateError
+from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
 from docverse.storage.organization_store import OrganizationStore
 
@@ -437,19 +437,33 @@ async def test_transition_status_pending_can_go_terminal(
 
 
 @pytest.mark.asyncio
-async def test_transition_status_raises_when_missing(
+@pytest.mark.parametrize(
+    "entry_point",
+    ["get_row", "transition_status"],
+)
+async def test_missing_run_raises_job_not_found(
     db_session: AsyncSession,
+    entry_point: str,
 ) -> None:
-    async def _try_transition_missing() -> None:
-        async with db_session.begin():
-            store = LifecycleEvalRunStore(session=db_session, logger=_logger())
+    """``_get_row`` and methods that delegate to it raise ``JobNotFoundError``.
+
+    Aligns the store with ``QueueJobStore._get_row``'s shape: a missing
+    row is a lookup miss, not an invalid state transition.
+    """
+
+    async def _call(store: LifecycleEvalRunStore) -> None:
+        if entry_point == "get_row":
+            await store._get_row(99999)
+        else:
             await store.transition_status(
                 run_id=99999,
                 new_status=LifecycleEvalRunStatus.in_progress,
             )
 
-    with pytest.raises(InvalidJobStateError):
-        await _try_transition_missing()
+    async with db_session.begin():
+        store = LifecycleEvalRunStore(session=db_session, logger=_logger())
+        with pytest.raises(JobNotFoundError):
+            await _call(store)
 
 
 @pytest.mark.asyncio
