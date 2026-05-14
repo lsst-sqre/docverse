@@ -12,7 +12,11 @@ from arq.cron import CronJob
 from arq.worker import Function
 
 from docverse.config import Configuration
-from docverse.worker.functions import lifecycle_eval, lifecycle_eval_dispatcher
+from docverse.worker.functions import (
+    lifecycle_eval,
+    lifecycle_eval_dispatcher,
+    lifecycle_reaper,
+)
 from docverse.worker.functions.lifecycle_eval_dispatcher import (
     LIFECYCLE_EVAL_QUEUE_NAME,
 )
@@ -82,6 +86,36 @@ def test_lifecycle_eval_dispatcher_runs_hourly() -> None:
     assert dispatcher_crons[0].minute == {0}
 
 
+def test_lifecycle_reaper_registered_as_function() -> None:
+    """The reaper is registered as a plain coroutine on the lifecycle pool.
+
+    Unlike the dispatcher and per-org worker, the reaper is not wrapped
+    in :func:`arq.func` — it is a cron-only backstop with no per-job
+    timeout knob and arq's default retry policy is irrelevant since
+    each tick is self-contained. Mirrors how ``keeper_sync_reaper`` is
+    registered on :class:`KeeperSyncWorkerSettings`.
+    """
+    assert lifecycle_reaper in LifecycleEvalWorkerSettings.functions
+
+
+def test_lifecycle_reaper_runs_every_thirty_minutes() -> None:
+    """The reaper cron fires on minute 0 and 30 of every hour.
+
+    Frequent enough that test/staging environments running with a low
+    ``lifecycle_reaper_threshold_seconds`` see prompt finalisation,
+    infrequent enough that production with the 6 h default rarely
+    sees no-work-to-do log spam.
+    """
+    cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob) and job.coroutine is lifecycle_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {0, 30}
+
+
 def test_default_worker_does_not_register_lifecycle_functions() -> None:
     """The default queue stays free of lifecycle work."""
     default_coros: set[object] = set()
@@ -90,5 +124,36 @@ def test_default_worker_does_not_register_lifecycle_functions() -> None:
             default_coros.add(entry.coroutine)
     assert lifecycle_eval not in WorkerSettings.functions
     assert lifecycle_eval_dispatcher not in WorkerSettings.functions
+    assert lifecycle_reaper not in WorkerSettings.functions
     assert lifecycle_eval not in default_coros
     assert lifecycle_eval_dispatcher not in default_coros
+    assert lifecycle_reaper not in default_coros
+
+
+def test_default_worker_has_no_lifecycle_cron() -> None:
+    """The default queue does not run the lifecycle dispatcher or reaper."""
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        job.coroutine for job in cron_jobs if isinstance(job, CronJob)
+    }
+    assert lifecycle_eval_dispatcher not in coroutines
+    assert lifecycle_reaper not in coroutines
+
+
+def test_keeper_sync_worker_does_not_register_lifecycle_functions() -> None:
+    """Lifecycle work does not leak onto the keeper-sync queue.
+
+    The PRD specifies a third pool precisely so that a slow rule pass
+    cannot delay keeper_sync_project; registering lifecycle functions
+    on KeeperSyncWorkerSettings would defeat that isolation.
+    """
+    sync_coros: set[object] = set()
+    for entry in KeeperSyncWorkerSettings.functions:
+        if isinstance(entry, Function):
+            sync_coros.add(entry.coroutine)
+    assert lifecycle_eval not in sync_coros
+    assert lifecycle_eval_dispatcher not in sync_coros
+    assert lifecycle_reaper not in sync_coros
+    assert lifecycle_eval not in KeeperSyncWorkerSettings.functions
+    assert lifecycle_eval_dispatcher not in KeeperSyncWorkerSettings.functions
+    assert lifecycle_reaper not in KeeperSyncWorkerSettings.functions

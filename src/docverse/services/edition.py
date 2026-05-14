@@ -432,15 +432,19 @@ class EditionService:
 
     async def soft_delete(
         self, *, org_slug: str, project_slug: str, slug: str
-    ) -> None:
+    ) -> Organization:
         """Soft-delete an edition.
+
+        Returns the resolved :class:`Organization` so the caller can
+        invoke downstream side-effects (e.g. CDN unpublish) keyed on
+        ``org_id`` without re-resolving the slug.
 
         Raises
         ------
         NotFoundError
             If the edition is not found.
         """
-        _, project = await self._resolve_org_project(org_slug, project_slug)
+        org, project = await self._resolve_org_project(org_slug, project_slug)
         deleted = await self._store.soft_delete(
             project_id=project.id, slug=slug
         )
@@ -453,3 +457,4 @@ class EditionService:
             org=org_slug,
             project=project_slug,
         )
+        return org

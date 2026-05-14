@@ -85,6 +85,15 @@ class _FailingPublisher:
         _ = (project_slug, edition_slug, build_public_id, object_key_prefix)
         raise self._exc
 
+    async def unpublish(
+        self,
+        *,
+        project_slug: str,
+        edition_slug: str,
+    ) -> None:
+        _ = (project_slug, edition_slug)
+        raise self._exc
+
 
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]

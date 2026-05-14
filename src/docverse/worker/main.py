@@ -44,6 +44,7 @@ from .functions import (
     keeper_sync_tier_other,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
+    lifecycle_reaper,
     ping,
     publish_edition,
 )
@@ -368,12 +369,10 @@ class LifecycleEvalWorkerSettings:
     row finalises via :func:`maybe_finalise_lifecycle_run` — arq's
     default 5-attempt retry would otherwise delay finalisation and
     obscure the underlying error in logs. The cron-driven
-    ``lifecycle_reaper`` (sibling task) is the second backstop for
-    the case where arq itself loses a job and no timeout ever fires.
-
-    The hourly dispatcher cron is registered here; the
-    ``lifecycle_reaper`` cron (sibling task) will be appended to this
-    class's ``cron_jobs`` list when it lands.
+    ``lifecycle_reaper`` is the second backstop for the case where
+    arq itself loses a job and no timeout ever fires; it runs every
+    30 minutes so a wedged child is unblocked on the same cadence as
+    the keeper-sync reaper.
     """
 
     functions = [
@@ -387,11 +386,16 @@ class LifecycleEvalWorkerSettings:
             timeout=config.lifecycle_eval_job_timeout_seconds,
             max_tries=1,
         ),
+        lifecycle_reaper,
     ]
     cron_jobs = [
         cron(
             lifecycle_eval_dispatcher,
             minute={0},
+        ),
+        cron(
+            lifecycle_reaper,
+            minute={0, 30},
         ),
     ]
     redis_settings = config.arq_redis_settings

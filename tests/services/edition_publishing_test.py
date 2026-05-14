@@ -68,6 +68,15 @@ class _FailingPublisher:
         _ = (project_slug, edition_slug, build_public_id, object_key_prefix)
         raise self._exc
 
+    async def unpublish(
+        self,
+        *,
+        project_slug: str,
+        edition_slug: str,
+    ) -> None:
+        _ = (project_slug, edition_slug)
+        raise self._exc
+
 
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
@@ -237,6 +246,51 @@ async def test_publish_failure_propagates_and_leaves_status_unchanged(
         assert refreshed.publish_status is None
         refreshed_history = await _fetch_history(db_session, edition.id)
         assert refreshed_history.publish_status is None
+
+
+@pytest.mark.asyncio
+async def test_unpublish_no_cdn_is_a_noop(
+    db_session: AsyncSession,
+) -> None:
+    """Org with cdn_service_label=None: unpublish does not call publisher."""
+    service = _make_service(db_session, provider_raises=True)
+    async with db_session.begin():
+        org_id, edition, _build, _history_entry = await _setup(
+            db_session, org_slug="no-cdn-unpub-org"
+        )
+        # Must not raise even though provider would AssertionError if called.
+        await service.unpublish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition_slug=edition.slug,
+        )
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_unpublish_calls_publisher_when_cdn_configured(
+    db_session: AsyncSession,
+) -> None:
+    """Configured CDN: unpublish records one call on the mock publisher."""
+    mock_publisher = MockEditionPublisher()
+    service = _make_service(db_session, publisher=mock_publisher)
+    async with db_session.begin():
+        org_id, edition, _build, _history_entry = await _setup(
+            db_session,
+            org_slug="cdn-unpub-org",
+            cdn_service_label="cdn-prod",
+        )
+        await service.unpublish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition_slug=edition.slug,
+        )
+        await db_session.commit()
+
+    assert len(mock_publisher.unpublish_calls) == 1
+    call = mock_publisher.unpublish_calls[0]
+    assert call.project_slug == _PROJECT_SLUG
+    assert call.edition_slug == edition.slug
 
 
 @pytest.mark.asyncio

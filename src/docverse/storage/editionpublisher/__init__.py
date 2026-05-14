@@ -2,7 +2,7 @@
 
 from ._cloudflare_kv import CloudflareKvEditionPublisher
 from ._factory import create_edition_publisher
-from ._mock import MockEditionPublisher, PublishCall
+from ._mock import MockEditionPublisher, PublishCall, UnpublishCall
 from ._protocol import EditionPublisher
 
 __all__ = [
@@ -10,5 +10,6 @@ __all__ = [
     "EditionPublisher",
     "MockEditionPublisher",
     "PublishCall",
+    "UnpublishCall",
     "create_edition_publisher",
 ]

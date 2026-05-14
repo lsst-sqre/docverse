@@ -7,16 +7,24 @@ import re
 import pytest
 import structlog
 from httpx import AsyncClient
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildCreate
 from docverse.client.models.builds import BuildAnnotations
+from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id
+from docverse.factory import Factory
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.editionpublisher import (
+    EditionPublisher,
+    MockEditionPublisher,
+)
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
@@ -176,6 +184,66 @@ async def test_delete_edition(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_edition_unpublishes_from_cdn(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DELETE handler removes the CDN pointer after the soft-delete commit.
+
+    Seeds an org with a ``cdn_service_label`` so the publishing service
+    resolves a publisher (rather than no-opping), patches the factory to
+    return a ``MockEditionPublisher``, then asserts the mock recorded
+    exactly one ``unpublish`` call keyed on the deleted edition's slug.
+    """
+    await _setup(client)
+    # Configure a CDN service label on the seeded org so unpublish is
+    # not skipped as a no-op.
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlOrganization)
+                .where(SqlOrganization.slug == "ed-org")
+                .values(cdn_service_label="cdn-prod")
+            )
+            await session.commit()
+
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "cdn-del",
+            "title": "CDN Delete",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    mock_publisher = MockEditionPublisher()
+
+    async def _create(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        return mock_publisher
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _create)
+
+    response = await client.delete(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/cdn-del",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+    assert len(mock_publisher.unpublish_calls) == 1
+    call = mock_publisher.unpublish_calls[0]
+    assert call.project_slug == "ed-proj"
+    assert call.edition_slug == "cdn-del"
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,10 @@ from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.domain.lifecycle import LifecycleRule, LifecycleRuleSet
 from docverse.domain.project import Project
 from docverse.factory import Factory
+from docverse.services.dashboard.enqueue import (
+    try_enqueue_dashboard_build_by_slug,
+)
+from docverse.services.edition_publishing import EditionPublishingService
 from docverse.services.lifecycle.evaluator import (
     LifecycleDecision,
     evaluate_lifecycle,
@@ -183,14 +187,17 @@ async def _evaluate_org(
 
     edition_index = _index_editions_by_id(editions_by_project)
     build_index = _index_builds_by_id(builds_by_project)
+    projects_with_edition_deletes: list[str] = []
 
     async with session.begin():
         edition_store = factory.create_edition_store()
         build_store = factory.create_build_store()
+        publishing_service = factory.create_edition_publishing_service()
         for project, rule_set, decision in decisions:
-            await _apply_decision(
+            editions_deleted = await _apply_decision(
                 edition_store=edition_store,
                 build_store=build_store,
+                publishing_service=publishing_service,
                 project=project,
                 rule_set=rule_set,
                 decision=decision,
@@ -200,6 +207,24 @@ async def _evaluate_org(
                 org_slug=org_slug,
                 logger=logger,
             )
+            if editions_deleted:
+                projects_with_edition_deletes.append(project.slug)
+
+    # Refresh the cached dashboard artifact for each project whose
+    # edition list actually shrank. Runs after the soft-delete commit
+    # boundary so the helper opens its own transaction, matching the
+    # user-initiated DELETE handler. Build-only deletions are skipped:
+    # the cached dashboard renders from the edition list, not the build
+    # list, so soft-deleting an orphan build would not change the
+    # rendered output and a rebuild would be wasted work.
+    for project_slug in projects_with_edition_deletes:
+        await try_enqueue_dashboard_build_by_slug(
+            factory=factory,
+            session=session,
+            logger=logger,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
 
 
 async def _load_org_state(
@@ -289,6 +314,7 @@ async def _apply_decision(  # noqa: PLR0913
     *,
     edition_store: EditionStore,
     build_store: BuildStore,
+    publishing_service: EditionPublishingService,
     project: Project,
     rule_set: LifecycleRuleSet,
     decision: LifecycleDecision,
@@ -297,7 +323,7 @@ async def _apply_decision(  # noqa: PLR0913
     org_id: int,
     org_slug: str,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> int:
     """Soft-delete every entity the decision matched and emit one log per row.
 
     The structured log line is the v1 audit trail (persistent
@@ -310,10 +336,17 @@ async def _apply_decision(  # noqa: PLR0913
     without code changes here), and the rule's resolved parameter
     dict so an operator can audit *why* a row was deleted from logs
     alone.
+
+    Returns the number of editions that actually transitioned to
+    soft-deleted in this call so the caller can decide whether a
+    dashboard rebuild is warranted. Build soft-deletes are not
+    counted: the cached dashboard renders from the edition list, not
+    the build list.
     """
     rules_by_type: dict[str, LifecycleRule] = {
         rule.type: rule for rule in rule_set.root
     }
+    editions_deleted = 0
     for edition_id in sorted(decision.edition_matches):
         edition = edition_index.get(edition_id)
         if edition is None:
@@ -325,6 +358,18 @@ async def _apply_decision(  # noqa: PLR0913
         )
         if not deleted:
             continue
+        editions_deleted += 1
+        # Remove the CDN pointer for the soft-deleted edition so the
+        # public URL stops resolving. ``unpublish`` is idempotent and a
+        # no-op when the org has no CDN configured, so this is safe to
+        # call unconditionally. A failure here propagates and rolls back
+        # the soft-deletes in this batch; the next dispatcher tick will
+        # re-evaluate from a consistent state.
+        await publishing_service.unpublish(
+            org_id=org_id,
+            project_slug=project.slug,
+            edition_slug=edition.slug,
+        )
         logger.info(
             "Soft-deleted entity by lifecycle rule",
             entity_type="edition",
@@ -361,3 +406,4 @@ async def _apply_decision(  # noqa: PLR0913
                 rule.model_dump(exclude={"type"}) if rule is not None else None
             ),
         )
+    return editions_deleted
