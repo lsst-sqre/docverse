@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
+from pydantic import BaseModel, Field
 
 from docverse.client.models import OrganizationCreate
 from docverse.dependencies.auth import require_superadmin
@@ -15,6 +16,23 @@ from docverse.handlers.params import OrgSlugParam
 from .models import Organization
 
 router = APIRouter(tags=["admin"], dependencies=[Depends(require_superadmin)])
+
+
+class SentryTestRequest(BaseModel):
+    """Body for the Sentry validation endpoint.
+
+    The optional ``message`` is carried verbatim into the deliberately-raised
+    ``RuntimeError`` so an operator running the post-deploy validation can
+    grep for their marker in the Sentry UI.
+    """
+
+    message: str | None = Field(
+        default=None,
+        description=(
+            "Optional marker string echoed into the deliberate exception so "
+            "the resulting Sentry event is easy to identify."
+        ),
+    )
 
 
 @router.post(
@@ -90,6 +108,31 @@ async def get_organization(
         service_store = context.factory.create_service_store()
         services = await service_store.list_by_org(org.id)
     return Organization.from_domain(org, context.request, services=services)
+
+
+@router.post(
+    "/admin/sentry/test",
+    summary="Trigger a test Sentry alert (diagnostic / validation tool)",
+    name="admin_post_sentry_test",
+    responses={
+        500: {
+            "description": (
+                "Always returned. This endpoint deliberately raises a "
+                "server-side exception so an operator can verify the "
+                "Sentry pipeline end-to-end after a deploy. Not part of "
+                "the application's normal API surface."
+            ),
+        },
+    },
+)
+async def post_sentry_test(
+    data: SentryTestRequest,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+) -> None:
+    if data.message:
+        context.rebind_logger(sentry_test_marker=data.message)
+    msg = f"Sentry validation alert: {data.message or 'no marker'}"
+    raise RuntimeError(msg)
 
 
 @router.delete(

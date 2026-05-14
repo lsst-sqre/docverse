@@ -22,7 +22,31 @@ from safir.testing.sentry import (
     sentry_init_fixture,
 )
 
+from docverse.dependencies.auth import require_superadmin
+from docverse.dependencies.context import context_dependency
+from docverse.handlers.admin import admin_router
 from docverse.sentry import initialize_sentry
+
+
+class _StubContext:
+    """Duck-typed :class:`RequestContext` for endpoint-level Sentry tests.
+
+    The ``/admin/sentry/test`` handler only touches ``rebind_logger`` before
+    raising, so the test substitutes a no-op stub via
+    :pyattr:`FastAPI.dependency_overrides` rather than wiring the full DB /
+    factory / arq machinery just to reach a deliberate ``RuntimeError``.
+    """
+
+    def rebind_logger(self, **_values: Any) -> None:
+        return None
+
+
+async def _stub_context_dependency() -> _StubContext:
+    return _StubContext()
+
+
+async def _stub_require_superadmin() -> None:
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +130,57 @@ async def test_api_initialize_sentry_captures_event_with_release_and_tags(
     assert event["release"] == version("docverse")
     assert event["tags"]["component"] == "api"
     assert event["tags"]["service"] == "docverse"
+
+
+@pytest.mark.asyncio
+async def test_admin_sentry_test_endpoint_captures_event_with_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``POST /admin/sentry/test`` produces one Sentry event carrying marker.
+
+    Locks the validation-tooling contract for the SRE-facing
+    ``/admin/sentry/test`` route from PRD #338: hitting the endpoint must
+    produce exactly one captured event tagged ``service=docverse`` /
+    ``component=api`` / ``release=<docverse version>``, and the request-body
+    ``message`` must land in the exception ``value`` so an operator can grep
+    for their marker after a deploy.
+
+    The router-level ``require_superadmin`` and ``context_dependency`` are
+    overridden because the contract under test is the Sentry envelope, not
+    the auth gate (covered in ``tests/handlers/admin_test.py``).
+    """
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    _patch_sentry_init_with_test_transport(monkeypatch)
+
+    marker = "validation-marker-42"
+
+    with sentry_init_fixture():
+        initialize_sentry(component="api")
+        captured = capture_events_fixture(monkeypatch)()
+
+        app = FastAPI()
+        app.include_router(admin_router)
+        app.dependency_overrides[context_dependency] = _stub_context_dependency
+        app.dependency_overrides[require_superadmin] = _stub_require_superadmin
+
+        async with AsyncClient(
+            base_url="https://example.com",
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+        ) as client:
+            response = await client.post(
+                "/admin/sentry/test",
+                json={"message": marker},
+            )
+        assert response.status_code == 500
+
+    assert len(captured.errors) == 1
+    event = captured.errors[0]
+    assert event["release"] == version("docverse")
+    assert event["tags"]["service"] == "docverse"
+    assert event["tags"]["component"] == "api"
+    exc_values = event["exception"]["values"]
+    assert any(marker in exc["value"] for exc in exc_values)
 
 
 def test_initialize_sentry_is_noop_when_dsn_unset(
