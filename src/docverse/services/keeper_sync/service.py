@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import sentry_sdk
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -223,6 +224,7 @@ class KeeperSyncService:
         for ltd_edition in ltd_editions:
             outcome = await self.sync_edition(
                 org_id=org.id,
+                org_slug=org.slug,
                 project=project,
                 ltd_edition=ltd_edition,
             )
@@ -230,7 +232,8 @@ class KeeperSyncService:
             if on_edition_synced is not None:
                 try:
                     await on_edition_synced(outcome)
-                except Exception:
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
                     self._logger.exception(
                         "on_edition_synced callback raised; continuing",
                         docverse_slug=outcome.docverse_slug,
@@ -282,6 +285,7 @@ class KeeperSyncService:
         org_id: int,
         project: Project,
         ltd_edition: LtdEdition,
+        org_slug: str | None = None,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse."""
         # ``manual`` editions need the published build's git_refs to
@@ -330,6 +334,7 @@ class KeeperSyncService:
         if ltd_edition.build_url is not None:
             build_outcome = await self.sync_build(
                 org_id=org_id,
+                org_slug=org_slug,
                 project=project,
                 edition=edition,
                 ltd_edition=ltd_edition,
@@ -396,7 +401,7 @@ class KeeperSyncService:
             tracking_params=tracking_params,
         )
 
-    async def sync_build(
+    async def sync_build(  # noqa: PLR0913
         self,
         *,
         org_id: int,
@@ -404,6 +409,7 @@ class KeeperSyncService:
         edition: Edition,
         ltd_edition: LtdEdition,
         ltd_build: LtdBuild | None = None,
+        org_slug: str | None = None,
     ) -> BuildSyncOutcome:
         """Sync the LTD edition's current build into Docverse.
 
@@ -518,7 +524,11 @@ class KeeperSyncService:
 
         async with self._session.begin():
             await self._reclaim_orphan_placeholders(
-                project_id=project.id, ltd_edition=ltd_edition
+                project_id=project.id,
+                project_slug=project.slug,
+                org_slug=org_slug,
+                edition_slug=edition.slug,
+                ltd_edition=ltd_edition,
             )
             new_build = await self._create_synced_build(
                 project=project, ltd_edition=ltd_edition
@@ -533,6 +543,8 @@ class KeeperSyncService:
             await self._finalize_synced_build(
                 build=new_build,
                 edition=edition,
+                project_slug=project.slug,
+                org_slug=org_slug,
                 copy_result=copy_result,
             )
             await self._state_store.upsert(
@@ -563,7 +575,13 @@ class KeeperSyncService:
         )
 
     async def _reclaim_orphan_placeholders(
-        self, *, project_id: int, ltd_edition: LtdEdition
+        self,
+        *,
+        project_id: int,
+        ltd_edition: LtdEdition,
+        project_slug: str | None = None,
+        org_slug: str | None = None,
+        edition_slug: str | None = None,
     ) -> None:
         """Fail stale ``pending`` placeholders left by a crashed prior run.
 
@@ -594,7 +612,11 @@ class KeeperSyncService:
         reclaimed_ids: list[int] = []
         for orphan in orphans:
             await self._build_store.transition_status(
-                build_id=orphan.id, new_status=BuildStatus.failed
+                build_id=orphan.id,
+                new_status=BuildStatus.failed,
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
             )
             reclaimed_ids.append(orphan.id)
         self._logger.warning(
@@ -630,6 +652,8 @@ class KeeperSyncService:
         build: Build,
         edition: Edition,
         copy_result: CopyResult,
+        project_slug: str | None = None,
+        org_slug: str | None = None,
     ) -> None:
         """Mark the build complete and atomically point the edition at it.
 
@@ -638,18 +662,33 @@ class KeeperSyncService:
         edition pointing at a build that does not exist or vice versa.
         """
         await self._build_store.update_content_hash(
-            build_id=build.id, content_hash=copy_result.content_hash
+            build_id=build.id,
+            content_hash=copy_result.content_hash,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition.slug,
         )
         await self._build_store.update_inventory(
             build_id=build.id,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition.slug,
         )
         await self._build_store.transition_status(
-            build_id=build.id, new_status=BuildStatus.processing
+            build_id=build.id,
+            new_status=BuildStatus.processing,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition.slug,
         )
         await self._build_store.transition_status(
-            build_id=build.id, new_status=BuildStatus.completed
+            build_id=build.id,
+            new_status=BuildStatus.completed,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition.slug,
         )
         await self._edition_store.set_current_build(
             edition_id=edition.id,

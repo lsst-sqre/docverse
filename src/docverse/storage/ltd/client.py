@@ -11,10 +11,13 @@ distinguish "LTD doesn't have this any more" (soft-deletion path) from
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, override
 
 import httpx
 import structlog
+from safir.slack.sentry import SentryEventInfo
+
+from docverse.exceptions import DocverseSlackException
 
 from .models import LtdBuild, LtdEdition, LtdProduct, LtdProductsListing
 
@@ -34,9 +37,92 @@ _BASE_BACKOFF_SECONDS = 0.5
 #: Status codes that the client retries.
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
+#: Cap on the response body bytes carried into Sentry events. LTD error
+#: bodies can be arbitrarily large (HTML error pages, full JSON payloads);
+#: 4 KiB is enough for the leading "what went wrong" snippet without
+#: ballooning Sentry envelopes.
+_MAX_BODY_BYTES = 4 * 1024
 
-class LtdClientError(Exception):
-    """Raised when an LTD Keeper API call cannot be satisfied."""
+
+def _truncate_body(body: str | bytes | None) -> str | None:
+    """Decode ``body`` if needed and cap it at :data:`_MAX_BODY_BYTES`.
+
+    Truncation is done on the UTF-8 byte length so the cap is honoured
+    even when the body contains multi-byte characters; any trailing
+    partial code point is dropped via ``errors="ignore"`` so the
+    resulting string is always well-formed.
+    """
+    if body is None:
+        return None
+    text = (
+        body.decode("utf-8", errors="replace")
+        if isinstance(body, bytes)
+        else body
+    )
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _MAX_BODY_BYTES:
+        return text
+    return encoded[:_MAX_BODY_BYTES].decode("utf-8", errors="ignore")
+
+
+class LtdClientError(DocverseSlackException):
+    """Raised when an LTD Keeper API call cannot be satisfied.
+
+    Carries the originating request URL, HTTP method, response status
+    code (if a response came back at all), and a truncated response
+    body so a Sentry triager can tell an LTD-side 5xx outage apart
+    from a stale Docverse credential. The body is truncated to
+    :data:`_MAX_BODY_BYTES` inside the constructor — callers pass the
+    full body and the class enforces the cap.
+
+    ``status_code`` and ``body`` default to ``None`` because the
+    network-error raise sites in :meth:`LtdClient._get_json` have
+    neither (the request never produced a response). ``to_sentry``
+    omits the missing tag in that case rather than emitting a literal
+    ``"None"`` string.
+    """
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        method: str,
+        status_code: int | None = None,
+        body: str | bytes | None = None,
+        message: str | None = None,
+    ) -> None:
+        if message is None:
+            message = _format_ltd_error_message(
+                url=url, method=method, status_code=status_code
+            )
+        super().__init__(message)
+        self.url = url
+        self.method = method
+        self.status_code = status_code
+        self.body = _truncate_body(body)
+
+    @override
+    def to_sentry(self) -> SentryEventInfo:
+        info = super().to_sentry()
+        if self.status_code is not None:
+            info.tags["ltd_status_code"] = str(self.status_code)
+        info.tags["ltd_method"] = self.method
+        info.contexts["ltd_request"] = {
+            "url": self.url,
+            "method": self.method,
+            "status_code": self.status_code,
+            "body": self.body,
+        }
+        return info
+
+
+def _format_ltd_error_message(
+    *, url: str, method: str, status_code: int | None
+) -> str:
+    """Render a default message for :class:`LtdClientError`."""
+    if status_code is not None:
+        return f"LTD {method} {url} returned {status_code}"
+    return f"LTD {method} {url} failed"
 
 
 class LtdNotFoundError(LtdClientError):
@@ -44,7 +130,10 @@ class LtdNotFoundError(LtdClientError):
 
     Distinct from :class:`LtdClientError` so the sync engine can map an
     LTD soft-deletion onto a Docverse soft-deletion without tripping
-    the generic retry/error path.
+    the generic retry/error path. Inherits the constructor and the
+    default ``to_sentry`` override from :class:`LtdClientError` — the
+    404 status code already gets surfaced as ``ltd_status_code`` so no
+    further override is needed.
     """
 
 
@@ -141,39 +230,60 @@ class LtdClient:
             except httpx.HTTPError as exc:
                 last_exc = exc
                 if attempt >= self._max_attempts:
-                    msg = f"LTD GET {url} failed: {exc}"
-                    raise LtdClientError(msg) from exc
+                    raise LtdClientError(
+                        url=url,
+                        method="GET",
+                        message=f"LTD GET {url} failed: {exc}",
+                    ) from exc
                 await asyncio.sleep(self._backoff_for_attempt(attempt))
                 continue
 
             if response.status_code == httpx.codes.NOT_FOUND:
-                msg = f"LTD resource {url} not found (404)"
-                raise LtdNotFoundError(msg)
+                raise LtdNotFoundError(
+                    url=url,
+                    method="GET",
+                    status_code=response.status_code,
+                    body=response.text,
+                    message=f"LTD resource {url} not found (404)",
+                )
 
             if response.status_code in _RETRYABLE_STATUS_CODES:
                 if attempt >= self._max_attempts:
-                    msg = (
-                        f"LTD GET {url} returned {response.status_code} "
-                        f"after {attempt} attempts"
+                    raise LtdClientError(
+                        url=url,
+                        method="GET",
+                        status_code=response.status_code,
+                        body=response.text,
+                        message=(
+                            f"LTD GET {url} returned {response.status_code} "
+                            f"after {attempt} attempts"
+                        ),
                     )
-                    raise LtdClientError(msg)
                 await asyncio.sleep(
                     self._backoff_for_response(response, attempt)
                 )
                 continue
 
             if response.is_error:
-                msg = (
-                    f"LTD GET {url} returned non-retryable status "
-                    f"{response.status_code}"
+                raise LtdClientError(
+                    url=url,
+                    method="GET",
+                    status_code=response.status_code,
+                    body=response.text,
+                    message=(
+                        f"LTD GET {url} returned non-retryable status "
+                        f"{response.status_code}"
+                    ),
                 )
-                raise LtdClientError(msg)
 
             payload: dict[str, Any] = response.json()
             return payload
 
-        msg = f"LTD GET {url} exhausted retries"
-        raise LtdClientError(msg) from last_exc
+        raise LtdClientError(
+            url=url,
+            method="GET",
+            message=f"LTD GET {url} exhausted retries",
+        ) from last_exc
 
     def _backoff_for_attempt(self, attempt: int) -> float:
         multiplier: int = 2 ** (attempt - 1)

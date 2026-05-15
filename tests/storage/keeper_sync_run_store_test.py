@@ -12,6 +12,7 @@ from docverse.client.models import KeeperSyncRunStatus, OrganizationCreate
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus
+from docverse.exceptions import JobNotFoundError
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
 
@@ -229,3 +230,33 @@ async def test_aggregate_activity_null_when_no_jobs(
 
     assert activity.total_count == 0
     assert activity.date_last_activity is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entry_point",
+    ["get_row", "transition_status"],
+)
+async def test_missing_run_raises_job_not_found(
+    db_session: AsyncSession,
+    entry_point: str,
+) -> None:
+    """``_get_row`` and methods that delegate to it raise ``JobNotFoundError``.
+
+    Aligns the store with ``QueueJobStore._get_row``'s shape: a missing
+    row is a lookup miss, not an invalid state transition.
+    """
+
+    async def _call(store: KeeperSyncRunStore) -> None:
+        if entry_point == "get_row":
+            await store._get_row(99999)
+        else:
+            await store.transition_status(
+                run_id=99999,
+                new_status=KeeperSyncRunStatus.in_progress,
+            )
+
+    async with db_session.begin():
+        store = KeeperSyncRunStore(session=db_session, logger=_logger())
+        with pytest.raises(JobNotFoundError):
+            await _call(store)

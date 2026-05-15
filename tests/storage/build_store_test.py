@@ -285,6 +285,35 @@ async def test_update_content_hash_rejects_non_pending(
 
 
 @pytest.mark.asyncio
+async def test_update_content_hash_not_found_omits_target_state_tag(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The not-found path is not a transition.
+
+    It must not tag ``build_target_state``. The org / project / edition
+    slugs the caller threaded down should still surface for triage.
+    """
+    with pytest.raises(InvalidBuildStateError) as exc_info:
+        await build_store.update_content_hash(
+            build_id=999_999,
+            content_hash="sha256:" + "0" * 64,
+            org_slug="build-org",
+            project_slug="build-proj",
+            edition_slug="main",
+        )
+    info = exc_info.value.to_sentry()
+    assert "build_target_state" not in info.tags
+    assert "build_current_state" not in info.tags
+    assert info.tags["org_slug"] == "build-org"
+    assert info.tags["project_slug"] == "build-proj"
+    transition = info.contexts["build_transition"]
+    assert transition["edition_slug"] == "main"
+    assert transition["org_slug"] == "build-org"
+    assert transition["project_slug"] == "build-proj"
+
+
+@pytest.mark.asyncio
 async def test_update_inventory(
     db_session: AsyncSession,
     build_store: BuildStore,

@@ -7,13 +7,16 @@ resolved template points at the synced content.
 
 from __future__ import annotations
 
-import traceback
 from typing import Any
 
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.exceptions import NotFoundError
+from docverse.services.dashboard_templates._sync_failure import (
+    mark_dashboard_sync_failed,
+)
 from docverse.services.dashboard_templates.sync import DashboardSyncStatus
 from docverse.services.lock_service import LockKey
 
@@ -105,23 +108,17 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     syncer = factory.create_dashboard_template_syncer()
                     sync_result = await syncer.sync(binding_id)
             except Exception as exc:
+                sentry_sdk.capture_exception(exc)
                 logger.exception("Dashboard sync failed unexpectedly")
-                error_message = f"{type(exc).__name__}: {exc}"
-                async with session.begin():
-                    await binding_store.update_sync_state(
-                        binding_id=binding_id,
-                        last_sync_status="failed",
-                        last_sync_error=error_message,
-                    )
-                async with session.begin():
-                    await queue_job_store.fail(
-                        queue_job_id,
-                        errors={
-                            "message": str(exc),
-                            "type": type(exc).__name__,
-                            "traceback": traceback.format_exc(),
-                        },
-                    )
+                await mark_dashboard_sync_failed(
+                    session=session,
+                    binding_store=binding_store,
+                    binding_id=binding_id,
+                    exc=exc,
+                    error_message=f"{type(exc).__name__}: {exc}",
+                    queue_job_store=queue_job_store,
+                    queue_job_id=queue_job_id,
+                )
                 return "failed"
 
             if sync_result.status is DashboardSyncStatus.failed:
@@ -134,7 +131,7 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         queue_job_id,
                         errors={
                             "message": sync_result.error or "Sync failed",
-                            "type": "DashboardTemplateSyncError",
+                            "type": "dashboard_sync_failed",
                         },
                     )
                 return "failed"

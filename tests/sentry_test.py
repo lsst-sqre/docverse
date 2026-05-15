@@ -8,7 +8,6 @@ on the real Docverse app's lifespan, DB, or GitHub validator.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from importlib.metadata import version
 from typing import Any
 
@@ -24,6 +23,7 @@ from safir.testing.sentry import (
 
 from docverse.dependencies.auth import require_superadmin
 from docverse.dependencies.context import context_dependency
+from docverse.exceptions import InvalidBuildStateError
 from docverse.handlers.admin import admin_router
 from docverse.sentry import initialize_sentry
 
@@ -47,26 +47,6 @@ async def _stub_context_dependency() -> _StubContext:
 
 async def _stub_require_superadmin() -> None:
     return None
-
-
-@pytest.fixture(autouse=True)
-def _isolate_sentry_global_scope() -> Iterator[None]:
-    """Strip ``initialize_sentry``'s global-scope tags around each test.
-
-    ``sentry_init_fixture`` saves and restores the *client* on the
-    global scope, but ``initialize_sentry`` also writes ``service`` and
-    ``component`` tags directly to that scope, which would otherwise
-    persist across tests in the session. Running on both sides isolates
-    this file from prior Sentry state and prevents tag bleed into any
-    later test that asserts tag absence.
-    """
-    scope = sentry_sdk.get_global_scope()
-    scope.remove_tag("service")
-    scope.remove_tag("component")
-    yield
-    scope = sentry_sdk.get_global_scope()
-    scope.remove_tag("service")
-    scope.remove_tag("component")
 
 
 def _patch_sentry_init_with_test_transport(
@@ -181,6 +161,52 @@ async def test_admin_sentry_test_endpoint_captures_event_with_marker(
     assert event["tags"]["component"] == "api"
     exc_values = event["exception"]["values"]
     assert any(marker in exc["value"] for exc in exc_values)
+
+
+@pytest.mark.asyncio
+async def test_docverse_slack_exception_subclass_captures_with_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raised ``DocverseSlackException`` subclass reaches Sentry.
+
+    Pins the slice #340 contract: an uncaught
+    :class:`docverse.exceptions.DocverseSlackException` subclass from a
+    FastAPI route lands as exactly one captured event with the expected
+    ``release`` and ``service`` / ``component`` global tags inherited
+    from :func:`docverse.sentry.initialize_sentry`. The default
+    ``SlackException.to_slack()`` / ``to_sentry()`` behaviour is enough
+    in this slice - the per-exception overrides land in #341-#344.
+    """
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    _patch_sentry_init_with_test_transport(monkeypatch)
+
+    boom_message = "uploaded -> uploaded is not a valid transition"
+
+    with sentry_init_fixture():
+        initialize_sentry(component="api")
+        captured = capture_events_fixture(monkeypatch)()
+
+        app = FastAPI()
+
+        @app.get("/raise-docverse-slack-exception")
+        async def raise_exc() -> None:
+            raise InvalidBuildStateError(message=boom_message)
+
+        async with AsyncClient(
+            base_url="https://example.com",
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+        ) as client:
+            await client.get("/raise-docverse-slack-exception")
+
+    assert len(captured.errors) == 1
+    event = captured.errors[0]
+    assert event["release"] == version("docverse")
+    assert event["tags"]["service"] == "docverse"
+    assert event["tags"]["component"] == "api"
+    exc_values = event["exception"]["values"]
+    assert any(boom_message in exc["value"] for exc in exc_values)
+    assert any(exc["type"] == "InvalidBuildStateError" for exc in exc_values)
 
 
 def test_initialize_sentry_is_noop_when_dsn_unset(

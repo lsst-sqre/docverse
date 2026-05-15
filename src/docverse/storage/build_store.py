@@ -223,7 +223,13 @@ class BuildStore:
         )
 
     async def transition_status(
-        self, *, build_id: int, new_status: BuildStatus
+        self,
+        *,
+        build_id: int,
+        new_status: BuildStatus,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
     ) -> Build:
         """Transition a build to a new status.
 
@@ -231,27 +237,40 @@ class BuildStore:
         transition to ``processing`` and ``date_completed`` on transition
         to ``completed`` or ``failed``.
 
+        ``org_slug`` / ``project_slug`` / ``edition_slug`` are optional
+        API-facing identifiers carried into :class:`InvalidBuildStateError`
+        so a Sentry triager sees slugs rather than internal row ids.
+
         Raises
         ------
         InvalidBuildStateError
-            If the transition is not valid.
+            If the build is not found or the transition is not valid.
         """
         result = await self._session.execute(
             select(SqlBuild).where(SqlBuild.id == build_id)
         )
         row = result.scalar_one_or_none()
         if row is None:
-            msg = f"Build {build_id} not found"
-            raise InvalidBuildStateError(msg)
+            raise InvalidBuildStateError(
+                target_state=new_status.value,
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=f"Build id={build_id} not found",
+            )
 
         current = BuildStatus(row.status)
+        build_public_id = serialize_base32_id(row.public_id)
         allowed = _VALID_TRANSITIONS.get(current, set())
         if new_status not in allowed:
-            msg = (
-                f"Cannot transition build {build_id} from "
-                f"{current.value!r} to {new_status.value!r}"
+            raise InvalidBuildStateError(
+                current_state=current.value,
+                target_state=new_status.value,
+                build_public_id=build_public_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
             )
-            raise InvalidBuildStateError(msg)
 
         row.status = new_status
         now = datetime.now(tz=UTC)
@@ -265,8 +284,15 @@ class BuildStore:
         await self._session.refresh(row)
         return Build.model_validate(row)
 
-    async def update_inventory(
-        self, *, build_id: int, object_count: int, total_size_bytes: int
+    async def update_inventory(  # noqa: PLR0913
+        self,
+        *,
+        build_id: int,
+        object_count: int,
+        total_size_bytes: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
     ) -> Build:
         """Update the inventory counts for a build."""
         result = await self._session.execute(
@@ -274,8 +300,12 @@ class BuildStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            msg = f"Build {build_id} not found"
-            raise InvalidBuildStateError(msg)
+            raise InvalidBuildStateError(
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=f"Build id={build_id} not found",
+            )
         row.object_count = object_count
         row.total_size_bytes = total_size_bytes
         await self._session.flush()
@@ -283,7 +313,13 @@ class BuildStore:
         return Build.model_validate(row)
 
     async def update_content_hash(
-        self, *, build_id: int, content_hash: str
+        self,
+        *,
+        build_id: int,
+        content_hash: str,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
     ) -> Build:
         """Overwrite the content hash on a build row.
 
@@ -307,14 +343,28 @@ class BuildStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            msg = f"Build {build_id} not found"
-            raise InvalidBuildStateError(msg)
-        if row.status != BuildStatus.pending:
-            msg = (
-                f"Cannot update content hash on build {build_id}: "
-                f"status is {row.status.value!r}, expected 'pending'"
+            raise InvalidBuildStateError(
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=f"Build id={build_id} not found",
             )
-            raise InvalidBuildStateError(msg)
+        if row.status != BuildStatus.pending:
+            current = BuildStatus(row.status)
+            raise InvalidBuildStateError(
+                current_state=current.value,
+                target_state=BuildStatus.pending.value,
+                build_public_id=serialize_base32_id(row.public_id),
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=(
+                    f"Cannot update content hash on build "
+                    f"{serialize_base32_id(row.public_id)}: "
+                    f"status is {current.value!r}, expected "
+                    f"{BuildStatus.pending.value!r}"
+                ),
+            )
         row.content_hash = content_hash
         await self._session.flush()
         await self._session.refresh(row)

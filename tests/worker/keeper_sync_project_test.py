@@ -12,6 +12,7 @@ failing paths — without depending on real S3 or R2.
 from __future__ import annotations
 
 import json
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -19,9 +20,15 @@ from typing import Any, Self
 import httpx
 import pytest
 import respx
+import sentry_sdk
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.testing.sentry import (
+    TestTransport,
+    capture_events_fixture,
+    sentry_init_fixture,
+)
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +46,7 @@ from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
+from docverse.sentry import initialize_sentry
 from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.build_store import BuildStore
@@ -613,6 +621,102 @@ async def test_keeper_sync_project_failure_marks_queue_job_and_finalises_run(
 
     # Nothing was copied to the destination on the failure path.
     assert object_store.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_failure_captures_to_sentry(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker's explicit ``capture_exception`` reaches Sentry on failure.
+
+    Locks the worker-side analogue of the FastAPI exception handler from
+    PRD #338 (user stories 2, 3, 23, 24): when ``keeper_sync_project``
+    catches an exception in its outer ``except`` block, transitions the
+    queue-job to ``failed``, and re-raises, the explicit
+    ``sentry_sdk.capture_exception(exc)`` produces exactly one Sentry
+    envelope tagged with the worker-keeper-sync component and the
+    package ``release``. The structured-log breadcrumb
+    (``logger.exception``) and the queue-job ``failed`` transition both
+    stay intact — Sentry is additive, never a replacement.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    # Force the LTD product fetch to 404 so ``LtdNotFoundError`` propagates
+    # out of ``KeeperSyncService.sync_project`` and hits the worker's
+    # outer ``except``.
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(404)
+    )
+    object_store = MockObjectStore()
+    _patch_factory_io(
+        monkeypatch, object_store=object_store, source_objects={}
+    )
+
+    # Sentry test transport + DSN gating must be in place *before*
+    # ``initialize_sentry`` runs — otherwise the wrapper's
+    # ``should_enable_sentry`` early-return leaves the SDK uninitialised
+    # and the explicit capture never reaches a transport.
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    real_init = sentry_sdk.init
+
+    def _init_with_test_transport(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("transport", TestTransport())
+        return real_init(*args, **kwargs)
+
+    monkeypatch.setattr(sentry_sdk, "init", _init_with_test_transport)
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with sentry_init_fixture():
+        initialize_sentry(component="worker-keeper-sync")
+        captured = capture_events_fixture(monkeypatch)()
+
+        with pytest.raises(LtdNotFoundError):
+            await keeper_sync_project(
+                ctx,
+                {
+                    "org_id": org_id,
+                    "org_slug": org_slug,
+                    "run_id": run_id,
+                    "queue_job_id": queue_job_id,
+                    "ltd_slug": "pipelines",
+                    "ltd_base_url": LTD_BASE,
+                },
+            )
+
+        assert len(captured.errors) == 1
+        event = captured.errors[0]
+        assert event["release"] == pkg_version("docverse")
+        assert event["tags"]["service"] == "docverse"
+        assert event["tags"]["component"] == "worker-keeper-sync"
+        exc_values = event["exception"]["values"]
+        assert any(exc["type"] == "LtdNotFoundError" for exc in exc_values)
+    await ctx["http_client"].aclose()
+
+    # The failure transitions the queue-job + run row are still in place
+    # — Sentry is additive to the existing finalisation contract.
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
 
 
 @pytest.mark.asyncio

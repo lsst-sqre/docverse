@@ -26,7 +26,7 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunActivity,
 )
 from docverse.domain.queue import JobStatus
-from docverse.exceptions import InvalidJobStateError
+from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse.storage.pagination import KeeperSyncRunDateStartedCursor
 
 __all__ = ["KeeperSyncRunStore"]
@@ -130,11 +130,15 @@ class KeeperSyncRunStore:
         if current is new_status:
             return KeeperSyncRun.model_validate(row)
         if not _is_allowed_transition(current, new_status):
-            msg = (
-                f"Cannot transition keeper sync run {run_id} from "
-                f"{current.value!r} to {new_status.value!r}"
+            raise InvalidJobStateError(
+                current_state=current.value,
+                target_state=new_status.value,
+                job_function="KeeperSyncRunStore.transition_status",
+                message=(
+                    f"Cannot transition keeper sync run {run_id} from "
+                    f"{current.value!r} to {new_status.value!r}"
+                ),
             )
-            raise InvalidJobStateError(msg)
 
         row.status = new_status.value
         if new_status not in _NON_TERMINAL_STATUSES:
@@ -279,8 +283,10 @@ class KeeperSyncRunStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            msg = f"Keeper sync run {run_id} not found"
-            raise InvalidJobStateError(msg)
+            raise JobNotFoundError(
+                job_function="KeeperSyncRunStore._get_row",
+                message=f"Keeper sync run {run_id} not found",
+            )
         return row
 
 

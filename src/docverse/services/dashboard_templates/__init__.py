@@ -16,14 +16,13 @@ from .resolver import (
     ResolvedTemplateOrigin,
     TemplateResolver,
 )
-from .sync import DashboardTemplateSyncer, DashboardTemplateSyncError
+from .sync import DashboardTemplateSyncer
 
 __all__ = [
     "DashboardRebuildFanout",
     "DashboardSyncEnqueuer",
     "DashboardTemplateBindingResult",
     "DashboardTemplateBindingService",
-    "DashboardTemplateSyncError",
     "DashboardTemplateSyncer",
     "InstallationEventProcessor",
     "PushEventProcessor",

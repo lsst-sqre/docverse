@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sentry_sdk
 import structlog
 
 from docverse.client.models.queue_enums import JobKind
@@ -208,7 +209,8 @@ async def try_enqueue_dashboard_build_by_slug(
                 org_slug=org_slug, project_slug=project_slug
             )
             await session.commit()
-    except Exception:
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         logger.exception(
             "Failed to enqueue dashboard_build",
             org_slug=org_slug,
@@ -232,7 +234,8 @@ async def try_enqueue_dashboard_build_by_id(
                 org_id=org_id, project_id=project_id
             )
             await session.commit()
-    except Exception:
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         logger.exception(
             "Failed to enqueue dashboard_build",
             org_id=org_id,

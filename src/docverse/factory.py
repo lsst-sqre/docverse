@@ -394,16 +394,27 @@ class Factory:
             ``github_webhook_secret`` is unset, or the startup-time
             validation marked the credentials as invalid.
         """
-        if (
-            self._github_app_id is None
-            or self._github_app_private_key is None
-            or self._github_webhook_secret is None
-        ):
-            msg = "GitHub App is not configured"
-            raise GitHubAppNotConfiguredError(msg)
+        if self._github_app_id is None:
+            raise GitHubAppNotConfiguredError(missing_secret="app_id")  # noqa: S106
+        if self._github_app_private_key is None:
+            raise GitHubAppNotConfiguredError(missing_secret="private_key")  # noqa: S106
+        if self._github_webhook_secret is None:
+            raise GitHubAppNotConfiguredError(missing_secret="webhook_secret")  # noqa: S106
         if not self._github_app_validated:
-            msg = "GitHub App credentials failed startup validation"
-            raise GitHubAppNotConfiguredError(msg)
+            # The startup validator failed but does not record which
+            # specific credential is to blame; the canonical failure
+            # mode is a malformed PEM or a key that no longer matches
+            # the registered app, both of which surface through the
+            # private key. Keep the explicit "failed startup
+            # validation" wording in pod logs and on the
+            # ``SlackException`` rendering while tagging the Sentry
+            # event with ``missing_secret="private_key"`` so the event
+            # routes to the same operator persona as the unset-key
+            # case.
+            raise GitHubAppNotConfiguredError(
+                missing_secret="private_key",  # noqa: S106
+                message="GitHub App credentials failed startup validation",
+            )
         return (
             self._github_app_id,
             self._github_app_private_key,

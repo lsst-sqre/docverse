@@ -24,7 +24,7 @@ from docverse.domain.lifecycle_eval_run import (
     LifecycleEvalRunActivity,
 )
 from docverse.domain.queue import JobStatus
-from docverse.exceptions import InvalidJobStateError
+from docverse.exceptions import InvalidJobStateError, JobNotFoundError
 
 __all__ = ["LifecycleEvalRunStore"]
 
@@ -109,11 +109,15 @@ class LifecycleEvalRunStore:
         if current is new_status:
             return LifecycleEvalRun.model_validate(row)
         if not _is_allowed_transition(current, new_status):
-            msg = (
-                f"Cannot transition lifecycle eval run {run_id} from "
-                f"{current.value!r} to {new_status.value!r}"
+            raise InvalidJobStateError(
+                current_state=current.value,
+                target_state=new_status.value,
+                job_function="LifecycleEvalRunStore.transition_status",
+                message=(
+                    f"Cannot transition lifecycle eval run {run_id} from "
+                    f"{current.value!r} to {new_status.value!r}"
+                ),
             )
-            raise InvalidJobStateError(msg)
 
         row.status = new_status.value
         if new_status not in _NON_TERMINAL_STATUSES:
@@ -201,8 +205,10 @@ class LifecycleEvalRunStore:
         )
         row = result.scalar_one_or_none()
         if row is None:
-            msg = f"Lifecycle eval run {run_id} not found"
-            raise InvalidJobStateError(msg)
+            raise JobNotFoundError(
+                job_function="LifecycleEvalRunStore._get_row",
+                message=f"Lifecycle eval run {run_id} not found",
+            )
         return row
 
 

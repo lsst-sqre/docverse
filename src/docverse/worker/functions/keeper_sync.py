@@ -34,6 +34,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
 import httpx
+import sentry_sdk
 import structlog
 from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
@@ -298,6 +299,7 @@ async def keeper_sync_run_discovery(
                 in_scope_count=len(in_scope),
             )
         except Exception as exc:
+            sentry_sdk.capture_exception(exc)
             logger.exception("Keeper-sync discovery failed")
             async with session.begin():
                 await queue_job_store.fail(
@@ -426,6 +428,7 @@ async def keeper_sync_project(
                 logger=logger,
             )
         except Exception as exc:
+            sentry_sdk.capture_exception(exc)
             logger.exception("Keeper-sync project failed")
             async with session.begin():
                 await queue_job_store.fail(
@@ -692,7 +695,8 @@ async def _fetch_ltd_product_slugs(
     )
     try:
         return await client.list_product_slugs()
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        sentry_sdk.capture_exception(exc)
         logger.exception("Failed to fetch LTD product slugs")
         raise
 
@@ -943,7 +947,8 @@ async def _run_tier(
                     org=org,
                     logger=logger,
                 )
-            except Exception:
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
                 logger.exception(
                     "Keeper-sync tier processor failed for org",
                     tier=tier_name,
@@ -1029,7 +1034,8 @@ async def _tier_main_for_org(
                 org_id=org.id,
                 ltd_slug=ltd_slug,
             )
-        except LtdClientError:
+        except LtdClientError as exc:
+            sentry_sdk.capture_exception(exc)
             logger.exception(
                 "Tier-main: failed to fetch main edition",
                 org=org.slug,
@@ -1155,7 +1161,8 @@ async def _tier_discovery_for_org(
                 project_state=project_state,
                 edition_state_by_ltd_id=edition_state_by_ltd_id,
             )
-        except LtdClientError:
+        except LtdClientError as exc:
+            sentry_sdk.capture_exception(exc)
             logger.exception(
                 "Tier-discovery: failed to inspect project editions",
                 org=org.slug,
@@ -1252,7 +1259,8 @@ async def _tier_other_for_org(
             continue
         try:
             ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
-        except LtdClientError:
+        except LtdClientError as exc:
+            sentry_sdk.capture_exception(exc)
             logger.exception(
                 "Tier-other: failed to fetch project editions",
                 org=org.slug,

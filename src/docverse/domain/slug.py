@@ -14,6 +14,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
 from docverse.client.models import EditionKind, TrackingMode
+from docverse.exceptions import DocverseSlackException
 
 __all__ = [
     "ALTERNATE_SEPARATOR",
@@ -48,7 +49,7 @@ _ALLOWED_SLASH_REPLACEMENTS = frozenset({"-", "_", "."})
 # --- Exceptions ---
 
 
-class InvalidSlugError(Exception):
+class InvalidSlugError(DocverseSlackException):
     """The derived slug fails validation."""
 
     def __init__(self, slug: str, reason: str) -> None:
