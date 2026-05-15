@@ -28,7 +28,6 @@ from docverse.exceptions import (
     InvalidJobStateError,
     JobNotFoundError,
 )
-from docverse.services.dashboard_templates import DashboardTemplateSyncError
 
 
 def _make_invalid_slug() -> InvalidSlugError:
@@ -69,10 +68,6 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("InvalidBuildStateError", _make_invalid_build_state),
     ("JobNotFoundError", _make_job_not_found),
     ("InvalidSlugError", _make_invalid_slug),
-    (
-        "DashboardTemplateSyncError",
-        lambda: DashboardTemplateSyncError("sync failed for binding 1"),
-    ),
 ]
 
 

@@ -131,7 +131,7 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         queue_job_id,
                         errors={
                             "message": sync_result.error or "Sync failed",
-                            "type": "DashboardTemplateSyncError",
+                            "type": "dashboard_sync_failed",
                         },
                     )
                 return "failed"

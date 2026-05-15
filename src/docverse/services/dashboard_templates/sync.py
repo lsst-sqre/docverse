@@ -14,7 +14,7 @@ import structlog
 from docverse.domain.dashboard_github_template import (
     DashboardGitHubTemplateBinding,
 )
-from docverse.exceptions import DocverseSlackException, NotFoundError
+from docverse.exceptions import NotFoundError
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
@@ -29,7 +29,6 @@ from docverse.storage.github import GitHubAppClient, GitHubTreeFetcher
 __all__ = [
     "DashboardSyncResult",
     "DashboardSyncStatus",
-    "DashboardTemplateSyncError",
     "DashboardTemplateSyncer",
 ]
 
@@ -46,19 +45,6 @@ class DashboardSyncStatus(StrEnum):
 
     succeeded = "succeeded"
     failed = "failed"
-
-
-class DashboardTemplateSyncError(DocverseSlackException):
-    """Convenience exception for callers that prefer to propagate failure.
-
-    The syncer's :meth:`DashboardTemplateSyncer.sync` method itself
-    never raises this — it always returns a :class:`DashboardSyncResult`
-    whose ``status`` is :attr:`DashboardSyncStatus.failed` on failure —
-    so the binding's ``last_sync_status`` / ``last_sync_error`` row
-    update commits with the caller's transaction. This class exists for
-    callers that want to convert a failed result into an exception
-    (e.g. the worker, which needs to mark the queue job failed).
-    """
 
 
 @dataclass(frozen=True)
