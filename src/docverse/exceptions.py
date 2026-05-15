@@ -105,7 +105,7 @@ class InvalidJobStateError(DocverseSlackException):
         message: str | None = None,
     ) -> None:
         if message is None:
-            message = _format_job_transition_message(
+            message = self._format_message(
                 current_state=current_state,
                 target_state=target_state,
                 job_public_id=job_public_id,
@@ -138,27 +138,29 @@ class InvalidJobStateError(DocverseSlackException):
         info.contexts["queue_job_transition"] = transition
         return info
 
-
-def _format_job_transition_message(
-    *,
-    current_state: str | None,
-    target_state: str | None,
-    job_public_id: str | None,
-) -> str:
-    """Render a default message for :class:`InvalidJobStateError`."""
-    job_part = f"job {job_public_id}" if job_public_id is not None else "job"
-    if current_state is not None and target_state is not None:
-        return (
-            f"Cannot transition {job_part} from "
-            f"{current_state!r} to {target_state!r}"
+    @staticmethod
+    def _format_message(
+        *,
+        current_state: str | None,
+        target_state: str | None,
+        job_public_id: str | None,
+    ) -> str:
+        job_part = (
+            f"job {job_public_id}" if job_public_id is not None else "job"
         )
-    if target_state is not None:
-        return f"Cannot transition {job_part} to {target_state!r}"
-    if current_state is not None:
-        return (
-            f"Invalid state transition for {job_part} from {current_state!r}"
-        )
-    return f"Invalid state for {job_part}"
+        if current_state is not None and target_state is not None:
+            return (
+                f"Cannot transition {job_part} from "
+                f"{current_state!r} to {target_state!r}"
+            )
+        if target_state is not None:
+            return f"Cannot transition {job_part} to {target_state!r}"
+        if current_state is not None:
+            return (
+                f"Invalid state transition for {job_part} "
+                f"from {current_state!r}"
+            )
+        return f"Invalid state for {job_part}"
 
 
 class InvalidBuildStateError(DocverseSlackException):
@@ -187,7 +189,7 @@ class InvalidBuildStateError(DocverseSlackException):
         message: str | None = None,
     ) -> None:
         if message is None:
-            message = _format_build_transition_message(
+            message = self._format_message(
                 current_state=current_state,
                 target_state=target_state,
                 build_public_id=build_public_id,
@@ -222,29 +224,31 @@ class InvalidBuildStateError(DocverseSlackException):
         info.contexts["build_transition"] = transition
         return info
 
-
-def _format_build_transition_message(
-    *,
-    current_state: str | None,
-    target_state: str | None,
-    build_public_id: str | None,
-) -> str:
-    """Render a default message for :class:`InvalidBuildStateError`."""
-    build_part = (
-        f"build {build_public_id}" if build_public_id is not None else "build"
-    )
-    if current_state is not None and target_state is not None:
-        return (
-            f"Cannot transition {build_part} from "
-            f"{current_state!r} to {target_state!r}"
+    @staticmethod
+    def _format_message(
+        *,
+        current_state: str | None,
+        target_state: str | None,
+        build_public_id: str | None,
+    ) -> str:
+        build_part = (
+            f"build {build_public_id}"
+            if build_public_id is not None
+            else "build"
         )
-    if target_state is not None:
-        return f"Cannot transition {build_part} to {target_state!r}"
-    if current_state is not None:
-        return (
-            f"Invalid state transition for {build_part} from {current_state!r}"
-        )
-    return f"Invalid state for {build_part}"
+        if current_state is not None and target_state is not None:
+            return (
+                f"Cannot transition {build_part} from "
+                f"{current_state!r} to {target_state!r}"
+            )
+        if target_state is not None:
+            return f"Cannot transition {build_part} to {target_state!r}"
+        if current_state is not None:
+            return (
+                f"Invalid state transition for {build_part} "
+                f"from {current_state!r}"
+            )
+        return f"Invalid state for {build_part}"
 
 
 class JobNotFoundError(DocverseSlackException):
@@ -271,9 +275,7 @@ class JobNotFoundError(DocverseSlackException):
         message: str | None = None,
     ) -> None:
         if message is None:
-            message = _format_job_not_found_message(
-                job_public_id=job_public_id
-            )
+            message = self._format_message(job_public_id=job_public_id)
         super().__init__(message)
         self.job_public_id = job_public_id
         self.queue_name = queue_name
@@ -292,9 +294,8 @@ class JobNotFoundError(DocverseSlackException):
         info.contexts["queue_job_lookup"] = lookup
         return info
 
-
-def _format_job_not_found_message(*, job_public_id: str | None) -> str:
-    """Render a default message for :class:`JobNotFoundError`."""
-    if job_public_id is not None:
-        return f"Queue job {job_public_id} not found"
-    return "Queue job not found"
+    @staticmethod
+    def _format_message(*, job_public_id: str | None) -> str:
+        if job_public_id is not None:
+            return f"Queue job {job_public_id} not found"
+        return "Queue job not found"
