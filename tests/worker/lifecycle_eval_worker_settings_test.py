@@ -8,6 +8,8 @@ same dedicated pool so the dispatcher's enqueues actually run.
 
 from __future__ import annotations
 
+from typing import Any
+
 from arq.cron import CronJob
 from arq.worker import Function
 
@@ -31,9 +33,26 @@ from docverse.worker.main import (
 _config = Configuration()
 
 
+def _underlying(coroutine: Any) -> Any:
+    """Return the raw function under any ``instrument_arq_task`` wrap.
+
+    Every task on the production WorkerSettings is wrapped with
+    :func:`docverse.sentry.instrument_arq_task`, which uses
+    :func:`functools.wraps` and therefore exposes the original
+    coroutine via ``__wrapped__``. This helper peels exactly one
+    layer (or returns the value as-is if it is already raw) so the
+    registration-shape assertions in this module can compare against
+    the unwrapped function imported from ``worker.functions``.
+    """
+    return getattr(coroutine, "__wrapped__", coroutine)
+
+
 def _function_by_coroutine(coro: object) -> Function:
     for entry in LifecycleEvalWorkerSettings.functions:
-        if isinstance(entry, Function) and entry.coroutine is coro:
+        if (
+            isinstance(entry, Function)
+            and _underlying(entry.coroutine) is coro
+        ):
             return entry
     msg = f"No registered Function wraps {coro!r}"
     raise AssertionError(msg)
@@ -89,7 +108,7 @@ def test_lifecycle_eval_dispatcher_runs_hourly() -> None:
         job
         for job in cron_jobs
         if isinstance(job, CronJob)
-        and job.coroutine is lifecycle_eval_dispatcher
+        and _underlying(job.coroutine) is lifecycle_eval_dispatcher
     ]
     assert len(dispatcher_crons) == 1
     assert dispatcher_crons[0].minute == {0}
@@ -102,9 +121,16 @@ def test_lifecycle_reaper_registered_as_function() -> None:
     in :func:`arq.func` — it is a cron-only backstop with no per-job
     timeout knob and arq's default retry policy is irrelevant since
     each tick is self-contained. Mirrors how ``keeper_sync_reaper`` is
-    registered on :class:`KeeperSyncWorkerSettings`.
+    registered on :class:`KeeperSyncWorkerSettings`. After
+    :func:`docverse.sentry.instrument_arq_task` wraps it, the entry is
+    no longer ``is lifecycle_reaper``; the test unwraps every entry to
+    recover the underlying coroutine.
     """
-    assert lifecycle_reaper in LifecycleEvalWorkerSettings.functions
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in LifecycleEvalWorkerSettings.functions
+    }
+    assert lifecycle_reaper in underlying
 
 
 def test_lifecycle_reaper_runs_every_thirty_minutes() -> None:
@@ -119,7 +145,8 @@ def test_lifecycle_reaper_runs_every_thirty_minutes() -> None:
     reaper_crons = [
         job
         for job in cron_jobs
-        if isinstance(job, CronJob) and job.coroutine is lifecycle_reaper
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is lifecycle_reaper
     ]
     assert len(reaper_crons) == 1
     assert reaper_crons[0].minute == {0, 30}
@@ -127,23 +154,22 @@ def test_lifecycle_reaper_runs_every_thirty_minutes() -> None:
 
 def test_default_worker_does_not_register_lifecycle_functions() -> None:
     """The default queue stays free of lifecycle work."""
-    default_coros: set[object] = set()
-    for entry in WorkerSettings.functions:
-        if isinstance(entry, Function):
-            default_coros.add(entry.coroutine)
-    assert lifecycle_eval not in WorkerSettings.functions
-    assert lifecycle_eval_dispatcher not in WorkerSettings.functions
-    assert lifecycle_reaper not in WorkerSettings.functions
-    assert lifecycle_eval not in default_coros
-    assert lifecycle_eval_dispatcher not in default_coros
-    assert lifecycle_reaper not in default_coros
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert lifecycle_eval not in default_underlying
+    assert lifecycle_eval_dispatcher not in default_underlying
+    assert lifecycle_reaper not in default_underlying
 
 
 def test_default_worker_has_no_lifecycle_cron() -> None:
     """The default queue does not run the lifecycle dispatcher or reaper."""
     cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
     coroutines = {
-        job.coroutine for job in cron_jobs if isinstance(job, CronJob)
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
     }
     assert lifecycle_eval_dispatcher not in coroutines
     assert lifecycle_reaper not in coroutines
@@ -156,13 +182,10 @@ def test_keeper_sync_worker_does_not_register_lifecycle_functions() -> None:
     cannot delay keeper_sync_project; registering lifecycle functions
     on KeeperSyncWorkerSettings would defeat that isolation.
     """
-    sync_coros: set[object] = set()
-    for entry in KeeperSyncWorkerSettings.functions:
-        if isinstance(entry, Function):
-            sync_coros.add(entry.coroutine)
-    assert lifecycle_eval not in sync_coros
-    assert lifecycle_eval_dispatcher not in sync_coros
-    assert lifecycle_reaper not in sync_coros
-    assert lifecycle_eval not in KeeperSyncWorkerSettings.functions
-    assert lifecycle_eval_dispatcher not in KeeperSyncWorkerSettings.functions
-    assert lifecycle_reaper not in KeeperSyncWorkerSettings.functions
+    sync_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in KeeperSyncWorkerSettings.functions
+    }
+    assert lifecycle_eval not in sync_underlying
+    assert lifecycle_eval_dispatcher not in sync_underlying
+    assert lifecycle_reaper not in sync_underlying

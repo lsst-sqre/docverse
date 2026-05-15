@@ -23,7 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.factory import Factory
-from docverse.sentry import DocverseSentryComponent, initialize_sentry
+from docverse.sentry import (
+    DocverseSentryComponent,
+    initialize_sentry,
+    instrument_arq_task,
+)
 from docverse.services.credential_encryptor import CredentialEncryptor
 from docverse.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
@@ -286,11 +290,11 @@ class WorkerSettings:
     """arq WorkerSettings for the default Docverse queue."""
 
     functions = [
-        build_processing,
-        dashboard_build,
-        dashboard_sync,
-        ping,
-        publish_edition,
+        instrument_arq_task(build_processing),
+        instrument_arq_task(dashboard_build),
+        instrument_arq_task(dashboard_sync),
+        instrument_arq_task(ping),
+        instrument_arq_task(publish_edition),
     ]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
@@ -323,19 +327,19 @@ class KeeperSyncWorkerSettings:
 
     functions = [
         func(
-            keeper_sync_run_discovery,
+            instrument_arq_task(keeper_sync_run_discovery),
             timeout=config.keeper_sync_job_timeout_seconds,
             max_tries=1,
         ),
         func(
-            keeper_sync_project,
+            instrument_arq_task(keeper_sync_project),
             timeout=config.keeper_sync_job_timeout_seconds,
             max_tries=1,
         ),
-        keeper_sync_reaper,
-        keeper_sync_tier_main,
-        keeper_sync_tier_discovery,
-        keeper_sync_tier_other,
+        instrument_arq_task(keeper_sync_reaper),
+        instrument_arq_task(keeper_sync_tier_main),
+        instrument_arq_task(keeper_sync_tier_discovery),
+        instrument_arq_task(keeper_sync_tier_other),
     ]
     # Tier-cron cadences come from the constants in
     # ``services/keeper_sync/scheduler.py`` so the planner's next-tick
@@ -343,19 +347,19 @@ class KeeperSyncWorkerSettings:
     # schedule cannot drift.
     cron_jobs = [
         cron(
-            keeper_sync_reaper,
+            instrument_arq_task(keeper_sync_reaper),
             minute={0, 30},
         ),
         # Tier 1 — keeps the user-visible ``main`` edition fresh per
         # user story 10's SLO.
         cron(
-            keeper_sync_tier_main,
+            instrument_arq_task(keeper_sync_tier_main),
             minute=_cron_minutes_for_tier_interval(TIER_MAIN_CRON_INTERVAL),
         ),
         # Tier 2 — discovers LTD resources without a
         # ``keeper_sync_state`` row.
         cron(
-            keeper_sync_tier_discovery,
+            instrument_arq_task(keeper_sync_tier_discovery),
             minute=_cron_minutes_for_tier_interval(
                 TIER_DISCOVERY_CRON_INTERVAL
             ),
@@ -363,7 +367,7 @@ class KeeperSyncWorkerSettings:
         # Tier 3 — catches non-``main`` editions whose state has aged
         # past the threshold.
         cron(
-            keeper_sync_tier_other,
+            instrument_arq_task(keeper_sync_tier_other),
             minute=_cron_minutes_for_tier_interval(TIER_OTHER_CRON_INTERVAL),
         ),
     ]
@@ -401,24 +405,24 @@ class LifecycleEvalWorkerSettings:
 
     functions = [
         func(
-            lifecycle_eval_dispatcher,
+            instrument_arq_task(lifecycle_eval_dispatcher),
             timeout=config.lifecycle_eval_job_timeout_seconds,
             max_tries=1,
         ),
         func(
-            lifecycle_eval,
+            instrument_arq_task(lifecycle_eval),
             timeout=config.lifecycle_eval_job_timeout_seconds,
             max_tries=1,
         ),
-        lifecycle_reaper,
+        instrument_arq_task(lifecycle_reaper),
     ]
     cron_jobs = [
         cron(
-            lifecycle_eval_dispatcher,
+            instrument_arq_task(lifecycle_eval_dispatcher),
             minute={0},
         ),
         cron(
-            lifecycle_reaper,
+            instrument_arq_task(lifecycle_reaper),
             minute={0, 30},
         ),
     ]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from arq.cron import CronJob
 from arq.worker import Function
 
@@ -23,9 +25,26 @@ from docverse.worker.main import (
 _config = Configuration()
 
 
+def _underlying(coroutine: Any) -> Any:
+    """Return the raw function under any ``instrument_arq_task`` wrap.
+
+    Every task on the production WorkerSettings is wrapped with
+    :func:`docverse.sentry.instrument_arq_task`, which uses
+    :func:`functools.wraps` and therefore exposes the original
+    coroutine via ``__wrapped__``. This helper peels exactly one
+    layer (or returns the value as-is if it is already raw) so the
+    registration-shape assertions in this module can compare against
+    the unwrapped function imported from ``worker.functions``.
+    """
+    return getattr(coroutine, "__wrapped__", coroutine)
+
+
 def _function_by_coroutine(coro: object) -> Function:
     for entry in KeeperSyncWorkerSettings.functions:
-        if isinstance(entry, Function) and entry.coroutine is coro:
+        if (
+            isinstance(entry, Function)
+            and _underlying(entry.coroutine) is coro
+        ):
             return entry
     msg = f"No registered Function wraps {coro!r}"
     raise AssertionError(msg)
@@ -57,17 +76,13 @@ def test_keeper_sync_worker_settings_registers_keeper_sync_functions() -> None:
 
 def test_default_worker_does_not_register_keeper_sync_functions() -> None:
     """The default queue stays free of keeper-sync work."""
-    assert keeper_sync_run_discovery not in WorkerSettings.functions
-    assert keeper_sync_project not in WorkerSettings.functions
-    assert keeper_sync_reaper not in WorkerSettings.functions
-    # And no ``arq.Function`` wrapper sneaks the same coroutines in either.
-    default_coros: set[object] = set()
-    for entry in WorkerSettings.functions:
-        if isinstance(entry, Function):
-            default_coros.add(entry.coroutine)
-    assert keeper_sync_run_discovery not in default_coros
-    assert keeper_sync_project not in default_coros
-    assert keeper_sync_reaper not in default_coros
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert keeper_sync_run_discovery not in default_underlying
+    assert keeper_sync_project not in default_underlying
+    assert keeper_sync_reaper not in default_underlying
 
 
 def test_keeper_sync_worker_settings_share_lifecycle_hooks() -> None:
@@ -97,7 +112,8 @@ def test_keeper_sync_worker_registers_reaper_cron() -> None:
     reaper_crons = [
         job
         for job in cron_jobs
-        if isinstance(job, CronJob) and job.coroutine is keeper_sync_reaper
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is keeper_sync_reaper
     ]
     assert len(reaper_crons) == 1
     assert reaper_crons[0].minute == {0, 30}
@@ -107,6 +123,8 @@ def test_default_worker_has_no_keeper_sync_cron() -> None:
     """The default queue does not run the reaper."""
     cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
     coroutines = {
-        job.coroutine for job in cron_jobs if isinstance(job, CronJob)
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
     }
     assert keeper_sync_reaper not in coroutines
