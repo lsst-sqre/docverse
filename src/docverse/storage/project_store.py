@@ -389,32 +389,55 @@ class ProjectStore:
         non-GitHub URLs and URLs whose first two path segments do not
         match ``(github_owner, old_repo)`` untouched.
 
+        ``date_updated`` is preserved on every row (the per-row
+        ``update()`` pins ``date_updated=SqlProject.date_updated`` so
+        the column's ``onupdate=func.now()`` does not fire): a
+        GitHub-side rename is sync-bookkeeping, not an operator-visible
+        source-coordinate edit, which arrives through PUT/PATCH. This
+        mirrors the discipline of the dashboard binding store's
+        ``rename_repo_by_repo_id`` and of ``apply_installation_scope``.
+        The ``source_url`` is computed in Python rather than mutated via
+        the ORM so the write can go through a ``date_updated``-pinning
+        bulk ``update()`` even when it differs per row.
+
         Returns the list of updated project ids.
         """
         result = await self._session.execute(
-            select(SqlProject).where(
+            select(
+                SqlProject.id,
+                SqlProject.source_url,
+                SqlProject.github_owner,
+                SqlProject.github_repo,
+            ).where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
             )
         )
         updated_ids: list[int] = []
-        for row in result.scalars().all():
-            old_repo = row.github_repo
-            row.github_repo = new_repo
+        for row in result.all():
+            values: dict[str, Any] = {
+                "github_repo": new_repo,
+                "date_updated": SqlProject.date_updated,
+            }
             if (
                 row.source_url is not None
                 and row.github_owner is not None
-                and old_repo is not None
+                and row.github_repo is not None
             ):
                 rewritten = _rewrite_github_source_url(
                     row.source_url,
                     old_owner=row.github_owner,
-                    old_repo=old_repo,
+                    old_repo=row.github_repo,
                     new_owner=row.github_owner,
                     new_repo=new_repo,
                 )
                 if rewritten is not None:
-                    row.source_url = rewritten
+                    values["source_url"] = rewritten
+            await self._session.execute(
+                update(SqlProject)
+                .where(SqlProject.id == row.id)
+                .values(**values)
+            )
             updated_ids.append(row.id)
         await self._session.flush()
         return updated_ids
@@ -440,34 +463,56 @@ class ProjectStore:
         github.com URL whose first two path segments match the old
         owner/repo — non-GitHub URLs and URLs whose path was
         already pointing somewhere else are left alone.
+
+        ``date_updated`` is preserved on every row (the per-row
+        ``update()`` pins ``date_updated=SqlProject.date_updated`` so
+        the column's ``onupdate=func.now()`` does not fire): a
+        GitHub-side transfer is sync-bookkeeping, not an operator-
+        visible source-coordinate edit, which arrives through PUT/PATCH.
+        This mirrors the discipline of the dashboard binding store's
+        ``transfer_repo_by_repo_id`` and of ``apply_installation_scope``.
+        The ``source_url`` is computed in Python rather than mutated via
+        the ORM so the write can go through a ``date_updated``-pinning
+        bulk ``update()`` even when it differs per row.
         """
         result = await self._session.execute(
-            select(SqlProject).where(
+            select(
+                SqlProject.id,
+                SqlProject.source_url,
+                SqlProject.github_owner,
+                SqlProject.github_repo,
+            ).where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
             )
         )
         updated_ids: list[int] = []
-        for row in result.scalars().all():
-            old_owner = row.github_owner
-            old_repo = row.github_repo
-            row.github_owner = new_owner
-            row.github_owner_id = new_owner_id
-            row.github_repo = new_repo
+        for row in result.all():
+            values: dict[str, Any] = {
+                "github_owner": new_owner,
+                "github_owner_id": new_owner_id,
+                "github_repo": new_repo,
+                "date_updated": SqlProject.date_updated,
+            }
             if (
                 row.source_url is not None
-                and old_owner is not None
-                and old_repo is not None
+                and row.github_owner is not None
+                and row.github_repo is not None
             ):
                 rewritten = _rewrite_github_source_url(
                     row.source_url,
-                    old_owner=old_owner,
-                    old_repo=old_repo,
+                    old_owner=row.github_owner,
+                    old_repo=row.github_repo,
                     new_owner=new_owner,
                     new_repo=new_repo,
                 )
                 if rewritten is not None:
-                    row.source_url = rewritten
+                    values["source_url"] = rewritten
+            await self._session.execute(
+                update(SqlProject)
+                .where(SqlProject.id == row.id)
+                .values(**values)
+            )
             updated_ids.append(row.id)
         await self._session.flush()
         return updated_ids
@@ -545,25 +590,35 @@ class ProjectStore:
         binding's columns — better to lose this update than to write
         ids that disagree with ``github_owner`` / ``github_repo``.
 
+        ``date_updated`` is explicitly preserved: capturing the three
+        opportunistic ``github_*_id`` columns is sync-bookkeeping, not
+        an operator-visible source-coordinate edit, so bumping
+        ``date_updated`` here would mislead any consumer that reads it
+        as ``last operator change``. Mirrors ``apply_installation_scope``
+        and the dashboard binding store.
+
         Returns ``True`` when the row was updated, ``False`` when no
         row matched (project deleted, or binding changed).
         """
-        result = await self._session.execute(
-            select(SqlProject).where(
+        stmt = (
+            update(SqlProject)
+            .where(
                 SqlProject.id == project_id,
                 SqlProject.github_owner == expected_owner,
                 SqlProject.github_repo == expected_repo,
                 SqlProject.date_deleted.is_(None),
             )
+            .values(
+                github_installation_id=installation_id,
+                github_owner_id=owner_id,
+                github_repo_id=repo_id,
+                date_updated=SqlProject.date_updated,
+            )
+            .returning(SqlProject.id)
         )
-        row = result.scalar_one_or_none()
-        if row is None:
-            return False
-        row.github_installation_id = installation_id
-        row.github_owner_id = owner_id
-        row.github_repo_id = repo_id
+        result = await self._session.execute(stmt)
         await self._session.flush()
-        return True
+        return result.first() is not None
 
     async def soft_delete(self, *, org_id: int, slug: str) -> bool:
         """Soft-delete a project by setting date_deleted.
