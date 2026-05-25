@@ -541,7 +541,7 @@ def _make_project() -> Project:
         slug="proj",
         title="Project",
         org_id=1,
-        doc_repo="https://example.com/repo",
+        source_url="https://example.com/repo",
         slug_rewrite_rules=None,
         lifecycle_rules=None,
         date_created=now,

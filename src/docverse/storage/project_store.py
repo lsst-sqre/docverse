@@ -41,7 +41,7 @@ class ProjectStore:
             slug=data.slug,
             title=data.title,
             org_id=org_id,
-            doc_repo=data.doc_repo,
+            source_url=data.doc_repo,
             lifecycle_rules=lifecycle_rules,
         )
         self._session.add(row)
@@ -285,6 +285,11 @@ class ProjectStore:
         if row is None:
             return None
         updates = data.model_dump(mode="json", exclude_unset=True)
+        # The client model still exposes ``doc_repo`` while the column
+        # was renamed to ``source_url`` for the structured GitHub-binding
+        # work; translate the client field on the way into the row.
+        if "doc_repo" in updates:
+            updates["source_url"] = updates.pop("doc_repo")
         for key, value in updates.items():
             setattr(row, key, value)
         await self._session.flush()

@@ -25,8 +25,52 @@ class Project(BaseModel):
         description="ID of the organization this project belongs to."
     )
 
-    doc_repo: str = Field(
-        description="URL of the documentation source repository."
+    source_url: str | None = Field(
+        default=None,
+        description=(
+            "URL of the documentation source repository. ``None`` for"
+            " projects bound to a GitHub repository only."
+        ),
+    )
+
+    github_owner: str | None = Field(
+        default=None,
+        description=(
+            "Owner login of the GitHub repository backing this project."
+            " Populated together with ``github_repo``."
+        ),
+    )
+
+    github_repo: str | None = Field(
+        default=None,
+        description=(
+            "Name of the GitHub repository backing this project."
+            " Populated together with ``github_owner``."
+        ),
+    )
+
+    github_owner_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub numeric owner id, captured opportunistically once the"
+            " GitHub App resolves the repository."
+        ),
+    )
+
+    github_repo_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub numeric repository id, captured opportunistically once"
+            " the GitHub App resolves the repository."
+        ),
+    )
+
+    github_installation_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub App installation id for the repository, captured"
+            " opportunistically once the App is installed."
+        ),
     )
 
     slug_rewrite_rules: list[dict[str, Any]] | None = Field(

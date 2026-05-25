@@ -118,7 +118,7 @@ async def _seed_duplicates(engine: AsyncEngine) -> tuple[int, int]:
                     "INSERT INTO projects"
                     " (slug, title, org_id, doc_repo)"
                     " VALUES ('cleanup-proj', 'Cleanup Project',"
-                    " :org_id, 'https://example.com/repo')"
+                    " :org_id, 'https://github.com/example/cleanup-proj')"
                     " RETURNING id"
                 ),
                 {"org_id": org_id},

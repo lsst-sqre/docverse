@@ -207,7 +207,7 @@ class Project(_ProjectBase):
             ),
             slug=domain.slug,
             title=domain.title,
-            doc_repo=domain.doc_repo,
+            doc_repo=domain.source_url or "",
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
             default_edition=edition_response,
