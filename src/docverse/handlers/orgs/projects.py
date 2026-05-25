@@ -17,6 +17,9 @@ from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse.services.project_github_resolve_enqueue import (
+    try_enqueue_project_github_resolve_by_id,
+)
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -124,6 +127,12 @@ async def post_project(
             org_slug=org_slug, data=data
         )
         await context.session.commit()
+    await try_enqueue_project_github_resolve_by_id(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        project_id=project.id,
+    )
     return Project.from_domain(
         project,
         context.request,
@@ -184,6 +193,12 @@ async def patch_project(
         logger=context.logger,
         org_slug=org_slug,
         project_slug=project_slug,
+    )
+    await try_enqueue_project_github_resolve_by_id(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        project_id=project.id,
     )
     return Project.from_domain(
         project,

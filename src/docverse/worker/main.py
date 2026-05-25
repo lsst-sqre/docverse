@@ -51,6 +51,7 @@ from .functions import (
     lifecycle_eval_dispatcher,
     lifecycle_reaper,
     ping,
+    project_github_resolve,
     publish_edition,
 )
 from .functions.lifecycle_eval_dispatcher import LIFECYCLE_EVAL_QUEUE_NAME
@@ -294,6 +295,7 @@ class WorkerSettings:
         instrument_arq_task(dashboard_build),
         instrument_arq_task(dashboard_sync),
         instrument_arq_task(ping),
+        instrument_arq_task(project_github_resolve),
         instrument_arq_task(publish_edition),
     ]
     redis_settings = config.arq_redis_settings

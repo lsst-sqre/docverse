@@ -591,10 +591,12 @@ class Factory:
         rename = RenameEventProcessor(
             binding_store=binding_store,
             template_store=template_store,
+            project_store=self.create_project_store(),
             logger=self._logger,
         )
         installation = InstallationEventProcessor(
             binding_store=binding_store,
+            project_store=self.create_project_store(),
             logger=self._logger,
         )
         return WebhookDispatch(

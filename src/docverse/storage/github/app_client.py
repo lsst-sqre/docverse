@@ -20,6 +20,7 @@ __all__ = [
     "GitHubAppNotConfiguredError",
     "InstallationAuth",
     "MissingGitHubAppSecret",
+    "RepositoryMetadata",
 ]
 
 
@@ -37,6 +38,23 @@ _GITHUB_APP_NAME = "lsst-sqre/docverse"
 #: each ("missing app id" vs "stale private key" vs "rotated webhook
 #: secret") without unpacking the rendered message.
 MissingGitHubAppSecret = Literal["app_id", "private_key", "webhook_secret"]
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryMetadata:
+    """Numeric ids GitHub assigns to a repository and its owner.
+
+    Returned by :meth:`GitHubAppClient.resolve_repository_metadata` so
+    the ``project_github_resolve`` worker captures all three columns
+    (``installation_id``, ``owner_id``, ``repo_id``) in a single deep
+    call rather than re-deriving the same shape at each call site.
+    The three fields together survive a GitHub-side rename or
+    transfer; the operator-visible ``owner``/``repo`` strings do not.
+    """
+
+    installation_id: int
+    owner_id: int
+    repo_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +219,45 @@ class GitHubAppClient:
             private_key=self._factory.app_key,
         )
         return str(token_info["token"])
+
+    async def resolve_repository_metadata(
+        self, *, owner: str, repo: str
+    ) -> RepositoryMetadata:
+        """Resolve ``installation_id`` + ``owner_id`` + ``repo_id`` for a repo.
+
+        Combines two GitHub REST calls so the
+        :func:`docverse.worker.functions.project_github_resolve` worker
+        captures all three opportunistic-id columns in one go:
+
+        1. ``GET /repos/{owner}/{repo}/installation`` (with the app
+           JWT) — yields the installation id.
+        2. ``GET /repos/{owner}/{repo}`` (with the installation token)
+           — yields the stable numeric repo id and owner id.
+
+        Mirrors the pair of calls
+        :class:`docverse.storage.github.GitHubTreeFetcher` already
+        makes on every sync; reusing those endpoints keeps the rename-
+        robust id capture path consistent across the codebase. The
+        installation-token round-trip is required because the
+        ``/repos/{owner}/{repo}`` endpoint refuses anonymous reads on
+        private repos.
+        """
+        installation_id = await self.get_installation_id(owner, repo)
+        token = await self.exchange_installation_token(installation_id)
+        response = await self._http_client.get(
+            f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        return RepositoryMetadata(
+            installation_id=installation_id,
+            owner_id=int(data["owner"]["id"]),
+            repo_id=int(data["id"]),
+        )
 
     async def get_installation_auth(
         self, *, owner: str, repo: str

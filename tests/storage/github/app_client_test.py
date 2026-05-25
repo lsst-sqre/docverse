@@ -20,6 +20,7 @@ from docverse.storage.github import (
     GitHubAppClient,
     GitHubAppNotConfiguredError,
     InstallationAuth,
+    RepositoryMetadata,
 )
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
@@ -105,6 +106,43 @@ async def test_get_installation_auth_returns_token_record(
     assert auth.token == "ghs_installtok"  # noqa: S105
     assert auth.base_url == GITHUB_API_BASE_URL
     assert auth.installation_id == 42
+
+
+@pytest.mark.asyncio
+async def test_resolve_repository_metadata_returns_all_three_ids(
+    mock_github: GitHubMock,
+) -> None:
+    """``resolve_repository_metadata`` returns installation, owner, repo IDs.
+
+    Combines the existing ``/repos/{owner}/{repo}/installation`` and
+    ``/repos/{owner}/{repo}`` lookups into one call so the ``project_
+    github_resolve`` worker has a single deep entry point. Asserts the
+    return record carries all three IDs without depending on which
+    endpoint surfaced each — the caller just needs the bundle.
+    """
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo("acme", "templates", repo_id=12345, owner_id=111)
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        metadata = await client.resolve_repository_metadata(
+            owner="acme", repo="templates"
+        )
+
+    assert isinstance(metadata, RepositoryMetadata)
+    assert metadata.installation_id == 42
+    assert metadata.owner_id == 111
+    assert metadata.repo_id == 12345
 
 
 @pytest.mark.asyncio

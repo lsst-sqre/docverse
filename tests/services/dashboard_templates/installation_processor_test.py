@@ -8,7 +8,8 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.services.dashboard_templates.installation_processor import (
     INSTALLATION_DELETED_REASON,
     INSTALLATION_SUSPENDED_REASON,
@@ -19,6 +20,7 @@ from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
 )
 from docverse.storage.organization_store import OrganizationStore
+from docverse.storage.project_store import ProjectStore
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -30,6 +32,7 @@ def _make_processor(session: AsyncSession) -> InstallationEventProcessor:
         binding_store=DashboardGitHubTemplateBindingStore(
             session=session, logger=_logger()
         ),
+        project_store=ProjectStore(session=session, logger=_logger()),
         logger=_logger(),
     )
 
@@ -83,6 +86,34 @@ def _installation_payload(
         },
         "repositories": [],
     }
+
+
+async def _seed_project(
+    session: AsyncSession,
+    *,
+    org_id: int,
+    slug: str,
+    github_owner: str | None,
+    github_repo: str | None,
+) -> int:
+    """Seed a project with optional structured GitHub coordinates."""
+    store = ProjectStore(session=session, logger=_logger())
+    binding = (
+        ProjectGitHubBindingCreate(owner=github_owner, repo=github_repo)
+        if github_owner is not None and github_repo is not None
+        else None
+    )
+    project = await store.create(
+        org_id=org_id,
+        data=ProjectCreate(
+            slug=slug,
+            title=f"Project {slug}",
+            github=binding,
+        ),
+        github_owner=github_owner,
+        github_repo=github_repo,
+    )
+    return project.id
 
 
 @pytest.mark.asyncio
@@ -283,3 +314,260 @@ async def test_installation_event_does_not_touch_other_installations(
     assert binding is not None
     assert binding.last_sync_status == "pending"
     assert binding.last_sync_error is None
+
+
+def _installation_created_payload(
+    *,
+    installation_id: int = 99,
+    owner: str = "acme",
+    owner_id: int = 999,
+    repos: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build an ``installation.created`` payload with seeded repositories."""
+    return {
+        "action": "created",
+        "installation": {
+            "id": installation_id,
+            "account": {"login": owner, "id": owner_id},
+        },
+        "repositories": repos or [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_installation_created_backfills_project_installation_id(
+    db_session: AsyncSession,
+) -> None:
+    """``installation.created`` writes the three github_*_id columns.
+
+    Reproduces the post-install steady state of PRD #346 user story 12:
+    an admin installed the Docverse App on a repo that already has a
+    Docverse project bound to it. The project row's three opportunistic
+    id columns are populated from the webhook payload alone, without a
+    follow-up GitHub API round-trip.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "install-create-backfill")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="docs",
+            github_owner="acme",
+            github_repo="templates",
+        )
+        await db_session.commit()
+
+    payload = _installation_created_payload(
+        installation_id=42,
+        owner="acme",
+        owner_id=999,
+        repos=[
+            {
+                "id": 12345,
+                "name": "templates",
+                "full_name": "acme/templates",
+            }
+        ],
+    )
+
+    async with db_session.begin():
+        await _make_processor(db_session).process(payload)
+        await db_session.commit()
+
+    async with db_session.begin():
+        project = await ProjectStore(
+            session=db_session, logger=_logger()
+        ).get_by_id(project_id)
+    assert project is not None
+    assert project.github_installation_id == 42
+    assert project.github_owner_id == 999
+    assert project.github_repo_id == 12345
+
+
+@pytest.mark.asyncio
+async def test_installation_created_ignores_non_matching_repo(
+    db_session: AsyncSession,
+) -> None:
+    """Projects whose owner/repo do not match the payload are untouched.
+
+    The webhook fires once for every Docverse-App installation, not
+    once per project; a payload covering ``acme/other`` must not flip
+    the columns on a project bound to ``acme/templates``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "install-create-no-match")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="docs",
+            github_owner="acme",
+            github_repo="templates",
+        )
+        await db_session.commit()
+
+    payload = _installation_created_payload(
+        installation_id=42,
+        owner="acme",
+        owner_id=999,
+        repos=[
+            {
+                "id": 88888,
+                "name": "other",
+                "full_name": "acme/other",
+            }
+        ],
+    )
+
+    async with db_session.begin():
+        await _make_processor(db_session).process(payload)
+        await db_session.commit()
+
+    async with db_session.begin():
+        project = await ProjectStore(
+            session=db_session, logger=_logger()
+        ).get_by_id(project_id)
+    assert project is not None
+    assert project.github_installation_id is None
+    assert project.github_owner_id is None
+    assert project.github_repo_id is None
+
+
+@pytest.mark.asyncio
+async def test_installation_created_matches_case_insensitive(
+    db_session: AsyncSession,
+) -> None:
+    """Owner/repo matching is case-insensitive (GitHub canonicalisation).
+
+    The seeded project may have been registered against ``Acme/Docs``
+    while GitHub delivers ``acme/docs`` in the payload. The case-
+    insensitive index on ``(lower(github_owner), lower(github_repo))``
+    is what makes the webhook lookup robust.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "install-create-case")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="docs",
+            github_owner="Acme",
+            github_repo="Templates",
+        )
+        await db_session.commit()
+
+    payload = _installation_created_payload(
+        repos=[
+            {
+                "id": 12345,
+                "name": "templates",
+                "full_name": "acme/templates",
+            }
+        ],
+    )
+
+    async with db_session.begin():
+        await _make_processor(db_session).process(payload)
+        await db_session.commit()
+
+    async with db_session.begin():
+        project = await ProjectStore(
+            session=db_session, logger=_logger()
+        ).get_by_id(project_id)
+    assert project is not None
+    assert project.github_installation_id == 99
+    assert project.github_repo_id == 12345
+
+
+@pytest.mark.asyncio
+async def test_installation_repositories_added_backfills_projects(
+    db_session: AsyncSession,
+) -> None:
+    """``installation_repositories.added`` backfills like ``installation``.
+
+    An operator can scope an existing app installation to new repos
+    after the fact; that path lands as ``installation_repositories
+    .added`` rather than a fresh ``installation.created``. Both event
+    shapes must end up in the same column-write contract.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "install-repos-added")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="docs",
+            github_owner="acme",
+            github_repo="templates",
+        )
+        await db_session.commit()
+
+    payload = {
+        "action": "added",
+        "installation": {
+            "id": 42,
+            "account": {"login": "acme", "id": 999},
+        },
+        "repositories_added": [
+            {
+                "id": 12345,
+                "name": "templates",
+                "full_name": "acme/templates",
+            }
+        ],
+    }
+
+    async with db_session.begin():
+        await _make_processor(db_session).process_installation_repositories(
+            payload
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        project = await ProjectStore(
+            session=db_session, logger=_logger()
+        ).get_by_id(project_id)
+    assert project is not None
+    assert project.github_installation_id == 42
+    assert project.github_owner_id == 999
+    assert project.github_repo_id == 12345
+
+
+@pytest.mark.asyncio
+async def test_installation_created_does_not_touch_non_github_project(
+    db_session: AsyncSession,
+) -> None:
+    """A project without ``github_owner``/``github_repo`` stays NULL.
+
+    Non-GitHub projects (story 14) have NULL in the structured columns;
+    the case-insensitive comparison never matches them, so no row is
+    accidentally bound to an installation that has no claim on it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "install-non-github")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="docs",
+            github_owner=None,
+            github_repo=None,
+        )
+        await db_session.commit()
+
+    payload = _installation_created_payload(
+        repos=[
+            {
+                "id": 12345,
+                "name": "templates",
+                "full_name": "acme/templates",
+            }
+        ],
+    )
+
+    async with db_session.begin():
+        await _make_processor(db_session).process(payload)
+        await db_session.commit()
+
+    async with db_session.begin():
+        project = await ProjectStore(
+            session=db_session, logger=_logger()
+        ).get_by_id(project_id)
+    assert project is not None
+    assert project.github_installation_id is None
