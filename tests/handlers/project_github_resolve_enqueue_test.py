@@ -77,36 +77,6 @@ async def test_post_project_with_github_enqueues_resolve(
 
 
 @pytest.mark.asyncio
-async def test_post_project_with_github_url_enqueues_resolve(
-    client: AsyncClient,
-) -> None:
-    """POST with a github.com ``source_url`` also enqueues a resolve.
-
-    The handler auto-populates ``github`` from a github.com URL when
-    the structured sub-object is omitted (existing behaviour from
-    #379); the resolution enqueue follows the populated binding rather
-    than the literal request body so this convenience path lands the
-    numeric ids too.
-    """
-    await _setup(client)
-    before = _resolve_count()
-
-    response = await client.post(
-        "/docverse/orgs/pgr-org/projects",
-        json={
-            "slug": "gh-from-url",
-            "title": "GitHub From URL",
-            "source_url": "https://github.com/lsst/from-url",
-        },
-        headers={"X-Auth-Request-User": "testuser"},
-    )
-    assert response.status_code == 201
-
-    after = _resolve_count()
-    assert after - before == 1
-
-
-@pytest.mark.asyncio
 async def test_post_non_github_project_does_not_enqueue_resolve(
     client: AsyncClient,
 ) -> None:

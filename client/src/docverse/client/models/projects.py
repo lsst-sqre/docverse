@@ -18,8 +18,21 @@ __all__ = [
     "ProjectGitHubBinding",
     "ProjectGitHubBindingCreate",
     "ProjectUpdate",
+    "build_github_url",
     "parse_github_url",
 ]
+
+
+def build_github_url(owner: str, repo: str) -> str:
+    """Build the canonical ``github.com`` URL for ``owner``/``repo``.
+
+    Inverse of :func:`parse_github_url`: returns
+    ``https://github.com/{owner}/{repo}`` with no trailing slash, path
+    tail, or ``.git`` suffix. Used to derive a project's effective
+    source URL from its structured GitHub binding, which is the single
+    source of truth for GitHub-backed projects.
+    """
+    return f"https://github.com/{owner}/{repo}"
 
 
 def parse_github_url(url: str) -> tuple[str, str] | None:
@@ -88,31 +101,36 @@ class ProjectGitHubBinding(BaseModel):
     )
 
 
-def _validate_github_source_url_agreement(
+def _validate_source_url_github_exclusivity(
     *,
     github: ProjectGitHubBindingCreate | None,
     source_url: str | None,
 ) -> None:
-    """Reject inputs whose ``github`` disagrees with a github.com URL.
+    """Keep ``source_url`` free of GitHub repos and apart from ``github``.
 
-    Raises a ``ValueError`` (which Pydantic surfaces as a 422 response)
-    when both fields are explicitly set, the URL parses as a
-    ``github.com`` repository URL, and the parsed ``(owner, repo)`` pair
-    does not match the structured sub-object. Non-GitHub ``source_url``
-    values and ``None`` on either side short-circuit without checking,
-    so the agreement rule never blocks a project bound to a non-GitHub
-    host or a project being cleared of one side.
+    The structured ``github`` binding is the single source of truth for
+    GitHub-backed projects, so the free-form ``source_url`` column must
+    never carry a ``github.com`` URL. Two rules, both surfaced as a 422:
+
+    * Rule A — ``source_url`` parses as a ``github.com`` repository URL.
+      Reject it: the caller must use the ``github`` field instead.
+    * Rule B — both ``source_url`` (non-null) and ``github`` (non-null)
+      are supplied. Reject it: the two are mutually exclusive, since a
+      project is GitHub-bound *or* points at a non-GitHub URL, never
+      both.
+
+    ``None`` on either side short-circuits the corresponding rule, so a
+    PATCH that clears one field while setting the other (e.g.
+    ``github: null`` plus a GitLab ``source_url``) passes cleanly.
     """
-    if github is None or source_url is None:
-        return
-    parsed = parse_github_url(source_url)
-    if parsed is None:
-        return
-    if (github.owner, github.repo) != parsed:
+    if source_url is not None and parse_github_url(source_url) is not None:
         msg = (
-            f"github sub-object ({github.owner}/{github.repo}) disagrees"
-            f" with source_url ({source_url})"
+            "source_url must not be a github.com URL; use the github field"
+            " for GitHub repositories"
         )
+        raise ValueError(msg)
+    if source_url is not None and github is not None:
+        msg = "source_url and github are mutually exclusive"
         raise ValueError(msg)
 
 
@@ -149,11 +167,13 @@ class ProjectCreate(BaseModel):
             min_length=1,
             max_length=512,
             description=(
-                "URL of the documentation source repository. ``None``"
-                " for projects whose source coordinates are tracked only"
-                " by the structured ``github`` sub-object."
+                "Non-GitHub URL of the documentation source repository;"
+                " use the ``github`` field for GitHub repositories. A"
+                " ``github.com`` value is rejected with a 422. ``None``"
+                " for GitHub-bound projects and for projects with no"
+                " source coordinates."
             ),
-            examples=["https://github.com/lsst/pipelines_lsst_io"],
+            examples=["https://gitlab.com/lsst/pipelines"],
         ),
     ] = None
 
@@ -161,8 +181,7 @@ class ProjectCreate(BaseModel):
         default=None,
         description=(
             "Structured GitHub coordinates for the project's source"
-            " repository. When omitted, the server populates this from"
-            " ``source_url`` if the URL is on ``github.com``."
+            " repository. Mutually exclusive with ``source_url``."
         ),
     )
 
@@ -180,8 +199,8 @@ class ProjectCreate(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _check_github_source_url_agreement(self) -> Self:
-        _validate_github_source_url_agreement(
+    def _check_source_url_github_exclusivity(self) -> Self:
+        _validate_source_url_github_exclusivity(
             github=self.github, source_url=self.source_url
         )
         return self
@@ -215,9 +234,10 @@ class Project(BaseModel):
     source_url: str | None = Field(
         default=None,
         description=(
-            "URL of the documentation source repository. ``None`` for"
-            " projects whose source coordinates are tracked only by the"
-            " structured ``github`` sub-object."
+            "Effective URL of the documentation source repository."
+            " Derived from the ``github`` binding when present"
+            " (``https://github.com/{owner}/{repo}``); otherwise the"
+            " stored non-GitHub URL. ``None`` when neither is set."
         ),
     )
 
@@ -269,17 +289,21 @@ class ProjectUpdate(BaseModel):
     source_url: str | None = Field(
         default=None,
         description=(
-            "URL of the documentation source repository. Pass ``null``"
-            " explicitly to clear the field."
+            "Non-GitHub URL of the documentation source repository; use"
+            " the ``github`` field for GitHub repositories. A"
+            " ``github.com`` value is rejected with a 422. Pass a"
+            " non-GitHub URL to clear any existing GitHub binding, or"
+            " ``null`` explicitly to clear the field."
         ),
     )
 
     github: ProjectGitHubBindingCreate | None = Field(
         default=None,
         description=(
-            "Structured GitHub coordinates for the project. Pass ``null``"
-            " explicitly to clear the binding (and the opportunistically-"
-            "captured numeric ids that depend on it)."
+            "Structured GitHub coordinates for the project. Setting this"
+            " nulls any stored ``source_url``. Pass ``null`` explicitly"
+            " to clear the binding (and the opportunistically-captured"
+            " numeric ids that depend on it)."
         ),
     )
 
@@ -294,8 +318,8 @@ class ProjectUpdate(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _check_github_source_url_agreement(self) -> Self:
-        _validate_github_source_url_agreement(
+    def _check_source_url_github_exclusivity(self) -> Self:
+        _validate_source_url_github_exclusivity(
             github=self.github, source_url=self.source_url
         )
         return self

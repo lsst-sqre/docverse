@@ -53,7 +53,6 @@ async def _seed_project(
     github_repo: str,
     github_owner_id: int | None = None,
     github_repo_id: int | None = None,
-    source_url: str | None = None,
 ) -> int:
     """Seed a project carrying structured GitHub coordinates."""
     store = ProjectStore(session=session, logger=_logger())
@@ -63,7 +62,6 @@ async def _seed_project(
         data=ProjectCreate(
             slug=slug,
             title=f"Project {slug}",
-            source_url=source_url,
             github=binding,
         ),
         github_owner=github_owner,
@@ -673,13 +671,13 @@ async def test_repository_renamed_no_id_match_no_writes(
 async def test_repository_renamed_updates_project_keyed_by_repo_id(
     db_session: AsyncSession,
 ) -> None:
-    """A repo rename rewrites ``github_repo`` + ``source_url`` on projects.
+    """A repo rename flips ``github_repo`` on the project keyed by repo id.
 
     User story 17: renaming the GitHub repository updates both the
-    dashboard-template binding and the project row. The project
-    structured columns are the source of truth; ``source_url`` is the
-    cosmetic URL that surfaces in admin tooling and must follow the
-    canonical owner/repo so the rendered link still resolves on GitHub.
+    dashboard-template binding and the project row. The structured
+    columns are the single source of truth; the operator-visible source
+    URL is derived from them on read, so there is no stored URL to keep
+    in sync.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "rename-project-by-id")
@@ -691,7 +689,6 @@ async def test_repository_renamed_updates_project_keyed_by_repo_id(
             github_repo="old-name",
             github_owner_id=999,
             github_repo_id=12345,
-            source_url="https://github.com/acme/old-name",
         )
         await db_session.commit()
 
@@ -716,119 +713,21 @@ async def test_repository_renamed_updates_project_keyed_by_repo_id(
     assert project.github_repo == "new-name"
     assert project.github_owner == "acme"
     assert project.github_repo_id == 12345
-    assert project.source_url == "https://github.com/acme/new-name"
-
-
-@pytest.mark.asyncio
-async def test_repository_renamed_preserves_source_url_path_tail(
-    db_session: AsyncSession,
-) -> None:
-    """Source URL deep paths survive the owner/repo rewrite.
-
-    ``source_url`` may carry a path tail like ``/tree/main/docs`` for
-    operators whose docs live in a subdirectory of the repo (PRD #346
-    in the dashboard-template world reuses this shape, and #381's
-    Project response already documents the deep-path case). The
-    rename rewrites only the first two path segments so the
-    operator-visible link still points at the same subtree under the
-    new repo name.
-    """
-    async with db_session.begin():
-        org_id = await _seed_org(db_session, "rename-project-path")
-        project_id = await _seed_project(
-            db_session,
-            org_id=org_id,
-            slug="docs",
-            github_owner="acme",
-            github_repo="old-name",
-            github_owner_id=999,
-            github_repo_id=12345,
-            source_url="https://github.com/acme/old-name/tree/main/docs",
-        )
-        await db_session.commit()
-
-    payload = _repository_renamed_payload(
-        repo_id=12345,
-        owner="acme",
-        owner_id=999,
-        new_name="new-name",
-        old_name="old-name",
-    )
-
-    async with db_session.begin():
-        processor = _make_processor(db_session)
-        await processor.process_repository_renamed(payload)
-        await db_session.commit()
-
-    async with db_session.begin():
-        project = await ProjectStore(
-            session=db_session, logger=_logger()
-        ).get_by_id(project_id)
-    assert project is not None
-    assert (
-        project.source_url == "https://github.com/acme/new-name/tree/main/docs"
-    )
-
-
-@pytest.mark.asyncio
-async def test_repository_renamed_leaves_non_github_source_url(
-    db_session: AsyncSession,
-) -> None:
-    """A non-github.com ``source_url`` survives a rename untouched.
-
-    Projects bound to a GitLab repo whose docs were once also mirrored
-    to GitHub may carry both a structured GitHub binding (because
-    something else lives there) and a non-GitHub ``source_url``. A
-    rename of the GitHub side must not rewrite the GitLab URL.
-    """
-    async with db_session.begin():
-        org_id = await _seed_org(db_session, "rename-non-github-url")
-        project_id = await _seed_project(
-            db_session,
-            org_id=org_id,
-            slug="docs",
-            github_owner="acme",
-            github_repo="old-name",
-            github_owner_id=999,
-            github_repo_id=12345,
-            source_url="https://gitlab.com/acme/old-name",
-        )
-        await db_session.commit()
-
-    payload = _repository_renamed_payload(
-        repo_id=12345,
-        owner="acme",
-        owner_id=999,
-        new_name="new-name",
-        old_name="old-name",
-    )
-
-    async with db_session.begin():
-        processor = _make_processor(db_session)
-        await processor.process_repository_renamed(payload)
-        await db_session.commit()
-
-    async with db_session.begin():
-        project = await ProjectStore(
-            session=db_session, logger=_logger()
-        ).get_by_id(project_id)
-    assert project is not None
-    assert project.github_repo == "new-name"
-    # GitLab URL is untouched.
-    assert project.source_url == "https://gitlab.com/acme/old-name"
+    # The derived effective URL follows the binding.
+    assert project.effective_source_url == "https://github.com/acme/new-name"
 
 
 @pytest.mark.asyncio
 async def test_repository_transferred_rewrites_project_owner(
     db_session: AsyncSession,
 ) -> None:
-    """A repo transfer updates ``github_owner``, owner_id, and source_url.
+    """A repo transfer flips ``github_owner``, owner_id, and repo strings.
 
     User story 18: transferring the repo to a new owner shifts every
-    operator-visible field for the project. ``github_repo_id`` is the
-    stable handle that survives the transfer; the strings on either
-    side of the slash and the cached numeric ``github_owner_id`` all
-    flip together.
+    structured field for the project. ``github_repo_id`` is the stable
+    handle that survives the transfer; the strings on either side of the
+    slash and the cached numeric ``github_owner_id`` all flip together,
+    and the derived source URL follows.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "transfer-project")
@@ -840,7 +739,6 @@ async def test_repository_transferred_rewrites_project_owner(
             github_repo="docs",
             github_owner_id=111,
             github_repo_id=12345,
-            source_url="https://github.com/old-owner/docs",
         )
         await db_session.commit()
 
@@ -867,7 +765,8 @@ async def test_repository_transferred_rewrites_project_owner(
     assert project.github_owner_id == 222
     assert project.github_repo == "docs"
     assert project.github_repo_id == 12345
-    assert project.source_url == "https://github.com/new-owner/docs"
+    # The derived effective URL follows the new owner namespace.
+    assert project.effective_source_url == "https://github.com/new-owner/docs"
 
 
 @pytest.mark.asyncio
@@ -899,7 +798,6 @@ async def test_repository_renamed_updates_binding_and_project_together(
             github_repo="old-name",
             github_owner_id=999,
             github_repo_id=12345,
-            source_url="https://github.com/acme/old-name",
         )
         await db_session.commit()
 
@@ -927,4 +825,4 @@ async def test_repository_renamed_updates_binding_and_project_together(
     assert binding.github_repo == "new-name"
     assert project is not None
     assert project.github_repo == "new-name"
-    assert project.source_url == "https://github.com/acme/new-name"
+    assert project.effective_source_url == "https://github.com/acme/new-name"

@@ -42,6 +42,12 @@ from docverse.dbschema import Base
 # Revision immediately before the projects GitHub-binding migration.
 PRE_GITHUB_BINDING_REVISION = "w1x2y3z4a5b6"
 
+# The projects GitHub-binding migration itself. The test targets this
+# revision rather than ``head`` so a later migration (e.g. the one that
+# nulls redundant github.com ``source_url`` values) does not perturb the
+# rename behaviour under test here.
+GITHUB_BINDING_REVISION = "x2y3z4a5b6c7"
+
 
 @pytest_asyncio.fixture
 async def fresh_engine() -> AsyncGenerator[AsyncEngine]:
@@ -157,7 +163,7 @@ async def test_projects_github_binding_migration_happy_path(
         doc_repo="https://github.com/example/repo.git",
     )
 
-    await _alembic_upgrade("head")
+    await _alembic_upgrade(GITHUB_BINDING_REVISION)
 
     async with fresh_engine.connect() as conn:
         rows = (
@@ -300,7 +306,7 @@ async def test_projects_github_binding_migration_aborts_on_non_github(
     )
 
     with pytest.raises(RuntimeError) as excinfo:
-        await _alembic_upgrade("head")
+        await _alembic_upgrade(GITHUB_BINDING_REVISION)
 
     # The error message must surface the offending project ids so the
     # operator can address them without grepping the table by hand.

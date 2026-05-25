@@ -208,7 +208,7 @@ class Project(_ProjectBase):
             ),
             slug=domain.slug,
             title=domain.title,
-            source_url=domain.source_url,
+            source_url=domain.effective_source_url,
             github=(
                 ProjectGitHubBinding(
                     owner=domain.github_owner,

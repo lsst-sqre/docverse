@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from docverse.client.models.projects import build_github_url
+
 from .lifecycle import LifecycleRuleSet
 
 
@@ -28,8 +30,12 @@ class Project(BaseModel):
     source_url: str | None = Field(
         default=None,
         description=(
-            "URL of the documentation source repository. ``None`` for"
-            " projects bound to a GitHub repository only."
+            "Stored non-GitHub URL of the documentation source"
+            " repository, or ``None``. Never a ``github.com`` URL: a"
+            " GitHub repo is tracked by the structured ``github_*``"
+            " binding instead. Read"
+            " :attr:`effective_source_url` for the value consumers"
+            " should display."
         ),
     )
 
@@ -95,3 +101,19 @@ class Project(BaseModel):
         default=None,
         description="Timestamp when the project was soft-deleted.",
     )
+
+    @property
+    def effective_source_url(self) -> str | None:
+        """Derive the source-repository URL consumers should display.
+
+        The structured ``github`` binding is the single source of truth
+        for GitHub-backed projects, so it wins when present and yields
+        the canonical ``https://github.com/{owner}/{repo}``. Otherwise
+        the stored non-GitHub ``source_url`` is returned verbatim, and
+        ``None`` when the project has no source coordinates at all. This
+        lives here, once, so the API response and the dashboard context
+        derive the same value.
+        """
+        if self.github_owner is not None and self.github_repo is not None:
+            return build_github_url(self.github_owner, self.github_repo)
+        return self.source_url

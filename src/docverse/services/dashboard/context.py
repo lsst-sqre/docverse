@@ -201,7 +201,7 @@ class DashboardContextBuilder:
             project=ProjectContext(
                 slug=project.slug,
                 title=project.title,
-                source_repo_url=project.source_url or "",
+                source_repo_url=project.effective_source_url or "",
                 published_url=project_url,
             ),
             editions=editions_context,

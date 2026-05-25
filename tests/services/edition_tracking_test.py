@@ -90,7 +90,7 @@ async def _setup(
         data=ProjectCreate(
             slug="track-proj",
             title="Track Project",
-            source_url="https://github.com/example/repo",
+            source_url="https://example.com/example/repo",
         ),
     )
     return org, project

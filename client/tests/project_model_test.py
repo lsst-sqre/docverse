@@ -11,7 +11,7 @@ from docverse.client.models import (
     ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
-from docverse.client.models.projects import parse_github_url
+from docverse.client.models.projects import build_github_url, parse_github_url
 
 
 @pytest.mark.parametrize(
@@ -42,6 +42,20 @@ from docverse.client.models.projects import parse_github_url
 )
 def test_parse_github_url(url: str, expected: tuple[str, str] | None) -> None:
     assert parse_github_url(url) == expected
+
+
+def test_build_github_url() -> None:
+    assert (
+        build_github_url("lsst", "docverse")
+        == "https://github.com/lsst/docverse"
+    )
+
+
+def test_build_github_url_round_trips_parse() -> None:
+    assert parse_github_url(build_github_url("lsst", "docverse")) == (
+        "lsst",
+        "docverse",
+    )
 
 
 def test_binding_create_accepts_valid_pair() -> None:
@@ -96,46 +110,36 @@ def test_project_create_accepts_github_without_source_url() -> None:
     assert proj.source_url is None
 
 
-def test_project_create_accepts_source_url_without_github() -> None:
+def test_project_create_accepts_non_github_source_url() -> None:
+    """A non-GitHub source URL alone is the canonical non-GitHub project."""
     proj = ProjectCreate(
         slug="docs",
         title="Docs",
-        source_url="https://github.com/lsst/docverse",
+        source_url="https://gitlab.com/lsst/mirror",
     )
-    assert proj.source_url == "https://github.com/lsst/docverse"
+    assert proj.source_url == "https://gitlab.com/lsst/mirror"
     assert proj.github is None
 
 
-def test_project_create_accepts_agreeing_pair() -> None:
-    proj = ProjectCreate(
-        slug="docs",
-        title="Docs",
-        source_url="https://github.com/lsst/docverse",
-        github=ProjectGitHubBindingCreate(owner="lsst", repo="docverse"),
-    )
-    assert proj.github is not None
-
-
-def test_project_create_rejects_disagreeing_pair() -> None:
+def test_project_create_rejects_github_source_url() -> None:
+    """Rule A: a github.com source_url must use the github field instead."""
     with pytest.raises(ValidationError):
         ProjectCreate(
             slug="docs",
             title="Docs",
             source_url="https://github.com/lsst/docverse",
-            github=ProjectGitHubBindingCreate(owner="other", repo="repo"),
         )
 
 
-def test_project_create_accepts_non_github_source_url_with_github() -> None:
-    """A non-GitHub source URL plus a github sub-object skips the check."""
-    proj = ProjectCreate(
-        slug="docs",
-        title="Docs",
-        source_url="https://gitlab.com/lsst/mirror",
-        github=ProjectGitHubBindingCreate(owner="lsst", repo="docverse"),
-    )
-    assert proj.github is not None
-    assert proj.source_url == "https://gitlab.com/lsst/mirror"
+def test_project_create_rejects_source_url_and_github_together() -> None:
+    """Rule B: source_url and github are mutually exclusive."""
+    with pytest.raises(ValidationError):
+        ProjectCreate(
+            slug="docs",
+            title="Docs",
+            source_url="https://gitlab.com/lsst/mirror",
+            github=ProjectGitHubBindingCreate(owner="lsst", repo="docverse"),
+        )
 
 
 def test_project_update_accepts_explicit_null_clears() -> None:
@@ -146,11 +150,29 @@ def test_project_update_accepts_explicit_null_clears() -> None:
     assert "source_url" in update.model_fields_set
 
 
-def test_project_update_rejects_disagreeing_pair() -> None:
+def test_project_update_rejects_github_source_url() -> None:
+    """Rule A also guards PATCH input."""
+    with pytest.raises(ValidationError):
+        ProjectUpdate.model_validate(
+            {"source_url": "https://github.com/lsst/docverse"}
+        )
+
+
+def test_project_update_rejects_source_url_and_github_together() -> None:
+    """Rule B also guards PATCH input."""
     with pytest.raises(ValidationError):
         ProjectUpdate.model_validate(
             {
-                "source_url": "https://github.com/lsst/docverse",
-                "github": {"owner": "other", "repo": "repo"},
+                "source_url": "https://gitlab.com/lsst/mirror",
+                "github": {"owner": "lsst", "repo": "docverse"},
             }
         )
+
+
+def test_project_update_clears_github_with_non_github_source_url() -> None:
+    """github: null plus a non-GitHub source_url passes (one side cleared)."""
+    update = ProjectUpdate.model_validate(
+        {"github": None, "source_url": "https://gitlab.com/lsst/mirror"}
+    )
+    assert update.github is None
+    assert update.source_url == "https://gitlab.com/lsst/mirror"

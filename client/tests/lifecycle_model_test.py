@@ -162,7 +162,7 @@ def test_project_create_accepts_typed_lifecycle_rules() -> None:
     payload = ProjectCreate(
         slug="pipelines",
         title="Pipelines",
-        source_url="https://github.com/example/pipelines",
+        source_url="https://example.com/example/pipelines",
         lifecycle_rules=[  # type: ignore[arg-type]
             {"type": "draft_inactivity", "max_days_inactive": 30},
             {"type": "ref_deleted"},
@@ -177,7 +177,7 @@ def test_project_create_rejects_unknown_lifecycle_rule_type() -> None:
         ProjectCreate(
             slug="pipelines",
             title="Pipelines",
-            source_url="https://github.com/example/pipelines",
+            source_url="https://example.com/example/pipelines",
             lifecycle_rules=[  # type: ignore[arg-type]
                 {"type": "purgatory_eviction", "enabled": True},
             ],
@@ -189,7 +189,7 @@ def test_project_create_rejects_duplicate_lifecycle_rule_types() -> None:
         ProjectCreate(
             slug="pipelines",
             title="Pipelines",
-            source_url="https://github.com/example/pipelines",
+            source_url="https://example.com/example/pipelines",
             lifecycle_rules=[  # type: ignore[arg-type]
                 {"type": "draft_inactivity", "max_days_inactive": 30},
                 {"type": "draft_inactivity", "max_days_inactive": 60},

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import structlog
 from safir.database import (
@@ -22,53 +21,6 @@ from docverse.storage.pagination import ProjectSearchCursor
 
 _TRGM_SIMILARITY_THRESHOLD = 0.1
 """Minimum trigram similarity score for fuzzy search results."""
-
-
-def _rewrite_github_source_url(
-    source_url: str,
-    *,
-    old_owner: str,
-    old_repo: str,
-    new_owner: str,
-    new_repo: str,
-) -> str | None:
-    """Rewrite a ``github.com`` URL's first two path segments.
-
-    Used by the ``repository.renamed`` / ``repository.transferred``
-    handlers to keep the project's ``source_url`` consistent with its
-    structured ``(github_owner, github_repo)`` after a GitHub-side
-    flip. Returns ``None`` (caller leaves the column unchanged) when:
-
-    * The URL is not on ``github.com``.
-    * The first two path segments do not match
-      ``(old_owner, old_repo)`` case-insensitively.
-
-    Otherwise returns the rewritten URL with the path tail and a
-    ``.git`` suffix (if present) preserved verbatim.
-    """
-    parsed = urlparse(source_url)
-    host = (parsed.hostname or "").lower()
-    if host != "github.com":
-        return None
-    segments = parsed.path.split("/")
-    min_segments = 3
-    if len(segments) < min_segments:
-        return None
-    if segments[1].lower() != old_owner.lower():
-        return None
-    repo_segment = segments[2]
-    suffix = ".git" if repo_segment.endswith(".git") else ""
-    repo_bare = repo_segment.removesuffix(".git")
-    if repo_bare.lower() != old_repo.lower():
-        return None
-    new_segments = [
-        "",
-        new_owner,
-        new_repo + suffix,
-        *segments[3:],
-    ]
-    new_path = "/".join(new_segments)
-    return urlunparse(parsed._replace(path=new_path))
 
 
 class ProjectStore:
@@ -94,8 +46,9 @@ class ProjectStore:
 
         ``github_owner`` and ``github_repo`` are passed in by the caller
         (``ProjectService``) after resolving the ``github`` sub-object
-        from the request payload, including any auto-population from a
-        ``github.com`` ``source_url``.
+        from the request payload. The validator guarantees a
+        GitHub-bound project sends no ``source_url``, so the column is
+        persisted NULL for those rows.
         """
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
@@ -378,69 +331,40 @@ class ProjectStore:
         github_repo_id: int,
         new_repo: str,
     ) -> list[int]:
-        """Rewrite ``github_repo`` (+ matching ``source_url``) on projects.
+        """Rewrite ``github_repo`` on projects backing a renamed repo.
 
         Used by :class:`docverse.services.dashboard_templates
         .RenameEventProcessor` to mirror the dashboard binding's
-        ``rename_repo_by_repo_id`` for projects on the same repo. Reads
-        each affected row so the structured columns and the cosmetic
-        ``source_url`` stay consistent — the URL rewrite is opt-in
-        per-row via :func:`_rewrite_github_source_url`, which leaves
-        non-GitHub URLs and URLs whose first two path segments do not
-        match ``(github_owner, old_repo)`` untouched.
+        ``rename_repo_by_repo_id`` for projects on the same repo. Only
+        the structured ``github_repo`` column flips; the
+        operator-visible source URL is derived from the binding
+        (:attr:`docverse.domain.project.Project.effective_source_url`),
+        so it follows automatically without a stored value to rewrite.
 
-        ``date_updated`` is preserved on every row (the per-row
-        ``update()`` pins ``date_updated=SqlProject.date_updated`` so
-        the column's ``onupdate=func.now()`` does not fire): a
+        ``date_updated`` is explicitly preserved (pinned to its current
+        value so the column's ``onupdate=func.now()`` does not fire): a
         GitHub-side rename is sync-bookkeeping, not an operator-visible
         source-coordinate edit, which arrives through PUT/PATCH. This
         mirrors the discipline of the dashboard binding store's
         ``rename_repo_by_repo_id`` and of ``apply_installation_scope``.
-        The ``source_url`` is computed in Python rather than mutated via
-        the ORM so the write can go through a ``date_updated``-pinning
-        bulk ``update()`` even when it differs per row.
 
         Returns the list of updated project ids.
         """
-        result = await self._session.execute(
-            select(
-                SqlProject.id,
-                SqlProject.source_url,
-                SqlProject.github_owner,
-                SqlProject.github_repo,
-            ).where(
+        stmt = (
+            update(SqlProject)
+            .where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
             )
-        )
-        updated_ids: list[int] = []
-        for row in result.all():
-            values: dict[str, Any] = {
-                "github_repo": new_repo,
-                "date_updated": SqlProject.date_updated,
-            }
-            if (
-                row.source_url is not None
-                and row.github_owner is not None
-                and row.github_repo is not None
-            ):
-                rewritten = _rewrite_github_source_url(
-                    row.source_url,
-                    old_owner=row.github_owner,
-                    old_repo=row.github_repo,
-                    new_owner=row.github_owner,
-                    new_repo=new_repo,
-                )
-                if rewritten is not None:
-                    values["source_url"] = rewritten
-            await self._session.execute(
-                update(SqlProject)
-                .where(SqlProject.id == row.id)
-                .values(**values)
+            .values(
+                github_repo=new_repo,
+                date_updated=SqlProject.date_updated,
             )
-            updated_ids.append(row.id)
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
         await self._session.flush()
-        return updated_ids
+        return [row[0] for row in result.all()]
 
     async def transfer_repo_by_repo_id(
         self,
@@ -450,72 +374,43 @@ class ProjectStore:
         new_owner_id: int,
         new_repo: str,
     ) -> list[int]:
-        """Rewrite owner + repo strings + owner_id (+ source_url) on transfer.
+        """Flip owner + owner_id + repo on projects backing a transfer.
 
         Mirrors :meth:`docverse.storage.dashboard_templates.github
         .DashboardGitHubTemplateBindingStore.transfer_repo_by_repo_id`:
         a ``repository.transferred`` event keeps ``repository.id``
         stable but moves the repo to a new owner namespace, so the
-        binding has to switch its owner-side identity to keep
-        matching push events from the new namespace.
+        binding has to switch its owner-side identity to keep matching
+        push events from the new namespace. Only the structured columns
+        flip; the operator-visible source URL is derived from the
+        binding, so it follows automatically.
 
-        The ``source_url`` is rewritten only when it parses as a
-        github.com URL whose first two path segments match the old
-        owner/repo — non-GitHub URLs and URLs whose path was
-        already pointing somewhere else are left alone.
-
-        ``date_updated`` is preserved on every row (the per-row
-        ``update()`` pins ``date_updated=SqlProject.date_updated`` so
-        the column's ``onupdate=func.now()`` does not fire): a
+        ``date_updated`` is explicitly preserved (pinned to its current
+        value so the column's ``onupdate=func.now()`` does not fire): a
         GitHub-side transfer is sync-bookkeeping, not an operator-
         visible source-coordinate edit, which arrives through PUT/PATCH.
         This mirrors the discipline of the dashboard binding store's
         ``transfer_repo_by_repo_id`` and of ``apply_installation_scope``.
-        The ``source_url`` is computed in Python rather than mutated via
-        the ORM so the write can go through a ``date_updated``-pinning
-        bulk ``update()`` even when it differs per row.
+
+        Returns the list of updated project ids.
         """
-        result = await self._session.execute(
-            select(
-                SqlProject.id,
-                SqlProject.source_url,
-                SqlProject.github_owner,
-                SqlProject.github_repo,
-            ).where(
+        stmt = (
+            update(SqlProject)
+            .where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
             )
-        )
-        updated_ids: list[int] = []
-        for row in result.all():
-            values: dict[str, Any] = {
-                "github_owner": new_owner,
-                "github_owner_id": new_owner_id,
-                "github_repo": new_repo,
-                "date_updated": SqlProject.date_updated,
-            }
-            if (
-                row.source_url is not None
-                and row.github_owner is not None
-                and row.github_repo is not None
-            ):
-                rewritten = _rewrite_github_source_url(
-                    row.source_url,
-                    old_owner=row.github_owner,
-                    old_repo=row.github_repo,
-                    new_owner=new_owner,
-                    new_repo=new_repo,
-                )
-                if rewritten is not None:
-                    values["source_url"] = rewritten
-            await self._session.execute(
-                update(SqlProject)
-                .where(SqlProject.id == row.id)
-                .values(**values)
+            .values(
+                github_owner=new_owner,
+                github_owner_id=new_owner_id,
+                github_repo=new_repo,
+                date_updated=SqlProject.date_updated,
             )
-            updated_ids.append(row.id)
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
         await self._session.flush()
-        return updated_ids
+        return [row[0] for row in result.all()]
 
     async def apply_installation_scope(
         self,

@@ -91,7 +91,7 @@ async def test_publisher_uploads_dashboard_and_switcher(
             data=ProjectCreate(
                 slug="pub-proj",
                 title="Pub Project",
-                source_url="https://github.com/example/pub",
+                source_url="https://example.com/example/pub",
             ),
         )
         await edition_store.create_internal(
@@ -194,7 +194,7 @@ async def test_publisher_writes_per_edition_json_files(
             data=ProjectCreate(
                 slug="per-ed-proj",
                 title="Per Ed Project",
-                source_url="https://github.com/example/per-ed",
+                source_url="https://example.com/example/per-ed",
             ),
         )
         await edition_store.create_internal(
@@ -266,7 +266,7 @@ async def test_publisher_handles_empty_project(
             data=ProjectCreate(
                 slug="empty-pub-proj",
                 title="Empty Project",
-                source_url="https://github.com/example/empty",
+                source_url="https://example.com/example/empty",
             ),
         )
         await db_session.commit()
@@ -350,7 +350,7 @@ async def test_publisher_resolve_template_returns_builtin_when_unbound(
             data=ProjectCreate(
                 slug="resolve-builtin-proj",
                 title="Resolve Builtin Project",
-                source_url="https://github.com/example/resolve-builtin",
+                source_url="https://example.com/example/resolve-builtin",
             ),
         )
         await db_session.commit()
@@ -401,7 +401,7 @@ async def test_publisher_render_and_upload_uses_provided_resolved_template(
             data=ProjectCreate(
                 slug="render-provided-proj",
                 title="Render Provided Project",
-                source_url="https://github.com/example/render-provided",
+                source_url="https://example.com/example/render-provided",
             ),
         )
         template_result = await template_store.upsert(
@@ -488,7 +488,7 @@ async def test_publisher_logs_builtin_template_origin(
             data=ProjectCreate(
                 slug="origin-builtin-proj",
                 title="Origin Builtin Project",
-                source_url="https://github.com/example/origin-builtin",
+                source_url="https://example.com/example/origin-builtin",
             ),
         )
         await db_session.commit()
@@ -545,7 +545,7 @@ async def test_publisher_logs_github_template_origin(
             data=ProjectCreate(
                 slug="origin-github-proj",
                 title="Origin GitHub Project",
-                source_url="https://github.com/example/origin-github",
+                source_url="https://example.com/example/origin-github",
             ),
         )
         template_result = await template_store.upsert(

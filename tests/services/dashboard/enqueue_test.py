@@ -56,7 +56,7 @@ async def _seed_org_with_project(
         data=ProjectCreate(
             slug=project_slug,
             title=f"Project {project_slug}",
-            source_url=f"https://github.com/example/{project_slug}",
+            source_url=f"https://example.com/example/{project_slug}",
         ),
     )
     return org.id, project.id
@@ -263,7 +263,7 @@ async def test_enqueue_for_org_filters_skipped_projects(
             data=ProjectCreate(
                 slug="keeper",
                 title="Keeper",
-                source_url="https://github.com/example/keeper",
+                source_url="https://example.com/example/keeper",
             ),
         )
         already_active = await proj_store.create(
@@ -271,7 +271,7 @@ async def test_enqueue_for_org_filters_skipped_projects(
             data=ProjectCreate(
                 slug="already",
                 title="Already",
-                source_url="https://github.com/example/already",
+                source_url="https://example.com/example/already",
             ),
         )
         await db_session.commit()

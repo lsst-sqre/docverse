@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
+    ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
 from docverse.storage.organization_store import OrganizationStore
@@ -59,7 +60,7 @@ async def test_create_project(
             data=ProjectCreate(
                 slug="my-project",
                 title="My Project",
-                source_url="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         await db_session.commit()
@@ -83,7 +84,7 @@ async def test_get_by_slug(
             data=ProjectCreate(
                 slug="find-me",
                 title="Find Me",
-                source_url="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         found = await store.get_by_slug(org_id=org_id, slug="find-me")
@@ -118,7 +119,7 @@ async def test_list_by_org(
             data=ProjectCreate(
                 slug="proj-aa",
                 title="A",
-                source_url="https://github.com/example/a",
+                source_url="https://example.com/example/a",
             ),
         )
         await store.create(
@@ -126,7 +127,7 @@ async def test_list_by_org(
             data=ProjectCreate(
                 slug="proj-bb",
                 title="B",
-                source_url="https://github.com/example/b",
+                source_url="https://example.com/example/b",
             ),
         )
         result = await store.list_by_org(
@@ -153,7 +154,7 @@ async def test_update_project(
             data=ProjectCreate(
                 slug="upd-proj",
                 title="Original",
-                source_url="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         updated = await store.update(
@@ -177,8 +178,8 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
 
     ``date_updated`` is the operator-visible "last source-coordinate
     edit" signal; those edits arrive through PUT/PATCH, not through a
-    GitHub-side metadata sync. The rename still rewrites ``github_repo``
-    and the matching ``source_url``.
+    GitHub-side metadata sync. The rename still flips ``github_repo``;
+    the effective source URL is derived from the binding.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -187,7 +188,9 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
             data=ProjectCreate(
                 slug="rename-me",
                 title="Rename Me",
-                source_url="https://github.com/acme/old-repo",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="old-repo"
+                ),
             ),
             github_owner="acme",
             github_repo="old-repo",
@@ -224,7 +227,8 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
         after = await store.get_by_id(created.id)
     assert after is not None
     assert after.github_repo == "new-repo"
-    assert after.source_url == "https://github.com/acme/new-repo"
+    assert after.source_url is None
+    assert after.effective_source_url == "https://github.com/acme/new-repo"
     assert after.date_updated == baseline
 
 
@@ -237,7 +241,8 @@ async def test_transfer_repo_by_repo_id_preserves_date_updated(
     """A GitHub-side repo transfer must not bump ``date_updated``.
 
     The transfer still flips ``github_owner`` / ``github_owner_id`` /
-    ``github_repo`` and rewrites the matching ``source_url``.
+    ``github_repo``; the effective source URL is derived from the
+    binding.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -246,7 +251,7 @@ async def test_transfer_repo_by_repo_id_preserves_date_updated(
             data=ProjectCreate(
                 slug="transfer-me",
                 title="Transfer Me",
-                source_url="https://github.com/acme/repo",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
             ),
             github_owner="acme",
             github_repo="repo",
@@ -281,7 +286,8 @@ async def test_transfer_repo_by_repo_id_preserves_date_updated(
     assert after is not None
     assert after.github_owner == "beta"
     assert after.github_owner_id == 444
-    assert after.source_url == "https://github.com/beta/repo"
+    assert after.source_url is None
+    assert after.effective_source_url == "https://github.com/beta/repo"
     assert after.date_updated == baseline
 
 
@@ -303,7 +309,7 @@ async def test_update_github_metadata_preserves_date_updated(
             data=ProjectCreate(
                 slug="meta-me",
                 title="Meta Me",
-                source_url="https://github.com/acme/repo",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
             ),
             github_owner="acme",
             github_repo="repo",
@@ -355,7 +361,7 @@ async def test_update_github_metadata_skips_on_binding_change(
             data=ProjectCreate(
                 slug="stale-me",
                 title="Stale Me",
-                source_url="https://github.com/acme/repo",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
             ),
             github_owner="acme",
             github_repo="repo",
@@ -395,7 +401,7 @@ async def test_soft_delete(
             data=ProjectCreate(
                 slug="del-proj",
                 title="Delete Me",
-                source_url="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         deleted = await store.soft_delete(org_id=org_id, slug="del-proj")

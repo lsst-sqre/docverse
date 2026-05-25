@@ -68,7 +68,7 @@ async def _create_project(
         json={
             "slug": slug,
             "title": slug.title(),
-            "source_url": f"https://github.com/example/{slug}",
+            "source_url": f"https://example.com/example/{slug}",
         },
         headers={"X-Auth-Request-User": _ADMIN},
     )

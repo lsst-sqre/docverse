@@ -38,7 +38,7 @@ async def _setup(client: AsyncClient) -> None:
         json={
             "slug": "ed-proj",
             "title": "Ed Project",
-            "source_url": "https://github.com/example/ed",
+            "source_url": "https://example.com/example/ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
