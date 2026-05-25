@@ -44,6 +44,7 @@ from docverse.services.dashboard.enqueue import (
 from docverse.services.edition_publishing import EditionPublishingService
 from docverse.services.lifecycle.evaluator import (
     LifecycleDecision,
+    LifecycleEvaluationContext,
     evaluate_lifecycle,
     resolve_rule_set,
 )
@@ -173,10 +174,13 @@ async def _evaluate_org(
             continue
         decision = evaluate_lifecycle(
             rule_set=rule_set,
-            editions=editions_by_project.get(project.id, []),
-            builds=builds_by_project.get(project.id, []),
-            edition_build_history=history_by_project.get(project.id, []),
-            now=now,
+            context=LifecycleEvaluationContext(
+                editions=editions_by_project.get(project.id, []),
+                builds=builds_by_project.get(project.id, []),
+                edition_build_history=history_by_project.get(project.id, []),
+                now=now,
+                live_refs=None,
+            ),
         )
         if decision.edition_matches or decision.build_matches:
             decisions.append((project, rule_set, decision))

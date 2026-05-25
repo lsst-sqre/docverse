@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from docverse.client.models import EditionKind, TrackingMode
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
@@ -17,7 +19,55 @@ from docverse.domain.lifecycle import (
     RefDeletedRule,
 )
 
-__all__ = ["LifecycleDecision", "evaluate_lifecycle", "resolve_rule_set"]
+__all__ = [
+    "LifecycleDecision",
+    "LifecycleEvaluationContext",
+    "evaluate_lifecycle",
+    "resolve_rule_set",
+]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LifecycleEvaluationContext:
+    """Bundled inputs to :func:`evaluate_lifecycle`.
+
+    Groups every per-project piece of state the evaluator reads so a
+    new context field (e.g. ``live_refs`` for the ``ref_deleted``
+    branch) can be added without changing the evaluator's public
+    signature.
+
+    ``live_refs`` is the set of bare ref names (branch + tag) that
+    currently exist on the project's GitHub repository, or ``None``
+    when no ref information is available (non-GitHub project, fetch
+    not yet performed). ``None`` is structurally distinct from an
+    empty set: ``frozenset()`` means "the repo exists but has no
+    branches or tags right now" (every tracked ref is a candidate),
+    while ``None`` means "we have no ref information" (the
+    ``ref_deleted`` branch returns no matches).
+
+    Namespace contract for ``live_refs`` (an inter-slice contract the
+    future populators must honor — the webhook fast-path and the
+    ``git_ref_audit`` cron land in later slices):
+
+    - Names are **bare**: ``main``, ``v1.0``, not ``refs/heads/main``
+      or ``refs/tags/v1.0``. The ``ref_deleted`` branch compares
+      ``edition.tracking_params["git_ref"]`` (itself bare) against
+      this set, so a populator that forgets to strip the
+      ``refs/heads/`` / ``refs/tags/`` prefix would make every tracked
+      ref look deleted.
+    - Branches and tags are **flattened into one set**. A deleted
+      branch that is shadowed by a same-named tag (or vice versa)
+      therefore survives the ``ref_deleted`` branch. This is an
+      accepted edge case, not a bug: collisions between branch and
+      tag names are rare and keeping one set avoids threading a
+      ref-kind discriminator through the evaluator.
+    """
+
+    editions: Sequence[Edition]
+    builds: Sequence[Build]
+    edition_build_history: Sequence[EditionBuildHistory]
+    now: datetime
+    live_refs: frozenset[str] | None = None
 
 
 class LifecycleDecision(BaseModel):
@@ -71,22 +121,21 @@ class LifecycleDecision(BaseModel):
 def evaluate_lifecycle(
     *,
     rule_set: LifecycleRuleSet,
-    editions: Iterable[Edition],
-    builds: Iterable[Build],
-    edition_build_history: Iterable[EditionBuildHistory],
-    now: datetime,
+    context: LifecycleEvaluationContext,
 ) -> LifecycleDecision:
-    """Evaluate ``rule_set`` against pre-fetched project state.
+    """Evaluate ``rule_set`` against the project state in ``context``.
 
-    No database access. The caller hands in already-loaded editions,
-    builds, and per-edition build-history rows; the function returns
-    a :class:`LifecycleDecision` listing the entities the rule set
-    has matched for soft-delete, each tagged with the matching rule's
+    No database access. The caller hands in a
+    :class:`LifecycleEvaluationContext` carrying already-loaded
+    editions, builds, per-edition build-history rows, and the current
+    ``live_refs`` set (when applicable); the function returns a
+    :class:`LifecycleDecision` listing the entities the rule set has
+    matched for soft-delete, each tagged with the matching rule's
     ``type`` discriminator.
     """
-    editions_list = list(editions)
-    builds_list = list(builds)
-    history_list = list(edition_build_history)
+    editions_list = list(context.editions)
+    builds_list = list(context.builds)
+    history_list = list(context.edition_build_history)
 
     edition_matches: dict[int, str] = {}
     build_matches: dict[int, str] = {}
@@ -95,27 +144,30 @@ def evaluate_lifecycle(
     for rule in rule_set.root:
         match rule:
             case DraftInactivityRule():
-                matches = _eval_draft_inactivity(
-                    rule=rule, editions=editions_list, now=now
+                draft_matches = _eval_draft_inactivity(
+                    rule=rule, editions=editions_list, now=context.now
                 )
-                for edition_id in matches:
+                for edition_id in draft_matches:
                     edition_matches.setdefault(edition_id, rule.type)
-                rule_match_counts[rule.type] = len(matches)
+                rule_match_counts[rule.type] = len(draft_matches)
             case BuildHistoryOrphanRule():
-                matches = _eval_build_history_orphan(
+                orphan_matches = _eval_build_history_orphan(
                     rule=rule,
                     editions=editions_list,
                     builds=builds_list,
                     history=history_list,
-                    now=now,
+                    now=context.now,
                 )
-                for build_id in matches:
+                for build_id in orphan_matches:
                     build_matches.setdefault(build_id, rule.type)
-                rule_match_counts[rule.type] = len(matches)
+                rule_match_counts[rule.type] = len(orphan_matches)
             case RefDeletedRule():
-                # DM-54913 will swap in the real predicate; until then the
-                # rule is recognized but matches nothing.
-                rule_match_counts[rule.type] = 0
+                ref_matches = _eval_ref_deleted(
+                    editions=editions_list, live_refs=context.live_refs
+                )
+                for edition_id in ref_matches:
+                    edition_matches.setdefault(edition_id, rule.type)
+                rule_match_counts[rule.type] = len(ref_matches)
             case _:
                 msg = f"unknown lifecycle rule type {rule.type!r}"
                 raise RuntimeError(msg)
@@ -158,7 +210,7 @@ def _eval_draft_inactivity(
     threshold = now - timedelta(days=rule.max_days_inactive)
     matched: set[int] = set()
     for edition in editions:
-        if edition.kind != "draft":
+        if edition.kind != EditionKind.draft:
             continue
         if edition.lifecycle_exempt:
             continue
@@ -194,6 +246,50 @@ def _eval_build_history_orphan(
         if completion > age_threshold:
             continue
         matched.add(build.id)
+    return matched
+
+
+_REF_DELETED_TRACKING_MODES = frozenset(
+    {TrackingMode.git_ref, TrackingMode.alternate_git_ref}
+)
+
+
+def _eval_ref_deleted(
+    *,
+    editions: list[Edition],
+    live_refs: frozenset[str] | None,
+) -> set[int]:
+    """Return edition ids that match ``RefDeletedRule``.
+
+    ``live_refs=None`` means no ref information was supplied for the
+    project (non-GitHub source, or a caller that has not been
+    migrated to provide the set). In that case the branch matches
+    nothing — soft-deleting every draft on missing information would
+    be the wrong default. An empty ``frozenset()`` is distinct: it
+    represents a repo whose branch and tag sets are both currently
+    empty, and every literal-ref draft becomes a candidate.
+    """
+    if live_refs is None:
+        return set()
+    matched: set[int] = set()
+    for edition in editions:
+        if edition.kind != EditionKind.draft:
+            continue
+        if edition.tracking_mode not in _REF_DELETED_TRACKING_MODES:
+            continue
+        if edition.lifecycle_exempt:
+            continue
+        if edition.date_deleted is not None:
+            continue
+        params = edition.tracking_params
+        if not params:
+            continue
+        git_ref = params.get("git_ref")
+        if not git_ref:
+            continue
+        if git_ref in live_refs:
+            continue
+        matched.add(edition.id)
     return matched
 
 

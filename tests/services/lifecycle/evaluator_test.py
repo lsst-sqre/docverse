@@ -26,7 +26,11 @@ from docverse.domain.lifecycle import (
     LifecycleRuleSet,
     RefDeletedRule,
 )
-from docverse.services.lifecycle import evaluate_lifecycle, resolve_rule_set
+from docverse.services.lifecycle import (
+    LifecycleEvaluationContext,
+    evaluate_lifecycle,
+    resolve_rule_set,
+)
 
 # A frozen "now" used across the tests. Chosen so subtracting whole-
 # day offsets from it stays inside February 2026 and avoids
@@ -47,6 +51,8 @@ def _edition(
     lifecycle_exempt: bool = False,
     date_deleted: datetime | None = None,
     current_build_id: int | None = None,
+    tracking_mode: TrackingMode = TrackingMode.git_ref,
+    tracking_params: dict[str, str] | None = None,
 ) -> Edition:
     """Construct an ``Edition`` with sane defaults for evaluator tests."""
     return Edition(
@@ -55,8 +61,8 @@ def _edition(
         title=f"Edition {edition_id}",
         project_id=1,
         kind=kind,
-        tracking_mode=TrackingMode.git_ref,
-        tracking_params=None,
+        tracking_mode=tracking_mode,
+        tracking_params=tracking_params,
         alternate_name=None,
         current_build_id=current_build_id,
         current_build_public_id=None,
@@ -117,6 +123,24 @@ def _history(
     )
 
 
+def _context(
+    *,
+    editions: list[Edition] | None = None,
+    builds: list[Build] | None = None,
+    edition_build_history: list[EditionBuildHistory] | None = None,
+    now: datetime = NOW,
+    live_refs: frozenset[str] | None = None,
+) -> LifecycleEvaluationContext:
+    """Construct a ``LifecycleEvaluationContext`` with sane defaults."""
+    return LifecycleEvaluationContext(
+        editions=editions or [],
+        builds=builds or [],
+        edition_build_history=edition_build_history or [],
+        now=now,
+        live_refs=live_refs,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Empty / no-op
 # ---------------------------------------------------------------------------
@@ -126,12 +150,11 @@ def test_empty_rule_set_returns_empty_decision() -> None:
     """An empty rule set matches nothing and reports no counts."""
     decision = evaluate_lifecycle(
         rule_set=LifecycleRuleSet(root=[]),
-        editions=[
-            _edition(edition_id=1, date_updated=NOW - timedelta(days=365))
-        ],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(
+            editions=[
+                _edition(edition_id=1, date_updated=NOW - timedelta(days=365))
+            ],
+        ),
     )
 
     assert decision.edition_ids == frozenset()
@@ -156,10 +179,7 @@ def test_draft_inactivity_matches_stale_draft() -> None:
         rule_set=LifecycleRuleSet(
             root=[DraftInactivityRule(max_days_inactive=30)]
         ),
-        editions=[stale],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[stale]),
     )
 
     assert decision.edition_ids == frozenset({10})
@@ -190,10 +210,7 @@ def test_draft_inactivity_only_matches_kind_draft(
         rule_set=LifecycleRuleSet(
             root=[DraftInactivityRule(max_days_inactive=30)]
         ),
-        editions=[edition],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[edition]),
     )
 
     assert decision.edition_ids == frozenset()
@@ -213,10 +230,7 @@ def test_draft_inactivity_skips_lifecycle_exempt() -> None:
         rule_set=LifecycleRuleSet(
             root=[DraftInactivityRule(max_days_inactive=30)]
         ),
-        editions=[exempt],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[exempt]),
     )
 
     assert decision.edition_ids == frozenset()
@@ -235,10 +249,7 @@ def test_draft_inactivity_skips_already_soft_deleted() -> None:
         rule_set=LifecycleRuleSet(
             root=[DraftInactivityRule(max_days_inactive=30)]
         ),
-        editions=[deleted],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[deleted]),
     )
 
     assert decision.edition_ids == frozenset()
@@ -262,10 +273,7 @@ def test_draft_inactivity_excludes_exact_boundary() -> None:
         rule_set=LifecycleRuleSet(
             root=[DraftInactivityRule(max_days_inactive=30)]
         ),
-        editions=[on_boundary],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[on_boundary]),
     )
 
     assert decision.edition_ids == frozenset()
@@ -283,10 +291,7 @@ def test_draft_inactivity_matches_just_past_boundary() -> None:
         rule_set=LifecycleRuleSet(
             root=[DraftInactivityRule(max_days_inactive=30)]
         ),
-        editions=[past],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[past]),
     )
 
     assert decision.edition_ids == frozenset({51})
@@ -313,10 +318,7 @@ def test_build_history_orphan_keeps_current_build() -> None:
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition],
-        builds=[current_build],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(editions=[edition], builds=[current_build]),
     )
 
     assert decision.build_ids == frozenset()
@@ -338,10 +340,11 @@ def test_build_history_orphan_keeps_in_window_position() -> None:
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition],
-        builds=[build],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[edition],
+            builds=[build],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset()
@@ -378,10 +381,11 @@ def test_build_history_orphan_keeps_shared_when_one_edition_in_window() -> (
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition_old, edition_new],
-        builds=[build],
-        edition_build_history=rows,
-        now=NOW,
+        context=_context(
+            editions=[edition_old, edition_new],
+            builds=[build],
+            edition_build_history=rows,
+        ),
     )
 
     assert decision.build_ids == frozenset()
@@ -402,10 +406,11 @@ def test_build_history_orphan_matches_orphan_past_position_and_age() -> None:
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition],
-        builds=[build],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[edition],
+            builds=[build],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset({130})
@@ -431,10 +436,11 @@ def test_build_history_orphan_age_threshold_protects_recent_build() -> None:
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition],
-        builds=[young_build],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[edition],
+            builds=[young_build],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset()
@@ -463,10 +469,11 @@ def test_build_history_orphan_uses_date_created_when_completed_missing() -> (
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition],
-        builds=[build],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[edition],
+            builds=[build],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset({150})
@@ -501,10 +508,11 @@ def test_build_history_orphan_exempt_edition_protects_referenced_builds() -> (
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[exempt],
-        builds=[build_current, build_history],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[exempt],
+            builds=[build_current, build_history],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset()
@@ -532,10 +540,11 @@ def test_build_history_orphan_ignores_history_from_deleted_editions() -> None:
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[deleted_edition],
-        builds=[build],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[deleted_edition],
+            builds=[build],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset({170})
@@ -557,10 +566,11 @@ def test_build_history_orphan_skips_already_deleted_build() -> None:
         rule_set=LifecycleRuleSet(
             root=[BuildHistoryOrphanRule(min_position=5, min_age_days=30)]
         ),
-        editions=[edition],
-        builds=[build],
-        edition_build_history=[history_row],
-        now=NOW,
+        context=_context(
+            editions=[edition],
+            builds=[build],
+            edition_build_history=[history_row],
+        ),
     )
 
     assert decision.build_ids == frozenset()
@@ -571,31 +581,228 @@ def test_build_history_orphan_skips_already_deleted_build() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ref_deleted_is_a_no_op_stub() -> None:
-    """The ``ref_deleted`` rule is recognized and returns no matches.
+def test_ref_deleted_matches_draft_tracking_deleted_branch() -> None:
+    """A draft edition whose tracked branch is missing from ``live_refs``."""
+    deleted_branch = _edition(
+        edition_id=200,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "tickets/DM-12345"},
+    )
 
-    DM-54913 swaps in the real predicate. Until then the evaluator
-    must accept the rule, return zero matches, and surface the rule
-    in ``rule_match_counts`` so logging callers see a 0 rather than a
-    missing key.
-    """
     decision = evaluate_lifecycle(
         rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
-        editions=[
-            _edition(
-                edition_id=150,
-                kind=EditionKind.draft,
-                date_updated=NOW - timedelta(days=365),
-            )
-        ],
-        builds=[],
-        edition_build_history=[],
-        now=NOW,
+        context=_context(
+            editions=[deleted_branch],
+            live_refs=frozenset({"main"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset({200})
+    assert decision.rule_match_counts == {"ref_deleted": 1}
+
+
+def test_ref_deleted_skips_draft_tracking_live_branch() -> None:
+    """A draft tracking a branch still present in ``live_refs`` survives."""
+    live = _edition(
+        edition_id=210,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "tickets/DM-12345"},
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[live],
+            live_refs=frozenset({"main", "tickets/DM-12345"}),
+        ),
     )
 
     assert decision.edition_ids == frozenset()
-    assert decision.build_ids == frozenset()
     assert decision.rule_match_counts == {"ref_deleted": 0}
+
+
+def test_ref_deleted_skips_lifecycle_exempt_edition() -> None:
+    """``lifecycle_exempt=True`` editions survive even when ref is gone."""
+    exempt = _edition(
+        edition_id=220,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "tickets/DM-12345"},
+        lifecycle_exempt=True,
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[exempt],
+            live_refs=frozenset({"main"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset()
+
+
+def test_ref_deleted_skips_release_edition_pinned_to_deleted_tag() -> None:
+    """A non-draft (release) edition pinned to a deleted tag is not matched.
+
+    SQR-112 user story 9: release editions pinned to tags must not
+    be surprise-deleted if an upstream pipeline force-recreates the
+    tag, so the candidate filter requires ``kind == draft``.
+    """
+    release = _edition(
+        edition_id=230,
+        kind=EditionKind.release,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "v1.0.0"},
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[release],
+            live_refs=frozenset({"main"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset()
+
+
+def test_ref_deleted_matches_alternate_git_ref_draft() -> None:
+    """A draft on ``alternate_git_ref`` is matched on the same rules."""
+    alt = _edition(
+        edition_id=240,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.alternate_git_ref,
+        tracking_params={"git_ref": "feature/x"},
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[alt],
+            live_refs=frozenset({"main"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset({240})
+
+
+def test_ref_deleted_returns_empty_when_live_refs_is_none() -> None:
+    """``live_refs=None`` means "no ref info" — the branch matches nothing.
+
+    The audit / sync paths populate ``live_refs`` from a GitHub fetch.
+    A ``None`` value means the fetch did not happen (e.g. non-GitHub
+    project, or a #337 caller that has not been updated yet); the
+    correct semantic is to skip the branch rather than soft-delete
+    every draft edition.
+    """
+    draft = _edition(
+        edition_id=250,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "tickets/DM-12345"},
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(editions=[draft], live_refs=None),
+    )
+
+    assert decision.edition_ids == frozenset()
+    assert decision.rule_match_counts == {"ref_deleted": 0}
+
+
+def test_ref_deleted_skips_edition_with_no_git_ref_tracking_param() -> None:
+    """A literal-ref draft with no ``tracking_params['git_ref']`` is skipped.
+
+    Defensive: even though every draft created via the slug-derivation
+    path has ``git_ref`` populated, the evaluator must not raise on a
+    malformed row.
+    """
+    bare = _edition(
+        edition_id=260,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params=None,
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[bare],
+            live_refs=frozenset({"main"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset()
+
+
+def test_ref_deleted_skips_already_soft_deleted_edition() -> None:
+    """An already-soft-deleted draft is not re-emitted as a candidate."""
+    deleted = _edition(
+        edition_id=270,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "tickets/DM-12345"},
+        date_deleted=NOW - timedelta(days=1),
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[deleted],
+            live_refs=frozenset({"main"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset()
+
+
+def test_ref_deleted_skips_non_literal_tracking_mode() -> None:
+    """Computed tracking modes (e.g. ``lsst_doc``) are not eligible."""
+    computed = _edition(
+        edition_id=280,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.lsst_doc,
+        tracking_params={"git_ref": "main"},
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(
+            editions=[computed],
+            live_refs=frozenset({"other"}),
+        ),
+    )
+
+    assert decision.edition_ids == frozenset()
+
+
+def test_ref_deleted_with_empty_live_refs_matches_all_eligible_drafts() -> (
+    None
+):
+    """An empty ``live_refs`` (repo with no branches/tags) still matches.
+
+    Empty-set semantics: every tracked ref is, by definition, missing
+    from ``live_refs``. Differentiating an empty fetch (repo exists
+    but has no refs) from a missing fetch (``live_refs=None``) is the
+    whole point of the nullable field.
+    """
+    draft = _edition(
+        edition_id=290,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "tickets/DM-12345"},
+    )
+
+    decision = evaluate_lifecycle(
+        rule_set=LifecycleRuleSet(root=[RefDeletedRule()]),
+        context=_context(editions=[draft], live_refs=frozenset()),
+    )
+
+    assert decision.edition_ids == frozenset({290})
 
 
 # ---------------------------------------------------------------------------
@@ -629,10 +836,11 @@ def test_multiple_rules_each_report_their_own_counts() -> None:
                 BuildHistoryOrphanRule(min_position=5, min_age_days=30),
             ]
         ),
-        editions=[stale_draft, holder_edition],
-        builds=[orphan_build],
-        edition_build_history=[orphan_row],
-        now=NOW,
+        context=_context(
+            editions=[stale_draft, holder_edition],
+            builds=[orphan_build],
+            edition_build_history=[orphan_row],
+        ),
     )
 
     assert decision.edition_ids == frozenset({160})

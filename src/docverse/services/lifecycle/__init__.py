@@ -13,10 +13,16 @@ of the canonical ``docverse-client`` models).
 
 from __future__ import annotations
 
-from .evaluator import LifecycleDecision, evaluate_lifecycle, resolve_rule_set
+from .evaluator import (
+    LifecycleDecision,
+    LifecycleEvaluationContext,
+    evaluate_lifecycle,
+    resolve_rule_set,
+)
 
 __all__ = [
     "LifecycleDecision",
+    "LifecycleEvaluationContext",
     "evaluate_lifecycle",
     "resolve_rule_set",
 ]
