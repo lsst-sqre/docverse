@@ -45,7 +45,7 @@ async def _setup_org_and_project(client: AsyncClient) -> None:
         json={
             "slug": _PROJECT,
             "title": "Tmpl Project",
-            "doc_repo": "https://github.com/example/tmpl",
+            "source_url": "https://github.com/example/tmpl",
         },
         headers={"X-Auth-Request-User": _ADMIN},
     )

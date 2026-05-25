@@ -49,7 +49,7 @@ async def _setup(client: AsyncClient) -> None:
         json={
             "slug": "dbt-proj",
             "title": "Dashboard Trigger Project",
-            "doc_repo": "https://github.com/example/dbt",
+            "source_url": "https://github.com/example/dbt",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )

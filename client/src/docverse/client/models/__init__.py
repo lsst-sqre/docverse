@@ -72,7 +72,13 @@ from .organizations import (
     OrganizationUpdate,
     UrlScheme,
 )
-from .projects import Project, ProjectCreate, ProjectUpdate
+from .projects import (
+    Project,
+    ProjectCreate,
+    ProjectGitHubBinding,
+    ProjectGitHubBindingCreate,
+    ProjectUpdate,
+)
 from .queue import QueueJob
 from .queue_enums import JobKind, JobStatus, PublishStatus
 from .services import (
@@ -141,6 +147,8 @@ __all__ = [
     "PrincipalType",
     "Project",
     "ProjectCreate",
+    "ProjectGitHubBinding",
+    "ProjectGitHubBindingCreate",
     "ProjectUpdate",
     "PublishStatus",
     "QueueJob",

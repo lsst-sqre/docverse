@@ -261,7 +261,7 @@ class KeeperSyncService:
                 data=ProjectCreate(
                     slug=ltd_product.slug,
                     title=ltd_product.title,
-                    doc_repo=str(ltd_product.doc_repo),
+                    source_url=str(ltd_product.doc_repo),
                     default_edition=DefaultEditionConfig(
                         tracking_mode=TrackingMode.git_ref,
                         tracking_params={"git_ref": "main"},

@@ -75,7 +75,7 @@ async def test_publish_edition_job_with_edition_id(
             data=ProjectCreate(
                 slug="qj-proj",
                 title="QJ Project",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://github.com/example/repo",
             ),
         )
         edition = await edition_store.create(

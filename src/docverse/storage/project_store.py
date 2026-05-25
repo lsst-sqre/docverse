@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from safir.database import (
     CountedPaginatedList,
@@ -32,8 +34,21 @@ class ProjectStore:
         self._session = session
         self._logger = logger
 
-    async def create(self, *, org_id: int, data: ProjectCreate) -> Project:
-        """Insert a new project row."""
+    async def create(
+        self,
+        *,
+        org_id: int,
+        data: ProjectCreate,
+        github_owner: str | None = None,
+        github_repo: str | None = None,
+    ) -> Project:
+        """Insert a new project row.
+
+        ``github_owner`` and ``github_repo`` are passed in by the caller
+        (``ProjectService``) after resolving the ``github`` sub-object
+        from the request payload, including any auto-population from a
+        ``github.com`` ``source_url``.
+        """
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
             lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
@@ -41,7 +56,9 @@ class ProjectStore:
             slug=data.slug,
             title=data.title,
             org_id=org_id,
-            source_url=data.doc_repo,
+            source_url=data.source_url,
+            github_owner=github_owner,
+            github_repo=github_repo,
             lifecycle_rules=lifecycle_rules,
         )
         self._session.add(row)
@@ -271,9 +288,22 @@ class ProjectStore:
         )
 
     async def update(
-        self, *, org_id: int, slug: str, data: ProjectUpdate
+        self,
+        *,
+        org_id: int,
+        slug: str,
+        data: ProjectUpdate,
+        extra_updates: dict[str, Any] | None = None,
     ) -> Project | None:
-        """Update a project by org_id and slug."""
+        """Update a project by org_id and slug.
+
+        ``extra_updates`` carries server-derived column updates (e.g.
+        the resolved ``github_owner``/``github_repo`` pair plus the
+        ``github_*_id`` clears that accompany a binding change) that
+        the service computed from the ``github`` sub-object on the
+        request body. The ``github`` field is removed from the model
+        dump because it has no direct column mapping.
+        """
         result = await self._session.execute(
             select(SqlProject).where(
                 SqlProject.org_id == org_id,
@@ -285,11 +315,9 @@ class ProjectStore:
         if row is None:
             return None
         updates = data.model_dump(mode="json", exclude_unset=True)
-        # The client model still exposes ``doc_repo`` while the column
-        # was renamed to ``source_url`` for the structured GitHub-binding
-        # work; translate the client field on the way into the row.
-        if "doc_repo" in updates:
-            updates["source_url"] = updates.pop("doc_repo")
+        updates.pop("github", None)
+        if extra_updates:
+            updates.update(extra_updates)
         for key, value in updates.items():
             setattr(row, key, value)
         await self._session.flush()

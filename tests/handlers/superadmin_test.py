@@ -51,7 +51,7 @@ async def test_superadmin_can_create_project(
         json={
             "slug": "my-proj",
             "title": "My Project",
-            "doc_repo": "https://github.com/example/proj",
+            "source_url": "https://github.com/example/proj",
         },
         headers=SUPERADMIN_HEADERS,
     )
@@ -80,7 +80,7 @@ async def test_superadmin_overrides_reader_membership(
         json={
             "slug": "sa-override-proj",
             "title": "Override Project",
-            "doc_repo": "https://github.com/example/override",
+            "source_url": "https://github.com/example/override",
         },
         headers=SUPERADMIN_HEADERS,
     )

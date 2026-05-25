@@ -116,7 +116,7 @@ def test_relaxed_edition_slug_chars_stay_edition_only(slug: str) -> None:
         ProjectCreate(
             slug=slug,
             title="T",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://github.com/example/repo",
         )
     with pytest.raises(ValidationError):
         OrganizationCreate(

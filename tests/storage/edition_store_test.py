@@ -62,7 +62,7 @@ async def _create_project(
         data=ProjectCreate(
             slug="ed-proj",
             title="Ed Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://github.com/example/repo",
         ),
     )
     return project.id

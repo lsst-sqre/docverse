@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from safir.database import CountedPaginatedList, PaginationCursor
 
@@ -11,6 +13,7 @@ from docverse.client.models import (
     ProjectCreate,
     ProjectUpdate,
 )
+from docverse.client.models.projects import parse_github_url
 from docverse.domain.edition import Edition
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
@@ -64,6 +67,61 @@ class ProjectService:
             )
         return DefaultEditionConfig()
 
+    @staticmethod
+    def _resolve_github_for_create(
+        data: ProjectCreate,
+    ) -> tuple[str | None, str | None]:
+        """Resolve ``(github_owner, github_repo)`` for ``ProjectCreate``.
+
+        Precedence: an explicit ``github`` sub-object wins; otherwise a
+        ``github.com`` ``source_url`` is parsed for the pair; otherwise
+        both columns stay NULL. Disagreement between an explicit
+        ``github`` and a ``github.com`` ``source_url`` is already
+        rejected by the model validator on ``ProjectCreate`` before we
+        reach this method.
+        """
+        if data.github is not None:
+            return data.github.owner, data.github.repo
+        if data.source_url is not None:
+            parsed = parse_github_url(data.source_url)
+            if parsed is not None:
+                return parsed
+        return None, None
+
+    @staticmethod
+    def _resolve_github_for_update(
+        data: ProjectUpdate,
+    ) -> dict[str, Any]:
+        """Resolve column updates for the github_* fields on PATCH.
+
+        Returns an empty dict when ``github`` was not in the request body
+        (so the existing column values are unchanged). When ``github`` is
+        explicitly cleared (``null``), all five github_* columns are
+        cleared together. When ``github`` is explicitly set to a value,
+        ``github_owner`` and ``github_repo`` are written and the three
+        opportunistically-captured numeric columns
+        (``github_owner_id``, ``github_repo_id``,
+        ``github_installation_id``) are cleared so they can be re-
+        resolved against the new repo.
+        """
+        if "github" not in data.model_fields_set:
+            return {}
+        if data.github is None:
+            return {
+                "github_owner": None,
+                "github_repo": None,
+                "github_owner_id": None,
+                "github_repo_id": None,
+                "github_installation_id": None,
+            }
+        return {
+            "github_owner": data.github.owner,
+            "github_repo": data.github.repo,
+            "github_owner_id": None,
+            "github_repo_id": None,
+            "github_installation_id": None,
+        }
+
     async def create(
         self, *, org_slug: str, data: ProjectCreate
     ) -> tuple[Organization, Project, Edition]:
@@ -79,7 +137,13 @@ class ProjectService:
         if existing is not None:
             msg = f"Project with slug {data.slug!r} already exists"
             raise ConflictError(msg)
-        project = await self._store.create(org_id=org.id, data=data)
+        github_owner, github_repo = self._resolve_github_for_create(data)
+        project = await self._store.create(
+            org_id=org.id,
+            data=data,
+            github_owner=github_owner,
+            github_repo=github_repo,
+        )
 
         config = self._resolve_default_edition_config(
             data.default_edition, org
@@ -161,7 +225,13 @@ class ProjectService:
             If the project is not found.
         """
         org = await self._resolve_org(org_slug)
-        project = await self._store.update(org_id=org.id, slug=slug, data=data)
+        extra_updates = self._resolve_github_for_update(data)
+        project = await self._store.update(
+            org_id=org.id,
+            slug=slug,
+            data=data,
+            extra_updates=extra_updates,
+        )
         if project is None:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)

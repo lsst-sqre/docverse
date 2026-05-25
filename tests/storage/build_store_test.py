@@ -45,7 +45,7 @@ async def _create_org_and_project(
         data=ProjectCreate(
             slug="build-proj",
             title="Build Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://github.com/example/repo",
         ),
     )
     return org.id, project.id

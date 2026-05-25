@@ -31,7 +31,7 @@ async def _create_project(client: AsyncClient, slug: str) -> None:
         json={
             "slug": slug,
             "title": f"Project {slug}",
-            "doc_repo": f"https://github.com/example/{slug}",
+            "source_url": f"https://github.com/example/{slug}",
         },
         headers=AUTH,
     )

@@ -23,7 +23,7 @@ async def test_create_project(client: AsyncClient) -> None:
         json={
             "slug": "my-docs",
             "title": "My Docs",
-            "doc_repo": "https://github.com/example/docs",
+            "source_url": "https://github.com/example/docs",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -50,7 +50,7 @@ async def test_create_project_with_lifecycle_rules(
         json={
             "slug": "lifecycle-create",
             "title": "Lifecycle Create",
-            "doc_repo": "https://github.com/example/lifecycle-create",
+            "source_url": "https://github.com/example/lifecycle-create",
             "lifecycle_rules": rules,
         },
         headers={"X-Auth-Request-User": "testuser"},
@@ -74,7 +74,7 @@ async def test_list_projects(client: AsyncClient) -> None:
         json={
             "slug": "proj-aa",
             "title": "A",
-            "doc_repo": "https://github.com/example/a",
+            "source_url": "https://github.com/example/a",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -103,7 +103,7 @@ async def test_get_project(client: AsyncClient) -> None:
         json={
             "slug": "get-proj",
             "title": "Get Proj",
-            "doc_repo": "https://github.com/example/get",
+            "source_url": "https://github.com/example/get",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -138,7 +138,7 @@ async def test_update_project(client: AsyncClient) -> None:
         json={
             "slug": "patch-proj",
             "title": "Original",
-            "doc_repo": "https://github.com/example/patch",
+            "source_url": "https://github.com/example/patch",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -162,7 +162,7 @@ async def test_patch_project_lifecycle_rules_valid(
         json={
             "slug": "lifecycle-proj",
             "title": "Lifecycle",
-            "doc_repo": "https://github.com/example/lifecycle",
+            "source_url": "https://github.com/example/lifecycle",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -201,7 +201,7 @@ async def test_patch_project_lifecycle_rules_unknown_type(
         json={
             "slug": "bad-lifecycle-proj",
             "title": "Bad",
-            "doc_repo": "https://github.com/example/bad",
+            "source_url": "https://github.com/example/bad",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -228,7 +228,7 @@ async def test_patch_project_lifecycle_rules_missing_field(
         json={
             "slug": "missing-field-proj",
             "title": "Missing",
-            "doc_repo": "https://github.com/example/missing",
+            "source_url": "https://github.com/example/missing",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -255,7 +255,7 @@ async def test_patch_project_lifecycle_rules_duplicate_types(
         json={
             "slug": "dup-lifecycle-proj",
             "title": "Dup",
-            "doc_repo": "https://github.com/example/dup",
+            "source_url": "https://github.com/example/dup",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -280,7 +280,7 @@ async def test_delete_project(client: AsyncClient) -> None:
         json={
             "slug": "del-proj",
             "title": "Delete Me",
-            "doc_repo": "https://github.com/example/del",
+            "source_url": "https://github.com/example/del",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -312,7 +312,7 @@ async def test_search_by_slug(client: AsyncClient) -> None:
             json={
                 "slug": slug,
                 "title": title,
-                "doc_repo": f"https://github.com/example/{slug}",
+                "source_url": f"https://github.com/example/{slug}",
             },
             headers=headers,
         )
@@ -345,7 +345,7 @@ async def test_search_by_title(client: AsyncClient) -> None:
             json={
                 "slug": slug,
                 "title": title,
-                "doc_repo": f"https://github.com/example/{slug}",
+                "source_url": f"https://github.com/example/{slug}",
             },
             headers=headers,
         )
@@ -387,7 +387,7 @@ async def test_search_pagination(client: AsyncClient) -> None:
             json={
                 "slug": f"pipeline-{i}",
                 "title": f"Pipeline Project {i}",
-                "doc_repo": f"https://github.com/example/pipeline-{i}",
+                "source_url": f"https://github.com/example/pipeline-{i}",
             },
             headers=headers,
         )
@@ -446,7 +446,7 @@ async def test_search_org_scoping(client: AsyncClient) -> None:
         json={
             "slug": "scoped-proj",
             "title": "Scoped Project",
-            "doc_repo": "https://github.com/example/scoped",
+            "source_url": "https://github.com/example/scoped",
         },
         headers=headers,
     )
@@ -457,7 +457,7 @@ async def test_search_org_scoping(client: AsyncClient) -> None:
         json={
             "slug": "scoped-proj",
             "title": "Scoped Project Other",
-            "doc_repo": "https://github.com/example/scoped-other",
+            "source_url": "https://github.com/example/scoped-other",
         },
         headers=headers,
     )
@@ -483,7 +483,7 @@ async def test_search_excludes_soft_deleted(client: AsyncClient) -> None:
         json={
             "slug": "deleted-proj",
             "title": "Deleted Project",
-            "doc_repo": "https://github.com/example/deleted",
+            "source_url": "https://github.com/example/deleted",
         },
         headers=headers,
     )
@@ -506,7 +506,7 @@ async def test_create_project_duplicate_slug(client: AsyncClient) -> None:
     payload = {
         "slug": "dup-proj",
         "title": "First",
-        "doc_repo": "https://github.com/example/dup",
+        "source_url": "https://github.com/example/dup",
     }
     response = await client.post(
         "/docverse/orgs/proj-org/projects",
@@ -533,7 +533,7 @@ async def test_create_project_has_default_edition(
         json={
             "slug": "default-ed",
             "title": "Default Ed",
-            "doc_repo": "https://github.com/example/default-ed",
+            "source_url": "https://github.com/example/default-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -568,7 +568,7 @@ async def test_create_project_custom_default_edition(
         json={
             "slug": "custom-ed",
             "title": "Custom Ed",
-            "doc_repo": "https://github.com/example/custom-ed",
+            "source_url": "https://github.com/example/custom-ed",
             "default_edition": {
                 "tracking_mode": "lsst_doc",
                 "title": "Custom Main",
@@ -595,7 +595,7 @@ async def test_get_project_includes_default_edition(
         json={
             "slug": "get-ed-proj",
             "title": "Get Ed Proj",
-            "doc_repo": "https://github.com/example/get-ed",
+            "source_url": "https://github.com/example/get-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -623,7 +623,7 @@ async def test_list_projects_no_default_edition(
         json={
             "slug": "list-ed-proj",
             "title": "List Ed Proj",
-            "doc_repo": "https://github.com/example/list-ed",
+            "source_url": "https://github.com/example/list-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -647,7 +647,7 @@ async def test_patch_project_includes_default_edition(
         json={
             "slug": "patch-ed-proj",
             "title": "Patch Ed Proj",
-            "doc_repo": "https://github.com/example/patch-ed",
+            "source_url": "https://github.com/example/patch-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -693,7 +693,7 @@ async def test_create_project_org_default_edition_config(
         json={
             "slug": "org-proj",
             "title": "Org Proj",
-            "doc_repo": "https://github.com/example/org-proj",
+            "source_url": "https://github.com/example/org-proj",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -734,7 +734,7 @@ async def test_create_project_request_overrides_org_config(
         json={
             "slug": "override-proj",
             "title": "Override Proj",
-            "doc_repo": "https://github.com/example/override",
+            "source_url": "https://github.com/example/override",
             "default_edition": {
                 "tracking_mode": "git_ref",
                 "tracking_params": {"git_ref": "master"},
@@ -756,3 +756,220 @@ async def test_permission_denied_no_auth(client: AsyncClient) -> None:
         "/docverse/orgs/proj-org/projects",
     )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_create_project_with_github_binding_only(
+    client: AsyncClient,
+) -> None:
+    """POST with ``github`` and no source URL embeds the structured binding."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-only",
+            "title": "GitHub Only",
+            "github": {"owner": "lsst", "repo": "docverse"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["github"] == {
+        "owner": "lsst",
+        "repo": "docverse",
+        "installation_id": None,
+    }
+    assert data["source_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_project_auto_populates_github_from_source_url(
+    client: AsyncClient,
+) -> None:
+    """POST with a github.com source URL populates ``github`` server-side."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "auto-gh",
+            "title": "Auto GH",
+            "source_url": "https://github.com/lsst/auto-gh.git",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["source_url"] == "https://github.com/lsst/auto-gh.git"
+    assert data["github"] == {
+        "owner": "lsst",
+        "repo": "auto-gh",
+        "installation_id": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_project_accepts_agreeing_github_and_source_url(
+    client: AsyncClient,
+) -> None:
+    """POST with agreeing ``source_url`` and ``github`` succeeds."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "agree-proj",
+            "title": "Agree",
+            "source_url": "https://github.com/lsst/agree-proj",
+            "github": {"owner": "lsst", "repo": "agree-proj"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["github"]["owner"] == "lsst"
+    assert data["github"]["repo"] == "agree-proj"
+
+
+@pytest.mark.asyncio
+async def test_create_project_rejects_disagreeing_github_and_source_url(
+    client: AsyncClient,
+) -> None:
+    """POST with disagreeing ``source_url`` and ``github`` fails with 422."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "mismatch-proj",
+            "title": "Mismatch",
+            "source_url": "https://github.com/lsst/one",
+            "github": {"owner": "other", "repo": "two"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_project_non_github_source_url_leaves_github_null(
+    client: AsyncClient,
+) -> None:
+    """POST with a non-GitHub source URL leaves ``github`` NULL."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gitlab-proj",
+            "title": "GitLab",
+            "source_url": "https://gitlab.com/lsst/gitlab-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["source_url"] == "https://gitlab.com/lsst/gitlab-proj"
+    assert data["github"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_project_without_source_or_github(
+    client: AsyncClient,
+) -> None:
+    """POST without source_url or github creates a project with both NULL."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "bare-proj",
+            "title": "Bare",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["source_url"] is None
+    assert data["github"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_project_rejects_disagreeing_github_and_source_url(
+    client: AsyncClient,
+) -> None:
+    """PATCH with disagreeing ``source_url`` and ``github`` fails with 422."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "patch-mismatch",
+            "title": "Patch Mismatch",
+            "github": {"owner": "lsst", "repo": "patch-mismatch"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/patch-mismatch",
+        json={
+            "source_url": "https://github.com/lsst/one",
+            "github": {"owner": "other", "repo": "two"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_project_flips_github_to_non_github(
+    client: AsyncClient,
+) -> None:
+    """PATCH that clears ``github`` and sets a GitLab source URL succeeds."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "flip-proj",
+            "title": "Flip",
+            "github": {"owner": "lsst", "repo": "flip-proj"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/flip-proj",
+        json={
+            "github": None,
+            "source_url": "https://gitlab.com/lsst/flip-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["github"] is None
+    assert data["source_url"] == "https://gitlab.com/lsst/flip-proj"
+
+
+@pytest.mark.asyncio
+async def test_patch_project_sets_github_binding(
+    client: AsyncClient,
+) -> None:
+    """PATCH that adds a ``github`` sub-object writes structured columns."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "add-gh",
+            "title": "Add GH",
+            "source_url": "https://gitlab.com/lsst/add-gh",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/add-gh",
+        json={"github": {"owner": "lsst", "repo": "add-gh"}},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["github"] == {
+        "owner": "lsst",
+        "repo": "add-gh",
+        "installation_id": None,
+    }
+    assert data["source_url"] == "https://gitlab.com/lsst/add-gh"

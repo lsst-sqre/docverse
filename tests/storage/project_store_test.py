@@ -57,7 +57,7 @@ async def test_create_project(
             data=ProjectCreate(
                 slug="my-project",
                 title="My Project",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://github.com/example/repo",
             ),
         )
         await db_session.commit()
@@ -81,7 +81,7 @@ async def test_get_by_slug(
             data=ProjectCreate(
                 slug="find-me",
                 title="Find Me",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://github.com/example/repo",
             ),
         )
         found = await store.get_by_slug(org_id=org_id, slug="find-me")
@@ -116,7 +116,7 @@ async def test_list_by_org(
             data=ProjectCreate(
                 slug="proj-aa",
                 title="A",
-                doc_repo="https://github.com/example/a",
+                source_url="https://github.com/example/a",
             ),
         )
         await store.create(
@@ -124,7 +124,7 @@ async def test_list_by_org(
             data=ProjectCreate(
                 slug="proj-bb",
                 title="B",
-                doc_repo="https://github.com/example/b",
+                source_url="https://github.com/example/b",
             ),
         )
         result = await store.list_by_org(
@@ -151,7 +151,7 @@ async def test_update_project(
             data=ProjectCreate(
                 slug="upd-proj",
                 title="Original",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://github.com/example/repo",
             ),
         )
         updated = await store.update(
@@ -178,7 +178,7 @@ async def test_soft_delete(
             data=ProjectCreate(
                 slug="del-proj",
                 title="Delete Me",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://github.com/example/repo",
             ),
         )
         deleted = await store.soft_delete(org_id=org_id, slug="del-proj")

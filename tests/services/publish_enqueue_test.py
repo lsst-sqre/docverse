@@ -76,7 +76,7 @@ async def _seed_org_project_edition_build(
         data=ProjectCreate(
             slug="pe-proj",
             title="PE Project",
-            doc_repo="https://github.com/example/pe",
+            source_url="https://github.com/example/pe",
         ),
     )
     edition = await edition_store.create(

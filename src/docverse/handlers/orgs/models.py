@@ -17,6 +17,7 @@ from docverse.client.models import (
 from docverse.client.models import (
     DefaultEditionConfig,
     OrganizationServiceSummary,
+    ProjectGitHubBinding,
 )
 from docverse.client.models import Edition as _EditionBase
 from docverse.client.models import (
@@ -207,7 +208,17 @@ class Project(_ProjectBase):
             ),
             slug=domain.slug,
             title=domain.title,
-            doc_repo=domain.source_url or "",
+            source_url=domain.source_url,
+            github=(
+                ProjectGitHubBinding(
+                    owner=domain.github_owner,
+                    repo=domain.github_repo,
+                    installation_id=domain.github_installation_id,
+                )
+                if domain.github_owner is not None
+                and domain.github_repo is not None
+                else None
+            ),
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
             default_edition=edition_response,

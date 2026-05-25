@@ -55,7 +55,7 @@ async def _seed_org_and_project(
         data=ProjectCreate(
             slug=project_slug,
             title="Resolver Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://github.com/example/repo",
         ),
     )
     return org.id, project

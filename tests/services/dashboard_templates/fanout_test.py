@@ -77,7 +77,7 @@ async def _seed_org_with_projects(
             data=ProjectCreate(
                 slug=slug,
                 title=f"Project {slug}",
-                doc_repo=f"https://github.com/example/{slug}",
+                source_url=f"https://github.com/example/{slug}",
             ),
         )
         project_ids.append(project.id)
