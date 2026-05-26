@@ -231,5 +231,41 @@ async def delete_project(
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        await service.soft_delete(org_slug=org_slug, slug=project_slug)
+        org, edition_slugs = await service.soft_delete(
+            org_slug=org_slug, slug=project_slug
+        )
         await context.session.commit()
+    # Remove each edition's CDN pointer after the soft-delete commit so
+    # the public URLs stop resolving once the project row is gone.
+    # ``unpublish`` is idempotent and a no-op for orgs without a
+    # configured CDN, so it is called unconditionally per edition.
+    # Wrapped in its own ``begin()`` block because the publishing
+    # service reads the org row (and may read service config +
+    # credentials) — without an explicit transaction SQLAlchemy
+    # auto-begins an implicit one that we then never commit.
+    #
+    # Failure semantics: mirror the ``delete_edition`` handler — if any
+    # ``unpublish`` raises, the soft-delete is already committed and is
+    # not rolled back. The client sees a 5xx, the project row stays
+    # soft-deleted, and any not-yet-unpublished editions keep their
+    # stale CDN pointer until the next webhook delivery or the daily
+    # ``git_ref_audit`` pass cleans them up (``unpublish`` is
+    # idempotent, so re-running is safe).
+    #
+    # Dashboard: a deleted project has no project dashboard to
+    # rebuild (``DashboardBuildEnqueuer.enqueue_for_project`` would
+    # reject on the ``date_deleted`` filter anyway), and there is no
+    # org-level listing/dashboard rebuild hook today — scoping this
+    # slice to the CDN unpublish, matching PRD #346's webhook fast-
+    # path's same trade-off.
+    if edition_slugs:
+        async with context.session.begin():
+            publishing_service = (
+                context.factory.create_edition_publishing_service()
+            )
+            for edition_slug in edition_slugs:
+                await publishing_service.unpublish(
+                    org_id=org.id,
+                    project_slug=project_slug,
+                    edition_slug=edition_slug,
+                )

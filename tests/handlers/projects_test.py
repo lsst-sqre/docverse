@@ -8,10 +8,16 @@ import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select
+from sqlalchemy import select, update
 
+from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.project import SqlProject
 from docverse.dependencies.context import context_dependency
+from docverse.factory import Factory
+from docverse.storage.editionpublisher import (
+    EditionPublisher,
+    MockEditionPublisher,
+)
 from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
 
@@ -302,6 +308,181 @@ async def test_delete_project(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
+
+
+async def _enable_cdn(org_slug: str) -> None:
+    """Set ``cdn_service_label`` on the seeded org so unpublish runs."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlOrganization)
+                .where(SqlOrganization.slug == org_slug)
+                .values(cdn_service_label="cdn-prod")
+            )
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_delete_project_unpublishes_each_edition(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DELETE project unpublishes the CDN pointer of every edition.
+
+    Seeds an org with a ``cdn_service_label`` and a project with two
+    extra editions on top of the auto-created ``__main`` edition. After
+    the project is soft-deleted, asserts the publisher recorded one
+    ``unpublish`` call per edition (``__main`` plus the two created),
+    each keyed on the deleted project's slug.
+    """
+    await _setup(client)
+    await _enable_cdn("proj-org")
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "cdn-del-proj",
+            "title": "CDN Delete Project",
+            "source_url": "https://example.com/example/cdn-del",
+        },
+        headers=headers,
+    )
+    for slug in ("draft-a", "draft-b"):
+        await client.post(
+            "/docverse/orgs/proj-org/projects/cdn-del-proj/editions",
+            json={
+                "slug": slug,
+                "title": slug,
+                "kind": "draft",
+                "tracking_mode": "git_ref",
+            },
+            headers=headers,
+        )
+
+    mock_publisher = MockEditionPublisher()
+
+    async def _create(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        return mock_publisher
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _create)
+
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/cdn-del-proj",
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+    unpublished = {
+        (call.project_slug, call.edition_slug)
+        for call in mock_publisher.unpublish_calls
+    }
+    assert unpublished == {
+        ("cdn-del-proj", "__main"),
+        ("cdn-del-proj", "draft-a"),
+        ("cdn-del-proj", "draft-b"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_delete_project_no_cdn_is_noop(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DELETE project on a no-CDN org does not invoke the publisher.
+
+    The seeded org has ``cdn_service_label=NULL``, so
+    ``EditionPublishingService.unpublish`` short-circuits before
+    resolving a publisher. The factory's publisher resolver is patched
+    to raise to prove no resolution attempt happens.
+    """
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "no-cdn-proj",
+            "title": "No CDN Project",
+            "source_url": "https://example.com/example/no-cdn",
+        },
+        headers=headers,
+    )
+
+    async def _boom(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        msg = "Publisher must not be resolved when cdn_service_label is NULL"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _boom)
+
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/no-cdn-proj",
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_project_idempotent_re_run(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-deleting a project is a 404; the publisher is not invoked again.
+
+    First delete unpublishes the editions; a second DELETE finds nothing
+    to delete (project is already soft-deleted) and returns 404 without
+    queuing extra unpublish calls.
+    """
+    await _setup(client)
+    await _enable_cdn("proj-org")
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "redel-proj",
+            "title": "Re-Delete Project",
+            "source_url": "https://example.com/example/redel",
+        },
+        headers=headers,
+    )
+
+    mock_publisher = MockEditionPublisher()
+
+    async def _create(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        return mock_publisher
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _create)
+
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/redel-proj",
+        headers=headers,
+    )
+    assert response.status_code == 204
+    first_pass = len(mock_publisher.unpublish_calls)
+    assert first_pass == 1  # __main only
+
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/redel-proj",
+        headers=headers,
+    )
+    assert response.status_code == 404
+    assert len(mock_publisher.unpublish_calls) == first_pass
 
 
 @pytest.mark.asyncio

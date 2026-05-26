@@ -243,8 +243,16 @@ class ProjectService:
         self._logger.info("Updated project", slug=slug, org=org_slug)
         return org, project
 
-    async def soft_delete(self, *, org_slug: str, slug: str) -> None:
+    async def soft_delete(
+        self, *, org_slug: str, slug: str
+    ) -> tuple[Organization, list[str]]:
         """Soft-delete a project.
+
+        Returns the resolved :class:`Organization` and the slug list of
+        the project's non-deleted editions captured before the soft-
+        delete. The handler keys the post-commit CDN unpublish on
+        ``org.id`` (no slug re-resolution) and iterates the slug list
+        without needing an additional ``EditionStore`` read pass.
 
         Raises
         ------
@@ -252,8 +260,20 @@ class ProjectService:
             If the project is not found.
         """
         org = await self._resolve_org(org_slug)
+        project = await self._store.get_by_slug(org_id=org.id, slug=slug)
+        if project is None:
+            msg = f"Project {slug!r} not found"
+            raise NotFoundError(msg)
+        editions = await self._edition_store.list_all_by_project(project.id)
+        edition_slugs = [e.slug for e in editions]
         deleted = await self._store.soft_delete(org_id=org.id, slug=slug)
         if not deleted:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
-        self._logger.info("Soft-deleted project", slug=slug, org=org_slug)
+        self._logger.info(
+            "Soft-deleted project",
+            slug=slug,
+            org=org_slug,
+            edition_count=len(edition_slugs),
+        )
+        return org, edition_slugs
