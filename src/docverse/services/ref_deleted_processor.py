@@ -9,10 +9,33 @@ from typing import Any
 import structlog
 
 from docverse.client.models.dashboard_template import normalize_github_ref
+from docverse.domain.project import Project
+from docverse.services.edition_publishing import EditionPublishingService
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
-__all__ = ["RefDeletedResult", "RefDeletedWebhookProcessor"]
+__all__ = [
+    "AffectedProject",
+    "RefDeletedResult",
+    "RefDeletedWebhookProcessor",
+]
+
+
+@dataclass(frozen=True)
+class AffectedProject:
+    """An (org_slug, project_slug) pair the handler should rebuild.
+
+    Paired because :func:`try_enqueue_dashboard_build_by_slug` needs
+    both, and the webhook's repo-keyed lookup
+    (:meth:`ProjectStore.list_by_github_repo`) does not filter by org —
+    matched projects can in principle span orgs, so the handler cannot
+    derive ``org_slug`` from a single ambient value the way the daily
+    audit's per-org worker can.
+    """
+
+    org_slug: str
+    project_slug: str
 
 
 @dataclass(frozen=True)
@@ -21,15 +44,19 @@ class RefDeletedResult:
 
     ``deleted_edition_ids`` is the list of edition ids the processor
     soft-deleted on this delivery, in the order the per-project sweep
-    visited them. Empty when nothing matched: a malformed payload, a
-    non-branch/tag ``ref_type``, a repo with no bound project, or a
-    ref no draft edition tracks. The webhook handler does not act on
-    the list — it is returned for tests and any future caller (the
-    daily audit reaches the same outcome through the lifecycle
-    evaluator, not this processor).
+    visited them. ``affected_projects`` is the list of (org_slug,
+    project_slug) pairs that had at least one edition soft-deleted,
+    each pair appearing once even when multiple editions on the same
+    project matched the deleted ref. The webhook handler uses this
+    list to enqueue one ``dashboard_build`` per affected project
+    post-commit, mirroring the daily ``git_ref_audit``'s
+    ``projects_with_deletes`` shape. Empty on a non-match path
+    (malformed payload, non-branch/tag ``ref_type``, repo with no
+    bound project, ref no draft edition tracks).
     """
 
     deleted_edition_ids: list[int]
+    affected_projects: list[AffectedProject]
 
 
 _BRANCH_OR_TAG = frozenset({"branch", "tag"})
@@ -63,10 +90,14 @@ class RefDeletedWebhookProcessor:
         *,
         project_store: ProjectStore,
         edition_store: EditionStore,
+        org_store: OrganizationStore,
+        publishing_service: EditionPublishingService,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._project_store = project_store
         self._edition_store = edition_store
+        self._org_store = org_store
+        self._publishing_service = publishing_service
         self._logger = logger
 
     async def process(self, payload: Mapping[str, Any]) -> RefDeletedResult:
@@ -105,7 +136,9 @@ class RefDeletedWebhookProcessor:
                 github_owner=owner,
                 github_repo=repo_name,
             )
-            return RefDeletedResult(deleted_edition_ids=[])
+            return RefDeletedResult(
+                deleted_edition_ids=[], affected_projects=[]
+            )
 
         if not (isinstance(ref, str) and owner and repo_name):
             self._logger.warning(
@@ -115,7 +148,9 @@ class RefDeletedWebhookProcessor:
                 repo=repo_name,
                 ref_type=ref_type,
             )
-            return RefDeletedResult(deleted_edition_ids=[])
+            return RefDeletedResult(
+                deleted_edition_ids=[], affected_projects=[]
+            )
 
         normalized_ref = normalize_github_ref(ref)
 
@@ -131,32 +166,35 @@ class RefDeletedWebhookProcessor:
                 github_ref=normalized_ref,
                 ref_type=ref_type,
             )
-            return RefDeletedResult(deleted_edition_ids=[])
+            return RefDeletedResult(
+                deleted_edition_ids=[], affected_projects=[]
+            )
 
         deleted_ids: list[int] = []
+        affected_projects: list[AffectedProject] = []
+        # Cache org_id -> org_slug across iterations: in the typical
+        # case every matched project sits in one org and one lookup
+        # serves the whole sweep; a multi-org match (rare — same repo
+        # backing project slugs in distinct orgs) still pays at most
+        # one lookup per unique org_id.
+        org_slug_cache: dict[int, str] = {}
         for project in projects:
-            editions = (
-                await self._edition_store.list_draft_editions_by_git_ref(
-                    project_id=project.id, git_ref=normalized_ref
-                )
+            project_deleted_ids = await self._sweep_project(
+                project=project,
+                normalized_ref=normalized_ref,
+                ref_type=ref_type,
             )
-            for edition in editions:
-                deleted = await self._edition_store.soft_delete(
-                    project_id=project.id, slug=edition.slug
-                )
-                if not deleted:
-                    continue
-                deleted_ids.append(edition.id)
-                self._logger.info(
-                    "Soft-deleted edition for deleted ref",
-                    project_id=project.id,
-                    project_slug=project.slug,
-                    edition_id=edition.id,
-                    edition_slug=edition.slug,
-                    github_ref=normalized_ref,
-                    ref_type=ref_type,
-                    trigger="webhook",
-                )
+            if not project_deleted_ids:
+                continue
+            deleted_ids.extend(project_deleted_ids)
+            org_slug = await self._resolve_org_slug(
+                org_id=project.org_id, cache=org_slug_cache
+            )
+            if org_slug is None:
+                continue
+            affected_projects.append(
+                AffectedProject(org_slug=org_slug, project_slug=project.slug)
+            )
 
         self._logger.info(
             "Processed delete webhook",
@@ -168,7 +206,67 @@ class RefDeletedWebhookProcessor:
             projects_matched=len(projects),
             editions_deleted=len(deleted_ids),
         )
-        return RefDeletedResult(deleted_edition_ids=deleted_ids)
+        return RefDeletedResult(
+            deleted_edition_ids=deleted_ids,
+            affected_projects=affected_projects,
+        )
+
+    async def _sweep_project(
+        self,
+        *,
+        project: Project,
+        normalized_ref: str,
+        ref_type: str,
+    ) -> list[int]:
+        """Soft-delete + unpublish every draft tracking the deleted ref.
+
+        Returns the ordered ids of the editions soft-deleted on this
+        project (empty when nothing matched or every match was already
+        soft-deleted by an in-flight delivery). ``unpublish`` runs
+        inside the handler's open transaction; see
+        :meth:`process`'s key-decision comment for why this matches the
+        daily audit worker rather than the ``delete_edition`` handler.
+        """
+        editions = await self._edition_store.list_draft_editions_by_git_ref(
+            project_id=project.id, git_ref=normalized_ref
+        )
+        deleted: list[int] = []
+        for edition in editions:
+            was_deleted = await self._edition_store.soft_delete(
+                project_id=project.id, slug=edition.slug
+            )
+            if not was_deleted:
+                continue
+            deleted.append(edition.id)
+            await self._publishing_service.unpublish(
+                org_id=project.org_id,
+                project_slug=project.slug,
+                edition_slug=edition.slug,
+            )
+            self._logger.info(
+                "Soft-deleted edition for deleted ref",
+                project_id=project.id,
+                project_slug=project.slug,
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                github_ref=normalized_ref,
+                ref_type=ref_type,
+                trigger="webhook",
+            )
+        return deleted
+
+    async def _resolve_org_slug(
+        self, *, org_id: int, cache: dict[int, str]
+    ) -> str | None:
+        """Return the org's slug, caching across the per-call sweep."""
+        cached = cache.get(org_id)
+        if cached is not None:
+            return cached
+        org = await self._org_store.get_by_id(org_id)
+        if org is None:
+            return None
+        cache[org_id] = org.slug
+        return org.slug
 
 
 def _split_full_name_tuple(full_name: object) -> tuple[str, str] | None:

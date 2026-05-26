@@ -14,20 +14,32 @@ import structlog
 from fastapi import FastAPI
 from httpx import AsyncClient
 from pydantic import SecretStr
+from safir.arq import MockArqQueue
+from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select, update
 
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
+    JobKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
+from docverse.dbschema.organization import SqlOrganization
+from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.dependencies.context import context_dependency
+from docverse.factory import Factory
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.editionpublisher import (
+    EditionPublisher,
+    MockEditionPublisher,
+)
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 
 _WEBHOOK_PATH = "/docverse/webhooks/github"
@@ -314,3 +326,188 @@ async def test_signed_delete_tag_handled_like_branch(
     response = await client.post(_WEBHOOK_PATH, content=body, headers=headers)
     assert response.status_code == 200
     assert await _is_deleted(project_id, "v0-9")
+
+
+async def _set_cdn_service_label(org_slug: str) -> None:
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlOrganization)
+                .where(SqlOrganization.slug == org_slug)
+                .values(cdn_service_label="cdn-prod")
+            )
+            await session.commit()
+        return
+    msg = "db_session_dependency yielded nothing"
+    raise AssertionError(msg)
+
+
+async def _count_dashboard_jobs() -> int:
+    async for session in db_session_dependency():
+        async with session.begin():
+            result = await session.execute(
+                select(SqlQueueJob).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value
+                )
+            )
+            return len(list(result.scalars().all()))
+    msg = "db_session_dependency yielded nothing"
+    raise AssertionError(msg)
+
+
+def _dashboard_build_arq_count() -> int:
+    mock_arq = arq_dependency._arq_queue
+    assert isinstance(mock_arq, MockArqQueue)
+    return count_jobs_by_name(mock_arq, "dashboard_build")
+
+
+@pytest.mark.asyncio
+async def test_signed_delete_unpublishes_from_cdn(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The webhook fast path removes the CDN pointer for each match.
+
+    Mirrors :func:`tests.handlers.editions_test
+    .test_delete_edition_unpublishes_from_cdn`'s factory-patch shape:
+    seed an org with a ``cdn_service_label`` so the publishing
+    service resolves a publisher, then assert the recorded
+    ``unpublish`` call matches the soft-deleted edition.
+    """
+    project_id, _ = await _seed_project_with_edition(
+        org_slug="delete-cdn", project_slug="docs"
+    )
+    await _set_cdn_service_label("delete-cdn")
+
+    mock_publisher = MockEditionPublisher()
+
+    async def _create(
+        self: Factory, *, org_id: int, service_label: str
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        return mock_publisher
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _create)
+
+    body, headers = _post_signed(_delete_payload())
+    response = await client.post(_WEBHOOK_PATH, content=body, headers=headers)
+    assert response.status_code == 200
+    assert await _is_deleted(project_id, "dm-1")
+    assert len(mock_publisher.unpublish_calls) == 1
+    call = mock_publisher.unpublish_calls[0]
+    assert call.project_slug == "docs"
+    assert call.edition_slug == "dm-1"
+
+
+@pytest.mark.asyncio
+async def test_signed_delete_enqueues_dashboard_build_per_affected_project(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """Each affected project gets one ``dashboard_build`` post-commit.
+
+    Asserts at the queue-row level so the test is independent of the
+    arq backend's job naming. The handler enqueues post-commit (after
+    the soft-delete + unpublish block exits), matching the daily
+    audit worker's order so an enqueue failure cannot roll back the
+    soft-delete.
+    """
+    await _seed_project_with_edition(
+        org_slug="delete-dashboard", project_slug="docs"
+    )
+
+    before = await _count_dashboard_jobs()
+    body, headers = _post_signed(_delete_payload())
+    response = await client.post(_WEBHOOK_PATH, content=body, headers=headers)
+    assert response.status_code == 200
+
+    after = await _count_dashboard_jobs()
+    assert after - before == 1
+    assert _dashboard_build_arq_count() >= 1
+
+
+@pytest.mark.asyncio
+async def test_signed_delete_no_match_does_not_enqueue_or_unpublish(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivery with no matched project fires neither side-effect.
+
+    Pairs with :func:`test_signed_delete_no_match_returns_200`: the
+    no-match path stays a silent 200 with zero CDN traffic and zero
+    queue rows.
+    """
+    mock_publisher = MockEditionPublisher()
+
+    async def _create(
+        self: Factory, *, org_id: int, service_label: str
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        return mock_publisher
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _create)
+
+    before = await _count_dashboard_jobs()
+    body, headers = _post_signed(
+        _delete_payload(owner="ghost", repo="repo", repo_id=99999)
+    )
+    response = await client.post(_WEBHOOK_PATH, content=body, headers=headers)
+    assert response.status_code == 200
+    assert mock_publisher.unpublish_calls == []
+    after = await _count_dashboard_jobs()
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_signed_delete_cdn_failure_rolls_back_soft_delete(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CDN unpublish failure rolls back the soft-delete + skips enqueue.
+
+    The unpublish runs inside the handler's open transaction, so a
+    raise propagates out of the webhook handler and the soft-delete is
+    rolled back along with it. In production the ASGI server returns
+    500 and GitHub redelivers the webhook; in this ASGI-transport test
+    rig the uncaught ``RuntimeError`` bubbles up through ``httpx``
+    without being translated, so the assertion uses ``pytest.raises``.
+    The contract being pinned is the rollback: the edition is still
+    present and no ``dashboard_build`` row was written.
+    """
+    project_id, _ = await _seed_project_with_edition(
+        org_slug="delete-cdn-fail", project_slug="docs"
+    )
+    await _set_cdn_service_label("delete-cdn-fail")
+
+    class _FailingPublisher(MockEditionPublisher):
+        async def unpublish(
+            self, *, project_slug: str, edition_slug: str
+        ) -> None:
+            await super().unpublish(
+                project_slug=project_slug, edition_slug=edition_slug
+            )
+            msg = "kv failure"
+            raise RuntimeError(msg)
+
+    failing_publisher = _FailingPublisher()
+
+    async def _create(
+        self: Factory, *, org_id: int, service_label: str
+    ) -> EditionPublisher:
+        _ = (self, org_id, service_label)
+        return failing_publisher
+
+    monkeypatch.setattr(Factory, "create_edition_publisher_for_org", _create)
+
+    before = await _count_dashboard_jobs()
+    body, headers = _post_signed(_delete_payload())
+    with pytest.raises(RuntimeError, match="kv failure"):
+        await client.post(_WEBHOOK_PATH, content=body, headers=headers)
+
+    assert len(failing_publisher.unpublish_calls) == 1
+    assert not await _is_deleted(project_id, "dm-1")
+    after = await _count_dashboard_jobs()
+    assert after == before

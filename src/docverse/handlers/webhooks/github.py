@@ -12,6 +12,9 @@ from gidgethub.routing import Router as GidgethubRouter
 
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.factory import WebhookDispatch
+from docverse.services.dashboard.enqueue import (
+    try_enqueue_dashboard_build_by_slug,
+)
 from docverse.services.dashboard_templates import (
     InstallationEventProcessor,
     PushEventProcessor,
@@ -153,11 +156,23 @@ async def _handle_delete(
     Wraps :meth:`RefDeletedWebhookProcessor.process` in the same
     ``context.session.begin()`` as the push and rename handlers so a
     failure mid-sweep rolls back the whole delivery's deletions
-    atomically.
+    atomically. After the commit, enqueues one ``dashboard_build``
+    per affected project so the project index drops the retired
+    editions; the enqueue runs in its own transaction (post-commit,
+    matching the daily ``git_ref_audit`` worker) so an enqueue
+    failure cannot roll back the soft-delete + unpublish.
     """
     async with context.session.begin():
-        await ref_deleted.process(event.data)
+        result = await ref_deleted.process(event.data)
         await context.session.commit()
+    for affected in result.affected_projects:
+        await try_enqueue_dashboard_build_by_slug(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            org_slug=affected.org_slug,
+            project_slug=affected.project_slug,
+        )
 
 
 @router.post(

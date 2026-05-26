@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from docverse.client.models import (
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.services.ref_deleted_processor import (
+    AffectedProject,
     RefDeletedResult,
     RefDeletedWebhookProcessor,
 )
@@ -29,10 +31,50 @@ def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("test")  # type: ignore[no-any-return]
 
 
-def _make_processor(session: AsyncSession) -> RefDeletedWebhookProcessor:
+@dataclass
+class _RecordedUnpublish:
+    org_id: int
+    project_slug: str
+    edition_slug: str
+
+
+@dataclass
+class _StubPublishingService:
+    """Duck-typed ``EditionPublishingService`` stand-in for unit tests.
+
+    Records every ``unpublish`` call in order so tests can assert on
+    arguments. ``raise_on_unpublish`` lets a test simulate a CDN
+    failure: the exception propagates out of ``process`` so the
+    handler's transaction rolls back.
+    """
+
+    calls: list[_RecordedUnpublish] = field(default_factory=list)
+    raise_on_unpublish: Exception | None = None
+
+    async def unpublish(
+        self, *, org_id: int, project_slug: str, edition_slug: str
+    ) -> None:
+        self.calls.append(
+            _RecordedUnpublish(
+                org_id=org_id,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+            )
+        )
+        if self.raise_on_unpublish is not None:
+            raise self.raise_on_unpublish
+
+
+def _make_processor(
+    session: AsyncSession,
+    *,
+    publishing_service: _StubPublishingService | None = None,
+) -> RefDeletedWebhookProcessor:
     return RefDeletedWebhookProcessor(
         project_store=ProjectStore(session=session, logger=_logger()),
         edition_store=EditionStore(session=session, logger=_logger()),
+        org_store=OrganizationStore(session=session, logger=_logger()),
+        publishing_service=publishing_service or _StubPublishingService(),  # type: ignore[arg-type]
         logger=_logger(),
     )
 
@@ -494,3 +536,173 @@ async def test_process_normalizes_fully_qualified_ref_defensively(
         )
         await db_session.commit()
     assert result.deleted_edition_ids == [edition_id]
+
+
+@pytest.mark.asyncio
+async def test_process_unpublishes_each_soft_deleted_edition(
+    db_session: AsyncSession,
+) -> None:
+    """Every soft-deleted edition triggers a matching ``unpublish`` call.
+
+    The unpublish runs inside the handler's open transaction (matching
+    the daily ``git_ref_audit`` worker's ``_apply_deletions`` shape) so
+    a CDN failure later in the sweep would roll the whole batch back —
+    the rollback semantics are exercised by their own test below.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ref-del-unpub")
+        a_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs-a", repo_id=12345
+        )
+        b_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs-b", repo_id=12345
+        )
+        await _seed_draft_edition(
+            db_session, project_id=a_id, slug="dm-1", git_ref="tickets/DM-1"
+        )
+        await _seed_draft_edition(
+            db_session, project_id=b_id, slug="dm-1", git_ref="tickets/DM-1"
+        )
+        await db_session.commit()
+
+    publishing = _StubPublishingService()
+    async with db_session.begin():
+        result = await _make_processor(
+            db_session, publishing_service=publishing
+        ).process(_delete_payload())
+        await db_session.commit()
+
+    assert len(result.deleted_edition_ids) == 2
+    assert {
+        (c.org_id, c.project_slug, c.edition_slug) for c in publishing.calls
+    } == {(org_id, "docs-a", "dm-1"), (org_id, "docs-b", "dm-1")}
+
+
+@pytest.mark.asyncio
+async def test_process_result_carries_unique_affected_projects(
+    db_session: AsyncSession,
+) -> None:
+    """``RefDeletedResult.affected_projects`` lists each project once.
+
+    The handler iterates this list to enqueue one ``dashboard_build``
+    per project; duplicates would produce redundant queue rows (the
+    enqueuer's dedup helps but is a backstop, not an excuse to fire
+    spurious enqueues from the caller). Each entry pairs ``org_slug``
+    with ``project_slug`` so the handler can call
+    ``try_enqueue_dashboard_build_by_slug`` without an extra org
+    lookup of its own.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ref-del-slugs")
+        a_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs-a", repo_id=12345
+        )
+        b_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs-b", repo_id=12345
+        )
+        # Two editions on project A both match the deleted ref; project
+        # A's slug must still appear exactly once in the result.
+        await _seed_draft_edition(
+            db_session, project_id=a_id, slug="dm-1", git_ref="tickets/DM-1"
+        )
+        await _seed_draft_edition(
+            db_session,
+            project_id=a_id,
+            slug="dm-1-alt",
+            git_ref="tickets/DM-1",
+            tracking_mode=TrackingMode.alternate_git_ref,
+            alternate_name="alt",
+        )
+        await _seed_draft_edition(
+            db_session, project_id=b_id, slug="dm-1", git_ref="tickets/DM-1"
+        )
+        await db_session.commit()
+
+    publishing = _StubPublishingService()
+    async with db_session.begin():
+        result = await _make_processor(
+            db_session, publishing_service=publishing
+        ).process(_delete_payload())
+        await db_session.commit()
+
+    assert len(result.deleted_edition_ids) == 3
+    assert sorted(result.affected_projects, key=lambda p: p.project_slug) == [
+        AffectedProject(org_slug="ref-del-slugs", project_slug="docs-a"),
+        AffectedProject(org_slug="ref-del-slugs", project_slug="docs-b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_no_match_does_not_unpublish_or_report_slugs(
+    db_session: AsyncSession,
+) -> None:
+    """A ref no draft tracks produces zero unpublish calls and no slugs."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ref-del-no-unpub")
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs", repo_id=12345
+        )
+        await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="feature-y",
+            git_ref="feature-y",
+        )
+        await db_session.commit()
+
+    publishing = _StubPublishingService()
+    async with db_session.begin():
+        result = await _make_processor(
+            db_session, publishing_service=publishing
+        ).process(_delete_payload(ref="feature-x"))
+        await db_session.commit()
+
+    assert publishing.calls == []
+    assert result.affected_projects == []
+
+
+@pytest.mark.asyncio
+async def test_process_unpublish_failure_propagates(
+    db_session: AsyncSession,
+) -> None:
+    """A CDN failure inside the sweep raises so the handler rolls back.
+
+    The unpublish call shares the handler's transaction; the handler
+    does not catch the exception, so it propagates to FastAPI as a
+    5xx and GitHub redelivers — matching the daily audit worker's
+    "CDN failure rolls back the soft-delete" contract.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ref-del-cdn-fail")
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs", repo_id=12345
+        )
+        await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="dm-1",
+            git_ref="tickets/DM-1",
+        )
+        await db_session.commit()
+
+    publishing = _StubPublishingService(
+        raise_on_unpublish=RuntimeError("kv failure")
+    )
+
+    async def _drive() -> None:
+        async with db_session.begin():
+            await _make_processor(
+                db_session, publishing_service=publishing
+            ).process(_delete_payload())
+            await db_session.commit()
+
+    with pytest.raises(RuntimeError, match="kv failure"):
+        await _drive()
+
+    # Confirm the unpublish was actually attempted (rather than the
+    # raise firing for an unrelated reason) before checking rollback.
+    assert len(publishing.calls) == 1
+    async with db_session.begin():
+        assert not await _is_deleted(
+            db_session, project_id=project_id, slug="dm-1"
+        )
