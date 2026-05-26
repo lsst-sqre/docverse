@@ -160,7 +160,7 @@ async def _setup_publish_scenario(
         data=ProjectCreate(
             slug="pub-proj",
             title="Publish Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://example.com/example/repo",
         ),
     )
     edition = await edition_store.create(

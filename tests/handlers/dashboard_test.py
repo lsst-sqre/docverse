@@ -16,7 +16,7 @@ async def _setup(client: AsyncClient) -> None:
         json={
             "slug": "dash-proj",
             "title": "Dash Project",
-            "doc_repo": "https://github.com/example/dash",
+            "source_url": "https://example.com/example/dash",
         },
         headers={"X-Auth-Request-User": "admin-user"},
     )
@@ -104,7 +104,7 @@ async def _create_project(
         json={
             "slug": slug,
             "title": f"Project {slug}",
-            "doc_repo": f"https://github.com/example/{slug}",
+            "source_url": f"https://example.com/example/{slug}",
         },
         headers={"X-Auth-Request-User": admin},
     )

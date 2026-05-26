@@ -16,7 +16,9 @@ from docverse.client.models import (
 )
 from docverse.client.models import (
     DefaultEditionConfig,
+    InstallationStatus,
     OrganizationServiceSummary,
+    ProjectGitHubBinding,
 )
 from docverse.client.models import Edition as _EditionBase
 from docverse.client.models import (
@@ -161,8 +163,15 @@ class Project(_ProjectBase):
         org: OrganizationDomain,
         *,
         default_edition: EditionDomain | None = None,
+        app_url: str | None = None,
     ) -> Self:
-        """Create from a domain object, adding HATEOAS URLs."""
+        """Create from a domain object, adding HATEOAS URLs.
+
+        ``app_url`` is the Docverse GitHub App's public install-page URL
+        (``context.factory.github_app_html_url``), surfaced on the
+        ``github`` binding so the UI can prompt operators to install the
+        App. ``None`` when the GitHub App feature is unconfigured.
+        """
         edition_response = None
         if default_edition is not None:
             project_url = project_published_url(org, domain)
@@ -174,6 +183,21 @@ class Project(_ProjectBase):
                 published_url=edition_published_url(
                     project_url, default_edition
                 ),
+            )
+        github_binding: ProjectGitHubBinding | None = None
+        if domain.github_owner is not None and domain.github_repo is not None:
+            github_binding = ProjectGitHubBinding(
+                owner=domain.github_owner,
+                repo=domain.github_repo,
+                installation_id=domain.github_installation_id,
+                # The binding branch guarantees owner+repo are set, so
+                # the derived status is never ``None`` here; the fallback
+                # only satisfies the required-field type.
+                installation_status=(
+                    domain.github_installation_status
+                    or InstallationStatus.not_installed
+                ),
+                app_url=app_url,
             )
         return cls(
             self_url=str(
@@ -207,7 +231,8 @@ class Project(_ProjectBase):
             ),
             slug=domain.slug,
             title=domain.title,
-            doc_repo=domain.doc_repo,
+            source_url=domain.effective_source_url,
+            github=github_binding,
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
             default_edition=edition_response,

@@ -19,7 +19,9 @@ from docverse.storage.github import (
     GITHUB_API_BASE_URL,
     GitHubAppClient,
     GitHubAppNotConfiguredError,
+    GitHubAppNotInstalledError,
     InstallationAuth,
+    RepositoryMetadata,
 )
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
@@ -48,6 +50,69 @@ async def test_get_installation_id_uses_app_jwt(
         installation_id = await client.get_installation_id("acme", "templates")
 
     assert installation_id == 42
+
+
+@pytest.mark.asyncio
+async def test_get_installation_id_raises_not_installed_on_404(
+    mock_github: GitHubMock,
+) -> None:
+    """A 404 maps to ``GitHubAppNotInstalledError`` carrying owner/repo.
+
+    A 404 from ``/repos/{owner}/{repo}/installation`` means no
+    installation grants the App access to this repo — an expected,
+    operator-recoverable state, not a credential bug. The wrapper
+    translates it to a dedicated non-Slack exception so the worker can
+    leave the ids NULL without paging Sentry.
+    """
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(return_value=httpx.Response(404, json={"message": "Not Found"}))
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        with pytest.raises(GitHubAppNotInstalledError) as excinfo:
+            await client.get_installation_id("acme", "templates")
+
+    assert excinfo.value.owner == "acme"
+    assert excinfo.value.repo == "templates"
+    assert not isinstance(excinfo.value, DocverseSlackException)
+
+
+@pytest.mark.asyncio
+async def test_get_installation_id_reraises_non_404_bad_request(
+    mock_github: GitHubMock,
+) -> None:
+    """A non-404 ``BadRequest`` (e.g. 403) propagates unchanged.
+
+    Only 404 means "App not connected to this repo". Other 4xx — a 403
+    forbidden, say — is a genuine error the worker must still capture to
+    Sentry, so the wrapper re-raises the original ``gidgethub`` error
+    rather than masking it as not-installed.
+    """
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(return_value=httpx.Response(403, json={"message": "Forbidden"}))
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        with pytest.raises(gidgethub.BadRequest):
+            await client.get_installation_id("acme", "templates")
 
 
 @pytest.mark.asyncio
@@ -108,10 +173,51 @@ async def test_get_installation_auth_returns_token_record(
 
 
 @pytest.mark.asyncio
+async def test_resolve_repository_metadata_returns_all_three_ids(
+    mock_github: GitHubMock,
+) -> None:
+    """``resolve_repository_metadata`` returns installation, owner, repo IDs.
+
+    Combines the existing ``/repos/{owner}/{repo}/installation`` and
+    ``/repos/{owner}/{repo}`` lookups into one call so the ``project_
+    github_resolve`` worker has a single deep entry point. Asserts the
+    return record carries all three IDs without depending on which
+    endpoint surfaced each — the caller just needs the bundle.
+    """
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo("acme", "templates", repo_id=12345, owner_id=111)
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        metadata = await client.resolve_repository_metadata(
+            owner="acme", repo="templates"
+        )
+
+    assert isinstance(metadata, RepositoryMetadata)
+    assert metadata.installation_id == 42
+    assert metadata.owner_id == 111
+    assert metadata.repo_id == 12345
+
+
+@pytest.mark.asyncio
 async def test_validate_succeeds_on_2xx_app_response(
     mock_github: GitHubMock,
 ) -> None:
-    """``validate`` returns cleanly when ``GET /app`` returns 200."""
+    """``validate`` returns the App ``html_url`` when ``GET /app`` is 200.
+
+    The captured ``html_url`` is the App's public install page, threaded
+    through startup so the API can surface it as ``github.app_url``.
+    """
     mock_github.seed_app()
 
     async with httpx.AsyncClient() as http_client:
@@ -124,7 +230,9 @@ async def test_validate_succeeds_on_2xx_app_response(
         client = GitHubAppClient(
             factory=factory, http_client=http_client, logger=_logger()
         )
-        await client.validate()
+        html_url = await client.validate()
+
+    assert html_url == "https://github.com/apps/docverse"
 
 
 @pytest.mark.asyncio

@@ -64,7 +64,7 @@ async def _create_edition_and_builds(
         data=ProjectCreate(
             slug=project_slug,
             title=f"Project {project_slug}",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://example.com/example/repo",
         ),
     )
     edition = await edition_store.create(
@@ -303,7 +303,7 @@ async def test_list_with_build_info_includes_annotations(
             data=ProjectCreate(
                 slug="ann-proj",
                 title="Ann Project",
-                doc_repo="https://github.com/example/ann",
+                source_url="https://example.com/example/ann",
             ),
         )
         edition = await edition_store.create(

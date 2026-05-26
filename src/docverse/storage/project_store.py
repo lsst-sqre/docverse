@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from safir.database import (
     CountedPaginatedList,
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import REAL, cast, select
+from sqlalchemy import REAL, cast, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
@@ -32,8 +34,22 @@ class ProjectStore:
         self._session = session
         self._logger = logger
 
-    async def create(self, *, org_id: int, data: ProjectCreate) -> Project:
-        """Insert a new project row."""
+    async def create(
+        self,
+        *,
+        org_id: int,
+        data: ProjectCreate,
+        github_owner: str | None = None,
+        github_repo: str | None = None,
+    ) -> Project:
+        """Insert a new project row.
+
+        ``github_owner`` and ``github_repo`` are passed in by the caller
+        (``ProjectService``) after resolving the ``github`` sub-object
+        from the request payload. The validator guarantees a
+        GitHub-bound project sends no ``source_url``, so the column is
+        persisted NULL for those rows.
+        """
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
             lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
@@ -41,7 +57,9 @@ class ProjectStore:
             slug=data.slug,
             title=data.title,
             org_id=org_id,
-            doc_repo=data.doc_repo,
+            source_url=data.source_url,
+            github_owner=github_owner,
+            github_repo=github_repo,
             lifecycle_rules=lifecycle_rules,
         )
         self._session.add(row)
@@ -271,9 +289,22 @@ class ProjectStore:
         )
 
     async def update(
-        self, *, org_id: int, slug: str, data: ProjectUpdate
+        self,
+        *,
+        org_id: int,
+        slug: str,
+        data: ProjectUpdate,
+        extra_updates: dict[str, Any] | None = None,
     ) -> Project | None:
-        """Update a project by org_id and slug."""
+        """Update a project by org_id and slug.
+
+        ``extra_updates`` carries server-derived column updates (e.g.
+        the resolved ``github_owner``/``github_repo`` pair plus the
+        ``github_*_id`` clears that accompany a binding change) that
+        the service computed from the ``github`` sub-object on the
+        request body. The ``github`` field is removed from the model
+        dump because it has no direct column mapping.
+        """
         result = await self._session.execute(
             select(SqlProject).where(
                 SqlProject.org_id == org_id,
@@ -285,11 +316,204 @@ class ProjectStore:
         if row is None:
             return None
         updates = data.model_dump(mode="json", exclude_unset=True)
+        updates.pop("github", None)
+        if extra_updates:
+            updates.update(extra_updates)
         for key, value in updates.items():
             setattr(row, key, value)
         await self._session.flush()
         await self._session.refresh(row)
         return Project.model_validate(row)
+
+    async def rename_repo_by_repo_id(
+        self,
+        *,
+        github_repo_id: int,
+        new_repo: str,
+    ) -> list[int]:
+        """Rewrite ``github_repo`` on projects backing a renamed repo.
+
+        Used by :class:`docverse.services.dashboard_templates
+        .RenameEventProcessor` to mirror the dashboard binding's
+        ``rename_repo_by_repo_id`` for projects on the same repo. Only
+        the structured ``github_repo`` column flips; the
+        operator-visible source URL is derived from the binding
+        (:attr:`docverse.domain.project.Project.effective_source_url`),
+        so it follows automatically without a stored value to rewrite.
+
+        ``date_updated`` is explicitly preserved (pinned to its current
+        value so the column's ``onupdate=func.now()`` does not fire): a
+        GitHub-side rename is sync-bookkeeping, not an operator-visible
+        source-coordinate edit, which arrives through PUT/PATCH. This
+        mirrors the discipline of the dashboard binding store's
+        ``rename_repo_by_repo_id`` and of ``apply_installation_scope``.
+
+        Returns the list of updated project ids.
+        """
+        stmt = (
+            update(SqlProject)
+            .where(
+                SqlProject.github_repo_id == github_repo_id,
+                SqlProject.date_deleted.is_(None),
+            )
+            .values(
+                github_repo=new_repo,
+                date_updated=SqlProject.date_updated,
+            )
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def transfer_repo_by_repo_id(
+        self,
+        *,
+        github_repo_id: int,
+        new_owner: str,
+        new_owner_id: int,
+        new_repo: str,
+    ) -> list[int]:
+        """Flip owner + owner_id + repo on projects backing a transfer.
+
+        Mirrors :meth:`docverse.storage.dashboard_templates.github
+        .DashboardGitHubTemplateBindingStore.transfer_repo_by_repo_id`:
+        a ``repository.transferred`` event keeps ``repository.id``
+        stable but moves the repo to a new owner namespace, so the
+        binding has to switch its owner-side identity to keep matching
+        push events from the new namespace. Only the structured columns
+        flip; the operator-visible source URL is derived from the
+        binding, so it follows automatically.
+
+        ``date_updated`` is explicitly preserved (pinned to its current
+        value so the column's ``onupdate=func.now()`` does not fire): a
+        GitHub-side transfer is sync-bookkeeping, not an operator-
+        visible source-coordinate edit, which arrives through PUT/PATCH.
+        This mirrors the discipline of the dashboard binding store's
+        ``transfer_repo_by_repo_id`` and of ``apply_installation_scope``.
+
+        Returns the list of updated project ids.
+        """
+        stmt = (
+            update(SqlProject)
+            .where(
+                SqlProject.github_repo_id == github_repo_id,
+                SqlProject.date_deleted.is_(None),
+            )
+            .values(
+                github_owner=new_owner,
+                github_owner_id=new_owner_id,
+                github_repo=new_repo,
+                date_updated=SqlProject.date_updated,
+            )
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def apply_installation_scope(
+        self,
+        *,
+        installation_id: int,
+        owner: str,
+        owner_id: int,
+        repo: str,
+        repo_id: int,
+    ) -> list[int]:
+        """Backfill the three github_*_id columns from a webhook payload.
+
+        Used by :class:`docverse.services.dashboard_templates
+        .InstallationEventProcessor` to capture
+        ``(github_installation_id, github_owner_id, github_repo_id)``
+        whenever GitHub announces that ``owner/repo`` is now in scope
+        of an installation. The match is case-insensitive on
+        ``(github_owner, github_repo)`` so a project registered as
+        ``Acme/Docs`` still matches a payload that delivers
+        ``acme/docs``.
+
+        ``date_updated`` is explicitly preserved: this write is
+        sync-bookkeeping, not an operator-visible source-coordinate
+        edit, and bumping ``date_updated`` here would mislead any
+        consumer that reads it as ``last operator change``. Mirrors
+        the same discipline the dashboard binding store's
+        ``rename_*`` / ``mark_unreachable_by_installation_id``
+        methods already apply.
+
+        Returns the list of project ids that were updated, so the
+        caller can log a count (``projects_updated=N``) without a
+        separate round-trip.
+        """
+        stmt = (
+            update(SqlProject)
+            .where(
+                func.lower(SqlProject.github_owner) == owner.lower(),
+                func.lower(SqlProject.github_repo) == repo.lower(),
+                SqlProject.date_deleted.is_(None),
+            )
+            .values(
+                github_installation_id=installation_id,
+                github_owner_id=owner_id,
+                github_repo_id=repo_id,
+                date_updated=SqlProject.date_updated,
+            )
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return [row[0] for row in result.all()]
+
+    async def update_github_metadata(  # noqa: PLR0913
+        self,
+        *,
+        project_id: int,
+        expected_owner: str,
+        expected_repo: str,
+        installation_id: int,
+        owner_id: int,
+        repo_id: int,
+    ) -> bool:
+        """Persist the three opportunistic github_*_id columns.
+
+        Used by :func:`docverse.worker.functions.project_github_resolve`
+        after a successful GitHub round-trip. The
+        ``expected_owner``/``expected_repo`` guard short-circuits when
+        the binding has flipped between enqueue and the worker run
+        (e.g. a PATCH rewrote ``github`` to a different repo, which
+        cleared the three id columns and re-enqueued resolution). In
+        that case the stale numeric ids would clobber the new
+        binding's columns — better to lose this update than to write
+        ids that disagree with ``github_owner`` / ``github_repo``.
+
+        ``date_updated`` is explicitly preserved: capturing the three
+        opportunistic ``github_*_id`` columns is sync-bookkeeping, not
+        an operator-visible source-coordinate edit, so bumping
+        ``date_updated`` here would mislead any consumer that reads it
+        as ``last operator change``. Mirrors ``apply_installation_scope``
+        and the dashboard binding store.
+
+        Returns ``True`` when the row was updated, ``False`` when no
+        row matched (project deleted, or binding changed).
+        """
+        stmt = (
+            update(SqlProject)
+            .where(
+                SqlProject.id == project_id,
+                SqlProject.github_owner == expected_owner,
+                SqlProject.github_repo == expected_repo,
+                SqlProject.date_deleted.is_(None),
+            )
+            .values(
+                github_installation_id=installation_id,
+                github_owner_id=owner_id,
+                github_repo_id=repo_id,
+                date_updated=SqlProject.date_updated,
+            )
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.first() is not None
 
     async def soft_delete(self, *, org_id: int, slug: str) -> bool:
         """Soft-delete a project by setting date_deleted.

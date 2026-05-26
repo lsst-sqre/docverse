@@ -5,8 +5,14 @@ from __future__ import annotations
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import structlog
 from httpx import AsyncClient
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
 
+from docverse.dbschema.project import SqlProject
+from docverse.dependencies.context import context_dependency
+from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
 
 
@@ -23,7 +29,7 @@ async def test_create_project(client: AsyncClient) -> None:
         json={
             "slug": "my-docs",
             "title": "My Docs",
-            "doc_repo": "https://github.com/example/docs",
+            "source_url": "https://example.com/example/docs",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -50,7 +56,7 @@ async def test_create_project_with_lifecycle_rules(
         json={
             "slug": "lifecycle-create",
             "title": "Lifecycle Create",
-            "doc_repo": "https://github.com/example/lifecycle-create",
+            "source_url": "https://example.com/example/lifecycle-create",
             "lifecycle_rules": rules,
         },
         headers={"X-Auth-Request-User": "testuser"},
@@ -74,7 +80,7 @@ async def test_list_projects(client: AsyncClient) -> None:
         json={
             "slug": "proj-aa",
             "title": "A",
-            "doc_repo": "https://github.com/example/a",
+            "source_url": "https://example.com/example/a",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -103,7 +109,7 @@ async def test_get_project(client: AsyncClient) -> None:
         json={
             "slug": "get-proj",
             "title": "Get Proj",
-            "doc_repo": "https://github.com/example/get",
+            "source_url": "https://example.com/example/get",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -138,7 +144,7 @@ async def test_update_project(client: AsyncClient) -> None:
         json={
             "slug": "patch-proj",
             "title": "Original",
-            "doc_repo": "https://github.com/example/patch",
+            "source_url": "https://example.com/example/patch",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -162,7 +168,7 @@ async def test_patch_project_lifecycle_rules_valid(
         json={
             "slug": "lifecycle-proj",
             "title": "Lifecycle",
-            "doc_repo": "https://github.com/example/lifecycle",
+            "source_url": "https://example.com/example/lifecycle",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -201,7 +207,7 @@ async def test_patch_project_lifecycle_rules_unknown_type(
         json={
             "slug": "bad-lifecycle-proj",
             "title": "Bad",
-            "doc_repo": "https://github.com/example/bad",
+            "source_url": "https://example.com/example/bad",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -228,7 +234,7 @@ async def test_patch_project_lifecycle_rules_missing_field(
         json={
             "slug": "missing-field-proj",
             "title": "Missing",
-            "doc_repo": "https://github.com/example/missing",
+            "source_url": "https://example.com/example/missing",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -255,7 +261,7 @@ async def test_patch_project_lifecycle_rules_duplicate_types(
         json={
             "slug": "dup-lifecycle-proj",
             "title": "Dup",
-            "doc_repo": "https://github.com/example/dup",
+            "source_url": "https://example.com/example/dup",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -280,7 +286,7 @@ async def test_delete_project(client: AsyncClient) -> None:
         json={
             "slug": "del-proj",
             "title": "Delete Me",
-            "doc_repo": "https://github.com/example/del",
+            "source_url": "https://example.com/example/del",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -312,7 +318,7 @@ async def test_search_by_slug(client: AsyncClient) -> None:
             json={
                 "slug": slug,
                 "title": title,
-                "doc_repo": f"https://github.com/example/{slug}",
+                "source_url": f"https://example.com/example/{slug}",
             },
             headers=headers,
         )
@@ -345,7 +351,7 @@ async def test_search_by_title(client: AsyncClient) -> None:
             json={
                 "slug": slug,
                 "title": title,
-                "doc_repo": f"https://github.com/example/{slug}",
+                "source_url": f"https://example.com/example/{slug}",
             },
             headers=headers,
         )
@@ -387,7 +393,7 @@ async def test_search_pagination(client: AsyncClient) -> None:
             json={
                 "slug": f"pipeline-{i}",
                 "title": f"Pipeline Project {i}",
-                "doc_repo": f"https://github.com/example/pipeline-{i}",
+                "source_url": f"https://example.com/example/pipeline-{i}",
             },
             headers=headers,
         )
@@ -446,7 +452,7 @@ async def test_search_org_scoping(client: AsyncClient) -> None:
         json={
             "slug": "scoped-proj",
             "title": "Scoped Project",
-            "doc_repo": "https://github.com/example/scoped",
+            "source_url": "https://example.com/example/scoped",
         },
         headers=headers,
     )
@@ -457,7 +463,7 @@ async def test_search_org_scoping(client: AsyncClient) -> None:
         json={
             "slug": "scoped-proj",
             "title": "Scoped Project Other",
-            "doc_repo": "https://github.com/example/scoped-other",
+            "source_url": "https://example.com/example/scoped-other",
         },
         headers=headers,
     )
@@ -483,7 +489,7 @@ async def test_search_excludes_soft_deleted(client: AsyncClient) -> None:
         json={
             "slug": "deleted-proj",
             "title": "Deleted Project",
-            "doc_repo": "https://github.com/example/deleted",
+            "source_url": "https://example.com/example/deleted",
         },
         headers=headers,
     )
@@ -506,7 +512,7 @@ async def test_create_project_duplicate_slug(client: AsyncClient) -> None:
     payload = {
         "slug": "dup-proj",
         "title": "First",
-        "doc_repo": "https://github.com/example/dup",
+        "source_url": "https://example.com/example/dup",
     }
     response = await client.post(
         "/docverse/orgs/proj-org/projects",
@@ -533,7 +539,7 @@ async def test_create_project_has_default_edition(
         json={
             "slug": "default-ed",
             "title": "Default Ed",
-            "doc_repo": "https://github.com/example/default-ed",
+            "source_url": "https://example.com/example/default-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -568,7 +574,7 @@ async def test_create_project_custom_default_edition(
         json={
             "slug": "custom-ed",
             "title": "Custom Ed",
-            "doc_repo": "https://github.com/example/custom-ed",
+            "source_url": "https://example.com/example/custom-ed",
             "default_edition": {
                 "tracking_mode": "lsst_doc",
                 "title": "Custom Main",
@@ -595,7 +601,7 @@ async def test_get_project_includes_default_edition(
         json={
             "slug": "get-ed-proj",
             "title": "Get Ed Proj",
-            "doc_repo": "https://github.com/example/get-ed",
+            "source_url": "https://example.com/example/get-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -623,7 +629,7 @@ async def test_list_projects_no_default_edition(
         json={
             "slug": "list-ed-proj",
             "title": "List Ed Proj",
-            "doc_repo": "https://github.com/example/list-ed",
+            "source_url": "https://example.com/example/list-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -647,7 +653,7 @@ async def test_patch_project_includes_default_edition(
         json={
             "slug": "patch-ed-proj",
             "title": "Patch Ed Proj",
-            "doc_repo": "https://github.com/example/patch-ed",
+            "source_url": "https://example.com/example/patch-ed",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -693,7 +699,7 @@ async def test_create_project_org_default_edition_config(
         json={
             "slug": "org-proj",
             "title": "Org Proj",
-            "doc_repo": "https://github.com/example/org-proj",
+            "source_url": "https://example.com/example/org-proj",
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -734,7 +740,7 @@ async def test_create_project_request_overrides_org_config(
         json={
             "slug": "override-proj",
             "title": "Override Proj",
-            "doc_repo": "https://github.com/example/override",
+            "source_url": "https://example.com/example/override",
             "default_edition": {
                 "tracking_mode": "git_ref",
                 "tracking_params": {"git_ref": "master"},
@@ -756,3 +762,301 @@ async def test_permission_denied_no_auth(client: AsyncClient) -> None:
         "/docverse/orgs/proj-org/projects",
     )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_create_project_with_github_binding_only(
+    client: AsyncClient,
+) -> None:
+    """POST with ``github`` derives the source_url from the binding."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-only",
+            "title": "GitHub Only",
+            "github": {"owner": "lsst", "repo": "docverse"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["github"] == {
+        "owner": "lsst",
+        "repo": "docverse",
+        "installation_id": None,
+        # installation_id is NULL -> derived status is not_installed;
+        # the test app leaves the GitHub App feature unconfigured so
+        # app_url is absent.
+        "installation_status": "not_installed",
+        "app_url": None,
+    }
+    # source_url is derived from the binding, not stored separately.
+    assert data["source_url"] == "https://github.com/lsst/docverse"
+
+
+@pytest.mark.asyncio
+async def test_create_project_rejects_github_source_url(
+    client: AsyncClient,
+) -> None:
+    """POST with a github.com ``source_url`` fails with 422 (Rule A).
+
+    The breaking change from PRD #346: a github.com URL must be supplied
+    through the structured ``github`` field, not ``source_url``.
+    """
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-url",
+            "title": "GH URL",
+            "source_url": "https://github.com/lsst/gh-url",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_project_rejects_source_url_and_github_together(
+    client: AsyncClient,
+) -> None:
+    """POST with both ``source_url`` and ``github`` fails with 422 (Rule B)."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "both-proj",
+            "title": "Both",
+            "source_url": "https://gitlab.com/lsst/both",
+            "github": {"owner": "lsst", "repo": "both"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_project_non_github_source_url_leaves_github_null(
+    client: AsyncClient,
+) -> None:
+    """POST with a non-GitHub source URL leaves ``github`` NULL."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gitlab-proj",
+            "title": "GitLab",
+            "source_url": "https://gitlab.com/lsst/gitlab-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["source_url"] == "https://gitlab.com/lsst/gitlab-proj"
+    assert data["github"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_project_without_source_or_github(
+    client: AsyncClient,
+) -> None:
+    """POST without source_url or github creates a project with both NULL."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "bare-proj",
+            "title": "Bare",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["source_url"] is None
+    assert data["github"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_project_rejects_source_url_and_github_together(
+    client: AsyncClient,
+) -> None:
+    """PATCH with both source_url and github fails with 422 (Rule B)."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "patch-both",
+            "title": "Patch Both",
+            "github": {"owner": "lsst", "repo": "patch-both"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/patch-both",
+        json={
+            "source_url": "https://gitlab.com/lsst/patch-both",
+            "github": {"owner": "other", "repo": "two"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_project_flips_github_to_non_github(
+    client: AsyncClient,
+) -> None:
+    """PATCH that clears ``github`` and sets a GitLab source URL succeeds."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "flip-proj",
+            "title": "Flip",
+            "github": {"owner": "lsst", "repo": "flip-proj"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/flip-proj",
+        json={
+            "github": None,
+            "source_url": "https://gitlab.com/lsst/flip-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["github"] is None
+    assert data["source_url"] == "https://gitlab.com/lsst/flip-proj"
+
+
+@pytest.mark.asyncio
+async def test_patch_project_sets_github_binding_drops_source_url(
+    client: AsyncClient,
+) -> None:
+    """PATCH adding ``github`` writes the binding and drops the stored URL.
+
+    The project starts non-GitHub (a GitLab ``source_url``); adding the
+    binding nulls that column, so the response source_url is now derived
+    from the binding rather than echoing the dropped GitLab URL.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "add-gh",
+            "title": "Add GH",
+            "source_url": "https://gitlab.com/lsst/add-gh",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/add-gh",
+        json={"github": {"owner": "lsst", "repo": "add-gh"}},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["github"] == {
+        "owner": "lsst",
+        "repo": "add-gh",
+        "installation_id": None,
+        "installation_status": "not_installed",
+        "app_url": None,
+    }
+    # The GitLab URL is dropped; source_url is derived from the binding.
+    assert data["source_url"] == "https://github.com/lsst/add-gh"
+
+
+@pytest.mark.asyncio
+async def test_patch_project_source_url_null_leaves_github_intact(
+    client: AsyncClient,
+) -> None:
+    """PATCH ``source_url: null`` is a no-op for a GitHub-bound project."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "keep-gh",
+            "title": "Keep GH",
+            "github": {"owner": "lsst", "repo": "keep-gh"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/keep-gh",
+        json={"source_url": None},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["github"] == {
+        "owner": "lsst",
+        "repo": "keep-gh",
+        "installation_id": None,
+        "installation_status": "not_installed",
+        "app_url": None,
+    }
+    assert data["source_url"] == "https://github.com/lsst/keep-gh"
+
+
+@pytest.mark.asyncio
+async def test_project_github_installed_status_and_app_url(
+    client: AsyncClient,
+) -> None:
+    """``installation_status`` flips to installed once the id is set.
+
+    A NULL ``github_installation_id`` derives ``not_installed`` (covered
+    by the create/patch tests above). Here we persist an installation id
+    out-of-band — as the resolve worker or ``installation`` webhook would
+    — and stamp the captured GitHub App install-page URL on the shared
+    context, then assert both surface on the GET response.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-installed",
+            "title": "GH Installed",
+            "github": {"owner": "lsst", "repo": "gh-installed"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    # Persist an installation id the way the resolve worker would.
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            result = await session.execute(
+                select(SqlProject.id).where(SqlProject.slug == "gh-installed")
+            )
+            project_id = result.scalar_one()
+            store = ProjectStore(session=session, logger=logger)
+            updated = await store.update_github_metadata(
+                project_id=project_id,
+                expected_owner="lsst",
+                expected_repo="gh-installed",
+                installation_id=42,
+                owner_id=111,
+                repo_id=222,
+            )
+            await session.commit()
+        assert updated
+        break
+
+    # Stand in for the startup ``GET /app`` html_url capture.
+    context_dependency.set_github_app_html_url(
+        "https://github.com/apps/docverse"
+    )
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/gh-installed",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    binding = response.json()["github"]
+    assert binding["installation_id"] == 42
+    assert binding["installation_status"] == "installed"
+    assert binding["app_url"] == "https://github.com/apps/docverse"

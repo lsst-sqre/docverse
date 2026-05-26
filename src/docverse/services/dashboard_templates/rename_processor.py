@@ -11,6 +11,7 @@ from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
 )
+from docverse.storage.project_store import ProjectStore
 
 __all__ = ["RenameEventProcessor"]
 
@@ -37,10 +38,12 @@ class RenameEventProcessor:
         *,
         binding_store: DashboardGitHubTemplateBindingStore,
         template_store: DashboardGitHubTemplateStore,
+        project_store: ProjectStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._binding_store = binding_store
         self._template_store = template_store
+        self._project_store = project_store
         self._logger = logger
 
     async def process_repository_renamed(
@@ -77,12 +80,16 @@ class RenameEventProcessor:
         binding_ids: list[int] = []
         template_ids: list[int] = []
         unsynced_ids: list[int] = []
+        project_ids: list[int] = []
 
         if repo_id is not None:
             binding_ids = await self._binding_store.rename_repo_by_repo_id(
                 github_repo_id=repo_id, new_repo=new_repo
             )
             template_ids = await self._template_store.rename_repo_by_repo_id(
+                github_repo_id=repo_id, new_repo=new_repo
+            )
+            project_ids = await self._project_store.rename_repo_by_repo_id(
                 github_repo_id=repo_id, new_repo=new_repo
             )
 
@@ -104,6 +111,7 @@ class RenameEventProcessor:
             bindings_updated=len(binding_ids),
             templates_updated=len(template_ids),
             bindings_updated_unsynced=len(unsynced_ids),
+            projects_updated=len(project_ids),
         )
 
     async def process_repository_transferred(
@@ -151,6 +159,12 @@ class RenameEventProcessor:
             new_owner_id=new_owner_id,
             new_repo=new_repo,
         )
+        project_ids = await self._project_store.transfer_repo_by_repo_id(
+            github_repo_id=repo_id,
+            new_owner=new_owner,
+            new_owner_id=new_owner_id,
+            new_repo=new_repo,
+        )
 
         self._logger.info(
             "Processed repository.transferred",
@@ -160,6 +174,7 @@ class RenameEventProcessor:
             new_repo=new_repo,
             bindings_updated=len(binding_ids),
             templates_updated=len(template_ids),
+            projects_updated=len(project_ids),
         )
 
     async def process_organization_renamed(

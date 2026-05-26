@@ -142,7 +142,7 @@ async def _setup(
         data=ProjectCreate(
             slug=_PROJECT_SLUG,
             title="Publish Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://example.com/example/repo",
         ),
     )
     edition = await edition_store.create(

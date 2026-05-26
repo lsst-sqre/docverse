@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
+    ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
 from docverse.storage.organization_store import OrganizationStore
@@ -57,7 +60,7 @@ async def test_create_project(
             data=ProjectCreate(
                 slug="my-project",
                 title="My Project",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         await db_session.commit()
@@ -81,7 +84,7 @@ async def test_get_by_slug(
             data=ProjectCreate(
                 slug="find-me",
                 title="Find Me",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         found = await store.get_by_slug(org_id=org_id, slug="find-me")
@@ -116,7 +119,7 @@ async def test_list_by_org(
             data=ProjectCreate(
                 slug="proj-aa",
                 title="A",
-                doc_repo="https://github.com/example/a",
+                source_url="https://example.com/example/a",
             ),
         )
         await store.create(
@@ -124,7 +127,7 @@ async def test_list_by_org(
             data=ProjectCreate(
                 slug="proj-bb",
                 title="B",
-                doc_repo="https://github.com/example/b",
+                source_url="https://example.com/example/b",
             ),
         )
         result = await store.list_by_org(
@@ -151,7 +154,7 @@ async def test_update_project(
             data=ProjectCreate(
                 slug="upd-proj",
                 title="Original",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         updated = await store.update(
@@ -163,6 +166,226 @@ async def test_update_project(
     assert updated is not None
     assert updated.title == "Updated"
     assert updated.slug == "upd-proj"
+
+
+@pytest.mark.asyncio
+async def test_rename_repo_by_repo_id_preserves_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A GitHub-side repo rename must not bump ``date_updated``.
+
+    ``date_updated`` is the operator-visible "last source-coordinate
+    edit" signal; those edits arrive through PUT/PATCH, not through a
+    GitHub-side metadata sync. The rename still flips ``github_repo``;
+    the effective source URL is derived from the binding.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="rename-me",
+                title="Rename Me",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="old-repo"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="old-repo",
+        )
+        # Set github_repo_id without bumping date_updated so the baseline
+        # below is the create timestamp.
+        await store.apply_installation_scope(
+            installation_id=111,
+            owner="acme",
+            owner_id=222,
+            repo="old-repo",
+            repo_id=333,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    # Run the rename in a later transaction so a re-fired
+    # ``onupdate=func.now()`` would yield a strictly greater timestamp
+    # than the create transaction's ``now()``.
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.rename_repo_by_repo_id(
+            github_repo_id=333,
+            new_repo="new-repo",
+        )
+        await db_session.commit()
+    assert updated_ids == [created.id]
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.github_repo == "new-repo"
+    assert after.source_url is None
+    assert after.effective_source_url == "https://github.com/acme/new-repo"
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_transfer_repo_by_repo_id_preserves_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A GitHub-side repo transfer must not bump ``date_updated``.
+
+    The transfer still flips ``github_owner`` / ``github_owner_id`` /
+    ``github_repo``; the effective source URL is derived from the
+    binding.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="transfer-me",
+                title="Transfer Me",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
+            ),
+            github_owner="acme",
+            github_repo="repo",
+        )
+        await store.apply_installation_scope(
+            installation_id=111,
+            owner="acme",
+            owner_id=222,
+            repo="repo",
+            repo_id=333,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.transfer_repo_by_repo_id(
+            github_repo_id=333,
+            new_owner="beta",
+            new_owner_id=444,
+            new_repo="repo",
+        )
+        await db_session.commit()
+    assert updated_ids == [created.id]
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.github_owner == "beta"
+    assert after.github_owner_id == 444
+    assert after.source_url is None
+    assert after.effective_source_url == "https://github.com/beta/repo"
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_update_github_metadata_preserves_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Capturing the github_*_id columns preserves ``date_updated``.
+
+    The three numeric ids are sync-bookkeeping, not an operator-visible
+    source-coordinate edit.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="meta-me",
+                title="Meta Me",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
+            ),
+            github_owner="acme",
+            github_repo="repo",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated = await store.update_github_metadata(
+            project_id=created.id,
+            expected_owner="acme",
+            expected_repo="repo",
+            installation_id=10,
+            owner_id=20,
+            repo_id=30,
+        )
+        await db_session.commit()
+    assert updated is True
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.github_installation_id == 10
+    assert after.github_owner_id == 20
+    assert after.github_repo_id == 30
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_update_github_metadata_skips_on_binding_change(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Returns ``False`` and writes nothing when the binding flipped.
+
+    The ``expected_owner``/``expected_repo`` guard protects against a
+    PATCH that rewrote ``github`` between enqueue and the worker run.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="stale-me",
+                title="Stale Me",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
+            ),
+            github_owner="acme",
+            github_repo="repo",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        updated = await store.update_github_metadata(
+            project_id=created.id,
+            expected_owner="acme",
+            expected_repo="different-repo",
+            installation_id=10,
+            owner_id=20,
+            repo_id=30,
+        )
+        await db_session.commit()
+    assert updated is False
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.github_repo_id is None
+    assert after.github_owner_id is None
+    assert after.github_installation_id is None
 
 
 @pytest.mark.asyncio
@@ -178,7 +401,7 @@ async def test_soft_delete(
             data=ProjectCreate(
                 slug="del-proj",
                 title="Delete Me",
-                doc_repo="https://github.com/example/repo",
+                source_url="https://example.com/example/repo",
             ),
         )
         deleted = await store.soft_delete(org_id=org_id, slug="del-proj")

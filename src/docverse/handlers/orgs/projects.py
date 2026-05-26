@@ -17,6 +17,9 @@ from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse.services.project_github_resolve_enqueue import (
+    try_enqueue_project_github_resolve_by_id,
+)
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -101,7 +104,13 @@ async def get_projects(  # noqa: PLR0913
         context.response.headers["Link"] = link
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
-        Project.from_domain(p, context.request, org) for p in result.entries
+        Project.from_domain(
+            p,
+            context.request,
+            org,
+            app_url=context.factory.github_app_html_url,
+        )
+        for p in result.entries
     ]
 
 
@@ -124,11 +133,18 @@ async def post_project(
             org_slug=org_slug, data=data
         )
         await context.session.commit()
+    await try_enqueue_project_github_resolve_by_id(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        project_id=project.id,
+    )
     return Project.from_domain(
         project,
         context.request,
         org,
         default_edition=default_edition,
+        app_url=context.factory.github_app_html_url,
     )
 
 
@@ -155,6 +171,7 @@ async def get_project(
         context.request,
         org,
         default_edition=default_edition,
+        app_url=context.factory.github_app_html_url,
     )
 
 
@@ -185,11 +202,18 @@ async def patch_project(
         org_slug=org_slug,
         project_slug=project_slug,
     )
+    await try_enqueue_project_github_resolve_by_id(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        project_id=project.id,
+    )
     return Project.from_domain(
         project,
         context.request,
         org,
         default_edition=default_edition,
+        app_url=context.factory.github_app_html_url,
     )
 
 

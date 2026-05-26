@@ -80,7 +80,7 @@ async def _seed_project(
         data=ProjectCreate(
             slug=slug,
             title=f"Project {slug}",
-            doc_repo=f"https://example.com/{slug}",
+            source_url=f"https://example.com/{slug}",
             lifecycle_rules=lifecycle_rules,
         ),
     )

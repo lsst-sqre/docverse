@@ -15,6 +15,7 @@ from .lifecycle_eval import lifecycle_eval
 from .lifecycle_eval_dispatcher import lifecycle_eval_dispatcher
 from .lifecycle_reaper import lifecycle_reaper
 from .ping import ping
+from .project_github_resolve import project_github_resolve
 from .publish_edition import publish_edition
 
 __all__ = [
@@ -31,5 +32,6 @@ __all__ = [
     "lifecycle_eval_dispatcher",
     "lifecycle_reaper",
     "ping",
+    "project_github_resolve",
     "publish_edition",
 ]

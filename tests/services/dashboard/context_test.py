@@ -73,7 +73,7 @@ async def _seed_org_and_project(
         data=ProjectCreate(
             slug=project_slug,
             title="Context Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://example.com/example/repo",
         ),
     )
     return org, project
@@ -541,7 +541,7 @@ def _make_project() -> Project:
         slug="proj",
         title="Project",
         org_id=1,
-        doc_repo="https://example.com/repo",
+        source_url="https://example.com/repo",
         slug_rewrite_rules=None,
         lifecycle_rules=None,
         date_created=now,

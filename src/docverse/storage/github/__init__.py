@@ -6,7 +6,9 @@ from .app_client import (
     GITHUB_API_BASE_URL,
     GitHubAppClient,
     GitHubAppNotConfiguredError,
+    GitHubAppNotInstalledError,
     InstallationAuth,
+    RepositoryMetadata,
 )
 from .changed_paths import (
     extract_changed_paths_from_push,
@@ -22,9 +24,11 @@ __all__ = [
     "FetchedTreeFile",
     "GitHubAppClient",
     "GitHubAppNotConfiguredError",
+    "GitHubAppNotInstalledError",
     "GitHubAppValidationState",
     "GitHubTreeFetcher",
     "InstallationAuth",
+    "RepositoryMetadata",
     "build_github_browse_url",
     "extract_changed_paths_from_push",
     "fetch_changed_paths_from_compare",

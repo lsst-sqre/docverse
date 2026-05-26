@@ -95,7 +95,7 @@ def _make_context(
         project=ProjectContext(
             slug="proj",
             title="A Project",
-            source_repo_url="https://github.com/example/proj",
+            source_repo_url="https://example.com/example/proj",
             published_url="https://proj.example.com/",
         ),
         editions=EditionsContext(

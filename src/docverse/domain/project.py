@@ -7,6 +7,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from docverse.client.models.projects import (
+    InstallationStatus,
+    build_github_url,
+)
+
 from .lifecycle import LifecycleRuleSet
 
 
@@ -25,8 +30,56 @@ class Project(BaseModel):
         description="ID of the organization this project belongs to."
     )
 
-    doc_repo: str = Field(
-        description="URL of the documentation source repository."
+    source_url: str | None = Field(
+        default=None,
+        description=(
+            "Stored non-GitHub URL of the documentation source"
+            " repository, or ``None``. Never a ``github.com`` URL: a"
+            " GitHub repo is tracked by the structured ``github_*``"
+            " binding instead. Read"
+            " :attr:`effective_source_url` for the value consumers"
+            " should display."
+        ),
+    )
+
+    github_owner: str | None = Field(
+        default=None,
+        description=(
+            "Owner login of the GitHub repository backing this project."
+            " Populated together with ``github_repo``."
+        ),
+    )
+
+    github_repo: str | None = Field(
+        default=None,
+        description=(
+            "Name of the GitHub repository backing this project."
+            " Populated together with ``github_owner``."
+        ),
+    )
+
+    github_owner_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub numeric owner id, captured opportunistically once the"
+            " GitHub App resolves the repository."
+        ),
+    )
+
+    github_repo_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub numeric repository id, captured opportunistically once"
+            " the GitHub App resolves the repository."
+        ),
+    )
+
+    github_installation_id: int | None = Field(
+        default=None,
+        description=(
+            "GitHub App installation id for the repository, captured"
+            " opportunistically once the App is installed."
+        ),
     )
 
     slug_rewrite_rules: list[dict[str, Any]] | None = Field(
@@ -51,3 +104,36 @@ class Project(BaseModel):
         default=None,
         description="Timestamp when the project was soft-deleted.",
     )
+
+    @property
+    def effective_source_url(self) -> str | None:
+        """Derive the source-repository URL consumers should display.
+
+        The structured ``github`` binding is the single source of truth
+        for GitHub-backed projects, so it wins when present and yields
+        the canonical ``https://github.com/{owner}/{repo}``. Otherwise
+        the stored non-GitHub ``source_url`` is returned verbatim, and
+        ``None`` when the project has no source coordinates at all. This
+        lives here, once, so the API response and the dashboard context
+        derive the same value.
+        """
+        if self.github_owner is not None and self.github_repo is not None:
+            return build_github_url(self.github_owner, self.github_repo)
+        return self.source_url
+
+    @property
+    def github_installation_status(self) -> InstallationStatus | None:
+        """Derive the App-installation status for the github binding.
+
+        Only meaningful with a binding present. ``installation_id`` set
+        -> installed; else not_installed. Note: a not-yet-resolved or
+        transiently-failed resolve also reads as not_installed until the
+        worker or installation webhook backfills the id (acceptable for
+        the derived-only status; persisting the resolve outcome is a
+        later slice).
+        """
+        if self.github_owner is None or self.github_repo is None:
+            return None
+        if self.github_installation_id is not None:
+            return InstallationStatus.installed
+        return InstallationStatus.not_installed

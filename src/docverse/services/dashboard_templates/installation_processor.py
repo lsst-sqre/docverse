@@ -10,6 +10,7 @@ import structlog
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
 )
+from docverse.storage.project_store import ProjectStore
 
 __all__ = [
     "INSTALLATION_DELETED_REASON",
@@ -60,9 +61,11 @@ class InstallationEventProcessor:
         self,
         *,
         binding_store: DashboardGitHubTemplateBindingStore,
+        project_store: ProjectStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._binding_store = binding_store
+        self._project_store = project_store
         self._logger = logger
 
     async def process(self, payload: Mapping[str, Any]) -> None:
@@ -80,12 +83,23 @@ class InstallationEventProcessor:
             return
 
         if action == "created":
-            # No DB write — the binding cannot know about the install
-            # before the operator registers it through the API. Log so
-            # the delivery is visible in audit trails.
+            # Binding-side state is still a no-op: an org-default
+            # binding cannot have referenced the install before the
+            # operator registered it through the API. Projects, by
+            # contrast, may already exist with structured
+            # ``github_owner``/``github_repo`` columns waiting for an
+            # installation to come into scope (PRD #346 user story
+            # 12), so backfill them from the payload's repository
+            # block here.
+            projects_updated = await self._backfill_projects_for_repos(
+                installation_id=installation_id,
+                installation=installation,
+                repos=payload.get("repositories"),
+            )
             self._logger.info(
-                "Processed installation.created (no-op)",
+                "Processed installation.created",
                 github_installation_id=installation_id,
+                projects_updated=projects_updated,
             )
             return
 
@@ -135,6 +149,118 @@ class InstallationEventProcessor:
             github_installation_id=installation_id,
             action=action,
         )
+
+    async def process_installation_repositories(
+        self, payload: Mapping[str, Any]
+    ) -> None:
+        """Dispatch on the ``installation_repositories`` action.
+
+        ``installation_repositories.added`` fires when an operator
+        scopes an existing app installation to new repos after the
+        fact; ``installation_repositories.removed`` fires on the
+        symmetric removal. Only ``added`` writes to projects today —
+        a removal does not in itself invalidate the captured ids
+        (the repo still exists, just outside this installation's
+        scope), and clobbering the columns there would lose stable
+        keys the rename handler still relies on.
+        """
+        action = payload.get("action")
+        installation = payload.get("installation", {})
+        installation_id = _coerce_int(installation.get("id"))
+
+        if installation_id is None or not isinstance(action, str):
+            self._logger.warning(
+                "installation_repositories payload missing id or action",
+                installation_id=installation_id,
+                action=action,
+            )
+            return
+
+        if action == "added":
+            projects_updated = await self._backfill_projects_for_repos(
+                installation_id=installation_id,
+                installation=installation,
+                repos=payload.get("repositories_added"),
+            )
+            self._logger.info(
+                "Processed installation_repositories.added",
+                github_installation_id=installation_id,
+                projects_updated=projects_updated,
+            )
+            return
+
+        self._logger.info(
+            "Ignoring installation_repositories action",
+            github_installation_id=installation_id,
+            action=action,
+        )
+
+    async def _backfill_projects_for_repos(
+        self,
+        *,
+        installation_id: int,
+        installation: Mapping[str, Any],
+        repos: object,
+    ) -> int:
+        """Apply the three github_*_id columns to matching project rows.
+
+        ``installation.account`` carries the installation's owner
+        (``login`` + ``id``); the ``repositories`` (or
+        ``repositories_added``) list carries one entry per repo with
+        ``id`` and either ``name`` or ``full_name``. The payload is
+        the only source needed — no follow-up GitHub API round-trip —
+        because all three numeric ids land in the same delivery.
+
+        Returns the count of project rows updated across every repo
+        in the payload so the caller can log a single
+        ``projects_updated=N`` summary.
+        """
+        account = installation.get("account") or {}
+        owner = account.get("login")
+        owner_id = _coerce_int(account.get("id"))
+        if (
+            not isinstance(owner, str)
+            or owner_id is None
+            or not isinstance(repos, list)
+        ):
+            return 0
+
+        total = 0
+        for repo in repos:
+            if not isinstance(repo, Mapping):
+                continue
+            repo_id = _coerce_int(repo.get("id"))
+            repo_name = repo.get("name") or _repo_name_from_full(
+                repo.get("full_name"), owner=owner
+            )
+            if repo_id is None or not isinstance(repo_name, str):
+                continue
+            updated = await self._project_store.apply_installation_scope(
+                installation_id=installation_id,
+                owner=owner,
+                owner_id=owner_id,
+                repo=repo_name,
+                repo_id=repo_id,
+            )
+            total += len(updated)
+        return total
+
+
+def _repo_name_from_full(full_name: object, *, owner: str) -> str | None:
+    """Extract the repo segment from ``"owner/repo"`` payload strings.
+
+    Some installation payloads carry only ``full_name`` rather than a
+    bare ``name`` (and a few historical deliveries flip the structure
+    entirely). Falling back to a manual split keeps the backfill
+    robust against either shape without forcing the caller into a
+    branch.
+    """
+    if not isinstance(full_name, str):
+        return None
+    prefix = f"{owner}/"
+    if not full_name.lower().startswith(prefix.lower()):
+        return None
+    return full_name[len(prefix) :] or None
 
 
 def _coerce_int(value: object) -> int | None:

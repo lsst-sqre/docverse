@@ -71,7 +71,7 @@ async def _setup_org_and_project(
         data=ProjectCreate(
             slug="dash-proj",
             title="Dash Project",
-            doc_repo="https://github.com/example/dash",
+            source_url="https://example.com/example/dash",
         ),
     )
     await edition_store.create_internal(

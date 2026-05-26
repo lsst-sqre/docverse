@@ -124,6 +124,21 @@ async def _handle_installation(
         await context.session.commit()
 
 
+@_event_router.register("installation_repositories", action="added")
+@_event_router.register("installation_repositories", action="removed")
+async def _handle_installation_repositories(
+    event: sansio.Event,
+    *,
+    installation: InstallationEventProcessor,
+    context: RequestContext,
+    **_unused: Any,
+) -> None:
+    """Backfill project github_*_id when an install's repo scope changes."""
+    async with context.session.begin():
+        await installation.process_installation_repositories(event.data)
+        await context.session.commit()
+
+
 @router.post(
     "/webhooks/github",
     status_code=status.HTTP_200_OK,

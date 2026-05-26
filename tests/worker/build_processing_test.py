@@ -99,7 +99,7 @@ async def _setup_org_and_project(
         data=ProjectCreate(
             slug="worker-test-proj",
             title="Worker Test Project",
-            doc_repo="https://github.com/example/repo",
+            source_url="https://example.com/example/repo",
         ),
     )
     return org, project

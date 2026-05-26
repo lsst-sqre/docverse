@@ -31,9 +31,11 @@ from docverse.client.models import (
     BuildStatus,
     EditionKind,
     ProjectCreate,
+    ProjectGitHubBindingCreate,
     TrackingMode,
 )
 from docverse.client.models.editions import DefaultEditionConfig
+from docverse.client.models.projects import parse_github_url
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
@@ -256,12 +258,28 @@ class KeeperSyncService:
             org_id=org_id, slug=ltd_product.slug
         )
         if existing is None:
+            # LTD ``doc_repo`` is almost always a github.com URL; route
+            # it into the structured ``github`` binding (the single
+            # source of truth) and leave ``source_url`` for the rare
+            # non-GitHub repo. The ProjectCreate validator rejects a
+            # github.com ``source_url`` outright, so this split is
+            # mandatory, not cosmetic.
+            doc_repo = str(ltd_product.doc_repo)
+            parsed = parse_github_url(doc_repo)
+            if parsed is not None:
+                owner, repo = parsed
+                github = ProjectGitHubBindingCreate(owner=owner, repo=repo)
+                source_url = None
+            else:
+                github = None
+                source_url = doc_repo
             org, project, _ = await self._project_service.create(
                 org_slug=org.slug,
                 data=ProjectCreate(
                     slug=ltd_product.slug,
                     title=ltd_product.title,
-                    doc_repo=str(ltd_product.doc_repo),
+                    source_url=source_url,
+                    github=github,
                     default_edition=DefaultEditionConfig(
                         tracking_mode=TrackingMode.git_ref,
                         tracking_params={"git_ref": "main"},

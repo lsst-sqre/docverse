@@ -72,7 +72,7 @@ async def _setup_org_and_projects(
             data=ProjectCreate(
                 slug=slug,
                 title=f"Project {slug}",
-                doc_repo=f"https://github.com/example/{slug}",
+                source_url=f"https://example.com/example/{slug}",
             ),
         )
         project_ids.append(project.id)

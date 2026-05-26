@@ -29,7 +29,7 @@ async def _setup(client: AsyncClient) -> None:
         json={
             "slug": "auth-proj",
             "title": "Auth Project",
-            "doc_repo": "https://github.com/example/auth",
+            "source_url": "https://example.com/example/auth",
         },
         headers={"X-Auth-Request-User": "admin-user"},
     )
@@ -101,7 +101,7 @@ async def test_create_project_as_reader(client: AsyncClient) -> None:
         json={
             "slug": "forbidden",
             "title": "No",
-            "doc_repo": "https://github.com/example/no",
+            "source_url": "https://example.com/example/no",
         },
         headers={"X-Auth-Request-User": "read-user"},
     )
@@ -116,7 +116,7 @@ async def test_create_project_as_uploader(client: AsyncClient) -> None:
         json={
             "slug": "forbidden",
             "title": "No",
-            "doc_repo": "https://github.com/example/no",
+            "source_url": "https://example.com/example/no",
         },
         headers={"X-Auth-Request-User": "upload-user"},
     )

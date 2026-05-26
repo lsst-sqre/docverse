@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         github_app_private_key=config.github_app_private_key,
         github_webhook_secret=config.github_webhook_secret,
     )
-    await validate_github_app(
+    github_app_html_url = await validate_github_app(
         state=context_dependency,
         app_id=config.github_app_id,
         private_key=config.github_app_private_key,
@@ -113,6 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         http_client=http_client,
         logger=logger,
     )
+    context_dependency.set_github_app_html_url(github_app_html_url)
     yield
     await context_dependency.aclose()
     await http_client_dependency.aclose()

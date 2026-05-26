@@ -66,7 +66,7 @@ async def test_group_uploader_can_create_build(
         json={
             "slug": "grp-proj",
             "title": "Group Project",
-            "doc_repo": "https://github.com/example/grp",
+            "source_url": "https://example.com/example/grp",
         },
         headers={"X-Auth-Request-User": "admin-user"},
     )
@@ -100,7 +100,7 @@ async def test_group_reader_cannot_create_build(
         json={
             "slug": "grp-ro-proj",
             "title": "Group RO Project",
-            "doc_repo": "https://github.com/example/grp-ro",
+            "source_url": "https://example.com/example/grp-ro",
         },
         headers={"X-Auth-Request-User": "admin-user"},
     )
