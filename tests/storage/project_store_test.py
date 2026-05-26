@@ -667,3 +667,183 @@ async def test_list_by_github_repo_dedupes_id_and_name_matches(
         )
         await db_session.commit()
     assert [p.slug for p in result] == ["docs"]
+
+
+# -- GitHub-bound project listing for git_ref_audit -----
+
+
+@pytest.mark.asyncio
+async def test_list_org_ids_with_github_bound_projects_only_includes_bound(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Returns the set of org_ids that own at least one GitHub-bound project.
+
+    Three orgs are seeded:
+
+    * ``gh-only`` — every project is GitHub-bound.
+    * ``mixed`` — one GitHub-bound, one non-GitHub project.
+    * ``non-gh-only`` — no GitHub-bound projects.
+
+    The dispatcher uses this to skip orgs that have nothing for the
+    audit to do.
+    """
+    async with db_session.begin():
+        gh_only = await _create_org(org_store, slug="gh-only")
+        mixed = await _create_org(org_store, slug="mixed")
+        non_gh_only = await _create_org(org_store, slug="non-gh-only")
+        await store.create(
+            org_id=gh_only,
+            data=ProjectCreate(
+                slug="proj-a",
+                title="A",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="proj-a"),
+            ),
+            github_owner="acme",
+            github_repo="proj-a",
+        )
+        await store.create(
+            org_id=mixed,
+            data=ProjectCreate(
+                slug="b-gh",
+                title="B",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="b"),
+            ),
+            github_owner="acme",
+            github_repo="b",
+        )
+        await store.create(
+            org_id=mixed,
+            data=ProjectCreate(
+                slug="b-non-gh",
+                title="B (Gitlab)",
+                source_url="https://gitlab.example.com/b",
+            ),
+        )
+        await store.create(
+            org_id=non_gh_only,
+            data=ProjectCreate(
+                slug="c-non-gh",
+                title="C",
+                source_url="https://gitlab.example.com/c",
+            ),
+        )
+        result = await store.list_org_ids_with_github_bound_projects()
+        await db_session.commit()
+    assert result == {gh_only, mixed}
+    assert non_gh_only not in result
+
+
+@pytest.mark.asyncio
+async def test_list_org_ids_with_github_bound_projects_excludes_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A soft-deleted GitHub-bound project does not keep its org in scope.
+
+    If the org's only GitHub-bound project is soft-deleted, the org
+    no longer has any work for the audit and the dispatcher must
+    skip it on the next tick.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="del-only-gh")
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="deletable",
+                title="Deletable",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="deletable"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="deletable",
+        )
+        await store.soft_delete(org_id=org_id, slug="deletable")
+        result = await store.list_org_ids_with_github_bound_projects()
+        await db_session.commit()
+    assert org_id not in result
+
+
+@pytest.mark.asyncio
+async def test_list_github_bound_by_org_returns_only_bound(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Per-org listing filters to projects with github_owner+repo set."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="per-org-list")
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="gh-1",
+                title="GH 1",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="one"),
+            ),
+            github_owner="acme",
+            github_repo="one",
+        )
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="gh-2",
+                title="GH 2",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="two"),
+            ),
+            github_owner="acme",
+            github_repo="two",
+        )
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="non-gh",
+                title="Non GH",
+                source_url="https://gitlab.example.com/x",
+            ),
+        )
+        result = await store.list_github_bound_by_org(org_id)
+        await db_session.commit()
+    assert [p.slug for p in result] == ["gh-1", "gh-2"]
+    for project in result:
+        assert project.github_owner is not None
+        assert project.github_repo is not None
+
+
+@pytest.mark.asyncio
+async def test_list_github_bound_by_org_excludes_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Soft-deleted GitHub-bound projects are not surfaced to the audit."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="per-org-del")
+        kept = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="kept",
+                title="Kept",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="kept"),
+            ),
+            github_owner="acme",
+            github_repo="kept",
+        )
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="deleted",
+                title="Deleted",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="deleted"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="deleted",
+        )
+        await store.soft_delete(org_id=org_id, slug="deleted")
+        result = await store.list_github_bound_by_org(org_id)
+        await db_session.commit()
+    assert [p.slug for p in result] == [kept.slug]

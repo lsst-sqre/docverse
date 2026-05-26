@@ -32,6 +32,7 @@ from pydantic import (
 __all__ = [
     "BuildHistoryOrphanRule",
     "DraftInactivityRule",
+    "GitRefAuditRunStatus",
     "LifecycleEvalRunStatus",
     "LifecycleRule",
     "LifecycleRuleSet",
@@ -157,6 +158,26 @@ class LifecycleEvalRunStatus(StrEnum):
     per-org child has been enqueued. ``succeeded`` /
     ``partial_failure`` / ``failed`` are terminal states set by
     ``maybe_finalise_lifecycle_run`` when every child is terminal.
+    """
+
+    pending = "pending"
+    in_progress = "in_progress"
+    succeeded = "succeeded"
+    partial_failure = "partial_failure"
+    failed = "failed"
+
+
+class GitRefAuditRunStatus(StrEnum):
+    """Lifecycle status of a ``git_ref_audit_runs`` aggregate row.
+
+    Shape mirrors :class:`LifecycleEvalRunStatus` so the daily
+    ``git_ref_audit`` dispatcher / per-org / reaper pattern transfers
+    between the two subsystems without operator re-training. ``pending``
+    — discovery has created the run row but has not yet enqueued any
+    per-org child jobs. ``in_progress`` — at least one per-org child
+    has been enqueued. ``succeeded`` / ``partial_failure`` / ``failed``
+    are terminal states set by ``maybe_finalise_git_ref_audit_run``
+    when every child is terminal.
     """
 
     pending = "pending"

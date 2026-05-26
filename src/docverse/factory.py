@@ -62,7 +62,12 @@ from .storage.editionpublisher import (
     EditionPublisher,
     create_edition_publisher,
 )
-from .storage.github import GitHubAppClient, GitHubAppNotConfiguredError
+from .storage.git_ref_audit_run_store import GitRefAuditRunStore
+from .storage.github import (
+    GitHubAppClient,
+    GitHubAppNotConfiguredError,
+    GitHubRefSetFetcher,
+)
 from .storage.keeper_sync import KeeperSyncStateStore
 from .storage.keeper_sync_run_store import KeeperSyncRunStore
 from .storage.lifecycle_eval_run_store import LifecycleEvalRunStore
@@ -187,6 +192,30 @@ class Factory:
         return LifecycleEvalRunStore(
             session=self._session, logger=self._logger
         )
+
+    def create_git_ref_audit_run_store(self) -> GitRefAuditRunStore:
+        """Create a :class:`GitRefAuditRunStore`."""
+        return GitRefAuditRunStore(session=self._session, logger=self._logger)
+
+    def create_github_ref_set_fetcher(self) -> GitHubRefSetFetcher:
+        """Create a :class:`GitHubRefSetFetcher`.
+
+        Used by the daily ``git_ref_audit`` worker (PRD #346) and by
+        the proactive ``sync_project`` pre-fetch (PRD #332). Both
+        callers paginate ``git/matching-refs/{heads,tags}`` against
+        the shared ``httpx.AsyncClient`` and attach installation
+        auth per request, so the fetcher is built once per worker
+        tick and shared across per-project fan-out.
+
+        Raises
+        ------
+        RuntimeError
+            If no shared ``httpx.AsyncClient`` is configured.
+        """
+        if self._http_client is None:
+            msg = "HTTP client is required to build a GitHubRefSetFetcher"
+            raise RuntimeError(msg)
+        return GitHubRefSetFetcher(http_client=self._http_client)
 
     def create_keeper_sync_run_service(self) -> KeeperSyncRunService:
         """Create a :class:`KeeperSyncRunService`."""

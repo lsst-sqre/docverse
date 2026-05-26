@@ -41,6 +41,8 @@ from .functions import (
     build_processing,
     dashboard_build,
     dashboard_sync,
+    git_ref_audit,
+    git_ref_audit_discovery,
     keeper_sync_project,
     keeper_sync_reaper,
     keeper_sync_run_discovery,
@@ -380,29 +382,37 @@ class KeeperSyncWorkerSettings:
 
 
 class LifecycleEvalWorkerSettings:
-    """arq WorkerSettings for the dedicated ``lifecycle_eval`` queue.
+    """arq WorkerSettings for the dedicated lifecycle queue.
 
     Bound to ``docverse:lifecycle-queue`` (see
     :data:`LIFECYCLE_EVAL_QUEUE_NAME`) so a slow lifecycle pass cannot
     starve the default queue's ``build_processing`` and
     ``publish_edition`` jobs or the keeper-sync queue's
     ``keeper_sync_project`` jobs. The PRD §"Orchestration" specifies a
-    third pool alongside the default and keeper-sync pools; this class
-    is the binding.
+    third pool alongside the default and keeper-sync pools; this
+    class is the binding.
 
-    Both the dispatcher and the per-org worker are wrapped with
-    :func:`arq.func` so the dedicated queue inherits a per-job
-    ``timeout`` (sourced from ``Config.lifecycle_eval_job_timeout_seconds``)
-    and a single-attempt policy. A failure must surface promptly so
-    the per-org worker's ``except Exception`` block can route to
-    ``queue_job_store.fail()`` and the parent ``lifecycle_eval_runs``
-    row finalises via :func:`maybe_finalise_lifecycle_run` — arq's
-    default 5-attempt retry would otherwise delay finalisation and
-    obscure the underlying error in logs. The cron-driven
-    ``lifecycle_reaper`` is the second backstop for the case where
-    arq itself loses a job and no timeout ever fires; it runs every
-    30 minutes so a wedged child is unblocked on the same cadence as
-    the keeper-sync reaper.
+    Both the hourly ``lifecycle_eval`` (dispatcher + per-org worker)
+    and the daily ``git_ref_audit`` (discovery + per-org worker) live
+    on this single pool: PRD #346 explicitly says the audit "shares
+    the same fan-out, per-org mutex, and reaper patterns as
+    lifecycle_eval and never competes with build processing or
+    keeper-sync for worker capacity", and the audit's daily cadence
+    is light enough that adding a fourth pool would be over-segmented.
+
+    All four functions are wrapped with :func:`arq.func` so the
+    dedicated queue inherits a per-job ``timeout`` (sourced from
+    ``Config.lifecycle_eval_job_timeout_seconds``) and a
+    single-attempt policy. A failure must surface promptly so the
+    per-org worker's ``except Exception`` block can route to
+    ``queue_job_store.fail()`` and the parent run finalises via the
+    matching finaliser — arq's default 5-attempt retry would
+    otherwise delay finalisation and obscure the underlying error in
+    logs. The cron-driven ``lifecycle_reaper`` is the second
+    backstop for the case where arq itself loses a job and no
+    timeout ever fires; it runs every 30 minutes and sweeps **both**
+    ``kind='lifecycle_eval'`` and ``kind='git_ref_audit'`` rows in a
+    single transaction.
     """
 
     functions = [
@@ -416,12 +426,34 @@ class LifecycleEvalWorkerSettings:
             timeout=config.lifecycle_eval_job_timeout_seconds,
             max_tries=1,
         ),
+        func(
+            instrument_arq_task(git_ref_audit_discovery),
+            timeout=config.lifecycle_eval_job_timeout_seconds,
+            max_tries=1,
+        ),
+        func(
+            instrument_arq_task(git_ref_audit),
+            timeout=config.lifecycle_eval_job_timeout_seconds,
+            max_tries=1,
+        ),
         instrument_arq_task(lifecycle_reaper),
     ]
     cron_jobs = [
         cron(
             instrument_arq_task(lifecycle_eval_dispatcher),
             minute={0},
+        ),
+        # Daily ``git_ref_audit`` discovery tick at UTC 05:17. Five in
+        # the morning UTC sits well outside North-American daytime
+        # peak when most release builds are running, and minute 17
+        # deliberately avoids the lifecycle_eval dispatcher's hourly
+        # ``minute={0}`` tick and the reaper's ``minute={0, 30}``
+        # ticks so the audit's fan-out does not contend with them on
+        # the shared lifecycle worker pool.
+        cron(
+            instrument_arq_task(git_ref_audit_discovery),
+            hour={5},
+            minute={17},
         ),
         cron(
             instrument_arq_task(lifecycle_reaper),

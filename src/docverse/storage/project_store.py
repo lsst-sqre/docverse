@@ -132,6 +132,50 @@ class ProjectStore:
         result = await self._session.execute(stmt)
         return set(result.scalars().all())
 
+    async def list_org_ids_with_github_bound_projects(self) -> set[int]:
+        """Return every ``org_id`` that owns a GitHub-bound project.
+
+        The ``git_ref_audit_discovery`` pre-flight uses this set
+        directly: an org is in-scope iff it owns at least one
+        non-deleted project whose ``github_owner`` and ``github_repo``
+        are both populated. Orgs whose every project points at a
+        non-GitHub ``source_url`` get no audit job at all — the audit
+        has nothing to do for them and a queued no-op would only
+        muddy operator queue-inspection.
+        """
+        stmt = select(SqlProject.org_id).where(
+            SqlProject.github_owner.is_not(None),
+            SqlProject.github_repo.is_not(None),
+            SqlProject.date_deleted.is_(None),
+        )
+        result = await self._session.execute(stmt)
+        return set(result.scalars().all())
+
+    async def list_github_bound_by_org(self, org_id: int) -> list[Project]:
+        """List every non-deleted GitHub-bound project for an organization.
+
+        Used by the ``git_ref_audit`` per-org worker to find every
+        project whose ``(github_owner, github_repo)`` is populated, so
+        the per-project audit pass can resolve the binding and fetch
+        the live ref set. Non-GitHub projects (``source_url`` pointing
+        at GitLab / Codeberg / on-prem, or no source URL at all) are
+        excluded — the ``ref_deleted`` rule does not apply to them
+        and including them would generate spurious skip-logged lines
+        in the per-org pass. Ordered by slug ascending for stable
+        iteration and operator-readable logs.
+        """
+        result = await self._session.execute(
+            select(SqlProject)
+            .where(
+                SqlProject.org_id == org_id,
+                SqlProject.github_owner.is_not(None),
+                SqlProject.github_repo.is_not(None),
+                SqlProject.date_deleted.is_(None),
+            )
+            .order_by(SqlProject.slug.asc())
+        )
+        return [Project.model_validate(row) for row in result.scalars().all()]
+
     async def list_all_by_org(self, org_id: int) -> list[Project]:
         """List every non-deleted project for an organization.
 

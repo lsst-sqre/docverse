@@ -45,6 +45,7 @@ class QueueJobStore:
         edition_id: int | None = None,
         keeper_sync_run_id: int | None = None,
         lifecycle_eval_run_id: int | None = None,
+        git_ref_audit_run_id: int | None = None,
         subject_label: str | None = None,
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
@@ -63,6 +64,7 @@ class QueueJobStore:
             edition_id=edition_id,
             keeper_sync_run_id=keeper_sync_run_id,
             lifecycle_eval_run_id=lifecycle_eval_run_id,
+            git_ref_audit_run_id=git_ref_audit_run_id,
             subject_label=subject_label,
         )
         self._session.add(row)
@@ -617,6 +619,106 @@ class QueueJobStore:
             row.errors = {
                 "message": (
                     "Orphaned lifecycle_eval: queue_jobs row committed "
+                    "without an arq backend_job_id (worker likely "
+                    "crashed between SQL commit and arq_queue.enqueue)"
+                ),
+                "type": "OrphanedQueueJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
+
+    async def fail_silent_git_ref_audit_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail ``git_ref_audit`` rows stuck ``in_progress`` past the window.
+
+        Sibling of :meth:`fail_silent_lifecycle_eval_jobs` for the daily
+        ``git_ref_audit`` worker pool: every per-org row carries
+        ``git_ref_audit_run_id`` so attribution is implied by
+        ``kind='git_ref_audit'`` alone. Rows that the worker actually
+        picked up but never finished (``status='in_progress'``,
+        ``date_completed IS NULL``, ``date_started`` older than
+        ``now - idle_after``) are reaped here; ``queued`` rows whose
+        worker crashed before arq enqueue go to
+        :meth:`fail_orphaned_git_ref_audit_jobs`.
+
+        Reaped rows carry ``errors.type='SilentWorker'`` matching the
+        keeper-sync / lifecycle-eval precedent so postmortem queries
+        that group by ``errors.type`` can compare the three subsystems
+        on the same axis.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.git_ref_audit.value,
+            SqlQueueJob.status == JobStatus.in_progress.value,
+            SqlQueueJob.date_completed.is_(None),
+            SqlQueueJob.date_started.is_not(None),
+            SqlQueueJob.date_started < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        reaped: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Reaped by lifecycle_reaper: git_ref_audit worker "
+                    "went silent while job was in_progress (likely "
+                    "OOM-killed or lost by arq)"
+                ),
+                "type": "SilentWorker",
+            }
+            reaped.append(QueueJob.model_validate(row, from_attributes=True))
+        if reaped:
+            await self._session.flush()
+        return reaped
+
+    async def fail_orphaned_git_ref_audit_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> list[QueueJob]:
+        """Fail ``git_ref_audit`` rows that never reached arq.
+
+        Sibling of :meth:`fail_orphaned_lifecycle_eval_jobs` for the
+        daily ``git_ref_audit`` worker pool. The discovery dispatcher
+        commits the per-org ``queue_jobs`` row *before* calling
+        ``arq_queue.enqueue``, so a worker crash in that window leaves
+        an orphan (``status='queued'``, ``backend_job_id IS NULL``).
+        Without reconciliation the orphan would wedge the per-org
+        mutex ``idx_queue_jobs_git_ref_audit_active_uq`` and block the
+        next day's discovery tick from enqueueing fresh work for
+        that org.
+
+        Scoped narrowly: ``kind='git_ref_audit'``,
+        ``status='queued'``, ``backend_job_id IS NULL``,
+        ``date_created`` older than ``now - idle_after``. Reaped rows
+        carry ``errors.type='OrphanedQueueJob'`` matching the
+        precedent for the other run-attributed orphan sweeps.
+        """
+        cutoff = datetime.now(tz=UTC) - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.git_ref_audit.value,
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_(None),
+            SqlQueueJob.date_created < cutoff,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+        now = datetime.now(tz=UTC)
+        failed: list[QueueJob] = []
+        for row in rows:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": (
+                    "Orphaned git_ref_audit: queue_jobs row committed "
                     "without an arq backend_job_id (worker likely "
                     "crashed between SQL commit and arq_queue.enqueue)"
                 ),

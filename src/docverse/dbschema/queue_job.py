@@ -73,6 +73,12 @@ class SqlQueueJob(Base):
         nullable=True,
     )
 
+    git_ref_audit_run_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("git_ref_audit_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     subject_label: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     progress: Mapped[dict[str, Any] | None] = mapped_column(
@@ -103,6 +109,10 @@ class SqlQueueJob(Base):
         Index(
             "idx_queue_jobs_lifecycle_eval_run_id",
             "lifecycle_eval_run_id",
+        ),
+        Index(
+            "idx_queue_jobs_git_ref_audit_run_id",
+            "git_ref_audit_run_id",
         ),
         # Per-project mutex for keeper_sync_project jobs: at most one
         # queued or in_progress row per (org_id, subject_label). The
@@ -140,6 +150,23 @@ class SqlQueueJob(Base):
             unique=True,
             postgresql_where=text(
                 "kind = 'lifecycle_eval' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
+        # Per-org mutex for ``git_ref_audit`` per-org child jobs: at
+        # most one queued or in_progress row per ``org_id`` for
+        # ``kind='git_ref_audit'``. Same single-column shape as the
+        # ``lifecycle_eval_active_uq`` mutex — git_ref_audit is also
+        # per-org by design (one daily audit pass per org), with no
+        # sub-key under ``org_id``. The row still carries
+        # ``subject_label = org.slug`` for operator readability, just
+        # as for the lifecycle_eval mutex.
+        Index(
+            "idx_queue_jobs_git_ref_audit_active_uq",
+            "org_id",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'git_ref_audit' "
                 "AND status IN ('queued', 'in_progress')"
             ),
         ),
