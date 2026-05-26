@@ -38,6 +38,8 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.domain.edition import Edition
+from docverse.domain.lifecycle import LifecycleRuleSet
 from docverse.domain.project import Project
 from docverse.factory import Factory
 from docverse.services.dashboard.enqueue import (
@@ -283,8 +285,8 @@ def _evaluate_matches(
     *,
     projects: list[Project],
     refs_by_project: dict[int, RepositoryRefSet],
-    editions_by_project: dict[int, list[Any]],
-    org_rules: Any,
+    editions_by_project: dict[int, list[Edition]],
+    org_rules: LifecycleRuleSet | None,
 ) -> dict[int, set[int]]:
     """Run :func:`evaluate_lifecycle` per project; collect edition matches.
 
@@ -328,7 +330,7 @@ async def _apply_deletions(  # noqa: PLR0913
     factory: Factory,
     projects: list[Project],
     matches_by_project: dict[int, set[int]],
-    editions_by_project: dict[int, list[Any]],
+    editions_by_project: dict[int, list[Edition]],
     org_id: int,
     org_slug: str,
     logger: structlog.stdlib.BoundLogger,
@@ -405,9 +407,9 @@ async def _load_org_state(
     org_id: int,
 ) -> (
     tuple[
-        Any,
+        LifecycleRuleSet | None,
         list[Project],
-        dict[int, list[Any]],
+        dict[int, list[Edition]],
     ]
     | None
 ):
@@ -432,7 +434,7 @@ async def _load_org_state(
         project_ids = [p.id for p in projects]
         editions = await edition_store.list_all_by_project_ids(project_ids)
 
-    editions_by_project: dict[int, list[Any]] = {
+    editions_by_project: dict[int, list[Edition]] = {
         pid: [] for pid in project_ids
     }
     for edition in editions:

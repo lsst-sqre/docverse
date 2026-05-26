@@ -154,6 +154,15 @@ class RefDeletedWebhookProcessor:
 
         normalized_ref = normalize_github_ref(ref)
 
+        # GitHub ``delete`` payloads reliably populate
+        # ``repository.id``, so any project that has resolved its
+        # ``github_repo_id`` is reachable via the store's repo-id path.
+        # The name fallback in
+        # :meth:`ProjectStore.list_by_github_repo` is restricted to
+        # ``github_repo_id IS NULL`` rows by design (a coincidentally-
+        # same-named row at a different numeric id must not match) —
+        # the store docstring explains the restriction; this note
+        # surfaces the invariant at the call site.
         projects = await self._project_store.list_by_github_repo(
             repo_id=repo_id, owner=owner, repo=repo_name
         )
