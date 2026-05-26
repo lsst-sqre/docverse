@@ -458,7 +458,7 @@ class EditionStore:
         """List draft editions whose literal ref tracks ``git_ref``.
 
         Server-side filter for the GitHub ``delete`` webhook fast path
-        in :class:`docverse.services.dashboard_templates
+        in :class:`docverse.services.ref_deleted_processor
         .RefDeletedWebhookProcessor`. Returns editions where
         ``kind='draft'``, ``tracking_mode IN ('git_ref',
         'alternate_git_ref')``, ``lifecycle_exempt=False``,

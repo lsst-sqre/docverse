@@ -27,7 +27,6 @@ from .services.dashboard_templates import (
     DashboardTemplateSyncer,
     InstallationEventProcessor,
     PushEventProcessor,
-    RefDeletedWebhookProcessor,
     RenameEventProcessor,
     TemplateResolver,
 )
@@ -51,6 +50,7 @@ from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .services.project_github_binding import ProjectGitHubBindingResolver
+from .services.ref_deleted_processor import RefDeletedWebhookProcessor
 from .storage.build_store import BuildStore
 from .storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,

@@ -15,9 +15,9 @@ from docverse.factory import WebhookDispatch
 from docverse.services.dashboard_templates import (
     InstallationEventProcessor,
     PushEventProcessor,
-    RefDeletedWebhookProcessor,
     RenameEventProcessor,
 )
+from docverse.services.ref_deleted_processor import RefDeletedWebhookProcessor
 from docverse.storage.github import GitHubAppNotConfiguredError
 
 __all__ = ["router"]

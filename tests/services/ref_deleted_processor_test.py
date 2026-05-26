@@ -16,7 +16,7 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.services.dashboard_templates.ref_deleted_processor import (
+from docverse.services.ref_deleted_processor import (
     RefDeletedResult,
     RefDeletedWebhookProcessor,
 )

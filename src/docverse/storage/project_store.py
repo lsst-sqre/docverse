@@ -378,7 +378,7 @@ class ProjectStore:
     ) -> list[Project]:
         """Find non-deleted projects matching a GitHub repo.
 
-        Used by :class:`docverse.services.dashboard_templates
+        Used by :class:`docverse.services.ref_deleted_processor
         .RefDeletedWebhookProcessor` (and any future webhook routing
         keyed on a repository, not a binding) to walk every project
         that backs the delivered ``(owner, repo, repository.id)``.

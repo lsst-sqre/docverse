@@ -1317,7 +1317,7 @@ async def test_list_draft_editions_by_git_ref_selects_matching_draft(
     """A draft edition tracking the deleted ref is selected.
 
     Pins the happy-path filter used by
-    :class:`docverse.services.dashboard_templates
+    :class:`docverse.services.ref_deleted_processor
     .RefDeletedWebhookProcessor`: server-side filter on
     ``kind='draft' AND tracking_mode IN ('git_ref',
     'alternate_git_ref') AND lifecycle_exempt=False AND
