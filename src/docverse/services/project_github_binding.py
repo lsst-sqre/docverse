@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.storage.github import GitHubAppClient, InstallationAuth
 from docverse.storage.project_store import ProjectStore
@@ -71,15 +72,24 @@ class ProjectGitHubBindingResolver:
       and tend to be consumed by a fan-out of fetches immediately
       after, so caching them across calls would buy little and
       complicate the eviction story.
+
+    The binding-column read runs inside a short read transaction
+    owned by this resolver; the installation-token exchange (a
+    GitHub network round-trip) runs **after** that transaction has
+    closed so the database connection is not held idle-in-transaction
+    across the network call. The audit's per-project fan-out would
+    otherwise compound the idle-in-transaction window per project.
     """
 
     def __init__(
         self,
         *,
+        session: AsyncSession,
         project_store: ProjectStore,
         app_client: GitHubAppClient,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
+        self._session = session
         self._project_store = project_store
         self._app_client = app_client
         self._logger = logger
@@ -94,8 +104,15 @@ class ProjectGitHubBindingResolver:
         anonymous-vs-installation auth choice is reflected on the
         returned record's ``auth`` field, not on the return type, so
         callers walk one ladder rather than two.
+
+        The binding lookup is wrapped in this resolver's own short
+        read transaction; the caller must therefore **not** wrap the
+        call in ``session.begin()``. The token exchange runs after
+        the read transaction has closed so the DB connection is not
+        idle-in-transaction across the GitHub round-trip.
         """
-        project = await self._project_store.get_by_id(project_id)
+        async with self._session.begin():
+            project = await self._project_store.get_by_id(project_id)
         if project is None:
             return None
         owner = project.github_owner

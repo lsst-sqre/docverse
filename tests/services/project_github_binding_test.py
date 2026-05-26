@@ -98,10 +98,66 @@ def _make_resolver(
         logger=_logger(),
     )
     return ProjectGitHubBindingResolver(
+        session=session,
         project_store=project_store,
         app_client=app_client,
         logger=_logger(),
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_mints_token_outside_open_db_transaction(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """The GitHub token-exchange must not run inside an open DB tx.
+
+    Holding a DB transaction open across the
+    ``exchange_installation_token`` round-trip leaves a connection
+    idle-in-transaction for the duration of the network call. For an
+    org with many GitHub-bound projects this would compound per
+    project in the daily ``git_ref_audit`` worker. The resolver owns
+    the short read transaction for the binding lookup and must mint
+    the installation token only after that transaction has closed.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="resolver-tx-boundary")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="proj-tx-boundary",
+            github_owner="acme",
+            github_repo="docs",
+            github_installation_id=77,
+        )
+        await db_session.commit()
+
+    mock_github.seed_installation(
+        "acme", "docs", installation_id=77, token="ghs_no_tx"
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        resolver = _make_resolver(
+            session=db_session,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        original_exchange = resolver._app_client.exchange_installation_token
+        in_tx_during_mint: list[bool] = []
+
+        async def _capturing_exchange(installation_id: int) -> str:
+            in_tx_during_mint.append(db_session.in_transaction())
+            return await original_exchange(installation_id)
+
+        resolver._app_client.exchange_installation_token = (  # type: ignore[method-assign]
+            _capturing_exchange
+        )
+        result = await resolver.resolve(project_id)
+
+    assert result is not None
+    assert result.auth is not None
+    assert in_tx_during_mint == [False]
 
 
 @pytest.mark.asyncio

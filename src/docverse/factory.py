@@ -474,6 +474,7 @@ class Factory:
             If no shared ``httpx.AsyncClient`` is configured.
         """
         return ProjectGitHubBindingResolver(
+            session=self._session,
             project_store=self.create_project_store(),
             app_client=self.create_github_app_client(),
             logger=self._logger,

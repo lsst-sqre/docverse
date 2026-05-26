@@ -235,8 +235,13 @@ async def _fetch_refs_per_project(
         project_logger = logger.bind(
             project=project.slug, project_id=project.id
         )
-        async with session.begin():
-            binding = await resolver.resolve(project.id)
+        # ``resolver.resolve`` owns its own short read transaction and
+        # mints the installation token (a GitHub network round-trip)
+        # only after that transaction has closed; wrapping this call
+        # in ``session.begin()`` would defeat that boundary and leave
+        # the DB connection idle-in-transaction for every project's
+        # token exchange.
+        binding = await resolver.resolve(project.id)
         if binding is None:
             project_logger.debug(
                 "Git ref audit: project has no GitHub binding, skipping"
