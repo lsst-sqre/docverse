@@ -1304,3 +1304,252 @@ async def test_create_internal_concurrent_mixed_case_slug(
         rows = result.scalars().all()
         await db_session.commit()
     assert len(rows) == 1
+
+
+# ── list_draft_editions_by_git_ref ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_selects_matching_draft(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A draft edition tracking the deleted ref is selected.
+
+    Pins the happy-path filter used by
+    :class:`docverse.services.dashboard_templates
+    .RefDeletedWebhookProcessor`: server-side filter on
+    ``kind='draft' AND tracking_mode IN ('git_ref',
+    'alternate_git_ref') AND lifecycle_exempt=False AND
+    date_deleted IS NULL AND tracking_params->>'git_ref' = :ref``.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="dm-1",
+                title="DM-1",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-1"},
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="tickets/DM-1"
+        )
+        await db_session.commit()
+    assert [e.slug for e in result] == ["dm-1"]
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_excludes_release(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A release-kind edition pinned to the same ref is excluded.
+
+    The webhook fast path is strictly for draft branch-tracking
+    editions; a release edition pinned to a tag survives an upstream
+    force-recreate of that tag.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="v1",
+                title="v1",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "v1"},
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="v1"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_excludes_lifecycle_exempt(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A draft edition with ``lifecycle_exempt=True`` is excluded."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="demo",
+                title="Demo",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "demo"},
+                lifecycle_exempt=True,
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="demo"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_excludes_soft_deleted(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Already-soft-deleted draft editions are filtered out."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="dm-2",
+                title="DM-2",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-2"},
+            ),
+        )
+        await edition_store.soft_delete(project_id=project_id, slug="dm-2")
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="tickets/DM-2"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_excludes_wrong_tracking_mode(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A draft edition with a non-literal-ref tracking mode is excluded."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="v2",
+                title="v2",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.semver_release,
+                tracking_params={"git_ref": "v2"},
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="v2"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_includes_alternate_git_ref(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """An ``alternate_git_ref`` draft on the same ref is included.
+
+    Mirrors the lifecycle evaluator's literal-ref candidate set: both
+    ``git_ref`` and ``alternate_git_ref`` modes are branch-tracking, so
+    a deletion of the underlying ref applies to both.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="dm-3-usdf",
+                title="DM-3 (usdf)",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.alternate_git_ref,
+                tracking_params={
+                    "git_ref": "tickets/DM-3",
+                    "alternate_name": "usdf",
+                },
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="tickets/DM-3"
+        )
+        await db_session.commit()
+    assert [e.slug for e in result] == ["dm-3-usdf"]
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_excludes_other_ref(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A draft edition tracking a different ref is not returned.
+
+    The server-side ``tracking_params->>'git_ref' = :ref`` filter is
+    what keeps a delete event for ``feature-x`` from sweeping up an
+    edition on ``feature-y`` in the same project.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="feature-y",
+                title="Feature Y",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "feature-y"},
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="feature-x"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_draft_editions_by_git_ref_scoped_to_project(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Editions in a sibling project on the same ref are not returned."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        logger = structlog.get_logger("docverse")
+        proj_store = ProjectStore(session=db_session, logger=logger)
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        other_org = await org_store.create(
+            OrganizationCreate(
+                slug="ed-org-other",
+                title="Other Org",
+                base_domain="ed-other.example.com",
+            )
+        )
+        other = await proj_store.create(
+            org_id=other_org.id,
+            data=ProjectCreate(
+                slug="ed-proj-other",
+                title="Other Proj",
+                source_url="https://example.com/other/repo",
+            ),
+        )
+        await edition_store.create(
+            project_id=other.id,
+            data=EditionCreate(
+                slug="feature-z",
+                title="Feature Z",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "feature-z"},
+            ),
+        )
+        result = await edition_store.list_draft_editions_by_git_ref(
+            project_id=project_id, git_ref="feature-z"
+        )
+        await db_session.commit()
+    assert result == []

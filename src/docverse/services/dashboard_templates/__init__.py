@@ -10,6 +10,7 @@ from .enqueue import DashboardSyncEnqueuer
 from .fanout import DashboardRebuildFanout
 from .installation_processor import InstallationEventProcessor
 from .push_processor import PushEventProcessor
+from .ref_deleted_processor import RefDeletedResult, RefDeletedWebhookProcessor
 from .rename_processor import RenameEventProcessor
 from .resolver import (
     ResolvedTemplate,
@@ -26,6 +27,8 @@ __all__ = [
     "DashboardTemplateSyncer",
     "InstallationEventProcessor",
     "PushEventProcessor",
+    "RefDeletedResult",
+    "RefDeletedWebhookProcessor",
     "RenameEventProcessor",
     "ResolvedTemplate",
     "ResolvedTemplateOrigin",

@@ -325,6 +325,72 @@ class ProjectStore:
         await self._session.refresh(row)
         return Project.model_validate(row)
 
+    async def list_by_github_repo(
+        self,
+        *,
+        repo_id: int | None,
+        owner: str,
+        repo: str,
+    ) -> list[Project]:
+        """Find non-deleted projects matching a GitHub repo.
+
+        Used by :class:`docverse.services.dashboard_templates
+        .RefDeletedWebhookProcessor` (and any future webhook routing
+        keyed on a repository, not a binding) to walk every project
+        that backs the delivered ``(owner, repo, repository.id)``.
+        Mirrors the dashboard binding store's
+        ``list_by_repo_id_and_ref`` + ``list_unsynced_by_repo_ref``
+        pair: the numeric id path is the rename-robust primary, and
+        the name path covers pre-resolve projects whose
+        ``github_repo_id`` column is still NULL.
+
+        Two queries unioned and deduplicated by project id:
+        - When ``repo_id`` is supplied (the webhook payload's
+          ``repository.id`` was populated), select projects with that
+          ``github_repo_id``. Rename-robust: a transferred or renamed
+          repo keeps its numeric id, so the row still matches even
+          when display names diverge.
+        - Always also select projects whose
+          ``(lower(github_owner), lower(github_repo))`` matches **and**
+          whose ``github_repo_id`` is NULL. Restricting the name path
+          to NULL-id rows defends against a different repo coming to
+          live at an old display name: any already-resolved project
+          would have a stable id that the id path covers, while a
+          coincidentally-same-named row sitting at a different numeric
+          id stays out.
+
+        Multiple projects may match (one repo shared across slugs);
+        callers iterate the returned list.
+        """
+        seen: set[int] = set()
+        results: list[Project] = []
+        if repo_id is not None:
+            by_id = await self._session.execute(
+                select(SqlProject).where(
+                    SqlProject.github_repo_id == repo_id,
+                    SqlProject.date_deleted.is_(None),
+                )
+            )
+            for row in by_id.scalars().all():
+                if row.id in seen:
+                    continue
+                seen.add(row.id)
+                results.append(Project.model_validate(row))
+        by_name = await self._session.execute(
+            select(SqlProject).where(
+                func.lower(SqlProject.github_owner) == owner.lower(),
+                func.lower(SqlProject.github_repo) == repo.lower(),
+                SqlProject.github_repo_id.is_(None),
+                SqlProject.date_deleted.is_(None),
+            )
+        )
+        for row in by_name.scalars().all():
+            if row.id in seen:
+                continue
+            seen.add(row.id)
+            results.append(Project.model_validate(row))
+        return results
+
     async def rename_repo_by_repo_id(
         self,
         *,

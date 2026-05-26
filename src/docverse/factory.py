@@ -27,6 +27,7 @@ from .services.dashboard_templates import (
     DashboardTemplateSyncer,
     InstallationEventProcessor,
     PushEventProcessor,
+    RefDeletedWebhookProcessor,
     RenameEventProcessor,
     TemplateResolver,
 )
@@ -85,17 +86,17 @@ from .storage.user_info_store import UserInfoStore
 class WebhookDispatch:
     """Bundle of objects the GitHub webhook handler needs per delivery.
 
-    The HMAC secret verifies ``x-hub-signature-256``; the three
-    processors handle the event types the dashboard-template feature
-    subscribes to. Created fresh per request inside
-    :meth:`Factory.create_webhook_dispatch` so each delivery binds to
-    the request's own DB session and logger.
+    The HMAC secret verifies ``x-hub-signature-256``; one processor per
+    registered event type handles the work. Created fresh per request
+    inside :meth:`Factory.create_webhook_dispatch` so each delivery
+    binds to the request's own DB session and logger.
     """
 
     webhook_secret: str
     push: PushEventProcessor
     rename: RenameEventProcessor
     installation: InstallationEventProcessor
+    ref_deleted: RefDeletedWebhookProcessor
 
 
 class Factory:
@@ -627,11 +628,17 @@ class Factory:
             project_store=self.create_project_store(),
             logger=self._logger,
         )
+        ref_deleted = RefDeletedWebhookProcessor(
+            project_store=self.create_project_store(),
+            edition_store=self.create_edition_store(),
+            logger=self._logger,
+        )
         return WebhookDispatch(
             webhook_secret=webhook_secret.get_secret_value(),
             push=push,
             rename=rename,
             installation=installation,
+            ref_deleted=ref_deleted,
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:

@@ -15,6 +15,7 @@ from docverse.factory import WebhookDispatch
 from docverse.services.dashboard_templates import (
     InstallationEventProcessor,
     PushEventProcessor,
+    RefDeletedWebhookProcessor,
     RenameEventProcessor,
 )
 from docverse.storage.github import GitHubAppNotConfiguredError
@@ -139,6 +140,26 @@ async def _handle_installation_repositories(
         await context.session.commit()
 
 
+@_event_router.register("delete")
+async def _handle_delete(
+    event: sansio.Event,
+    *,
+    ref_deleted: RefDeletedWebhookProcessor,
+    context: RequestContext,
+    **_unused: Any,
+) -> None:
+    """Soft-delete draft editions tracking the deleted branch/tag.
+
+    Wraps :meth:`RefDeletedWebhookProcessor.process` in the same
+    ``context.session.begin()`` as the push and rename handlers so a
+    failure mid-sweep rolls back the whole delivery's deletions
+    atomically.
+    """
+    async with context.session.begin():
+        await ref_deleted.process(event.data)
+        await context.session.commit()
+
+
 @router.post(
     "/webhooks/github",
     status_code=status.HTTP_200_OK,
@@ -196,6 +217,7 @@ async def post_github_webhook(
         push=dispatch.push,
         rename=dispatch.rename,
         installation=dispatch.installation,
+        ref_deleted=dispatch.ref_deleted,
         context=context,
     )
 

@@ -410,3 +410,260 @@ async def test_soft_delete(
         found = await store.get_by_slug(org_id=org_id, slug="del-proj")
         await db_session.commit()
     assert found is None
+
+
+# ── list_by_github_repo ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_matches_by_repo_id(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A project resolved against ``github_repo_id`` is returned.
+
+    The ``id`` path is the rename-robust primary key: the numeric repo
+    id outlives display-name renames and transfers, so a webhook
+    delivered for ``new-name`` still matches a project whose
+    ``github_repo`` column has not yet been updated by the rename
+    webhook (or never will be, if that webhook is missed).
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="docs",
+                title="Docs",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="templates"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="templates",
+        )
+        await store.apply_installation_scope(
+            installation_id=99,
+            owner="acme",
+            owner_id=999,
+            repo="templates",
+            repo_id=12345,
+        )
+        result = await store.list_by_github_repo(
+            repo_id=12345, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert [p.slug for p in result] == ["docs"]
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_matches_pre_resolve_by_owner_repo(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A project with NULL ``github_repo_id`` still matches by name pair.
+
+    A freshly-created project has structured owner/repo but no numeric
+    ids yet (those are filled opportunistically by the resolve worker
+    or the installation webhook). The webhook must still route to it.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="docs",
+                title="Docs",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="templates"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="templates",
+        )
+        result = await store.list_by_github_repo(
+            repo_id=None, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert [p.slug for p in result] == ["docs"]
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_matches_case_insensitively(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Owner/repo matching is case-insensitive.
+
+    GitHub canonical casing (``Acme/Templates``) and the webhook's
+    delivered casing (``acme/templates``) must both resolve to the
+    same project row.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="docs",
+                title="Docs",
+                github=ProjectGitHubBindingCreate(
+                    owner="Acme", repo="Templates"
+                ),
+            ),
+            github_owner="Acme",
+            github_repo="Templates",
+        )
+        result = await store.list_by_github_repo(
+            repo_id=None, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert [p.slug for p in result] == ["docs"]
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_returns_multiple_matches(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Multiple project slugs may share one upstream GitHub repo."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        for slug in ("docs-a", "docs-b"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(
+                    slug=slug,
+                    title=slug,
+                    github=ProjectGitHubBindingCreate(
+                        owner="acme", repo="templates"
+                    ),
+                ),
+                github_owner="acme",
+                github_repo="templates",
+            )
+        await store.apply_installation_scope(
+            installation_id=99,
+            owner="acme",
+            owner_id=999,
+            repo="templates",
+            repo_id=12345,
+        )
+        result = await store.list_by_github_repo(
+            repo_id=12345, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert {p.slug for p in result} == {"docs-a", "docs-b"}
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_no_match_returns_empty(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A repo with no bound projects returns an empty list, no error."""
+    async with db_session.begin():
+        await _create_org(org_store)
+        result = await store.list_by_github_repo(
+            repo_id=42, owner="ghost", repo="repo"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_excludes_non_github_projects(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A project with NULL github_owner/repo never matches."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="gitlab-proj",
+                title="GitLab Proj",
+                source_url="https://gitlab.com/acme/templates",
+            ),
+        )
+        result = await store.list_by_github_repo(
+            repo_id=None, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_excludes_soft_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Soft-deleted projects are not returned by webhook lookups."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="docs",
+                title="Docs",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="templates"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="templates",
+        )
+        await store.soft_delete(org_id=org_id, slug="docs")
+        result = await store.list_by_github_repo(
+            repo_id=None, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_github_repo_dedupes_id_and_name_matches(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A project matched by both repo_id and owner/repo appears once.
+
+    The two-query union exists so pre-resolve projects (no repo_id) and
+    rename-survivors (repo_id stable, name flipped) both surface; for
+    a project that satisfies both predicates, the result must dedup on
+    the project id rather than return a duplicate.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="docs",
+                title="Docs",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="templates"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="templates",
+        )
+        await store.apply_installation_scope(
+            installation_id=99,
+            owner="acme",
+            owner_id=999,
+            repo="templates",
+            repo_id=12345,
+        )
+        result = await store.list_by_github_repo(
+            repo_id=12345, owner="acme", repo="templates"
+        )
+        await db_session.commit()
+    assert [p.slug for p in result] == ["docs"]
