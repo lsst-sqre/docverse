@@ -49,6 +49,7 @@ from .services.keeper_sync_run import KeeperSyncRunService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
+from .services.project_github_binding import ProjectGitHubBindingResolver
 from .storage.build_store import BuildStore
 from .storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
@@ -419,6 +420,33 @@ class Factory:
             self._github_app_id,
             self._github_app_private_key,
             self._github_webhook_secret,
+        )
+
+    def create_project_github_binding_resolver(
+        self,
+    ) -> ProjectGitHubBindingResolver:
+        """Create a :class:`ProjectGitHubBindingResolver`.
+
+        Used by the future ``git_ref_audit`` worker (PRD #346) and by
+        the proactive ``sync_project`` pre-fetch (PRD #332). Both
+        callers need the same "installation > anonymous > skip" decision
+        before calling :class:`GitHubRefSetFetcher`, so the resolver is
+        the one place that ladder lives.
+
+        Raises
+        ------
+        GitHubAppNotConfiguredError
+            If any of the three GitHub App secrets is unset. The audit
+            cannot mint installation tokens without them; routing this
+            via the same Sentry pipeline as other GitHub failures keeps
+            misconfiguration loud.
+        RuntimeError
+            If no shared ``httpx.AsyncClient`` is configured.
+        """
+        return ProjectGitHubBindingResolver(
+            project_store=self.create_project_store(),
+            app_client=self.create_github_app_client(),
+            logger=self._logger,
         )
 
     def create_github_app_client(self) -> GitHubAppClient:
