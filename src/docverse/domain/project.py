@@ -7,7 +7,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from docverse.client.models.projects import build_github_url
+from docverse.client.models.projects import (
+    InstallationStatus,
+    build_github_url,
+)
 
 from .lifecycle import LifecycleRuleSet
 
@@ -117,3 +120,20 @@ class Project(BaseModel):
         if self.github_owner is not None and self.github_repo is not None:
             return build_github_url(self.github_owner, self.github_repo)
         return self.source_url
+
+    @property
+    def github_installation_status(self) -> InstallationStatus | None:
+        """Derive the App-installation status for the github binding.
+
+        Only meaningful with a binding present. ``installation_id`` set
+        -> installed; else not_installed. Note: a not-yet-resolved or
+        transiently-failed resolve also reads as not_installed until the
+        worker or installation webhook backfills the id (acceptable for
+        the derived-only status; persisting the resolve outcome is a
+        later slice).
+        """
+        if self.github_owner is None or self.github_repo is None:
+            return None
+        if self.github_installation_id is not None:
+            return InstallationStatus.installed
+        return InstallationStatus.not_installed

@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from docverse.client.models import (
+    InstallationStatus,
     ProjectCreate,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
@@ -89,14 +90,44 @@ def test_binding_create_rejects_extra_fields() -> None:
 def test_binding_response_includes_installation_id() -> None:
     expected = 42
     binding = ProjectGitHubBinding(
-        owner="lsst", repo="docverse", installation_id=expected
+        owner="lsst",
+        repo="docverse",
+        installation_id=expected,
+        installation_status=InstallationStatus.installed,
     )
     assert binding.installation_id == expected
 
 
 def test_binding_response_installation_id_defaults_none() -> None:
-    binding = ProjectGitHubBinding(owner="lsst", repo="docverse")
+    binding = ProjectGitHubBinding(
+        owner="lsst",
+        repo="docverse",
+        installation_status=InstallationStatus.not_installed,
+    )
     assert binding.installation_id is None
+
+
+def test_binding_response_app_url_defaults_none() -> None:
+    """``app_url`` is optional and absent until startup captures it."""
+    binding = ProjectGitHubBinding(
+        owner="lsst",
+        repo="docverse",
+        installation_status=InstallationStatus.not_installed,
+    )
+    assert binding.app_url is None
+
+
+def test_binding_response_carries_status_and_app_url() -> None:
+    """Both new fields round-trip through the response model."""
+    binding = ProjectGitHubBinding(
+        owner="lsst",
+        repo="docverse",
+        installation_id=42,
+        installation_status=InstallationStatus.installed,
+        app_url="https://github.com/apps/docverse",
+    )
+    assert binding.installation_status == InstallationStatus.installed
+    assert binding.app_url == "https://github.com/apps/docverse"
 
 
 def test_project_create_accepts_github_without_source_url() -> None:

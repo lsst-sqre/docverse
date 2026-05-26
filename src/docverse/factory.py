@@ -840,6 +840,7 @@ class HandlerFactory(Factory):
         github_app_id: int | None = None,
         github_app_private_key: SecretStr | None = None,
         github_webhook_secret: SecretStr | None = None,
+        github_app_html_url: str | None = None,
         *,
         github_app_validated: bool = True,
         default_queue_name: str,
@@ -859,7 +860,21 @@ class HandlerFactory(Factory):
             default_queue_name=default_queue_name,
         )
         self._user_info_store = user_info_store
+        self._github_app_html_url = github_app_html_url
 
     def get_user_info_store(self) -> UserInfoStore:
         """Get the UserInfoStore instance."""
         return self._user_info_store
+
+    @property
+    def github_app_html_url(self) -> str | None:
+        """The GitHub App's public install-page URL, or ``None``.
+
+        Captured from the startup ``GET /app`` validation and threaded
+        through :class:`docverse.dependencies.context.ContextDependency`.
+        Handlers read it as ``context.factory.github_app_html_url`` to
+        populate ``github.app_url`` on project responses. ``None`` when
+        the GitHub App feature is unconfigured or its credentials failed
+        startup validation.
+        """
+        return self._github_app_html_url

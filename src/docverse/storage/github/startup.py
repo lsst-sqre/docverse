@@ -50,7 +50,7 @@ async def validate_github_app(  # noqa: PLR0913
     app_name: str,
     http_client: httpx.AsyncClient,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> str | None:
     """Validate GitHub App credentials and update ``state`` on failure.
 
     No-op when ``state.github_app_enabled`` is ``False`` — the
@@ -58,13 +58,24 @@ async def validate_github_app(  # noqa: PLR0913
     :meth:`docverse.factory.Factory._require_github_app_config` already
     keeps the feature disabled, so issuing a network call would be
     redundant and would fail anyway.
+
+    Returns
+    -------
+    str or None
+        On a successful validation, the App's public ``html_url`` from
+        the ``GET /app`` response (the install page the API surfaces so
+        the UI can prompt operators to install the App). ``None`` when
+        the feature is disabled, when GitHub omits the field, or when
+        validation failed (the failure also flips ``state`` off). The
+        API lifespan stores this value; the worker startup path
+        discards it.
     """
     if not state.github_app_enabled:
-        return
+        return None
     # ``github_app_enabled`` guarantees both are set; the explicit
     # check narrows the types for the GitHubAppClientFactory call.
     if app_id is None or private_key is None:  # pragma: no cover
-        return
+        return None
     factory = GitHubAppClientFactory(
         id=app_id,
         key=private_key.get_secret_value(),
@@ -75,7 +86,7 @@ async def validate_github_app(  # noqa: PLR0913
         factory=factory, http_client=http_client, logger=logger
     )
     try:
-        await client.validate()
+        html_url = await client.validate()
     except Exception as exc:  # noqa: BLE001
         # Validator must not crash the service. Known failure types
         # are ``jwt.exceptions.InvalidKeyError`` (PEM parse) and
@@ -89,5 +100,6 @@ async def validate_github_app(  # noqa: PLR0913
             error_type=type(exc).__name__,
         )
         state.set_github_app_validated(value=False)
-    else:
-        logger.info("GitHub App config validated", app_id=state.github_app_id)
+        return None
+    logger.info("GitHub App config validated", app_id=state.github_app_id)
+    return html_url

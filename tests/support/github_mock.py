@@ -101,10 +101,12 @@ class GitHubMock:
         failure branch of the validator.
         """
         if body is None:
+            slug = self.app_name.split("/", 1)[-1]
             body = {
                 "id": self.app_id,
-                "slug": self.app_name.split("/", 1)[-1],
+                "slug": slug,
                 "name": self.app_name,
+                "html_url": f"https://github.com/apps/{slug}",
             }
         self.router.get(f"{_GITHUB_API}/app").mock(
             return_value=httpx.Response(status_code, json=body)

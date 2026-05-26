@@ -6,6 +6,7 @@ from .app_client import (
     GITHUB_API_BASE_URL,
     GitHubAppClient,
     GitHubAppNotConfiguredError,
+    GitHubAppNotInstalledError,
     InstallationAuth,
     RepositoryMetadata,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "FetchedTreeFile",
     "GitHubAppClient",
     "GitHubAppNotConfiguredError",
+    "GitHubAppNotInstalledError",
     "GitHubAppValidationState",
     "GitHubTreeFetcher",
     "InstallationAuth",

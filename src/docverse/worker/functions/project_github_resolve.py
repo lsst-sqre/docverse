@@ -19,6 +19,8 @@ import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
+from docverse.storage.github import GitHubAppNotInstalledError
+
 __all__ = ["project_github_resolve"]
 
 
@@ -39,9 +41,12 @@ async def project_github_resolve(
     -------
     str
         ``"completed"`` on a successful resolve, ``"skipped"`` when the
-        project has no GitHub binding (or has been deleted), or
-        ``"failed"`` when GitHub returned an error or the columns
-        could not be written.
+        project has no GitHub binding (or has been deleted),
+        ``"not_installed"`` when the GitHub App is not installed on the
+        repository (an expected, operator-recoverable state — the ids
+        stay NULL and the ``installation`` webhook backfills them once
+        the App is installed), or ``"failed"`` when GitHub returned a
+        genuine error or the columns could not be written.
     """
     project_id: int = payload["project_id"]
     logger = structlog.get_logger(
@@ -71,6 +76,18 @@ async def project_github_resolve(
             metadata = await app_client.resolve_repository_metadata(
                 owner=owner, repo=repo
             )
+        except GitHubAppNotInstalledError:
+            # Expected state, not a bug: no installation grants the App
+            # access to this repo (not installed on the account,
+            # installed without this repo selected, or a mistyped URL).
+            # Leave the ids NULL and stay out of Sentry — the
+            # ``installation`` webhook backfills them once an operator
+            # installs the App. The API surfaces this as
+            # ``installation_status: "not_installed"``.
+            logger.info(
+                "GitHub App not installed on repository; leaving ids NULL"
+            )
+            return "not_installed"
         except (
             httpx.HTTPError,
             gidgethub.GitHubException,

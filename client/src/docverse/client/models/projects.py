@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated, Any, Self
 from urllib.parse import urlparse
 
@@ -13,6 +14,7 @@ from .editions import Edition as EditionResponse
 from .lifecycle import LifecycleRuleSet
 
 __all__ = [
+    "InstallationStatus",
     "Project",
     "ProjectCreate",
     "ProjectGitHubBinding",
@@ -83,6 +85,22 @@ class ProjectGitHubBindingCreate(BaseModel):
     repo: Annotated[str, _GITHUB_REPO_FIELD]
 
 
+class InstallationStatus(StrEnum):
+    """Whether the Docverse GitHub App is installed on a repository.
+
+    Derived per response from the project's GitHub binding. Today only
+    ``not_installed`` and ``installed`` are ever returned;
+    ``suspended`` and ``needs_permissions`` are reserved enum values
+    for a later slice (projects currently have no suspended state — the
+    suspend/unsuspend webhooks only touch dashboard-template bindings).
+    """
+
+    not_installed = "not_installed"
+    installed = "installed"
+    suspended = "suspended"
+    needs_permissions = "needs_permissions"
+
+
 class ProjectGitHubBinding(BaseModel):
     """Structured GitHub coordinates returned on a project resource."""
 
@@ -97,6 +115,25 @@ class ProjectGitHubBinding(BaseModel):
         description=(
             "GitHub App installation id for the repository. ``None`` when"
             " the App is not installed or has not yet been resolved."
+        ),
+    )
+
+    installation_status: InstallationStatus = Field(
+        description=(
+            "Whether the Docverse GitHub App is installed on this repo."
+            " Today only ``not_installed``/``installed`` are returned;"
+            " ``suspended`` and ``needs_permissions`` are reserved."
+        ),
+    )
+
+    app_url: str | None = Field(
+        default=None,
+        description=(
+            "Public URL of the Docverse GitHub App's install page (e.g."
+            " ``https://github.com/apps/{slug}``), so an operator can"
+            " install the App on the repository. ``None`` when the"
+            " GitHub App feature is unconfigured or its credentials"
+            " failed startup validation."
         ),
     )
 

@@ -73,6 +73,7 @@ from .organizations import (
     UrlScheme,
 )
 from .projects import (
+    InstallationStatus,
     Project,
     ProjectCreate,
     ProjectGitHubBinding,
@@ -113,6 +114,7 @@ __all__ = [
     "EditionUpdate",
     "FastlyCredentials",
     "GcpCredentials",
+    "InstallationStatus",
     "JobKind",
     "JobStatus",
     "KeeperSyncConfig",

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import http
 from dataclasses import dataclass
 from typing import Any, Literal, override
 
+import gidgethub
 import httpx
 import structlog
 from gidgethub.apps import get_installation_access_token
@@ -18,6 +20,7 @@ __all__ = [
     "GITHUB_API_BASE_URL",
     "GitHubAppClient",
     "GitHubAppNotConfiguredError",
+    "GitHubAppNotInstalledError",
     "InstallationAuth",
     "MissingGitHubAppSecret",
     "RepositoryMetadata",
@@ -142,6 +145,33 @@ def _format_github_app_not_configured_message(
     )
 
 
+class GitHubAppNotInstalledError(Exception):
+    """No installation grants the GitHub App access to ``owner/repo``.
+
+    Raised by :meth:`GitHubAppClient.get_installation_id` when
+    ``GET /repos/{owner}/{repo}/installation`` returns 404. A GitHub App
+    installation id is per-account, not per-repo, and that endpoint
+    finds the account's installation via a repo it can reach — so a 404
+    means *no* installation grants the App access to this repo: the App
+    is not installed on the account, it is installed with "Only select
+    repositories" and this repo is not selected, or the
+    ``owner``/``repo`` is mistyped. The JWT was accepted (a bad key is a
+    401), so this is an App-to-repo connection issue, not a credential
+    one.
+
+    Deliberately **not** a :class:`DocverseSlackException`: a
+    not-installed repo is an expected, operator-recoverable state that
+    the ``installation`` webhook backfills once the App is installed, so
+    it must stay out of Slack and Sentry. Carries ``owner``/``repo`` so
+    callers can log which repository was unreachable.
+    """
+
+    def __init__(self, *, owner: str, repo: str) -> None:
+        super().__init__(f"GitHub App is not installed on {owner}/{repo}")
+        self.owner = owner
+        self.repo = repo
+
+
 class GitHubAppClient:
     """Installation-scoped access to the GitHub REST API.
 
@@ -164,7 +194,7 @@ class GitHubAppClient:
         self._http_client = http_client
         self._logger = logger
 
-    async def validate(self) -> None:
+    async def validate(self) -> str | None:
         """Validate that the configured GitHub App credentials work.
 
         Two-step check:
@@ -180,10 +210,22 @@ class GitHubAppClient:
         Raises any exception encountered during the two steps; callers
         are expected to log the failure and disable the feature for the
         lifetime of the process.
+
+        Returns
+        -------
+        str or None
+            The App's public ``html_url`` (e.g.
+            ``https://github.com/apps/{slug}``) from the ``GET /app``
+            response — the page an operator visits to install the App on
+            a repository. ``None`` if GitHub omits the field. Callers
+            surface this through the API so the UI can link operators to
+            the install page.
         """
         jwt = self._factory.get_app_jwt()
         anon = GitHubAPI(self._http_client, self._factory.app_name)
-        await anon.getitem("/app", jwt=jwt)
+        data = await anon.getitem("/app", jwt=jwt)
+        html_url = data.get("html_url")
+        return str(html_url) if html_url is not None else None
 
     async def get_installation_id(self, owner: str, repo: str) -> int:
         """Resolve the installation ID for a repository.
@@ -193,14 +235,29 @@ class GitHubAppClient:
         ``installation.id`` value, which is stable across GitHub repo
         renames / transfers and is therefore the preferred internal key
         for later lookups.
+
+        Raises
+        ------
+        GitHubAppNotInstalledError
+            If GitHub returns 404 — no installation grants the App
+            access to ``owner/repo`` (not installed on the account,
+            installed without this repo selected, or a mistyped
+            ``owner``/``repo``).
         """
         jwt = self._factory.get_app_jwt()
         anon = GitHubAPI(self._http_client, self._factory.app_name)
-        data = await anon.getitem(
-            "/repos/{owner}/{repo}/installation",
-            url_vars={"owner": owner, "repo": repo},
-            jwt=jwt,
-        )
+        try:
+            data = await anon.getitem(
+                "/repos/{owner}/{repo}/installation",
+                url_vars={"owner": owner, "repo": repo},
+                jwt=jwt,
+            )
+        except gidgethub.BadRequest as exc:
+            if exc.status_code == http.HTTPStatus.NOT_FOUND:
+                raise GitHubAppNotInstalledError(
+                    owner=owner, repo=repo
+                ) from exc
+            raise
         return int(data["id"])
 
     async def exchange_installation_token(self, installation_id: int) -> str:

@@ -104,7 +104,13 @@ async def get_projects(  # noqa: PLR0913
         context.response.headers["Link"] = link
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
-        Project.from_domain(p, context.request, org) for p in result.entries
+        Project.from_domain(
+            p,
+            context.request,
+            org,
+            app_url=context.factory.github_app_html_url,
+        )
+        for p in result.entries
     ]
 
 
@@ -138,6 +144,7 @@ async def post_project(
         context.request,
         org,
         default_edition=default_edition,
+        app_url=context.factory.github_app_html_url,
     )
 
 
@@ -164,6 +171,7 @@ async def get_project(
         context.request,
         org,
         default_edition=default_edition,
+        app_url=context.factory.github_app_html_url,
     )
 
 
@@ -205,6 +213,7 @@ async def patch_project(
         context.request,
         org,
         default_edition=default_edition,
+        app_url=context.factory.github_app_html_url,
     )
 
 

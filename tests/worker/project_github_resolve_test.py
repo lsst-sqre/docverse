@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+import sentry_sdk
 import structlog
 from pydantic import SecretStr
 from safir.dependencies.db_session import db_session_dependency
@@ -184,14 +185,18 @@ async def test_project_github_resolve_leaves_ids_null_on_github_404(
     app: None,
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 404 from GitHub leaves the columns NULL and is logged.
+    """A 404 is the expected "App not installed" state, not a failure.
 
-    Acceptance criteria from the issue: ``on failure they stay NULL and
-    the failure is logged``. The 404 path is the canonical case
-    (GitHub App not installed for the repo) so it must not raise out of
-    the worker — that would surface as an arq-level error rather than
-    a per-row data-gap log line.
+    The GitHub App installation id is per-account, found via a repo the
+    App can access — so a 404 from ``/repos/{owner}/{repo}/installation``
+    means no installation grants the App access to this repo. That is an
+    operator-recoverable state the ``installation`` webhook backfills, so
+    the worker returns ``"not_installed"``, leaves the ids NULL, and must
+    **not** page Sentry (which it did before this change). It also must
+    not raise out of the worker — that would surface as an arq-level
+    error rather than a per-row data-gap log line.
     """
     async with db_session.begin():
         _org_id, project_id = await _seed_org_and_project(db_session)
@@ -201,11 +206,18 @@ async def test_project_github_resolve_leaves_ids_null_on_github_404(
         "https://api.github.com/repos/acme/templates/installation"
     ).mock(return_value=httpx.Response(404, json={"message": "Not Found"}))
 
+    captured: list[BaseException] = []
+    # The worker calls ``sentry_sdk.capture_exception``; patch the
+    # module attribute (the string-path form fails because
+    # ``project_github_resolve`` is a module, not a package).
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
     async with httpx.AsyncClient() as http_client:
         ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
         result = await project_github_resolve(ctx, {"project_id": project_id})
 
-    assert result == "failed"
+    assert result == "not_installed"
+    assert captured == []
     (
         owner,
         repo,
@@ -215,6 +227,52 @@ async def test_project_github_resolve_leaves_ids_null_on_github_404(
     ) = await _fetch_project_github_ids(project_id)
     assert owner == "acme"
     assert repo == "templates"
+    assert owner_id is None
+    assert repo_id is None
+    assert installation_id is None
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_captures_genuine_github_error(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-404 GitHub error fails the resolve and is paged to Sentry.
+
+    Only a 404 is the expected "App not installed" state. Any other
+    GitHub error (here a 500) is a genuine failure: the worker leaves
+    the ids NULL, returns ``"failed"``, and still calls
+    ``sentry_sdk.capture_exception`` so an operator is paged.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(return_value=httpx.Response(500, json={"message": "Server Error"}))
+
+    captured: list[BaseException] = []
+    # The worker calls ``sentry_sdk.capture_exception``; patch the
+    # module attribute (the string-path form fails because
+    # ``project_github_resolve`` is a module, not a package).
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "failed"
+    assert len(captured) == 1
+    (
+        _owner,
+        _repo,
+        owner_id,
+        repo_id,
+        installation_id,
+    ) = await _fetch_project_github_ids(project_id)
     assert owner_id is None
     assert repo_id is None
     assert installation_id is None

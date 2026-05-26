@@ -5,8 +5,14 @@ from __future__ import annotations
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import structlog
 from httpx import AsyncClient
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
 
+from docverse.dbschema.project import SqlProject
+from docverse.dependencies.context import context_dependency
+from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
 
 
@@ -779,6 +785,11 @@ async def test_create_project_with_github_binding_only(
         "owner": "lsst",
         "repo": "docverse",
         "installation_id": None,
+        # installation_id is NULL -> derived status is not_installed;
+        # the test app leaves the GitHub App feature unconfigured so
+        # app_url is absent.
+        "installation_status": "not_installed",
+        "app_url": None,
     }
     # source_url is derived from the binding, not stored separately.
     assert data["source_url"] == "https://github.com/lsst/docverse"
@@ -952,6 +963,8 @@ async def test_patch_project_sets_github_binding_drops_source_url(
         "owner": "lsst",
         "repo": "add-gh",
         "installation_id": None,
+        "installation_status": "not_installed",
+        "app_url": None,
     }
     # The GitLab URL is dropped; source_url is derived from the binding.
     assert data["source_url"] == "https://github.com/lsst/add-gh"
@@ -983,5 +996,67 @@ async def test_patch_project_source_url_null_leaves_github_intact(
         "owner": "lsst",
         "repo": "keep-gh",
         "installation_id": None,
+        "installation_status": "not_installed",
+        "app_url": None,
     }
     assert data["source_url"] == "https://github.com/lsst/keep-gh"
+
+
+@pytest.mark.asyncio
+async def test_project_github_installed_status_and_app_url(
+    client: AsyncClient,
+) -> None:
+    """``installation_status`` flips to installed once the id is set.
+
+    A NULL ``github_installation_id`` derives ``not_installed`` (covered
+    by the create/patch tests above). Here we persist an installation id
+    out-of-band — as the resolve worker or ``installation`` webhook would
+    — and stamp the captured GitHub App install-page URL on the shared
+    context, then assert both surface on the GET response.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-installed",
+            "title": "GH Installed",
+            "github": {"owner": "lsst", "repo": "gh-installed"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    # Persist an installation id the way the resolve worker would.
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            result = await session.execute(
+                select(SqlProject.id).where(SqlProject.slug == "gh-installed")
+            )
+            project_id = result.scalar_one()
+            store = ProjectStore(session=session, logger=logger)
+            updated = await store.update_github_metadata(
+                project_id=project_id,
+                expected_owner="lsst",
+                expected_repo="gh-installed",
+                installation_id=42,
+                owner_id=111,
+                repo_id=222,
+            )
+            await session.commit()
+        assert updated
+        break
+
+    # Stand in for the startup ``GET /app`` html_url capture.
+    context_dependency.set_github_app_html_url(
+        "https://github.com/apps/docverse"
+    )
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/gh-installed",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    binding = response.json()["github"]
+    assert binding["installation_id"] == 42
+    assert binding["installation_status"] == "installed"
+    assert binding["app_url"] == "https://github.com/apps/docverse"

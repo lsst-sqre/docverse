@@ -90,6 +90,7 @@ class ContextDependency:
         self._github_app_private_key: SecretStr | None = None
         self._github_webhook_secret: SecretStr | None = None
         self._github_app_validated: bool = True
+        self._github_app_html_url: str | None = None
 
     @property
     def github_app_enabled(self) -> bool:
@@ -145,6 +146,7 @@ class ContextDependency:
                 github_app_private_key=self._github_app_private_key,
                 github_webhook_secret=self._github_webhook_secret,
                 github_app_validated=self._github_app_validated,
+                github_app_html_url=self._github_app_html_url,
                 default_queue_name=self._arq_queue_name,
             ),
         )
@@ -214,6 +216,17 @@ class ContextDependency:
         this process without taking the service down.
         """
         self._github_app_validated = value
+
+    def set_github_app_html_url(self, html_url: str | None) -> None:
+        """Record the GitHub App's public install-page URL.
+
+        Called by the API service lifespan with the ``html_url`` the
+        startup ``GET /app`` validation returned, so the project
+        serializer can surface it as ``github.app_url`` and the UI can
+        link operators to the App's install page. ``None`` leaves the
+        field absent (feature unconfigured or validation failed).
+        """
+        self._github_app_html_url = html_url
 
     async def aclose(self) -> None:
         """Clean up the per-process configuration."""
