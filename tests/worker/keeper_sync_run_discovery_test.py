@@ -25,6 +25,12 @@ from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobStatus
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.queue_job_store import QueueJobStore
@@ -511,3 +517,79 @@ async def test_discovery_leaves_recent_unenqueued_children_alone(
             untouched = await queue_job_store.get(recent.id)
             assert untouched is not None
             assert untouched.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_discovery_skips_tombstoned_project_slugs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Tombstoned project slugs drop out of the fan-out candidate set.
+
+    Issue #396 acceptance criterion: an org with a tombstoned project
+    produces no ``keeper_sync_project`` child job for that resource.
+    Without the filter, ``run_discovery`` would fan out a child per
+    in-scope slug and the per-slug ``keeper_sync_project`` worker
+    would short-circuit inside ``sync_project`` — wasted queue and DB
+    work the filter avoids.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001", "sqr-112"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # Tombstone one of the two in-scope project slugs.
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        tombstone_service = KeeperSyncTombstoneService(
+            session=db_session,
+            state_store=state_store,
+            logger=_logger(),
+        )
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="dmtn-001",
+            reason=TombstoneReason.manual_delete,
+        )
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001", "sqr-112"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # Only the non-tombstoned slug is enqueued.
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert len(project_jobs) == 1
+    assert project_jobs[0].kwargs["payload"]["ltd_slug"] == "sqr-112"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.keeper_sync_run_id == run_id,
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+            )
+            child_rows = (await session.execute(stmt)).scalars().all()
+            assert len(child_rows) == 1
+            assert child_rows[0].subject_label == "sqr-112"
