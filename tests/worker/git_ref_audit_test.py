@@ -10,6 +10,8 @@ the parent ``git_ref_audit_runs`` row.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
 import respx
@@ -32,7 +34,11 @@ from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.project import SqlProject
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.lifecycle import LifecycleRuleSet, RefDeletedRule
+from docverse.domain.lifecycle import (
+    DraftInactivityRule,
+    LifecycleRuleSet,
+    RefDeletedRule,
+)
 from docverse.domain.queue import JobStatus
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
@@ -123,6 +129,7 @@ async def _seed_draft_edition(
     git_ref: str,
     tracking_mode: TrackingMode = TrackingMode.git_ref,
     lifecycle_exempt: bool = False,
+    date_updated: datetime | None = None,
 ) -> int:
     edition_store = EditionStore(session=db_session, logger=_logger())
     edition = await edition_store.create_internal(
@@ -134,6 +141,14 @@ async def _seed_draft_edition(
         tracking_params={"git_ref": git_ref},
         lifecycle_exempt=lifecycle_exempt,
     )
+    if date_updated is not None:
+        # Bypass ``onupdate=func.now()`` so the backdated timestamp
+        # survives — mirrors ``lifecycle_eval_test._seed_edition``.
+        await db_session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == edition.id)
+            .values(date_updated=date_updated)
+        )
     return edition.id
 
 
@@ -726,3 +741,107 @@ async def test_git_ref_audit_missing_org_is_noop(
             assert qj.status == JobStatus.completed
             assert qj.subject_label == org_slug
             assert qj.org_id == org_id
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_does_not_fire_draft_inactivity(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """An org with both rules: the audit only ref-deletes, never inactivates.
+
+    Regression guard for the cross-firing bug: the daily ref audit owns
+    only ``RefDeletedRule``. It filters the resolved rule set down to
+    that kind before evaluation, so a co-configured
+    ``DraftInactivityRule`` must never soft-delete an inactive draft from
+    this code path — that is the hourly ``lifecycle_eval`` worker's job.
+
+    Seeds one GitHub-bound project with two drafts: draft **A** tracks a
+    branch (``main``) that is still live but is backdated 60 days past
+    the 30-day inactivity threshold, and draft **B** tracks a branch
+    that is absent from the live refs. Asserts A survives (proving
+    ``DraftInactivityRule`` does not fire) while B is soft-deleted by
+    ``RefDeletedRule``.
+    """
+    both_rules = LifecycleRuleSet(
+        root=[RefDeletedRule(), DraftInactivityRule(max_days_inactive=30)]
+    )
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, slug="gra-both-rules", lifecycle_rules=both_rules
+        )
+        installation_id = mock_github.seed_installation(
+            "acme", "both", installation_id=71, owner_id=444
+        )
+        proj = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="both-rules-project",
+            owner="acme",
+            repo="both",
+            installation_id=installation_id,
+        )
+        stale_live_ref_id = await _seed_draft_edition(
+            db_session,
+            project_id=proj,
+            slug="stale-but-live-ref",
+            git_ref="main",
+            date_updated=datetime.now(tz=UTC) - timedelta(days=60),
+        )
+        deleted_ref_id = await _seed_draft_edition(
+            db_session,
+            project_id=proj,
+            slug="deleted-ref",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="both",
+        branches=["main"],
+        tags=[],
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await git_ref_audit(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "git_ref_audit_run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            # Draft A survives: DraftInactivityRule is not owned by the
+            # ref audit, so its 60-day staleness is irrelevant here, and
+            # its tracked ref is still live.
+            survivor = await edition_store.get_by_slug(
+                project_id=proj, slug="stale-but-live-ref"
+            )
+            assert survivor is not None
+            assert survivor.id == stale_live_ref_id
+            assert survivor.date_deleted is None
+
+            # Draft B is soft-deleted by RefDeletedRule (its ref is gone).
+            gone = await edition_store.get_by_slug(
+                project_id=proj, slug="deleted-ref"
+            )
+            assert gone is None
+            row = await session.execute(
+                select(SqlEdition.date_deleted).where(
+                    SqlEdition.id == deleted_ref_id
+                )
+            )
+            assert row.scalar_one() is not None

@@ -39,7 +39,7 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.domain.edition import Edition
-from docverse.domain.lifecycle import LifecycleRuleSet
+from docverse.domain.lifecycle import LifecycleRuleSet, RefDeletedRule
 from docverse.domain.project import Project
 from docverse.factory import Factory
 from docverse.services.dashboard.enqueue import (
@@ -51,6 +51,7 @@ from docverse.services.git_ref_audit_finalisation import (
 from docverse.services.lifecycle.evaluator import (
     LifecycleEvaluationContext,
     evaluate_lifecycle,
+    filter_rule_set,
     resolve_rule_set,
 )
 from docverse.storage.github import (
@@ -290,13 +291,15 @@ def _evaluate_matches(
 ) -> dict[int, set[int]]:
     """Run :func:`evaluate_lifecycle` per project; collect edition matches.
 
-    Projects whose effective rule set is empty or has no
-    ``RefDeletedRule`` will simply produce no matches — the
-    ``ref_deleted`` branch of the evaluator is the only one that
-    consumes ``live_refs``, and we deliberately pass empty ``builds``
-    / ``edition_build_history`` so the other rule branches do not
-    fire from this code path even when an org has them configured.
-    The hourly ``lifecycle_eval`` worker owns those other branches.
+    The resolved rule set is filtered down to ``RefDeletedRule`` before
+    evaluation — this worker owns only that rule kind. Filtering makes
+    the "each worker owns its concern" contract explicit and structural:
+    the ``ref_deleted`` branch is the only one that can fire from this
+    code path, even for an org that also configures other rule kinds
+    (the hourly ``lifecycle_eval`` worker owns those). A project whose
+    effective rule set carries no ``RefDeletedRule`` is skipped. The
+    empty ``builds`` / ``edition_build_history`` lists are unused by the
+    single remaining branch.
     """
     now = datetime.now(tz=UTC)
     matches_by_project: dict[int, set[int]] = {}
@@ -304,8 +307,11 @@ def _evaluate_matches(
         ref_set = refs_by_project.get(project.id)
         if ref_set is None:
             continue
-        rule_set = resolve_rule_set(
-            org_rules=org_rules, project_rules=project.lifecycle_rules
+        rule_set = filter_rule_set(
+            resolve_rule_set(
+                org_rules=org_rules, project_rules=project.lifecycle_rules
+            ),
+            include=(RefDeletedRule,),
         )
         if not rule_set.root:
             continue
@@ -385,6 +391,8 @@ async def _apply_deletions(  # noqa: PLR0913
                     org=org_slug,
                     project_id=project.id,
                     project=project.slug,
+                    # _evaluate_matches filters to RefDeletedRule, so
+                    # every match reaching here is a ref-deleted match.
                     rule_type="ref_deleted",
                 )
             if deleted_count:

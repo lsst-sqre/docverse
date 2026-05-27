@@ -17,6 +17,7 @@ from .evaluator import (
     LifecycleDecision,
     LifecycleEvaluationContext,
     evaluate_lifecycle,
+    filter_rule_set,
     resolve_rule_set,
 )
 
@@ -24,5 +25,6 @@ __all__ = [
     "LifecycleDecision",
     "LifecycleEvaluationContext",
     "evaluate_lifecycle",
+    "filter_rule_set",
     "resolve_rule_set",
 ]

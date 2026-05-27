@@ -37,6 +37,7 @@ from docverse.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     LifecycleRuleSet,
+    RefDeletedRule,
 )
 from docverse.factory import Factory
 from docverse.storage.build_store import BuildStore
@@ -509,6 +510,92 @@ async def test_lifecycle_eval_project_rules_replace_org_rules(
                 )
             )
             assert row_result.scalar_one() is not None
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_ignores_ref_deleted_rule(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """An org with both rules: lifecycle_eval inactivates, never ref-deletes.
+
+    Mirror guard for the cross-firing fix: ``lifecycle_eval`` owns
+    ``DraftInactivityRule`` and ``BuildHistoryOrphanRule`` but never
+    ``RefDeletedRule`` (the ``git_ref_audit`` cron owns that). It filters
+    the resolved rule set down to its own kinds before evaluation, so a
+    co-configured ``RefDeletedRule`` performs no ref-deletion here.
+
+    Seeds one project with two drafts: a stale draft (updated 60 days
+    ago) that ``DraftInactivityRule`` soft-deletes, and a recently-
+    updated draft tracking a git ref that survives — lifecycle_eval does
+    no ref-deletion (``RefDeletedRule`` is filtered out and ``live_refs``
+    is ``None`` anyway). Guards against a future regression where
+    lifecycle_eval starts honoring ``RefDeletedRule``.
+    """
+    org_rules = LifecycleRuleSet(
+        root=[DraftInactivityRule(max_days_inactive=30), RefDeletedRule()]
+    )
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, slug="lce-ref-deleted-org", lifecycle_rules=org_rules
+        )
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="ref-deleted-proj"
+        )
+        stale_draft_id = await _seed_edition(
+            db_session,
+            project_id=project_id,
+            slug="stale-draft",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=60),
+        )
+        recent_draft_id = await _seed_edition(
+            db_session,
+            project_id=project_id,
+            slug="recent-ref-draft",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=5),
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            # Stale draft is soft-deleted by DraftInactivityRule.
+            stale = await edition_store.get_by_slug(
+                project_id=project_id, slug="stale-draft"
+            )
+            assert stale is None
+            row_result = await session.execute(
+                select(SqlEdition.date_deleted).where(
+                    SqlEdition.id == stale_draft_id
+                )
+            )
+            assert row_result.scalar_one() is not None
+
+            # Recent ref-tracking draft survives: no ref-deletion here.
+            recent = await edition_store.get_by_slug(
+                project_id=project_id, slug="recent-ref-draft"
+            )
+            assert recent is not None
+            assert recent.id == recent_draft_id
+            assert recent.date_deleted is None
 
 
 @pytest.mark.asyncio
