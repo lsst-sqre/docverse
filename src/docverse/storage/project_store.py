@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -666,7 +665,7 @@ class ProjectStore:
                 SqlKeeperSyncState.docverse_id == row.id,
             )
             .values(
-                date_tombstoned=datetime.now(tz=UTC),
+                date_tombstoned=func.now(),
                 tombstone_reason=reason.value,
                 tombstone_note=None,
             )
