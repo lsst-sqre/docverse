@@ -14,6 +14,11 @@ from docverse.client.models import (
     ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import ProjectSlugCursor
 from docverse.storage.project_store import ProjectStore
@@ -404,12 +409,98 @@ async def test_soft_delete(
                 source_url="https://example.com/example/repo",
             ),
         )
-        deleted = await store.soft_delete(org_id=org_id, slug="del-proj")
+        deleted = await store.soft_delete(
+            org_id=org_id,
+            slug="del-proj",
+            reason=TombstoneReason.manual_delete,
+        )
         assert deleted is True
         # Should not be found after soft delete
         found = await store.get_by_slug(org_id=org_id, slug="del-proj")
         await db_session.commit()
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_project_stamps_tombstone_when_state_row_exists(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A project state row is stamped in the same flush as ``date_deleted``."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="proj-tomb-org")
+        project = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="del-tomb-proj",
+                title="Tomb Me",
+                source_url="https://example.com/example/repo",
+            ),
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="del-tomb-proj",
+            docverse_id=project.id,
+        )
+        deleted = await store.soft_delete(
+            org_id=org_id,
+            slug="del-tomb-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+        assert deleted is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="del-tomb-proj",
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.date_tombstoned is not None
+    assert state.tombstone_reason == "manual_delete"
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_project_no_state_row_is_tombstone_noop(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The soft-delete succeeds without creating a tombstone row."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="proj-no-state-org")
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="del-no-state-proj",
+                title="No State",
+                source_url="https://example.com/example/repo",
+            ),
+        )
+        deleted = await store.soft_delete(
+            org_id=org_id,
+            slug="del-no-state-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+        assert deleted is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="del-no-state-proj",
+            include_tombstoned=True,
+        )
+    assert state is None
 
 
 # ── list_by_github_repo ───────────────────────────────────────────────────
@@ -620,7 +711,11 @@ async def test_list_by_github_repo_excludes_soft_deleted(
             github_owner="acme",
             github_repo="templates",
         )
-        await store.soft_delete(org_id=org_id, slug="docs")
+        await store.soft_delete(
+            org_id=org_id,
+            slug="docs",
+            reason=TombstoneReason.manual_delete,
+        )
         result = await store.list_by_github_repo(
             repo_id=None, owner="acme", repo="templates"
         )
@@ -761,7 +856,11 @@ async def test_list_org_ids_with_github_bound_projects_excludes_deleted(
             github_owner="acme",
             github_repo="deletable",
         )
-        await store.soft_delete(org_id=org_id, slug="deletable")
+        await store.soft_delete(
+            org_id=org_id,
+            slug="deletable",
+            reason=TombstoneReason.manual_delete,
+        )
         result = await store.list_org_ids_with_github_bound_projects()
         await db_session.commit()
     assert org_id not in result
@@ -843,7 +942,11 @@ async def test_list_github_bound_by_org_excludes_deleted(
             github_owner="acme",
             github_repo="deleted",
         )
-        await store.soft_delete(org_id=org_id, slug="deleted")
+        await store.soft_delete(
+            org_id=org_id,
+            slug="deleted",
+            reason=TombstoneReason.manual_delete,
+        )
         result = await store.list_github_bound_by_org(org_id)
         await db_session.commit()
     assert [p.slug for p in result] == [kept.slug]

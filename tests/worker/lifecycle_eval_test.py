@@ -49,6 +49,7 @@ from docverse.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
@@ -1028,3 +1029,70 @@ async def test_lifecycle_eval_unpublishes_each_soft_deleted_edition(
     assert recorded_slugs == ["stale-a", "stale-b"]
     for call in mock_publisher.unpublish_calls:
         assert call.project_slug == "unpub-proj"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_writes_lifecycle_delete_tombstone(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The worker's soft-delete stamps a ``lifecycle_delete`` tombstone."""
+    org_rules = LifecycleRuleSet(
+        root=[DraftInactivityRule(max_days_inactive=30)]
+    )
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, slug="lce-tomb-org", lifecycle_rules=org_rules
+        )
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="lce-tomb-proj"
+        )
+        stale_id = await _seed_edition(
+            db_session,
+            project_id=project_id,
+            slug="stale-tomb",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=60),
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=9090,
+            ltd_slug="stale-tomb",
+            docverse_id=stale_id,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=9090,
+                include_tombstoned=True,
+            )
+            assert state is not None
+            assert state.date_tombstoned is not None
+            assert state.tombstone_reason == "lifecycle_delete"

@@ -17,14 +17,22 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
+from docverse.services.edition import EditionService
 from docverse.services.ref_deleted_processor import (
     AffectedProject,
     RefDeletedResult,
     RefDeletedWebhookProcessor,
 )
+from docverse.storage.build_store import BuildStore
+from docverse.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from docverse.storage.queue_backend import NullQueueBackend
+from docverse.storage.queue_job_store import QueueJobStore
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -65,6 +73,20 @@ class _StubPublishingService:
             raise self.raise_on_unpublish
 
 
+def _make_edition_service(session: AsyncSession) -> EditionService:
+    log = _logger()
+    return EditionService(
+        store=EditionStore(session=session, logger=log),
+        org_store=OrganizationStore(session=session, logger=log),
+        project_store=ProjectStore(session=session, logger=log),
+        logger=log,
+        history_store=EditionBuildHistoryStore(session=session, logger=log),
+        build_store=BuildStore(session=session, logger=log),
+        queue_backend=NullQueueBackend(),
+        queue_job_store=QueueJobStore(session=session, logger=log),
+    )
+
+
 def _make_processor(
     session: AsyncSession,
     *,
@@ -73,6 +95,7 @@ def _make_processor(
     return RefDeletedWebhookProcessor(
         project_store=ProjectStore(session=session, logger=_logger()),
         edition_store=EditionStore(session=session, logger=_logger()),
+        edition_service=_make_edition_service(session),
         org_store=OrganizationStore(session=session, logger=_logger()),
         publishing_service=publishing_service or _StubPublishingService(),  # type: ignore[arg-type]
         logger=_logger(),
@@ -706,3 +729,51 @@ async def test_process_unpublish_failure_propagates(
         assert not await _is_deleted(
             db_session, project_id=project_id, slug="dm-1"
         )
+
+
+@pytest.mark.asyncio
+async def test_process_writes_lifecycle_delete_tombstone(
+    db_session: AsyncSession,
+) -> None:
+    """A webhook-driven soft-delete stamps a ``lifecycle_delete`` tombstone."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ref-del-tomb")
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="docs", repo_id=12345
+        )
+        edition_id = await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="dm-tomb",
+            git_ref="tickets/DM-1",
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=5050,
+            ltd_slug="dm-tomb",
+            docverse_id=edition_id,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        result = await _make_processor(db_session).process(_delete_payload())
+        await db_session.commit()
+
+    assert result.deleted_edition_ids == [edition_id]
+    async with db_session.begin():
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=5050,
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.date_tombstoned is not None
+    assert state.tombstone_reason == "lifecycle_delete"

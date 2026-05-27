@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -15,8 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
 from docverse.client.models import ProjectCreate, ProjectUpdate
+from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.dbschema.project import SqlProject
 from docverse.domain.project import Project
+from docverse.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse.storage.pagination import ProjectSearchCursor
 
 _TRGM_SIMILARITY_THRESHOLD = 0.1
@@ -625,8 +628,19 @@ class ProjectStore:
         await self._session.flush()
         return result.first() is not None
 
-    async def soft_delete(self, *, org_id: int, slug: str) -> bool:
-        """Soft-delete a project by setting date_deleted.
+    async def soft_delete(
+        self, *, org_id: int, slug: str, reason: TombstoneReason
+    ) -> bool:
+        """Soft-delete a project and stamp the keeper-sync tombstone.
+
+        The physical chokepoint for centralized project soft-delete
+        (PRD #332): in the same flush that stamps ``date_deleted``,
+        this records the tombstone fields on the matching
+        ``keeper_sync_state`` row (located by
+        ``(org_id, resource_type='project', docverse_id=<project.id>)``).
+        The tombstone write is a no-op when no state row exists for
+        this project (e.g. a manually-created project never imported
+        from LTD).
 
         Returns
         -------
@@ -644,5 +658,18 @@ class ProjectStore:
         if row is None:
             return False
         row.date_deleted = func.now()
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.project.value,
+                SqlKeeperSyncState.docverse_id == row.id,
+            )
+            .values(
+                date_tombstoned=datetime.now(tz=UTC),
+                tombstone_reason=reason.value,
+                tombstone_note=None,
+            )
+        )
         await self._session.flush()
         return True

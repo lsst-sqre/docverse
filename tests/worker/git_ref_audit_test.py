@@ -43,6 +43,7 @@ from docverse.domain.queue import JobStatus
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
 from docverse.storage.github import GITHUB_API_BASE_URL
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
@@ -845,3 +846,81 @@ async def test_git_ref_audit_does_not_fire_draft_inactivity(
                 )
             )
             assert row.scalar_one() is not None
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_writes_lifecycle_delete_tombstone(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Soft-delete via the worker stamps a ``lifecycle_delete`` tombstone."""
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tomb")
+        installation_id = mock_github.seed_installation(
+            "acme", "tomb", installation_id=77, owner_id=333
+        )
+        proj = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tomb-project",
+            owner="acme",
+            repo="tomb",
+            installation_id=installation_id,
+        )
+        deleted_id = await _seed_draft_edition(
+            db_session,
+            project_id=proj,
+            slug="dead-ref",
+            git_ref="tickets/DM-dead",
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=4242,
+            ltd_slug="dead-ref",
+            docverse_id=deleted_id,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="tomb",
+        branches=["main"],
+        tags=[],
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await git_ref_audit(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "git_ref_audit_run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=4242,
+                include_tombstoned=True,
+            )
+            assert state is not None
+            assert state.date_tombstoned is not None
+            assert state.tombstone_reason == "lifecycle_delete"

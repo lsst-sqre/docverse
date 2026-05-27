@@ -1619,7 +1619,10 @@ async def test_sync_edition_does_not_crash_on_soft_deleted_tombstoned_row(
         )
         assert project is not None
         soft_deleted = await edition_store.soft_delete(
-            project_id=project.id, slug="__main"
+            org_id=org_id,
+            project_id=project.id,
+            slug="__main",
+            reason=TombstoneReason.manual_delete,
         )
         assert soft_deleted is True
         await tombstone_service.record(

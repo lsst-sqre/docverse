@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -10,7 +11,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -24,6 +25,7 @@ from docverse.client.models import (
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
+from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.domain.edition import Edition
 from docverse.domain.version import (
     EupsDailyVersion,
@@ -32,6 +34,7 @@ from docverse.domain.version import (
     LsstDocVersion,
     SemverVersion,
 )
+from docverse.storage.keeper_sync import ResourceType, TombstoneReason
 
 
 class EditionStore:
@@ -428,10 +431,24 @@ class EditionStore:
         row.alternate_name = alternate_name
         await self._session.flush()
 
-    async def soft_delete(self, *, project_id: int, slug: str) -> bool:
-        """Soft-delete an edition by setting date_deleted.
+    async def soft_delete(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        slug: str,
+        reason: TombstoneReason,
+    ) -> bool:
+        """Soft-delete an edition and stamp the keeper-sync tombstone.
 
         Slug matching is case-insensitive (see :meth:`get_by_slug`).
+        The physical chokepoint for centralized soft-delete (PRD #332):
+        in the same flush that stamps ``date_deleted``, this records
+        the tombstone fields on the matching ``keeper_sync_state`` row
+        (located by ``(org_id, resource_type='edition', docverse_id=
+        <edition.id>)``). The tombstone write is a no-op when no state
+        row exists for this edition (e.g. a manually-created edition
+        never imported from LTD).
 
         Returns
         -------
@@ -449,6 +466,19 @@ class EditionStore:
         if row is None:
             return False
         row.date_deleted = func.now()
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id == row.id,
+            )
+            .values(
+                date_tombstoned=datetime.now(tz=UTC),
+                tombstone_reason=reason.value,
+                tombstone_note=None,
+            )
+        )
         await self._session.flush()
         return True
 

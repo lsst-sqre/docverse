@@ -22,7 +22,7 @@ from docverse.domain.published_url import (
     edition_published_url,
     project_published_url,
 )
-from docverse.exceptions import PermissionDeniedError
+from docverse.exceptions import NotFoundError, PermissionDeniedError
 from docverse.handlers.params import (
     EditionSlugParam,
     OrgSlugParam,
@@ -31,6 +31,7 @@ from docverse.handlers.params import (
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse.storage.keeper_sync import TombstoneReason
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     EDITION_CURSOR_TYPES,
@@ -341,12 +342,36 @@ async def delete_edition(
         msg = "The default edition '__main' cannot be deleted"
         raise PermissionDeniedError(msg)
     async with context.session.begin():
-        service = context.factory.create_edition_service()
-        org = await service.soft_delete(
-            org_slug=org_slug,
-            project_slug=project_slug,
-            slug=edition_slug,
+        org_store = context.factory.create_org_store()
+        project_store = context.factory.create_project_store()
+        edition_store = context.factory.create_edition_store()
+        org = await org_store.get_by_slug(org_slug)
+        if org is None:
+            msg = f"Organization {org_slug!r} not found"
+            raise NotFoundError(msg)
+        project = await project_store.get_by_slug(
+            org_id=org.id, slug=project_slug
         )
+        if project is None:
+            msg = f"Project {project_slug!r} not found"
+            raise NotFoundError(msg)
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug=edition_slug
+        )
+        if edition is None:
+            msg = f"Edition {edition_slug!r} not found"
+            raise NotFoundError(msg)
+        service = context.factory.create_edition_service()
+        deleted = await service.soft_delete(
+            org_id=org.id,
+            project_id=project.id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            reason=TombstoneReason.manual_delete,
+        )
+        if not deleted:
+            msg = f"Edition {edition_slug!r} not found"
+            raise NotFoundError(msg)
         await context.session.commit()
     # Remove the CDN pointer after the soft-delete commit so the public
     # URL stops resolving once the row is gone. ``unpublish`` is

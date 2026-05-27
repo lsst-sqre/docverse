@@ -46,6 +46,7 @@ from docverse.factory import Factory
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse.services.edition import EditionService
 from docverse.services.edition_publishing import EditionPublishingService
 from docverse.services.lifecycle.evaluator import (
     LifecycleDecision,
@@ -58,7 +59,7 @@ from docverse.services.lifecycle_finalisation import (
     maybe_finalise_lifecycle_run,
 )
 from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import TombstoneReason
 
 __all__ = ["lifecycle_eval"]
 
@@ -209,12 +210,12 @@ async def _evaluate_org(
     projects_with_edition_deletes: list[str] = []
 
     async with session.begin():
-        edition_store = factory.create_edition_store()
+        edition_service = factory.create_edition_service()
         build_store = factory.create_build_store()
         publishing_service = factory.create_edition_publishing_service()
         for project, rule_set, decision in decisions:
             editions_deleted = await _apply_decision(
-                edition_store=edition_store,
+                edition_service=edition_service,
                 build_store=build_store,
                 publishing_service=publishing_service,
                 project=project,
@@ -331,7 +332,7 @@ def _index_builds_by_id(
 
 async def _apply_decision(  # noqa: PLR0913
     *,
-    edition_store: EditionStore,
+    edition_service: EditionService,
     build_store: BuildStore,
     publishing_service: EditionPublishingService,
     project: Project,
@@ -372,8 +373,12 @@ async def _apply_decision(  # noqa: PLR0913
             continue
         rule_type = decision.edition_matches[edition_id]
         rule = rules_by_type.get(rule_type)
-        deleted = await edition_store.soft_delete(
-            project_id=project.id, slug=edition.slug
+        deleted = await edition_service.soft_delete(
+            org_id=org_id,
+            project_id=project.id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            reason=TombstoneReason.lifecycle_delete,
         )
         if not deleted:
             continue

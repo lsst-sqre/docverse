@@ -18,6 +18,8 @@ from docverse.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
 
@@ -308,6 +310,65 @@ async def test_delete_project(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_project_writes_manual_delete_tombstone(
+    client: AsyncClient,
+) -> None:
+    """DELETE handler stamps a ``manual_delete`` tombstone on the row."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "tomb-proj",
+            "title": "Tomb Project",
+            "source_url": "https://example.com/example/tomb",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    logger = structlog.get_logger("test")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            project_store = ProjectStore(session=session, logger=logger)
+            org = await org_store.get_by_slug("proj-org")
+            assert org is not None
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug="tomb-proj"
+            )
+            assert project is not None
+            state_store = KeeperSyncStateStore(session=session, logger=logger)
+            await state_store.upsert(
+                org_id=org.id,
+                resource_type=ResourceType.project,
+                ltd_slug="tomb-proj",
+                docverse_id=project.id,
+            )
+            await session.commit()
+
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/tomb-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug("proj-org")
+            assert org is not None
+            state_store = KeeperSyncStateStore(session=session, logger=logger)
+            state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.project,
+                ltd_slug="tomb-proj",
+                include_tombstoned=True,
+            )
+    assert state is not None
+    assert state.date_tombstoned is not None
+    assert state.tombstone_reason == "manual_delete"
 
 
 async def _enable_cdn(org_slug: str) -> None:

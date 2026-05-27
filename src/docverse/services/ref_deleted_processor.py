@@ -10,8 +10,10 @@ import structlog
 
 from docverse.client.models.dashboard_template import normalize_github_ref
 from docverse.domain.project import Project
+from docverse.services.edition import EditionService
 from docverse.services.edition_publishing import EditionPublishingService
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import TombstoneReason
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 
@@ -85,17 +87,19 @@ class RefDeletedWebhookProcessor:
     opens its own ``session.begin()``.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         project_store: ProjectStore,
         edition_store: EditionStore,
+        edition_service: EditionService,
         org_store: OrganizationStore,
         publishing_service: EditionPublishingService,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._project_store = project_store
         self._edition_store = edition_store
+        self._edition_service = edition_service
         self._org_store = org_store
         self._publishing_service = publishing_service
         self._logger = logger
@@ -241,8 +245,12 @@ class RefDeletedWebhookProcessor:
         )
         deleted: list[int] = []
         for edition in editions:
-            was_deleted = await self._edition_store.soft_delete(
-                project_id=project.id, slug=edition.slug
+            was_deleted = await self._edition_service.soft_delete(
+                org_id=project.org_id,
+                project_id=project.id,
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                reason=TombstoneReason.lifecycle_delete,
             )
             if not was_deleted:
                 continue

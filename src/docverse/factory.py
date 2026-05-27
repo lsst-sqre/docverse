@@ -662,6 +662,7 @@ class Factory:
         ref_deleted = RefDeletedWebhookProcessor(
             project_store=self.create_project_store(),
             edition_store=self.create_edition_store(),
+            edition_service=self.create_edition_service(),
             org_store=self.create_org_store(),
             publishing_service=self.create_edition_publishing_service(),
             logger=self._logger,
