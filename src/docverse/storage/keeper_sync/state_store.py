@@ -31,6 +31,7 @@ __all__ = [
     "KeeperSyncState",
     "KeeperSyncStateStore",
     "ResourceType",
+    "TombstoneReason",
 ]
 
 
@@ -40,6 +41,27 @@ class ResourceType(StrEnum):
     project = "project"
     edition = "edition"
     build = "build"
+
+
+class TombstoneReason(StrEnum):
+    """Why a ``keeper_sync_state`` row was tombstoned.
+
+    Mirrors the SQL ``CheckConstraint`` on ``tombstone_reason``. The
+    values are stable wire identifiers — admin API responses and
+    operator-facing logs use them as-is.
+    """
+
+    manual_delete = "manual_delete"
+    """Operator-driven soft-delete of the Docverse-side resource."""
+
+    lifecycle_delete = "lifecycle_delete"
+    """Automated soft-delete by ``lifecycle_eval`` / ``git_ref_audit`` /
+    the ``ref_deleted`` webhook."""
+
+    lifecycle_preemptive = "lifecycle_preemptive"
+    """Sync itself short-circuited an LTD edition that the lifecycle
+    rules would immediately delete, before the build content was
+    copied. No matching Docverse row exists in this case."""
 
 
 class KeeperSyncState(BaseModel):
@@ -80,6 +102,9 @@ class KeeperSyncState(BaseModel):
     last_seen_etag: str | None = None
     content_hash: str | None = None
     annotations: dict[str, Any] | None = None
+    date_tombstoned: datetime | None = None
+    tombstone_reason: str | None = None
+    tombstone_note: str | None = None
 
 
 def _key_clauses(
@@ -138,11 +163,16 @@ class KeeperSyncStateStore:
         resource_type: ResourceType,
         ltd_id: int | None = None,
         ltd_slug: str | None = None,
+        include_tombstoned: bool = False,
     ) -> KeeperSyncState | None:
         """Fetch a row by its per-resource idempotency key.
 
         Pass ``ltd_slug`` for projects and ``ltd_id`` for editions /
-        builds; see :func:`_key_clauses`.
+        builds; see :func:`_key_clauses`. Tombstoned rows are filtered
+        out by default so existing convergence / short-circuit callers
+        treat a tombstoned LTD resource as "not present"; pass
+        ``include_tombstoned=True`` for the tombstone-service write
+        path and admin endpoints that need to see them.
         """
         clauses = _key_clauses(
             org_id=org_id,
@@ -150,6 +180,8 @@ class KeeperSyncStateStore:
             ltd_id=ltd_id,
             ltd_slug=ltd_slug,
         )
+        if not include_tombstoned:
+            clauses.append(SqlKeeperSyncState.date_tombstoned.is_(None))
         stmt = select(SqlKeeperSyncState).where(*clauses)
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
@@ -192,6 +224,7 @@ class KeeperSyncStateStore:
         resource_type: ResourceType,
         ltd_ids: Iterable[int] | None = None,
         docverse_ids: Iterable[int] | None = None,
+        include_tombstoned: bool = False,
     ) -> list[KeeperSyncState]:
         """Return every state row for ``(org_id, resource_type)``.
 
@@ -207,6 +240,12 @@ class KeeperSyncStateStore:
         column, so the Docverse edition ids are the natural project
         scope). Passing an empty ``ltd_ids`` or ``docverse_ids``
         returns ``[]`` without hitting the database.
+
+        Tombstoned rows are filtered out by default so the
+        convergence and short-circuit callers see a tombstoned LTD
+        resource as "not present"; admin endpoints and the
+        tombstone-service write path opt in with
+        ``include_tombstoned=True``.
         """
         if ltd_ids is not None:
             ltd_id_list = list(ltd_ids)
@@ -230,6 +269,8 @@ class KeeperSyncStateStore:
             clauses.append(
                 SqlKeeperSyncState.docverse_id.in_(docverse_id_list)
             )
+        if not include_tombstoned:
+            clauses.append(SqlKeeperSyncState.date_tombstoned.is_(None))
         stmt = select(SqlKeeperSyncState).where(*clauses)
         result = await self._session.execute(stmt)
         return [
@@ -243,6 +284,7 @@ class KeeperSyncStateStore:
         org_id: int,
         cursor: KeeperSyncProjectStateIdCursor | None,
         limit: int,
+        include_tombstoned: bool = False,
     ) -> CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]:
         """Return a paginated page of project-resource rows for an org.
 
@@ -250,15 +292,23 @@ class KeeperSyncStateStore:
         Ordered by ``id DESC`` via
         :class:`docverse.storage.pagination.KeeperSyncProjectStateIdCursor`
         so newest-discovered projects appear first.
+
+        Tombstoned rows are filtered out by default so the operator
+        projects listing does not show LTD products that have been
+        deleted on the Docverse side; pass ``include_tombstoned=True``
+        from the admin tombstones endpoint.
         """
         from docverse.storage.pagination import (  # noqa: PLC0415
             KeeperSyncProjectStateIdCursor,
         )
 
-        stmt = select(SqlKeeperSyncState).where(
+        clauses: list[ColumnElement[bool]] = [
             SqlKeeperSyncState.org_id == org_id,
             SqlKeeperSyncState.resource_type == ResourceType.project.value,
-        )
+        ]
+        if not include_tombstoned:
+            clauses.append(SqlKeeperSyncState.date_tombstoned.is_(None))
+        stmt = select(SqlKeeperSyncState).where(*clauses)
         runner = CountedPaginatedQueryRunner(
             entry_type=KeeperSyncState,
             cursor_type=KeeperSyncProjectStateIdCursor,

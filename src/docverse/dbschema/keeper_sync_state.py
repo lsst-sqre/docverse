@@ -72,6 +72,18 @@ class SqlKeeperSyncState(Base):
         JSONB, nullable=True
     )
 
+    date_tombstoned: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    tombstone_reason: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
+    tombstone_note: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )
+
     __table_args__ = (
         Index(
             "uq_keeper_sync_state_project_org_slug",
@@ -91,6 +103,11 @@ class SqlKeeperSyncState(Base):
         CheckConstraint(
             "resource_type IN ('project', 'edition', 'build')",
             name="ck_keeper_sync_state_resource_type",
+        ),
+        CheckConstraint(
+            "tombstone_reason IS NULL OR tombstone_reason IN "
+            "('manual_delete', 'lifecycle_delete', 'lifecycle_preemptive')",
+            name="ck_keeper_sync_state_tombstone_reason",
         ),
         Index("idx_keeper_sync_state_org_id", "org_id"),
     )

@@ -6,9 +6,11 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import OrganizationCreate
+from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
 
@@ -456,3 +458,133 @@ async def test_get_by_docverse_id_isolates_by_org_and_resource_type(
     assert row is not None
     assert row.org_id == org_a
     assert row.resource_type == ResourceType.edition.value
+
+
+async def _set_tombstone(
+    session: AsyncSession,
+    *,
+    row_id: int,
+    reason: str = "manual_delete",
+    note: str | None = None,
+) -> None:
+    """Stamp tombstone fields directly on a state row via the ORM."""
+    stmt = select(SqlKeeperSyncState).where(SqlKeeperSyncState.id == row_id)
+    row = (await session.execute(stmt)).scalar_one()
+    row.date_tombstoned = datetime(2026, 5, 27, tzinfo=UTC)
+    row.tombstone_reason = reason
+    row.tombstone_note = note
+
+
+@pytest.mark.asyncio
+async def test_get_hides_tombstoned_row_by_default(
+    db_session: AsyncSession,
+) -> None:
+    """A tombstoned row is invisible to the default ``get`` read."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-get")
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        state = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+        )
+        await _set_tombstone(db_session, row_id=state.id)
+
+    async with db_session.begin():
+        hidden = await store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+        )
+        visible = await store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            include_tombstoned=True,
+        )
+    assert hidden is None
+    assert visible is not None
+    assert visible.date_tombstoned is not None
+    assert visible.tombstone_reason == "manual_delete"
+
+
+@pytest.mark.asyncio
+async def test_list_for_org_hides_tombstoned_rows_by_default(
+    db_session: AsyncSession,
+) -> None:
+    """``list_for_org`` filters tombstoned rows out unless asked."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-list")
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+        )
+        tombstoned = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+        )
+        await _set_tombstone(
+            db_session, row_id=tombstoned.id, reason="lifecycle_delete"
+        )
+
+    async with db_session.begin():
+        default_rows = await store.list_for_org(
+            org_id=org_id, resource_type=ResourceType.edition
+        )
+        all_rows = await store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            include_tombstoned=True,
+        )
+    assert sorted(r.ltd_id for r in default_rows if r.ltd_id is not None) == [
+        1
+    ]
+    assert sorted(r.ltd_id for r in all_rows if r.ltd_id is not None) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_list_project_resources_hides_tombstoned_by_default(
+    db_session: AsyncSession,
+) -> None:
+    """``list_project_resources_for_org`` skips tombstoned rows by default."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-projects")
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+        )
+        deleted = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="dmtn-123",
+        )
+        await _set_tombstone(
+            db_session, row_id=deleted.id, reason="manual_delete"
+        )
+
+    async with db_session.begin():
+        default_page = await store.list_project_resources_for_org(
+            org_id=org_id, cursor=None, limit=50
+        )
+        all_page = await store.list_project_resources_for_org(
+            org_id=org_id, cursor=None, limit=50, include_tombstoned=True
+        )
+    assert sorted(r.ltd_slug for r in default_page.entries) == ["pipelines"]
+    assert sorted(r.ltd_slug for r in all_page.entries) == [
+        "dmtn-123",
+        "pipelines",
+    ]

@@ -46,6 +46,7 @@ from .services.keeper_sync import (
 from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.keeper_sync_project import KeeperSyncProjectService
 from .services.keeper_sync_run import KeeperSyncRunService
+from .services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
@@ -844,6 +845,16 @@ class Factory:
     def create_keeper_sync_state_store(self) -> KeeperSyncStateStore:
         """Create a :class:`KeeperSyncStateStore`."""
         return KeeperSyncStateStore(session=self._session, logger=self._logger)
+
+    def create_keeper_sync_tombstone_service(
+        self,
+    ) -> KeeperSyncTombstoneService:
+        """Create a :class:`KeeperSyncTombstoneService`."""
+        return KeeperSyncTombstoneService(
+            session=self._session,
+            state_store=self.create_keeper_sync_state_store(),
+            logger=self._logger,
+        )
 
     def create_keeper_sync_service(
         self,
