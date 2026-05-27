@@ -893,6 +893,23 @@ class Factory:
             build_store=self.create_build_store(),
             state_store=self.create_keeper_sync_state_store(),
         )
+        # The proactive lifecycle evaluator needs all three GitHub-aware
+        # deps. Missing GitHub-App secrets or an unconfigured HTTP client
+        # disables the proactive pass — sync_project then falls through
+        # to the existing per-edition path; the regular lifecycle_eval
+        # / git_ref_audit crons still catch any deletable editions on
+        # their own schedule.
+        tombstone_service = self.create_keeper_sync_tombstone_service()
+        binding_resolver: ProjectGitHubBindingResolver | None
+        ref_set_fetcher: GitHubRefSetFetcher | None
+        try:
+            binding_resolver = self.create_project_github_binding_resolver()
+        except (GitHubAppNotConfiguredError, RuntimeError):
+            binding_resolver = None
+        try:
+            ref_set_fetcher = self.create_github_ref_set_fetcher()
+        except RuntimeError:
+            ref_set_fetcher = None
         return KeeperSyncService(
             session=self._session,
             context=context,
@@ -900,6 +917,9 @@ class Factory:
             copy_callable=copy_callable,
             manifest_callable=manifest_callable,
             logger=self._logger,
+            tombstone_service=tombstone_service,
+            binding_resolver=binding_resolver,
+            ref_set_fetcher=ref_set_fetcher,
         )
 
 

@@ -39,13 +39,33 @@ from docverse.client.models.projects import parse_github_url
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
+from docverse.domain.lifecycle import DraftInactivityRule, RefDeletedRule
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
 from docverse.exceptions import NotFoundError
+from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
+from docverse.services.lifecycle.evaluator import (
+    LifecycleEvaluationContext,
+    evaluate_lifecycle,
+    filter_rule_set,
+    resolve_rule_set,
+)
 from docverse.services.project import DEFAULT_EDITION_SLUG, ProjectService
+from docverse.services.project_github_binding import (
+    ProjectGitHubBindingResolver,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.github import (
+    GitHubRefSetFetcher,
+    RepositoryNotAccessibleError,
+    RepositoryRefFetchError,
+)
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.ltd import (
     LtdBuild,
     LtdClient,
@@ -193,6 +213,9 @@ class KeeperSyncService:
         manifest_callable: ManifestCallable,
         logger: structlog.stdlib.BoundLogger,
         orphan_reclaim_max_age: timedelta = DEFAULT_ORPHAN_RECLAIM_MAX_AGE,
+        tombstone_service: KeeperSyncTombstoneService | None = None,
+        binding_resolver: ProjectGitHubBindingResolver | None = None,
+        ref_set_fetcher: GitHubRefSetFetcher | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -206,6 +229,9 @@ class KeeperSyncService:
         self._manifest_callable = manifest_callable
         self._logger = logger
         self._orphan_reclaim_max_age = orphan_reclaim_max_age
+        self._tombstone_service = tombstone_service
+        self._binding_resolver = binding_resolver
+        self._ref_set_fetcher = ref_set_fetcher
 
     async def sync_project(
         self,
@@ -261,8 +287,15 @@ class KeeperSyncService:
         ltd_editions = await self._ltd_client.list_editions_for_product(
             ltd_slug
         )
+        skip_ltd_ids = await self._proactive_lifecycle_pass(
+            org=org,
+            project=project,
+            ltd_editions=ltd_editions,
+        )
         outcomes: list[EditionSyncOutcome] = []
         for ltd_edition in ltd_editions:
+            if ltd_edition.ltd_id in skip_ltd_ids:
+                continue
             outcome = await self.sync_edition(
                 org_id=org.id,
                 org_slug=org.slug,
@@ -284,6 +317,182 @@ class KeeperSyncService:
             docverse_project_slug=project.slug,
             edition_outcomes=outcomes,
         )
+
+    async def _proactive_lifecycle_pass(
+        self,
+        *,
+        org: Organization,
+        project: Project,
+        ltd_editions: list[LtdEdition],
+    ) -> set[int]:
+        """Tombstone LTD editions a lifecycle rule would delete on import.
+
+        Runs once per :meth:`sync_project` invocation, between the LTD
+        editions list and the per-edition fan-out. For every LTD edition
+        that has no Docverse row and no existing tombstone, builds a
+        transient domain :class:`Edition` and runs
+        :func:`evaluate_lifecycle` filtered to ``draft_inactivity`` and
+        ``ref_deleted``; ``build_history_orphan`` is excluded because it
+        matches against the Docverse build-history chain that only
+        exists post-import (the post-import ``lifecycle_eval`` pass owns
+        it).
+
+        Returns the set of LTD edition ids the caller must skip — those
+        are tombstoned ``lifecycle_preemptive`` and never reach
+        ``sync_edition``. An empty set means "nothing tombstoned
+        proactively; iterate every LTD edition normally."
+
+        The proactive pass is a no-op when any of ``tombstone_service``,
+        ``binding_resolver``, or ``ref_set_fetcher`` is unconfigured —
+        the production factory wires all three; tests that exercise
+        only the non-proactive paths can omit them.
+
+        The per-project GitHub ref pre-fetch happens here (once,
+        outside any open write transaction) and is shared across every
+        edition. A ``RepositoryNotAccessibleError`` or
+        ``RepositoryRefFetchError`` is caught, logged, and downgrades
+        the pass — ``ref_deleted`` cannot match without ``live_refs``,
+        so those projects fall through to KEEP and the regular
+        ``git_ref_audit`` cron catches up on its own schedule.
+        """
+        if (
+            self._tombstone_service is None
+            or self._binding_resolver is None
+            or self._ref_set_fetcher is None
+        ):
+            return set()
+        if not ltd_editions:
+            return set()
+        rule_set = filter_rule_set(
+            resolve_rule_set(
+                org_rules=org.lifecycle_rules,
+                project_rules=project.lifecycle_rules,
+            ),
+            include=(DraftInactivityRule, RefDeletedRule),
+        )
+        if not rule_set.root:
+            return set()
+
+        # Pre-load state rows for this project's LTD editions in one
+        # round-trip. We need both ``date_tombstoned`` (skip already-
+        # vetoed editions so we do not overwrite the recorded reason)
+        # and ``docverse_id`` (skip already-imported editions — the
+        # regular ``lifecycle_eval`` pass owns those, and the transient
+        # built from LTD metadata could not see ``lifecycle_exempt`` or
+        # other Docverse-side state).
+        ltd_ids = [e.ltd_id for e in ltd_editions]
+        async with self._session.begin():
+            state_rows = await self._state_store.list_for_org(
+                org_id=org.id,
+                resource_type=ResourceType.edition,
+                ltd_ids=ltd_ids,
+                include_tombstoned=True,
+            )
+        state_by_ltd_id = {
+            row.ltd_id: row for row in state_rows if row.ltd_id is not None
+        }
+
+        live_refs = await self._fetch_live_refs(project=project)
+        now = _now()
+        skip_ltd_ids: set[int] = set()
+        for ltd_edition in ltd_editions:
+            state = state_by_ltd_id.get(ltd_edition.ltd_id)
+            if state is not None and (
+                state.date_tombstoned is not None
+                or state.docverse_id is not None
+            ):
+                continue
+            transient = _transient_edition_from_ltd(
+                ltd_edition=ltd_edition, project_id=project.id
+            )
+            if transient is None:
+                continue
+            decision = evaluate_lifecycle(
+                rule_set=rule_set,
+                context=LifecycleEvaluationContext(
+                    editions=[transient],
+                    builds=[],
+                    edition_build_history=[],
+                    now=now,
+                    live_refs=live_refs,
+                ),
+            )
+            matched_rule = decision.edition_matches.get(transient.id)
+            if matched_rule is None:
+                continue
+            async with self._session.begin():
+                await self._tombstone_service.record(
+                    org_id=org.id,
+                    resource_type=ResourceType.edition,
+                    ltd_id=ltd_edition.ltd_id,
+                    ltd_slug=ltd_edition.slug,
+                    reason=TombstoneReason.lifecycle_preemptive,
+                )
+            self._logger.info(
+                "Proactive lifecycle delete: tombstoning LTD edition",
+                ltd_edition_id=ltd_edition.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                rule_type=matched_rule,
+                org_id=org.id,
+                project_id=project.id,
+                project=project.slug,
+            )
+            skip_ltd_ids.add(ltd_edition.ltd_id)
+        return skip_ltd_ids
+
+    async def _fetch_live_refs(
+        self, *, project: Project
+    ) -> frozenset[str] | None:
+        """Resolve binding + fetch the project's live ref set, once.
+
+        Returns ``None`` when the project has no GitHub binding (the
+        ``ref_deleted`` rule simply does not fire) or when the GitHub
+        round-trip fails — both are accepted "rule disabled, KEEP wins"
+        outcomes. ``draft_inactivity`` is unaffected because it does
+        not read ``live_refs``.
+
+        ``ProjectGitHubBindingResolver.resolve`` owns its own short
+        read transaction and mints the GitHub installation token
+        *after* that transaction has closed; the caller must therefore
+        **not** wrap this method in ``session.begin()``. Mirrors
+        :func:`git_ref_audit._fetch_refs_per_project`.
+        """
+        assert self._binding_resolver is not None  # checked by caller
+        assert self._ref_set_fetcher is not None  # checked by caller
+        binding = await self._binding_resolver.resolve(project.id)
+        if binding is None:
+            return None
+        try:
+            ref_set = await self._ref_set_fetcher.fetch(
+                owner=binding.owner,
+                repo=binding.repo,
+                auth=binding.auth,
+                logger=self._logger,
+            )
+        except RepositoryNotAccessibleError as exc:
+            self._logger.info(
+                "Proactive lifecycle: GitHub repository not accessible,"
+                " ref_deleted disabled for this pass",
+                owner=exc.owner,
+                repo=exc.repo,
+                installation_id=binding.installation_id,
+                project_id=project.id,
+                project=project.slug,
+            )
+            return None
+        except RepositoryRefFetchError as exc:
+            self._logger.warning(
+                "Proactive lifecycle: GitHub ref fetch failed,"
+                " ref_deleted disabled for this pass",
+                owner=exc.owner,
+                repo=exc.repo,
+                installation_id=binding.installation_id,
+                project_id=project.id,
+                project=project.slug,
+                error=str(exc),
+            )
+            return None
+        return ref_set.all
 
     async def _ensure_project(
         self, *, org_id: int, ltd_product: LtdProduct
@@ -792,3 +1001,47 @@ def _now() -> datetime:
 
 def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
+
+
+def _transient_edition_from_ltd(
+    *, ltd_edition: LtdEdition, project_id: int
+) -> Edition | None:
+    """Build a transient ``Edition`` from an LTD edition for proactive eval.
+
+    The proactive lifecycle pass evaluates :func:`evaluate_lifecycle`
+    against editions that may not have a Docverse row yet, so we
+    synthesise a domain :class:`Edition` from the LTD edition's
+    metadata. Only ``draft_inactivity`` and ``ref_deleted`` participate
+    in the proactive pass, so the transient only needs the fields
+    those two predicates read: ``kind``, ``tracking_mode``,
+    ``tracking_params``, ``lifecycle_exempt``, ``date_deleted``, and
+    ``date_updated``.
+
+    Returns ``None`` when the LTD edition's mode requires the
+    currently-published build to map (``manual``) — the proactive
+    evaluator deliberately does not fetch builds (defeats the
+    bandwidth-saving point). Those editions fall through to
+    ``sync_edition`` and the regular ``lifecycle_eval`` pass handles
+    them post-import. ``date_updated`` mirrors LTD's ``date_rebuilt``
+    when set (LTD's analogue of Docverse's edition-touch timestamp)
+    and falls back to ``date_created`` otherwise.
+    """
+    try:
+        tracking_mode, tracking_params = map_edition_tracking(
+            ltd_edition, build=None
+        )
+    except ValueError:
+        return None
+    return Edition(
+        id=ltd_edition.ltd_id,
+        slug=derive_edition_slug(ltd_edition.slug),
+        title=ltd_edition.title,
+        project_id=project_id,
+        kind=derive_edition_kind(ltd_edition.slug),
+        tracking_mode=tracking_mode,
+        tracking_params=tracking_params or None,
+        lifecycle_exempt=False,
+        date_created=ltd_edition.date_created,
+        date_updated=ltd_edition.date_rebuilt or ltd_edition.date_created,
+        date_deleted=None,
+    )
