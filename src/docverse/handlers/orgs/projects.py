@@ -244,13 +244,21 @@ async def delete_project(
     # credentials) — without an explicit transaction SQLAlchemy
     # auto-begins an implicit one that we then never commit.
     #
-    # Failure semantics: mirror the ``delete_edition`` handler — if any
-    # ``unpublish`` raises, the soft-delete is already committed and is
-    # not rolled back. The client sees a 5xx, the project row stays
-    # soft-deleted, and any not-yet-unpublished editions keep their
-    # stale CDN pointer until the next webhook delivery or the daily
-    # ``git_ref_audit`` pass cleans them up (``unpublish`` is
-    # idempotent, so re-running is safe).
+    # Failure semantics: if ``unpublish`` raises on edition k of n, the
+    # soft-delete is already committed and is not rolled back. The loop
+    # aborts on that first failing edition, the client sees a 5xx, and
+    # the project row stays soft-deleted. Unlike ``delete_edition``
+    # (which leaves the project row live, so a later lifecycle pass can
+    # revisit it), a soft-deleted project drops out of every recovery
+    # path: both the webhook (``list_by_github_repo``) and the daily
+    # audit (``list_github_bound_by_org``) filter ``date_deleted IS
+    # NULL``, and a re-issued DELETE returns 404 without re-attempting
+    # unpublish (see ``test_delete_project_idempotent_re_run``). So
+    # editions k..n are orphaned with stale CDN pointers until a manual
+    # sweep. A future improvement could make this loop best-effort
+    # (continue past a failing edition) and/or have a cleanup sweep
+    # revisit soft-deleted projects so the orphaned pointers are
+    # reclaimed automatically.
     #
     # Dashboard: a deleted project has no project dashboard to
     # rebuild (``DashboardBuildEnqueuer.enqueue_for_project`` would
