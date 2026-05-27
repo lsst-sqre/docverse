@@ -132,9 +132,14 @@ class EditionSyncOutcome:
     ``on_edition_synced`` publish-enqueue callback) have the project
     context the publish helper needs without re-querying the project
     store from the closure.
+
+    ``docverse_edition_id`` is ``None`` when the call short-circuited
+    on a tombstoned ``keeper_sync_state`` row whose ``docverse_id`` is
+    also ``None`` (the ``lifecycle_preemptive`` case writes such rows
+    for LTD editions that were never imported).
     """
 
-    docverse_edition_id: int
+    docverse_edition_id: int | None
     docverse_slug: str
     docverse_project_id: int
     docverse_project_slug: str
@@ -143,9 +148,17 @@ class EditionSyncOutcome:
 
 @dataclass(frozen=True)
 class ProjectSyncResult:
-    """What ``sync_project`` did with one LTD product."""
+    """What ``sync_project`` did with one LTD product.
 
-    docverse_project_id: int
+    ``docverse_project_id`` is ``None`` only when the call
+    short-circuited on a tombstoned ``keeper_sync_state`` project row
+    whose ``docverse_id`` was never populated — practically a
+    defensive shape; the only production path that writes a project
+    tombstone is the manual-delete chokepoint, which always carries a
+    Docverse project id.
+    """
+
+    docverse_project_id: int | None
     docverse_project_slug: str
     edition_outcomes: list[EditionSyncOutcome]
 
@@ -213,7 +226,33 @@ class KeeperSyncService:
         stop the rest of the project sync; the tail-end self-heal pass
         in the worker picks up any edition the callback failed to act
         on. The default ``None`` preserves all non-worker call sites.
+
+        Short-circuits before the LTD product fetch when the project's
+        ``keeper_sync_state`` row is tombstoned: the operator has
+        deleted the project on the Docverse side and the migration
+        must not re-import it. Returns a result with empty
+        ``edition_outcomes`` so worker post-sync passes (e.g. the
+        self-heal pass) iterate nothing.
         """
+        async with self._session.begin():
+            project_state = await self._state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+                include_tombstoned=True,
+            )
+        if project_state is not None and project_state.date_tombstoned:
+            self._logger.info(
+                "Sync short-circuited: project tombstoned",
+                ltd_slug=ltd_slug,
+                tombstone_reason=project_state.tombstone_reason,
+            )
+            return ProjectSyncResult(
+                docverse_project_id=project_state.docverse_id,
+                docverse_project_slug=ltd_slug,
+                edition_outcomes=[],
+            )
+
         ltd_product = await self._ltd_client.get_product(ltd_slug)
         async with self._session.begin():
             org, project = await self._ensure_project(
@@ -305,7 +344,39 @@ class KeeperSyncService:
         ltd_edition: LtdEdition,
         org_slug: str | None = None,
     ) -> EditionSyncOutcome:
-        """Sync one LTD edition (and its current build) into Docverse."""
+        """Sync one LTD edition (and its current build) into Docverse.
+
+        Short-circuits *before* ``_ensure_edition`` runs when the
+        edition's ``keeper_sync_state`` row is tombstoned. The check
+        sits ahead of ``_ensure_edition`` so a tombstoned-but-still-
+        soft-deleted edition row cannot trip the ``create_internal``
+        slug clash that previously raised "lost ON CONFLICT race"
+        (the canonical Docverse uniqueness index ignores
+        ``date_deleted``, so a soft-deleted row keeps its slug
+        reserved against re-import).
+        """
+        async with self._session.begin():
+            edition_state = await self._state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_edition.ltd_id,
+                include_tombstoned=True,
+            )
+        if edition_state is not None and edition_state.date_tombstoned:
+            self._logger.info(
+                "Sync short-circuited: edition tombstoned",
+                ltd_edition_id=ltd_edition.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                tombstone_reason=edition_state.tombstone_reason,
+            )
+            return EditionSyncOutcome(
+                docverse_edition_id=edition_state.docverse_id,
+                docverse_slug=derive_edition_slug(ltd_edition.slug),
+                docverse_project_id=project.id,
+                docverse_project_slug=project.slug,
+                build_outcome=None,
+            )
+
         # ``manual`` editions need the published build's git_refs to
         # synthesize a Docverse ``git_ref`` tracking pair. Other modes
         # ignore the build for mapping; we skip the extra fetch when we

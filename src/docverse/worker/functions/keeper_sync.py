@@ -511,6 +511,9 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
     their ``publish_status`` is still ``NULL``. Skips when the build
     outcome is missing or carries no Docverse build id (a no-op edition
     or a convergence outcome that did not point at a publishable row).
+    Skips when the edition outcome carries no Docverse edition id —
+    a tombstoned ``keeper_sync_state`` row whose ``docverse_id`` is
+    ``NULL`` short-circuited before the edition was ever imported.
     """
     build_outcome = outcome.build_outcome
     if build_outcome is None:
@@ -521,6 +524,9 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
         build_outcome.docverse_build_id is None
         or build_outcome.docverse_build_public_id is None
     ):
+        return
+    edition_id = outcome.docverse_edition_id
+    if edition_id is None:
         return
 
     edition_store = factory.create_edition_store()
@@ -536,7 +542,7 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
         org_id=org_id,
         project_id=outcome.docverse_project_id,
         project_slug=outcome.docverse_project_slug,
-        edition_id=outcome.docverse_edition_id,
+        edition_id=edition_id,
         edition_slug=outcome.docverse_slug,
         build_id=build_outcome.docverse_build_id,
         build_public_id=build_outcome.docverse_build_public_id,
@@ -586,17 +592,24 @@ async def _self_heal_unpublished_editions(  # noqa: PLR0913
     short-circuited and is already published, or was freshly synced and
     just got published by the per-edition callback).
     """
+    project_id = sync_result.docverse_project_id
+    if project_id is None:
+        # A tombstoned project short-circuit returned no edition
+        # outcomes; nothing to self-heal.
+        return
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
     project_slug = sync_result.docverse_project_slug
-    project_id = sync_result.docverse_project_id
 
     for outcome in sync_result.edition_outcomes:
         build_outcome = outcome.build_outcome
         if build_outcome is None:
             continue
         if not build_outcome.short_circuited:
+            continue
+        edition_id = outcome.docverse_edition_id
+        if edition_id is None:
             continue
 
         target = await _resolve_self_heal_target(
@@ -618,7 +631,7 @@ async def _self_heal_unpublished_editions(  # noqa: PLR0913
             org_id=org_id,
             project_id=project_id,
             project_slug=project_slug,
-            edition_id=outcome.docverse_edition_id,
+            edition_id=edition_id,
             edition_slug=outcome.docverse_slug,
             build_id=build_id,
             build_public_id=build_public_id,

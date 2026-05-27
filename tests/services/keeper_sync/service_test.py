@@ -36,10 +36,15 @@ from docverse.services.keeper_sync.service import (
     KeeperSyncService,
     _now,
 )
+from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from docverse.services.project import ProjectService
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.ltd import LtdClient, LtdSourceProtocol
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
@@ -1384,3 +1389,253 @@ async def test_sync_project_continues_when_callback_raises(
     outcome_slugs = [o.docverse_slug for o in result.edition_outcomes]
     assert "__main" in outcome_slugs
     assert "u-jsick-feature" in outcome_slugs
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_short_circuits_when_tombstoned(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned edition state row short-circuits ``sync_edition``.
+
+    The build copy must not run, the build store must not be touched,
+    and ``date_last_synced`` on the tombstoned state row must remain
+    untouched (proves ``_ensure_edition`` / state ``upsert`` were
+    skipped).
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-edition")
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    # First sync imports the edition + build normally.
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert first.edition_outcomes
+    keys_after_first = set(object_store.objects.keys())
+    assert keys_after_first
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=state_store,
+        logger=structlog.get_logger("test"),
+    )
+
+    # Tombstone the edition state row + snapshot ``date_last_synced``
+    # so the post-sync assertion can prove the upsert was skipped.
+    async with db_session.begin():
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        state_before = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            include_tombstoned=True,
+        )
+    assert state_before is not None
+    assert state_before.date_tombstoned is not None
+    date_last_synced_before = state_before.date_last_synced
+
+    # LTD pretends a fresh build arrived — without the short-circuit
+    # the sync would copy bucket content into Docverse.
+    edition_v2 = _load("edition_main_git_refs.json")
+    edition_v2["date_rebuilt"] = "2026-05-04T12:00:00.000000+00:00"
+    edition_v2["build_url"] = f"{LTD_BASE}/builds/43"
+    build_v2 = _load("build.json")
+    build_v2["self_url"] = f"{LTD_BASE}/builds/43"
+    build_v2["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.reset()
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition_v2)
+    )
+    builds_43_route = mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_v2)
+    )
+
+    source_objects_v2 = {
+        "pipelines/builds/43/index.html": b"<html>v2</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v2
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The edition outcome is present but carries no build_outcome — the
+    # short-circuit fired before ``sync_build`` had a chance to run.
+    assert len(result.edition_outcomes) == 1
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_slug == "__main"
+    assert outcome.build_outcome is None
+
+    # No new bytes landed in the destination object store, and the
+    # build endpoint was never fetched — short-circuit fired before
+    # any sync_build work could begin.
+    assert set(object_store.objects.keys()) == keys_after_first
+    assert builds_43_route.call_count == 0
+
+    # The tombstoned state row is unchanged — no upsert ran inside
+    # the short-circuited sync_edition.
+    async with db_session.begin():
+        state_after = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            include_tombstoned=True,
+        )
+    assert state_after is not None
+    assert state_after.date_tombstoned is not None
+    assert state_after.date_last_synced == date_last_synced_before
+
+
+@pytest.mark.asyncio
+async def test_sync_project_short_circuits_when_tombstoned(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned project state row short-circuits ``sync_project``.
+
+    The LTD product fetch must not run and ``edition_outcomes`` must
+    be empty.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-project")
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    # First sync imports the project + writes the project state row.
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=state_store,
+        logger=structlog.get_logger("test"),
+    )
+    async with db_session.begin():
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            reason=TombstoneReason.manual_delete,
+        )
+
+    # Clear LTD call stats — the short-circuit must issue zero LTD
+    # calls, so any post-tombstone delta would indicate the sync
+    # still walked LTD. ``reset()`` keeps the routes registered so a
+    # missed short-circuit still returns the stubbed responses (no
+    # passthrough surprises) while the call counter remains pinnable.
+    mock_discovery.reset()
+
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert mock_discovery.calls.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_does_not_crash_on_soft_deleted_tombstoned_row(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Regression: tombstone short-circuit defuses the slug-clash crash.
+
+    Without the short-circuit, a soft-deleted Docverse edition row
+    whose LTD source still exists makes ``_ensure_edition`` /
+    ``EditionStore.create_internal`` hit a ``uq_editions_project_lower_slug``
+    conflict against the soft-deleted row, ``ON CONFLICT DO NOTHING``
+    short-circuits the insert, and the follow-up ``get_by_slug``
+    (which filters ``date_deleted IS NULL``) returns ``None`` —
+    raising ``"create_internal lost ON CONFLICT race"``. The tombstone
+    must defuse that crash by short-circuiting ``sync_edition`` before
+    ``_ensure_edition`` runs.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-soft-deleted")
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=state_store,
+        logger=structlog.get_logger("test"),
+    )
+
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        soft_deleted = await edition_store.soft_delete(
+            project_id=project.id, slug="__main"
+        )
+        assert soft_deleted is True
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            reason=TombstoneReason.manual_delete,
+        )
+
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    # Without the short-circuit this raises "lost ON CONFLICT race".
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_outcomes) == 1
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_slug == "__main"
+    assert outcome.build_outcome is None
