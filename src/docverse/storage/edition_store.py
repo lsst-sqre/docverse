@@ -452,6 +452,47 @@ class EditionStore:
         await self._session.flush()
         return True
 
+    async def list_draft_editions_by_git_ref(
+        self, *, project_id: int, git_ref: str
+    ) -> list[Edition]:
+        """List draft editions whose literal ref tracks ``git_ref``.
+
+        Server-side filter for the GitHub ``delete`` webhook fast path
+        in :class:`docverse.services.ref_deleted_processor
+        .RefDeletedWebhookProcessor`. Returns editions where
+        ``kind='draft'``, ``tracking_mode IN ('git_ref',
+        'alternate_git_ref')``, ``lifecycle_exempt=False``,
+        ``date_deleted IS NULL``, and ``tracking_params->>'git_ref'``
+        equals ``git_ref``. The webhook delivers one ref name; this
+        method keeps the JSON-path filter in the database so the
+        processor never loads non-matching rows.
+
+        The filter mirrors :func:`docverse.services.lifecycle.evaluator
+        ._eval_ref_deleted`'s candidate selection so the webhook and
+        the daily audit can never disagree on which editions a deleted
+        ref should sweep.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.kind == EditionKind.draft,
+                SqlEdition.tracking_mode.in_(
+                    [TrackingMode.git_ref, TrackingMode.alternate_git_ref]
+                ),
+                SqlEdition.lifecycle_exempt.is_(False),
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.tracking_params["git_ref"].astext == git_ref,
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
     async def find_matching_editions(
         self,
         *,

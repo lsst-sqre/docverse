@@ -55,6 +55,7 @@ from .keeper_sync import (
 from .lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
+    GitRefAuditRunStatus,
     LifecycleEvalRunStatus,
     LifecycleRule,
     LifecycleRuleSet,
@@ -114,6 +115,7 @@ __all__ = [
     "EditionUpdate",
     "FastlyCredentials",
     "GcpCredentials",
+    "GitRefAuditRunStatus",
     "InstallationStatus",
     "JobKind",
     "JobStatus",

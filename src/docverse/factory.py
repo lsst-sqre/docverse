@@ -49,6 +49,8 @@ from .services.keeper_sync_run import KeeperSyncRunService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
+from .services.project_github_binding import ProjectGitHubBindingResolver
+from .services.ref_deleted_processor import RefDeletedWebhookProcessor
 from .storage.build_store import BuildStore
 from .storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
@@ -60,7 +62,12 @@ from .storage.editionpublisher import (
     EditionPublisher,
     create_edition_publisher,
 )
-from .storage.github import GitHubAppClient, GitHubAppNotConfiguredError
+from .storage.git_ref_audit_run_store import GitRefAuditRunStore
+from .storage.github import (
+    GitHubAppClient,
+    GitHubAppNotConfiguredError,
+    GitHubRefSetFetcher,
+)
 from .storage.keeper_sync import KeeperSyncStateStore
 from .storage.keeper_sync_run_store import KeeperSyncRunStore
 from .storage.lifecycle_eval_run_store import LifecycleEvalRunStore
@@ -84,17 +91,17 @@ from .storage.user_info_store import UserInfoStore
 class WebhookDispatch:
     """Bundle of objects the GitHub webhook handler needs per delivery.
 
-    The HMAC secret verifies ``x-hub-signature-256``; the three
-    processors handle the event types the dashboard-template feature
-    subscribes to. Created fresh per request inside
-    :meth:`Factory.create_webhook_dispatch` so each delivery binds to
-    the request's own DB session and logger.
+    The HMAC secret verifies ``x-hub-signature-256``; one processor per
+    registered event type handles the work. Created fresh per request
+    inside :meth:`Factory.create_webhook_dispatch` so each delivery
+    binds to the request's own DB session and logger.
     """
 
     webhook_secret: str
     push: PushEventProcessor
     rename: RenameEventProcessor
     installation: InstallationEventProcessor
+    ref_deleted: RefDeletedWebhookProcessor
 
 
 class Factory:
@@ -185,6 +192,30 @@ class Factory:
         return LifecycleEvalRunStore(
             session=self._session, logger=self._logger
         )
+
+    def create_git_ref_audit_run_store(self) -> GitRefAuditRunStore:
+        """Create a :class:`GitRefAuditRunStore`."""
+        return GitRefAuditRunStore(session=self._session, logger=self._logger)
+
+    def create_github_ref_set_fetcher(self) -> GitHubRefSetFetcher:
+        """Create a :class:`GitHubRefSetFetcher`.
+
+        Used by the daily ``git_ref_audit`` worker (PRD #346) and by
+        the proactive ``sync_project`` pre-fetch (PRD #332). Both
+        callers paginate ``git/matching-refs/{heads,tags}`` against
+        the shared ``httpx.AsyncClient`` and attach installation
+        auth per request, so the fetcher is built once per worker
+        tick and shared across per-project fan-out.
+
+        Raises
+        ------
+        RuntimeError
+            If no shared ``httpx.AsyncClient`` is configured.
+        """
+        if self._http_client is None:
+            msg = "HTTP client is required to build a GitHubRefSetFetcher"
+            raise RuntimeError(msg)
+        return GitHubRefSetFetcher(http_client=self._http_client)
 
     def create_keeper_sync_run_service(self) -> KeeperSyncRunService:
         """Create a :class:`KeeperSyncRunService`."""
@@ -421,6 +452,34 @@ class Factory:
             self._github_webhook_secret,
         )
 
+    def create_project_github_binding_resolver(
+        self,
+    ) -> ProjectGitHubBindingResolver:
+        """Create a :class:`ProjectGitHubBindingResolver`.
+
+        Used by the future ``git_ref_audit`` worker (PRD #346) and by
+        the proactive ``sync_project`` pre-fetch (PRD #332). Both
+        callers need the same "installation > anonymous > skip" decision
+        before calling :class:`GitHubRefSetFetcher`, so the resolver is
+        the one place that ladder lives.
+
+        Raises
+        ------
+        GitHubAppNotConfiguredError
+            If any of the three GitHub App secrets is unset. The audit
+            cannot mint installation tokens without them; routing this
+            via the same Sentry pipeline as other GitHub failures keeps
+            misconfiguration loud.
+        RuntimeError
+            If no shared ``httpx.AsyncClient`` is configured.
+        """
+        return ProjectGitHubBindingResolver(
+            session=self._session,
+            project_store=self.create_project_store(),
+            app_client=self.create_github_app_client(),
+            logger=self._logger,
+        )
+
     def create_github_app_client(self) -> GitHubAppClient:
         """Create a GitHubAppClient from the configured GitHub App secrets.
 
@@ -599,11 +658,19 @@ class Factory:
             project_store=self.create_project_store(),
             logger=self._logger,
         )
+        ref_deleted = RefDeletedWebhookProcessor(
+            project_store=self.create_project_store(),
+            edition_store=self.create_edition_store(),
+            org_store=self.create_org_store(),
+            publishing_service=self.create_edition_publishing_service(),
+            logger=self._logger,
+        )
         return WebhookDispatch(
             webhook_secret=webhook_secret.get_secret_value(),
             push=push,
             rename=rename,
             installation=installation,
+            ref_deleted=ref_deleted,
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:

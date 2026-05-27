@@ -14,6 +14,12 @@ from .changed_paths import (
     extract_changed_paths_from_push,
     fetch_changed_paths_from_compare,
 )
+from .ref_fetcher import (
+    GitHubRefSetFetcher,
+    RepositoryNotAccessibleError,
+    RepositoryRefFetchError,
+    RepositoryRefSet,
+)
 from .startup import GitHubAppValidationState, validate_github_app
 from .tree_fetcher import FetchedTree, FetchedTreeFile, GitHubTreeFetcher
 from .web_url import build_github_browse_url
@@ -26,9 +32,13 @@ __all__ = [
     "GitHubAppNotConfiguredError",
     "GitHubAppNotInstalledError",
     "GitHubAppValidationState",
+    "GitHubRefSetFetcher",
     "GitHubTreeFetcher",
     "InstallationAuth",
     "RepositoryMetadata",
+    "RepositoryNotAccessibleError",
+    "RepositoryRefFetchError",
+    "RepositoryRefSet",
     "build_github_browse_url",
     "extract_changed_paths_from_push",
     "fetch_changed_paths_from_compare",

@@ -3,6 +3,8 @@
 from .build_processing import build_processing
 from .dashboard_build import dashboard_build
 from .dashboard_sync import dashboard_sync
+from .git_ref_audit import git_ref_audit
+from .git_ref_audit_discovery import git_ref_audit_discovery
 from .keeper_sync import (
     keeper_sync_project,
     keeper_sync_reaper,
@@ -22,6 +24,8 @@ __all__ = [
     "build_processing",
     "dashboard_build",
     "dashboard_sync",
+    "git_ref_audit",
+    "git_ref_audit_discovery",
     "keeper_sync_project",
     "keeper_sync_reaper",
     "keeper_sync_run_discovery",

@@ -35,7 +35,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
-from docverse.domain.lifecycle import LifecycleRule, LifecycleRuleSet
+from docverse.domain.lifecycle import (
+    BuildHistoryOrphanRule,
+    DraftInactivityRule,
+    LifecycleRule,
+    LifecycleRuleSet,
+)
 from docverse.domain.project import Project
 from docverse.factory import Factory
 from docverse.services.dashboard.enqueue import (
@@ -46,6 +51,7 @@ from docverse.services.lifecycle.evaluator import (
     LifecycleDecision,
     LifecycleEvaluationContext,
     evaluate_lifecycle,
+    filter_rule_set,
     resolve_rule_set,
 )
 from docverse.services.lifecycle_finalisation import (
@@ -167,8 +173,17 @@ async def _evaluate_org(
     now = datetime.now(tz=UTC)
     decisions: list[tuple[Project, LifecycleRuleSet, LifecycleDecision]] = []
     for project in projects:
-        rule_set = resolve_rule_set(
-            org_rules=org_rules, project_rules=project.lifecycle_rules
+        # This worker owns DraftInactivityRule and BuildHistoryOrphanRule;
+        # filtering makes that ownership explicit and structural so a
+        # RefDeletedRule (owned by the git_ref_audit cron) can never fire
+        # from this code path. The filtered set feeds both the evaluator
+        # and the ``decisions`` tuple so ``_apply_decision`` builds
+        # ``rules_by_type`` from the same filtered rules.
+        rule_set = filter_rule_set(
+            resolve_rule_set(
+                org_rules=org_rules, project_rules=project.lifecycle_rules
+            ),
+            include=(DraftInactivityRule, BuildHistoryOrphanRule),
         )
         if not rule_set.root:
             continue

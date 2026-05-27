@@ -192,6 +192,24 @@ class Configuration(BaseSettings):
             " knob shape is identical across the two reapers; the"
             " env-overridable default lets non-prod environments drive"
             " the threshold down to seconds for fast verification."
+            " The same threshold covers ``kind='git_ref_audit'`` rows"
+            " — the two subsystems share one reaper job."
+        ),
+    )
+
+    git_ref_audit_enabled: bool = Field(
+        default=False,
+        title="Whether the daily git_ref_audit dispatcher fans out work",
+        description=(
+            "Feature flag for the daily ``git_ref_audit`` safety-net"
+            " (PRD #346). When false, the discovery cron returns"
+            " ``skipped`` immediately without creating a"
+            " ``git_ref_audit_runs`` row or any per-org ``queue_jobs``"
+            " children — the cron itself stays registered so flipping"
+            " the flag does not require a worker restart. Phalanx"
+            " ships the flag false in production until the audit's"
+            " GitHub API budget and per-project cost are observed in"
+            " a live environment."
         ),
     )
 

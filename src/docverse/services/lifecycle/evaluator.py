@@ -15,6 +15,7 @@ from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
+    LifecycleRule,
     LifecycleRuleSet,
     RefDeletedRule,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "LifecycleDecision",
     "LifecycleEvaluationContext",
     "evaluate_lifecycle",
+    "filter_rule_set",
     "resolve_rule_set",
 ]
 
@@ -198,6 +200,27 @@ def resolve_rule_set(
     if org_rules is not None:
         return org_rules
     return LifecycleRuleSet(root=[])
+
+
+def filter_rule_set(
+    rule_set: LifecycleRuleSet,
+    *,
+    include: tuple[type[LifecycleRule], ...],
+) -> LifecycleRuleSet:
+    """Return a copy of rule_set keeping only rules of the included kinds.
+
+    Each lifecycle worker owns a specific subset of rule kinds (the
+    git_ref_audit cron owns RefDeletedRule; lifecycle_eval owns
+    DraftInactivityRule and BuildHistoryOrphanRule). Filtering before
+    evaluate_lifecycle makes that ownership explicit and structural, so
+    a rule kind a worker does not own can never fire from its code path.
+
+    Filtering an already-valid set produces no duplicate ``type``s, so
+    the :class:`LifecycleRuleSet` duplicate-type validator is satisfied.
+    """
+    return LifecycleRuleSet(
+        root=[rule for rule in rule_set.root if isinstance(rule, include)]
+    )
 
 
 def _eval_draft_inactivity(

@@ -29,6 +29,7 @@ from docverse.domain.lifecycle import (
 from docverse.services.lifecycle import (
     LifecycleEvaluationContext,
     evaluate_lifecycle,
+    filter_rule_set,
     resolve_rule_set,
 )
 
@@ -911,3 +912,54 @@ def test_resolve_does_not_merge() -> None:
     resolved = resolve_rule_set(org_rules=org, project_rules=project)
 
     assert [rule.type for rule in resolved.root] == ["build_history_orphan"]
+
+
+# ---------------------------------------------------------------------------
+# filter_rule_set
+# ---------------------------------------------------------------------------
+
+
+def test_filter_rule_set_keeps_only_ref_deleted() -> None:
+    """``include=(RefDeletedRule,)`` keeps exactly the ref-deleted rule."""
+    rule_set = LifecycleRuleSet(
+        root=[
+            DraftInactivityRule(max_days_inactive=30),
+            BuildHistoryOrphanRule(min_position=5, min_age_days=30),
+            RefDeletedRule(),
+        ]
+    )
+
+    filtered = filter_rule_set(rule_set, include=(RefDeletedRule,))
+
+    assert [rule.type for rule in filtered.root] == ["ref_deleted"]
+
+
+def test_filter_rule_set_keeps_lifecycle_eval_rule_kinds() -> None:
+    """``include`` with the two lifecycle_eval kinds drops ref_deleted."""
+    rule_set = LifecycleRuleSet(
+        root=[
+            DraftInactivityRule(max_days_inactive=30),
+            BuildHistoryOrphanRule(min_position=5, min_age_days=30),
+            RefDeletedRule(),
+        ]
+    )
+
+    filtered = filter_rule_set(
+        rule_set, include=(DraftInactivityRule, BuildHistoryOrphanRule)
+    )
+
+    assert [rule.type for rule in filtered.root] == [
+        "draft_inactivity",
+        "build_history_orphan",
+    ]
+
+
+def test_filter_rule_set_empty_match_returns_empty_set() -> None:
+    """A rule set with none of the included kinds filters to empty."""
+    rule_set = LifecycleRuleSet(
+        root=[DraftInactivityRule(max_days_inactive=30)]
+    )
+
+    filtered = filter_rule_set(rule_set, include=(RefDeletedRule,))
+
+    assert filtered.root == []

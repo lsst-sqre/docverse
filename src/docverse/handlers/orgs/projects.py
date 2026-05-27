@@ -231,5 +231,49 @@ async def delete_project(
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        await service.soft_delete(org_slug=org_slug, slug=project_slug)
+        org, edition_slugs = await service.soft_delete(
+            org_slug=org_slug, slug=project_slug
+        )
         await context.session.commit()
+    # Remove each edition's CDN pointer after the soft-delete commit so
+    # the public URLs stop resolving once the project row is gone.
+    # ``unpublish`` is idempotent and a no-op for orgs without a
+    # configured CDN, so it is called unconditionally per edition.
+    # Wrapped in its own ``begin()`` block because the publishing
+    # service reads the org row (and may read service config +
+    # credentials) — without an explicit transaction SQLAlchemy
+    # auto-begins an implicit one that we then never commit.
+    #
+    # Failure semantics: if ``unpublish`` raises on edition k of n, the
+    # soft-delete is already committed and is not rolled back. The loop
+    # aborts on that first failing edition, the client sees a 5xx, and
+    # the project row stays soft-deleted. Unlike ``delete_edition``
+    # (which leaves the project row live, so a later lifecycle pass can
+    # revisit it), a soft-deleted project drops out of every recovery
+    # path: both the webhook (``list_by_github_repo``) and the daily
+    # audit (``list_github_bound_by_org``) filter ``date_deleted IS
+    # NULL``, and a re-issued DELETE returns 404 without re-attempting
+    # unpublish (see ``test_delete_project_idempotent_re_run``). So
+    # editions k..n are orphaned with stale CDN pointers until a manual
+    # sweep. A future improvement could make this loop best-effort
+    # (continue past a failing edition) and/or have a cleanup sweep
+    # revisit soft-deleted projects so the orphaned pointers are
+    # reclaimed automatically.
+    #
+    # Dashboard: a deleted project has no project dashboard to
+    # rebuild (``DashboardBuildEnqueuer.enqueue_for_project`` would
+    # reject on the ``date_deleted`` filter anyway), and there is no
+    # org-level listing/dashboard rebuild hook today — scoping this
+    # slice to the CDN unpublish, matching PRD #346's webhook fast-
+    # path's same trade-off.
+    if edition_slugs:
+        async with context.session.begin():
+            publishing_service = (
+                context.factory.create_edition_publishing_service()
+            )
+            for edition_slug in edition_slugs:
+                await publishing_service.unpublish(
+                    org_id=org.id,
+                    project_slug=project_slug,
+                    edition_slug=edition_slug,
+                )
