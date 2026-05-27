@@ -23,6 +23,7 @@ from docverse.storage.pagination import (
     KEEPER_SYNC_EDITION_CURSOR_TYPE,
     KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE,
     KEEPER_SYNC_RUN_CURSOR_TYPE,
+    KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
     QUEUE_JOB_CURSOR_TYPE,
 )
@@ -446,7 +447,7 @@ async def get_org_keeper_sync_tombstones(  # noqa: PLR0913
     ] = None,
 ) -> list[KeeperSyncTombstone]:
     parsed_cursor = (
-        KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE.from_str(cursor)
+        KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE.from_str(cursor)
         if cursor is not None
         else None
     )

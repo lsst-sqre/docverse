@@ -110,4 +110,17 @@ class SqlKeeperSyncState(Base):
             name="ck_keeper_sync_state_tombstone_reason",
         ),
         Index("idx_keeper_sync_state_org_id", "org_id"),
+        # Backs the admin tombstones listing
+        # (``GET /orgs/{org}/keeper-sync/tombstones``), which filters to
+        # one org's tombstoned rows and orders by ``date_tombstoned DESC,
+        # id DESC``. The ``WHERE date_tombstoned IS NOT NULL`` predicate
+        # keeps the index to just tombstoned rows — the rare case — and
+        # PostgreSQL scans the ``date_tombstoned`` key backward to serve
+        # the DESC ordering, so no explicit DESC modifier is needed.
+        Index(
+            "idx_keeper_sync_state_org_date_tombstoned",
+            "org_id",
+            "date_tombstoned",
+            postgresql_where=text("date_tombstoned IS NOT NULL"),
+        ),
     )

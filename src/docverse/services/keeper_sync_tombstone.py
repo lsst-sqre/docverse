@@ -32,7 +32,7 @@ from docverse.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse.storage.keeper_sync.state_store import _key_clauses
-from docverse.storage.pagination import KeeperSyncProjectStateIdCursor
+from docverse.storage.pagination import KeeperSyncStateDateTombstonedCursor
 
 __all__ = [
     "ClearedTombstone",
@@ -57,7 +57,9 @@ class KeeperSyncTombstoneListResult:
     tombstone.
     """
 
-    page: CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]
+    page: CountedPaginatedList[
+        KeeperSyncState, KeeperSyncStateDateTombstonedCursor
+    ]
     display_path_by_state_id: dict[int, str]
 
 
@@ -182,7 +184,7 @@ class KeeperSyncTombstoneService:
         self,
         *,
         org_id: int,
-        cursor: KeeperSyncProjectStateIdCursor | None,
+        cursor: KeeperSyncStateDateTombstonedCursor | None,
         limit: int,
         resource_type: ResourceType | None = None,
         tombstone_reason: TombstoneReason | None = None,

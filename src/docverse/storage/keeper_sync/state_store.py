@@ -25,7 +25,10 @@ from sqlalchemy.sql import ColumnElement
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 
 if TYPE_CHECKING:
-    from docverse.storage.pagination import KeeperSyncProjectStateIdCursor
+    from docverse.storage.pagination import (
+        KeeperSyncProjectStateIdCursor,
+        KeeperSyncStateDateTombstonedCursor,
+    )
 
 __all__ = [
     "KeeperSyncState",
@@ -321,11 +324,13 @@ class KeeperSyncStateStore:
         self,
         *,
         org_id: int,
-        cursor: KeeperSyncProjectStateIdCursor | None,
+        cursor: KeeperSyncStateDateTombstonedCursor | None,
         limit: int,
         resource_type: ResourceType | None = None,
         tombstone_reason: str | None = None,
-    ) -> CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]:
+    ) -> CountedPaginatedList[
+        KeeperSyncState, KeeperSyncStateDateTombstonedCursor
+    ]:
         """Return a paginated page of tombstoned state rows for an org.
 
         Backs the admin ``GET /orgs/{org}/keeper-sync/tombstones``
@@ -339,18 +344,16 @@ class KeeperSyncStateStore:
           ``lifecycle_delete`` / ``lifecycle_preemptive``).
 
         Pagination uses
-        :class:`docverse.storage.pagination.KeeperSyncProjectStateIdCursor`
-        (id DESC) — the cursor's name retains the original
-        project-listing call site but its underlying column is the
-        table's plain primary key, so it is correct for tombstone rows
-        of any resource type. Ordering by ``id`` puts the most-recently
-        inserted state rows first; tombstones written on long-standing
-        rows therefore intermix with newer ones, but each row's
-        ``date_tombstoned`` is included in the response so an operator
-        can still sort client-side if needed.
+        :class:`docverse.storage.pagination.KeeperSyncStateDateTombstonedCursor`
+        (``date_tombstoned DESC, id DESC``) so the most-recently
+        tombstoned rows lead the page — the operator-facing "what was
+        just deleted?" ordering. A tombstone stamped today on a
+        long-standing low-id row therefore sorts ahead of an older
+        tombstone on a newer row, which the previous ``id DESC``
+        ordering buried at the bottom.
         """
         from docverse.storage.pagination import (  # noqa: PLC0415
-            KeeperSyncProjectStateIdCursor,
+            KeeperSyncStateDateTombstonedCursor,
         )
 
         clauses: list[ColumnElement[bool]] = [
@@ -368,7 +371,7 @@ class KeeperSyncStateStore:
         stmt = select(SqlKeeperSyncState).where(*clauses)
         runner = CountedPaginatedQueryRunner(
             entry_type=KeeperSyncState,
-            cursor_type=KeeperSyncProjectStateIdCursor,
+            cursor_type=KeeperSyncStateDateTombstonedCursor,
         )
         return await runner.query_object(
             self._session, stmt, cursor=cursor, limit=limit

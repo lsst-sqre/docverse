@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 import structlog
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -14,6 +17,7 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.exceptions import NotFoundError
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from docverse.storage.edition_store import EditionStore
@@ -279,6 +283,130 @@ async def test_list_for_org_returns_only_tombstoned_rows(
         if entry.ltd_id is not None
     )
     assert ltd_ids == [2]
+
+
+async def _set_date_tombstoned(
+    session: AsyncSession, *, org_id: int, ltd_id: int, when: datetime
+) -> None:
+    """Force a row's ``date_tombstoned`` so ordering is deterministic."""
+    await session.execute(
+        update(SqlKeeperSyncState)
+        .where(
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.ltd_id == ltd_id,
+        )
+        .values(date_tombstoned=when)
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_for_org_orders_by_date_tombstoned_desc(
+    db_session: AsyncSession,
+) -> None:
+    """Most-recently-tombstoned rows sort first, regardless of row id.
+
+    A tombstone stamped recently on a long-standing (low-id) row must
+    sort ahead of an older tombstone on a newer (high-id) row. This
+    guards against regressing to the previous ``id DESC`` ordering,
+    which buried freshly-deleted aged resources at the bottom.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-list-order")
+
+    service = _build_service(db_session, logger=logger)
+    # ltd_id=1 is recorded first → lowest id; ltd_id=2 → higher id.
+    async with db_session.begin():
+        await service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    # Give the low-id row the *newer* tombstone time so date-ordering
+    # and id-ordering disagree.
+    async with db_session.begin():
+        await _set_date_tombstoned(
+            db_session,
+            org_id=org_id,
+            ltd_id=1,
+            when=datetime(2026, 5, 1, tzinfo=UTC),
+        )
+        await _set_date_tombstoned(
+            db_session,
+            org_id=org_id,
+            ltd_id=2,
+            when=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+    async with db_session.begin():
+        result = await service.list_for_org(
+            org_id=org_id, cursor=None, limit=25
+        )
+
+    assert [entry.ltd_id for entry in result.page.entries] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_list_for_org_paginates_in_date_tombstoned_order(
+    db_session: AsyncSession,
+) -> None:
+    """Walking pages by cursor yields newest-tombstoned rows first.
+
+    Exercises the ``date_tombstoned``-keyed cursor's ``apply_cursor``
+    across page boundaries: with timestamps assigned opposite to id
+    order, paging with ``limit=1`` must still surface rows newest-first
+    and visit each exactly once.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-list-page-order")
+
+    service = _build_service(db_session, logger=logger)
+    async with db_session.begin():
+        for ltd_id in (1, 2, 3):
+            await service.record(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                reason=TombstoneReason.lifecycle_delete,
+            )
+
+    # Tombstone times decrease as ltd_id increases, the reverse of id
+    # order, so the expected page order is ltd_id 1, 2, 3.
+    times = {
+        1: datetime(2026, 5, 3, tzinfo=UTC),
+        2: datetime(2026, 5, 2, tzinfo=UTC),
+        3: datetime(2026, 5, 1, tzinfo=UTC),
+    }
+    async with db_session.begin():
+        for ltd_id, when in times.items():
+            await _set_date_tombstoned(
+                db_session, org_id=org_id, ltd_id=ltd_id, when=when
+            )
+
+    seen: list[int | None] = []
+    cursor = None
+    async with db_session.begin():
+        while True:
+            page = (
+                await service.list_for_org(
+                    org_id=org_id, cursor=cursor, limit=1
+                )
+            ).page
+            seen.extend(entry.ltd_id for entry in page.entries)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+    assert seen == [1, 2, 3]
 
 
 @pytest.mark.asyncio
