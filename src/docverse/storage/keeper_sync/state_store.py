@@ -317,6 +317,89 @@ class KeeperSyncStateStore:
             self._session, stmt, cursor=cursor, limit=limit
         )
 
+    async def list_tombstones_for_org(
+        self,
+        *,
+        org_id: int,
+        cursor: KeeperSyncProjectStateIdCursor | None,
+        limit: int,
+        resource_type: ResourceType | None = None,
+        tombstone_reason: str | None = None,
+    ) -> CountedPaginatedList[KeeperSyncState, KeeperSyncProjectStateIdCursor]:
+        """Return a paginated page of tombstoned state rows for an org.
+
+        Backs the admin ``GET /orgs/{org}/keeper-sync/tombstones``
+        endpoint. Only rows with ``date_tombstoned IS NOT NULL`` are
+        returned. Filters are optional and stack:
+
+        - ``resource_type`` — narrows to ``project`` / ``edition`` /
+          ``build`` rows.
+        - ``tombstone_reason`` — narrows to one of the
+          :class:`TombstoneReason` wire values (``manual_delete`` /
+          ``lifecycle_delete`` / ``lifecycle_preemptive``).
+
+        Pagination uses
+        :class:`docverse.storage.pagination.KeeperSyncProjectStateIdCursor`
+        (id DESC) — the cursor's name retains the original
+        project-listing call site but its underlying column is the
+        table's plain primary key, so it is correct for tombstone rows
+        of any resource type. Ordering by ``id`` puts the most-recently
+        inserted state rows first; tombstones written on long-standing
+        rows therefore intermix with newer ones, but each row's
+        ``date_tombstoned`` is included in the response so an operator
+        can still sort client-side if needed.
+        """
+        from docverse.storage.pagination import (  # noqa: PLC0415
+            KeeperSyncProjectStateIdCursor,
+        )
+
+        clauses: list[ColumnElement[bool]] = [
+            SqlKeeperSyncState.org_id == org_id,
+            SqlKeeperSyncState.date_tombstoned.is_not(None),
+        ]
+        if resource_type is not None:
+            clauses.append(
+                SqlKeeperSyncState.resource_type == resource_type.value
+            )
+        if tombstone_reason is not None:
+            clauses.append(
+                SqlKeeperSyncState.tombstone_reason == tombstone_reason
+            )
+        stmt = select(SqlKeeperSyncState).where(*clauses)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=KeeperSyncState,
+            cursor_type=KeeperSyncProjectStateIdCursor,
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
+
+    async def get_by_id_for_org(
+        self,
+        *,
+        state_id: int,
+        org_id: int,
+    ) -> KeeperSyncState | None:
+        """Fetch a state row by primary key, scoped to an org.
+
+        The admin tombstones DELETE endpoint addresses rows by their
+        plain primary key (``state_id``); scoping to ``org_id`` keeps
+        the lookup org-isolated so a misformatted URL or guessed id
+        from a different org returns ``None`` (404) rather than the
+        wrong row. Tombstoned rows are visible to this lookup — the
+        admin clear path is the only caller and must be able to see
+        the row it is about to un-tombstone.
+        """
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.id == state_id,
+            SqlKeeperSyncState.org_id == org_id,
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncState.model_validate(row)
+
     async def upsert(  # noqa: PLR0913
         self,
         *,

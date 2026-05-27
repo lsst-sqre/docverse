@@ -44,6 +44,7 @@ from .keeper_sync import (
     KeeperSyncProjectRefreshAccepted,
     KeeperSyncProjectStateSummary,
     KeeperSyncProjectStatus,
+    KeeperSyncResourceType,
     KeeperSyncRun,
     KeeperSyncRunCreated,
     KeeperSyncRunKind,
@@ -51,6 +52,8 @@ from .keeper_sync import (
     KeeperSyncTierCohort,
     KeeperSyncTierName,
     KeeperSyncTierStatus,
+    KeeperSyncTombstone,
+    KeeperSyncTombstoneReason,
 )
 from .lifecycle import (
     BuildHistoryOrphanRule,
@@ -125,6 +128,7 @@ __all__ = [
     "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncProjectStateSummary",
     "KeeperSyncProjectStatus",
+    "KeeperSyncResourceType",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
     "KeeperSyncRunKind",
@@ -132,6 +136,8 @@ __all__ = [
     "KeeperSyncTierCohort",
     "KeeperSyncTierName",
     "KeeperSyncTierStatus",
+    "KeeperSyncTombstone",
+    "KeeperSyncTombstoneReason",
     "LifecycleEvalRunStatus",
     "LifecycleRule",
     "LifecycleRuleSet",
