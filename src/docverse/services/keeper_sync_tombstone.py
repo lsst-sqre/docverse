@@ -284,7 +284,10 @@ class KeeperSyncTombstoneService:
             row is treated as "no such tombstone" — the admin URL is
             meaningful only on a tombstoned row.)
         """
-        from docverse.exceptions import NotFoundError  # noqa: PLC0415
+        from docverse.exceptions import (  # noqa: PLC0415
+            KeeperSyncInvariantError,
+            NotFoundError,
+        )
 
         state = await self._state_store.get_by_id_for_org(
             state_id=state_id, org_id=org_id
@@ -333,7 +336,12 @@ class KeeperSyncTombstoneService:
         cleared = await self._state_store.get_by_id_for_org(
             state_id=state_id, org_id=org_id
         )
-        assert cleared is not None  # we just cleared it; row still exists
+        if cleared is None:
+            msg = (
+                f"State row state_id={state_id} vanished after clearing its "
+                "tombstone"
+            )
+            raise KeeperSyncInvariantError(msg)
         self._logger.info(
             "Sync tombstone cleared",
             org_id=org_id,

@@ -42,7 +42,7 @@ from docverse.domain.edition import Edition
 from docverse.domain.lifecycle import DraftInactivityRule, RefDeletedRule
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
-from docverse.exceptions import NotFoundError
+from docverse.exceptions import KeeperSyncInvariantError, NotFoundError
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from docverse.services.lifecycle.evaluator import (
     LifecycleEvaluationContext,
@@ -457,8 +457,13 @@ class KeeperSyncService:
         **not** wrap this method in ``session.begin()``. Mirrors
         :func:`git_ref_audit._fetch_refs_per_project`.
         """
-        assert self._binding_resolver is not None  # checked by caller
-        assert self._ref_set_fetcher is not None  # checked by caller
+        if self._binding_resolver is None or self._ref_set_fetcher is None:
+            msg = (
+                "_fetch_live_refs requires binding_resolver and "
+                "ref_set_fetcher to be configured; caller must "
+                "short-circuit when they are None"
+            )
+            raise KeeperSyncInvariantError(msg)
         binding = await self._binding_resolver.resolve(project.id)
         if binding is None:
             return None

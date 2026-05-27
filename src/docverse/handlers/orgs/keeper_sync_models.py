@@ -38,6 +38,7 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunActivity as KeeperSyncRunActivityDomain,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
+from docverse.exceptions import KeeperSyncInvariantError
 from docverse.services.keeper_sync_project import KeeperSyncProjectStatusResult
 from docverse.storage.keeper_sync import KeeperSyncState
 
@@ -265,11 +266,16 @@ class KeeperSyncTombstone(_KeeperSyncTombstoneBase):
 
         ``state.date_tombstoned`` and ``state.tombstone_reason`` must
         be non-null — the caller (admin list endpoint) only invokes
-        this for tombstoned rows. The assertions documents that
-        invariant for static analysis.
+        this for tombstoned rows. The guard below enforces that
+        invariant at runtime and narrows both fields for static
+        analysis.
         """
-        assert state.date_tombstoned is not None
-        assert state.tombstone_reason is not None
+        if state.date_tombstoned is None or state.tombstone_reason is None:
+            msg = (
+                "KeeperSyncTombstone.from_domain requires a tombstoned "
+                f"state row; state_id={state.id} has no tombstone"
+            )
+            raise KeeperSyncInvariantError(msg)
         return cls(
             self_url=HttpUrl(
                 str(

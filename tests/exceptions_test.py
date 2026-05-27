@@ -27,6 +27,7 @@ from docverse.exceptions import (
     InvalidBuildStateError,
     InvalidJobStateError,
     JobNotFoundError,
+    KeeperSyncInvariantError,
 )
 
 
@@ -63,11 +64,16 @@ def _make_job_not_found() -> JobNotFoundError:
     )
 
 
+def _make_keeper_sync_invariant() -> KeeperSyncInvariantError:
+    return KeeperSyncInvariantError("state_id=42 has no tombstone")
+
+
 _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("InvalidJobStateError", _make_invalid_job_state),
     ("InvalidBuildStateError", _make_invalid_build_state),
     ("JobNotFoundError", _make_job_not_found),
     ("InvalidSlugError", _make_invalid_slug),
+    ("KeeperSyncInvariantError", _make_keeper_sync_invariant),
 ]
 
 
