@@ -256,10 +256,23 @@ async def keeper_sync_run_discovery(
                 factory=factory, config=config, logger=logger
             )
             in_scope = _filter_to_allowlist(ltd_slugs, config.project_slugs)
+            # Drop tombstoned project slugs from the fan-out so we do
+            # not enqueue ``keeper_sync_project`` children that
+            # ``sync_project`` would only short-circuit on its own
+            # tombstone check (PRD #332 / user story 17). The empty-
+            # fan-out finalisation path below covers the case where
+            # tombstones consume the entire in-scope set.
+            state_store = factory.create_keeper_sync_state_store()
+            tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+                state_store=state_store, session=session, org_id=org_id
+            )
+            if tombstoned_slugs:
+                in_scope = [s for s in in_scope if s not in tombstoned_slugs]
             logger.info(
                 "Resolved keeper-sync run scope",
                 ltd_count=len(ltd_slugs),
                 in_scope_count=len(in_scope),
+                tombstoned_count=len(tombstoned_slugs),
             )
 
             enqueued_count = await _enqueue_children(
@@ -511,6 +524,9 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
     their ``publish_status`` is still ``NULL``. Skips when the build
     outcome is missing or carries no Docverse build id (a no-op edition
     or a convergence outcome that did not point at a publishable row).
+    Skips when the edition outcome carries no Docverse edition id —
+    a tombstoned ``keeper_sync_state`` row whose ``docverse_id`` is
+    ``NULL`` short-circuited before the edition was ever imported.
     """
     build_outcome = outcome.build_outcome
     if build_outcome is None:
@@ -521,6 +537,9 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
         build_outcome.docverse_build_id is None
         or build_outcome.docverse_build_public_id is None
     ):
+        return
+    edition_id = outcome.docverse_edition_id
+    if edition_id is None:
         return
 
     edition_store = factory.create_edition_store()
@@ -536,7 +555,7 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
         org_id=org_id,
         project_id=outcome.docverse_project_id,
         project_slug=outcome.docverse_project_slug,
-        edition_id=outcome.docverse_edition_id,
+        edition_id=edition_id,
         edition_slug=outcome.docverse_slug,
         build_id=build_outcome.docverse_build_id,
         build_public_id=build_outcome.docverse_build_public_id,
@@ -586,17 +605,24 @@ async def _self_heal_unpublished_editions(  # noqa: PLR0913
     short-circuited and is already published, or was freshly synced and
     just got published by the per-edition callback).
     """
+    project_id = sync_result.docverse_project_id
+    if project_id is None:
+        # A tombstoned project short-circuit returned no edition
+        # outcomes; nothing to self-heal.
+        return
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
     project_slug = sync_result.docverse_project_slug
-    project_id = sync_result.docverse_project_id
 
     for outcome in sync_result.edition_outcomes:
         build_outcome = outcome.build_outcome
         if build_outcome is None:
             continue
         if not build_outcome.short_circuited:
+            continue
+        edition_id = outcome.docverse_edition_id
+        if edition_id is None:
             continue
 
         target = await _resolve_self_heal_target(
@@ -618,7 +644,7 @@ async def _self_heal_unpublished_editions(  # noqa: PLR0913
             org_id=org_id,
             project_id=project_id,
             project_slug=project_slug,
-            edition_id=outcome.docverse_edition_id,
+            edition_id=edition_id,
             edition_slug=outcome.docverse_slug,
             build_id=build_id,
             build_public_id=build_public_id,
@@ -714,6 +740,33 @@ def _filter_to_allowlist(
         return list(ltd_slugs)
     allowed = set(allowlist)
     return [slug for slug in ltd_slugs if slug in allowed]
+
+
+async def _fetch_tombstoned_project_slugs(
+    *,
+    state_store: KeeperSyncStateStore,
+    session: AsyncSession,
+    org_id: int,
+) -> set[str]:
+    """Return the LTD slugs of all tombstoned project state rows.
+
+    The four discovery paths (``keeper_sync_run_discovery`` plus the
+    three tier crons) call this once per pass and subtract the result
+    from their in-scope slug list, so a ``keeper_sync_project`` child
+    is never enqueued for a Docverse-side-vetoed project. Without the
+    filter, ``sync_project`` would short-circuit on its own tombstone
+    check (PRD #332 §"Sync-side skip checks") a few milliseconds later
+    — same outcome, wasted queue + DB work. Issue #396 / user story 17.
+    """
+    async with session.begin():
+        project_states = await state_store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            include_tombstoned=True,
+        )
+    return {
+        s.ltd_slug for s in project_states if s.date_tombstoned is not None
+    }
 
 
 async def _enqueue_children(  # noqa: PLR0913
@@ -1016,6 +1069,14 @@ async def _tier_main_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
+    # Drop tombstoned project slugs from the candidate set up front:
+    # ``sync_project`` would only short-circuit on them a few
+    # milliseconds later (issue #396 / PRD #332 user story 17).
+    tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+        state_store=state_store, session=session, org_id=org.id
+    )
+    if tombstoned_slugs:
+        in_scope = [s for s in in_scope if s not in tombstoned_slugs]
     enqueued = 0
     for ltd_slug in in_scope:
         async with session.begin():
@@ -1068,14 +1129,11 @@ async def _tier_main_for_org(
         )
         if main_edition is None:
             continue
-        async with session.begin():
-            state = await state_store.get(
-                org_id=org.id,
-                resource_type=ResourceType.edition,
-                ltd_id=main_edition.ltd_id,
-            )
-        if not should_refresh_main_edition(
-            state=state, ltd_date_rebuilt=main_edition.date_rebuilt
+        if not await _tier_main_should_enqueue_edition(
+            state_store=state_store,
+            session=session,
+            org_id=org.id,
+            main_edition=main_edition,
         ):
             continue
         if await _enqueue_tier_project_sync(
@@ -1125,14 +1183,31 @@ async def _tier_discovery_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
+    # Drop tombstoned project slugs up front (issue #396 / PRD #332
+    # user story 17): ``sync_project`` would short-circuit on its own
+    # tombstone check, so the enqueue is pure waste.
+    tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+        state_store=state_store, session=session, org_id=org.id
+    )
+    if tombstoned_slugs:
+        in_scope = [s for s in in_scope if s not in tombstoned_slugs]
     # Hoist the org-wide edition-state read out of the per-slug loop.
     # The previous shape called ``list_for_org`` from inside
     # ``_project_needs_discovery``, so a 1500-slug discovery tick
     # scanned the org's ~15 000 edition state rows 1500 times per
     # tick. The map is consulted in memory per slug.
+    #
+    # ``include_tombstoned=True`` keeps tombstoned edition rows in the
+    # dict so :func:`is_unknown_resource` reads them as known
+    # (non-``None``) and ``_project_needs_discovery`` does not fire
+    # the "unseen LTD edition" enqueue branch on them. Without the
+    # flag, a tombstoned edition is filtered out and reads as missing
+    # — the very state the enqueue branch reacts to. Issue #396.
     async with session.begin():
         edition_states = await state_store.list_for_org(
-            org_id=org.id, resource_type=ResourceType.edition
+            org_id=org.id,
+            resource_type=ResourceType.edition,
+            include_tombstoned=True,
         )
     edition_state_by_ltd_id = {
         s.ltd_id: s for s in edition_states if s.ltd_id is not None
@@ -1240,6 +1315,16 @@ async def _tier_other_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
+    # Drop tombstoned project slugs up front (issue #396 / PRD #332
+    # user story 17). ``_has_stale_non_main_edition``'s default
+    # ``include_tombstoned=False`` already excludes tombstoned
+    # editions from the staleness scan, so no edition-level filter is
+    # needed here.
+    tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+        state_store=state_store, session=session, org_id=org.id
+    )
+    if tombstoned_slugs:
+        in_scope = [s for s in in_scope if s not in tombstoned_slugs]
     enqueued = 0
     for ltd_slug in in_scope:
         async with session.begin():
@@ -1371,6 +1456,42 @@ async def _find_main_edition(
                 return edition
     return await _walk_for_main_edition(
         ltd_client=ltd_client, product_slug=ltd_slug
+    )
+
+
+async def _tier_main_should_enqueue_edition(
+    *,
+    state_store: KeeperSyncStateStore,
+    session: AsyncSession,
+    org_id: int,
+    main_edition: LtdEdition,
+) -> bool:
+    """Return ``True`` iff a resolved main edition warrants an enqueue.
+
+    Reads the matching edition state row (including tombstoned rows)
+    and runs the two skip predicates the per-slug loop consults
+    after :func:`_find_main_edition` succeeds:
+
+    * Skip on tombstoned state row — ``sync_edition`` would only
+      short-circuit on its own tombstone check (issue #396 / PRD #332
+      user story 17).
+    * Otherwise defer to :func:`should_refresh_main_edition` for the
+      LTD ``date_rebuilt`` vs ``state.date_rebuilt_seen`` decision.
+
+    Lifted out of :func:`_tier_main_for_org` to keep the per-slug
+    loop's cyclomatic complexity under the project's ruff C901 ceiling.
+    """
+    async with session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=main_edition.ltd_id,
+            include_tombstoned=True,
+        )
+    if state is not None and state.date_tombstoned is not None:
+        return False
+    return should_refresh_main_edition(
+        state=state, ltd_date_rebuilt=main_edition.date_rebuilt
     )
 
 

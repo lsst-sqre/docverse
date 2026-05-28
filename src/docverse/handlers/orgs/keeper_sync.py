@@ -4,22 +4,26 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from docverse.client.models import (
     JobStatus,
     KeeperSyncConfig,
+    KeeperSyncResourceType,
     KeeperSyncRunStatus,
+    KeeperSyncTombstoneReason,
 )
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam
 from docverse.handlers.queue.models import QueueJob
+from docverse.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     KEEPER_SYNC_EDITION_CURSOR_TYPE,
     KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE,
     KEEPER_SYNC_RUN_CURSOR_TYPE,
+    KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
     QUEUE_JOB_CURSOR_TYPE,
 )
@@ -30,6 +34,7 @@ from .keeper_sync_models import (
     KeeperSyncProjectStatus,
     KeeperSyncRun,
     KeeperSyncRunCreated,
+    KeeperSyncTombstone,
 )
 
 router = APIRouter()
@@ -403,3 +408,123 @@ async def get_org_keeper_sync_run_jobs(  # noqa: PLR0913
     return [
         QueueJob.from_domain(job, context.request) for job in result.entries
     ]
+
+
+@router.get(
+    "/orgs/{org}/keeper-sync/tombstones",
+    response_model=list[KeeperSyncTombstone],
+    summary="List sync tombstones for an organization",
+    name="get_org_keeper_sync_tombstones",
+)
+async def get_org_keeper_sync_tombstones(  # noqa: PLR0913
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    cursor: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Opaque pagination cursor from a previous response's"
+                " ``Link`` header."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Maximum number of results per page.",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    resource_type: Annotated[
+        KeeperSyncResourceType | None,
+        Query(description="Filter tombstones by resource type."),
+    ] = None,
+    tombstone_reason: Annotated[
+        KeeperSyncTombstoneReason | None,
+        Query(description="Filter tombstones by reason."),
+    ] = None,
+) -> list[KeeperSyncTombstone]:
+    parsed_cursor = (
+        KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE.from_str(cursor)
+        if cursor is not None
+        else None
+    )
+    storage_resource_type = (
+        ResourceType(resource_type.value)
+        if resource_type is not None
+        else None
+    )
+    storage_tombstone_reason = (
+        TombstoneReason(tombstone_reason.value)
+        if tombstone_reason is not None
+        else None
+    )
+    context.rebind_logger(actor=user.username)
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_tombstone_service()
+        result = await service.list_for_org(
+            org_id=user.org.id,
+            cursor=parsed_cursor,
+            limit=limit,
+            resource_type=storage_resource_type,
+            tombstone_reason=storage_tombstone_reason,
+        )
+    context.response.headers["Link"] = result.page.link_header(
+        context.request.url
+    )
+    context.response.headers["X-Total-Count"] = str(result.page.count)
+    context.logger.info(
+        "Listed sync tombstones",
+        org=org_slug,
+        resource_type=(
+            resource_type.value if resource_type is not None else None
+        ),
+        tombstone_reason=(
+            tombstone_reason.value if tombstone_reason is not None else None
+        ),
+        count=len(result.page.entries),
+    )
+    return [
+        KeeperSyncTombstone.from_domain(
+            entry,
+            result.display_path_by_state_id[entry.id],
+            context.request,
+            org_slug,
+        )
+        for entry in result.page.entries
+    ]
+
+
+@router.delete(
+    "/orgs/{org}/keeper-sync/tombstones/{state_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Clear a sync tombstone",
+    name="delete_org_keeper_sync_tombstone",
+)
+async def delete_org_keeper_sync_tombstone(
+    org_slug: OrgSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+    state_id: Annotated[
+        int,
+        Path(description="Primary key of the keeper_sync_state row."),
+    ],
+) -> Response:
+    context.rebind_logger(actor=user.username)
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_tombstone_service()
+        cleared = await service.clear(state_id=state_id, org_id=user.org.id)
+        await context.session.commit()
+    context.logger.info(
+        "Cleared sync tombstone",
+        org=org_slug,
+        state_id=state_id,
+        resource_type=cleared.state.resource_type,
+        ltd_id=cleared.state.ltd_id,
+        ltd_slug=cleared.state.ltd_slug,
+        revived_docverse_row=cleared.revived_docverse_row,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

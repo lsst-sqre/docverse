@@ -29,6 +29,11 @@ from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import EditionSlugCursor
 from docverse.storage.project_store import ProjectStore
@@ -44,9 +49,9 @@ def edition_store(
     return EditionStore(session=db_session, logger=logger)
 
 
-async def _create_project(
+async def _create_project_with_org(
     db_session: AsyncSession,
-) -> int:
+) -> tuple[int, int]:
     logger = structlog.get_logger("docverse")
     org_store = OrganizationStore(session=db_session, logger=logger)
     proj_store = ProjectStore(session=db_session, logger=logger)
@@ -65,7 +70,14 @@ async def _create_project(
             source_url="https://example.com/example/repo",
         ),
     )
-    return project.id
+    return org.id, project.id
+
+
+async def _create_project(
+    db_session: AsyncSession,
+) -> int:
+    _, project_id = await _create_project_with_org(db_session)
+    return project_id
 
 
 @pytest.mark.asyncio
@@ -482,7 +494,7 @@ async def test_soft_delete_edition(
     edition_store: EditionStore,
 ) -> None:
     async with db_session.begin():
-        project_id = await _create_project(db_session)
+        org_id, project_id = await _create_project_with_org(db_session)
         await edition_store.create(
             project_id=project_id,
             data=EditionCreate(
@@ -493,7 +505,10 @@ async def test_soft_delete_edition(
             ),
         )
         deleted = await edition_store.soft_delete(
-            project_id=project_id, slug="del-ed"
+            org_id=org_id,
+            project_id=project_id,
+            slug="del-ed",
+            reason=TombstoneReason.manual_delete,
         )
         assert deleted is True
         found = await edition_store.get_by_slug(
@@ -501,6 +516,196 @@ async def test_soft_delete_edition(
         )
         await db_session.commit()
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_edition_stamps_tombstone_when_state_row_exists(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A state row is stamped in the same flush as ``date_deleted``."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="del-tomb",
+                title="Tombstone Me",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=4242,
+            ltd_slug="del-tomb",
+            docverse_id=edition.id,
+        )
+        deleted = await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="del-tomb",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        assert deleted is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=4242,
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.date_tombstoned is not None
+    assert state.tombstone_reason == "lifecycle_delete"
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_edition_no_state_row_is_tombstone_noop(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The soft-delete succeeds without creating a tombstone row."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="noimport",
+                title="No Import",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        deleted = await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="noimport",
+            reason=TombstoneReason.manual_delete,
+        )
+        assert deleted is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        rows = await state_store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            docverse_ids=[edition.id],
+            include_tombstoned=True,
+        )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_edition_records_reason_as_passed(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``reason=manual_delete`` is recorded on the state row as-is."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="manual",
+                title="Manual",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=7777,
+            ltd_slug="manual",
+            docverse_id=edition.id,
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="manual",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=7777,
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.tombstone_reason == "manual_delete"
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_edition_rollback_unwinds_both(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A rollback after ``soft_delete`` leaves both rows untouched."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="rollback-me",
+                title="Rollback",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=8888,
+            ltd_slug="rollback-me",
+            docverse_id=edition.id,
+        )
+        await db_session.commit()
+
+    # Start a write transaction, perform the soft-delete + tombstone
+    # write, then rollback by raising out of the ``begin()`` block.
+    async def _run() -> None:
+        async with db_session.begin():
+            await edition_store.soft_delete(
+                org_id=org_id,
+                project_id=project_id,
+                slug="rollback-me",
+                reason=TombstoneReason.lifecycle_delete,
+            )
+            msg = "trigger rollback"
+            raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="trigger rollback"):
+        await _run()
+
+    async with db_session.begin():
+        found = await edition_store.get_by_slug(
+            project_id=project_id, slug="rollback-me"
+        )
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=8888,
+            include_tombstoned=True,
+        )
+    assert found is not None
+    assert state is not None
+    assert state.date_tombstoned is None
+    assert state.tombstone_reason is None
 
 
 @pytest.mark.asyncio
@@ -1095,7 +1300,7 @@ async def test_get_by_slug_case_insensitive(
 ) -> None:
     """get_by_slug matches across case and skips soft-deleted rows."""
     async with db_session.begin():
-        project_id = await _create_project(db_session)
+        org_id, project_id = await _create_project_with_org(db_session)
         await edition_store.create(
             project_id=project_id,
             data=EditionCreate(
@@ -1128,7 +1333,12 @@ async def test_get_by_slug_case_insensitive(
 
     # Soft-deleting the row releases the slug for reuse.
     async with db_session.begin():
-        await edition_store.soft_delete(project_id=project_id, slug="DM-54112")
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="DM-54112",
+            reason=TombstoneReason.manual_delete,
+        )
         assert (
             await edition_store.get_by_slug(
                 project_id=project_id, slug="dm-54112"
@@ -1405,7 +1615,7 @@ async def test_list_draft_editions_by_git_ref_excludes_soft_deleted(
 ) -> None:
     """Already-soft-deleted draft editions are filtered out."""
     async with db_session.begin():
-        project_id = await _create_project(db_session)
+        org_id, project_id = await _create_project_with_org(db_session)
         await edition_store.create(
             project_id=project_id,
             data=EditionCreate(
@@ -1416,7 +1626,12 @@ async def test_list_draft_editions_by_git_ref_excludes_soft_deleted(
                 tracking_params={"git_ref": "tickets/DM-2"},
             ),
         )
-        await edition_store.soft_delete(project_id=project_id, slug="dm-2")
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="dm-2",
+            reason=TombstoneReason.manual_delete,
+        )
         result = await edition_store.list_draft_editions_by_git_ref(
             project_id=project_id, git_ref="tickets/DM-2"
         )

@@ -37,7 +37,12 @@ from docverse.client.models import (
 )
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.keeper_sync import (
@@ -219,6 +224,35 @@ async def _seed_state(
         docverse_id=docverse_id,
         date_last_synced=date_last_synced,
         date_rebuilt_seen=date_rebuilt_seen,
+    )
+
+
+async def _seed_tombstone(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    resource_type: ResourceType,
+    ltd_id: int | None = None,
+    ltd_slug: str | None = None,
+    reason: TombstoneReason = TombstoneReason.manual_delete,
+) -> None:
+    """Stamp a tombstone on the matching ``keeper_sync_state`` row.
+
+    Uses the same service entrypoint the production deletion paths
+    will use (PRD #332 §"Centralized edition soft-delete"), so the
+    tier-cron filter behavior is exercised against rows produced the
+    same way operators and lifecycle workers produce them.
+    """
+    state_store = KeeperSyncStateStore(session=db_session, logger=_logger())
+    service = KeeperSyncTombstoneService(
+        session=db_session, state_store=state_store, logger=_logger()
+    )
+    await service.record(
+        org_id=org_id,
+        resource_type=resource_type,
+        ltd_id=ltd_id,
+        ltd_slug=ltd_slug,
+        reason=reason,
     )
 
 
@@ -1077,6 +1111,143 @@ async def test_tier_main_skips_when_active_keeper_sync_project_exists(
     assert rows[0].id == existing.id
 
 
+@pytest.mark.asyncio
+async def test_tier_main_skips_tombstoned_project_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned project state row keeps its slug out of the candidate set.
+
+    Issue #396: the tier crons must filter tombstoned state rows out
+    of their candidate set up front so they do not enqueue child jobs
+    that ``sync_project`` would only short-circuit. The non-tombstoned
+    slug in the same org still gets its enqueue, locking the
+    "non-tombstoned resources are still discovered" half of the
+    acceptance criterion.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-tomb",
+            project_slugs=["pipelines", "live-proj"],
+        )
+        # Tombstoned project: the per-slug pre-check must skip without
+        # touching LTD.
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+        )
+        # Live project: the main edition state lags LTD so the normal
+        # enqueue path fires.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2),
+        )
+
+    _stub_products(mock_discovery, ["pipelines", "live-proj"])
+    # Live-proj's main edition listing + edition payload — ``pipelines``
+    # is tombstoned and must never be polled, so no stubs for it.
+    _stub_editions_listing(
+        mock_discovery, product_slug="live-proj", edition_ids=[2]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
+    assert slugs == {"live-proj"}
+
+
+@pytest.mark.asyncio
+async def test_tier_main_skips_tombstoned_main_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned main-edition state row keeps the project from enqueueing.
+
+    Issue #396: even when the project itself is not tombstoned, a
+    tombstoned main edition must not produce a ``keeper_sync_project``
+    enqueue — the resulting ``sync_edition`` would only short-circuit.
+    The seeded ``date_rebuilt_seen`` would otherwise lag LTD and trip
+    :func:`should_refresh_main_edition` into enqueueing, so the only
+    reason no enqueue lands is the tombstone filter.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-edition-tomb",
+            project_slugs=["pipelines"],
+        )
+        # Edition state lags LTD but is tombstoned — must not enqueue.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2),
+        )
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
 # ---------------------------------------------------------------------------
 # tier_discovery
 # ---------------------------------------------------------------------------
@@ -1276,15 +1447,15 @@ async def test_tier_discovery_batches_edition_state_lookups(
     # short-circuit (now shared between :func:`should_poll_for_tier`
     # and :func:`_project_needs_discovery`), and one inside
     # :func:`_record_tier_polled` to merge with prior annotations
-    # before stamping ``date_discovery_last_polled``. One
-    # ``list_for_org`` for the edition lookup, now hoisted out of
-    # :func:`_project_needs_discovery` and called once before the
-    # per-slug loop (see
+    # before stamping ``date_discovery_last_polled``. Two
+    # ``list_for_org`` calls: one for the project-tombstone filter
+    # (issue #396) and one for the org-wide edition lookup hoisted
+    # out of :func:`_project_needs_discovery` (see
     # :func:`test_tier_discovery_batches_edition_state_lookups_across_slugs`
     # for the cross-slug lock). Five-edition fixture still proves the
     # count is independent of edition cardinality.
     assert recorder.get_calls == 2
-    assert recorder.list_for_org_calls == 1
+    assert recorder.list_for_org_calls == 2
 
 
 @pytest.mark.asyncio
@@ -1659,6 +1830,141 @@ async def test_tier_discovery_records_polled_annotation_on_ltd_error(
     assert (now - stamped) < timedelta(minutes=5)
 
 
+@pytest.mark.asyncio
+async def test_tier_discovery_skips_tombstoned_project_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned project state row keeps its slug out of the candidate set.
+
+    Issue #396 acceptance criterion: an org with a tombstoned project
+    produces no ``keeper_sync_project`` child jobs for that resource.
+    The non-tombstoned slug in the same org still enqueues — its
+    project has no state row, so ``_project_needs_discovery``'s
+    cheap-path short-circuit fires.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-tomb",
+            project_slugs=["pipelines", "live-proj"],
+        )
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+        )
+
+    _stub_products(mock_discovery, ["pipelines", "live-proj"])
+    # No editions stub for ``pipelines`` — the per-slug pre-check
+    # must skip without touching LTD.
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
+    assert slugs == {"live-proj"}
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned edition counts as known, not unknown.
+
+    Issue #396: without the filter, ``_project_needs_discovery`` would
+    consult the org-wide edition-state dict, find no entry for the
+    tombstoned edition (default ``include_tombstoned=False`` filters
+    it out), call :func:`is_unknown_resource` which returns True for a
+    ``None`` state, and enqueue ``keeper_sync_project`` — which would
+    then iterate LTD editions, hit the tombstoned edition, and have
+    ``sync_edition`` short-circuit. The fix keeps tombstoned editions
+    visible to the dict so they read as known, not unknown.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-tomb-ed",
+            project_slugs=["pipelines"],
+        )
+        # Project state exists — no cheap-path enqueue.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        # Main edition state present + a tombstoned non-main edition.
+        # Without the filter, the tombstoned edition reads as unknown
+        # and ``_project_needs_discovery`` returns True.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT,
+        )
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    # LTD still lists the tombstoned edition (id=2) — it has not been
+    # deleted on the LTD side, only Docverse-side.
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
 # ---------------------------------------------------------------------------
 # tier_other
 # ---------------------------------------------------------------------------
@@ -1960,12 +2266,13 @@ async def test_tier_other_batches_edition_state_lookups(
     # Two ``get`` calls per project per tick: one for the dormancy
     # planner read at the top of the loop and one inside
     # :func:`_record_tier_polled` to merge with prior annotations
-    # before stamping ``date_other_last_polled``. Exactly one
-    # ``list_for_org`` regardless of LTD's edition cardinality —
-    # the per-project edition-state cost stays independent of the
-    # branch count.
+    # before stamping ``date_other_last_polled``. Two
+    # ``list_for_org`` calls: one for the project-tombstone filter
+    # (issue #396) and one for the non-main edition staleness scan
+    # in :func:`_has_stale_non_main_edition`. The per-project
+    # edition-state cost stays independent of the branch count.
     assert recorder.get_calls == 2
-    assert recorder.list_for_org_calls == 1
+    assert recorder.list_for_org_calls == 2
 
 
 @pytest.mark.asyncio
@@ -2199,6 +2506,81 @@ async def test_tier_other_records_polled_annotation_on_ltd_error(
     stamped = datetime.fromisoformat(raw)
     # Update fired during this tick, not 49h ago.
     assert (now - stamped) < timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
+async def test_tier_other_skips_tombstoned_project_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned project state row keeps its slug out of the candidate set.
+
+    Issue #396: a tier_other tick must not call
+    ``GET /products/<slug>/editions/`` for a tombstoned project, nor
+    enqueue a ``keeper_sync_project`` child for it. The non-tombstoned
+    slug in the same org still enqueues from its stale non-main
+    edition.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-tomb",
+            project_slugs=["pipelines", "live-proj"],
+        )
+        # Tombstoned project: must be skipped entirely.
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+        )
+        # Live project: a stale non-main edition triggers the normal
+        # enqueue path.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=20,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=stale,
+        )
+
+    _stub_products(mock_discovery, ["pipelines", "live-proj"])
+    # Only stub live-proj's editions — the tombstoned ``pipelines``
+    # must not hit LTD.
+    _stub_editions_listing(
+        mock_discovery, product_slug="live-proj", edition_ids=[20, 10]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=10,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=20,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
+    assert slugs == {"live-proj"}
 
 
 # ---------------------------------------------------------------------------

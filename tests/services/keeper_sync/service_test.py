@@ -19,6 +19,7 @@ import pytest
 import pytest_asyncio
 import respx
 import structlog
+from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,20 +31,40 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.dbschema.build import SqlBuild
+from docverse.domain.lifecycle import (
+    BuildHistoryOrphanRule,
+    DraftInactivityRule,
+    LifecycleRuleSet,
+    RefDeletedRule,
+)
 from docverse.services.keeper_sync.copier import BuildContentCopier
 from docverse.services.keeper_sync.service import (
     KeeperSyncContext,
     KeeperSyncService,
     _now,
 )
+from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from docverse.services.project import ProjectService
+from docverse.services.project_github_binding import (
+    ProjectGitHubBindingResolver,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
+from docverse.storage.github import (
+    GITHUB_API_BASE_URL,
+    GitHubAppClient,
+    GitHubRefSetFetcher,
+)
+from docverse.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse.storage.ltd import LtdClient, LtdSourceProtocol
 from docverse.storage.objectstore import MockObjectStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
+from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 FIXTURES_DIR = (
     Path(__file__).parent.parent.parent / "storage" / "ltd" / "fixtures"
@@ -75,7 +96,12 @@ async def http_client() -> AsyncGenerator[httpx.AsyncClient]:
         yield client
 
 
-async def _seed_org(session: AsyncSession, *, slug: str = "ks-svc") -> int:
+async def _seed_org(
+    session: AsyncSession,
+    *,
+    slug: str = "ks-svc",
+    lifecycle_rules: LifecycleRuleSet | None = None,
+) -> int:
     logger = structlog.get_logger("test")
     store = OrganizationStore(session=session, logger=logger)
     org = await store.create(
@@ -83,6 +109,7 @@ async def _seed_org(session: AsyncSession, *, slug: str = "ks-svc") -> int:
             slug=slug,
             title="ks-svc",
             base_domain=f"{slug}.example.com",
+            lifecycle_rules=lifecycle_rules,
         )
     )
     return org.id
@@ -93,8 +120,18 @@ def _build_service(
     http_client: httpx.AsyncClient,
     object_store: MockObjectStore,
     source_objects: dict[str, bytes],
+    *,
+    binding_resolver: ProjectGitHubBindingResolver | None = None,
+    ref_set_fetcher: GitHubRefSetFetcher | None = None,
+    tombstone_service: KeeperSyncTombstoneService | None = None,
 ) -> KeeperSyncService:
-    """Construct a real ``KeeperSyncService`` against the test DB."""
+    """Construct a real ``KeeperSyncService`` against the test DB.
+
+    Optional ``binding_resolver`` / ``ref_set_fetcher`` /
+    ``tombstone_service`` wire the proactive-lifecycle path; tests
+    that don't care about that path leave them unset and get the
+    pre-PRD-#332 behavior (proactive pass is a no-op).
+    """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
     project_store = ProjectStore(session=session, logger=logger)
@@ -141,7 +178,96 @@ def _build_service(
         copy_callable=copy_callable,  # type: ignore[arg-type]
         manifest_callable=manifest_callable,
         logger=logger,
+        tombstone_service=tombstone_service,
+        binding_resolver=binding_resolver,
+        ref_set_fetcher=ref_set_fetcher,
     )
+
+
+def _make_proactive_deps(
+    *,
+    session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_github: GitHubMock,
+) -> tuple[
+    ProjectGitHubBindingResolver,
+    GitHubRefSetFetcher,
+    KeeperSyncTombstoneService,
+]:
+    """Build the three proactive-lifecycle deps for a sync_project test.
+
+    Mirrors the production factory wiring at the unit-test layer: the
+    resolver, ref fetcher, and tombstone service are the same concrete
+    classes the production ``Factory.create_keeper_sync_service`` would
+    construct. Tests pass these straight into ``_build_service`` to
+    exercise the proactive path.
+    """
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=session, logger=logger)
+    state_store = KeeperSyncStateStore(session=session, logger=logger)
+    safir_factory = GitHubAppClientFactory(
+        id=mock_github.app_id,
+        key=mock_github.private_key_pem,
+        name=DEFAULT_APP_NAME,
+        http_client=http_client,
+    )
+    app_client = GitHubAppClient(
+        factory=safir_factory,
+        http_client=http_client,
+        logger=logger,
+    )
+    resolver = ProjectGitHubBindingResolver(
+        session=session,
+        project_store=project_store,
+        app_client=app_client,
+        logger=logger,
+    )
+    fetcher = GitHubRefSetFetcher(http_client=http_client)
+    tombstone_service = KeeperSyncTombstoneService(
+        session=session, state_store=state_store, logger=logger
+    )
+    return resolver, fetcher, tombstone_service
+
+
+def _ref_entry(ref: str) -> dict[str, object]:
+    return {
+        "ref": ref,
+        "node_id": f"node-{ref}",
+        "url": f"https://api.github.com/{ref}",
+        "object": {"sha": "deadbeef", "type": "commit"},
+    }
+
+
+def _seed_github_refs(
+    router: respx.Router,
+    *,
+    owner: str,
+    repo: str,
+    branches: list[str] | None = None,
+    tags: list[str] | None = None,
+) -> tuple[respx.Route, respx.Route]:
+    """Seed the matching-refs endpoints for one repo; return the routes.
+
+    Returning the routes lets the caller pin call counts on the
+    heads/tags endpoints (the "fetched once per sync_project" assertion).
+    """
+    branches = branches if branches is not None else []
+    tags = tags if tags is not None else []
+    heads_route = router.get(
+        f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/git/matching-refs/heads"
+    ).mock(
+        return_value=httpx.Response(
+            200, json=[_ref_entry(f"refs/heads/{n}") for n in branches]
+        )
+    )
+    tags_route = router.get(
+        f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/git/matching-refs/tags"
+    ).mock(
+        return_value=httpx.Response(
+            200, json=[_ref_entry(f"refs/tags/{n}") for n in tags]
+        )
+    )
+    return heads_route, tags_route
 
 
 def _seed_ltd(
@@ -1384,3 +1510,945 @@ async def test_sync_project_continues_when_callback_raises(
     outcome_slugs = [o.docverse_slug for o in result.edition_outcomes]
     assert "__main" in outcome_slugs
     assert "u-jsick-feature" in outcome_slugs
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_short_circuits_when_tombstoned(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned edition state row short-circuits ``sync_edition``.
+
+    The build copy must not run, the build store must not be touched,
+    and ``date_last_synced`` on the tombstoned state row must remain
+    untouched (proves ``_ensure_edition`` / state ``upsert`` were
+    skipped).
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-edition")
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    # First sync imports the edition + build normally.
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert first.edition_outcomes
+    keys_after_first = set(object_store.objects.keys())
+    assert keys_after_first
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=state_store,
+        logger=structlog.get_logger("test"),
+    )
+
+    # Tombstone the edition state row + snapshot ``date_last_synced``
+    # so the post-sync assertion can prove the upsert was skipped.
+    async with db_session.begin():
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        state_before = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            include_tombstoned=True,
+        )
+    assert state_before is not None
+    assert state_before.date_tombstoned is not None
+    date_last_synced_before = state_before.date_last_synced
+
+    # LTD pretends a fresh build arrived — without the short-circuit
+    # the sync would copy bucket content into Docverse.
+    edition_v2 = _load("edition_main_git_refs.json")
+    edition_v2["date_rebuilt"] = "2026-05-04T12:00:00.000000+00:00"
+    edition_v2["build_url"] = f"{LTD_BASE}/builds/43"
+    build_v2 = _load("build.json")
+    build_v2["self_url"] = f"{LTD_BASE}/builds/43"
+    build_v2["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.reset()
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/1"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition_v2)
+    )
+    builds_43_route = mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_v2)
+    )
+
+    source_objects_v2 = {
+        "pipelines/builds/43/index.html": b"<html>v2</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects_v2
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The edition outcome is present but carries no build_outcome — the
+    # short-circuit fired before ``sync_build`` had a chance to run.
+    assert len(result.edition_outcomes) == 1
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_slug == "__main"
+    assert outcome.build_outcome is None
+
+    # No new bytes landed in the destination object store, and the
+    # build endpoint was never fetched — short-circuit fired before
+    # any sync_build work could begin.
+    assert set(object_store.objects.keys()) == keys_after_first
+    assert builds_43_route.call_count == 0
+
+    # The tombstoned state row is unchanged — no upsert ran inside
+    # the short-circuited sync_edition.
+    async with db_session.begin():
+        state_after = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            include_tombstoned=True,
+        )
+    assert state_after is not None
+    assert state_after.date_tombstoned is not None
+    assert state_after.date_last_synced == date_last_synced_before
+
+
+@pytest.mark.asyncio
+async def test_sync_project_short_circuits_when_tombstoned(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned project state row short-circuits ``sync_project``.
+
+    The LTD product fetch must not run and ``edition_outcomes`` must
+    be empty.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-project")
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    # First sync imports the project + writes the project state row.
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=state_store,
+        logger=structlog.get_logger("test"),
+    )
+    async with db_session.begin():
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            reason=TombstoneReason.manual_delete,
+        )
+
+    # Clear LTD call stats — the short-circuit must issue zero LTD
+    # calls, so any post-tombstone delta would indicate the sync
+    # still walked LTD. ``reset()`` keeps the routes registered so a
+    # missed short-circuit still returns the stubbed responses (no
+    # passthrough surprises) while the call counter remains pinnable.
+    mock_discovery.reset()
+
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert mock_discovery.calls.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_does_not_crash_on_soft_deleted_tombstoned_row(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Regression: tombstone short-circuit defuses the slug-clash crash.
+
+    Without the short-circuit, a soft-deleted Docverse edition row
+    whose LTD source still exists makes ``_ensure_edition`` /
+    ``EditionStore.create_internal`` hit a ``uq_editions_project_lower_slug``
+    conflict against the soft-deleted row, ``ON CONFLICT DO NOTHING``
+    short-circuits the insert, and the follow-up ``get_by_slug``
+    (which filters ``date_deleted IS NULL``) returns ``None`` —
+    raising ``"create_internal lost ON CONFLICT race"``. The tombstone
+    must defuse that crash by short-circuiting ``sync_edition`` before
+    ``_ensure_edition`` runs.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-soft-deleted")
+
+    _seed_ltd(mock_discovery)
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=state_store,
+        logger=structlog.get_logger("test"),
+    )
+
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        soft_deleted = await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project.id,
+            slug="__main",
+            reason=TombstoneReason.manual_delete,
+        )
+        assert soft_deleted is True
+        await tombstone_service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            reason=TombstoneReason.manual_delete,
+        )
+
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    # Without the short-circuit this raises "lost ON CONFLICT race".
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_outcomes) == 1
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_slug == "__main"
+    assert outcome.build_outcome is None
+
+
+# ---------------------------------------------------------------------------
+# Proactive lifecycle evaluation (PRD #332 / DM-54914) — sync_project
+# pre-filters LTD editions that ``draft_inactivity`` or ``ref_deleted``
+# would immediately tombstone, so the migration does not spend bandwidth
+# copying build assets the lifecycle pass would delete seconds later.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_editions_main_and_draft(
+    mock_discovery: respx.Router,
+    *,
+    draft_payload: dict | None = None,  # type: ignore[type-arg]
+    draft_build_payload: dict | None = None,  # type: ignore[type-arg]
+) -> None:
+    """Stub LTD's view of a project with main + one draft edition.
+
+    Two edition resources at ``/editions/1`` (main, build 42) and
+    ``/editions/2`` (the supplied draft, build 43). The draft's
+    ``tracked_refs`` and ``date_rebuilt`` are driven by the caller via
+    ``draft_payload`` so individual tests can express their scenario
+    (ref present / ref deleted / stale / fresh) directly.
+    """
+    if draft_payload is None:
+        draft_payload = _load("edition_branch_git_refs.json")
+    if draft_build_payload is None:
+        draft_build_payload = _load("build.json")
+        draft_build_payload["self_url"] = f"{LTD_BASE}/builds/43"
+        draft_build_payload["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=draft_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=draft_build_payload)
+    )
+
+
+# The ``pipelines`` LTD product's ``doc_repo`` parses to
+# (lsst, pipelines_lsst_io); every proactive test seeds GitHub refs for
+# that coordinate. Keep the constant here so the wiring is obvious at
+# the test call sites.
+_LSST_OWNER = "lsst"
+_LSST_REPO = "pipelines_lsst_io"
+
+
+@pytest.mark.asyncio
+async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A draft tracking a missing GitHub branch is tombstoned pre-import.
+
+    Seeds an org with ``RefDeletedRule`` configured, an LTD product
+    whose ``doc_repo`` is a public GitHub repo, and a draft edition
+    tracking a branch that no longer exists on GitHub. The proactive
+    evaluator must tombstone the draft ``lifecycle_preemptive``, skip
+    its ``sync_edition`` call entirely (no Docverse edition row, no
+    LTD build endpoint hit, no bytes in the destination store), and
+    sync the main edition normally.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-ref",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    # Track a branch that the GitHub mock will NOT list as live.
+    draft_payload["tracked_refs"] = ["tickets/DM-deleted"]
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+        tags=[],
+    )
+    # Track the draft build endpoint so we can prove it was not fetched.
+    draft_build_route = mock_discovery.get(f"{LTD_BASE}/builds/43")
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Only the main edition produced an outcome — the draft was
+    # tombstoned pre-import and skipped.
+    assert len(result.edition_outcomes) == 1
+    assert result.edition_outcomes[0].docverse_slug == "__main"
+
+    # The draft's LTD build endpoint was never fetched.
+    assert draft_build_route.call_count == 0
+
+    # No draft edition row was created in Docverse.
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        draft = await edition_store.get_by_slug(
+            project_id=project.id, slug="u-jsick-feature"
+        )
+        assert draft is None
+
+        # ...but the tombstone state row IS present.
+        tombstone = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert tombstone is not None
+        assert tombstone.date_tombstoned is not None
+        assert tombstone.tombstone_reason == (
+            TombstoneReason.lifecycle_preemptive.value
+        )
+        # No Docverse row was created — the tombstone is a pure veto.
+        assert tombstone.docverse_id is None
+
+    # No draft bytes landed in the destination object store.
+    assert not any(
+        k.startswith("pipelines/builds/43") for k in object_store.objects
+    )
+
+
+@pytest.mark.asyncio
+async def test_proactive_draft_inactivity_tombstones_and_skips(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A draft past its inactivity threshold is tombstoned pre-import.
+
+    ``draft_inactivity`` does not read ``live_refs`` — the rule fires
+    purely on edition kind + age. This test seeds GitHub refs so the
+    binding resolves cleanly, then backdates the LTD draft's
+    ``date_rebuilt`` / ``date_created`` well past the configured
+    inactivity threshold so the proactive evaluator tombstones it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-stale",
+            lifecycle_rules=LifecycleRuleSet(
+                root=[DraftInactivityRule(max_days_inactive=30)]
+            ),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    # Backdate ``date_rebuilt`` and ``date_created`` past the threshold.
+    stale_date = (datetime.now(tz=UTC) - timedelta(days=60)).isoformat()
+    draft_payload["date_rebuilt"] = stale_date
+    draft_payload["date_created"] = stale_date
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main", "u/jsick/feature"],
+        tags=[],
+    )
+    draft_build_route = mock_discovery.get(f"{LTD_BASE}/builds/43")
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Only the main edition produced an outcome.
+    assert len(result.edition_outcomes) == 1
+    assert result.edition_outcomes[0].docverse_slug == "__main"
+    assert draft_build_route.call_count == 0
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        tombstone = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert tombstone is not None
+        assert tombstone.tombstone_reason == (
+            TombstoneReason.lifecycle_preemptive.value
+        )
+
+
+@pytest.mark.asyncio
+async def test_proactive_keep_proceeds_through_sync_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A draft whose ref still exists is NOT tombstoned and syncs normally.
+
+    ``RefDeletedRule`` is configured. GitHub lists the draft's branch
+    as live, so the proactive evaluator returns KEEP and the regular
+    ``sync_edition`` flow imports the edition + build.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-keep",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    draft_payload["tracked_refs"] = ["u/jsick/feature"]
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main", "u/jsick/feature"],
+        tags=[],
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Both editions produced outcomes — the draft was kept and synced.
+    assert len(result.edition_outcomes) == 2
+    outcome_slugs = {o.docverse_slug for o in result.edition_outcomes}
+    assert "__main" in outcome_slugs
+    assert "u-jsick-feature" in outcome_slugs
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        draft = await edition_store.get_by_slug(
+            project_id=project.id, slug="u-jsick-feature"
+        )
+        assert draft is not None
+        # No tombstone for the kept edition.
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert state is not None
+        assert state.date_tombstoned is None
+
+
+@pytest.mark.asyncio
+async def test_proactive_build_history_orphan_never_fires(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """``build_history_orphan`` is excluded from the proactive filter.
+
+    Even when configured on the org, the rule must NOT fire during
+    ``sync_project`` — it matches against the Docverse build-history
+    chain that does not exist until import, and is owned by the
+    post-import ``lifecycle_eval`` pass. The draft edition syncs
+    normally despite the rule being configured.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-orphan",
+            lifecycle_rules=LifecycleRuleSet(
+                root=[BuildHistoryOrphanRule(min_position=1, min_age_days=0)]
+            ),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+        tags=[],
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Both editions synced; no tombstone written.
+    assert len(result.edition_outcomes) == 2
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        draft_state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert draft_state is not None
+        assert draft_state.date_tombstoned is None
+
+
+@pytest.mark.asyncio
+async def test_proactive_fetch_failure_disables_ref_deleted_only(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A 500 from GitHub falls through to KEEP; editions sync normally.
+
+    The proactive evaluator's ``RepositoryRefFetchError`` handling
+    leaves ``live_refs`` unset, which disables ``ref_deleted`` for
+    this project pass. The draft tracking a ref that would otherwise
+    look deleted is therefore kept (and synced); the regular
+    ``git_ref_audit`` cron catches up later if needed.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-fetch-fail",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    draft_payload["tracked_refs"] = ["tickets/DM-anything"]
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    # 500 on the heads endpoint → RepositoryRefFetchError → live_refs
+    # stays unset → ref_deleted disabled.
+    mock_github.router.get(
+        f"{GITHUB_API_BASE_URL}/repos/{_LSST_OWNER}/{_LSST_REPO}"
+        "/git/matching-refs/heads"
+    ).mock(return_value=httpx.Response(500, json={"message": "boom"}))
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Both editions synced — fetch failure did not abort the pass.
+    assert len(result.edition_outcomes) == 2
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        draft_state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert draft_state is not None
+        assert draft_state.date_tombstoned is None
+
+
+@pytest.mark.asyncio
+async def test_proactive_no_binding_skips_fetch_and_syncs(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A project with no GitHub binding skips the fetch entirely.
+
+    Substitutes a non-GitHub ``doc_repo`` (parses to ``None`` via
+    ``parse_github_url``) so the resolved binding is ``None``. The
+    proactive evaluator must not call GitHub for that project; the
+    ``ref_deleted`` rule simply does not fire and editions sync
+    normally.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-no-binding",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    product_payload = _load("product_pipelines.json")
+    product_payload["doc_repo"] = "https://gitlab.example.com/lsst/pipelines"
+    draft_payload = _load("edition_branch_git_refs.json")
+    draft_payload["tracked_refs"] = ["tickets/DM-anything"]
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=product_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=draft_payload)
+    )
+    draft_build = _load("build.json")
+    draft_build["self_url"] = f"{LTD_BASE}/builds/43"
+    draft_build["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=draft_build)
+    )
+    # Seed the GitHub refs endpoints so we can prove they were NOT
+    # called by the proactive evaluator (the project has no GitHub
+    # binding, so no resolve / fetch happens).
+    heads_route, tags_route = _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+        tags=[],
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_outcomes) == 2
+    # GitHub endpoints were never called.
+    assert heads_route.call_count == 0
+    assert tags_route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_proactive_ref_set_fetched_once_per_sync_project(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """The ref set is fetched exactly once even with many editions.
+
+    Seeds five LTD editions (one main + four drafts); the GitHub
+    matching-refs endpoints must each be hit exactly once across the
+    whole ``sync_project`` invocation, demonstrating the per-project
+    cache the PRD calls out for GitHub API budget reasons.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-once",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    edition_urls = [f"{LTD_BASE}/editions/{i}" for i in range(1, 6)]
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(200, json={"editions": edition_urls})
+    )
+    # main → /editions/1, /builds/42
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+    }
+    # Four drafts, each on its own ref; all four refs are live so they
+    # KEEP and proceed to sync_edition.
+    for i, ref in enumerate(["feat-a", "feat-b", "feat-c", "feat-d"], start=2):
+        draft_payload = _load("edition_branch_git_refs.json")
+        draft_payload["self_url"] = f"{LTD_BASE}/editions/{i}"
+        draft_payload["slug"] = f"u-jsick-{ref}"
+        draft_payload["title"] = f"u/jsick/{ref}"
+        draft_payload["tracked_refs"] = [ref]
+        build_id = 100 + i
+        draft_payload["build_url"] = f"{LTD_BASE}/builds/{build_id}"
+        mock_discovery.get(f"{LTD_BASE}/editions/{i}").mock(
+            return_value=httpx.Response(200, json=draft_payload)
+        )
+        draft_build = _load("build.json")
+        draft_build["self_url"] = f"{LTD_BASE}/builds/{build_id}"
+        draft_build["bucket_root_dir"] = f"pipelines/builds/{build_id}"
+        mock_discovery.get(f"{LTD_BASE}/builds/{build_id}").mock(
+            return_value=httpx.Response(200, json=draft_build)
+        )
+        source_objects[f"pipelines/builds/{build_id}/index.html"] = (
+            f"<html>{ref}</html>".encode()
+        )
+
+    heads_route, tags_route = _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main", "feat-a", "feat-b", "feat-c", "feat-d"],
+        tags=[],
+    )
+
+    object_store = MockObjectStore()
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # All five editions synced.
+    assert len(result.edition_outcomes) == 5
+    # GitHub refs endpoints each hit exactly once.
+    assert heads_route.call_count == 1
+    assert tags_route.call_count == 1

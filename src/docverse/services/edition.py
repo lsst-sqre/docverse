@@ -18,6 +18,7 @@ from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import TombstoneReason
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import EditionBuildHistoryPositionCursor
 from docverse.storage.project_store import ProjectStore
@@ -431,30 +432,42 @@ class EditionService:
         return org, project, updated_edition
 
     async def soft_delete(
-        self, *, org_slug: str, project_slug: str, slug: str
-    ) -> Organization:
-        """Soft-delete an edition.
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        edition_id: int,
+        edition_slug: str,
+        reason: TombstoneReason,
+    ) -> bool:
+        """Soft-delete one edition and stamp the keeper-sync tombstone.
 
-        Returns the resolved :class:`Organization` so the caller can
-        invoke downstream side-effects (e.g. CDN unpublish) keyed on
-        ``org_id`` without re-resolving the slug.
+        The single, id-based entrypoint shared by every Docverse-side
+        deletion path (PRD #332): the API DELETE handler, the
+        ``lifecycle_eval`` and ``git_ref_audit`` workers, and the
+        ``ref_deleted`` webhook processor. The ``reason`` is threaded
+        through to :meth:`EditionStore.soft_delete`, which records it
+        on the matching ``keeper_sync_state`` row in the same flush as
+        ``date_deleted`` (no-op when no state row exists).
 
-        Raises
-        ------
-        NotFoundError
-            If the edition is not found.
+        Returns ``False`` when the edition was not found / already
+        soft-deleted so bulk callers iterating a candidate set can
+        treat it as a no-op and continue; the handler raises
+        :class:`NotFoundError` on ``False``.
         """
-        org, project = await self._resolve_org_project(org_slug, project_slug)
         deleted = await self._store.soft_delete(
-            project_id=project.id, slug=slug
+            org_id=org_id,
+            project_id=project_id,
+            slug=edition_slug,
+            reason=reason,
         )
-        if not deleted:
-            msg = f"Edition {slug!r} not found"
-            raise NotFoundError(msg)
-        self._logger.info(
-            "Soft-deleted edition",
-            slug=slug,
-            org=org_slug,
-            project=project_slug,
-        )
-        return org
+        if deleted:
+            self._logger.info(
+                "Soft-deleted edition",
+                org_id=org_id,
+                project_id=project_id,
+                edition_id=edition_id,
+                edition_slug=edition_slug,
+                reason=reason.value,
+            )
+        return deleted

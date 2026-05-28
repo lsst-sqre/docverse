@@ -18,6 +18,7 @@ from docverse.domain.organization import Organization
 from docverse.domain.project import Project
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.edition_store import EditionStore
+from docverse.storage.keeper_sync import TombstoneReason
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.pagination import ProjectSearchCursor
 from docverse.storage.project_store import ProjectStore
@@ -266,7 +267,11 @@ class ProjectService:
             raise NotFoundError(msg)
         editions = await self._edition_store.list_all_by_project(project.id)
         edition_slugs = [e.slug for e in editions]
-        deleted = await self._store.soft_delete(org_id=org.id, slug=slug)
+        deleted = await self._store.soft_delete(
+            org_id=org.id,
+            slug=slug,
+            reason=TombstoneReason.manual_delete,
+        )
         if not deleted:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)

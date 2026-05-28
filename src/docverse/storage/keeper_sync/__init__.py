@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from .state_store import KeeperSyncState, KeeperSyncStateStore, ResourceType
+from .state_store import (
+    KeeperSyncState,
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 
 __all__ = [
     "KeeperSyncState",
     "KeeperSyncStateStore",
     "ResourceType",
+    "TombstoneReason",
 ]

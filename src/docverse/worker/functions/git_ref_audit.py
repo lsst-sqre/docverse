@@ -59,6 +59,7 @@ from docverse.storage.github import (
     RepositoryRefFetchError,
     RepositoryRefSet,
 )
+from docverse.storage.keeper_sync import TombstoneReason
 
 __all__ = ["git_ref_audit"]
 
@@ -353,7 +354,7 @@ async def _apply_deletions(  # noqa: PLR0913
         e.id: e for editions in editions_by_project.values() for e in editions
     }
     async with session.begin():
-        edition_store = factory.create_edition_store()
+        edition_service = factory.create_edition_service()
         publishing_service = factory.create_edition_publishing_service()
         for project in projects:
             matched_ids = matches_by_project.get(project.id)
@@ -364,8 +365,12 @@ async def _apply_deletions(  # noqa: PLR0913
                 edition = editions_index.get(edition_id)
                 if edition is None:
                     continue
-                deleted = await edition_store.soft_delete(
-                    project_id=project.id, slug=edition.slug
+                deleted = await edition_service.soft_delete(
+                    org_id=org_id,
+                    project_id=project.id,
+                    edition_id=edition.id,
+                    edition_slug=edition.slug,
+                    reason=TombstoneReason.lifecycle_delete,
                 )
                 if not deleted:
                     continue

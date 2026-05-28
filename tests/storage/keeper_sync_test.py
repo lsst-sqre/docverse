@@ -228,3 +228,41 @@ async def test_keeper_sync_state_resource_type_check_rejects_invalid(
                     ltd_slug="g-99",
                 )
             )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_state_tombstone_reason_check_rejects_invalid(
+    db_session: AsyncSession,
+) -> None:
+    """A ``tombstone_reason`` outside the allowed set fails the CHECK."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-check")
+
+    with pytest.raises(IntegrityError):
+        async with db_session.begin():
+            db_session.add(
+                SqlKeeperSyncState(
+                    org_id=org_id,
+                    resource_type="edition",
+                    ltd_id=1,
+                    ltd_slug="main",
+                    tombstone_reason="garbage",
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_state_tombstone_reason_check_allows_null(
+    db_session: AsyncSession,
+) -> None:
+    """``tombstone_reason=NULL`` (the not-tombstoned default) is accepted."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-check-null")
+        db_session.add(
+            SqlKeeperSyncState(
+                org_id=org_id,
+                resource_type="edition",
+                ltd_id=1,
+                ltd_slug="main",
+            )
+        )

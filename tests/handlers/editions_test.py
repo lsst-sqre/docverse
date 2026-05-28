@@ -25,6 +25,7 @@ from docverse.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
+from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
@@ -244,6 +245,74 @@ async def test_delete_edition_unpublishes_from_cdn(
     call = mock_publisher.unpublish_calls[0]
     assert call.project_slug == "ed-proj"
     assert call.edition_slug == "cdn-del"
+
+
+@pytest.mark.asyncio
+async def test_delete_edition_writes_manual_delete_tombstone(
+    client: AsyncClient,
+) -> None:
+    """DELETE handler stamps a ``manual_delete`` tombstone on the row."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "tomb-ed",
+            "title": "Tomb Me",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    # Seed a matching keeper_sync_state row for this edition so the
+    # tombstone write at the chokepoint has a target to stamp.
+    logger = structlog.get_logger("test")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            project_store = ProjectStore(session=session, logger=logger)
+            edition_store = EditionStore(session=session, logger=logger)
+            org = await org_store.get_by_slug("ed-org")
+            assert org is not None
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug="ed-proj"
+            )
+            assert project is not None
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="tomb-ed"
+            )
+            assert edition is not None
+            state_store = KeeperSyncStateStore(session=session, logger=logger)
+            await state_store.upsert(
+                org_id=org.id,
+                resource_type=ResourceType.edition,
+                ltd_id=33001,
+                ltd_slug="tomb-ed",
+                docverse_id=edition.id,
+            )
+            await session.commit()
+
+    response = await client.delete(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/tomb-ed",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug("ed-org")
+            assert org is not None
+            state_store = KeeperSyncStateStore(session=session, logger=logger)
+            state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.edition,
+                ltd_id=33001,
+                include_tombstoned=True,
+            )
+    assert state is not None
+    assert state.date_tombstoned is not None
+    assert state.tombstone_reason == "manual_delete"
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ __all__ = [
     "InvalidBuildStateError",
     "InvalidJobStateError",
     "JobNotFoundError",
+    "KeeperSyncInvariantError",
     "MissingConfigurationError",
     "NotFoundError",
     "PermissionDeniedError",
@@ -299,3 +300,20 @@ class JobNotFoundError(DocverseSlackException):
         if job_public_id is not None:
             return f"Queue job {job_public_id} not found"
         return "Queue job not found"
+
+
+class KeeperSyncInvariantError(DocverseSlackException):
+    """An internal keeper-sync invariant was violated.
+
+    Raised by "should never happen" guards on the keeper-sync sync and
+    tombstone paths (composing a tombstone response from a row that is
+    not tombstoned, a state row vanishing mid-transaction, or
+    ``_fetch_live_refs`` invoked without its GitHub collaborators
+    configured). Replaces bare ``assert`` statements so the invariant
+    still fails loudly under ``python -O``.
+
+    No ``to_sentry`` override: the stack trace plus the free-form
+    ``message`` is enough to triage, and the only identifiers in scope
+    (``state_id``, ``org_id``) are internal row ids that must not be
+    surfaced as Sentry tags. Mirrors :class:`InvalidSlugError`.
+    """

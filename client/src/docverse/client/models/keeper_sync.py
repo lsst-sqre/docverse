@@ -17,6 +17,7 @@ __all__ = [
     "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncProjectStateSummary",
     "KeeperSyncProjectStatus",
+    "KeeperSyncResourceType",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
     "KeeperSyncRunKind",
@@ -24,6 +25,8 @@ __all__ = [
     "KeeperSyncTierCohort",
     "KeeperSyncTierName",
     "KeeperSyncTierStatus",
+    "KeeperSyncTombstone",
+    "KeeperSyncTombstoneReason",
 ]
 
 
@@ -467,4 +470,135 @@ class KeeperSyncProjectRefreshAccepted(BaseModel):
 
     queue_job_url: HttpUrl = Field(
         description="URL of the enqueued queue job resource."
+    )
+
+
+class KeeperSyncResourceType(StrEnum):
+    """LTD resource types tracked by keeper-sync.
+
+    Mirrors :class:`docverse.storage.keeper_sync.ResourceType` as a
+    public wire value so the admin tombstone API can filter requests
+    and shape responses without leaking the server-side enum's import
+    path. Builds are not tombstoned today, but the value is kept so
+    operator-facing filters do not silently reject a valid resource
+    type the schema otherwise carries.
+    """
+
+    project = "project"
+    edition = "edition"
+    build = "build"
+
+
+class KeeperSyncTombstoneReason(StrEnum):
+    """Why a ``keeper_sync_state`` row was tombstoned.
+
+    Wire-stable enum surfaced by the admin tombstone API. Mirrors
+    :class:`docverse.storage.keeper_sync.TombstoneReason`.
+    """
+
+    manual_delete = "manual_delete"
+    """Operator-driven soft-delete of the Docverse-side resource."""
+
+    lifecycle_delete = "lifecycle_delete"
+    """Automated soft-delete by ``lifecycle_eval`` / ``git_ref_audit`` /
+    the ``ref_deleted`` webhook."""
+
+    lifecycle_preemptive = "lifecycle_preemptive"
+    """Sync itself short-circuited an LTD edition that the lifecycle
+    rules would immediately delete, before the build content was
+    copied. No matching Docverse row exists in this case."""
+
+
+class KeeperSyncTombstone(BaseModel):
+    """One tombstoned ``keeper_sync_state`` row.
+
+    Returned by ``GET /orgs/{org}/keeper-sync/tombstones`` and
+    ``DELETE /orgs/{org}/keeper-sync/tombstones/{state_id}`` (the
+    DELETE returns 204 with no body, so this model only appears on
+    list responses today; keeping it as a sibling of the list-entry
+    shape lets a future "get one tombstone" endpoint reuse it).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    self_url: HttpUrl = Field(
+        description=(
+            "Canonical URL of the DELETE endpoint that would clear this"
+            " tombstone (``delete_org_keeper_sync_tombstone``). The"
+            " endpoint accepts only ``DELETE``; GET-on-self is not"
+            " modelled because the list response already carries every"
+            " field a single-tombstone fetch would return."
+        )
+    )
+
+    state_id: int = Field(
+        description=(
+            "Primary key of the underlying ``keeper_sync_state`` row."
+            " Use this id with the DELETE endpoint to clear the"
+            " tombstone."
+        )
+    )
+
+    resource_type: KeeperSyncResourceType = Field(
+        description=(
+            "LTD resource type the tombstone applies to. ``project``"
+            " vetoes re-import of the LTD product entirely; ``edition``"
+            " vetoes one specific LTD edition; ``build`` is reserved"
+            " (no caller writes build-level tombstones today)."
+        )
+    )
+
+    ltd_slug: str = Field(
+        description=(
+            "LTD-side slug for the tombstoned resource. For ``project``"
+            " rows this is the LTD product slug; for ``edition`` rows"
+            " it is the LTD edition slug (e.g. ``main`` or ``v1.0``)."
+        )
+    )
+
+    ltd_id: int | None = Field(
+        default=None,
+        description=(
+            "LTD-side numeric id for the tombstoned resource."
+            " Populated for ``edition`` and ``build`` rows; ``null``"
+            " for ``project`` rows (LTD products are slug-only)."
+        ),
+    )
+
+    docverse_id: int | None = Field(
+        default=None,
+        description=(
+            "Docverse-side row id the tombstone is paired to."
+            " ``null`` for ``lifecycle_preemptive`` rows that veto an"
+            " LTD edition that was never imported (so no Docverse row"
+            " exists)."
+        ),
+    )
+
+    date_tombstoned: datetime = Field(
+        description="Wall-clock time the tombstone was recorded."
+    )
+
+    tombstone_reason: KeeperSyncTombstoneReason = Field(
+        description="Why this row was tombstoned."
+    )
+
+    tombstone_note: str | None = Field(
+        default=None,
+        description=(
+            "Optional operator-facing note the writer attached to this"
+            " tombstone. ``null`` for automated writes (lifecycle and"
+            " preemptive paths attach no note today)."
+        ),
+    )
+
+    display_path: str = Field(
+        description=(
+            "Docverse-side display path for the tombstoned resource."
+            " For ``project`` rows: the Docverse project slug. For"
+            " ``edition`` rows: ``<project_slug>/<edition_slug>``."
+            " Falls back to the LTD slug when no Docverse row is"
+            " linked (``lifecycle_preemptive`` rows) or the linked"
+            " row has been hard-deleted out from under the tombstone."
+        )
     )

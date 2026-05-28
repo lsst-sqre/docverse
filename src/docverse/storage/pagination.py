@@ -38,6 +38,7 @@ __all__ = [
     "KEEPER_SYNC_EDITION_CURSOR_TYPE",
     "KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE",
     "KEEPER_SYNC_RUN_CURSOR_TYPE",
+    "KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE",
     "MAX_PAGE_LIMIT",
     "PROJECT_CURSOR_TYPES",
     "QUEUE_JOB_CURSOR_TYPE",
@@ -50,6 +51,7 @@ __all__ = [
     "KeeperSyncEditionSlugCursor",
     "KeeperSyncProjectStateIdCursor",
     "KeeperSyncRunDateStartedCursor",
+    "KeeperSyncStateDateTombstonedCursor",
     "ProjectDateCreatedCursor",
     "ProjectSearchCursor",
     "ProjectSlugCursor",
@@ -454,6 +456,50 @@ class KeeperSyncRunDateStartedCursor(_TzAwareDatetimeIdCursor[KeeperSyncRun]):
 
 
 @dataclass(slots=True)
+class KeeperSyncStateDateTombstonedCursor(
+    _TzAwareDatetimeIdCursor[KeeperSyncState]
+):
+    """Keyset cursor for tombstoned ``keeper_sync_state`` rows.
+
+    Orders by ``date_tombstoned DESC, id DESC`` so the admin
+    ``GET /orgs/{org}/keeper-sync/tombstones`` view surfaces the
+    most-recently tombstoned rows first — the operator-facing "what was
+    just deleted?" expectation. Unlike
+    :class:`KeeperSyncProjectStateIdCursor` (id DESC, discovery order),
+    a tombstone stamped *today* on a long-standing low-id row sorts to
+    the top rather than the bottom.
+
+    Only rows with a non-null ``date_tombstoned`` are paginated with
+    this cursor — the tombstone listing query filters them in — so
+    :meth:`from_entry` treats a missing timestamp as a programming
+    error rather than guessing a sort position.
+    """
+
+    @staticmethod
+    @override
+    def id_column() -> InstrumentedAttribute[int]:
+        return SqlKeeperSyncState.id
+
+    @staticmethod
+    @override
+    def time_column() -> InstrumentedAttribute[datetime | None]:
+        return SqlKeeperSyncState.date_tombstoned
+
+    @override
+    @classmethod
+    def from_entry(
+        cls, entry: KeeperSyncState, *, reverse: bool = False
+    ) -> Self:
+        if entry.date_tombstoned is None:
+            msg = (
+                "KeeperSyncState row has no date_tombstoned; cannot build "
+                "a tombstone cursor for a non-tombstoned row"
+            )
+            raise ValueError(msg)
+        return cls(time=entry.date_tombstoned, id=entry.id, previous=reverse)
+
+
+@dataclass(slots=True)
 class QueueJobDateCreatedCursor(_TzAwareDatetimeIdCursor[QueueJob]):
     """Keyset cursor for queue jobs ordered by date_created DESC, id DESC."""
 
@@ -568,6 +614,10 @@ KEEPER_SYNC_RUN_CURSOR_TYPE: type[KeeperSyncRunDateStartedCursor] = (
 KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE: type[KeeperSyncProjectStateIdCursor] = (
     KeeperSyncProjectStateIdCursor
 )
+
+KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE: type[
+    KeeperSyncStateDateTombstonedCursor
+] = KeeperSyncStateDateTombstonedCursor
 
 QUEUE_JOB_CURSOR_TYPE: type[QueueJobDateCreatedCursor] = (
     QueueJobDateCreatedCursor

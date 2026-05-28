@@ -16,11 +16,19 @@ from docverse.client.models import (
 from docverse.client.models import (
     KeeperSyncProjectStatus as _KeeperSyncProjectStatusBase,
 )
+from docverse.client.models import (
+    KeeperSyncResourceType,
+    KeeperSyncRunKind,
+    KeeperSyncRunStatus,
+    KeeperSyncTombstoneReason,
+)
 from docverse.client.models import KeeperSyncRun as _KeeperSyncRunBase
 from docverse.client.models import (
     KeeperSyncRunCreated as _KeeperSyncRunCreatedBase,
 )
-from docverse.client.models import KeeperSyncRunKind, KeeperSyncRunStatus
+from docverse.client.models import (
+    KeeperSyncTombstone as _KeeperSyncTombstoneBase,
+)
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.edition import Edition as EditionDomain
 from docverse.domain.keeper_sync_run import (
@@ -30,6 +38,7 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunActivity as KeeperSyncRunActivityDomain,
 )
 from docverse.domain.queue import QueueJob as QueueJobDomain
+from docverse.exceptions import KeeperSyncInvariantError
 from docverse.services.keeper_sync_project import KeeperSyncProjectStatusResult
 from docverse.storage.keeper_sync import KeeperSyncState
 
@@ -39,6 +48,7 @@ __all__ = [
     "KeeperSyncProjectStatus",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
+    "KeeperSyncTombstone",
 ]
 
 
@@ -238,4 +248,51 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
             tier_status=result.tier_status,
             main_edition=main_edition,
             edition_diff=result.edition_diff,
+        )
+
+
+class KeeperSyncTombstone(_KeeperSyncTombstoneBase):
+    """Tombstone entry wrapper minting the HATEOAS DELETE URL."""
+
+    @classmethod
+    def from_domain(
+        cls,
+        state: KeeperSyncState,
+        display_path: str,
+        request: Request,
+        org_slug: str,
+    ) -> Self:
+        """Compose the entry from a state row + derived display path.
+
+        ``state.date_tombstoned`` and ``state.tombstone_reason`` must
+        be non-null — the caller (admin list endpoint) only invokes
+        this for tombstoned rows. The guard below enforces that
+        invariant at runtime and narrows both fields for static
+        analysis.
+        """
+        if state.date_tombstoned is None or state.tombstone_reason is None:
+            msg = (
+                "KeeperSyncTombstone.from_domain requires a tombstoned "
+                f"state row; state_id={state.id} has no tombstone"
+            )
+            raise KeeperSyncInvariantError(msg)
+        return cls(
+            self_url=HttpUrl(
+                str(
+                    request.url_for(
+                        "delete_org_keeper_sync_tombstone",
+                        org=org_slug,
+                        state_id=state.id,
+                    )
+                )
+            ),
+            state_id=state.id,
+            resource_type=KeeperSyncResourceType(state.resource_type),
+            ltd_slug=state.ltd_slug,
+            ltd_id=state.ltd_id,
+            docverse_id=state.docverse_id,
+            date_tombstoned=state.date_tombstoned,
+            tombstone_reason=KeeperSyncTombstoneReason(state.tombstone_reason),
+            tombstone_note=state.tombstone_note,
+            display_path=display_path,
         )

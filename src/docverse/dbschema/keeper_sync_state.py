@@ -72,6 +72,18 @@ class SqlKeeperSyncState(Base):
         JSONB, nullable=True
     )
 
+    date_tombstoned: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    tombstone_reason: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
+    tombstone_note: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )
+
     __table_args__ = (
         Index(
             "uq_keeper_sync_state_project_org_slug",
@@ -92,5 +104,23 @@ class SqlKeeperSyncState(Base):
             "resource_type IN ('project', 'edition', 'build')",
             name="ck_keeper_sync_state_resource_type",
         ),
+        CheckConstraint(
+            "tombstone_reason IS NULL OR tombstone_reason IN "
+            "('manual_delete', 'lifecycle_delete', 'lifecycle_preemptive')",
+            name="ck_keeper_sync_state_tombstone_reason",
+        ),
         Index("idx_keeper_sync_state_org_id", "org_id"),
+        # Backs the admin tombstones listing
+        # (``GET /orgs/{org}/keeper-sync/tombstones``), which filters to
+        # one org's tombstoned rows and orders by ``date_tombstoned DESC,
+        # id DESC``. The ``WHERE date_tombstoned IS NOT NULL`` predicate
+        # keeps the index to just tombstoned rows — the rare case — and
+        # PostgreSQL scans the ``date_tombstoned`` key backward to serve
+        # the DESC ordering, so no explicit DESC modifier is needed.
+        Index(
+            "idx_keeper_sync_state_org_date_tombstoned",
+            "org_id",
+            "date_tombstoned",
+            postgresql_where=text("date_tombstoned IS NOT NULL"),
+        ),
     )
