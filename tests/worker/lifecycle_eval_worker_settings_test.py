@@ -15,6 +15,7 @@ from arq.worker import Function
 
 from docverse.config import Configuration
 from docverse.worker.functions import (
+    dashboard_build_reaper,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
     lifecycle_reaper,
@@ -150,6 +151,63 @@ def test_lifecycle_reaper_runs_every_thirty_minutes() -> None:
     ]
     assert len(reaper_crons) == 1
     assert reaper_crons[0].minute == {0, 30}
+
+
+def test_dashboard_build_reaper_registered_as_function() -> None:
+    """``dashboard_build_reaper`` is registered on the lifecycle pool.
+
+    Per PRD #367 §"Pool placement" the four main-pool kind reapers
+    register on the existing :class:`LifecycleEvalWorkerSettings` arq
+    pool so reaper sweeps never compete with build processing or
+    user-triggered dashboard rebuilds for worker capacity.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in LifecycleEvalWorkerSettings.functions
+    }
+    assert dashboard_build_reaper in underlying
+
+
+def test_dashboard_build_reaper_runs_every_fifteen_minutes() -> None:
+    """The dashboard_build reaper cron fires on minute 0, 15, 30 and 45.
+
+    ``dashboard_build`` is the only main-pool kind whose wedge is
+    directly user-visible (the 409 on ``POST /dashboard/rebuild``),
+    so PRD #367 picks a tighter 15-minute cadence — worst-case
+    wall-clock recovery time stays under ~45 minutes from the moment
+    a worker silently dies.
+    """
+    cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is dashboard_build_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {0, 15, 30, 45}
+
+
+def test_default_worker_does_not_register_dashboard_build_reaper() -> None:
+    """The default queue stays free of the dashboard_build reaper.
+
+    The reaper lives exclusively on the lifecycle pool so cron-driven
+    maintenance work never contends with the operator-triggered
+    ``dashboard_build`` job itself on the default pool.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert dashboard_build_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert dashboard_build_reaper not in coroutines
 
 
 def test_default_worker_does_not_register_lifecycle_functions() -> None:

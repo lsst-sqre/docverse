@@ -2,6 +2,7 @@
 
 from .build_processing import build_processing
 from .dashboard_build import dashboard_build
+from .dashboard_build_reaper import dashboard_build_reaper
 from .dashboard_sync import dashboard_sync
 from .git_ref_audit import git_ref_audit
 from .git_ref_audit_discovery import git_ref_audit_discovery
@@ -23,6 +24,7 @@ from .publish_edition import publish_edition
 __all__ = [
     "build_processing",
     "dashboard_build",
+    "dashboard_build_reaper",
     "dashboard_sync",
     "git_ref_audit",
     "git_ref_audit_discovery",

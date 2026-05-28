@@ -1528,3 +1528,278 @@ async def test_fail_orphaned_lifecycle_eval_jobs_skips_started_rows(
         await db_session.commit()
 
     assert failed == []
+
+
+# ---------------------------------------------------------------------
+# dashboard_build reaper helpers (PRD #367)
+# ---------------------------------------------------------------------
+
+
+async def _seed_dashboard_build_row(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    status: JobStatus,
+    backend_job_id: str | None,
+    date_started: datetime | None = None,
+    date_created_offset: timedelta | None = None,
+) -> int:
+    """Insert one ``kind='dashboard_build'`` row with explicit timestamps.
+
+    Sibling of :func:`_seed_lifecycle_eval_row` for the
+    dashboard-build reaper's storage tests: drives every field the
+    sweep predicates consult so the assertions are unambiguous.
+    """
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        backend_job_id=backend_job_id,
+        kind=JobKind.dashboard_build.value,
+        status=status.value,
+        org_id=org_id,
+        date_started=date_started,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    if date_created_offset is not None:
+        row.date_created = datetime.now(tz=UTC) - date_created_offset
+        await db_session.flush()
+    return row.id
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_dashboard_build_jobs_reaps_old_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` dashboard_build row past the threshold is failed."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-reap-1")
+        stuck_id = await _seed_dashboard_build_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id="arq-db-stuck",
+            date_started=datetime.now(tz=UTC) - timedelta(hours=1),
+        )
+
+        reaped = await store.fail_silent_dashboard_build_jobs(
+            idle_after=timedelta(minutes=30)
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 1
+    assert reaped[0].id == stuck_id
+    assert reaped[0].status == JobStatus.failed
+    assert reaped[0].errors is not None
+    assert reaped[0].errors["type"] == "SilentWorker"
+    assert reaped[0].date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_dashboard_build_jobs_skips_recent(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` row within the idle window is left alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-reap-2")
+        await _seed_dashboard_build_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id="arq-db-fresh",
+            date_started=datetime.now(tz=UTC),
+        )
+
+        reaped = await store.fail_silent_dashboard_build_jobs(
+            idle_after=timedelta(minutes=30)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_dashboard_build_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Other ``kind`` values with the same staleness shape stay untouched.
+
+    Cross-kind scoping: an ``in_progress`` row past the threshold of
+    every other main-pool kind (plus ``lifecycle_eval``) must be left
+    alone by the dashboard_build sweep. Matches PRD #367 "Testing
+    Decisions" — cross-kind scoping.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-reap-3")
+        other_kinds = [
+            JobKind.publish_edition,
+            JobKind.build_processing,
+            JobKind.dashboard_sync,
+            JobKind.lifecycle_eval,
+        ]
+        for idx, kind in enumerate(other_kinds):
+            unrelated = await store.create(
+                kind=kind,
+                org_id=org_id,
+                backend_job_id=f"arq-other-{idx}",
+            )
+            await store.start(unrelated.id)
+            row = await db_session.get(SqlQueueJob, unrelated.id)
+            assert row is not None
+            row.date_started = datetime.now(tz=UTC) - timedelta(hours=1)
+            await db_session.flush()
+
+        reaped = await store.fail_silent_dashboard_build_jobs(
+            idle_after=timedelta(minutes=30)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_silent_dashboard_build_jobs_skips_queued_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Status respect: silent sweep ignores ``queued`` rows.
+
+    The orphan sweep owns ``queued`` rows; the silent sweep is
+    confined to ``in_progress``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-reap-4")
+        await _seed_dashboard_build_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=timedelta(hours=1),
+        )
+
+        reaped = await store.fail_silent_dashboard_build_jobs(
+            idle_after=timedelta(minutes=30)
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_dashboard_build_jobs_reaps_old_orphan(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A ``queued`` dashboard_build row with no ``backend_job_id`` fails."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-orphan-1")
+        orphan_id = await _seed_dashboard_build_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=timedelta(minutes=10),
+        )
+
+        failed = await store.fail_orphaned_dashboard_build_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert len(failed) == 1
+    assert failed[0].id == orphan_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "OrphanedQueueJob"
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_dashboard_build_jobs_skips_rows_with_backend_id(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row that already has a backend_job_id is not an orphan."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-orphan-2")
+        await _seed_dashboard_build_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-db-enqueued",
+            date_created_offset=timedelta(minutes=30),
+        )
+
+        failed = await store.fail_orphaned_dashboard_build_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_dashboard_build_jobs_skips_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An ``in_progress`` row is not an orphan; silent sweep owns it."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-orphan-3")
+        await _seed_dashboard_build_row(
+            db_session,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=None,
+            date_started=datetime.now(tz=UTC) - timedelta(hours=1),
+            date_created_offset=timedelta(minutes=30),
+        )
+
+        failed = await store.fail_orphaned_dashboard_build_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_orphaned_dashboard_build_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Cross-kind scoping for the orphan sweep.
+
+    A ``queued`` row of every other main-pool kind plus
+    ``lifecycle_eval`` with no ``backend_job_id`` past the idle
+    window must be left alone by the dashboard_build orphan sweep.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="dbr-orphan-4")
+        other_kinds = [
+            JobKind.publish_edition,
+            JobKind.build_processing,
+            JobKind.dashboard_sync,
+            JobKind.lifecycle_eval,
+        ]
+        for idx, kind in enumerate(other_kinds):
+            row = SqlQueueJob(
+                public_id=validate_base32_id(generate_base32_id()),
+                backend_job_id=None,
+                kind=kind.value,
+                status=JobStatus.queued.value,
+                org_id=org_id,
+                subject_label=f"orphan-{idx}",
+            )
+            db_session.add(row)
+            await db_session.flush()
+            row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
+            await db_session.flush()
+
+        failed = await store.fail_orphaned_dashboard_build_jobs(
+            idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []

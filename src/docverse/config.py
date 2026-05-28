@@ -197,6 +197,27 @@ class Configuration(BaseSettings):
         ),
     )
 
+    dashboard_build_reaper_threshold_seconds: int = Field(
+        1800,
+        title="Dashboard_build stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``dashboard_build``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``dashboard_build_reaper`` fails"
+            " any ``kind='dashboard_build'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed``, releasing the per-project mutex"
+            " ``idx_queue_jobs_dashboard_build_active_uq`` so the"
+            " operator's next ``POST /dashboard/rebuild`` no longer"
+            " returns 409. Mirrors"
+            " ``lifecycle_reaper_threshold_seconds`` so the operator"
+            " knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
     git_ref_audit_enabled: bool = Field(
         default=False,
         title="Whether the daily git_ref_audit dispatcher fans out work",

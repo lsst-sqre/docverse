@@ -40,6 +40,7 @@ from docverse.storage.github import validate_github_app
 from .functions import (
     build_processing,
     dashboard_build,
+    dashboard_build_reaper,
     dashboard_sync,
     git_ref_audit,
     git_ref_audit_discovery,
@@ -413,6 +414,14 @@ class LifecycleEvalWorkerSettings:
     timeout ever fires; it runs every 30 minutes and sweeps **both**
     ``kind='lifecycle_eval'`` and ``kind='git_ref_audit'`` rows in a
     single transaction.
+
+    The pool also hosts cross-subsystem reaper backstops for the
+    default-pool kinds: ``dashboard_build_reaper`` runs here (PRD
+    #367) so reaper sweeps never compete with build processing or
+    user-triggered dashboard rebuilds for worker capacity. The pool
+    name retains its lifecycle-eval lineage but is no longer scoped
+    to lifecycle work alone; a rename to a maintenance-style
+    identifier is tracked separately.
     """
 
     functions = [
@@ -437,6 +446,7 @@ class LifecycleEvalWorkerSettings:
             max_tries=1,
         ),
         instrument_arq_task(lifecycle_reaper),
+        instrument_arq_task(dashboard_build_reaper),
     ]
     cron_jobs = [
         cron(
@@ -458,6 +468,16 @@ class LifecycleEvalWorkerSettings:
         cron(
             instrument_arq_task(lifecycle_reaper),
             minute={0, 30},
+        ),
+        # ``dashboard_build_reaper`` runs every 15 minutes because
+        # ``dashboard_build`` is the only main-pool kind whose
+        # wedge is user-visible (the 409 on ``POST
+        # /dashboard/rebuild``); the tighter cadence keeps worst-case
+        # wall-clock recovery time under ~45 minutes from the moment
+        # a worker silently dies.
+        cron(
+            instrument_arq_task(dashboard_build_reaper),
+            minute={0, 15, 30, 45},
         ),
     ]
     redis_settings = config.arq_redis_settings
