@@ -218,6 +218,28 @@ class Configuration(BaseSettings):
         ),
     )
 
+    publish_edition_reaper_threshold_seconds: int = Field(
+        14400,
+        title="Publish_edition stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``publish_edition``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``publish_edition_reaper`` fails"
+            " any ``kind='publish_edition'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed`` so an edition does not sit in"
+            " ``publishing`` indefinitely and the CDN does not silently"
+            " stay behind. Defaults to 4 hours — long enough for the"
+            " CDN-publish retry loop to legitimately complete, short"
+            " enough that wedged rows clear the same day. Mirrors"
+            " ``lifecycle_reaper_threshold_seconds`` so the operator"
+            " knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
     git_ref_audit_enabled: bool = Field(
         default=False,
         title="Whether the daily git_ref_audit dispatcher fans out work",

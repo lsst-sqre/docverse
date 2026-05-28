@@ -20,6 +20,7 @@ from .lifecycle_reaper import lifecycle_reaper
 from .ping import ping
 from .project_github_resolve import project_github_resolve
 from .publish_edition import publish_edition
+from .publish_edition_reaper import publish_edition_reaper
 
 __all__ = [
     "build_processing",
@@ -40,4 +41,5 @@ __all__ = [
     "ping",
     "project_github_resolve",
     "publish_edition",
+    "publish_edition_reaper",
 ]

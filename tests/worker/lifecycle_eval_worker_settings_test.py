@@ -19,6 +19,7 @@ from docverse.worker.functions import (
     lifecycle_eval,
     lifecycle_eval_dispatcher,
     lifecycle_reaper,
+    publish_edition_reaper,
 )
 from docverse.worker.functions.lifecycle_eval_dispatcher import (
     LIFECYCLE_EVAL_QUEUE_NAME,
@@ -208,6 +209,62 @@ def test_default_worker_does_not_register_dashboard_build_reaper() -> None:
         if isinstance(job, CronJob)
     }
     assert dashboard_build_reaper not in coroutines
+
+
+def test_publish_edition_reaper_registered_as_function() -> None:
+    """``publish_edition_reaper`` is registered on the lifecycle pool.
+
+    Per PRD #367 §"Pool placement" the four main-pool kind reapers
+    register on the existing :class:`LifecycleEvalWorkerSettings` arq
+    pool so reaper sweeps never compete with build processing or
+    user-triggered ``publish_edition`` jobs for worker capacity.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in LifecycleEvalWorkerSettings.functions
+    }
+    assert publish_edition_reaper in underlying
+
+
+def test_publish_edition_reaper_runs_every_thirty_minutes() -> None:
+    """The publish_edition reaper cron fires on minute 0 and 30.
+
+    A stuck ``publish_edition`` is not directly user-visible (no
+    operator-facing 409), so PRD #367 picks the standard 30-minute
+    cadence shared with the lifecycle and keeper-sync reapers rather
+    than the dashboard_build reaper's tighter 15-minute schedule.
+    """
+    cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is publish_edition_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {0, 30}
+
+
+def test_default_worker_does_not_register_publish_edition_reaper() -> None:
+    """The default queue stays free of the publish_edition reaper.
+
+    The reaper lives exclusively on the lifecycle pool so cron-driven
+    maintenance work never contends with the operator-triggered
+    ``publish_edition`` job itself on the default pool.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert publish_edition_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert publish_edition_reaper not in coroutines
 
 
 def test_default_worker_does_not_register_lifecycle_functions() -> None:

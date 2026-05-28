@@ -56,6 +56,7 @@ from .functions import (
     ping,
     project_github_resolve,
     publish_edition,
+    publish_edition_reaper,
 )
 from .functions.lifecycle_eval_dispatcher import LIFECYCLE_EVAL_QUEUE_NAME
 
@@ -416,12 +417,13 @@ class LifecycleEvalWorkerSettings:
     single transaction.
 
     The pool also hosts cross-subsystem reaper backstops for the
-    default-pool kinds: ``dashboard_build_reaper`` runs here (PRD
-    #367) so reaper sweeps never compete with build processing or
-    user-triggered dashboard rebuilds for worker capacity. The pool
-    name retains its lifecycle-eval lineage but is no longer scoped
-    to lifecycle work alone; a rename to a maintenance-style
-    identifier is tracked separately.
+    default-pool kinds: ``dashboard_build_reaper`` and
+    ``publish_edition_reaper`` run here (PRD #367) so reaper sweeps
+    never compete with build processing or user-triggered dashboard
+    rebuilds for worker capacity. The pool name retains its
+    lifecycle-eval lineage but is no longer scoped to lifecycle work
+    alone; a rename to a maintenance-style identifier is tracked
+    separately.
     """
 
     functions = [
@@ -447,6 +449,7 @@ class LifecycleEvalWorkerSettings:
         ),
         instrument_arq_task(lifecycle_reaper),
         instrument_arq_task(dashboard_build_reaper),
+        instrument_arq_task(publish_edition_reaper),
     ]
     cron_jobs = [
         cron(
@@ -478,6 +481,15 @@ class LifecycleEvalWorkerSettings:
         cron(
             instrument_arq_task(dashboard_build_reaper),
             minute={0, 15, 30, 45},
+        ),
+        # ``publish_edition_reaper`` runs on the standard
+        # ``minute={0, 30}`` cadence shared by the lifecycle and
+        # keeper-sync reapers — a stuck ``publish_edition`` is not
+        # directly user-visible (no 409), so the tighter cadence the
+        # ``dashboard_build`` reaper uses is not warranted.
+        cron(
+            instrument_arq_task(publish_edition_reaper),
+            minute={0, 30},
         ),
     ]
     redis_settings = config.arq_redis_settings
