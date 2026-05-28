@@ -240,6 +240,29 @@ class Configuration(BaseSettings):
         ),
     )
 
+    build_processing_reaper_threshold_seconds: int = Field(
+        28800,
+        title="Build_processing stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``build_processing``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``build_processing_reaper`` fails"
+            " any ``kind='build_processing'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed`` so an uploaded build does not stay"
+            " unregistered indefinitely after a worker crash. Defaults"
+            " to 8 hours — generous enough that an honest multi-hour"
+            " tarball download + unpack + S3 upload for a very large"
+            " build is never falsely reaped, short enough that a truly"
+            " wedged job does not block the project indefinitely."
+            " Mirrors ``lifecycle_reaper_threshold_seconds`` so the"
+            " operator knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
     git_ref_audit_enabled: bool = Field(
         default=False,
         title="Whether the daily git_ref_audit dispatcher fans out work",

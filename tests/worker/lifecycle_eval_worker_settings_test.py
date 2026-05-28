@@ -15,6 +15,7 @@ from arq.worker import Function
 
 from docverse.config import Configuration
 from docverse.worker.functions import (
+    build_processing_reaper,
     dashboard_build_reaper,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
@@ -265,6 +266,64 @@ def test_default_worker_does_not_register_publish_edition_reaper() -> None:
         if isinstance(job, CronJob)
     }
     assert publish_edition_reaper not in coroutines
+
+
+def test_build_processing_reaper_registered_as_function() -> None:
+    """``build_processing_reaper`` is registered on the lifecycle pool.
+
+    Per PRD #367 §"Pool placement" the four main-pool kind reapers
+    register on the existing :class:`LifecycleEvalWorkerSettings` arq
+    pool so reaper sweeps never compete with build processing or
+    user-triggered ``build_processing`` jobs for worker capacity.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in LifecycleEvalWorkerSettings.functions
+    }
+    assert build_processing_reaper in underlying
+
+
+def test_build_processing_reaper_runs_every_thirty_minutes() -> None:
+    """The build_processing reaper cron fires on minute 0 and 30.
+
+    A stuck ``build_processing`` is not directly user-visible (no
+    operator-facing 409), so PRD #367 picks the standard 30-minute
+    cadence shared with the lifecycle and keeper-sync reapers rather
+    than the dashboard_build reaper's tighter 15-minute schedule.
+    The 8-hour threshold is what keeps real multi-hour uploads safe
+    from false reaping — cadence is independent of threshold.
+    """
+    cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is build_processing_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {0, 30}
+
+
+def test_default_worker_does_not_register_build_processing_reaper() -> None:
+    """The default queue stays free of the build_processing reaper.
+
+    The reaper lives exclusively on the lifecycle pool so cron-driven
+    maintenance work never contends with the operator-triggered
+    ``build_processing`` job itself on the default pool.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert build_processing_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert build_processing_reaper not in coroutines
 
 
 def test_default_worker_does_not_register_lifecycle_functions() -> None:

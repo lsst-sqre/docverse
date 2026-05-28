@@ -1,6 +1,7 @@
 """Worker task functions for Docverse."""
 
 from .build_processing import build_processing
+from .build_processing_reaper import build_processing_reaper
 from .dashboard_build import dashboard_build
 from .dashboard_build_reaper import dashboard_build_reaper
 from .dashboard_sync import dashboard_sync
@@ -24,6 +25,7 @@ from .publish_edition_reaper import publish_edition_reaper
 
 __all__ = [
     "build_processing",
+    "build_processing_reaper",
     "dashboard_build",
     "dashboard_build_reaper",
     "dashboard_sync",

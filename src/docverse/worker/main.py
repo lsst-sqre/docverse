@@ -39,6 +39,7 @@ from docverse.storage.github import validate_github_app
 
 from .functions import (
     build_processing,
+    build_processing_reaper,
     dashboard_build,
     dashboard_build_reaper,
     dashboard_sync,
@@ -417,13 +418,13 @@ class LifecycleEvalWorkerSettings:
     single transaction.
 
     The pool also hosts cross-subsystem reaper backstops for the
-    default-pool kinds: ``dashboard_build_reaper`` and
-    ``publish_edition_reaper`` run here (PRD #367) so reaper sweeps
-    never compete with build processing or user-triggered dashboard
-    rebuilds for worker capacity. The pool name retains its
-    lifecycle-eval lineage but is no longer scoped to lifecycle work
-    alone; a rename to a maintenance-style identifier is tracked
-    separately.
+    default-pool kinds: ``dashboard_build_reaper``,
+    ``publish_edition_reaper``, and ``build_processing_reaper`` run
+    here (PRD #367) so reaper sweeps never compete with build
+    processing or user-triggered dashboard rebuilds for worker
+    capacity. The pool name retains its lifecycle-eval lineage but is
+    no longer scoped to lifecycle work alone; a rename to a
+    maintenance-style identifier is tracked separately.
     """
 
     functions = [
@@ -450,6 +451,7 @@ class LifecycleEvalWorkerSettings:
         instrument_arq_task(lifecycle_reaper),
         instrument_arq_task(dashboard_build_reaper),
         instrument_arq_task(publish_edition_reaper),
+        instrument_arq_task(build_processing_reaper),
     ]
     cron_jobs = [
         cron(
@@ -489,6 +491,17 @@ class LifecycleEvalWorkerSettings:
         # ``dashboard_build`` reaper uses is not warranted.
         cron(
             instrument_arq_task(publish_edition_reaper),
+            minute={0, 30},
+        ),
+        # ``build_processing_reaper`` runs on the same standard
+        # ``minute={0, 30}`` cadence — a stuck ``build_processing``
+        # is invisible to operators today (no user-facing surface),
+        # so the tighter dashboard_build cadence is not warranted.
+        # The 8-hour threshold is intentionally generous so a real
+        # multi-hour upload of a very large build is never falsely
+        # reaped by this cron backstop.
+        cron(
+            instrument_arq_task(build_processing_reaper),
             minute={0, 30},
         ),
     ]
