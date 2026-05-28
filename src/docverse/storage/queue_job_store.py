@@ -730,33 +730,33 @@ class QueueJobStore:
             await self._session.flush()
         return failed
 
-    async def fail_silent_dashboard_build_jobs(
+    async def fail_silent_jobs(
         self,
+        kind: JobKind,
         *,
         idle_after: timedelta,
     ) -> list[QueueJob]:
-        """Fail ``dashboard_build`` rows stuck ``in_progress`` past the window.
+        """Fail rows of ``kind`` stuck ``in_progress`` past the window.
 
-        ``dashboard_build_reaper``'s silent-row sweep. Sibling of
-        :meth:`fail_silent_lifecycle_eval_jobs` scoped to
-        ``kind='dashboard_build'``. Rows the worker picked up but never
-        finished (``status='in_progress'``, ``date_completed IS NULL``,
-        ``date_started`` older than ``now - idle_after``) are reaped
-        here; ``queued`` rows whose dispatcher crashed before arq
-        enqueue go to :meth:`fail_orphaned_dashboard_build_jobs`.
+        Shared silent-row sweep used by the run-less reaper modules
+        (``dashboard_build_reaper`` and siblings — see
+        :mod:`docverse.worker.functions._runless_reaper`). Rows the
+        worker picked up but never finished (``status='in_progress'``,
+        ``date_completed IS NULL``, ``date_started`` older than
+        ``now - idle_after``) are reaped here; ``queued`` orphans go
+        to :meth:`fail_orphaned_jobs`.
 
-        Reaping releases the per-project mutex
-        ``idx_queue_jobs_dashboard_build_active_uq`` so the operator's
-        next ``POST /dashboard/rebuild`` is no longer blocked with a
-        409. Reaped rows carry ``errors.type='SilentWorker'`` matching
-        the lifecycle/git_ref_audit precedent so postmortem queries
-        that group by ``errors.type`` can compare subsystems on the
-        same axis.
+        Reaped rows carry ``errors.type='SilentWorker'`` matching the
+        lifecycle/git_ref_audit precedent so postmortem queries that
+        group by ``errors.type`` can compare subsystems on the same
+        axis. The per-kind reaper-name in the error message lets a
+        postmortem reader identify the sweep that produced the row
+        without joining against the run table.
         """
         now = (await self._session.execute(select(func.now()))).scalar_one()
         cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.dashboard_build.value,
+            SqlQueueJob.kind == kind.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
             SqlQueueJob.date_completed.is_(None),
             SqlQueueJob.date_started.is_not(None),
@@ -770,7 +770,7 @@ class QueueJobStore:
             row.date_completed = now
             row.errors = {
                 "message": (
-                    "Reaped by dashboard_build_reaper: worker went silent "
+                    f"Reaped by {kind.value}_reaper: worker went silent "
                     "while job was in_progress (likely OOM-killed or "
                     "lost by arq)"
                 ),
@@ -781,23 +781,26 @@ class QueueJobStore:
             await self._session.flush()
         return reaped
 
-    async def fail_orphaned_dashboard_build_jobs(
+    async def fail_orphaned_jobs(
         self,
+        kind: JobKind,
         *,
         idle_after: timedelta,
     ) -> list[QueueJob]:
-        """Fail ``dashboard_build`` rows that never reached arq.
+        """Fail rows of ``kind`` that never reached arq.
 
-        ``dashboard_build_reaper``'s orphan sweep. The enqueue path
-        commits the ``queue_jobs`` row before calling
+        Shared orphan sweep used by the run-less reaper modules. The
+        enqueue path commits the ``queue_jobs`` row before calling
         ``arq_queue.enqueue``, so a crash in that window leaves an
         orphan (``status='queued'``, ``backend_job_id IS NULL``).
-        Without reconciliation the orphan wedges the per-project mutex
-        ``idx_queue_jobs_dashboard_build_active_uq`` and the operator's
-        ``POST /dashboard/rebuild`` keeps returning 409 forever.
+        Without reconciliation the orphan wedges any per-kind active
+        mutex the row holds (for example
+        ``idx_queue_jobs_dashboard_build_active_uq`` for
+        ``dashboard_build``), and the operator-facing rebuild/publish
+        flow stays blocked.
 
-        Scoped narrowly: ``kind='dashboard_build'``,
-        ``status='queued'``, ``backend_job_id IS NULL``,
+        Scoped narrowly: rows of the given ``kind`` with
+        ``status='queued'``, ``backend_job_id IS NULL``, and
         ``date_created`` older than ``now - idle_after``. Reaped rows
         carry ``errors.type='OrphanedQueueJob'`` matching the
         lifecycle/git_ref_audit precedent.
@@ -805,7 +808,7 @@ class QueueJobStore:
         now = (await self._session.execute(select(func.now()))).scalar_one()
         cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.dashboard_build.value,
+            SqlQueueJob.kind == kind.value,
             SqlQueueJob.status == JobStatus.queued.value,
             SqlQueueJob.backend_job_id.is_(None),
             SqlQueueJob.date_created < cutoff,
@@ -818,306 +821,9 @@ class QueueJobStore:
             row.date_completed = now
             row.errors = {
                 "message": (
-                    "Orphaned dashboard_build: queue_jobs row committed "
+                    f"Orphaned {kind.value}: queue_jobs row committed "
                     "without an arq backend_job_id (worker likely "
                     "crashed between SQL commit and arq_queue.enqueue)"
-                ),
-                "type": "OrphanedQueueJob",
-            }
-            failed.append(QueueJob.model_validate(row, from_attributes=True))
-        if failed:
-            await self._session.flush()
-        return failed
-
-    async def fail_silent_publish_edition_jobs(
-        self,
-        *,
-        idle_after: timedelta,
-    ) -> list[QueueJob]:
-        """Fail ``publish_edition`` rows stuck ``in_progress`` past the window.
-
-        ``publish_edition_reaper``'s silent-row sweep. Sibling of
-        :meth:`fail_silent_dashboard_build_jobs` scoped to
-        ``kind='publish_edition'``. Rows the worker picked up but
-        never finished (``status='in_progress'``,
-        ``date_completed IS NULL``, ``date_started`` older than
-        ``now - idle_after``) are reaped here; ``queued`` rows whose
-        dispatcher crashed before arq enqueue go to
-        :meth:`fail_orphaned_publish_edition_jobs`.
-
-        Without reconciliation a wedged ``publish_edition`` leaves an
-        edition in ``publishing`` status that never reaches the CDN
-        and silently stays behind. Reaped rows carry
-        ``errors.type='SilentWorker'`` matching the
-        lifecycle/git_ref_audit precedent so postmortem queries that
-        group by ``errors.type`` can compare subsystems on the same
-        axis.
-        """
-        now = (await self._session.execute(select(func.now()))).scalar_one()
-        cutoff = now - idle_after
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.publish_edition.value,
-            SqlQueueJob.status == JobStatus.in_progress.value,
-            SqlQueueJob.date_completed.is_(None),
-            SqlQueueJob.date_started.is_not(None),
-            SqlQueueJob.date_started < cutoff,
-        )
-        result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        reaped: list[QueueJob] = []
-        for row in rows:
-            row.status = JobStatus.failed.value
-            row.date_completed = now
-            row.errors = {
-                "message": (
-                    "Reaped by publish_edition_reaper: worker went silent "
-                    "while job was in_progress (likely OOM-killed or "
-                    "lost by arq)"
-                ),
-                "type": "SilentWorker",
-            }
-            reaped.append(QueueJob.model_validate(row, from_attributes=True))
-        if reaped:
-            await self._session.flush()
-        return reaped
-
-    async def fail_orphaned_publish_edition_jobs(
-        self,
-        *,
-        idle_after: timedelta,
-    ) -> list[QueueJob]:
-        """Fail ``publish_edition`` rows that never reached arq.
-
-        ``publish_edition_reaper``'s orphan sweep. The enqueue path
-        commits the ``queue_jobs`` row before calling
-        ``arq_queue.enqueue``, so a crash in that window leaves an
-        orphan (``status='queued'``, ``backend_job_id IS NULL``).
-        Without reconciliation the edition stays in ``publishing``
-        forever and the CDN silently lags behind.
-
-        Scoped narrowly: ``kind='publish_edition'``,
-        ``status='queued'``, ``backend_job_id IS NULL``,
-        ``date_created`` older than ``now - idle_after``. Reaped rows
-        carry ``errors.type='OrphanedQueueJob'`` matching the
-        lifecycle/git_ref_audit precedent.
-        """
-        now = (await self._session.execute(select(func.now()))).scalar_one()
-        cutoff = now - idle_after
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.publish_edition.value,
-            SqlQueueJob.status == JobStatus.queued.value,
-            SqlQueueJob.backend_job_id.is_(None),
-            SqlQueueJob.date_created < cutoff,
-        )
-        result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        failed: list[QueueJob] = []
-        for row in rows:
-            row.status = JobStatus.failed.value
-            row.date_completed = now
-            row.errors = {
-                "message": (
-                    "Orphaned publish_edition: queue_jobs row committed "
-                    "without an arq backend_job_id (worker likely "
-                    "crashed between SQL commit and arq_queue.enqueue)"
-                ),
-                "type": "OrphanedQueueJob",
-            }
-            failed.append(QueueJob.model_validate(row, from_attributes=True))
-        if failed:
-            await self._session.flush()
-        return failed
-
-    async def fail_silent_build_processing_jobs(
-        self,
-        *,
-        idle_after: timedelta,
-    ) -> list[QueueJob]:
-        """Fail ``build_processing`` rows stuck ``in_progress`` past window.
-
-        ``build_processing_reaper``'s silent-row sweep. Sibling of
-        :meth:`fail_silent_publish_edition_jobs` scoped to
-        ``kind='build_processing'``. Rows the worker picked up but
-        never finished (``status='in_progress'``,
-        ``date_completed IS NULL``, ``date_started`` older than
-        ``now - idle_after``) are reaped here; ``queued`` rows whose
-        dispatcher crashed before arq enqueue go to
-        :meth:`fail_orphaned_build_processing_jobs`.
-
-        Without reconciliation a wedged ``build_processing`` leaves an
-        uploaded build that is never registered as ready — invisible
-        to operators today but corrosive. Reaped rows carry
-        ``errors.type='SilentWorker'`` matching the
-        lifecycle/git_ref_audit precedent so postmortem queries that
-        group by ``errors.type`` can compare subsystems on the same
-        axis.
-        """
-        now = (await self._session.execute(select(func.now()))).scalar_one()
-        cutoff = now - idle_after
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.build_processing.value,
-            SqlQueueJob.status == JobStatus.in_progress.value,
-            SqlQueueJob.date_completed.is_(None),
-            SqlQueueJob.date_started.is_not(None),
-            SqlQueueJob.date_started < cutoff,
-        )
-        result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        reaped: list[QueueJob] = []
-        for row in rows:
-            row.status = JobStatus.failed.value
-            row.date_completed = now
-            row.errors = {
-                "message": (
-                    "Reaped by build_processing_reaper: worker went silent"
-                    " while job was in_progress (likely OOM-killed or"
-                    " lost by arq)"
-                ),
-                "type": "SilentWorker",
-            }
-            reaped.append(QueueJob.model_validate(row, from_attributes=True))
-        if reaped:
-            await self._session.flush()
-        return reaped
-
-    async def fail_orphaned_build_processing_jobs(
-        self,
-        *,
-        idle_after: timedelta,
-    ) -> list[QueueJob]:
-        """Fail ``build_processing`` rows that never reached arq.
-
-        ``build_processing_reaper``'s orphan sweep. The enqueue path
-        commits the ``queue_jobs`` row before calling
-        ``arq_queue.enqueue``, so a crash in that window leaves an
-        orphan (``status='queued'``, ``backend_job_id IS NULL``).
-        Without reconciliation the uploaded build is never registered
-        and the project sees no progress on its new release.
-
-        Scoped narrowly: ``kind='build_processing'``,
-        ``status='queued'``, ``backend_job_id IS NULL``,
-        ``date_created`` older than ``now - idle_after``. Reaped rows
-        carry ``errors.type='OrphanedQueueJob'`` matching the
-        lifecycle/git_ref_audit precedent.
-        """
-        now = (await self._session.execute(select(func.now()))).scalar_one()
-        cutoff = now - idle_after
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.build_processing.value,
-            SqlQueueJob.status == JobStatus.queued.value,
-            SqlQueueJob.backend_job_id.is_(None),
-            SqlQueueJob.date_created < cutoff,
-        )
-        result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        failed: list[QueueJob] = []
-        for row in rows:
-            row.status = JobStatus.failed.value
-            row.date_completed = now
-            row.errors = {
-                "message": (
-                    "Orphaned build_processing: queue_jobs row committed"
-                    " without an arq backend_job_id (worker likely"
-                    " crashed between SQL commit and arq_queue.enqueue)"
-                ),
-                "type": "OrphanedQueueJob",
-            }
-            failed.append(QueueJob.model_validate(row, from_attributes=True))
-        if failed:
-            await self._session.flush()
-        return failed
-
-    async def fail_silent_dashboard_sync_jobs(
-        self,
-        *,
-        idle_after: timedelta,
-    ) -> list[QueueJob]:
-        """Fail ``dashboard_sync`` rows stuck ``in_progress`` past window.
-
-        ``dashboard_sync_reaper``'s silent-row sweep. Sibling of
-        :meth:`fail_silent_build_processing_jobs` scoped to
-        ``kind='dashboard_sync'``. Rows the worker picked up but never
-        finished (``status='in_progress'``, ``date_completed IS NULL``,
-        ``date_started`` older than ``now - idle_after``) are reaped
-        here; ``queued`` rows whose dispatcher crashed before arq
-        enqueue go to :meth:`fail_orphaned_dashboard_sync_jobs`.
-
-        Without reconciliation a wedged ``dashboard_sync`` leaves a
-        binding's ``last_sync_queue_job`` showing a permanently
-        in-progress sync after a worker crash. Reaped rows carry
-        ``errors.type='SilentWorker'`` matching the
-        lifecycle/git_ref_audit precedent so postmortem queries that
-        group by ``errors.type`` can compare subsystems on the same
-        axis.
-        """
-        now = (await self._session.execute(select(func.now()))).scalar_one()
-        cutoff = now - idle_after
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.dashboard_sync.value,
-            SqlQueueJob.status == JobStatus.in_progress.value,
-            SqlQueueJob.date_completed.is_(None),
-            SqlQueueJob.date_started.is_not(None),
-            SqlQueueJob.date_started < cutoff,
-        )
-        result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        reaped: list[QueueJob] = []
-        for row in rows:
-            row.status = JobStatus.failed.value
-            row.date_completed = now
-            row.errors = {
-                "message": (
-                    "Reaped by dashboard_sync_reaper: worker went silent"
-                    " while job was in_progress (likely OOM-killed or"
-                    " lost by arq)"
-                ),
-                "type": "SilentWorker",
-            }
-            reaped.append(QueueJob.model_validate(row, from_attributes=True))
-        if reaped:
-            await self._session.flush()
-        return reaped
-
-    async def fail_orphaned_dashboard_sync_jobs(
-        self,
-        *,
-        idle_after: timedelta,
-    ) -> list[QueueJob]:
-        """Fail ``dashboard_sync`` rows that never reached arq.
-
-        ``dashboard_sync_reaper``'s orphan sweep. The enqueue path
-        commits the ``queue_jobs`` row before calling
-        ``arq_queue.enqueue``, so a crash in that window leaves an
-        orphan (``status='queued'``, ``backend_job_id IS NULL``).
-        Without reconciliation the binding's ``last_sync_queue_job``
-        shows a permanently queued sync that no arq job will ever
-        pick up.
-
-        Scoped narrowly: ``kind='dashboard_sync'``,
-        ``status='queued'``, ``backend_job_id IS NULL``,
-        ``date_created`` older than ``now - idle_after``. Reaped rows
-        carry ``errors.type='OrphanedQueueJob'`` matching the
-        lifecycle/git_ref_audit precedent.
-        """
-        now = (await self._session.execute(select(func.now()))).scalar_one()
-        cutoff = now - idle_after
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.kind == JobKind.dashboard_sync.value,
-            SqlQueueJob.status == JobStatus.queued.value,
-            SqlQueueJob.backend_job_id.is_(None),
-            SqlQueueJob.date_created < cutoff,
-        )
-        result = await self._session.execute(stmt)
-        rows = list(result.scalars().all())
-        failed: list[QueueJob] = []
-        for row in rows:
-            row.status = JobStatus.failed.value
-            row.date_completed = now
-            row.errors = {
-                "message": (
-                    "Orphaned dashboard_sync: queue_jobs row committed"
-                    " without an arq backend_job_id (worker likely"
-                    " crashed between SQL commit and arq_queue.enqueue)"
                 ),
                 "type": "OrphanedQueueJob",
             }

@@ -14,76 +14,27 @@ binding's template state can be retried on the next operator action.
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
-import structlog
-from safir.dependencies.db_session import db_session_dependency
+from docverse.domain.queue import JobKind
 
-from docverse.config import config
+from ._runless_reaper import sweep_runless_kind
 
 __all__ = ["dashboard_sync_reaper"]
-
-
-# Window before a queued ``dashboard_sync`` row with no
-# ``backend_job_id`` is treated as orphaned. Matches the lifecycle and
-# keeper-sync reapers' :data:`_ORPHAN_IDLE_WINDOW` (5 min) so the
-# staleness checks across reapers stay aligned — long enough never to
-# race a healthy concurrent enqueue, short enough to free the wedged
-# row on the next reaper tick.
-_ORPHAN_IDLE_WINDOW = timedelta(minutes=5)
 
 
 async def dashboard_sync_reaper(ctx: dict[str, Any]) -> str:
     """Cron-driven backstop that fails silently-stuck dashboard_sync rows.
 
-    Sweeps two populations in one transaction:
-
-    1. Silent rows
-       (:meth:`QueueJobStore.fail_silent_dashboard_sync_jobs`) —
-       ``status='in_progress'`` past
-       ``config.dashboard_sync_reaper_threshold_seconds`` (default
-       6 h, env-overridable for fast verification in non-prod).
-    2. Orphan rows
-       (:meth:`QueueJobStore.fail_orphaned_dashboard_sync_jobs`) —
-       ``status='queued'`` with ``backend_job_id IS NULL`` past
-       :data:`_ORPHAN_IDLE_WINDOW` (5 min).
-
-    Returns a one-line status string for arq's result log; the
-    structured ``logger.warning`` carries the detail when anything was
-    reaped, and ``logger.debug`` keeps healthy ticks quiet.
+    Thin shim over
+    :func:`docverse.worker.functions._runless_reaper.sweep_runless_kind`;
+    see that module for the shared sweep mechanics. Threshold defaults
+    to 6 h via ``config.dashboard_sync_reaper_threshold_seconds``;
+    non-prod can override with
+    ``DOCVERSE_DASHBOARD_SYNC_REAPER_THRESHOLD_SECONDS``.
     """
-    logger = structlog.get_logger("docverse.worker.dashboard_sync_reaper")
-    threshold = timedelta(
-        seconds=config.dashboard_sync_reaper_threshold_seconds
+    return await sweep_runless_kind(
+        ctx,
+        kind=JobKind.dashboard_sync,
+        threshold_attr="dashboard_sync_reaper_threshold_seconds",
     )
-
-    async for session in db_session_dependency():
-        factory = ctx["factory_builder"](session=session, logger=logger)
-        queue_job_store = factory.create_queue_job_store()
-
-        async with session.begin():
-            silent = await queue_job_store.fail_silent_dashboard_sync_jobs(
-                idle_after=threshold
-            )
-            orphan = await queue_job_store.fail_orphaned_dashboard_sync_jobs(
-                idle_after=_ORPHAN_IDLE_WINDOW
-            )
-
-        reaped_count = len(silent) + len(orphan)
-        if reaped_count:
-            logger.warning(
-                "Reaped stuck dashboard_sync queue jobs",
-                reaped_count=reaped_count,
-                silent_count=len(silent),
-                orphan_count=len(orphan),
-                reaped_public_ids=sorted(
-                    qj.public_id for qj in (*silent, *orphan)
-                ),
-            )
-        else:
-            logger.debug("No stuck dashboard_sync queue jobs to reap")
-        return "completed"
-
-    msg = "No database session available"
-    raise RuntimeError(msg)
