@@ -197,6 +197,94 @@ class Configuration(BaseSettings):
         ),
     )
 
+    dashboard_build_reaper_threshold_seconds: int = Field(
+        1800,
+        title="Dashboard_build stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``dashboard_build``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``dashboard_build_reaper`` fails"
+            " any ``kind='dashboard_build'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed``, releasing the per-project mutex"
+            " ``idx_queue_jobs_dashboard_build_active_uq`` so the"
+            " operator's next ``POST /dashboard/rebuild`` no longer"
+            " returns 409. Mirrors"
+            " ``lifecycle_reaper_threshold_seconds`` so the operator"
+            " knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
+    publish_edition_reaper_threshold_seconds: int = Field(
+        14400,
+        title="Publish_edition stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``publish_edition``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``publish_edition_reaper`` fails"
+            " any ``kind='publish_edition'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed`` so an edition does not sit in"
+            " ``publishing`` indefinitely and the CDN does not silently"
+            " stay behind. Defaults to 4 hours — long enough for the"
+            " CDN-publish retry loop to legitimately complete, short"
+            " enough that wedged rows clear the same day. Mirrors"
+            " ``lifecycle_reaper_threshold_seconds`` so the operator"
+            " knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
+    build_processing_reaper_threshold_seconds: int = Field(
+        28800,
+        title="Build_processing stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``build_processing``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``build_processing_reaper`` fails"
+            " any ``kind='build_processing'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed`` so an uploaded build does not stay"
+            " unregistered indefinitely after a worker crash. Defaults"
+            " to 8 hours — generous enough that an honest multi-hour"
+            " tarball download + unpack + S3 upload for a very large"
+            " build is never falsely reaped, short enough that a truly"
+            " wedged job does not block the project indefinitely."
+            " Mirrors ``lifecycle_reaper_threshold_seconds`` so the"
+            " operator knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
+    dashboard_sync_reaper_threshold_seconds: int = Field(
+        21600,
+        title="Dashboard_sync stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``dashboard_sync``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``dashboard_sync_reaper`` fails"
+            " any ``kind='dashboard_sync'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed`` so a binding's ``last_sync_queue_job``"
+            " does not show a permanently in-progress sync after a"
+            " worker crash. Defaults to 6 hours — long enough for an"
+            " operator-triggered GitHub fetch + fanout to legitimately"
+            " complete, short enough that wedged rows clear within a"
+            " working day. Mirrors ``lifecycle_reaper_threshold_seconds``"
+            " so the operator knob shape is identical across reapers;"
+            " the env-overridable default lets non-prod environments"
+            " drive the threshold down to seconds for fast verification."
+        ),
+    )
+
     git_ref_audit_enabled: bool = Field(
         default=False,
         title="Whether the daily git_ref_audit dispatcher fans out work",

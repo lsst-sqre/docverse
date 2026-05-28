@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1524,6 +1525,368 @@ async def test_fail_orphaned_lifecycle_eval_jobs_skips_started_rows(
 
         failed = await store.fail_orphaned_lifecycle_eval_jobs(
             idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+# ---------------------------------------------------------------------
+# Run-less reaper storage tests (PRD #367)
+# ---------------------------------------------------------------------
+#
+# The four run-less reapers (dashboard_build, publish_edition,
+# build_processing, dashboard_sync) share the same two-method storage
+# API — fail_silent_jobs(kind, ...) and fail_orphaned_jobs(kind, ...) —
+# so their unit tests are parametrized over the four kinds. Each spec
+# carries the kind, the kind's production idle_after default, and a
+# "well past threshold" offset for stuck-row seeds. The cross-kind
+# isolation tests derive their "other kinds" list from the spec table
+# (every other run-less kind plus ``lifecycle_eval``).
+
+
+@dataclass(frozen=True)
+class RunlessReaperSpec:
+    """One row per run-less kind for the parametrized storage tests."""
+
+    kind: JobKind
+    silent_idle_after: timedelta
+    silent_past_offset: timedelta
+    slug_prefix: str
+
+    @property
+    def label(self) -> str:
+        return self.kind.value
+
+
+RUNLESS_REAPER_SPECS = [
+    RunlessReaperSpec(
+        kind=JobKind.dashboard_build,
+        silent_idle_after=timedelta(minutes=30),
+        silent_past_offset=timedelta(hours=1),
+        slug_prefix="dbr",
+    ),
+    RunlessReaperSpec(
+        kind=JobKind.publish_edition,
+        silent_idle_after=timedelta(hours=4),
+        silent_past_offset=timedelta(hours=5),
+        slug_prefix="per",
+    ),
+    RunlessReaperSpec(
+        kind=JobKind.build_processing,
+        silent_idle_after=timedelta(hours=8),
+        silent_past_offset=timedelta(hours=9),
+        slug_prefix="bpr",
+    ),
+    RunlessReaperSpec(
+        kind=JobKind.dashboard_sync,
+        silent_idle_after=timedelta(hours=6),
+        silent_past_offset=timedelta(hours=7),
+        slug_prefix="dsr",
+    ),
+]
+
+
+_runless_param = pytest.mark.parametrize(
+    "spec",
+    RUNLESS_REAPER_SPECS,
+    ids=lambda s: s.label,
+)
+
+
+async def _seed_runless_row(
+    db_session: AsyncSession,
+    *,
+    kind: JobKind,
+    org_id: int,
+    status: JobStatus,
+    backend_job_id: str | None,
+    date_started: datetime | None = None,
+    date_created_offset: timedelta | None = None,
+) -> int:
+    """Insert one row of ``kind`` with explicit timestamps for sweep tests."""
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        backend_job_id=backend_job_id,
+        kind=kind.value,
+        status=status.value,
+        org_id=org_id,
+        date_started=date_started,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    if date_created_offset is not None:
+        row.date_created = datetime.now(tz=UTC) - date_created_offset
+        await db_session.flush()
+    return row.id
+
+
+def _other_runless_kinds(spec: RunlessReaperSpec) -> list[JobKind]:
+    """All run-less kinds plus ``lifecycle_eval``, excluding ``spec.kind``."""
+    return [s.kind for s in RUNLESS_REAPER_SPECS if s.kind != spec.kind] + [
+        JobKind.lifecycle_eval
+    ]
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_silent_jobs_reaps_old_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """An ``in_progress`` row of ``kind`` past the threshold is failed."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-reap-1"
+        )
+        stuck_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=f"arq-{spec.slug_prefix}-stuck",
+            date_started=datetime.now(tz=UTC) - spec.silent_past_offset,
+        )
+
+        reaped = await store.fail_silent_jobs(
+            spec.kind, idle_after=spec.silent_idle_after
+        )
+        await db_session.commit()
+
+    assert len(reaped) == 1
+    assert reaped[0].id == stuck_id
+    assert reaped[0].status == JobStatus.failed
+    assert reaped[0].errors is not None
+    assert reaped[0].errors["type"] == "SilentWorker"
+    assert reaped[0].date_completed is not None
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_silent_jobs_skips_recent(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """An ``in_progress`` row within the idle window is left alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-reap-2"
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=f"arq-{spec.slug_prefix}-fresh",
+            date_started=datetime.now(tz=UTC),
+        )
+
+        reaped = await store.fail_silent_jobs(
+            spec.kind, idle_after=spec.silent_idle_after
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_silent_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Cross-kind scoping for the silent sweep.
+
+    An ``in_progress`` row past the threshold of every other run-less
+    kind (plus ``lifecycle_eval``) must be left alone by the target
+    kind's silent sweep. Matches PRD #367 "Testing Decisions" —
+    cross-kind scoping.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-reap-3"
+        )
+        for idx, kind in enumerate(_other_runless_kinds(spec)):
+            unrelated = await store.create(
+                kind=kind,
+                org_id=org_id,
+                backend_job_id=f"arq-other-{idx}",
+            )
+            await store.start(unrelated.id)
+            row = await db_session.get(SqlQueueJob, unrelated.id)
+            assert row is not None
+            row.date_started = datetime.now(tz=UTC) - spec.silent_past_offset
+            await db_session.flush()
+
+        reaped = await store.fail_silent_jobs(
+            spec.kind, idle_after=spec.silent_idle_after
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_silent_jobs_skips_queued_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Status respect: the silent sweep ignores ``queued`` rows.
+
+    The orphan sweep owns ``queued`` rows; the silent sweep is
+    confined to ``in_progress``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-reap-4"
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=spec.silent_past_offset,
+        )
+
+        reaped = await store.fail_silent_jobs(
+            spec.kind, idle_after=spec.silent_idle_after
+        )
+        await db_session.commit()
+
+    assert reaped == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_orphaned_jobs_reaps_old_orphan(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """A ``queued`` row of ``kind`` with no ``backend_job_id`` fails."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-orphan-1"
+        )
+        orphan_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=timedelta(minutes=10),
+        )
+
+        failed = await store.fail_orphaned_jobs(
+            spec.kind, idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert len(failed) == 1
+    assert failed[0].id == orphan_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "OrphanedQueueJob"
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_orphaned_jobs_skips_rows_with_backend_id(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """A queued row that already has a backend_job_id is not an orphan."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-orphan-2"
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-enqueued",
+            date_created_offset=timedelta(minutes=30),
+        )
+
+        failed = await store.fail_orphaned_jobs(
+            spec.kind, idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_orphaned_jobs_skips_in_progress(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """An ``in_progress`` row is not an orphan; the silent sweep owns it."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-orphan-3"
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=None,
+            date_started=datetime.now(tz=UTC) - spec.silent_past_offset,
+            date_created_offset=timedelta(minutes=30),
+        )
+
+        failed = await store.fail_orphaned_jobs(
+            spec.kind, idle_after=timedelta(minutes=5)
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_orphaned_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Cross-kind scoping for the orphan sweep.
+
+    A ``queued`` row of every other run-less kind plus
+    ``lifecycle_eval`` with no ``backend_job_id`` past the idle
+    window must be left alone by the target kind's orphan sweep.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-orphan-4"
+        )
+        for idx, kind in enumerate(_other_runless_kinds(spec)):
+            row = SqlQueueJob(
+                public_id=validate_base32_id(generate_base32_id()),
+                backend_job_id=None,
+                kind=kind.value,
+                status=JobStatus.queued.value,
+                org_id=org_id,
+                subject_label=f"orphan-{idx}",
+            )
+            db_session.add(row)
+            await db_session.flush()
+            row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
+            await db_session.flush()
+
+        failed = await store.fail_orphaned_jobs(
+            spec.kind, idle_after=timedelta(minutes=5)
         )
         await db_session.commit()
 
