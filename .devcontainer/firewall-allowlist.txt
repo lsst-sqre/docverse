@@ -1,0 +1,81 @@
+# stoker-managed: sandbox:firewall-allowlist.txt:e9c72d448fb0282d
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+# GitHub anycast IP ranges — FALLBACK only. The live source of truth
+# is https://api.github.com/meta, which init-firewall.sh fetches on
+# every run via `gh api meta` (or `curl`) and merges into the v4/v6
+# ipsets. These static CIDRs are used when that fetch can't succeed
+# (no network, parse error, gh/curl/jq missing) so the firewall still
+# has a viable seed without the dynamic refresh.
+192.30.252.0/22
+185.199.108.0/22
+140.82.112.0/20
+143.55.64.0/20
+2a0a:a440::/29
+2606:50c0::/32
+api.anthropic.com
+console.anthropic.com
+claude.ai
+api.openai.com
+auth.openai.com
+chatgpt.com
+registry-1.docker.io
+auth.docker.io
+production.cloudflare.docker.com
+pypi.org
+files.pythonhosted.org
+registry.npmjs.org
+nodejs.org
+deb.debian.org
+security.debian.org
+cli.github.com
+downloads.1password.com
+astral.sh
+
+# --- Rubin: Docker-in-Docker testcontainers ------------------------------
+# The Rubin sandbox runs Docker-in-Docker so testcontainers can pull and run
+# images inside the AFK loop. The package init-firewall.sh reads CIDR lines
+# (anything containing '/') straight into the ipset, so these are honored
+# without modifying the package's firewall script.
+
+# RFC1918 private ranges. Docker publishes a testcontainer's port and
+# DNATs a localhost:hostport connection to the container's bridge IP
+# (e.g. 172.17.0.x); after that rewrite the egress OUTPUT chain sees a
+# private destination, not loopback. Allowlisting the bridge ranges lets
+# that (and dockerd<->container) traffic through the OUTPUT REJECT.
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+
+# Cloudflare edge CIDRs. Docker Hub's CDN (and R2 blob storage) front on
+# Cloudflare, and image-layer pulls hit ranges that a single getent
+# snapshot of registry-1.docker.io / production.cloudflare.docker.com
+# misses. Source: https://www.cloudflare.com/ips-v4 and /ips-v6. Static
+# because the firewall itself would otherwise block the fetch; refresh
+# only if a pull starts timing out on a new range (updates are years
+# apart).
+173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22
+2400:cb00::/32
+2606:4700::/32
+2803:f800::/32
+2405:b500::/32
+2405:8100::/32
+2a06:98c0::/29
+2c0f:f248::/32

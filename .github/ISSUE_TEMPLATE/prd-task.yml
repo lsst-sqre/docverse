@@ -1,0 +1,107 @@
+# stoker-managed: issue-templates:.github/ISSUE_TEMPLATE/prd-task.yml:c28a82ce56e32dbb
+name: prd-task
+description: A single implementation task the stoker AFK loop can pick up.
+title: "<task title>"
+labels:
+  - prd-task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for individual tasks under a PRD. The stoker
+        AFK loop filters by the `Type=AFK` field below, sorts by
+        `Task Order`, and respects `Blocked by` / `Parallel with`
+        relationships.
+
+  - type: input
+    id: branch
+    attributes:
+      label: Branch
+      description: Branch name the AFK iteration should work on (e.g. `tickets/DM-12345` or `tickets/DM-12345-add-foo`; `u/<login>/<desc>` for a ticket-less task).
+      placeholder: tickets/DM-12345
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type
+      description: |
+        `AFK` makes the task eligible for the loop. `MANUAL` excludes
+        it (use for tasks needing human judgement, design work, etc.).
+      options:
+        - AFK
+        - MANUAL
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: jira_key
+    attributes:
+      label: Jira Key
+      description: Optional Rubin/DM Jira ticket this task implements (e.g. `DM-12345`). Inherited from the parent PRD; leave blank for a ticket-less task.
+      placeholder: DM-12345
+    validations:
+      required: false
+
+  - type: input
+    id: jira_url
+    attributes:
+      label: Jira URL
+      description: Optional link to the Jira ticket. The Rubin `stoker-create-pr` skill reads this to add a `Jira:` reference to the PR.
+      placeholder: https://rubinobs.atlassian.net/browse/DM-12345
+    validations:
+      required: false
+
+  - type: input
+    id: blocked_by
+    attributes:
+      label: Blocked by
+      description: Comma-separated `#N` issues / PRs that must close before this task is eligible. Leave blank if none.
+      placeholder: "#42, #57"
+    validations:
+      required: false
+
+  - type: input
+    id: parent_prd
+    attributes:
+      label: Parent PRD
+      description: The PRD issue this task belongs to (e.g. `#100`). Used for filtering with `--prd`.
+      placeholder: "#100"
+    validations:
+      required: false
+
+  - type: input
+    id: task_order
+    attributes:
+      label: Task Order
+      description: Integer ordering within the parent PRD. Lower numbers run first within a tier.
+      placeholder: "1"
+    validations:
+      required: false
+
+  - type: input
+    id: parallel_with
+    attributes:
+      label: Parallel with
+      description: Comma-separated `#N` task issues that can run alongside this one (informational; does not affect gating).
+      placeholder: "#5"
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What this task covers. Be concrete about the slice.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Manual-QA checklist. Bullets here flow into the PR's Validation steps section.
+    validations:
+      required: false

@@ -1,0 +1,2 @@
+# stoker-managed: sandbox:firewall-refresh.cron:c05efd403ae66480
+*/15 * * * * root /workspace/.devcontainer/init-firewall.sh >>/var/log/stoker-firewall.log 2>&1
