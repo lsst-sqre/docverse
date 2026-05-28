@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
 
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import (
@@ -123,7 +124,7 @@ class QueueJobStore:
                 job_function=row.kind,
             )
         row.status = JobStatus.in_progress.value
-        row.date_started = datetime.now(tz=UTC)
+        row.date_started = func.now()
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
@@ -219,7 +220,7 @@ class QueueJobStore:
             if has_errors
             else JobStatus.completed.value
         )
-        row.date_completed = datetime.now(tz=UTC)
+        row.date_completed = func.now()
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
@@ -247,7 +248,7 @@ class QueueJobStore:
                 job_function=row.kind,
             )
         row.status = JobStatus.failed.value
-        row.date_completed = datetime.now(tz=UTC)
+        row.date_completed = func.now()
         if errors is not None:
             row.errors = errors
         await self._session.flush()
@@ -272,7 +273,7 @@ class QueueJobStore:
                 job_function=row.kind,
             )
         row.status = JobStatus.cancelled.value
-        row.date_completed = datetime.now(tz=UTC)
+        row.date_completed = func.now()
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
@@ -395,7 +396,8 @@ class QueueJobStore:
         ``fail_orphaned_run_children`` shape, swept by the next
         discovery attempt instead.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.keeper_sync_run_id.is_not(None),
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -405,7 +407,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -450,7 +451,8 @@ class QueueJobStore:
         postmortems can distinguish tier-cron reaps from
         run-attributed reaps.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.keeper_sync_project.value,
             SqlQueueJob.keeper_sync_run_id.is_(None),
@@ -461,7 +463,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -501,7 +502,8 @@ class QueueJobStore:
         ``now - idle_after``. Reaped rows carry
         ``errors.type='OrphanedTierCronJob'``.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.keeper_sync_project.value,
             SqlQueueJob.keeper_sync_run_id.is_(None),
@@ -511,7 +513,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -553,7 +554,8 @@ class QueueJobStore:
         keeper-sync precedent so postmortem queries that group by
         ``errors.type`` can compare the two subsystems on the same axis.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.lifecycle_eval.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -563,7 +565,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -602,7 +603,8 @@ class QueueJobStore:
         ``errors.type='OrphanedQueueJob'`` matching the keeper-sync
         precedent for run-attributed orphans.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.lifecycle_eval.value,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -611,7 +613,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -651,7 +652,8 @@ class QueueJobStore:
         that group by ``errors.type`` can compare the three subsystems
         on the same axis.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.git_ref_audit.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -661,7 +663,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -702,7 +703,8 @@ class QueueJobStore:
         carry ``errors.type='OrphanedQueueJob'`` matching the
         precedent for the other run-attributed orphan sweeps.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.git_ref_audit.value,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -711,7 +713,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -752,7 +753,8 @@ class QueueJobStore:
         that group by ``errors.type`` can compare subsystems on the
         same axis.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.dashboard_build.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -762,7 +764,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -801,7 +802,8 @@ class QueueJobStore:
         carry ``errors.type='OrphanedQueueJob'`` matching the
         lifecycle/git_ref_audit precedent.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.dashboard_build.value,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -810,7 +812,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -852,7 +853,8 @@ class QueueJobStore:
         group by ``errors.type`` can compare subsystems on the same
         axis.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.publish_edition.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -862,7 +864,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -900,7 +901,8 @@ class QueueJobStore:
         carry ``errors.type='OrphanedQueueJob'`` matching the
         lifecycle/git_ref_audit precedent.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.publish_edition.value,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -909,7 +911,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -951,7 +952,8 @@ class QueueJobStore:
         group by ``errors.type`` can compare subsystems on the same
         axis.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.build_processing.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -961,7 +963,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -999,7 +1000,8 @@ class QueueJobStore:
         carry ``errors.type='OrphanedQueueJob'`` matching the
         lifecycle/git_ref_audit precedent.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.build_processing.value,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -1008,7 +1010,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -1049,7 +1050,8 @@ class QueueJobStore:
         group by ``errors.type`` can compare subsystems on the same
         axis.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.dashboard_sync.value,
             SqlQueueJob.status == JobStatus.in_progress.value,
@@ -1059,7 +1061,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         reaped: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -1098,7 +1099,8 @@ class QueueJobStore:
         carry ``errors.type='OrphanedQueueJob'`` matching the
         lifecycle/git_ref_audit precedent.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.kind == JobKind.dashboard_sync.value,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -1107,7 +1109,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value
@@ -1146,7 +1147,8 @@ class QueueJobStore:
         rows are never reaped before it has a chance to write back the
         backend job ID.
         """
-        cutoff = datetime.now(tz=UTC) - idle_after
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         stmt = select(SqlQueueJob).where(
             SqlQueueJob.keeper_sync_run_id == run_id,
             SqlQueueJob.status == JobStatus.queued.value,
@@ -1155,7 +1157,6 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         rows = list(result.scalars().all())
-        now = datetime.now(tz=UTC)
         failed: list[QueueJob] = []
         for row in rows:
             row.status = JobStatus.failed.value

@@ -9,7 +9,7 @@ pattern transfers between subsystems.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -121,7 +121,7 @@ class LifecycleEvalRunStore:
 
         row.status = new_status.value
         if new_status not in _NON_TERMINAL_STATUSES:
-            row.date_finished = datetime.now(tz=UTC)
+            row.date_finished = func.now()
         await self._session.flush()
         await self._session.refresh(row)
         return LifecycleEvalRun.model_validate(row)
