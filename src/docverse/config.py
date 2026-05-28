@@ -263,6 +263,28 @@ class Configuration(BaseSettings):
         ),
     )
 
+    dashboard_sync_reaper_threshold_seconds: int = Field(
+        21600,
+        title="Dashboard_sync stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a ``dashboard_sync``"
+            " job (e.g. an OOM-killed worker pod or a dispatcher that"
+            " crashed between the ``queue_jobs`` SQL commit and"
+            " ``arq_queue.enqueue``). ``dashboard_sync_reaper`` fails"
+            " any ``kind='dashboard_sync'`` ``queue_jobs`` row that"
+            " has been ``in_progress`` longer than this without"
+            " ``date_completed`` so a binding's ``last_sync_queue_job``"
+            " does not show a permanently in-progress sync after a"
+            " worker crash. Defaults to 6 hours — long enough for an"
+            " operator-triggered GitHub fetch + fanout to legitimately"
+            " complete, short enough that wedged rows clear within a"
+            " working day. Mirrors ``lifecycle_reaper_threshold_seconds``"
+            " so the operator knob shape is identical across reapers;"
+            " the env-overridable default lets non-prod environments"
+            " drive the threshold down to seconds for fast verification."
+        ),
+    )
+
     git_ref_audit_enabled: bool = Field(
         default=False,
         title="Whether the daily git_ref_audit dispatcher fans out work",

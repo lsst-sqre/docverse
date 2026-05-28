@@ -17,6 +17,7 @@ from docverse.config import Configuration
 from docverse.worker.functions import (
     build_processing_reaper,
     dashboard_build_reaper,
+    dashboard_sync_reaper,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
     lifecycle_reaper,
@@ -324,6 +325,64 @@ def test_default_worker_does_not_register_build_processing_reaper() -> None:
         if isinstance(job, CronJob)
     }
     assert build_processing_reaper not in coroutines
+
+
+def test_dashboard_sync_reaper_registered_as_function() -> None:
+    """``dashboard_sync_reaper`` is registered on the lifecycle pool.
+
+    Per PRD #367 §"Pool placement" the four main-pool kind reapers
+    register on the existing :class:`LifecycleEvalWorkerSettings` arq
+    pool so reaper sweeps never compete with build processing or
+    user-triggered ``dashboard_sync`` jobs for worker capacity.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in LifecycleEvalWorkerSettings.functions
+    }
+    assert dashboard_sync_reaper in underlying
+
+
+def test_dashboard_sync_reaper_runs_every_thirty_minutes() -> None:
+    """The dashboard_sync reaper cron fires on minute 0 and 30.
+
+    A stuck ``dashboard_sync`` is not directly user-visible (no
+    operator-facing 409), so PRD #367 picks the standard 30-minute
+    cadence shared with the lifecycle and keeper-sync reapers rather
+    than the dashboard_build reaper's tighter 15-minute schedule.
+    The 6-hour threshold is what gives an operator-triggered GitHub
+    fetch + fanout room — cadence is independent of threshold.
+    """
+    cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is dashboard_sync_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {0, 30}
+
+
+def test_default_worker_does_not_register_dashboard_sync_reaper() -> None:
+    """The default queue stays free of the dashboard_sync reaper.
+
+    The reaper lives exclusively on the lifecycle pool so cron-driven
+    maintenance work never contends with the operator-triggered
+    ``dashboard_sync`` job itself on the default pool.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert dashboard_sync_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert dashboard_sync_reaper not in coroutines
 
 
 def test_default_worker_does_not_register_lifecycle_functions() -> None:

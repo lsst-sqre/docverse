@@ -43,6 +43,7 @@ from .functions import (
     dashboard_build,
     dashboard_build_reaper,
     dashboard_sync,
+    dashboard_sync_reaper,
     git_ref_audit,
     git_ref_audit_discovery,
     keeper_sync_project,
@@ -419,12 +420,13 @@ class LifecycleEvalWorkerSettings:
 
     The pool also hosts cross-subsystem reaper backstops for the
     default-pool kinds: ``dashboard_build_reaper``,
-    ``publish_edition_reaper``, and ``build_processing_reaper`` run
-    here (PRD #367) so reaper sweeps never compete with build
-    processing or user-triggered dashboard rebuilds for worker
-    capacity. The pool name retains its lifecycle-eval lineage but is
-    no longer scoped to lifecycle work alone; a rename to a
-    maintenance-style identifier is tracked separately.
+    ``publish_edition_reaper``, ``build_processing_reaper``, and
+    ``dashboard_sync_reaper`` run here (PRD #367) so reaper sweeps
+    never compete with build processing or user-triggered dashboard
+    rebuilds for worker capacity. The pool name retains its
+    lifecycle-eval lineage but is no longer scoped to lifecycle work
+    alone; a rename to a maintenance-style identifier is tracked
+    separately.
     """
 
     functions = [
@@ -452,6 +454,7 @@ class LifecycleEvalWorkerSettings:
         instrument_arq_task(dashboard_build_reaper),
         instrument_arq_task(publish_edition_reaper),
         instrument_arq_task(build_processing_reaper),
+        instrument_arq_task(dashboard_sync_reaper),
     ]
     cron_jobs = [
         cron(
@@ -502,6 +505,16 @@ class LifecycleEvalWorkerSettings:
         # reaped by this cron backstop.
         cron(
             instrument_arq_task(build_processing_reaper),
+            minute={0, 30},
+        ),
+        # ``dashboard_sync_reaper`` runs on the same standard
+        # ``minute={0, 30}`` cadence — a stuck ``dashboard_sync``
+        # is invisible to operators today (no user-facing surface),
+        # so the tighter dashboard_build cadence is not warranted.
+        # The 6-hour threshold gives an operator-triggered GitHub
+        # fetch + fanout room to legitimately complete.
+        cron(
+            instrument_arq_task(dashboard_sync_reaper),
             minute={0, 30},
         ),
     ]

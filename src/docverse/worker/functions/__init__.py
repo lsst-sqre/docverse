@@ -5,6 +5,7 @@ from .build_processing_reaper import build_processing_reaper
 from .dashboard_build import dashboard_build
 from .dashboard_build_reaper import dashboard_build_reaper
 from .dashboard_sync import dashboard_sync
+from .dashboard_sync_reaper import dashboard_sync_reaper
 from .git_ref_audit import git_ref_audit
 from .git_ref_audit_discovery import git_ref_audit_discovery
 from .keeper_sync import (
@@ -29,6 +30,7 @@ __all__ = [
     "dashboard_build",
     "dashboard_build_reaper",
     "dashboard_sync",
+    "dashboard_sync_reaper",
     "git_ref_audit",
     "git_ref_audit_discovery",
     "keeper_sync_project",
