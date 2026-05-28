@@ -143,7 +143,10 @@ def test_lifecycle_reaper_runs_every_thirty_minutes() -> None:
     Frequent enough that test/staging environments running with a low
     ``lifecycle_reaper_threshold_seconds`` see prompt finalisation,
     infrequent enough that production with the 6 h default rarely
-    sees no-work-to-do log spam.
+    sees no-work-to-do log spam. The ``lifecycle_reaper`` keeps the
+    canonical ``{0, 30}`` slot; the other reapers on the lifecycle
+    pool are staggered off it so a horizontally scaled pool never
+    fires two reapers on the same minute.
     """
     cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
     reaper_crons = [
@@ -172,13 +175,15 @@ def test_dashboard_build_reaper_registered_as_function() -> None:
 
 
 def test_dashboard_build_reaper_runs_every_fifteen_minutes() -> None:
-    """The dashboard_build reaper cron fires on minute 0, 15, 30 and 45.
+    """The dashboard_build reaper cron fires every 15 minutes.
 
     ``dashboard_build`` is the only main-pool kind whose wedge is
     directly user-visible (the 409 on ``POST /dashboard/rebuild``),
     so PRD #367 picks a tighter 15-minute cadence — worst-case
     wall-clock recovery time stays under ~45 minutes from the moment
-    a worker silently dies.
+    a worker silently dies. The slots are offset off the canonical
+    quarter-hours (``{3, 18, 33, 48}``) so this reaper never
+    co-fires with the lifecycle pool's other reapers.
     """
     cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
     reaper_crons = [
@@ -188,7 +193,7 @@ def test_dashboard_build_reaper_runs_every_fifteen_minutes() -> None:
         and _underlying(job.coroutine) is dashboard_build_reaper
     ]
     assert len(reaper_crons) == 1
-    assert reaper_crons[0].minute == {0, 15, 30, 45}
+    assert reaper_crons[0].minute == {3, 18, 33, 48}
 
 
 def test_default_worker_does_not_register_dashboard_build_reaper() -> None:
@@ -229,12 +234,14 @@ def test_publish_edition_reaper_registered_as_function() -> None:
 
 
 def test_publish_edition_reaper_runs_every_thirty_minutes() -> None:
-    """The publish_edition reaper cron fires on minute 0 and 30.
+    """The publish_edition reaper fires twice an hour, staggered off lifecycle.
 
     A stuck ``publish_edition`` is not directly user-visible (no
-    operator-facing 409), so PRD #367 picks the standard 30-minute
-    cadence shared with the lifecycle and keeper-sync reapers rather
-    than the dashboard_build reaper's tighter 15-minute schedule.
+    operator-facing 409), so PRD #367 picks a 30-minute cadence
+    rather than the dashboard_build reaper's tighter 15-minute
+    schedule. The slot is offset off the lifecycle reaper's
+    ``{0, 30}`` so the two reapers never query ``queue_jobs`` at
+    the same instant on a horizontally scaled lifecycle pool.
     """
     cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
     reaper_crons = [
@@ -244,7 +251,7 @@ def test_publish_edition_reaper_runs_every_thirty_minutes() -> None:
         and _underlying(job.coroutine) is publish_edition_reaper
     ]
     assert len(reaper_crons) == 1
-    assert reaper_crons[0].minute == {0, 30}
+    assert reaper_crons[0].minute == {6, 36}
 
 
 def test_default_worker_does_not_register_publish_edition_reaper() -> None:
@@ -285,13 +292,15 @@ def test_build_processing_reaper_registered_as_function() -> None:
 
 
 def test_build_processing_reaper_runs_every_thirty_minutes() -> None:
-    """The build_processing reaper cron fires on minute 0 and 30.
+    """The build_processing reaper fires twice an hour, off lifecycle's slot.
 
     A stuck ``build_processing`` is not directly user-visible (no
-    operator-facing 409), so PRD #367 picks the standard 30-minute
-    cadence shared with the lifecycle and keeper-sync reapers rather
-    than the dashboard_build reaper's tighter 15-minute schedule.
-    The 8-hour threshold is what keeps real multi-hour uploads safe
+    operator-facing 409), so PRD #367 picks a 30-minute cadence
+    rather than the dashboard_build reaper's tighter 15-minute
+    schedule. The slot is offset off the lifecycle reaper's
+    ``{0, 30}`` so the two reapers never query ``queue_jobs`` at
+    the same instant on a horizontally scaled lifecycle pool. The
+    8-hour threshold is what keeps real multi-hour uploads safe
     from false reaping — cadence is independent of threshold.
     """
     cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
@@ -302,7 +311,7 @@ def test_build_processing_reaper_runs_every_thirty_minutes() -> None:
         and _underlying(job.coroutine) is build_processing_reaper
     ]
     assert len(reaper_crons) == 1
-    assert reaper_crons[0].minute == {0, 30}
+    assert reaper_crons[0].minute == {12, 42}
 
 
 def test_default_worker_does_not_register_build_processing_reaper() -> None:
@@ -343,13 +352,15 @@ def test_dashboard_sync_reaper_registered_as_function() -> None:
 
 
 def test_dashboard_sync_reaper_runs_every_thirty_minutes() -> None:
-    """The dashboard_sync reaper cron fires on minute 0 and 30.
+    """The dashboard_sync reaper fires twice an hour, staggered off lifecycle.
 
     A stuck ``dashboard_sync`` is not directly user-visible (no
-    operator-facing 409), so PRD #367 picks the standard 30-minute
-    cadence shared with the lifecycle and keeper-sync reapers rather
-    than the dashboard_build reaper's tighter 15-minute schedule.
-    The 6-hour threshold is what gives an operator-triggered GitHub
+    operator-facing 409), so PRD #367 picks a 30-minute cadence
+    rather than the dashboard_build reaper's tighter 15-minute
+    schedule. The slot is offset off the lifecycle reaper's
+    ``{0, 30}`` so the two reapers never query ``queue_jobs`` at
+    the same instant on a horizontally scaled lifecycle pool. The
+    6-hour threshold is what gives an operator-triggered GitHub
     fetch + fanout room — cadence is independent of threshold.
     """
     cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
@@ -360,7 +371,54 @@ def test_dashboard_sync_reaper_runs_every_thirty_minutes() -> None:
         and _underlying(job.coroutine) is dashboard_sync_reaper
     ]
     assert len(reaper_crons) == 1
-    assert reaper_crons[0].minute == {0, 30}
+    assert reaper_crons[0].minute == {24, 54}
+
+
+def test_lifecycle_pool_reaper_crons_are_staggered() -> None:
+    """No two reapers on the lifecycle pool share a firing minute.
+
+    Today's single-worker lifecycle pool runs cron jobs sequentially,
+    so co-fires are harmless. The lifecycle pool is explicitly
+    designed to scale horizontally, however, and on a multi-worker
+    pool every reaper that fires on the same minute would race for
+    the same Postgres connection-pool slots and ``queue_jobs`` heap
+    pages. The disjoint-minute invariant is what keeps that load
+    spread across the hour; this test pins it so a future cadence
+    tweak cannot silently re-collapse the schedule.
+
+    The ``git_ref_audit_discovery`` cron at ``minute=17`` is the
+    canonical precedent (see ``worker/main.py``).
+    """
+    reaper_coros = {
+        lifecycle_reaper,
+        publish_edition_reaper,
+        build_processing_reaper,
+        dashboard_sync_reaper,
+        dashboard_build_reaper,
+    }
+    cron_jobs = list(getattr(LifecycleEvalWorkerSettings, "cron_jobs", []))
+    seen: dict[int, str] = {}
+    for job in cron_jobs:
+        if not isinstance(job, CronJob):
+            continue
+        coro = _underlying(job.coroutine)
+        if coro not in reaper_coros:
+            continue
+        # ``CronJob.minute`` is typed ``set[int] | int`` (arq accepts
+        # either form); every lifecycle-pool reaper uses the set form,
+        # but normalise here so the invariant test does not have to
+        # care about that shape.
+        raw = job.minute
+        if raw is None:
+            continue
+        minutes = raw if isinstance(raw, set) else {raw}
+        for minute in minutes:
+            assert minute not in seen, (
+                f"minute {minute} is shared by {seen[minute]!r} and "
+                f"{coro.__name__!r} — reaper crons on the lifecycle "
+                "pool must be staggered"
+            )
+            seen[minute] = coro.__name__
 
 
 def test_default_worker_does_not_register_dashboard_sync_reaper() -> None:

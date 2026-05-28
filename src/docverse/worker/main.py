@@ -465,9 +465,11 @@ class LifecycleEvalWorkerSettings:
         # the morning UTC sits well outside North-American daytime
         # peak when most release builds are running, and minute 17
         # deliberately avoids the lifecycle_eval dispatcher's hourly
-        # ``minute={0}`` tick and the reaper's ``minute={0, 30}``
-        # ticks so the audit's fan-out does not contend with them on
-        # the shared lifecycle worker pool.
+        # ``minute={0}`` tick and the lifecycle reaper's
+        # ``minute={0, 30}`` ticks so the audit's fan-out does not
+        # contend with them on the shared lifecycle worker pool. The
+        # other reapers on this pool are staggered onto their own
+        # minute slots (see below) for the same reason.
         cron(
             instrument_arq_task(git_ref_audit_discovery),
             hour={5},
@@ -482,40 +484,55 @@ class LifecycleEvalWorkerSettings:
         # wedge is user-visible (the 409 on ``POST
         # /dashboard/rebuild``); the tighter cadence keeps worst-case
         # wall-clock recovery time under ~45 minutes from the moment
-        # a worker silently dies.
+        # a worker silently dies. The slots are offset off the
+        # canonical quarter-hours so this reaper never co-fires with
+        # the other reapers on the lifecycle pool — see the
+        # ``git_ref_audit_discovery`` comment above for the same
+        # precedent on contention avoidance.
         cron(
             instrument_arq_task(dashboard_build_reaper),
-            minute={0, 15, 30, 45},
+            minute={3, 18, 33, 48},
         ),
-        # ``publish_edition_reaper`` runs on the standard
-        # ``minute={0, 30}`` cadence shared by the lifecycle and
-        # keeper-sync reapers — a stuck ``publish_edition`` is not
-        # directly user-visible (no 409), so the tighter cadence the
+        # ``publish_edition_reaper`` runs on a 30-minute cadence
+        # staggered off the lifecycle reaper's ``minute={0, 30}``
+        # slot so the two reapers never query ``queue_jobs`` at the
+        # same instant on a horizontally scaled lifecycle pool — the
+        # same precedent that puts ``git_ref_audit_discovery`` on
+        # minute 17. A stuck ``publish_edition`` is not directly
+        # user-visible (no 409), so the tighter cadence the
         # ``dashboard_build`` reaper uses is not warranted.
         cron(
             instrument_arq_task(publish_edition_reaper),
-            minute={0, 30},
+            minute={6, 36},
         ),
-        # ``build_processing_reaper`` runs on the same standard
-        # ``minute={0, 30}`` cadence — a stuck ``build_processing``
-        # is invisible to operators today (no user-facing surface),
-        # so the tighter dashboard_build cadence is not warranted.
-        # The 8-hour threshold is intentionally generous so a real
-        # multi-hour upload of a very large build is never falsely
-        # reaped by this cron backstop.
+        # ``build_processing_reaper`` runs on a 30-minute cadence
+        # staggered off the lifecycle reaper's ``minute={0, 30}``
+        # slot so the two reapers never query ``queue_jobs`` at the
+        # same instant on a horizontally scaled lifecycle pool — the
+        # same precedent that puts ``git_ref_audit_discovery`` on
+        # minute 17. A stuck ``build_processing`` is invisible to
+        # operators today (no user-facing surface), so the tighter
+        # dashboard_build cadence is not warranted. The 8-hour
+        # threshold is intentionally generous so a real multi-hour
+        # upload of a very large build is never falsely reaped by
+        # this cron backstop.
         cron(
             instrument_arq_task(build_processing_reaper),
-            minute={0, 30},
+            minute={12, 42},
         ),
-        # ``dashboard_sync_reaper`` runs on the same standard
-        # ``minute={0, 30}`` cadence — a stuck ``dashboard_sync``
-        # is invisible to operators today (no user-facing surface),
-        # so the tighter dashboard_build cadence is not warranted.
-        # The 6-hour threshold gives an operator-triggered GitHub
-        # fetch + fanout room to legitimately complete.
+        # ``dashboard_sync_reaper`` runs on a 30-minute cadence
+        # staggered off the lifecycle reaper's ``minute={0, 30}``
+        # slot so the two reapers never query ``queue_jobs`` at the
+        # same instant on a horizontally scaled lifecycle pool — the
+        # same precedent that puts ``git_ref_audit_discovery`` on
+        # minute 17. A stuck ``dashboard_sync`` is invisible to
+        # operators today (no user-facing surface), so the tighter
+        # dashboard_build cadence is not warranted. The 6-hour
+        # threshold gives an operator-triggered GitHub fetch + fanout
+        # room to legitimately complete.
         cron(
             instrument_arq_task(dashboard_sync_reaper),
-            minute={0, 30},
+            minute={24, 54},
         ),
     ]
     redis_settings = config.arq_redis_settings
