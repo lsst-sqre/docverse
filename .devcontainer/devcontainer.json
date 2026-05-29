@@ -1,4 +1,4 @@
-// stoker-managed: sandbox:devcontainer.json:57d1a882d476531f
+// stoker-managed: sandbox:devcontainer.json:ea48f3c83e66f0cc
 {
   "name": "stoker-rubin-lsst-sqre-docverse",
   "build": {
@@ -31,6 +31,7 @@
     "STOKER_GIT_IDENTITY_EMAIL": "${localEnv:STOKER_GIT_IDENTITY_EMAIL}"
   },
   "remoteUser": "vscode",
+  "containerUser": "root",
   "onCreateCommand": "sudo chown \"$(id -u):$(id -g)\" /workspace && if [ -d /workspace/.git ]; then echo \"Workspace already seeded; skipping clone\"; elif [ -n \"$(ls -A /workspace 2>/dev/null)\" ]; then echo '/workspace is non-empty but has no .git; refusing to clone over it — run `stoker sandbox rebuild` to re-seed' >&2; exit 1; else if [ -z \"${GH_TOKEN}\" ]; then echo 'GH_TOKEN is unset; cannot seed /workspace' >&2; exit 1; fi; echo \"Seeding /workspace from ${STOKER_CLONE_BRANCH:-<remote default>}\"; git clone ${STOKER_CLONE_BRANCH:+--branch \"${STOKER_CLONE_BRANCH}\"} \"https://x-access-token:${GH_TOKEN}@github.com/${STOKER_REPO_OWNER}/${STOKER_REPO_NAME}.git\" /workspace; git -C /workspace remote set-url origin \"https://github.com/${STOKER_REPO_OWNER}/${STOKER_REPO_NAME}.git\"; fi && if [ -n \"${GH_TOKEN}\" ]; then git config --global credential.helper '!f() { echo username=x-access-token; echo password=${GH_TOKEN}; }; f'; fi",
   "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude /home/vscode/.codex && { [ -f /home/vscode/.codex/config.toml ] || install -m 0644 .devcontainer/codex-config.toml /home/vscode/.codex/config.toml; } && sudo .devcontainer/init-firewall.sh && sudo install -m 0644 -o root -g root .devcontainer/firewall-refresh.cron /etc/cron.d/stoker-firewall-refresh && sudo touch /var/log/stoker-firewall.log && sudo chmod 0640 /var/log/stoker-firewall.log && sudo service cron start && npm install -g @anthropic-ai/claude-code @openai/codex @github/copilot",
   "postStartCommand": "sudo service cron start"
