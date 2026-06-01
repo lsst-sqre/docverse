@@ -7,6 +7,11 @@ repos:
         args: [--allow-multiple-documents]
       - id: check-toml
       - id: check-json
+        # The human devcontainer.json is JSONC (comments), and everything
+        # under .devcontainer/stoker/ is stoker-generated (the derived
+        # devcontainer.json + the stoker-sandbox feature manifest carry
+        # comment headers). stoker validates that tree via `stoker doctor`.
+        exclude: ^\.devcontainer/(devcontainer\.json$|stoker/)
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.10

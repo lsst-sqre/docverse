@@ -1,0 +1,5 @@
+[profile]
+source = "github.com/lsst-sqre/rubin-stoker//profile@u/jonathansick/init"
+
+[sandbox]
+repo = "lsst-sqre/docverse"

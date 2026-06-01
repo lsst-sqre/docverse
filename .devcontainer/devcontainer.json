@@ -1,39 +1,32 @@
 {
-  "name": "docverse-sandbox",
+  "name": "docverse",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": "."
+    "context": ".."
   },
   "features": {
+    // Node 22+ for the Cloudflare worker (cloudflare-worker/package.json
+    // requires "node": ">=22").
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    },
+    // Docker-in-Docker for the testcontainers-based Postgres tests.
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
-  "privileged": true,
-  "runArgs": [
-    "--cap-add=NET_ADMIN",
-    "--cap-add=NET_RAW"
-  ],
-  "workspaceMount": "",
-  "workspaceFolder": "/workspace",
-  "mounts": [
-    "type=volume,source=docverse-workspace,target=/workspace",
-    "type=volume,source=docverse-claude-home,target=/home/node/.claude",
-    "type=volume,source=docverse-cmdhistory,target=/commandhistory",
-    "type=volume,source=docverse-uv-cache,target=/home/node/.cache/uv",
-    "type=volume,source=docverse-docker-cache,target=/var/lib/docker"
-  ],
-  "containerEnv": {
-    "NODE_OPTIONS": "--max-old-space-size=4096",
-    "UV_LINK_MODE": "copy",
-    "EDITOR": "vim",
-    "VISUAL": "vim",
-    "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_AUTH_TOKEN": "",
-    "CLAUDE_CODE_USE_BEDROCK": "",
-    "CLAUDE_CODE_USE_VERTEX": ""
-  },
-  "postCreateCommand": "sudo chown node:node /home/node/.cache && sudo chown -R node:node /workspace /home/node/.claude /commandhistory /home/node/.cache/uv",
-  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && sudo cron",
-  "waitFor": "postStartCommand",
+  // DinD requires the container to START as root: the docker-in-docker
+  // Feature's docker-init.sh runs as PID 1 and only starts dockerd cleanly
+  // when it is root, and --privileged lets dockerd manage iptables/cgroups.
+  // remoteUser stays "vscode" so lifecycle/agent commands run unprivileged.
+  // Drop containerUser and the sandbox dies on startup with
+  // "Shell server terminated (code: 126)" / "no users found".
+  // Stoker's derive carries containerUser/privileged into its AFK sandbox.
   "containerUser": "root",
-  "remoteUser": "node"
+  "remoteUser": "vscode",
+  "privileged": true,
+  "postCreateCommand": "uv sync",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"]
+    }
+  }
 }
