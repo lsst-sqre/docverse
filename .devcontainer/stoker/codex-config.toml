@@ -1,4 +1,4 @@
-# stoker-managed: sandbox:codex-config.toml:f8ad7f56b57c34c2
+# stoker-managed: sandbox:stoker/codex-config.toml:f8ad7f56b57c34c2
 check_for_update_on_startup = false
 
 [analytics]

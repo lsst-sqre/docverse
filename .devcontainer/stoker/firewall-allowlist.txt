@@ -1,4 +1,4 @@
-# stoker-managed: sandbox:firewall-allowlist.txt:e9c72d448fb0282d
+# stoker-managed: sandbox:stoker/firewall-allowlist.txt:e9c72d448fb0282d
 github.com
 api.github.com
 codeload.github.com

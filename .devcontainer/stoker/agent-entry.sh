@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stoker-managed: sandbox:agent-entry.sh:385f9b5e805c5d65
+# stoker-managed: sandbox:stoker/agent-entry.sh:385f9b5e805c5d65
 # Sandbox entrypoint for stoker. Configures git identity, refreshes the
 # firewall, and exec's the agent harness. Secrets are resolved host-side
 # by the stoker CLI and injected via `--remote-env` on each `exec` /

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stoker-managed: sandbox:init-firewall.sh:8d95046b8cb62718
+# stoker-managed: sandbox:stoker/init-firewall.sh:8d95046b8cb62718
 # Configure egress firewall for the stoker sandbox. Resolves every
 # allowlisted hostname to its current IPs and installs an ipset that
 # the iptables rules drop everything else against. Re-run periodically

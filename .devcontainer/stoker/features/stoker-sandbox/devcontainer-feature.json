@@ -1,0 +1,10 @@
+// stoker-managed: sandbox:.devcontainer/stoker/features/stoker-sandbox/devcontainer-feature.json:c54006b3d8e7891d
+{
+  "id": "stoker-sandbox",
+  "version": "1.0.0",
+  "name": "Stoker sandbox operational tooling",
+  "description": "Installs stoker's egress-firewall / sudo / cron / 1Password stack (the tooling init-firewall.sh, agent-entry.sh, and the firewall cron consume) plus the NOPASSWD sudoers rule, so the repo's own base Dockerfile stays project-only.",
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils"
+  ]
+}
