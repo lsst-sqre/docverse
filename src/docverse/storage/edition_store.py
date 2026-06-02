@@ -540,9 +540,19 @@ class EditionStore:
         database — mirroring
         :meth:`list_draft_editions_by_git_ref`. Unlike that method this
         restricts to ``tracking_mode = git_ref`` (no ``alternate_git_ref``,
-        no ``kind``/``lifecycle_exempt`` filter) so it answers exactly
-        whether a literal-ref-tracking edition holds the ref. Soft-deleted
-        rows (``date_deleted IS NULL``) are ignored.
+        no ``lifecycle_exempt`` filter) so it answers exactly whether a
+        literal-ref-tracking edition holds the ref. Soft-deleted rows
+        (``date_deleted IS NULL``) are ignored.
+
+        The auto-created default ``__main`` edition (``kind = main``,
+        tracking ``{'git_ref': 'main'}``) is excluded: an imported LTD
+        edition that maps to ``git_ref = 'main'`` under a non-``main`` slug
+        (e.g. a manual edition pinned to a build built from ``main``, or a
+        ``git_refs`` edition tracking ``['main']`` under another slug) must
+        get its own row rather than adopt — and silently alias onto — the
+        project's default edition. An LTD edition actually slugged ``main``
+        folds to ``__main`` via ``derive_edition_slug`` and is updated
+        directly through ``get_by_slug``, never reaching this adoption path.
 
         Returns the earliest-created match (``date_created``, then ``id``)
         so adoption is deterministic and keeps the first-created slug when
@@ -554,6 +564,7 @@ class EditionStore:
             .where(
                 SqlEdition.project_id == project_id,
                 SqlEdition.tracking_mode == TrackingMode.git_ref,
+                SqlEdition.kind != EditionKind.main,
                 SqlEdition.date_deleted.is_(None),
                 SqlEdition.tracking_params["git_ref"].astext == git_ref,
             )

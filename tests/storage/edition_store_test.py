@@ -1908,3 +1908,76 @@ async def test_get_git_ref_tracking_edition_excludes_other_tracking_mode(
         )
         await db_session.commit()
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_excludes_default_main(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The auto-created default ``__main`` edition is never adopted.
+
+    A non-``main``-slugged LTD edition that maps to ``git_ref = 'main'``
+    (e.g. a manual edition pinned to a build built from ``main``) must get
+    its own row rather than fold onto — and silently alias — the project's
+    default edition. The lookup excludes ``kind = main`` so such an import
+    does not adopt ``__main``.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        # The reserved ``__main`` slug only goes through ``create_internal``
+        # (it does not conform to ``EditionCreate``'s user-facing pattern),
+        # matching how project creation seeds the default edition.
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="main"
+        )
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_returns_non_default_on_main(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A non-default edition tracking ``main`` is still returned.
+
+    Excluding the default ``__main`` edition must stay narrow: a genuine
+    draft edition that happens to track ``git_ref = 'main'`` under its own
+    slug remains adoptable for de-duplication even when the default edition
+    is present.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="stable",
+                title="Stable",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="main"
+        )
+        await db_session.commit()
+    assert found is not None
+    assert found.slug == "stable"

@@ -34,10 +34,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
     BuildStatus,
+    EditionCreate,
+    EditionKind,
     JobKind,
     KeeperSyncConfig,
     KeeperSyncRunStatus,
     OrganizationCreate,
+    ProjectCreate,
+    TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.edition import SqlEdition
@@ -352,6 +356,142 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(  # noqa: P
     # Build content actually landed in the destination object store.
     assert any(k.endswith("/index.html") for k in object_store.objects)
     assert any(k.endswith("/app.js") for k in object_store.objects)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_publishes_adopted_edition_under_native_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An adopted edition's publish carries the persisted native slug.
+
+    PRD #409: a native edition already tracks ``tickets/DM-54686`` under
+    the slugified ``tickets-DM-54686`` slug; keeper-sync imports LTD's own
+    ``DM-54686`` slug on the same ref and adopts the native edition. The
+    enqueued ``publish_edition`` job must carry the *persisted* slug
+    (``tickets-DM-54686``) — both publish paths resolve the edition via
+    ``get_by_slug``, so the keeper-derived ``DM-54686`` would miss the row
+    and the freshly-synced build would fail to publish.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # A native auto-created edition already tracks the branch ref under
+        # the slugified slug, before keeper-sync ever runs.
+        project_store = ProjectStore(session=db_session, logger=_logger())
+        seed_project = await project_store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        native_edition = await edition_store.create(
+            project_id=seed_project.id,
+            data=EditionCreate(
+                slug="tickets-DM-54686",
+                title="DM-54686",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-54686"},
+            ),
+        )
+    native_edition_id = native_edition.id
+
+    # LTD reports the same branch under its own ``DM-54686`` slug.
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/2"]}
+        )
+    )
+    branch_edition = _load("edition_branch_git_refs.json")
+    branch_edition["slug"] = "DM-54686"
+    branch_edition["title"] = "DM-54686"
+    branch_edition["tracked_refs"] = ["tickets/DM-54686"]
+    branch_edition["build_url"] = f"{LTD_BASE}/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    branch_build = _load("build.json")
+    branch_build["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build)
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_jobs) == 1
+    publish_payload = publish_jobs[0].kwargs["payload"]
+    # The publish job must carry the persisted native slug so
+    # ``publish_edition``'s ``get_by_slug`` resolves the adopted edition;
+    # the keeper-derived ``DM-54686`` slug would miss the row entirely.
+    assert publish_payload["edition_slug"] == "tickets-DM-54686"
+    assert publish_payload["edition_id"] == native_edition_id
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+
+            edition_store = EditionStore(session=session, logger=_logger())
+            # The adopted edition got the synced build and a pending publish.
+            adopted = await edition_store.get_by_slug(
+                project_id=project.id, slug="tickets-DM-54686"
+            )
+            assert adopted is not None
+            assert adopted.id == native_edition_id
+            assert adopted.current_build_id is not None
+            assert adopted.publish_status == PublishStatus.pending
+
+            # No second row was created under the keeper-derived slug.
+            keeper_slugged = await edition_store.get_by_slug(
+                project_id=project.id, slug="DM-54686"
+            )
+            assert keeper_slugged is None
 
 
 @pytest.mark.asyncio

@@ -646,7 +646,16 @@ class KeeperSyncService:
 
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
-            docverse_slug=docverse_slug,
+            # Report the *persisted* edition's slug, not the keeper-derived
+            # ``docverse_slug``. When ``_ensure_edition`` adopts a
+            # differently-slugged native edition on the same git_ref (PRD
+            # #409: native ``tickets-DM-54686`` vs keeper ``DM-54686``), the
+            # two disagree. Both publish paths key off
+            # ``outcome.docverse_slug`` via ``get_by_slug``
+            # (publish_edition / _resolve_self_heal_target), so reporting the
+            # keeper slug would miss the row — the build would fail to
+            # publish (NotFoundError) or be silently skipped.
+            docverse_slug=edition.slug,
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             build_outcome=build_outcome,
