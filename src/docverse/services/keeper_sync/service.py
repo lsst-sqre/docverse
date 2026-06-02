@@ -674,6 +674,37 @@ class KeeperSyncService:
             )
             raise RuntimeError(msg)
         if edition is None:
+            # PRD #409: native auto-creation and keeper-sync derive an
+            # edition's slug from a branch differently, so the same
+            # ``git_ref`` can be slugged two ways (native
+            # ``tickets-DM-54686`` vs keeper-sync ``DM-54686``). After a
+            # slug miss, consult the shared git_ref lookup: if a
+            # differently-slugged edition already tracks this ref, adopt
+            # it — refresh its tracking and keep its slug — rather than
+            # insert a duplicate row on the same ref.
+            if tracking_mode == TrackingMode.git_ref:
+                adopted = (
+                    await self._edition_store.get_git_ref_tracking_edition(
+                        project_id=project_id,
+                        git_ref=tracking_params["git_ref"],
+                    )
+                )
+                if adopted is not None:
+                    await self._refresh_tracking(
+                        edition=adopted,
+                        tracking_mode=tracking_mode,
+                        tracking_params=tracking_params,
+                    )
+                    self._logger.info(
+                        "Adopted existing git_ref edition for keeper-sync"
+                        " import",
+                        project_id=project_id,
+                        git_ref=tracking_params["git_ref"],
+                        adopted_slug=adopted.slug,
+                        keeper_slug=docverse_slug,
+                        edition_id=adopted.id,
+                    )
+                    return adopted
             edition = await self._edition_store.create_internal(
                 project_id=project_id,
                 slug=docverse_slug,
