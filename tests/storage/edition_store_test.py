@@ -1768,3 +1768,216 @@ async def test_list_draft_editions_by_git_ref_scoped_to_project(
         )
         await db_session.commit()
     assert result == []
+
+
+# ── get_git_ref_tracking_edition ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_returns_match(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The git_ref-mode edition tracking the ref is returned.
+
+    Pins the shared "is any git_ref-mode edition already tracking this
+    ref?" lookup that keeper-sync consults before creating an edition
+    (PRD #409). The server-side filter mirrors
+    :meth:`EditionStore.list_draft_editions_by_git_ref` but restricts to
+    ``tracking_mode = git_ref``.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="tickets-DM-54686",
+                title="DM-54686",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-54686"},
+            ),
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="tickets/DM-54686"
+        )
+        await db_session.commit()
+    assert found is not None
+    assert found.slug == "tickets-DM-54686"
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_none_when_no_match(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``None`` is returned when no edition tracks the ref."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="tickets/DM-54686"
+        )
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_excludes_other_ref(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A git_ref-mode edition tracking a different ref is not returned."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="feature-y",
+                title="Feature Y",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "feature-y"},
+            ),
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="feature-x"
+        )
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_excludes_soft_deleted(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A soft-deleted edition on the ref is ignored (returns ``None``)."""
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="tickets-DM-1",
+                title="DM-1",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-1"},
+            ),
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="tickets-DM-1",
+            reason=TombstoneReason.manual_delete,
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="tickets/DM-1"
+        )
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_excludes_other_tracking_mode(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A non-``git_ref``-mode edition on the same ref is not returned.
+
+    The lookup answers strictly "is any ``git_ref``-mode edition tracking
+    this ref?"; an ``alternate_git_ref`` edition that happens to carry the
+    same ``tracking_params->>'git_ref'`` must not satisfy it.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="usdf-dev",
+                title="USDF Dev",
+                kind=EditionKind.alternate,
+                tracking_mode=TrackingMode.alternate_git_ref,
+                tracking_params={
+                    "git_ref": "tickets/DM-2",
+                    "alternate_name": "usdf-dev",
+                },
+            ),
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="tickets/DM-2"
+        )
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_excludes_default_main(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The auto-created default ``__main`` edition is never adopted.
+
+    A non-``main``-slugged LTD edition that maps to ``git_ref = 'main'``
+    (e.g. a manual edition pinned to a build built from ``main``) must get
+    its own row rather than fold onto — and silently alias — the project's
+    default edition. The lookup excludes ``kind = main`` so such an import
+    does not adopt ``__main``.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        # The reserved ``__main`` slug only goes through ``create_internal``
+        # (it does not conform to ``EditionCreate``'s user-facing pattern),
+        # matching how project creation seeds the default edition.
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="main"
+        )
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_git_ref_tracking_edition_returns_non_default_on_main(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A non-default edition tracking ``main`` is still returned.
+
+    Excluding the default ``__main`` edition must stay narrow: a genuine
+    draft edition that happens to track ``git_ref = 'main'`` under its own
+    slug remains adoptable for de-duplication even when the default edition
+    is present.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="stable",
+                title="Stable",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        found = await edition_store.get_git_ref_tracking_edition(
+            project_id=project_id, git_ref="main"
+        )
+        await db_session.commit()
+    assert found is not None
+    assert found.slug == "stable"

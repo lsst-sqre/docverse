@@ -646,7 +646,16 @@ class KeeperSyncService:
 
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
-            docverse_slug=docverse_slug,
+            # Report the *persisted* edition's slug, not the keeper-derived
+            # ``docverse_slug``. When ``_ensure_edition`` adopts a
+            # differently-slugged native edition on the same git_ref (PRD
+            # #409: native ``tickets-DM-54686`` vs keeper ``DM-54686``), the
+            # two disagree. Both publish paths key off
+            # ``outcome.docverse_slug`` via ``get_by_slug``
+            # (publish_edition / _resolve_self_heal_target), so reporting the
+            # keeper slug would miss the row — the build would fail to
+            # publish (NotFoundError) or be silently skipped.
+            docverse_slug=edition.slug,
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             build_outcome=build_outcome,
@@ -674,6 +683,37 @@ class KeeperSyncService:
             )
             raise RuntimeError(msg)
         if edition is None:
+            # PRD #409: native auto-creation and keeper-sync derive an
+            # edition's slug from a branch differently, so the same
+            # ``git_ref`` can be slugged two ways (native
+            # ``tickets-DM-54686`` vs keeper-sync ``DM-54686``). After a
+            # slug miss, consult the shared git_ref lookup: if a
+            # differently-slugged edition already tracks this ref, adopt
+            # it — refresh its tracking and keep its slug — rather than
+            # insert a duplicate row on the same ref.
+            if tracking_mode == TrackingMode.git_ref:
+                adopted = (
+                    await self._edition_store.get_git_ref_tracking_edition(
+                        project_id=project_id,
+                        git_ref=tracking_params["git_ref"],
+                    )
+                )
+                if adopted is not None:
+                    await self._refresh_tracking(
+                        edition=adopted,
+                        tracking_mode=tracking_mode,
+                        tracking_params=tracking_params,
+                    )
+                    self._logger.info(
+                        "Adopted existing git_ref edition for keeper-sync"
+                        " import",
+                        project_id=project_id,
+                        git_ref=tracking_params["git_ref"],
+                        adopted_slug=adopted.slug,
+                        keeper_slug=docverse_slug,
+                        edition_id=adopted.id,
+                    )
+                    return adopted
             edition = await self._edition_store.create_internal(
                 project_id=project_id,
                 slug=docverse_slug,

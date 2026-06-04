@@ -26,8 +26,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
+    EditionCreate,
     EditionKind,
     OrganizationCreate,
+    ProjectCreate,
     TrackingMode,
 )
 from docverse.dbschema.build import SqlBuild
@@ -644,6 +646,132 @@ async def test_branch_edition_creates_new_draft_edition(
         )
         assert main is not None
         assert main.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_adopts_native_git_ref_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """keeper-sync adopts a differently-slugged native edition on one ref.
+
+    PRD #409: native auto-creation slugifies ``tickets/DM-54686`` to
+    ``tickets-DM-54686`` while keeper-sync imports LTD's own ``DM-54686``
+    slug. Both track the same ``git_ref``. After a ``get_by_slug`` miss,
+    keeper-sync must consult the shared git_ref lookup, adopt the
+    existing native edition (refresh its tracking, keep its slug), and
+    create no second row; the ``keeper_sync_state`` for the imported
+    edition points at the adopted edition's id.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+
+    # A native auto-created edition already tracks ``tickets/DM-54686``
+    # under the slugified slug, before keeper-sync ever runs.
+    async with db_session.begin():
+        project = await project_store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        native_edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="tickets-DM-54686",
+                title="DM-54686",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-54686"},
+            ),
+        )
+    native_edition_id = native_edition.id
+
+    # LTD reports the same branch under its own ``DM-54686`` slug.
+    branch_edition = _load("edition_branch_git_refs.json")
+    branch_edition["slug"] = "DM-54686"
+    branch_edition["title"] = "DM-54686"
+    branch_edition["tracked_refs"] = ["tickets/DM-54686"]
+    branch_edition["build_url"] = f"{LTD_BASE}/builds/43"
+    branch_build = _load("build.json")
+    branch_build["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build["bucket_root_dir"] = "pipelines/builds/43"
+
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/2"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build)
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The adopted edition's id is returned even though the keeper slug
+    # differs from the native one.
+    assert len(result.edition_outcomes) == 1
+    assert result.edition_outcomes[0].docverse_edition_id == native_edition_id
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        # No second edition under the keeper-derived slug was created.
+        keeper_slugged = await edition_store.get_by_slug(
+            project_id=project.id, slug="DM-54686"
+        )
+        assert keeper_slugged is None
+
+        # The native edition survives, keeps its slug, and its tracking
+        # was refreshed to the imported git_ref.
+        adopted = await edition_store.get_by_slug(
+            project_id=project.id, slug="tickets-DM-54686"
+        )
+        assert adopted is not None
+        assert adopted.id == native_edition_id
+        assert adopted.tracking_mode == TrackingMode.git_ref
+        assert adopted.tracking_params == {"git_ref": "tickets/DM-54686"}
+
+        # Exactly one edition tracks the ref — no duplicate row.
+        all_editions = await edition_store.list_all_by_project(project.id)
+        on_ref = [
+            e
+            for e in all_editions
+            if (e.tracking_params or {}).get("git_ref") == "tickets/DM-54686"
+        ]
+        assert len(on_ref) == 1
+
+        # keeper_sync_state for the imported edition (ltd_id=2) points at
+        # the adopted edition's id.
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+        )
+        assert state is not None
+        assert state.docverse_id == native_edition_id
 
 
 @pytest.mark.asyncio

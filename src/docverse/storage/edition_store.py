@@ -522,6 +522,62 @@ class EditionStore:
             for edition_row, build_public_id, build_git_ref in rows
         ]
 
+    async def get_git_ref_tracking_edition(
+        self, *, project_id: int, git_ref: str
+    ) -> Edition | None:
+        """Return the ``git_ref``-mode edition tracking ``git_ref``, if any.
+
+        The shared "is any ``git_ref``-mode edition already tracking this
+        ref?" lookup. keeper-sync consults it after a ``get_by_slug`` miss
+        so it adopts a differently-slugged existing edition rather than
+        inserting a duplicate that tracks the same ref (PRD #409): native
+        auto-creation and keeper-sync derive an edition's slug from a
+        branch differently, so the same branch can otherwise yield two
+        editions on one ``git_ref``.
+
+        The ``tracking_params->>'git_ref'`` equality is applied as a
+        server-side JSONB filter — non-matching rows never leave the
+        database — mirroring
+        :meth:`list_draft_editions_by_git_ref`. Unlike that method this
+        restricts to ``tracking_mode = git_ref`` (no ``alternate_git_ref``,
+        no ``lifecycle_exempt`` filter) so it answers exactly whether a
+        literal-ref-tracking edition holds the ref. Soft-deleted rows
+        (``date_deleted IS NULL``) are ignored.
+
+        The auto-created default ``__main`` edition (``kind = main``,
+        tracking ``{'git_ref': 'main'}``) is excluded: an imported LTD
+        edition that maps to ``git_ref = 'main'`` under a non-``main`` slug
+        (e.g. a manual edition pinned to a build built from ``main``, or a
+        ``git_refs`` edition tracking ``['main']`` under another slug) must
+        get its own row rather than adopt — and silently alias onto — the
+        project's default edition. An LTD edition actually slugged ``main``
+        folds to ``__main`` via ``derive_edition_slug`` and is updated
+        directly through ``get_by_slug``, never reaching this adoption path.
+
+        Returns the earliest-created match (``date_created``, then ``id``)
+        so adoption is deterministic and keeps the first-created slug when
+        a duplicate already exists; ``None`` when no edition tracks the
+        ref.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.tracking_mode == TrackingMode.git_ref,
+                SqlEdition.kind != EditionKind.main,
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.tracking_params["git_ref"].astext == git_ref,
+            )
+            .order_by(SqlEdition.date_created, SqlEdition.id)
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        row_tuple = result.first()
+        if row_tuple is None:
+            return None
+        edition_row, build_public_id, build_git_ref = row_tuple
+        return self._validate(edition_row, build_public_id, build_git_ref)
+
     async def find_matching_editions(
         self,
         *,
