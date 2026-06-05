@@ -61,8 +61,7 @@ from docverse.domain.queue import QueueJob
 from docverse.factory import Factory
 from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
 from docverse.storage.queue_job_store import QueueJobStore
-
-from .lifecycle_eval_dispatcher import LIFECYCLE_EVAL_QUEUE_NAME
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
 
 __all__ = ["git_ref_audit_discovery"]
 
@@ -239,7 +238,7 @@ async def _enqueue_arq_jobs(  # noqa: PLR0913
     enqueue and the ``backend_job_id`` write leaves an orphan-queued
     row (``backend_job_id IS NULL``) which ``lifecycle_reaper`` sweeps
     via :meth:`QueueJobStore.fail_orphaned_git_ref_audit_jobs`. The
-    audit shares the lifecycle-eval worker pool's queue so audit and
+    audit shares the maintenance worker pool's queue so audit and
     lifecycle-eval ticks can never crowd each other off the worker
     fleet.
     """
@@ -247,7 +246,7 @@ async def _enqueue_arq_jobs(  # noqa: PLR0913
     for org, queue_job in zip(orgs, queue_jobs, strict=True):
         metadata = await arq_queue.enqueue(
             "git_ref_audit",
-            _queue_name=LIFECYCLE_EVAL_QUEUE_NAME,
+            _queue_name=MAINTENANCE_QUEUE_NAME,
             payload={
                 "org_id": org.id,
                 "org_slug": org.slug,

@@ -34,7 +34,7 @@ job. On each firing the dispatcher:
    orphan-tail window — row committed, ``backend_job_id IS NULL`` —
    is the responsibility of ``lifecycle_reaper``, the second
    durability backstop. The per-job arq ``timeout`` configured on
-   ``LifecycleEvalWorkerSettings`` is the first backstop (cancels a
+   ``MaintenanceWorkerSettings`` is the first backstop (cancels a
    runaway evaluator long before the reaper window).
 """
 
@@ -54,20 +54,9 @@ from docverse.domain.queue import QueueJob
 from docverse.factory import Factory
 from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
 from docverse.storage.queue_job_store import QueueJobStore
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
 
-__all__ = ["LIFECYCLE_EVAL_QUEUE_NAME", "lifecycle_eval_dispatcher"]
-
-
-LIFECYCLE_EVAL_QUEUE_NAME = "docverse:lifecycle-queue"
-"""arq queue name dedicated to ``lifecycle_eval`` work.
-
-The queue is isolated from the default ``docverse:queue`` and the
-``docverse:sync-queue`` so a slow lifecycle pass cannot starve
-``build_processing`` / ``publish_edition`` or keeper-sync jobs. The
-PRD calls for "a new dedicated arq worker pool (the third pool,
-alongside the default and keeper-sync pools)" — this constant is the
-queue name those pools bind to.
-"""
+__all__ = ["lifecycle_eval_dispatcher"]
 
 
 async def lifecycle_eval_dispatcher(ctx: dict[str, Any]) -> str:
@@ -252,7 +241,7 @@ async def _enqueue_arq_jobs(  # noqa: PLR0913
     for org, queue_job in zip(orgs, queue_jobs, strict=True):
         metadata = await arq_queue.enqueue(
             "lifecycle_eval",
-            _queue_name=LIFECYCLE_EVAL_QUEUE_NAME,
+            _queue_name=MAINTENANCE_QUEUE_NAME,
             payload={
                 "org_id": org.id,
                 "org_slug": org.slug,

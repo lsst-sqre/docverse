@@ -60,7 +60,7 @@ from .functions import (
     publish_edition,
     publish_edition_reaper,
 )
-from .functions.lifecycle_eval_dispatcher import LIFECYCLE_EVAL_QUEUE_NAME
+from .queues import MAINTENANCE_QUEUE_NAME
 
 config = Configuration()
 
@@ -275,9 +275,9 @@ async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
     await _startup(ctx, component="worker-keeper-sync")
 
 
-async def startup_lifecycle_eval(ctx: dict[str, Any]) -> None:
-    """on_startup for the dedicated lifecycle-eval arq queue."""
-    await _startup(ctx, component="worker-lifecycle-eval")
+async def startup_maintenance(ctx: dict[str, Any]) -> None:
+    """on_startup for the dedicated maintenance arq queue."""
+    await _startup(ctx, component="worker-maintenance")
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
@@ -385,16 +385,17 @@ class KeeperSyncWorkerSettings:
     on_shutdown = shutdown
 
 
-class LifecycleEvalWorkerSettings:
-    """arq WorkerSettings for the dedicated lifecycle queue.
+class MaintenanceWorkerSettings:
+    """arq WorkerSettings for the dedicated maintenance queue.
 
-    Bound to ``docverse:lifecycle-queue`` (see
-    :data:`LIFECYCLE_EVAL_QUEUE_NAME`) so a slow lifecycle pass cannot
+    Bound to ``docverse:maintenance-queue`` (see
+    :data:`MAINTENANCE_QUEUE_NAME`) so a slow maintenance pass cannot
     starve the default queue's ``build_processing`` and
     ``publish_edition`` jobs or the keeper-sync queue's
-    ``keeper_sync_project`` jobs. The PRD §"Orchestration" specifies a
-    third pool alongside the default and keeper-sync pools; this
-    class is the binding.
+    ``keeper_sync_project`` jobs. This is the third pool alongside the
+    default and keeper-sync pools — a catch-all for non-publishing
+    periodic work rather than lifecycle evaluation alone; this class
+    is the binding.
 
     Both the hourly ``lifecycle_eval`` (dispatcher + per-org worker)
     and the daily ``git_ref_audit`` (discovery + per-org worker) live
@@ -406,7 +407,7 @@ class LifecycleEvalWorkerSettings:
 
     All four functions are wrapped with :func:`arq.func` so the
     dedicated queue inherits a per-job ``timeout`` (sourced from
-    ``Config.lifecycle_eval_job_timeout_seconds``) and a
+    ``Config.maintenance_job_timeout_seconds``) and a
     single-attempt policy. A failure must surface promptly so the
     per-org worker's ``except Exception`` block can route to
     ``queue_job_store.fail()`` and the parent run finalises via the
@@ -423,31 +424,30 @@ class LifecycleEvalWorkerSettings:
     ``publish_edition_reaper``, ``build_processing_reaper``, and
     ``dashboard_sync_reaper`` run here (PRD #367) so reaper sweeps
     never compete with build processing or user-triggered dashboard
-    rebuilds for worker capacity. The pool name retains its
-    lifecycle-eval lineage but is no longer scoped to lifecycle work
-    alone; a rename to a maintenance-style identifier is tracked
-    separately.
+    rebuilds for worker capacity. The maintenance name reflects that
+    the pool is the shared home for this non-publishing periodic work,
+    no longer scoped to lifecycle evaluation alone.
     """
 
     functions = [
         func(
             instrument_arq_task(lifecycle_eval_dispatcher),
-            timeout=config.lifecycle_eval_job_timeout_seconds,
+            timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
         func(
             instrument_arq_task(lifecycle_eval),
-            timeout=config.lifecycle_eval_job_timeout_seconds,
+            timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
         func(
             instrument_arq_task(git_ref_audit_discovery),
-            timeout=config.lifecycle_eval_job_timeout_seconds,
+            timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
         func(
             instrument_arq_task(git_ref_audit),
-            timeout=config.lifecycle_eval_job_timeout_seconds,
+            timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
         instrument_arq_task(lifecycle_reaper),
@@ -536,6 +536,6 @@ class LifecycleEvalWorkerSettings:
         ),
     ]
     redis_settings = config.arq_redis_settings
-    queue_name = LIFECYCLE_EVAL_QUEUE_NAME
-    on_startup = startup_lifecycle_eval
+    queue_name = MAINTENANCE_QUEUE_NAME
+    on_startup = startup_maintenance
     on_shutdown = shutdown

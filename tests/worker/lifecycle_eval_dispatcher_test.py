@@ -31,10 +31,10 @@ from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from docverse.worker.functions.lifecycle_eval_dispatcher import (
-    LIFECYCLE_EVAL_QUEUE_NAME,
     _create_run_with_children,
     lifecycle_eval_dispatcher,
 )
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 
@@ -131,7 +131,7 @@ async def test_dispatcher_fans_out_per_in_scope_org(
 
     http_client = httpx.AsyncClient()
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
-    register_queue(mock_arq, LIFECYCLE_EVAL_QUEUE_NAME)
+    register_queue(mock_arq, MAINTENANCE_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
     result = await lifecycle_eval_dispatcher(ctx)
@@ -141,7 +141,7 @@ async def test_dispatcher_fans_out_per_in_scope_org(
     # Two child ``lifecycle_eval`` jobs were enqueued on the dedicated
     # queue — one per in-scope org — and zero on the default queue.
     eval_jobs = get_jobs_by_name(
-        mock_arq, "lifecycle_eval", queue_name=LIFECYCLE_EVAL_QUEUE_NAME
+        mock_arq, "lifecycle_eval", queue_name=MAINTENANCE_QUEUE_NAME
     )
     assert len(eval_jobs) == 2
     default_jobs = get_jobs_by_name(
@@ -210,7 +210,7 @@ async def test_dispatcher_with_no_in_scope_orgs_terminates_run_succeeded(
 
     http_client = httpx.AsyncClient()
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
-    register_queue(mock_arq, LIFECYCLE_EVAL_QUEUE_NAME)
+    register_queue(mock_arq, MAINTENANCE_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
     result = await lifecycle_eval_dispatcher(ctx)
@@ -218,7 +218,7 @@ async def test_dispatcher_with_no_in_scope_orgs_terminates_run_succeeded(
     assert result == "completed"
 
     eval_jobs = get_jobs_by_name(
-        mock_arq, "lifecycle_eval", queue_name=LIFECYCLE_EVAL_QUEUE_NAME
+        mock_arq, "lifecycle_eval", queue_name=MAINTENANCE_QUEUE_NAME
     )
     assert eval_jobs == []
 
@@ -292,7 +292,7 @@ async def test_dispatcher_skips_when_create_loses_race(
 
     http_client = httpx.AsyncClient()
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
-    register_queue(mock_arq, LIFECYCLE_EVAL_QUEUE_NAME)
+    register_queue(mock_arq, MAINTENANCE_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
     result = await lifecycle_eval_dispatcher(ctx)
@@ -300,7 +300,7 @@ async def test_dispatcher_skips_when_create_loses_race(
     assert result == "skipped"
 
     eval_jobs = get_jobs_by_name(
-        mock_arq, "lifecycle_eval", queue_name=LIFECYCLE_EVAL_QUEUE_NAME
+        mock_arq, "lifecycle_eval", queue_name=MAINTENANCE_QUEUE_NAME
     )
     assert eval_jobs == []
 
@@ -344,7 +344,7 @@ async def test_dispatcher_skips_tick_when_prior_run_in_flight(
 
     http_client = httpx.AsyncClient()
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
-    register_queue(mock_arq, LIFECYCLE_EVAL_QUEUE_NAME)
+    register_queue(mock_arq, MAINTENANCE_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
     result = await lifecycle_eval_dispatcher(ctx)
@@ -352,7 +352,7 @@ async def test_dispatcher_skips_tick_when_prior_run_in_flight(
     assert result == "skipped"
 
     eval_jobs = get_jobs_by_name(
-        mock_arq, "lifecycle_eval", queue_name=LIFECYCLE_EVAL_QUEUE_NAME
+        mock_arq, "lifecycle_eval", queue_name=MAINTENANCE_QUEUE_NAME
     )
     assert eval_jobs == []
 
