@@ -2,7 +2,7 @@
 name: stoker-implement
 description: Drive a single pre-selected task through stoker-work's TDD cycle and commit/push/PR/close it (or stuck-mark it on failure). Use when invoked from the implement-phase prompt — the host has already picked the task and checked out its branch.
 ---
-<!-- stoker-managed: skills:.claude/skills/stoker-implement/SKILL.md:3ea7153b66cda0e2 -->
+<!-- stoker-managed: skills:.claude/skills/stoker-implement/SKILL.md:5822ab153beed9be -->
 
 # stoker-implement — drive one pre-selected stoker task to completion
 

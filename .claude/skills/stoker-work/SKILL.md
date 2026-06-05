@@ -2,7 +2,7 @@
 name: stoker-work
 description: The universal red/green/refactor TDD methodology building block — drives a unit of work through plan → failing test → minimal implementation → refactor → validation against this repo's project-mechanics. Use when invoked from `stoker-implement` (always delegates here for the dev cycle), from `stoker-fixup` or `stoker-rebase` when a finding or conflict warrants the full TDD discipline rather than an in-place apply-and-validate, or any time the user wants to drive a feature/bug-fix/refactor through plan → test → implement → validate.
 ---
-<!-- stoker-managed: skills:.claude/skills/stoker-work/SKILL.md:61b63b26db2bc01e -->
+<!-- stoker-managed: skills:.claude/skills/stoker-work/SKILL.md:6516b08d6df1db5b -->
 
 # stoker-work — Development Work Cycle
 
