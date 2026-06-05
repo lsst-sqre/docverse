@@ -141,3 +141,27 @@ def test_queue_job_progress_none() -> None:
     """A job with no progress yields ``None``."""
     job = QueueJob.model_validate(_queue_job())
     assert job.progress is None
+
+
+def test_queue_job_subject_back_reference_fields_default_none() -> None:
+    """The subject back-reference URL fields are declared and optional."""
+    job = QueueJob.model_validate(_queue_job())
+
+    assert job.build_url is None
+    assert job.edition_url is None
+    assert job.subject_url is None
+    for name in ("build_url", "edition_url", "subject_url"):
+        assert name in QueueJob.model_fields
+
+
+def test_queue_job_subject_back_reference_fields_round_trip() -> None:
+    """The back-reference URLs survive a validate round-trip."""
+    build = "https://example.com/orgs/o/projects/p/builds/0000-0000-0000-05"
+    edition = "https://example.com/orgs/o/projects/p/editions/main"
+    job = QueueJob.model_validate(
+        _queue_job(build_url=build, edition_url=edition, subject_url=edition)
+    )
+
+    assert job.build_url == build
+    assert job.edition_url == edition
+    assert job.subject_url == edition

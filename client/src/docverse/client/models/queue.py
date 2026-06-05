@@ -162,6 +162,33 @@ class QueueJob(BaseModel):
         ),
     )
 
+    subject_url: str | None = Field(
+        default=None,
+        description=(
+            "Absolute URL of the primary API resource this job processes (a"
+            " HATEOAS link clients follow instead of reconstructing the"
+            " path): the build for build_processing jobs, the edition for"
+            " publish jobs. ``null`` when no API resource exists or it could"
+            " not be resolved."
+        ),
+    )
+
+    build_url: str | None = Field(
+        default=None,
+        description=(
+            "Absolute URL of the build this job processes, or ``null`` when"
+            " the job targets no build or it could not be resolved."
+        ),
+    )
+
+    edition_url: str | None = Field(
+        default=None,
+        description=(
+            "Absolute URL of the edition this job targets, or ``null`` when"
+            " the job targets no edition or it could not be resolved."
+        ),
+    )
+
     phase: str | None = Field(
         default=None,
         description=(

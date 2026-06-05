@@ -403,11 +403,13 @@ async def get_org_keeper_sync_run_jobs(  # noqa: PLR0913
             cursor=parsed_cursor,
             limit=limit,
         )
+        jobs = [
+            await QueueJob.from_domain(job, context.request, context.factory)
+            for job in result.entries
+        ]
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
-    return [
-        QueueJob.from_domain(job, context.request) for job in result.entries
-    ]
+    return jobs
 
 
 @router.get(

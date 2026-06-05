@@ -187,6 +187,25 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def get_by_id(self, edition_id: int) -> Edition | None:
+        """Fetch an edition by its internal ID.
+
+        Soft-deleted editions (``date_deleted`` set) are excluded so a
+        best-effort HATEOAS back-reference never points at a removed
+        resource; callers resolving a link treat ``None`` as "no API
+        resource exists".
+        """
+        stmt = self._base_query().where(
+            SqlEdition.id == edition_id,
+            SqlEdition.date_deleted.is_(None),
+        )
+        result = await self._session.execute(stmt)
+        row_tuple = result.one_or_none()
+        if row_tuple is None:
+            return None
+        edition_row, build_public_id, build_git_ref = row_tuple
+        return self._validate(edition_row, build_public_id, build_git_ref)
+
     async def list_by_project_ids_and_kind(
         self, *, project_ids: list[int], kind: EditionKind
     ) -> list[Edition]:
