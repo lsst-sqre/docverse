@@ -47,6 +47,12 @@ If `stoker-work` Phase 4 cannot be made green within this iteration
 the project-mechanics file is missing), route to the stuck path
 (Phase 4 of *this* skill) — do not push broken state.
 
+**Turn-end invariant.** Your turn must not end until you have either
+(success) committed, pushed, opened/updated the PR, and closed the
+issue, or (failure) taken the stuck path. Never end your turn with a
+dirty working tree or with validation still running in the background —
+the host's next iteration will abort on the dirty tree.
+
 ## Phase 2: Commit (success path)
 
 `stoker-work` Phase 4 already left the working tree at a fixpoint with

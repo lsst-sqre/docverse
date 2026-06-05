@@ -80,6 +80,14 @@ routing rules so the focused commands stay fast.
 
 ## Phase 4: Final validation
 
+Run every command in this phase in the **foreground** and wait for it
+to finish. Do **not** launch `<complete_test>` / `<lint_all>` /
+`<typing>` with `run_in_background` and then wait via `Monitor` or end
+your turn — under `stoker run` the agent is a single-shot headless
+session, so ending your turn terminates the run and any background work
+is killed before it reports. These commands may take several minutes;
+that wait is expected. Block on them.
+
 After all slices are complete, run the full suite to catch
 regressions and reach a clean fixpoint. Stoker's `stoker-implement`
 expects the working tree to be in a known good state when this phase

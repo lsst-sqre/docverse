@@ -18,7 +18,12 @@ Node/TypeScript). The named commands below target the primary
 ## Test commands
 
 - `focused_test`: `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test -- tests/path/to/file_test.py::test_name`
-- `complete_test`: `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test client_test`
+- `complete_test`: run only the suite(s) for the package(s) you changed,
+  per `## Monorepo selectors` — server change →
+  `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test`;
+  client change → `uv run --only-group=nox nox -s client_test`; both
+  changed → run both. The full cross-package suite is **not** the
+  in-iteration gate (see `## Final validation`).
 
 ## Lint
 
@@ -32,11 +37,19 @@ Node/TypeScript). The named commands below target the primary
 ## Final validation
 
 End-of-task validation runs `complete_test` + `lint_all` + `typing`
-in that order. Additional checks by component:
+in that order. Run the gate in the **foreground** and wait for it to
+finish — it may take a few minutes; keep going, don't background it.
+
+`complete_test` is **package-scoped**: run only the suite(s) for the
+package(s) you changed (see `## Monorepo selectors`). The full
+cross-package run (`nox -s test client_test`) and the multi-version
+compat suites (`client_test_compat`, `client_test_oldest`) are **CI's
+responsibility**, not the in-iteration gate — do not run them here.
+
+Additional checks by component:
 
 - Worker changes (`cloudflare-worker/`): `cd cloudflare-worker && npm run build && npm test` (run `npm ci` first if dependencies aren't installed).
 - deploy-worker changes (client deploy-worker code, which shells out to Node/npm): `uv run --only-group=nox nox -s deploy_worker_test`.
-- Client changes also run multi-version compat suites in CI: `uv run --only-group=nox nox -s client_test_compat client_test_oldest` (Python 3.12 + 3.13).
 
 ## Monorepo selectors
 
