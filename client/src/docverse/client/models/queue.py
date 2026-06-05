@@ -9,6 +9,109 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .queue_enums import JobKind, JobStatus
 
+__all__ = [
+    "BuildProcessingProgress",
+    "EditionUpdateRef",
+    "PublishJobRef",
+    "QueueJob",
+]
+
+
+class EditionUpdateRef(BaseModel):
+    """An entry in a build_processing job's ``editions_updated``/``skipped``.
+
+    All fields are optional and unknown keys are preserved
+    (``extra="allow"``) so the payload can grow without breaking older
+    clients. ``edition_url`` is added in a follow-up slice.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    slug: str | None = Field(
+        default=None,
+        description="Slug of the edition that was updated or skipped.",
+    )
+
+    action: str | None = Field(
+        default=None,
+        description=(
+            "Tracking action applied to the edition (e.g. ``updated`` or"
+            " ``created``); omitted for skipped editions."
+        ),
+    )
+
+
+class PublishJobRef(BaseModel):
+    """An entry in a build_processing job's ``publish_jobs``.
+
+    Identifies a child ``publish_edition`` queue job enqueued for an
+    updated edition. All fields are optional and unknown keys are
+    preserved (``extra="allow"``). ``queue_job_url`` is added in a
+    follow-up slice.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    edition_slug: str | None = Field(
+        default=None,
+        description="Slug of the edition this publish job targets.",
+    )
+
+    publish_queue_job_public_id: str | None = Field(
+        default=None,
+        description=(
+            "Public Crockford Base32 identifier of the publish_edition job."
+        ),
+    )
+
+
+class BuildProcessingProgress(BaseModel):
+    """Typed ``progress`` payload for a ``build_processing`` queue job.
+
+    All fields are optional and unknown keys are preserved
+    (``extra="allow"``) so other job kinds — whose progress shapes are
+    not modelled here — round-trip unchanged through this model.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    message: str | None = Field(
+        default=None,
+        description="Human-readable progress message.",
+    )
+
+    object_count: int | None = Field(
+        default=None,
+        description="Number of objects uploaded to the object store.",
+    )
+
+    total_size_bytes: int | None = Field(
+        default=None,
+        description="Total size in bytes of the uploaded objects.",
+    )
+
+    editions_updated: list[EditionUpdateRef] | None = Field(
+        default=None,
+        description="Editions whose pointer was moved to this build.",
+    )
+
+    editions_skipped: list[EditionUpdateRef] | None = Field(
+        default=None,
+        description="Editions the stale-build guard left unchanged.",
+    )
+
+    publish_jobs: list[PublishJobRef] | None = Field(
+        default=None,
+        description=(
+            "Child publish_edition jobs enqueued for updated editions."
+        ),
+    )
+
+    edition_tracking_error: bool | None = Field(
+        default=None,
+        description="``True`` when edition tracking failed for this build.",
+    )
+
 
 class QueueJob(BaseModel):
     """Response model for a queue job."""
@@ -49,9 +152,12 @@ class QueueJob(BaseModel):
         ),
     )
 
-    progress: dict[str, Any] | None = Field(
+    progress: BuildProcessingProgress | None = Field(
         default=None,
-        description="Structured progress data, phase-specific.",
+        description=(
+            "Structured progress data. Typed for ``build_processing`` jobs;"
+            " other kinds round-trip their fields via ``extra='allow'``."
+        ),
     )
 
     errors: dict[str, Any] | None = Field(

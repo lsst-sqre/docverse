@@ -18,7 +18,12 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import BuildStatus
+from docverse.client.models import (
+    BuildProcessingProgress,
+    BuildStatus,
+    EditionUpdateRef,
+    PublishJobRef,
+)
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
@@ -355,24 +360,40 @@ async def _finalize_success(  # noqa: PLR0913
 
     # Phase 4: Mark queue job as complete
     if queue_job_id is not None:
-        progress: dict[str, object] = {
-            "message": "Build processing complete",
-            "object_count": object_count,
-            "total_size_bytes": total_size_bytes,
-        }
-        if tracking_result is not None:
-            progress["editions_updated"] = [
-                {"slug": o.slug, "action": o.action}
-                for o in tracking_result.updated
-            ]
-            progress["editions_skipped"] = [
-                {"slug": o.slug} for o in tracking_result.skipped
-            ]
-        if publish_jobs:
-            progress["publish_jobs"] = publish_jobs
         has_errors = tracking_result is None
-        if has_errors:
-            progress["edition_tracking_error"] = True
+        # Build the payload through BuildProcessingProgress so it is
+        # validated at write time, then dump to a plain dict for JSONB
+        # storage. exclude_none keeps the stored shape minimal (and
+        # matches the legacy hand-built dict): keys only appear when the
+        # corresponding value is present.
+        progress_model = BuildProcessingProgress(
+            message="Build processing complete",
+            object_count=object_count,
+            total_size_bytes=total_size_bytes,
+            editions_updated=(
+                [
+                    EditionUpdateRef(slug=o.slug, action=o.action)
+                    for o in tracking_result.updated
+                ]
+                if tracking_result is not None
+                else None
+            ),
+            editions_skipped=(
+                [
+                    EditionUpdateRef(slug=o.slug)
+                    for o in tracking_result.skipped
+                ]
+                if tracking_result is not None
+                else None
+            ),
+            publish_jobs=(
+                [PublishJobRef.model_validate(job) for job in publish_jobs]
+                if publish_jobs
+                else None
+            ),
+            edition_tracking_error=has_errors or None,
+        )
+        progress = progress_model.model_dump(exclude_none=True)
         async with session.begin():
             await queue_job_store.update_phase(
                 queue_job_id, "complete", progress=progress
