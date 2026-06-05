@@ -56,6 +56,30 @@ def test_build_processing_progress_typed_fields() -> None:
     )
 
 
+def test_edition_update_ref_has_typed_edition_url() -> None:
+    """``edition_url`` is a declared field, not merely an ``extra`` key."""
+    url = "https://docverse.example/api/orgs/o/projects/p/editions/main"
+    ref = EditionUpdateRef(slug="main", action="created", edition_url=url)
+
+    assert ref.edition_url == url
+    assert "edition_url" in EditionUpdateRef.model_fields
+    assert ref.model_dump(exclude_none=True)["edition_url"] == url
+
+
+def test_publish_job_ref_has_typed_queue_job_url() -> None:
+    """``queue_job_url`` is a declared field, not merely an ``extra`` key."""
+    url = "https://docverse.example/api/queue/jobs/0000-0000-0000-05"
+    ref = PublishJobRef(
+        edition_slug="main",
+        publish_queue_job_public_id="0000-0000-0000-05",
+        queue_job_url=url,
+    )
+
+    assert ref.queue_job_url == url
+    assert "queue_job_url" in PublishJobRef.model_fields
+    assert ref.model_dump(exclude_none=True)["queue_job_url"] == url
+
+
 def test_build_processing_progress_allows_extra_keys() -> None:
     """Unknown keys (e.g. stale_skipped) survive via ``extra='allow'``."""
     progress = BuildProcessingProgress.model_validate(

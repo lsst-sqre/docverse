@@ -24,6 +24,7 @@ from docverse.client.models import (
     EditionUpdateRef,
     PublishJobRef,
 )
+from docverse.domain.api_urls import edition_url, queue_job_url
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
@@ -241,6 +242,7 @@ async def _process_build_locked(  # noqa: PLR0913
             build_store=build_store,
             queue_job_store=queue_job_store,
             org_id=org_id,
+            org_slug=org_slug,
             project_id=build.project_id,
             project_slug=project_slug,
             build_id=build_id,
@@ -311,6 +313,42 @@ async def _start_queue_job(
     return queue_job.id
 
 
+async def _resolve_api_base_url(
+    factory: Factory,
+    logger: structlog.stdlib.BoundLogger,
+) -> str | None:
+    """Resolve the Docverse API base URL via Repertoire discovery.
+
+    Returns ``None`` — after logging a warning — when no discovery client
+    is configured, the discovery lookup fails, or Docverse is not
+    registered in Repertoire. Callers omit the HATEOAS URL fields in that
+    case rather than failing the build, mirroring the non-fatal
+    edition-tracking posture.
+    """
+    discovery = factory.discovery
+    if discovery is None:
+        logger.warning(
+            "No Repertoire discovery client configured; omitting HATEOAS "
+            "URLs from build_processing progress"
+        )
+        return None
+    try:
+        api_base = await discovery.url_for_internal("docverse")
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to resolve Docverse API URL from Repertoire; omitting "
+            "HATEOAS URLs from build_processing progress",
+            exc_info=True,
+        )
+        return None
+    if api_base is None:
+        logger.warning(
+            "Docverse is not registered in Repertoire; omitting HATEOAS "
+            "URLs from build_processing progress"
+        )
+    return api_base
+
+
 async def _finalize_success(  # noqa: PLR0913
     *,
     session: AsyncSession,
@@ -318,6 +356,7 @@ async def _finalize_success(  # noqa: PLR0913
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     org_id: int,
+    org_slug: str,
     project_id: int,
     project_slug: str,
     build_id: int,
@@ -331,6 +370,12 @@ async def _finalize_success(  # noqa: PLR0913
 
     Edition tracking failures are logged but do not fail the build.
     """
+    # Resolve the Docverse API base URL once for every HATEOAS link in
+    # this job's progress payload. ``None`` means discovery is
+    # unavailable or Docverse is unregistered, in which case the URL
+    # fields are omitted and the build still completes.
+    api_base = await _resolve_api_base_url(factory, logger)
+
     # Phase 3b: Edition tracking
     tracking_result = await _track_editions(
         session=session,
@@ -355,6 +400,7 @@ async def _finalize_success(  # noqa: PLR0913
             project_slug=project_slug,
             build_id=build_id,
             build_public_id=build_public_id,
+            api_base=api_base,
             logger=logger,
         )
 
@@ -372,7 +418,20 @@ async def _finalize_success(  # noqa: PLR0913
             total_size_bytes=total_size_bytes,
             editions_updated=(
                 [
-                    EditionUpdateRef(slug=o.slug, action=o.action)
+                    EditionUpdateRef(
+                        slug=o.slug,
+                        action=o.action,
+                        edition_url=(
+                            edition_url(
+                                api_base,
+                                org=org_slug,
+                                project=project_slug,
+                                edition=o.slug,
+                            )
+                            if api_base is not None
+                            else None
+                        ),
+                    )
                     for o in tracking_result.updated
                 ]
                 if tracking_result is not None
@@ -413,6 +472,7 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     project_slug: str,
     build_id: int,
     build_public_id: str,
+    api_base: str | None,
     logger: structlog.stdlib.BoundLogger,
 ) -> list[dict[str, str]]:
     """Create a ``publish_edition`` child job for each updated edition.
@@ -424,7 +484,8 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     backend-job-id write-back) sequencing.
 
     Returns a list of ``{edition_slug, publish_queue_job_public_id}``
-    entries suitable for embedding in the parent build job's progress.
+    entries (plus a ``queue_job_url`` HATEOAS link when ``api_base`` is
+    set) suitable for embedding in the parent build job's progress.
     """
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
@@ -446,12 +507,15 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
             build_id=outcome.build_id,
             build_public_id=build_public_id,
         )
-        publish_jobs.append(
-            {
-                "edition_slug": result.edition_slug,
-                "publish_queue_job_public_id": result.queue_job_public_id,
-            }
-        )
+        entry: dict[str, str] = {
+            "edition_slug": result.edition_slug,
+            "publish_queue_job_public_id": result.queue_job_public_id,
+        }
+        if api_base is not None:
+            entry["queue_job_url"] = queue_job_url(
+                api_base, job=result.queue_job_public_id
+            )
+        publish_jobs.append(entry)
         logger.info(
             "Enqueued publish_edition job",
             edition_slug=result.edition_slug,

@@ -22,7 +22,7 @@ class EditionUpdateRef(BaseModel):
 
     All fields are optional and unknown keys are preserved
     (``extra="allow"``) so the payload can grow without breaking older
-    clients. ``edition_url`` is added in a follow-up slice.
+    clients.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -40,14 +40,22 @@ class EditionUpdateRef(BaseModel):
         ),
     )
 
+    edition_url: str | None = Field(
+        default=None,
+        description=(
+            "Absolute URL of the edition resource (a HATEOAS link clients"
+            " follow instead of reconstructing the path). Omitted when the"
+            " Docverse API base URL could not be resolved."
+        ),
+    )
+
 
 class PublishJobRef(BaseModel):
     """An entry in a build_processing job's ``publish_jobs``.
 
     Identifies a child ``publish_edition`` queue job enqueued for an
     updated edition. All fields are optional and unknown keys are
-    preserved (``extra="allow"``). ``queue_job_url`` is added in a
-    follow-up slice.
+    preserved (``extra="allow"``).
     """
 
     model_config = ConfigDict(extra="allow")
@@ -61,6 +69,16 @@ class PublishJobRef(BaseModel):
         default=None,
         description=(
             "Public Crockford Base32 identifier of the publish_edition job."
+        ),
+    )
+
+    queue_job_url: str | None = Field(
+        default=None,
+        description=(
+            "Absolute URL of the publish_edition queue-job resource (a"
+            " HATEOAS link clients follow instead of reconstructing the"
+            " path). Omitted when the Docverse API base URL could not be"
+            " resolved."
         ),
     )
 
