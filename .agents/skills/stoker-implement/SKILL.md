@@ -2,7 +2,7 @@
 name: stoker-implement
 description: Drive a single pre-selected task through stoker-work's TDD cycle and commit/push/PR/close it (or stuck-mark it on failure). Use when invoked from the implement-phase prompt — the host has already picked the task and checked out its branch.
 ---
-<!-- stoker-managed: skills:.agents/skills/stoker-implement/SKILL.md:5822ab153beed9be -->
+<!-- stoker-managed: skills:.agents/skills/stoker-implement/SKILL.md:a4de715878f733e0 -->
 
 # stoker-implement — drive one pre-selected stoker task to completion
 
@@ -50,8 +50,15 @@ the project-mechanics file is missing), route to the stuck path
 **Turn-end invariant.** Your turn must not end until you have either
 (success) committed, pushed, opened/updated the PR, and closed the
 issue, or (failure) taken the stuck path. Never end your turn with a
-dirty working tree or with validation still running in the background —
-the host's next iteration will abort on the dirty tree.
+dirty working tree, with validation still running in the background, or
+on a `Monitor` wait for a still-running command. This covers **any**
+project-mechanics command in **any** phase — including a Phase 3 Red/Green
+`<focused_test>`, not just Phase 4's final validation. Under `stoker run`
+the agent is single-shot headless, so ending your turn (or waiting on a
+backgrounded test via `Monitor`) kills the run before the work reports
+and leaves the tree dirty — the host's next iteration will abort on it.
+Run every such command in the foreground and block on it, however long
+it takes.
 
 ## Phase 2: Commit (success path)
 

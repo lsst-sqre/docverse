@@ -2,7 +2,7 @@
 name: stoker-work
 description: The universal red/green/refactor TDD methodology building block — drives a unit of work through plan → failing test → minimal implementation → refactor → validation against this repo's project-mechanics. Use when invoked from `stoker-implement` (always delegates here for the dev cycle), from `stoker-fixup` or `stoker-rebase` when a finding or conflict warrants the full TDD discipline rather than an in-place apply-and-validate, or any time the user wants to drive a feature/bug-fix/refactor through plan → test → implement → validate.
 ---
-<!-- stoker-managed: skills:.agents/skills/stoker-work/SKILL.md:6516b08d6df1db5b -->
+<!-- stoker-managed: skills:.agents/skills/stoker-work/SKILL.md:d3eafd8629e5f1ba -->
 
 # stoker-work — Development Work Cycle
 
@@ -39,6 +39,20 @@ The remaining phases reference these command names verbatim. When you
 see `<focused_test>`, substitute the value from the
 `## Test commands` section. Same for the other four names.
 
+**Foreground invariant (applies to every phase).** Every command
+derived from project-mechanics — `<focused_test>`, `<lint_touched>`,
+`<complete_test>`, `<lint_all>`, `<typing>` — runs in the
+**foreground**, and you block on it until it finishes. Never launch one
+with `run_in_background` and then wait via `Monitor` or end your turn.
+Under `stoker run` the agent is a single-shot headless session, so
+ending your turn terminates the run and any background work is killed
+before it reports — leaving the working tree dirty and aborting the
+next iteration. This holds even for a single test: a testcontainer- or
+fixture-backed `<focused_test>` can be slow just to start, and the
+harness may block a bare `sleep` and funnel you toward `Monitor` — do
+not take that path. These commands may take several minutes; that wait
+is expected. Block on them.
+
 ## Phase 1: Understand the task
 
 - Read any referenced plan or PRD.
@@ -61,7 +75,9 @@ cycle:
 
 1. **Red** — Write ONE failing test that defines the next behavior.
    Run it to confirm it fails using `<focused_test>` scoped to the
-   new test.
+   new test. Run `<focused_test>` in the **foreground** per the
+   Phase 0.5 foreground invariant — never `run_in_background` + `Monitor`
+   or end your turn waiting on it, even when one test is slow to start.
 2. **Green** — Write the minimum production code to make that test
    pass. Run the test again to confirm it passes.
 3. **Refactor** — Clean up the production code and/or test while
@@ -80,13 +96,11 @@ routing rules so the focused commands stay fast.
 
 ## Phase 4: Final validation
 
-Run every command in this phase in the **foreground** and wait for it
-to finish. Do **not** launch `<complete_test>` / `<lint_all>` /
-`<typing>` with `run_in_background` and then wait via `Monitor` or end
-your turn — under `stoker run` the agent is a single-shot headless
-session, so ending your turn terminates the run and any background work
-is killed before it reports. These commands may take several minutes;
-that wait is expected. Block on them.
+Run every command in this phase in the **foreground** and block on it
+per the Phase 0.5 foreground invariant — `<lint_all>`, `<typing>`, and
+`<complete_test>` are exactly the kind of multi-minute commands that
+invariant covers, so never background one and wait via `Monitor` or end
+your turn.
 
 After all slices are complete, run the full suite to catch
 regressions and reach a clean fixpoint. Stoker's `stoker-implement`
