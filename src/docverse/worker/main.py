@@ -301,7 +301,6 @@ class WorkerSettings:
         instrument_arq_task(dashboard_build),
         instrument_arq_task(dashboard_sync),
         instrument_arq_task(ping),
-        instrument_arq_task(project_github_resolve),
         instrument_arq_task(publish_edition),
     ]
     redis_settings = config.arq_redis_settings
@@ -427,6 +426,14 @@ class MaintenanceWorkerSettings:
     rebuilds for worker capacity. The maintenance name reflects that
     the pool is the shared home for this non-publishing periodic work,
     no longer scoped to lifecycle evaluation alone.
+
+    The opportunistic ``project_github_resolve`` job (PRD #346) also
+    runs here: PRD #419 moves it off the default publishing pool because
+    its installation-id resolution is not time-sensitive and should not
+    contend with the live publishing flow. It is the one event-driven
+    (rather than cron-driven) function on the pool and is registered
+    plainly — no ``func`` timeout wrapper — exactly as it was on the
+    default pool.
     """
 
     functions = [
@@ -455,6 +462,14 @@ class MaintenanceWorkerSettings:
         instrument_arq_task(publish_edition_reaper),
         instrument_arq_task(build_processing_reaper),
         instrument_arq_task(dashboard_sync_reaper),
+        # ``project_github_resolve`` is the opportunistic GitHub-id
+        # resolve (PRD #346). PRD #419 moves it off the default
+        # publishing pool onto this maintenance pool: its work is not
+        # time-sensitive and must not contend with the live publishing
+        # flow. Registered plainly (no ``func`` timeout wrapper, arq's
+        # default retry policy) exactly as it was on the default pool,
+        # so the move changes only which pool runs it.
+        instrument_arq_task(project_github_resolve),
     ]
     cron_jobs = [
         cron(

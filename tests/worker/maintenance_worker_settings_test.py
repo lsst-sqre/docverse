@@ -21,6 +21,7 @@ from docverse.worker.functions import (
     lifecycle_eval,
     lifecycle_eval_dispatcher,
     lifecycle_reaper,
+    project_github_resolve,
     publish_edition_reaper,
 )
 from docverse.worker.main import (
@@ -439,6 +440,35 @@ def test_default_worker_does_not_register_dashboard_sync_reaper() -> None:
         if isinstance(job, CronJob)
     }
     assert dashboard_sync_reaper not in coroutines
+
+
+def test_project_github_resolve_registered_on_maintenance_pool() -> None:
+    """``project_github_resolve`` is registered on the maintenance pool.
+
+    PRD #419 moves the opportunistic GitHub-id resolve off the default
+    publishing queue and onto the maintenance pool: its work is not
+    time-sensitive and must not contend with the live publishing flow.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in MaintenanceWorkerSettings.functions
+    }
+    assert project_github_resolve in underlying
+
+
+def test_default_worker_does_not_register_project_github_resolve() -> None:
+    """The default queue no longer registers ``project_github_resolve``.
+
+    PRD #419 relocates the resolve onto the maintenance pool, so the
+    default publishing pool must not also register it — otherwise a
+    default-pool worker could pick the job up and defeat the isolation
+    the move exists to provide.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert project_github_resolve not in default_underlying
 
 
 def test_default_worker_does_not_register_lifecycle_functions() -> None:

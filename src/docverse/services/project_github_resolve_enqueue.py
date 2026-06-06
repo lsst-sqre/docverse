@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 import sentry_sdk
 import structlog
 
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,9 +58,13 @@ async def try_enqueue_project_github_resolve_by_id(
             ):
                 return
             queue_backend = factory.create_queue_backend()
+            # Route onto the dedicated maintenance pool (PRD #419): the
+            # resolve's installation-id lookup is opportunistic and must
+            # not contend with the default pool's live publishing flow.
             await queue_backend.enqueue(
                 "project_github_resolve",
                 {"project_id": project_id},
+                queue_name=MAINTENANCE_QUEUE_NAME,
             )
             await session.commit()
     except Exception as exc:
