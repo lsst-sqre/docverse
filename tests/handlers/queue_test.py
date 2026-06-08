@@ -392,6 +392,49 @@ async def test_get_queue_job_subject_urls_null_when_no_resource(
 
 
 @pytest.mark.asyncio
+async def test_get_queue_job_build_url_null_when_build_deleted(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A build_processing job whose build is soft-deleted has null URLs.
+
+    Mirrors the edition-exclusion coverage: a soft-deleted build must not
+    yield a build_url/subject_url, matching ``get_build``'s 404 on it.
+    """
+    logger = structlog.get_logger("docverse")
+
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            build_id,
+            _build_public,
+        ) = await _create_org_project_build(
+            db_session, org_slug="del-org", project_slug="del-proj"
+        )
+        build_store = BuildStore(session=db_session, logger=logger)
+        await build_store.soft_delete(build_id=build_id)
+        store = QueueJobStore(session=db_session, logger=logger)
+        job = await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            project_id=project_id,
+            build_id=build_id,
+        )
+        await db_session.commit()
+
+    job_id_str = serialize_base32_id(job.public_id)
+    response = await client.get(f"/docverse/queue/jobs/{job_id_str}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["build_url"] is None
+    # With no edition targeted, the subject also degrades to null.
+    assert data["subject_url"] is None
+    assert data["edition_url"] is None
+
+
+@pytest.mark.asyncio
 async def test_queue_job_progress_schema_is_typed(
     client: AsyncClient,
 ) -> None:

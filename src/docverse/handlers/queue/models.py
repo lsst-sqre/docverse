@@ -90,7 +90,13 @@ async def _resolve_subject_urls(
     build_url: str | None = None
     if domain.build_id is not None:
         build = await factory.create_build_store().get_by_id(domain.build_id)
-        if build is not None:
+        # Exclude soft-deleted builds here, unlike the edition side which
+        # filters date_deleted at the store (EditionStore.get_by_id):
+        # BuildStore.get_by_id can't, because the build_processing /
+        # publish_edition / dashboard workers rely on fetching soft-deleted
+        # builds. A soft-deleted build 404s from get_build, so it must not
+        # yield a build_url/subject_url.
+        if build is not None and build.date_deleted is None:
             build_url = str(
                 request.url_for(
                     "get_build",
