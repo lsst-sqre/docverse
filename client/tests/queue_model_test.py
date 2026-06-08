@@ -80,6 +80,58 @@ def test_publish_job_ref_has_typed_queue_job_url() -> None:
     assert ref.model_dump(exclude_none=True)["queue_job_url"] == url
 
 
+_SIX_BUILD_KEYS = (
+    "object_count",
+    "total_size_bytes",
+    "editions_updated",
+    "editions_skipped",
+    "publish_jobs",
+    "edition_tracking_error",
+)
+
+
+def test_non_build_progress_omits_null_build_fields() -> None:
+    """A non-build progress serializes to only its real keys + extras.
+
+    Validating a non-build job's progress into ``BuildProcessingProgress``
+    leaves the six build-specific typed fields ``None``; serialization must
+    drop them rather than leak them as ``null``.
+    """
+    progress = BuildProcessingProgress.model_validate(
+        {
+            "message": "Discovery complete",
+            "in_scope_count": 5,
+            "enqueued_count": 4,
+        }
+    )
+
+    dumped = progress.model_dump(mode="json")
+
+    # The shared ``message`` field and the ``extra='allow'`` extras survive.
+    assert dumped["message"] == "Discovery complete"
+    assert dumped["in_scope_count"] == 5  # noqa: PLR2004
+    assert dumped["enqueued_count"] == 4  # noqa: PLR2004
+    # None of the six build-specific typed fields leak as ``null``.
+    for key in _SIX_BUILD_KEYS:
+        assert key not in dumped
+
+
+def test_build_progress_keeps_set_fields_drops_unset() -> None:
+    """A build payload keeps every field it set; only ``None`` fields drop."""
+    progress = BuildProcessingProgress.model_validate(
+        _build_processing_progress()
+    )
+
+    dumped = progress.model_dump(mode="json")
+
+    # Set fields — including nested entries with embedded data — survive.
+    assert dumped["object_count"] == 3  # noqa: PLR2004
+    assert dumped["editions_updated"][0]["slug"] == "main"
+    assert dumped["publish_jobs"][0]["edition_slug"] == "main"
+    # ``edition_tracking_error`` was never set → omitted, not serialized null.
+    assert "edition_tracking_error" not in dumped
+
+
 def test_build_processing_progress_allows_extra_keys() -> None:
     """Unknown keys (e.g. stale_skipped) survive via ``extra='allow'``."""
     progress = BuildProcessingProgress.model_validate(

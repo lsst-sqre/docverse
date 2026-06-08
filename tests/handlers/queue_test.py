@@ -266,6 +266,67 @@ async def test_get_queue_job_non_build_progress_preserved(
 
 
 @pytest.mark.asyncio
+async def test_get_queue_job_non_build_progress_omits_null_build_fields(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A non-build job's progress JSON omits the six build-specific keys.
+
+    ``from_domain`` validates any non-null progress into
+    ``BuildProcessingProgress``; without the model serializer the six
+    build-specific typed fields would leak as ``null`` for a non-build kind.
+    Assert they are absent while the job's real keys survive.
+    """
+    logger = structlog.get_logger("docverse")
+
+    await client.post(
+        "/docverse/admin/orgs",
+        json={
+            "slug": "ks-null-org",
+            "title": "Keeper Sync Null Org",
+            "base_domain": "ksnull.example.com",
+        },
+        headers={"X-Auth-Request-User": "superadmin"},
+    )
+
+    async with db_session.begin():
+        store = QueueJobStore(session=db_session, logger=logger)
+        job = await store.create(
+            kind=JobKind.keeper_sync_run_discovery, org_id=1
+        )
+        await store.update_phase(
+            job.id,
+            "complete",
+            progress={
+                "message": "Discovery complete",
+                "in_scope_count": 5,
+                "enqueued_count": 4,
+            },
+        )
+        await db_session.commit()
+
+    job_id_str = serialize_base32_id(job.public_id)
+    response = await client.get(f"/docverse/queue/jobs/{job_id_str}")
+    assert response.status_code == 200
+
+    progress = response.json()["progress"]
+    # The job's real keys (the shared typed ``message`` + extras) survive.
+    assert progress["message"] == "Discovery complete"
+    assert progress["in_scope_count"] == 5
+    assert progress["enqueued_count"] == 4
+    # None of the six build-specific typed fields leak as ``null``.
+    for key in (
+        "object_count",
+        "total_size_bytes",
+        "editions_updated",
+        "editions_skipped",
+        "publish_jobs",
+        "edition_tracking_error",
+    ):
+        assert key not in progress
+
+
+@pytest.mark.asyncio
 async def test_get_queue_job_build_processing_subject_url(
     client: AsyncClient,
     db_session: AsyncSession,

@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 from .queue_enums import JobKind, JobStatus
 
@@ -129,6 +135,21 @@ class BuildProcessingProgress(BaseModel):
         default=None,
         description="``True`` when edition tracking failed for this build.",
     )
+
+    @model_serializer(mode="wrap")
+    def _drop_none_keys(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        """Serialize to only keys whose value is not ``None``.
+
+        Every field is *declared* (so the OpenAPI schema is unchanged), but a
+        non-build job validated into this model leaves the six build-specific
+        typed fields ``None``. Dropping them at serialization time keeps a
+        non-build job's ``progress`` to its real keys (e.g. ``message`` plus
+        its ``extra='allow'`` extras) instead of leaking six ``null`` keys,
+        while a build job still emits every field it actually set.
+        """
+        return {k: v for k, v in handler(self).items() if v is not None}
 
 
 class QueueJob(BaseModel):
