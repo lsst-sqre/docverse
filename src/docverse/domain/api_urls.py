@@ -41,6 +41,12 @@ def edition_url(base: str, *, org: str, project: str, edition: str) -> str:
 def build_url(base: str, *, org: str, project: str, build: str) -> str:
     """Compose the URL of a build resource.
 
+    Provided alongside :func:`edition_url` / :func:`queue_job_url` for
+    symmetry and future request-less (worker) use. The request-time
+    ``QueueJob.build_url`` is minted via ``request.url_for``, so this builder
+    currently has no production caller — only its drift-guard test pins it to
+    the live ``get_build`` route.
+
     Parameters
     ----------
     base

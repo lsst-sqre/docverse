@@ -370,12 +370,6 @@ async def _finalize_success(  # noqa: PLR0913
 
     Edition tracking failures are logged but do not fail the build.
     """
-    # Resolve the Docverse API base URL once for every HATEOAS link in
-    # this job's progress payload. ``None`` means discovery is
-    # unavailable or Docverse is unregistered, in which case the URL
-    # fields are omitted and the build still completes.
-    api_base = await _resolve_api_base_url(factory, logger)
-
     # Phase 3b: Edition tracking
     tracking_result = await _track_editions(
         session=session,
@@ -388,8 +382,20 @@ async def _finalize_success(  # noqa: PLR0913
     )
 
     # Phase 3c: Enqueue a publish_edition job for each updated edition.
+    #
+    # Resolve the Docverse API base URL once for every HATEOAS link in this
+    # job's progress payload, but only when there are updated editions to
+    # link: a build that updates nothing has no edition_url / queue_job_url
+    # to embed, so it skips the Repertoire discovery round-trip (and its
+    # "unregistered" warning) entirely. ``None`` means discovery is
+    # unavailable or Docverse is unregistered, in which case the URL fields
+    # are omitted and the build still completes. The editions_updated
+    # comprehension below only dereferences ``api_base`` while iterating
+    # ``tracking_result.updated``, so leaving it ``None`` here is safe.
+    api_base: str | None = None
     publish_jobs: list[dict[str, str]] = []
     if tracking_result is not None and tracking_result.updated:
+        api_base = await _resolve_api_base_url(factory, logger)
         publish_jobs = await _enqueue_publish_jobs(
             session=session,
             factory=factory,
