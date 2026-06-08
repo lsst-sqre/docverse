@@ -527,6 +527,21 @@ async def test_queue_job_progress_schema_is_typed(
     }
     assert "#/components/schemas/BuildProcessingProgress" in refs
 
+    # The serialization-mode schema FastAPI emits for the response model
+    # must keep every typed field. The ``_drop_none_keys`` model serializer
+    # would otherwise collapse it to a property-less object, silently
+    # regressing ``progress`` to a free-form shape; guard against that.
+    progress_props = set(schemas["BuildProcessingProgress"]["properties"])
+    assert {
+        "message",
+        "object_count",
+        "total_size_bytes",
+        "editions_updated",
+        "editions_skipped",
+        "publish_jobs",
+        "edition_tracking_error",
+    } <= progress_props
+
     # extra='allow' is reflected so other kinds round-trip generically.
     assert schemas["BuildProcessingProgress"]["additionalProperties"] is True
 
