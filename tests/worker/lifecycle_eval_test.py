@@ -9,6 +9,7 @@ drained.
 
 from __future__ import annotations
 
+import importlib
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -58,6 +59,27 @@ from docverse.worker.functions.lifecycle_eval import lifecycle_eval
 from tests.worker.conftest import make_worker_ctx
 
 NOW = datetime(2026, 5, 12, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_eval_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the worker's lifecycle evaluation clock to ``NOW``.
+
+    The fixtures below build their ``date_updated`` / ``date_completed``
+    timestamps as offsets from the frozen ``NOW`` constant, but the
+    worker evaluates against ``_utcnow()`` (real wall clock in
+    production). Monkeypatching ``_utcnow`` to return ``NOW`` keeps the
+    fixture dates and the evaluation clock pinned together so the suite
+    is deterministic regardless of the real wall-clock date.
+    """
+    # Resolve the real submodule via import_module: the functions package
+    # __init__ rebinds the ``lifecycle_eval`` attribute to the worker
+    # function, shadowing the submodule, so a dotted-string monkeypatch
+    # target would resolve to the function and miss ``_utcnow``.
+    module = importlib.import_module(
+        "docverse.worker.functions.lifecycle_eval"
+    )
+    monkeypatch.setattr(module, "_utcnow", lambda: NOW)
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
