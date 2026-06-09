@@ -21,7 +21,7 @@ __all__ = [
 
 
 DocverseSentryComponent = Literal[
-    "api", "worker", "worker-keeper-sync", "worker-lifecycle-eval", "cli"
+    "api", "worker", "worker-keeper-sync", "worker-maintenance", "cli"
 ]
 """Tag values for the ``component`` Sentry global tag.
 

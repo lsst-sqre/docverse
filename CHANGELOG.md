@@ -4,6 +4,8 @@
 
 ## 2.0.0 (Unreleased)
 
+- Rename the dedicated lifecycle-eval arq worker pool to "maintenance" to reflect that it is now a catch-all for non-publishing periodic work (lifecycle evaluation, the git-ref audit, and the cross-subsystem reaper backstops) rather than lifecycle evaluation alone. `LifecycleEvalWorkerSettings` is now `MaintenanceWorkerSettings`, its queue binds `docverse:maintenance-queue` (via the new `docverse.worker.queues.MAINTENANCE_QUEUE_NAME`), the pool-wide timeout setting is `maintenance_job_timeout_seconds`, and the Sentry component is `worker-maintenance`. The lifecycle-evaluation domain (the `lifecycle_eval` job kind, worker functions, `lifecycle_eval_runs` table, and `lifecycle_reaper`) keeps its names. Operators must update the Phalanx worker Deployment to launch `docverse.worker.main.MaintenanceWorkerSettings` (and rename the timeout env override if set) in lock-step with this change.
+- Move the opportunistic `project_github_resolve` job off the default publishing queue onto the maintenance pool, so its installation-id resolution no longer contends with the live publishing flow. Creating or updating a project with a GitHub binding now enqueues the resolve onto `docverse:maintenance-queue`, and the job is registered on `MaintenanceWorkerSettings` rather than the default `WorkerSettings`.
 - Add support for testing mysql and postgres databases locally and in GitHub Actions.
 - Update to Flask 2.
 

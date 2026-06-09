@@ -5,6 +5,10 @@ one ``project_github_resolve`` arq job (PRD #346 user story 12 /
 acceptance criterion 1). Projects without a GitHub binding must not
 generate a no-op enqueue: the worker would just skip them, and the
 queue noise would obscure real enqueues.
+
+PRD #419 routes the resolve onto the dedicated ``maintenance`` pool
+rather than the default publishing queue, so it never contends with the
+live publishing flow; the POST test pins that queue target explicitly.
 """
 
 from __future__ import annotations
@@ -14,8 +18,12 @@ from httpx import AsyncClient
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 
+from docverse.config import Configuration
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.conftest import seed_org_with_admin
 from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
+
+_config = Configuration()
 
 
 async def _setup(client: AsyncClient) -> None:
@@ -23,11 +31,18 @@ async def _setup(client: AsyncClient) -> None:
     await seed_org_with_admin(client, "pgr-org", "testuser")
 
 
-def _resolve_count() -> int:
-    """Count enqueued ``project_github_resolve`` arq jobs."""
+def _resolve_count(*, queue_name: str | None = None) -> int:
+    """Count enqueued ``project_github_resolve`` arq jobs.
+
+    With ``queue_name`` given, restrict the count to that one queue;
+    with ``None`` (the default) union the count across every queue the
+    mock has touched (see :func:`count_jobs_by_name`).
+    """
     mock_arq = arq_dependency._arq_queue
     assert isinstance(mock_arq, MockArqQueue)
-    return count_jobs_by_name(mock_arq, "project_github_resolve")
+    return count_jobs_by_name(
+        mock_arq, "project_github_resolve", queue_name=queue_name
+    )
 
 
 def _resolve_payloads() -> list[dict[str, object]]:
@@ -50,16 +65,19 @@ def _resolve_payloads() -> list[dict[str, object]]:
 async def test_post_project_with_github_enqueues_resolve(
     client: AsyncClient,
 ) -> None:
-    """POST with ``github`` enqueues one ``project_github_resolve`` job.
+    """POST with ``github`` enqueues one resolve onto the maintenance queue.
 
     Reproduces the post-create steady state of user story 12: an admin
     creates a project with structured GitHub coordinates, and the
     handler fires off the asynchronous installation-id resolution so
     the operator does not have to know the installation id at create
-    time.
+    time. PRD #419 routes that resolve onto the dedicated maintenance
+    pool, so this pins the enqueue to ``docverse:maintenance-queue`` and
+    asserts it does not land on the default publishing queue.
     """
     await _setup(client)
-    before = _resolve_count()
+    before_maintenance = _resolve_count(queue_name=MAINTENANCE_QUEUE_NAME)
+    before_default = _resolve_count(queue_name=_config.arq_queue_name)
 
     response = await client.post(
         "/docverse/orgs/pgr-org/projects",
@@ -72,8 +90,13 @@ async def test_post_project_with_github_enqueues_resolve(
     )
     assert response.status_code == 201
 
-    after = _resolve_count()
-    assert after - before == 1
+    assert (
+        _resolve_count(queue_name=MAINTENANCE_QUEUE_NAME) - before_maintenance
+        == 1
+    )
+    assert (
+        _resolve_count(queue_name=_config.arq_queue_name) - before_default == 0
+    )
 
 
 @pytest.mark.asyncio

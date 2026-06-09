@@ -164,13 +164,14 @@ class Configuration(BaseSettings):
         ),
     )
 
-    lifecycle_eval_job_timeout_seconds: int = Field(
+    maintenance_job_timeout_seconds: int = Field(
         3600,
-        title="Lifecycle-eval per-job timeout, in seconds",
+        title="Maintenance per-job timeout, in seconds",
         description=(
-            "Wraps the ``lifecycle_eval_dispatcher`` and per-org"
-            " ``lifecycle_eval`` arq functions on"
-            " ``LifecycleEvalWorkerSettings``: arq cancels a job that"
+            "Wraps all four maintenance-pool arq functions"
+            " (``lifecycle_eval_dispatcher`` / ``lifecycle_eval`` and"
+            " ``git_ref_audit_discovery`` / ``git_ref_audit``) on"
+            " ``MaintenanceWorkerSettings``: arq cancels a job that"
             " runs past this. The cron-driven ``lifecycle_reaper`` is"
             " the second backstop (covers OOM-killed workers / arq"
             " losing a job), so this should sit well below"

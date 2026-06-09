@@ -38,9 +38,11 @@ from safir.testing.sentry import (
 from docverse.sentry import initialize_sentry, instrument_arq_task
 from docverse.worker.main import (
     KeeperSyncWorkerSettings,
-    LifecycleEvalWorkerSettings,
+    MaintenanceWorkerSettings,
     WorkerSettings,
+    startup_maintenance,
 )
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
 
 
 def _patch_sentry_init_with_test_transport(
@@ -94,7 +96,7 @@ def test_instrument_arq_task_keeps_arq_func_registration_name() -> None:
     Direct end-to-end check that the ``functools.wraps`` contract above
     survives :func:`arq.func`'s ``coroutine.__qualname__`` fallback,
     which is the actual registration path used by the production
-    :class:`KeeperSyncWorkerSettings` / :class:`LifecycleEvalWorkerSettings`
+    :class:`KeeperSyncWorkerSettings` / :class:`MaintenanceWorkerSettings`
     classes.
     """
     registered = func(instrument_arq_task(_example_task))
@@ -178,7 +180,7 @@ def test_worker_settings_registers_tasks_under_original_names() -> None:
     Backstop against a future regression where someone adds a task or
     cron job to :class:`WorkerSettings`,
     :class:`KeeperSyncWorkerSettings`, or
-    :class:`LifecycleEvalWorkerSettings` and forgets to wrap it with
+    :class:`MaintenanceWorkerSettings` and forgets to wrap it with
     :func:`instrument_arq_task` (which would leave it producing
     ``transaction: "unknown arq task"`` alerts) -- or wraps it with
     something that breaks :func:`functools.wraps` and silently renames
@@ -193,7 +195,7 @@ def test_worker_settings_registers_tasks_under_original_names() -> None:
     settings_classes = (
         WorkerSettings,
         KeeperSyncWorkerSettings,
-        LifecycleEvalWorkerSettings,
+        MaintenanceWorkerSettings,
     )
     for settings in settings_classes:
         # ``functions`` may hold raw coroutines or ``arq.Function``
@@ -222,3 +224,32 @@ def test_worker_settings_registers_tasks_under_original_names() -> None:
                 f"{settings.__name__}: task {entry.name!r} is not wrapped"
                 " with instrument_arq_task"
             )
+
+
+@pytest.mark.asyncio
+async def test_startup_maintenance_uses_worker_maintenance_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The maintenance startup tags Sentry events with ``worker-maintenance``.
+
+    ``MaintenanceWorkerSettings.on_startup`` funnels through the shared
+    ``_startup`` body (DB / Redis init) that every pool reuses; the only
+    intentional divergence is the Sentry ``component`` tag that lets the
+    maintenance pool's events be filtered apart from the default and
+    keeper-sync pools. Rather than stand up the full worker environment,
+    patch ``_startup`` and assert the maintenance wrapper forwards
+    ``component="worker-maintenance"`` — the one value that
+    distinguishes this pool.
+    """
+    captured: dict[str, Any] = {}
+
+    async def fake_startup(
+        ctx: dict[str, Any], *, component: str, queue_name: str
+    ) -> None:
+        captured["component"] = component
+        captured["queue_name"] = queue_name
+
+    monkeypatch.setattr("docverse.worker.main._startup", fake_startup)
+    await startup_maintenance({})
+    assert captured["component"] == "worker-maintenance"
+    assert captured["queue_name"] == MAINTENANCE_QUEUE_NAME

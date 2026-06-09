@@ -283,11 +283,11 @@ _JOB_STATE_CASES: list[
     (
         "run-not-found",
         lambda: InvalidJobStateError(
-            queue_name="docverse:lifecycle-queue",
+            queue_name="docverse:maintenance-queue",
             message="Lifecycle eval run 99 not found",
         ),
         {
-            "queue_name": "docverse:lifecycle-queue",
+            "queue_name": "docverse:maintenance-queue",
         },
     ),
 ]
