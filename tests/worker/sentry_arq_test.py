@@ -42,6 +42,7 @@ from docverse.worker.main import (
     WorkerSettings,
     startup_maintenance,
 )
+from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
 
 
 def _patch_sentry_init_with_test_transport(
@@ -242,9 +243,13 @@ async def test_startup_maintenance_uses_worker_maintenance_component(
     """
     captured: dict[str, Any] = {}
 
-    async def fake_startup(ctx: dict[str, Any], *, component: str) -> None:
+    async def fake_startup(
+        ctx: dict[str, Any], *, component: str, queue_name: str
+    ) -> None:
         captured["component"] = component
+        captured["queue_name"] = queue_name
 
     monkeypatch.setattr("docverse.worker.main._startup", fake_startup)
     await startup_maintenance({})
     assert captured["component"] == "worker-maintenance"
+    assert captured["queue_name"] == MAINTENANCE_QUEUE_NAME

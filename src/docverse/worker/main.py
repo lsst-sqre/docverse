@@ -175,7 +175,10 @@ class WorkerFactoryBuilder:
 
 
 async def _startup(
-    ctx: dict[str, Any], *, component: DocverseSentryComponent
+    ctx: dict[str, Any],
+    *,
+    component: DocverseSentryComponent,
+    queue_name: str,
 ) -> None:
     """Initialize resources for the arq worker process.
 
@@ -205,6 +208,7 @@ async def _startup(
         "Docverse worker startup",
         app_version=version("docverse"),
         db_revision=db_revision,
+        queue_name=queue_name,
     )
 
     await db_session_dependency.initialize(
@@ -267,17 +271,25 @@ async def _startup(
 
 async def startup_default(ctx: dict[str, Any]) -> None:
     """on_startup for the default Docverse arq queue."""
-    await _startup(ctx, component="worker")
+    await _startup(ctx, component="worker", queue_name=config.arq_queue_name)
 
 
 async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
     """on_startup for the dedicated keeper-sync arq queue."""
-    await _startup(ctx, component="worker-keeper-sync")
+    await _startup(
+        ctx,
+        component="worker-keeper-sync",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
 
 
 async def startup_maintenance(ctx: dict[str, Any]) -> None:
     """on_startup for the dedicated maintenance arq queue."""
-    await _startup(ctx, component="worker-maintenance")
+    await _startup(
+        ctx,
+        component="worker-maintenance",
+        queue_name=MAINTENANCE_QUEUE_NAME,
+    )
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
