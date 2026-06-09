@@ -39,6 +39,8 @@ from docverse.dbschema import Base
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id
 from docverse.main import app as docverse_app
+from docverse.metrics import build_event_manager
+from docverse.metrics.events import DocverseEvents
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.build_store import BuildStore
 from docverse.storage.membership_store import OrgMembershipStore
@@ -127,6 +129,21 @@ async def discovery_client() -> AsyncGenerator[DiscoveryClient]:
     """Return a ``DiscoveryClient`` backed by the autouse respx mock."""
     async with httpx.AsyncClient() as http_client:
         yield DiscoveryClient(http_client)
+
+
+@pytest_asyncio.fixture
+async def mock_events() -> AsyncGenerator[DocverseEvents]:
+    """Build an initialized ``DocverseEvents`` over a ``MockEventManager``.
+
+    Mirrors what the FastAPI lifespan and worker startup build, for unit
+    tests that construct a ``ContextDependency`` or worker ``ctx``
+    directly and therefore need to supply the metrics events themselves.
+    """
+    manager, events = await build_event_manager(config)
+    try:
+        yield events
+    finally:
+        await manager.aclose()
 
 
 @pytest_asyncio.fixture

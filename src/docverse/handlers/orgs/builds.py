@@ -21,6 +21,7 @@ from docverse.handlers.params import (
     OrgSlugParam,
     ProjectSlugParam,
 )
+from docverse.metrics import BuildUploadedEvent
 from docverse.storage.pagination import (
     BUILD_CURSOR_TYPE,
     DEFAULT_PAGE_LIMIT,
@@ -175,6 +176,7 @@ async def patch_build(  # noqa: PLR0913
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],  # noqa: ARG001
 ) -> Build:
     queue_url: str | None = None
+    upload_completed = False
     async with context.session.begin():
         service = context.factory.create_build_service()
 
@@ -190,6 +192,7 @@ async def patch_build(  # noqa: PLR0913
                     job=serialize_base32_id(queue_job.public_id),
                 )
             )
+            upload_completed = True
         else:
             # No-op update: just fetch the build
             build = await service.get_by_public_id(
@@ -199,6 +202,29 @@ async def patch_build(  # noqa: PLR0913
             )
 
         await context.session.commit()
+
+    # Emit the build_uploaded metric only for a real upload-complete
+    # transition, and only after the commit so the event reflects durably
+    # persisted state. Production runs raise_on_error=False, so a metrics
+    # backend outage cannot fail this request (no defensive try/except).
+    if upload_completed:
+        annotations = build.annotations
+        await context.events.build_uploaded.publish(
+            BuildUploadedEvent(
+                organization=org_slug,
+                project=project_slug,
+                uploader=build.uploader,
+                commit_sha=annotations.commit_sha if annotations else None,
+                github_repository=(
+                    annotations.github_repository if annotations else None
+                ),
+                github_run_id=(
+                    annotations.github_run_id if annotations else None
+                ),
+                github_actor=annotations.github_actor if annotations else None,
+                ci_platform=annotations.ci_platform if annotations else None,
+            )
+        )
 
     return Build.from_domain(
         build,

@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.config import Configuration
 from docverse.database import get_current_revision
 from docverse.factory import Factory
+from docverse.metrics import build_event_manager
 from docverse.sentry import (
     DocverseSentryComponent,
     initialize_sentry,
@@ -266,6 +267,13 @@ async def _startup(
     )
     ctx["factory_builder"] = factory_builder
 
+    # The metrics event manager is process-lifetime like the factory
+    # builder; ``shutdown`` owns ``event_manager`` teardown. Worker
+    # functions publish through ``ctx["events"]``.
+    event_manager, events = await build_event_manager(config, logger=logger)
+    ctx["event_manager"] = event_manager
+    ctx["events"] = events
+
     logger.info("Worker startup complete")
 
 
@@ -299,6 +307,9 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         # Private-attribute access until safir adds a public shutdown API;
         # see https://github.com/lsst-sqre/safir/issues/522
         await arq_queue._pool.aclose()  # noqa: SLF001
+    event_manager = ctx.get("event_manager")
+    if event_manager is not None:
+        await event_manager.aclose()
     await ctx["http_client"].aclose()
     await db_session_dependency.aclose()
     logger = structlog.get_logger("docverse.worker")

@@ -13,6 +13,7 @@ from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.dependencies.context import ContextDependency
+from docverse.metrics.events import DocverseEvents
 from docverse.storage.github import (
     GitHubAppClient,
     GitHubAppNotConfiguredError,
@@ -28,6 +29,7 @@ def _logger() -> structlog.stdlib.BoundLogger:
 async def test_request_context_creates_github_app_client_when_configured(
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    mock_events: DocverseEvents,
 ) -> None:
     """With all three secrets set, the factory builds a GitHubAppClient."""
     dep = ContextDependency()
@@ -37,6 +39,7 @@ async def test_request_context_creates_github_app_client_when_configured(
             github_app_id=mock_github.app_id,
             github_app_private_key=SecretStr(mock_github.private_key_pem),
             github_webhook_secret=SecretStr("webhook-secret"),
+            events=mock_events,
         )
         context = await dep(
             request=Mock(spec=Request),
@@ -54,6 +57,7 @@ async def test_request_context_creates_github_app_client_when_configured(
 async def test_request_context_raises_when_github_secret_missing(
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    mock_events: DocverseEvents,
 ) -> None:
     """A single missing secret makes ``create_github_app_client`` raise."""
     dep = ContextDependency()
@@ -63,6 +67,7 @@ async def test_request_context_raises_when_github_secret_missing(
             github_app_id=mock_github.app_id,
             github_app_private_key=SecretStr(mock_github.private_key_pem),
             # github_webhook_secret intentionally unset
+            events=mock_events,
         )
         context = await dep(
             request=Mock(spec=Request),
@@ -79,6 +84,7 @@ async def test_request_context_raises_when_github_secret_missing(
 async def test_set_github_app_validated_disables_feature(
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    mock_events: DocverseEvents,
 ) -> None:
     """``set_github_app_validated(False)`` makes the gate raise.
 
@@ -93,6 +99,7 @@ async def test_set_github_app_validated_disables_feature(
             github_app_id=mock_github.app_id,
             github_app_private_key=SecretStr(mock_github.private_key_pem),
             github_webhook_secret=SecretStr("webhook-secret"),
+            events=mock_events,
         )
         # Sanity check: the feature is enabled out of the gate.
         context = await dep(
@@ -139,6 +146,7 @@ async def test_github_app_enabled_property_tracks_secret_presence(
 async def test_set_github_secrets_resets_validated_flag(
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    mock_events: DocverseEvents,
 ) -> None:
     """A new secret bundle clears the prior ``validated=False`` decision.
 
@@ -153,6 +161,7 @@ async def test_set_github_secrets_resets_validated_flag(
             github_app_id=mock_github.app_id,
             github_app_private_key=SecretStr(mock_github.private_key_pem),
             github_webhook_secret=SecretStr("webhook-secret"),
+            events=mock_events,
         )
         dep.set_github_app_validated(value=False)
         dep.set_github_secrets(
@@ -176,11 +185,12 @@ async def test_set_github_secrets_resets_validated_flag(
 async def test_set_github_secrets_overrides_three_fields(
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    mock_events: DocverseEvents,
 ) -> None:
     """``set_github_secrets`` updates the three GitHub-App secret slots."""
     dep = ContextDependency()
     async with httpx.AsyncClient() as http_client:
-        await dep.initialize(http_client=http_client)
+        await dep.initialize(http_client=http_client, events=mock_events)
         # No secrets yet.
         context = await dep(
             request=Mock(spec=Request),

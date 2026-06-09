@@ -10,6 +10,7 @@ from pydantic import BeforeValidator, Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from safir.arq import ArqMode, build_arq_redis_settings
 from safir.logging import LogLevel, Profile
+from safir.metrics import MetricsConfiguration, metrics_configuration_factory
 from safir.pydantic import EnvRedisDsn
 
 __all__ = ["Configuration", "config"]
@@ -45,6 +46,30 @@ class Configuration(BaseSettings):
         None,
         title="Slack webhook for alerts",
         description="If set, alerts will be posted to this Slack webhook",
+    )
+
+    metrics: MetricsConfiguration = Field(
+        default_factory=metrics_configuration_factory,
+        title="Sasquatch application-metrics configuration",
+        description=(
+            "Configures Safir's ``EventManager`` for the Docverse"
+            " application-metrics pipeline (SQR-112). The concrete"
+            " variant is selected from the environment by"
+            " ``metrics_configuration_factory``:\n\n"
+            "- ``METRICS_APPLICATION`` (e.g. ``docverse``),"
+            " ``METRICS_ENABLED``, and ``METRICS_MOCK`` choose between"
+            " the mock, disabled, and Kafka-backed managers. Set"
+            " ``METRICS_MOCK=true`` (with ``METRICS_ENABLED=false``) for"
+            " tests; set ``METRICS_ENABLED=true`` in production.\n"
+            "- When enabled, ``KAFKA_*`` (bootstrap servers, security"
+            " protocol, and any TLS material) and ``SCHEMA_MANAGER_*``"
+            " (the Confluent-compatible schema-registry URL) connect the"
+            " manager to Sasquatch.\n\n"
+            "Events publish to the ``lsst.square.metrics.events.docverse``"
+            " topic, which the ``phalanx-docverse`` deployment must"
+            " register in Sasquatch (tracked separately from this"
+            " application)."
+        ),
     )
 
     github_app_id: int | None = Field(

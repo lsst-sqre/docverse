@@ -8,20 +8,29 @@ work without external context (per SQR-112 user story 12).
 
 from __future__ import annotations
 
+import time
 import traceback
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import EditionKind
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
+from docverse.metrics import (
+    EditionPublishedEvent,
+    EditionPublishTrigger,
+    MetricsEditionKind,
+)
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
@@ -70,6 +79,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 
     queue_job_id: int = payload["queue_job_id"]
 
+    started = time.monotonic()
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
         edition_store = factory.create_edition_store()
@@ -142,6 +152,19 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     factory=factory, queue_job_id=queue_job_id
                 )
             logger.info("Edition publish completed")
+            # Publish after the success transition commits. Best-effort:
+            # production runs raise_on_error=False so a metrics outage
+            # never fails the publish (no defensive try/except).
+            await _publish_edition_published(
+                ctx=ctx,
+                session=session,
+                factory=factory,
+                org_id=payload["org_id"],
+                project_slug=payload["project_slug"],
+                edition=resources.edition,
+                queue_job_id=queue_job_id,
+                started=started,
+            )
             await try_enqueue_dashboard_build_by_id(
                 factory=factory,
                 session=session,
@@ -283,4 +306,56 @@ async def _maybe_finalise_keeper_sync_run(
         return
     await maybe_finalise_run(
         run_store=run_store, run_id=queue_job.keeper_sync_run_id
+    )
+
+
+def _metrics_edition_kind(kind: EditionKind) -> MetricsEditionKind:
+    """Map the API ``EditionKind`` to the dedicated metrics enum.
+
+    Values are identical, so this is a straight value lookup; keeping
+    the mapping explicit lets the metrics schema evolve independently of
+    the API model (SQR-112 D4).
+    """
+    return MetricsEditionKind(kind.value)
+
+
+async def _publish_edition_published(  # noqa: PLR0913
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    org_id: int,
+    project_slug: str,
+    edition: Edition,
+    queue_job_id: int,
+    started: float,
+) -> None:
+    """Emit one ``edition_published`` metric for a successful publish.
+
+    The publish job's ``queue_jobs`` row carries a ``keeper_sync_run_id``
+    only when the LTD-keeper backfill drove it, so its presence
+    classifies the ``trigger``.
+    """
+    events = ctx.get("events")
+    if events is None:
+        return
+    org_store = factory.create_org_store()
+    queue_job_store = factory.create_queue_job_store()
+    async with session.begin():
+        org = await org_store.get_by_id(org_id)
+        queue_job = await queue_job_store.get(queue_job_id)
+    organization = org.slug if org is not None else str(org_id)
+    trigger = (
+        EditionPublishTrigger.keeper_sync
+        if queue_job is not None and queue_job.keeper_sync_run_id is not None
+        else EditionPublishTrigger.build
+    )
+    await events.edition_published.publish(
+        EditionPublishedEvent(
+            organization=organization,
+            project=project_slug,
+            edition_kind=_metrics_edition_kind(edition.kind),
+            trigger=trigger,
+            elapsed=timedelta(seconds=time.monotonic() - started),
+        )
     )

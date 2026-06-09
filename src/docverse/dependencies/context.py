@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.stdlib import BoundLogger
 
 from ..factory import HandlerFactory
+from ..metrics.events import DocverseEvents
 from ..services.credential_encryptor import CredentialEncryptor
 from ..storage.user_info_store import StubUserInfoStore, UserInfoStore
 
@@ -58,6 +59,13 @@ class RequestContext:
     factory: HandlerFactory
     """The component factory."""
 
+    events: DocverseEvents
+    """The Sasquatch metrics event publishers.
+
+    Handlers publish application metrics through this after committing
+    their transaction (e.g. ``context.events.build_uploaded.publish(...)``).
+    """
+
     def rebind_logger(self, **values: Any) -> None:
         """Add the given values to the logging context.
 
@@ -91,6 +99,7 @@ class ContextDependency:
         self._github_webhook_secret: SecretStr | None = None
         self._github_app_validated: bool = True
         self._github_app_html_url: str | None = None
+        self._events: DocverseEvents | None = None
 
     @property
     def github_app_enabled(self) -> bool:
@@ -128,11 +137,15 @@ class ContextDependency:
         if not self._initialized:
             msg = "ContextDependency not initialized"
             raise RuntimeError(msg)
+        if self._events is None:
+            msg = "ContextDependency events not initialized"
+            raise RuntimeError(msg)
         return RequestContext(
             request=request,
             response=response,
             logger=logger,
             session=session,
+            events=self._events,
             factory=HandlerFactory(
                 session=session,
                 logger=logger,
@@ -151,7 +164,7 @@ class ContextDependency:
             ),
         )
 
-    async def initialize(  # noqa: PLR0913
+    async def initialize(  # noqa: C901, PLR0913
         self,
         user_info_store: UserInfoStore | None = None,
         credential_encryptor: CredentialEncryptor | None = None,
@@ -162,9 +175,12 @@ class ContextDependency:
         github_app_id: int | None = None,
         github_app_private_key: SecretStr | None = None,
         github_webhook_secret: SecretStr | None = None,
+        events: DocverseEvents | None = None,
     ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
+        if events is not None:
+            self._events = events
         if user_info_store is not None:
             self._user_info_store = user_info_store
         if credential_encryptor is not None:

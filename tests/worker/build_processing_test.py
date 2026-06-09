@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import tarfile
 import time
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ import structlog
 from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +37,7 @@ from docverse.domain.api_urls import edition_url, queue_job_url
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
+from docverse.metrics import build_event_manager
 from docverse.services.edition_tracking import EditionTrackingService
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.build_store import BuildStore
@@ -270,6 +273,77 @@ async def test_build_processing_updates_edition(
             assert len(job.progress["editions_updated"]) == 1
             assert job.progress["editions_updated"][0]["slug"] == "main"
             assert job.progress["editions_updated"][0]["action"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_build_processing_publishes_build_processed(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A processed build emits one ``build_processed`` metric event."""
+    logger = _logger()
+    mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-metrics",
+        )
+
+    file_body = b"<html>hello</html>"
+    tarball = _make_tarball({"index.html": file_body})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-metrics",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org.slug
+    assert event.project == project.slug
+    assert event.success is True
+    assert event.object_count == 1
+    assert event.total_size_bytes == len(file_body)
+    assert event.editions_updated == 1
+    assert event.editions_skipped == 0
+    assert event.stale_skipped is False
+    assert event.elapsed >= timedelta(0)
 
 
 @pytest.mark.asyncio

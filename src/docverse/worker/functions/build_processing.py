@@ -11,6 +11,9 @@ import asyncio
 import io
 import mimetypes
 import tarfile
+import time
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import sentry_sdk
@@ -29,6 +32,7 @@ from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
+from docverse.metrics import BuildProcessedEvent
 from docverse.services.lock_service import LockKey
 from docverse.services.publish_enqueue import enqueue_publish_for_edition
 from docverse.storage.build_store import BuildStore
@@ -38,6 +42,23 @@ from docverse.storage.queue_job_store import QueueJobStore
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
+
+
+@dataclass(slots=True)
+class _BuildProcessedOutcome:
+    """Terminal metrics for one ``build_processing`` run.
+
+    Carried up from the per-path helpers so the top-level function can
+    emit a single ``build_processed`` event covering whichever of the
+    three terminal outcomes (success, failure, stale-skip) occurred.
+    """
+
+    success: bool
+    object_count: int | None
+    total_size_bytes: int | None
+    editions_updated: int
+    editions_skipped: int
+    stale_skipped: bool
 
 
 async def build_processing(
@@ -70,6 +91,7 @@ async def build_processing(
         build=build_public_id,
     )
 
+    started = time.monotonic()
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
         build_store = factory.create_build_store()
@@ -101,25 +123,73 @@ async def build_processing(
                 build_id=build_id,
                 logger=logger,
             ):
-                return "completed"
-            return await _process_build_locked(
-                session=session,
-                factory=factory,
-                org_slug=org_slug,
-                build_store=build_store,
-                org_store=org_store,
-                queue_job_store=queue_job_store,
-                ctx=ctx,
-                build=build,
-                org_id=org_id,
-                project_slug=project_slug,
-                build_id=build_id,
-                build_public_id=build_public_id,
-                logger=logger,
-            )
+                result = "completed"
+                outcome = _BuildProcessedOutcome(
+                    success=True,
+                    object_count=None,
+                    total_size_bytes=None,
+                    editions_updated=0,
+                    editions_skipped=0,
+                    stale_skipped=True,
+                )
+            else:
+                result, outcome = await _process_build_locked(
+                    session=session,
+                    factory=factory,
+                    org_slug=org_slug,
+                    build_store=build_store,
+                    org_store=org_store,
+                    queue_job_store=queue_job_store,
+                    ctx=ctx,
+                    build=build,
+                    org_id=org_id,
+                    project_slug=project_slug,
+                    build_id=build_id,
+                    build_public_id=build_public_id,
+                    logger=logger,
+                )
+
+        # Publish after releasing the lock and after the terminal DB
+        # transition has committed. Best-effort: production runs
+        # raise_on_error=False so a metrics outage never fails the build.
+        await _publish_build_processed(
+            ctx=ctx,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            outcome=outcome,
+            started=started,
+        )
+        return result
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _publish_build_processed(
+    *,
+    ctx: dict[str, Any],
+    org_slug: str,
+    project_slug: str,
+    outcome: _BuildProcessedOutcome,
+    started: float,
+) -> None:
+    """Emit one ``build_processed`` metric for a finished build run."""
+    events = ctx.get("events")
+    if events is None:
+        return
+    await events.build_processed.publish(
+        BuildProcessedEvent(
+            organization=org_slug,
+            project=project_slug,
+            success=outcome.success,
+            object_count=outcome.object_count,
+            total_size_bytes=outcome.total_size_bytes,
+            editions_updated=outcome.editions_updated,
+            editions_skipped=outcome.editions_skipped,
+            stale_skipped=outcome.stale_skipped,
+            elapsed=timedelta(seconds=time.monotonic() - started),
+        )
+    )
 
 
 async def _guard_stale_build(  # noqa: PLR0913
@@ -178,11 +248,14 @@ async def _process_build_locked(  # noqa: PLR0913
     build_id: int,
     build_public_id: str,
     logger: structlog.stdlib.BoundLogger,
-) -> str:
+) -> tuple[str, _BuildProcessedOutcome]:
     """Unpack, upload, and finalize a non-stale build under the lock.
 
     Assumes the caller holds the BUILD_PROCESSING advisory lock and has
     already confirmed this build is the latest for ``(project, git_ref)``.
+
+    Returns the arq status message paired with the terminal metrics for
+    the run so the caller can emit one ``build_processed`` event.
     """
     # Phase 1: Load metadata and mark QueueJob as in_progress
     async with session.begin():
@@ -234,9 +307,16 @@ async def _process_build_locked(  # noqa: PLR0913
             )
             if queue_job_id is not None:
                 await queue_job_store.fail(queue_job_id)
-        return "failed"
+        return "failed", _BuildProcessedOutcome(
+            success=False,
+            object_count=None,
+            total_size_bytes=None,
+            editions_updated=0,
+            editions_skipped=0,
+            stale_skipped=False,
+        )
     else:
-        await _finalize_success(
+        editions_updated, editions_skipped = await _finalize_success(
             session=session,
             factory=factory,
             build_store=build_store,
@@ -252,7 +332,14 @@ async def _process_build_locked(  # noqa: PLR0913
             total_size_bytes=total_size_bytes,
             logger=logger,
         )
-        return "completed"
+        return "completed", _BuildProcessedOutcome(
+            success=True,
+            object_count=object_count,
+            total_size_bytes=total_size_bytes,
+            editions_updated=editions_updated,
+            editions_skipped=editions_skipped,
+            stale_skipped=False,
+        )
 
 
 async def _mark_stale_skipped(  # noqa: PLR0913
@@ -365,10 +452,16 @@ async def _finalize_success(  # noqa: PLR0913
     object_count: int,
     total_size_bytes: int,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> tuple[int, int]:
     """Run edition tracking and mark the queue job complete.
 
     Edition tracking failures are logged but do not fail the build.
+
+    Returns
+    -------
+    tuple of int, int
+        The number of editions updated and skipped (both ``0`` when
+        edition tracking failed), for the ``build_processed`` metric.
     """
     # Phase 3b: Edition tracking
     tracking_result = await _track_editions(
@@ -465,6 +558,10 @@ async def _finalize_success(  # noqa: PLR0913
             )
             await queue_job_store.complete(queue_job_id, has_errors=has_errors)
     logger.info("Build processing completed")
+
+    if tracking_result is None:
+        return 0, 0
+    return len(tracking_result.updated), len(tracking_result.skipped)
 
 
 async def _enqueue_publish_jobs(  # noqa: PLR0913

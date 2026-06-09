@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 from types import TracebackType
 from typing import Any, Self
 
@@ -11,6 +12,7 @@ import pytest
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -36,6 +38,11 @@ from docverse.domain.organization import Organization
 from docverse.domain.project import Project
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.factory import Factory
+from docverse.metrics import (
+    EditionPublishTrigger,
+    MetricsEditionKind,
+    build_event_manager,
+)
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
@@ -310,6 +317,68 @@ async def test_publish_edition_success_lifecycle(
             assert job.date_started is not None
             assert job.date_completed is not None
             _ = history_entry
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_publishes_edition_published(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful publish emits one ``edition_published`` metric event."""
+    mock_publisher = MockEditionPublisher()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-metrics-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-metrics",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-metrics",
+        events=events,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publisher = events.edition_published
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org.slug
+    assert event.project == project.slug
+    # The scenario edition is ``EditionKind.release``; the worker maps it
+    # to the dedicated metrics enum.
+    assert event.edition_kind == MetricsEditionKind.release
+    # No keeper_sync_run_id on the queue job => a build-driven publish.
+    assert event.trigger == EditionPublishTrigger.build
+    assert event.elapsed >= timedelta(0)
 
 
 @pytest.mark.asyncio
