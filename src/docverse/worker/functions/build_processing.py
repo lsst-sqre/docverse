@@ -18,7 +18,13 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import BuildStatus
+from docverse.client.models import (
+    BuildProcessingProgress,
+    BuildStatus,
+    EditionUpdateRef,
+    PublishJobRef,
+)
+from docverse.domain.api_urls import edition_url, queue_job_url
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
@@ -236,6 +242,7 @@ async def _process_build_locked(  # noqa: PLR0913
             build_store=build_store,
             queue_job_store=queue_job_store,
             org_id=org_id,
+            org_slug=org_slug,
             project_id=build.project_id,
             project_slug=project_slug,
             build_id=build_id,
@@ -306,6 +313,42 @@ async def _start_queue_job(
     return queue_job.id
 
 
+async def _resolve_api_base_url(
+    factory: Factory,
+    logger: structlog.stdlib.BoundLogger,
+) -> str | None:
+    """Resolve the Docverse API base URL via Repertoire discovery.
+
+    Returns ``None`` — after logging a warning — when no discovery client
+    is configured, the discovery lookup fails, or Docverse is not
+    registered in Repertoire. Callers omit the HATEOAS URL fields in that
+    case rather than failing the build, mirroring the non-fatal
+    edition-tracking posture.
+    """
+    discovery = factory.discovery
+    if discovery is None:
+        logger.warning(
+            "No Repertoire discovery client configured; omitting HATEOAS "
+            "URLs from build_processing progress"
+        )
+        return None
+    try:
+        api_base = await discovery.url_for_internal("docverse")
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to resolve Docverse API URL from Repertoire; omitting "
+            "HATEOAS URLs from build_processing progress",
+            exc_info=True,
+        )
+        return None
+    if api_base is None:
+        logger.warning(
+            "Docverse is not registered in Repertoire; omitting HATEOAS "
+            "URLs from build_processing progress"
+        )
+    return api_base
+
+
 async def _finalize_success(  # noqa: PLR0913
     *,
     session: AsyncSession,
@@ -313,6 +356,7 @@ async def _finalize_success(  # noqa: PLR0913
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     org_id: int,
+    org_slug: str,
     project_id: int,
     project_slug: str,
     build_id: int,
@@ -338,8 +382,20 @@ async def _finalize_success(  # noqa: PLR0913
     )
 
     # Phase 3c: Enqueue a publish_edition job for each updated edition.
+    #
+    # Resolve the Docverse API base URL once for every HATEOAS link in this
+    # job's progress payload, but only when there are updated editions to
+    # link: a build that updates nothing has no edition_url / queue_job_url
+    # to embed, so it skips the Repertoire discovery round-trip (and its
+    # "unregistered" warning) entirely. ``None`` means discovery is
+    # unavailable or Docverse is unregistered, in which case the URL fields
+    # are omitted and the build still completes. The editions_updated
+    # comprehension below only dereferences ``api_base`` while iterating
+    # ``tracking_result.updated``, so leaving it ``None`` here is safe.
+    api_base: str | None = None
     publish_jobs: list[dict[str, str]] = []
     if tracking_result is not None and tracking_result.updated:
+        api_base = await _resolve_api_base_url(factory, logger)
         publish_jobs = await _enqueue_publish_jobs(
             session=session,
             factory=factory,
@@ -350,29 +406,59 @@ async def _finalize_success(  # noqa: PLR0913
             project_slug=project_slug,
             build_id=build_id,
             build_public_id=build_public_id,
+            api_base=api_base,
             logger=logger,
         )
 
     # Phase 4: Mark queue job as complete
     if queue_job_id is not None:
-        progress: dict[str, object] = {
-            "message": "Build processing complete",
-            "object_count": object_count,
-            "total_size_bytes": total_size_bytes,
-        }
-        if tracking_result is not None:
-            progress["editions_updated"] = [
-                {"slug": o.slug, "action": o.action}
-                for o in tracking_result.updated
-            ]
-            progress["editions_skipped"] = [
-                {"slug": o.slug} for o in tracking_result.skipped
-            ]
-        if publish_jobs:
-            progress["publish_jobs"] = publish_jobs
         has_errors = tracking_result is None
-        if has_errors:
-            progress["edition_tracking_error"] = True
+        # Build the payload through BuildProcessingProgress so it is
+        # validated at write time, then dump to a plain dict for JSONB
+        # storage. exclude_none keeps the stored shape minimal (and
+        # matches the legacy hand-built dict): keys only appear when the
+        # corresponding value is present.
+        progress_model = BuildProcessingProgress(
+            message="Build processing complete",
+            object_count=object_count,
+            total_size_bytes=total_size_bytes,
+            editions_updated=(
+                [
+                    EditionUpdateRef(
+                        slug=o.slug,
+                        action=o.action,
+                        edition_url=(
+                            edition_url(
+                                api_base,
+                                org=org_slug,
+                                project=project_slug,
+                                edition=o.slug,
+                            )
+                            if api_base is not None
+                            else None
+                        ),
+                    )
+                    for o in tracking_result.updated
+                ]
+                if tracking_result is not None
+                else None
+            ),
+            editions_skipped=(
+                [
+                    EditionUpdateRef(slug=o.slug)
+                    for o in tracking_result.skipped
+                ]
+                if tracking_result is not None
+                else None
+            ),
+            publish_jobs=(
+                [PublishJobRef.model_validate(job) for job in publish_jobs]
+                if publish_jobs
+                else None
+            ),
+            edition_tracking_error=has_errors or None,
+        )
+        progress = progress_model.model_dump(exclude_none=True)
         async with session.begin():
             await queue_job_store.update_phase(
                 queue_job_id, "complete", progress=progress
@@ -392,6 +478,7 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     project_slug: str,
     build_id: int,
     build_public_id: str,
+    api_base: str | None,
     logger: structlog.stdlib.BoundLogger,
 ) -> list[dict[str, str]]:
     """Create a ``publish_edition`` child job for each updated edition.
@@ -403,7 +490,8 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     backend-job-id write-back) sequencing.
 
     Returns a list of ``{edition_slug, publish_queue_job_public_id}``
-    entries suitable for embedding in the parent build job's progress.
+    entries (plus a ``queue_job_url`` HATEOAS link when ``api_base`` is
+    set) suitable for embedding in the parent build job's progress.
     """
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
@@ -425,12 +513,15 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
             build_id=outcome.build_id,
             build_public_id=build_public_id,
         )
-        publish_jobs.append(
-            {
-                "edition_slug": result.edition_slug,
-                "publish_queue_job_public_id": result.queue_job_public_id,
-            }
-        )
+        entry: dict[str, str] = {
+            "edition_slug": result.edition_slug,
+            "publish_queue_job_public_id": result.queue_job_public_id,
+        }
+        if api_base is not None:
+            entry["queue_job_url"] = queue_job_url(
+                api_base, job=result.queue_job_public_id
+            )
+        publish_jobs.append(entry)
         logger.info(
             "Enqueued publish_edition job",
             edition_slug=result.edition_slug,

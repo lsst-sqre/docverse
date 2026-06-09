@@ -64,6 +64,19 @@ from docverse.storage.keeper_sync import TombstoneReason
 __all__ = ["lifecycle_eval"]
 
 
+def _utcnow() -> datetime:
+    """Return the current UTC time.
+
+    A module-internal seam for the worker's lifecycle evaluation clock,
+    mirroring the ``LifecycleEvaluationContext.now`` injection the pure
+    evaluator already accepts. Production callers get real wall-clock
+    time; the integration test monkeypatches this to a frozen ``NOW`` so
+    the fixture timestamps and the evaluation clock stay pinned together
+    and the suite is deterministic regardless of the real date.
+    """
+    return datetime.now(tz=UTC)
+
+
 async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Evaluate lifecycle rules for one org's projects and soft-delete matches.
 
@@ -171,7 +184,7 @@ async def _evaluate_org(
         logger.debug("Lifecycle eval: no projects for org")
         return
 
-    now = datetime.now(tz=UTC)
+    now = _utcnow()
     decisions: list[tuple[Project, LifecycleRuleSet, LifecycleDecision]] = []
     for project in projects:
         # This worker owns DraftInactivityRule and BuildHistoryOrphanRule;

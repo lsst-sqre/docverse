@@ -84,7 +84,12 @@ from .projects import (
     ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
-from .queue import QueueJob
+from .queue import (
+    BuildProcessingProgress,
+    EditionUpdateRef,
+    PublishJobRef,
+    QueueJob,
+)
 from .queue_enums import JobKind, JobStatus, PublishStatus
 from .services import (
     OrganizationService,
@@ -100,6 +105,7 @@ __all__ = [
     "BuildAnnotations",
     "BuildCreate",
     "BuildHistoryOrphanRule",
+    "BuildProcessingProgress",
     "BuildStatus",
     "BuildUpdate",
     "CloudflareCredentials",
@@ -116,6 +122,7 @@ __all__ = [
     "EditionKind",
     "EditionRollback",
     "EditionUpdate",
+    "EditionUpdateRef",
     "FastlyCredentials",
     "GcpCredentials",
     "GitRefAuditRunStatus",
@@ -160,6 +167,7 @@ __all__ = [
     "ProjectGitHubBinding",
     "ProjectGitHubBindingCreate",
     "ProjectUpdate",
+    "PublishJobRef",
     "PublishStatus",
     "QueueJob",
     "RefDeletedRule",

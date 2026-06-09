@@ -159,6 +159,68 @@ async def test_get_by_slug(
 
 
 @pytest.mark.asyncio
+async def test_get_by_id(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        created = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="by-id-ed",
+                title="By Id Ed",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        found = await edition_store.get_by_id(created.id)
+        await db_session.commit()
+    assert found is not None
+    assert found.id == created.id
+    assert found.slug == "by-id-ed"
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_missing_returns_none(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    async with db_session.begin():
+        await _create_project(db_session)
+        found = await edition_store.get_by_id(999999)
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_excludes_soft_deleted(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        created = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="gone-ed",
+                title="Gone Ed",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="gone-ed",
+            reason=TombstoneReason.manual_delete,
+        )
+        found = await edition_store.get_by_id(created.id)
+        await db_session.commit()
+    assert found is None
+
+
+@pytest.mark.asyncio
 async def test_list_by_project(
     db_session: AsyncSession,
     edition_store: EditionStore,

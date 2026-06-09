@@ -143,6 +143,11 @@ class Factory:
         """Set the logger for the factory."""
         self._logger = logger
 
+    @property
+    def discovery(self) -> DiscoveryClient | None:
+        """Repertoire discovery client, or ``None`` when not configured."""
+        return self._discovery
+
     def create_queue_backend(self) -> QueueBackend:
         """Create a :class:`QueueBackend` for enqueuing jobs."""
         if self._arq_queue is None:

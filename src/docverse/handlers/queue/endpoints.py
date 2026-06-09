@@ -33,4 +33,6 @@ async def get_queue_job(
         if job is None:
             msg = f"Queue job {job_id!r} not found"
             raise NotFoundError(msg)
-    return QueueJob.from_domain(job, context.request)
+        return await QueueJob.from_domain(
+            job, context.request, context.factory
+        )

@@ -9,7 +9,9 @@ from typing import Any
 
 import httpx
 import pytest
+import respx
 import structlog
+from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
@@ -27,7 +29,9 @@ from docverse.client.models import (
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
+from docverse.dbschema.project import SqlProject
 from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.domain.api_urls import edition_url, queue_job_url
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
@@ -55,6 +59,11 @@ from tests.worker.conftest import make_worker_ctx
 _HASH = "sha256:" + "a" * 64
 
 _config = Configuration()
+
+#: Docverse API base URL registered for the ``docverse`` internal service
+#: in ``tests/data/discovery.json`` (the autouse ``mock_discovery``
+#: fixture). HATEOAS links in build_processing progress hang off it.
+_DISCOVERY_BASE = "https://example.test/docverse/api"
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -525,6 +534,268 @@ async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
             assert entry["publish_queue_job_public_id"] == serialize_base32_id(
                 child.public_id
             )
+
+
+@pytest.mark.asyncio
+async def test_build_processing_embeds_hateoas_urls(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Progress entries carry HATEOAS ``edition_url`` / ``queue_job_url``.
+
+    The autouse ``mock_discovery`` fixture registers the ``docverse``
+    internal service, so the worker resolves the API base from Repertoire
+    and embeds an absolute edition link on each ``editions_updated`` entry
+    and an absolute queue-job link on each ``publish_jobs`` entry.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-hateoas",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-hateoas",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            parent = await qjs.get_by_backend_job_id("test-arq-hateoas")
+            assert parent is not None
+            assert parent.progress is not None
+
+            updated = parent.progress["editions_updated"][0]
+            assert updated["slug"] == "main"
+            assert updated["edition_url"] == edition_url(
+                _DISCOVERY_BASE,
+                org=org.slug,
+                project=project.slug,
+                edition="main",
+            )
+
+            entry = parent.progress["publish_jobs"][0]
+            child_public_id = entry["publish_queue_job_public_id"]
+            assert entry["queue_job_url"] == queue_job_url(
+                _DISCOVERY_BASE, job=child_public_id
+            )
+
+
+@pytest.mark.asyncio
+async def test_build_processing_omits_urls_when_docverse_unregistered(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_discovery: respx.Router,
+) -> None:
+    """No Docverse Repertoire registration => URL fields omitted, no fail.
+
+    The build still completes and the existing slug/ID fields remain; only
+    the HATEOAS ``edition_url`` / ``queue_job_url`` links are dropped.
+    """
+    # Re-register discovery with no internal ``docverse`` service so the
+    # worker's ``url_for_internal("docverse")`` resolves to ``None``.
+    mock_discovery.reset()
+    register_mock_discovery(mock_discovery, {"services": {"internal": {}}})
+
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-nourl",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-nourl",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            parent = await qjs.get_by_backend_job_id("test-arq-nourl")
+            assert parent is not None
+            assert parent.status == JobStatus.completed
+            assert parent.progress is not None
+
+            updated = parent.progress["editions_updated"][0]
+            assert updated["slug"] == "main"
+            assert "edition_url" not in updated
+
+            entry = parent.progress["publish_jobs"][0]
+            assert "publish_queue_job_public_id" in entry
+            assert "queue_job_url" not in entry
+
+
+@pytest.mark.asyncio
+async def test_build_processing_skips_url_resolution_when_no_updates(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No updated editions => no Repertoire discovery call; build completes.
+
+    A project ignore rule suppresses edition tracking for the build's git
+    ref, so ``tracking_result.updated`` is empty. ``_finalize_success`` must
+    not resolve the Docverse API base URL in that case — sparing the
+    discovery round-trip and the "unregistered" warning when there is no
+    edition link to embed — while the build still completes.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        # Ignore the build's git ref so edition tracking yields no updates.
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(slug_rewrite_rules=[{"type": "ignore", "glob": "main"}])
+        )
+        await db_session.flush()
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-noupdate",
+        )
+
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    # Spy on Repertoire discovery: resolving the Docverse API base must not
+    # happen when there are no updated editions to link.
+    discovery_services: list[str] = []
+    real_url_for_internal = DiscoveryClient.url_for_internal
+
+    async def _spy_url_for_internal(
+        self: DiscoveryClient,
+        service: str,
+        *,
+        version: str | None = None,
+    ) -> str | None:
+        discovery_services.append(service)
+        return await real_url_for_internal(self, service, version=version)
+
+    monkeypatch.setattr(
+        DiscoveryClient, "url_for_internal", _spy_url_for_internal
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-noupdate",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # No Docverse discovery lookup happened: nothing was updated, so no
+    # HATEOAS link needed resolving (and no "unregistered" warning fired).
+    assert "docverse" not in discovery_services
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            parent = await qjs.get_by_backend_job_id("test-arq-noupdate")
+            assert parent is not None
+            assert parent.status == JobStatus.completed
+            assert parent.progress is not None
+            # Tracking ran and succeeded but matched nothing to update.
+            assert parent.progress.get("editions_updated") == []
 
 
 @pytest.mark.asyncio
