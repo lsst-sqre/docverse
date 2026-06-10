@@ -15,9 +15,11 @@ from .manager import build_event_manager
 from .payloads import (
     BuildProcessedEvent,
     BuildUploadedEvent,
+    DashboardBuiltEvent,
     DocverseEventBase,
     EditionLifecycleEvent,
     EditionPublishedEvent,
+    KeeperSyncRunCompletedEvent,
     MembershipChangedEvent,
     ProjectLifecycleEvent,
 )
@@ -25,11 +27,13 @@ from .payloads import (
 __all__ = [
     "BuildProcessedEvent",
     "BuildUploadedEvent",
+    "DashboardBuiltEvent",
     "DocverseEventBase",
     "DocverseEvents",
     "EditionLifecycleEvent",
     "EditionPublishTrigger",
     "EditionPublishedEvent",
+    "KeeperSyncRunCompletedEvent",
     "LifecycleAction",
     "MembershipChangeAction",
     "MembershipChangedEvent",

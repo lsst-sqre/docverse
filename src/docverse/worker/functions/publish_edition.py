@@ -23,6 +23,7 @@ from docverse.client.models.queue_enums import PublishStatus
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
+from docverse.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
 from docverse.metrics import (
@@ -33,7 +34,10 @@ from docverse.metrics import (
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
-from docverse.services.keeper_sync_finalisation import maybe_finalise_run
+from docverse.services.keeper_sync_finalisation import (
+    maybe_finalise_run,
+    publish_run_completed,
+)
 from docverse.services.lock_service import LockKey
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -132,6 +136,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             except Exception as exc:
                 sentry_sdk.capture_exception(exc)
                 logger.exception("Edition publish failed")
+                completion: KeeperSyncRunWithActivity | None = None
                 async with session.begin():
                     await _mark_failed(
                         edition_store=edition_store,
@@ -141,13 +146,20 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         queue_job_id=queue_job_id,
                         exc=exc,
                     )
-                    await _maybe_finalise_keeper_sync_run(
+                    completion = await _maybe_finalise_keeper_sync_run(
                         factory=factory, queue_job_id=queue_job_id
                     )
+                await publish_run_completed(
+                    events=ctx.get("events"),
+                    session=session,
+                    org_store=factory.create_org_store(),
+                    completion=completion,
+                )
                 return "failed"
+            completion = None
             async with session.begin():
                 await queue_job_store.complete(queue_job_id)
-                await _maybe_finalise_keeper_sync_run(
+                completion = await _maybe_finalise_keeper_sync_run(
                     factory=factory, queue_job_id=queue_job_id
                 )
             logger.info("Edition publish completed")
@@ -163,6 +175,12 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 edition=resources.edition,
                 queue_job_id=queue_job_id,
                 started=started,
+            )
+            await publish_run_completed(
+                events=ctx.get("events"),
+                session=session,
+                org_store=factory.create_org_store(),
+                completion=completion,
             )
             await try_enqueue_dashboard_build_by_id(
                 factory=factory,
@@ -280,7 +298,7 @@ async def _maybe_finalise_keeper_sync_run(
     *,
     factory: Factory,
     queue_job_id: int,
-) -> None:
+) -> KeeperSyncRunWithActivity | None:
     """Roll up the parent keeper-sync run if this publish was attributed.
 
     Publish jobs enqueued by ``keeper_sync_project`` (via the shared
@@ -302,8 +320,8 @@ async def _maybe_finalise_keeper_sync_run(
     run_store = factory.create_keeper_sync_run_store()
     queue_job = await queue_job_store.get(queue_job_id)
     if queue_job is None or queue_job.keeper_sync_run_id is None:
-        return
-    await maybe_finalise_run(
+        return None
+    return await maybe_finalise_run(
         run_store=run_store, run_id=queue_job.keeper_sync_run_id
     )
 

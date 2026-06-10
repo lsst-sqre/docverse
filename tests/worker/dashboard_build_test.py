@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 from typing import Any
 
 import httpx
 import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -19,10 +21,12 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
+from docverse.metrics import build_event_manager
 from docverse.services.lock_service import LockClass, LockKey
 from docverse.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
@@ -239,6 +243,132 @@ async def test_dashboard_build_marks_failed_on_render_exception(
             assert job.status == JobStatus.failed
             assert job.errors is not None
             assert "Simulated objectstore" in job.errors["message"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_publishes_dashboard_built(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed dashboard_build emits one ``dashboard_built`` event."""
+    logger = _logger()
+    mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-event",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-event",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publisher = events.dashboard_built
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org.slug
+    assert event.project == project.slug
+    assert event.success is True
+    # Four MVP artifacts uploaded (matches the phase-transition test).
+    assert event.object_count == 4
+    assert event.total_size_bytes is not None
+    assert event.total_size_bytes > 0
+    assert event.elapsed >= timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_publishes_dashboard_built_on_failure(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed dashboard_build emits dashboard_built with success=False."""
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-event-fail",
+        )
+
+    async def _broken_create_objectstore(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> MockObjectStore:
+        msg = "Simulated objectstore resolution failure"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _broken_create_objectstore,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-event-fail",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "failed"
+
+    publisher = events.dashboard_built
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org.slug
+    assert event.project == project.slug
+    assert event.success is False
+    assert event.object_count is None
+    assert event.total_size_bytes is None
+    assert event.elapsed >= timedelta(0)
 
 
 class _RecordingMockObjectStore(MockObjectStore):

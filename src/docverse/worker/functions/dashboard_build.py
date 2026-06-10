@@ -6,8 +6,9 @@ MVP slice) and uploads them to the project's object store.
 
 from __future__ import annotations
 
+import time
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import sentry_sdk
@@ -15,6 +16,7 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.exceptions import NotFoundError
+from docverse.metrics import DashboardBuiltEvent
 from docverse.services.lock_service import LockKey
 
 
@@ -44,6 +46,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     project_id: int = payload["project_id"]
     queue_job_id: int = payload["queue_job_id"]
 
+    started = time.monotonic()
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
         queue_job_store = factory.create_queue_job_store()
@@ -119,6 +122,18 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                             "traceback": traceback.format_exc(),
                         },
                     )
+                # Publish after the failed transition commits. Best-effort:
+                # production runs raise_on_error=False so a metrics outage
+                # never fails the build (no defensive try/except).
+                await _publish_dashboard_built(
+                    ctx=ctx,
+                    org_slug=payload["org_slug"],
+                    project_slug=payload["project_slug"],
+                    success=False,
+                    object_count=None,
+                    total_size_bytes=None,
+                    started=started,
+                )
                 return "failed"
 
             async with session.begin():
@@ -134,7 +149,44 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 )
                 await queue_job_store.complete(queue_job_id)
             logger.info("Dashboard build completed")
+            # Publish after the terminal transition commits (same
+            # best-effort rationale as the failure branch above).
+            await _publish_dashboard_built(
+                ctx=ctx,
+                org_slug=payload["org_slug"],
+                project_slug=payload["project_slug"],
+                success=True,
+                object_count=progress.object_count,
+                total_size_bytes=progress.total_size_bytes,
+                started=started,
+            )
             return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _publish_dashboard_built(  # noqa: PLR0913
+    *,
+    ctx: dict[str, Any],
+    org_slug: str,
+    project_slug: str,
+    success: bool,
+    object_count: int | None,
+    total_size_bytes: int | None,
+    started: float,
+) -> None:
+    """Emit one ``dashboard_built`` metric for a finished dashboard build."""
+    events = ctx.get("events")
+    if events is None:
+        return
+    await events.dashboard_built.publish(
+        DashboardBuiltEvent(
+            organization=org_slug,
+            project=project_slug,
+            success=success,
+            object_count=object_count,
+            total_size_bytes=total_size_bytes,
+            elapsed=timedelta(seconds=time.monotonic() - started),
+        )
+    )
