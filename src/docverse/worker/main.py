@@ -18,6 +18,12 @@ from safir.arq import ArqQueue, RedisArqQueue
 from safir.database import create_database_engine, is_database_current
 from safir.dependencies.db_session import db_session_dependency
 from safir.logging import configure_logging
+from safir.metrics.arq import (
+    ARQ_EVENTS_CONTEXT_KEY,
+    initialize_arq_metrics,
+    make_on_job_start,
+    publish_queue_stats,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.config import Configuration
@@ -93,6 +99,34 @@ def _cron_minutes_for_tier_interval(interval: timedelta) -> set[int]:
         raise ValueError(msg)
     minutes = seconds // 60
     return set(range(0, 60, minutes))
+
+
+_QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
+"""Five-minute cadence for the ``arq_queue_stats`` gauge.
+
+Queue depth is a Sasquatch product-analytics gauge (SQR-112),
+deliberately distinct from operational telemetry, so a five-minute
+resolution is ample; the coarser cadence also limits the per-tick Redis
+pool that Safir's :func:`safir.metrics.arq.publish_queue_stats` opens.
+"""
+
+
+async def publish_queue_stats_cron(
+    ctx: dict[Any, Any], *args: Any, **kwargs: Any
+) -> None:
+    """Publish this pool's queue-depth ``arq_queue_stats`` gauge (SQR-112).
+
+    Registered as a per-pool cron on every ``WorkerSettings``. The pool's
+    queue name, Redis settings, and the generic arq publishers are all
+    read from the job ``ctx`` that :func:`_startup` populated, so one
+    coroutine serves all three pools and each publishes stats for the
+    queue its own worker process serves.
+    """
+    await publish_queue_stats(
+        ctx["queue_name"],
+        ctx["redis_settings"],
+        ctx[ARQ_EVENTS_CONTEXT_KEY],
+    )
 
 
 class WorkerFactoryBuilder:
@@ -274,6 +308,17 @@ async def _startup(
     ctx["event_manager"] = event_manager
     ctx["events"] = events
 
+    # Generic Safir arq-queue metrics (SQR-112): ``arq_job_run`` for every
+    # job (via ``make_on_job_start`` on each WorkerSettings) and
+    # ``arq_queue_stats`` per pool (via the ``publish_queue_stats_cron``
+    # cron). ``initialize_arq_metrics`` populates
+    # ``ctx[ARQ_EVENTS_CONTEXT_KEY]``; the stats cron also reads this
+    # pool's ``queue_name`` and the ``redis_settings`` (validated non-None
+    # above) back from ``ctx``.
+    await initialize_arq_metrics(event_manager, ctx)
+    ctx["queue_name"] = queue_name
+    ctx["redis_settings"] = config.arq_redis_settings
+
     logger.info("Worker startup complete")
 
 
@@ -326,9 +371,18 @@ class WorkerSettings:
         instrument_arq_task(ping),
         instrument_arq_task(publish_edition),
     ]
+    # Generic arq-queue metrics (SQR-112): publish ``arq_job_run`` for
+    # every job and an ``arq_queue_stats`` gauge for this pool's queue.
+    cron_jobs = [
+        cron(
+            instrument_arq_task(publish_queue_stats_cron),
+            minute=_QUEUE_STATS_CRON_MINUTES,
+        ),
+    ]
     redis_settings = config.arq_redis_settings
     queue_name = config.arq_queue_name
     on_startup = startup_default
+    on_job_start = make_on_job_start(config.arq_queue_name)
     on_shutdown = shutdown
 
 
@@ -400,10 +454,17 @@ class KeeperSyncWorkerSettings:
             instrument_arq_task(keeper_sync_tier_other),
             minute=_cron_minutes_for_tier_interval(TIER_OTHER_CRON_INTERVAL),
         ),
+        # Generic arq-queue metrics (SQR-112): per-pool ``arq_queue_stats``
+        # gauge for the keeper-sync queue.
+        cron(
+            instrument_arq_task(publish_queue_stats_cron),
+            minute=_QUEUE_STATS_CRON_MINUTES,
+        ),
     ]
     redis_settings = config.arq_redis_settings
     queue_name = KEEPER_SYNC_QUEUE_NAME
     on_startup = startup_keeper_sync
+    on_job_start = make_on_job_start(KEEPER_SYNC_QUEUE_NAME)
     on_shutdown = shutdown
 
 
@@ -572,8 +633,17 @@ class MaintenanceWorkerSettings:
             instrument_arq_task(dashboard_sync_reaper),
             minute={24, 54},
         ),
+        # Generic arq-queue metrics (SQR-112): per-pool ``arq_queue_stats``
+        # gauge for the maintenance queue. Queue-depth stats only touch
+        # Redis and Kafka, so the five-minute cadence is free to overlap
+        # the Postgres-bound reaper slots above without contention.
+        cron(
+            instrument_arq_task(publish_queue_stats_cron),
+            minute=_QUEUE_STATS_CRON_MINUTES,
+        ),
     ]
     redis_settings = config.arq_redis_settings
     queue_name = MAINTENANCE_QUEUE_NAME
     on_startup = startup_maintenance
+    on_job_start = make_on_job_start(MAINTENANCE_QUEUE_NAME)
     on_shutdown = shutdown
