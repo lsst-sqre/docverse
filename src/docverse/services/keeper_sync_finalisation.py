@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import sentry_sdk
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import KeeperSyncRunStatus
@@ -93,6 +95,7 @@ async def publish_run_completed(
     session: AsyncSession,
     org_store: OrganizationStore,
     completion: KeeperSyncRunWithActivity | None,
+    logger: structlog.stdlib.BoundLogger,
 ) -> None:
     """Emit one ``keeper_sync_run_completed`` metric for a finalised run.
 
@@ -102,33 +105,42 @@ async def publish_run_completed(
     A keeper-sync run spans many projects, so it is org-scoped and
     ``project`` is always ``None``; ``success`` is ``True`` only for a
     clean ``succeeded`` finalisation, ``False`` for ``partial_failure`` /
-    ``failed``. Best-effort: production runs ``raise_on_error=False`` so a
-    metrics-backend outage never disrupts run finalisation (no defensive
-    try/except at the call sites).
+    ``failed``.
+
+    Fully best-effort: callers invoke this *after* their finalisation
+    transaction has committed, so it swallows and logs any error — a
+    metrics-backend outage (already covered by ``raise_on_error=False``)
+    *or* a DB error during its own ``org_id`` resolution — rather than
+    letting it propagate and disrupt (or retry) an already-committed run
+    finalisation.
 
     The org slug is resolved from the run's ``org_id`` so a single helper
     serves every finaliser regardless of what its payload carried.
     """
     if events is None or completion is None:
         return
-    run = completion.run
-    activity = completion.activity
-    async with session.begin():
-        org = await org_store.get_by_id(run.org_id)
-    organization = org.slug if org is not None else str(run.org_id)
-    elapsed = (
-        run.date_finished - run.date_started
-        if run.date_finished is not None
-        else timedelta(0)
-    )
-    await events.keeper_sync_run_completed.publish(
-        KeeperSyncRunCompletedEvent(
-            organization=organization,
-            project=None,
-            success=run.status == KeeperSyncRunStatus.succeeded,
-            total_count=activity.total_count,
-            succeeded_count=activity.succeeded_count,
-            failed_count=activity.failed_count,
-            elapsed=elapsed,
+    try:
+        run = completion.run
+        activity = completion.activity
+        async with session.begin():
+            org = await org_store.get_by_id(run.org_id)
+        organization = org.slug if org is not None else str(run.org_id)
+        elapsed = (
+            run.date_finished - run.date_started
+            if run.date_finished is not None
+            else timedelta(0)
         )
-    )
+        await events.keeper_sync_run_completed.publish(
+            KeeperSyncRunCompletedEvent(
+                organization=organization,
+                project=None,
+                success=run.status == KeeperSyncRunStatus.succeeded,
+                total_count=activity.total_count,
+                succeeded_count=activity.succeeded_count,
+                failed_count=activity.failed_count,
+                elapsed=elapsed,
+            )
+        )
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception("Failed to publish keeper_sync_run_completed metric")

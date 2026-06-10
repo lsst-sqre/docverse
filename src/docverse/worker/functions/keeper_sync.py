@@ -197,6 +197,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                 session=session,
                 org_store=org_store,
                 completion=completion,
+                logger=logger,
             )
 
         total_reaped = len(reaped) + len(tier_silent) + len(tier_orphans)
@@ -483,6 +484,7 @@ async def keeper_sync_project(
                 session=session,
                 org_store=org_store,
                 completion=completion,
+                logger=logger,
             )
             raise
 
@@ -498,6 +500,7 @@ async def keeper_sync_project(
             session=session,
             org_store=org_store,
             completion=completion,
+            logger=logger,
         )
         logger.info("Keeper-sync project completed")
         return "completed"

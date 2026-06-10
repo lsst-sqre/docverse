@@ -154,6 +154,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     session=session,
                     org_store=factory.create_org_store(),
                     completion=completion,
+                    logger=logger,
                 )
                 return "failed"
             completion = None
@@ -163,13 +164,16 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     factory=factory, queue_job_id=queue_job_id
                 )
             logger.info("Edition publish completed")
-            # Publish after the success transition commits. Best-effort:
-            # production runs raise_on_error=False so a metrics outage
-            # never fails the publish (no defensive try/except).
+            # Emit the post-commit metrics after the success transition
+            # commits. Both emitters are fully best-effort: they swallow
+            # and log any error (a metrics outage *or* a DB hiccup during
+            # their own post-commit reads), so neither can fail or retry
+            # an edition whose publish has already committed.
             await _publish_edition_published(
                 ctx=ctx,
                 session=session,
                 factory=factory,
+                logger=logger,
                 org_id=payload["org_id"],
                 project_slug=payload["project_slug"],
                 edition=resources.edition,
@@ -181,6 +185,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 session=session,
                 org_store=factory.create_org_store(),
                 completion=completion,
+                logger=logger,
             )
             await try_enqueue_dashboard_build_by_id(
                 factory=factory,
@@ -331,6 +336,7 @@ async def _publish_edition_published(  # noqa: PLR0913
     ctx: dict[str, Any],
     session: AsyncSession,
     factory: Factory,
+    logger: structlog.stdlib.BoundLogger,
     org_id: int,
     project_slug: str,
     edition: Edition,
@@ -342,27 +348,38 @@ async def _publish_edition_published(  # noqa: PLR0913
     The publish job's ``queue_jobs`` row carries a ``keeper_sync_run_id``
     only when the LTD-keeper backfill drove it, so its presence
     classifies the ``trigger``.
+
+    Fully best-effort: this runs *after* the publish has committed, so it
+    swallows and logs any error — a metrics-backend outage (already
+    covered by ``raise_on_error=False``) *or* a DB error during its own
+    post-commit reads — rather than letting it propagate and retry an
+    edition that has already published.
     """
     events = ctx.get("events")
     if events is None:
         return
-    org_store = factory.create_org_store()
-    queue_job_store = factory.create_queue_job_store()
-    async with session.begin():
-        org = await org_store.get_by_id(org_id)
-        queue_job = await queue_job_store.get(queue_job_id)
-    organization = org.slug if org is not None else str(org_id)
-    trigger = (
-        EditionPublishTrigger.keeper_sync
-        if queue_job is not None and queue_job.keeper_sync_run_id is not None
-        else EditionPublishTrigger.build
-    )
-    await events.edition_published.publish(
-        EditionPublishedEvent(
-            organization=organization,
-            project=project_slug,
-            edition_kind=MetricsEditionKind.from_api(edition.kind),
-            trigger=trigger,
-            elapsed=timedelta(seconds=time.monotonic() - started),
+    try:
+        org_store = factory.create_org_store()
+        queue_job_store = factory.create_queue_job_store()
+        async with session.begin():
+            org = await org_store.get_by_id(org_id)
+            queue_job = await queue_job_store.get(queue_job_id)
+        organization = org.slug if org is not None else str(org_id)
+        trigger = (
+            EditionPublishTrigger.keeper_sync
+            if queue_job is not None
+            and queue_job.keeper_sync_run_id is not None
+            else EditionPublishTrigger.build
         )
-    )
+        await events.edition_published.publish(
+            EditionPublishedEvent(
+                organization=organization,
+                project=project_slug,
+                edition_kind=MetricsEditionKind.from_api(edition.kind),
+                trigger=trigger,
+                elapsed=timedelta(seconds=time.monotonic() - started),
+            )
+        )
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception("Failed to publish edition_published metric")
