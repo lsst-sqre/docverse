@@ -419,7 +419,7 @@ async def test_git_ref_audit_publishes_lifecycle_action(
     ``action=ref_deleted``, ``trigger=git_ref_audit``, and
     ``success=True``.
     """
-    _manager, events = await build_event_manager(Configuration())
+    manager, events = await build_event_manager(Configuration())
 
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session, slug="gra-event-org")
@@ -483,6 +483,7 @@ async def test_git_ref_audit_publishes_lifecycle_action(
     assert event.action is LifecycleReapAction.ref_deleted
     assert event.trigger is LifecycleActionTrigger.git_ref_audit
     assert event.success is True
+    await manager.aclose()
 
 
 @pytest.mark.asyncio

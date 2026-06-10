@@ -1080,7 +1080,7 @@ async def test_lifecycle_eval_publishes_lifecycle_action(
     project_b_rules = LifecycleRuleSet(
         root=[BuildHistoryOrphanRule(min_position=1, min_age_days=30)]
     )
-    _manager, events = await build_event_manager(Configuration())
+    manager, events = await build_event_manager(Configuration())
 
     async with db_session.begin():
         org_id, org_slug = await _seed_org(
@@ -1153,6 +1153,7 @@ async def test_lifecycle_eval_publishes_lifecycle_action(
         ("event-project-a", LifecycleReapAction.draft_inactivity),
         ("event-project-b", LifecycleReapAction.build_history_orphan),
     }
+    await manager.aclose()
 
 
 @pytest.mark.asyncio
