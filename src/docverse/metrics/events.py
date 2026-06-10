@@ -19,6 +19,7 @@ from .payloads import (
     EditionLifecycleEvent,
     EditionPublishedEvent,
     KeeperSyncRunCompletedEvent,
+    LifecycleActionEvent,
     MembershipChangedEvent,
     ProjectLifecycleEvent,
 )
@@ -43,6 +44,7 @@ class DocverseEvents(EventMaker):
     edition_lifecycle: EventPublisher[EditionLifecycleEvent]
     membership_changed: EventPublisher[MembershipChangedEvent]
     keeper_sync_run_completed: EventPublisher[KeeperSyncRunCompletedEvent]
+    lifecycle_action: EventPublisher[LifecycleActionEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -75,4 +77,7 @@ class DocverseEvents(EventMaker):
         )
         self.keeper_sync_run_completed = await manager.create_publisher(
             "keeper_sync_run_completed", KeeperSyncRunCompletedEvent
+        )
+        self.lifecycle_action = await manager.create_publisher(
+            "lifecycle_action", LifecycleActionEvent
         )

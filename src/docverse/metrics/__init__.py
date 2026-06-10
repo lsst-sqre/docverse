@@ -5,6 +5,8 @@ from __future__ import annotations
 from .enums import (
     EditionPublishTrigger,
     LifecycleAction,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
     MembershipChangeAction,
     MetricsEditionKind,
     MetricsOrgRole,
@@ -20,6 +22,7 @@ from .payloads import (
     EditionLifecycleEvent,
     EditionPublishedEvent,
     KeeperSyncRunCompletedEvent,
+    LifecycleActionEvent,
     MembershipChangedEvent,
     ProjectLifecycleEvent,
 )
@@ -35,6 +38,9 @@ __all__ = [
     "EditionPublishedEvent",
     "KeeperSyncRunCompletedEvent",
     "LifecycleAction",
+    "LifecycleActionEvent",
+    "LifecycleActionTrigger",
+    "LifecycleReapAction",
     "MembershipChangeAction",
     "MembershipChangedEvent",
     "MetricsEditionKind",

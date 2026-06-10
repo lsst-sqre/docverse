@@ -50,6 +50,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.edition_lifecycle, MockEventPublisher)
     assert isinstance(events.membership_changed, MockEventPublisher)
     assert isinstance(events.keeper_sync_run_completed, MockEventPublisher)
+    assert isinstance(events.lifecycle_action, MockEventPublisher)
 
     await manager.aclose()
 

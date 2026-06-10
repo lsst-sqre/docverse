@@ -17,6 +17,8 @@ from safir.metrics import EventPayload
 from .enums import (
     EditionPublishTrigger,
     LifecycleAction,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
     MembershipChangeAction,
     MetricsEditionKind,
     MetricsOrgRole,
@@ -31,6 +33,7 @@ __all__ = [
     "EditionLifecycleEvent",
     "EditionPublishedEvent",
     "KeeperSyncRunCompletedEvent",
+    "LifecycleActionEvent",
     "MembershipChangedEvent",
     "ProjectLifecycleEvent",
 ]
@@ -204,6 +207,31 @@ class KeeperSyncRunCompletedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time from the run starting to its terminal transition."""
+
+
+class LifecycleActionEvent(DocverseEventBase):
+    """A lifecycle reaper soft-deleted a resource.
+
+    Emitted once per reap/deletion by the ``lifecycle_eval`` and
+    ``git_ref_audit`` workers (SQR-112 D7), published after the per-org
+    soft-delete transaction commits. ``action`` records which lifecycle
+    rule drove the reap and ``trigger`` records which worker performed it;
+    both are dedicated metrics enums mapped at the emission site. The
+    event is project-scoped — every reaped row belongs to a known project,
+    so ``project`` is always set. ``success`` is ``True`` because the
+    event is only published once the reap's atomic commit succeeds; it is
+    carried for schema uniformity with the other flow events (SQR-112 D3)
+    and leaves room for a future soft-failure reap path.
+    """
+
+    action: LifecycleReapAction
+    """Which lifecycle rule drove the reap."""
+
+    trigger: LifecycleActionTrigger
+    """Which worker performed the reap (lifecycle_eval vs. git_ref_audit)."""
+
+    success: bool
+    """Whether the reap committed successfully (always ``True`` today)."""
 
 
 class MembershipChangedEvent(DocverseEventBase):

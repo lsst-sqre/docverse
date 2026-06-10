@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 __all__ = [
     "EditionPublishTrigger",
     "LifecycleAction",
+    "LifecycleActionTrigger",
+    "LifecycleReapAction",
     "MembershipChangeAction",
     "MetricsEditionKind",
     "MetricsOrgRole",
@@ -128,6 +130,49 @@ class MetricsPrincipalType(StrEnum):
         of the API model.
         """
         return cls(principal_type.value)
+
+
+class LifecycleActionTrigger(StrEnum):
+    """Which worker drove a ``lifecycle_action`` reap (SQR-112 D7).
+
+    ``lifecycle_action`` is emitted by two shared reaper workers that
+    both soft-delete resources; this enum records which one performed a
+    given reap. Each worker selects its trigger statically at the
+    emission site (``lifecycle_eval`` vs. ``git_ref_audit``).
+    """
+
+    lifecycle_eval = "lifecycle_eval"
+    git_ref_audit = "git_ref_audit"
+
+
+class LifecycleReapAction(StrEnum):
+    """The lifecycle rule that drove a reap on a ``lifecycle_action`` event.
+
+    Mirrors the lifecycle-rule ``type`` discriminators
+    (:class:`docverse.domain.lifecycle.LifecycleRule`) value-for-value;
+    the emission site maps the matched rule's ``type`` to this enum so the
+    metrics Avro schema evolves independently of the rule schema. The
+    ``lifecycle_eval`` worker emits ``draft_inactivity`` (editions) and
+    ``build_history_orphan`` (builds); ``git_ref_audit`` emits only
+    ``ref_deleted``.
+    """
+
+    draft_inactivity = "draft_inactivity"
+    build_history_orphan = "build_history_orphan"
+    ref_deleted = "ref_deleted"
+
+    @classmethod
+    def from_rule_type(cls, rule_type: str) -> LifecycleReapAction:
+        """Map a lifecycle-rule ``type`` discriminator to this enum.
+
+        Values are identical to the rule ``type`` strings, so this is a
+        straight value lookup; keeping the mapping explicit makes a rename
+        on either side a reviewable change rather than a silent schema
+        break. The reaper workers filter their rule sets to the kinds they
+        own before evaluation, so every ``rule_type`` reaching here is one
+        of this enum's members.
+        """
+        return cls(rule_type)
 
 
 class EditionPublishTrigger(StrEnum):

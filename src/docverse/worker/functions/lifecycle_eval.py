@@ -43,6 +43,11 @@ from docverse.domain.lifecycle import (
 )
 from docverse.domain.project import Project
 from docverse.factory import Factory
+from docverse.metrics import (
+    LifecycleActionEvent,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+)
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -113,12 +118,20 @@ async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         async with session.begin():
             await queue_job_store.start(queue_job_id)
 
+        # Collected inside the soft-delete transaction and published only
+        # after it commits below: one (project_slug, action) per reaped
+        # row. On the failure path ``_evaluate_org`` raises before its
+        # transaction commits, so the partially-filled list is discarded
+        # without ever being published (no phantom events for rolled-back
+        # reaps).
+        reaps: list[tuple[str, LifecycleReapAction]] = []
         try:
             await _evaluate_org(
                 session=session,
                 factory=factory,
                 org_id=org_id,
                 org_slug=org_slug,
+                reaps=reaps,
                 logger=logger,
             )
         except Exception as exc:
@@ -143,18 +156,25 @@ async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 run_store=run_store, run_id=run_id
             )
         logger.info("Lifecycle evaluation completed for org")
+        # Publish one lifecycle_action per reaped row after the commit.
+        # Best-effort: production runs raise_on_error=False so a metrics
+        # outage never fails the pass (no defensive try/except).
+        await _publish_lifecycle_actions(
+            ctx=ctx, org_slug=org_slug, reaps=reaps
+        )
         return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
 
 
-async def _evaluate_org(
+async def _evaluate_org(  # noqa: PLR0913
     *,
     session: AsyncSession,
     factory: Factory,
     org_id: int,
     org_slug: str,
+    reaps: list[tuple[str, LifecycleReapAction]],
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
     """Load the org's state, evaluate per-project rules, and apply deletions.
@@ -238,6 +258,7 @@ async def _evaluate_org(
                 build_index=build_index,
                 org_id=org_id,
                 org_slug=org_slug,
+                reaps=reaps,
                 logger=logger,
             )
             if editions_deleted:
@@ -355,6 +376,7 @@ async def _apply_decision(  # noqa: PLR0913
     build_index: dict[int, Build],
     org_id: int,
     org_slug: str,
+    reaps: list[tuple[str, LifecycleReapAction]],
     logger: structlog.stdlib.BoundLogger,
 ) -> int:
     """Soft-delete every entity the decision matched and emit one log per row.
@@ -396,6 +418,9 @@ async def _apply_decision(  # noqa: PLR0913
         if not deleted:
             continue
         editions_deleted += 1
+        reaps.append(
+            (project.slug, LifecycleReapAction.from_rule_type(rule_type))
+        )
         # Remove the CDN pointer for the soft-deleted edition so the
         # public URL stops resolving. ``unpublish`` is idempotent and a
         # no-op when the org has no CDN configured, so this is safe to
@@ -430,6 +455,9 @@ async def _apply_decision(  # noqa: PLR0913
         deleted = await build_store.soft_delete(build_id=build.id)
         if not deleted:
             continue
+        reaps.append(
+            (project.slug, LifecycleReapAction.from_rule_type(rule_type))
+        )
         logger.info(
             "Soft-deleted entity by lifecycle rule",
             entity_type="build",
@@ -444,3 +472,31 @@ async def _apply_decision(  # noqa: PLR0913
             ),
         )
     return editions_deleted
+
+
+async def _publish_lifecycle_actions(
+    *,
+    ctx: dict[str, Any],
+    org_slug: str,
+    reaps: list[tuple[str, LifecycleReapAction]],
+) -> None:
+    """Emit one ``lifecycle_action`` metric per reaped row.
+
+    ``trigger`` is fixed to ``lifecycle_eval`` (this worker), and
+    ``success`` is ``True`` because each reap is published only after its
+    atomic soft-delete transaction committed. Skips silently when the
+    process has no event manager (tests that do not assert on metrics).
+    """
+    events = ctx.get("events")
+    if events is None:
+        return
+    for project_slug, action in reaps:
+        await events.lifecycle_action.publish(
+            LifecycleActionEvent(
+                organization=org_slug,
+                project=project_slug,
+                action=action,
+                trigger=LifecycleActionTrigger.lifecycle_eval,
+                success=True,
+            )
+        )
