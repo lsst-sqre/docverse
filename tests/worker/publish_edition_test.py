@@ -22,12 +22,14 @@ from docverse.client.models import (
     BuildStatus,
     EditionCreate,
     EditionKind,
+    KeeperSyncRunStatus,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.config import Configuration
+from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
@@ -53,6 +55,7 @@ from docverse.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
+from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
@@ -131,6 +134,7 @@ async def _setup_publish_scenario(
     org_slug: str,
     cdn_service_label: str | None,
     backend_job_id: str,
+    keeper_sync_run_id: int | None = None,
 ) -> tuple[
     Organization,
     Project,
@@ -139,7 +143,12 @@ async def _setup_publish_scenario(
     EditionBuildHistory,
     QueueJob,
 ]:
-    """Create org, project, edition, build, history entry, and queue job."""
+    """Create org, project, edition, build, history entry, and queue job.
+
+    When ``keeper_sync_run_id`` is supplied the publish ``QueueJob`` is
+    attributed to that keeper-sync run (mirroring the backfill path), so
+    completing the publish drives the run terminal.
+    """
     logger = _logger()
     org_store = OrganizationStore(session=db_session, logger=logger)
     proj_store = ProjectStore(session=db_session, logger=logger)
@@ -204,6 +213,7 @@ async def _setup_publish_scenario(
         build_id=refreshed_build.id,
         edition_id=edition.id,
         backend_job_id=backend_job_id,
+        keeper_sync_run_id=keeper_sync_run_id,
     )
     return org, project, edition, refreshed_build, history_entry, queue_job
 
@@ -230,6 +240,19 @@ def _make_payload(
     if trigger is not None:
         payload["trigger"] = trigger
     return payload
+
+
+async def _seed_keeper_sync_run(
+    db_session: AsyncSession, *, org_id: int
+) -> int:
+    """Seed an ``in_progress`` keeper-sync run to attribute a publish to."""
+    row = SqlKeeperSyncRun(
+        org_id=org_id, kind="backfill", status="in_progress"
+    )
+    db_session.add(row)
+    await db_session.flush()
+    await db_session.refresh(row)
+    return row.id
 
 
 @pytest.mark.asyncio
@@ -444,6 +467,95 @@ async def test_publish_edition_rollback_trigger(
     assert isinstance(publisher, MockEventPublisher)
     assert len(publisher.published) == 1
     assert publisher.published[0].trigger == EditionPublishTrigger.rollback
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_finalises_keeper_sync_run_succeeded(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run's last publish completing emits ``success=True`` run-completed.
+
+    Attributes the publish job to a keeper-sync run as its only child, so
+    completing the publish drives the run to ``succeeded`` and the worker
+    publishes one ``keeper_sync_run_completed`` with ``success=True`` —
+    covering the ``publish_edition`` finaliser wiring and the clean
+    success branch (the keeper_sync_project test only covers
+    ``partial_failure``).
+    """
+    mock_publisher = MockEditionPublisher()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org_store = OrganizationStore(session=db_session, logger=_logger())
+        org_seed = await org_store.create(
+            OrganizationCreate(
+                slug="pub-run-org",
+                title="Run Org",
+                base_domain="pub-run-org.example.com",
+            )
+        )
+        run_id = await _seed_keeper_sync_run(db_session, org_id=org_seed.id)
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-run-attrib-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-run",
+            keeper_sync_run_id=run_id,
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-run",
+        events=events,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    # A keeper-sync run is org-scoped, so it carries no project.
+    assert event.project is None
+    assert event.success is True
+    assert event.total_count == 1
+    assert event.succeeded_count == 1
+    assert event.failed_count == 0
+    assert event.elapsed >= timedelta(0)
+
+    # The run row itself reached the terminal succeeded status.
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.succeeded
 
 
 @pytest.mark.asyncio
