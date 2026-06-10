@@ -22,6 +22,7 @@ from .payloads import (
     LifecycleActionEvent,
     MembershipChangedEvent,
     ProjectLifecycleEvent,
+    ResourceInventoryEvent,
 )
 
 __all__ = ["DocverseEvents"]
@@ -45,6 +46,7 @@ class DocverseEvents(EventMaker):
     membership_changed: EventPublisher[MembershipChangedEvent]
     keeper_sync_run_completed: EventPublisher[KeeperSyncRunCompletedEvent]
     lifecycle_action: EventPublisher[LifecycleActionEvent]
+    resource_inventory: EventPublisher[ResourceInventoryEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -80,4 +82,7 @@ class DocverseEvents(EventMaker):
         )
         self.lifecycle_action = await manager.create_publisher(
             "lifecycle_action", LifecycleActionEvent
+        )
+        self.resource_inventory = await manager.create_publisher(
+            "resource_inventory", ResourceInventoryEvent
         )

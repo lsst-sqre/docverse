@@ -8,6 +8,7 @@ from .dashboard_sync import dashboard_sync
 from .dashboard_sync_reaper import dashboard_sync_reaper
 from .git_ref_audit import git_ref_audit
 from .git_ref_audit_discovery import git_ref_audit_discovery
+from .inventory_census import inventory_census
 from .keeper_sync import (
     keeper_sync_project,
     keeper_sync_reaper,
@@ -33,6 +34,7 @@ __all__ = [
     "dashboard_sync_reaper",
     "git_ref_audit",
     "git_ref_audit_discovery",
+    "inventory_census",
     "keeper_sync_project",
     "keeper_sync_reaper",
     "keeper_sync_run_discovery",

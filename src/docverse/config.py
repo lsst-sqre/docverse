@@ -327,6 +327,36 @@ class Configuration(BaseSettings):
         ),
     )
 
+    inventory_census_cron_hour: int = Field(
+        4,
+        title="UTC hour for the daily resource_inventory census cron",
+        description=(
+            "Hour (UTC) at which the daily ``inventory_census`` job runs"
+            " on the maintenance pool, publishing the SQR-112"
+            " ``resource_inventory`` gauge. Paired with"
+            " ``inventory_census_cron_minute``; the 04:47 default sits"
+            " in the quiet pre-dawn UTC window, ahead of the daily"
+            " ``git_ref_audit`` tick at 05:17, and its minute is"
+            " staggered off every maintenance-pool reaper slot so the"
+            " census never co-fires with them. Config-driven so an"
+            " operator can move the census without a code change."
+        ),
+    )
+
+    inventory_census_cron_minute: int = Field(
+        47,
+        title="UTC minute for the daily resource_inventory census cron",
+        description=(
+            "Minute of ``inventory_census_cron_hour`` (UTC) at which the"
+            " daily ``inventory_census`` job runs. The default 47 is"
+            " staggered off every maintenance-pool reaper minute slot"
+            " (``{0,30}`` / ``{3,18,33,48}`` / ``{6,36}`` / ``{12,42}``"
+            " / ``{24,54}``) and the five-minute ``arq_queue_stats``"
+            " cadence so a horizontally scaled maintenance pool never"
+            " fires the census on the same minute as another cron."
+        ),
+    )
+
     superadmin_usernames: Annotated[
         list[str], BeforeValidator(_parse_comma_separated)
     ] = Field(

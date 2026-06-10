@@ -36,6 +36,7 @@ __all__ = [
     "LifecycleActionEvent",
     "MembershipChangedEvent",
     "ProjectLifecycleEvent",
+    "ResourceInventoryEvent",
 ]
 
 
@@ -232,6 +233,31 @@ class LifecycleActionEvent(DocverseEventBase):
 
     success: bool
     """Whether the reap committed successfully (always ``True`` today)."""
+
+
+class ResourceInventoryEvent(DocverseEventBase):
+    """A daily census snapshot of active resources (SQR-112 D8).
+
+    Emitted by the ``inventory_census`` worker once per org (org-scoped,
+    ``project=None``, ``project_count`` set) and once per non-deleted
+    project (project-scoped, ``project`` set, ``project_count=None``).
+    Every field is a self-contained absolute-count gauge queried
+    downstream with ``last()``: soft-deleted projects/editions/builds are
+    excluded and ``total_build_bytes`` is the summed footprint of exactly
+    the active builds counted by ``build_count``.
+    """
+
+    project_count: int | None
+    """Active projects in the org; ``None`` on a project-scoped row."""
+
+    edition_count: int
+    """Active editions in scope (org-wide on an org row, else the project)."""
+
+    build_count: int
+    """Active builds in scope (org-wide on an org row, else the project)."""
+
+    total_build_bytes: int
+    """Summed ``total_size_bytes`` of the active builds in scope."""
 
 
 class MembershipChangedEvent(DocverseEventBase):

@@ -37,6 +37,7 @@ from .services.edition_tracking import (
     EditionTrackingService,
 )
 from .services.infrastructure import InfrastructureService
+from .services.inventory_census import InventoryCensusService
 from .services.keeper_sync import (
     BuildContentCopier,
     CopyResult,
@@ -69,6 +70,7 @@ from .storage.github import (
     GitHubAppNotConfiguredError,
     GitHubRefSetFetcher,
 )
+from .storage.inventory_census_store import InventoryCensusStore
 from .storage.keeper_sync import KeeperSyncStateStore
 from .storage.keeper_sync_run_store import KeeperSyncRunStore
 from .storage.lifecycle_eval_run_store import LifecycleEvalRunStore
@@ -202,6 +204,17 @@ class Factory:
     def create_git_ref_audit_run_store(self) -> GitRefAuditRunStore:
         """Create a :class:`GitRefAuditRunStore`."""
         return GitRefAuditRunStore(session=self._session, logger=self._logger)
+
+    def create_inventory_census_store(self) -> InventoryCensusStore:
+        """Create an :class:`InventoryCensusStore`."""
+        return InventoryCensusStore(session=self._session, logger=self._logger)
+
+    def create_inventory_census_service(self) -> InventoryCensusService:
+        """Create an :class:`InventoryCensusService`."""
+        return InventoryCensusService(
+            store=self.create_inventory_census_store(),
+            logger=self._logger,
+        )
 
     def create_github_ref_set_fetcher(self) -> GitHubRefSetFetcher:
         """Create a :class:`GitHubRefSetFetcher`.

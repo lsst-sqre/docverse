@@ -25,6 +25,7 @@ from .payloads import (
     LifecycleActionEvent,
     MembershipChangedEvent,
     ProjectLifecycleEvent,
+    ResourceInventoryEvent,
 )
 
 __all__ = [
@@ -47,5 +48,6 @@ __all__ = [
     "MetricsOrgRole",
     "MetricsPrincipalType",
     "ProjectLifecycleEvent",
+    "ResourceInventoryEvent",
     "build_event_manager",
 ]

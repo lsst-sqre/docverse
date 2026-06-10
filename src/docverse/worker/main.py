@@ -53,6 +53,7 @@ from .functions import (
     dashboard_sync_reaper,
     git_ref_audit,
     git_ref_audit_discovery,
+    inventory_census,
     keeper_sync_project,
     keeper_sync_reaper,
     keeper_sync_run_discovery,
@@ -541,6 +542,17 @@ class MaintenanceWorkerSettings:
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
+        # The daily ``inventory_census`` cron (SQR-112 D8) publishes the
+        # ``resource_inventory`` gauge. Wrapped like the dispatchers with
+        # the maintenance per-job ``timeout`` and ``max_tries=1``: the
+        # census is the pool's primary cron work (not a backstop), and a
+        # single attempt avoids arq's default retry republishing the
+        # gauge — duplicates are harmless under ``last()`` but pointless.
+        func(
+            instrument_arq_task(inventory_census),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
         instrument_arq_task(lifecycle_reaper),
         instrument_arq_task(dashboard_build_reaper),
         instrument_arq_task(publish_edition_reaper),
@@ -573,6 +585,20 @@ class MaintenanceWorkerSettings:
             instrument_arq_task(git_ref_audit_discovery),
             hour={5},
             minute={17},
+        ),
+        # Daily ``inventory_census`` tick (SQR-112 D8) at the
+        # config-driven UTC ``inventory_census_cron_hour`` /
+        # ``inventory_census_cron_minute`` (04:47 by default). The hour
+        # sits in the quiet pre-dawn UTC window ahead of the
+        # ``git_ref_audit`` tick, and the minute is staggered off every
+        # maintenance-pool reaper slot and the five-minute queue-stats
+        # cadence so the census never co-fires with another cron on a
+        # horizontally scaled pool — the same contention-avoidance
+        # precedent as ``git_ref_audit_discovery`` at minute 17.
+        cron(
+            instrument_arq_task(inventory_census),
+            hour={config.inventory_census_cron_hour},
+            minute={config.inventory_census_cron_minute},
         ),
         cron(
             instrument_arq_task(lifecycle_reaper),
