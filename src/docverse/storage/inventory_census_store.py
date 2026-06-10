@@ -83,12 +83,16 @@ class InventoryCensusStore:
         # soft-deleted project are dropped below because that project
         # contributes no row to assemble them onto.
         edition_count_rows = (
-            await self._session.execute(
-                select(SqlEdition.project_id, func.count(SqlEdition.id))
-                .where(SqlEdition.date_deleted.is_(None))
-                .group_by(SqlEdition.project_id)
+            (
+                await self._session.execute(
+                    select(SqlEdition.project_id, func.count(SqlEdition.id))
+                    .where(SqlEdition.date_deleted.is_(None))
+                    .group_by(SqlEdition.project_id)
+                )
             )
-        ).all()
+            .tuples()
+            .all()
+        )
         edition_counts: dict[int, int] = dict(edition_count_rows)
 
         # Non-deleted build counts + byte sums per project. ``SUM`` skips
