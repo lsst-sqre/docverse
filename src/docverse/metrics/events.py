@@ -15,7 +15,9 @@ from safir.metrics import EventManager, EventPublisher
 from .payloads import (
     BuildProcessedEvent,
     BuildUploadedEvent,
+    EditionLifecycleEvent,
     EditionPublishedEvent,
+    ProjectLifecycleEvent,
 )
 
 __all__ = ["DocverseEvents"]
@@ -33,6 +35,8 @@ class DocverseEvents(EventMaker):
     build_uploaded: EventPublisher[BuildUploadedEvent]
     build_processed: EventPublisher[BuildProcessedEvent]
     edition_published: EventPublisher[EditionPublishedEvent]
+    project_lifecycle: EventPublisher[ProjectLifecycleEvent]
+    edition_lifecycle: EventPublisher[EditionLifecycleEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -50,4 +54,10 @@ class DocverseEvents(EventMaker):
         )
         self.edition_published = await manager.create_publisher(
             "edition_published", EditionPublishedEvent
+        )
+        self.project_lifecycle = await manager.create_publisher(
+            "project_lifecycle", ProjectLifecycleEvent
+        )
+        self.edition_lifecycle = await manager.create_publisher(
+            "edition_lifecycle", EditionLifecycleEvent
         )

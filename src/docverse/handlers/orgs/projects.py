@@ -14,6 +14,7 @@ from docverse.dependencies.auth import (
 )
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
+from docverse.metrics import LifecycleAction, ProjectLifecycleEvent
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -133,6 +134,16 @@ async def post_project(
             org_slug=org_slug, data=data
         )
         await context.session.commit()
+    # Emit after the commit so the event reflects durably persisted state.
+    # Production runs raise_on_error=False, so a metrics-backend outage
+    # cannot fail this request (no defensive try/except).
+    await context.events.project_lifecycle.publish(
+        ProjectLifecycleEvent(
+            organization=org_slug,
+            project=project.slug,
+            action=LifecycleAction.create,
+        )
+    )
     await try_enqueue_project_github_resolve_by_id(
         factory=context.factory,
         session=context.session,
@@ -195,6 +206,14 @@ async def patch_project(
         )
         default_edition = await service.get_default_edition(project.id)
         await context.session.commit()
+    # Publish after the commit (best-effort; raise_on_error=False).
+    await context.events.project_lifecycle.publish(
+        ProjectLifecycleEvent(
+            organization=org_slug,
+            project=project.slug,
+            action=LifecycleAction.update,
+        )
+    )
     await try_enqueue_dashboard_build_by_slug(
         factory=context.factory,
         session=context.session,
@@ -277,3 +296,14 @@ async def delete_project(
                     project_slug=project_slug,
                     edition_slug=edition_slug,
                 )
+    # Delete is multi-transaction (soft-delete commit + per-edition CDN
+    # unpublish); publish only after that final step succeeds, so the
+    # event signals a fully-completed delete (best-effort,
+    # raise_on_error=False).
+    await context.events.project_lifecycle.publish(
+        ProjectLifecycleEvent(
+            organization=org_slug,
+            project=project_slug,
+            action=LifecycleAction.delete,
+        )
+    )

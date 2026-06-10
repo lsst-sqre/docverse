@@ -14,13 +14,15 @@ from datetime import timedelta
 
 from safir.metrics import EventPayload
 
-from .enums import EditionPublishTrigger, MetricsEditionKind
+from .enums import EditionPublishTrigger, LifecycleAction, MetricsEditionKind
 
 __all__ = [
     "BuildProcessedEvent",
     "BuildUploadedEvent",
     "DocverseEventBase",
+    "EditionLifecycleEvent",
     "EditionPublishedEvent",
+    "ProjectLifecycleEvent",
 ]
 
 
@@ -113,3 +115,30 @@ class EditionPublishedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time the worker spent on this publish."""
+
+
+class ProjectLifecycleEvent(DocverseEventBase):
+    """A project was created, updated, or deleted via the projects handler.
+
+    Consolidates the project management verbs into one event keyed by
+    ``action`` (SQR-112 D4). Published from the FastAPI projects handler
+    after the operation's final commit.
+    """
+
+    action: LifecycleAction
+    """Which management operation occurred (create/update/delete)."""
+
+
+class EditionLifecycleEvent(DocverseEventBase):
+    """An edition was created, updated, deleted, or rolled back.
+
+    Consolidates the edition management verbs into one event keyed by
+    ``action`` (SQR-112 D4). Published from the FastAPI editions handler
+    after the operation's final commit.
+    """
+
+    action: LifecycleAction
+    """Which management operation occurred (create/update/delete/rollback)."""
+
+    edition_kind: MetricsEditionKind
+    """Kind of the edition the operation acted on."""

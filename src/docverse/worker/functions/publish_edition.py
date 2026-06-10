@@ -19,7 +19,6 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import EditionKind
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
@@ -309,16 +308,6 @@ async def _maybe_finalise_keeper_sync_run(
     )
 
 
-def _metrics_edition_kind(kind: EditionKind) -> MetricsEditionKind:
-    """Map the API ``EditionKind`` to the dedicated metrics enum.
-
-    Values are identical, so this is a straight value lookup; keeping
-    the mapping explicit lets the metrics schema evolve independently of
-    the API model (SQR-112 D4).
-    """
-    return MetricsEditionKind(kind.value)
-
-
 async def _publish_edition_published(  # noqa: PLR0913
     *,
     ctx: dict[str, Any],
@@ -354,7 +343,7 @@ async def _publish_edition_published(  # noqa: PLR0913
         EditionPublishedEvent(
             organization=organization,
             project=project_slug,
-            edition_kind=_metrics_edition_kind(edition.kind),
+            edition_kind=MetricsEditionKind.from_api(edition.kind),
             trigger=trigger,
             elapsed=timedelta(seconds=time.monotonic() - started),
         )

@@ -8,12 +8,14 @@ import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.project import SqlProject
 from docverse.dependencies.context import context_dependency
 from docverse.factory import Factory
+from docverse.metrics import LifecycleAction
 from docverse.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
@@ -1302,3 +1304,100 @@ async def test_project_github_installed_status_and_app_url(
     assert binding["installation_id"] == 42
     assert binding["installation_status"] == "installed"
     assert binding["app_url"] == "https://github.com/apps/docverse"
+
+
+@pytest.mark.asyncio
+async def test_post_project_publishes_project_lifecycle(
+    client: AsyncClient,
+) -> None:
+    """POST project emits one project_lifecycle with action=create."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "lifecycle-create-proj",
+            "title": "Lifecycle Create",
+            "source_url": "https://example.com/example/lc-create",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.project_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "proj-org"
+    assert event.project == "lifecycle-create-proj"
+    assert event.action == LifecycleAction.create
+
+
+@pytest.mark.asyncio
+async def test_patch_project_publishes_project_lifecycle(
+    client: AsyncClient,
+) -> None:
+    """PATCH project emits one project_lifecycle with action=update."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "lifecycle-update-proj",
+            "title": "Original",
+            "source_url": "https://example.com/example/lc-update",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/lifecycle-update-proj",
+        json={"title": "Updated"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.project_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    update_events = [
+        e for e in publisher.published if e.action == LifecycleAction.update
+    ]
+    assert len(update_events) == 1
+    event = update_events[0]
+    assert event.organization == "proj-org"
+    assert event.project == "lifecycle-update-proj"
+
+
+@pytest.mark.asyncio
+async def test_delete_project_publishes_project_lifecycle(
+    client: AsyncClient,
+) -> None:
+    """DELETE project emits one project_lifecycle with action=delete."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "lifecycle-delete-proj",
+            "title": "Delete Me",
+            "source_url": "https://example.com/example/lc-delete",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/lifecycle-delete-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.project_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    delete_events = [
+        e for e in publisher.published if e.action == LifecycleAction.delete
+    ]
+    assert len(delete_events) == 1
+    event = delete_events[0]
+    assert event.organization == "proj-org"
+    assert event.project == "lifecycle-delete-proj"
