@@ -215,8 +215,9 @@ def _make_payload(
     edition: Edition,
     build: Build,
     queue_job: QueueJob,
+    trigger: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "org_id": org.id,
         "project_slug": project.slug,
         "edition_id": edition.id,
@@ -226,6 +227,9 @@ def _make_payload(
         "queue_job_id": queue_job.id,
         "queue_job_public_id": serialize_base32_id(queue_job.public_id),
     }
+    if trigger is not None:
+        payload["trigger"] = trigger
+    return payload
 
 
 @pytest.mark.asyncio
@@ -379,6 +383,67 @@ async def test_publish_edition_publishes_edition_published(
     # No keeper_sync_run_id on the queue job => a build-driven publish.
     assert event.trigger == EditionPublishTrigger.build
     assert event.elapsed >= timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_rollback_trigger(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback-driven publish reports ``trigger=rollback``.
+
+    The rollback handler enqueues ``publish_edition`` with no
+    ``keeper_sync_run_id`` but tags its payload ``trigger=rollback``
+    (SQR-112 D7), so the ``edition_published`` metric must distinguish it
+    from the ordinary build fan-out.
+    """
+    mock_publisher = MockEditionPublisher()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-rollback-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-rollback",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-rollback",
+        events=events,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+        trigger=EditionPublishTrigger.rollback.value,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publisher = events.edition_published
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].trigger == EditionPublishTrigger.rollback
 
 
 @pytest.mark.asyncio

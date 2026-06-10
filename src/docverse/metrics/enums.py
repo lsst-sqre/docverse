@@ -185,7 +185,16 @@ class EditionPublishTrigger(StrEnum):
     - ``build`` — a client-uploaded build's edition-tracking fan-out.
     - ``keeper_sync`` — the LTD Keeper backfill (the publish job's
       ``queue_jobs`` row carries a ``keeper_sync_run_id``).
+    - ``rollback`` — a user-initiated edition rollback (the rollback
+      handler enqueues a ``publish_edition`` job with no
+      ``keeper_sync_run_id``, tagging its payload ``trigger=rollback``
+      so it is not conflated with build fan-out).
+
+    ``build`` is the default: a publish with neither a
+    ``keeper_sync_run_id`` nor an explicit payload ``trigger`` is the
+    ordinary build-driven fan-out.
     """
 
     build = "build"
     keeper_sync = "keeper_sync"
+    rollback = "rollback"

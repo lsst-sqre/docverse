@@ -179,6 +179,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 edition=resources.edition,
                 queue_job_id=queue_job_id,
                 started=started,
+                trigger_override=payload.get("trigger"),
             )
             await publish_run_completed(
                 events=ctx.get("events"),
@@ -342,12 +343,17 @@ async def _publish_edition_published(  # noqa: PLR0913
     edition: Edition,
     queue_job_id: int,
     started: float,
+    trigger_override: str | None = None,
 ) -> None:
     """Emit one ``edition_published`` metric for a successful publish.
 
-    The publish job's ``queue_jobs`` row carries a ``keeper_sync_run_id``
-    only when the LTD-keeper backfill drove it, so its presence
-    classifies the ``trigger``.
+    The ``trigger`` is classified, in order:
+
+    * ``keeper_sync`` when the publish job's ``queue_jobs`` row carries a
+      ``keeper_sync_run_id`` (only the LTD-keeper backfill sets it);
+    * otherwise the explicit ``trigger_override`` from the job payload
+      (the rollback handler tags ``trigger=rollback``);
+    * otherwise ``build`` — the ordinary client-upload fan-out.
 
     Fully best-effort: this runs *after* the publish has committed, so it
     swallows and logs any error — a metrics-backend outage (already
@@ -365,12 +371,12 @@ async def _publish_edition_published(  # noqa: PLR0913
             org = await org_store.get_by_id(org_id)
             queue_job = await queue_job_store.get(queue_job_id)
         organization = org.slug if org is not None else str(org_id)
-        trigger = (
-            EditionPublishTrigger.keeper_sync
-            if queue_job is not None
-            and queue_job.keeper_sync_run_id is not None
-            else EditionPublishTrigger.build
-        )
+        if queue_job is not None and queue_job.keeper_sync_run_id is not None:
+            trigger = EditionPublishTrigger.keeper_sync
+        elif trigger_override is not None:
+            trigger = EditionPublishTrigger(trigger_override)
+        else:
+            trigger = EditionPublishTrigger.build
         await events.edition_published.publish(
             EditionPublishedEvent(
                 organization=organization,

@@ -370,6 +370,9 @@ async def test_rollback_enqueues_publish_edition_arq_job(
     assert "org_id" in payload
     assert "edition_id" in payload
     assert "queue_job_id" in payload
+    # The rollback path tags its publish so the edition_published metric
+    # reports trigger=rollback rather than the default build fan-out.
+    assert payload["trigger"] == "rollback"
 
     logger = structlog.get_logger("docverse")
     async with db_session.begin():

@@ -13,6 +13,7 @@ from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project
 from docverse.exceptions import ConflictError, NotFoundError
+from docverse.metrics import EditionPublishTrigger
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -415,6 +416,10 @@ class EditionService:
                 "queue_job_public_id": serialize_base32_id(
                     child_job.public_id
                 ),
+                # Tag the publish so its edition_published metric reports
+                # trigger=rollback rather than the default build fan-out
+                # (the queue job carries no keeper_sync_run_id). SQR-112 D7.
+                "trigger": EditionPublishTrigger.rollback.value,
             },
         )
 
