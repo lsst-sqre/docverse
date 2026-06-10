@@ -89,9 +89,7 @@ class InventoryCensusStore:
                 .group_by(SqlEdition.project_id)
             )
         ).all()
-        edition_counts: dict[int, int] = {
-            project_id: count for project_id, count in edition_count_rows
-        }
+        edition_counts: dict[int, int] = dict(edition_count_rows)
 
         # Non-deleted build counts + byte sums per project. ``SUM`` skips
         # NULL ``total_size_bytes`` (an unprocessed build still counts
