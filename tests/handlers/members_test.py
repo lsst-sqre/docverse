@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient
+from safir.metrics import MockEventPublisher
 
+from docverse.dependencies.context import context_dependency
+from docverse.metrics import (
+    MembershipChangeAction,
+    MetricsOrgRole,
+    MetricsPrincipalType,
+)
 from tests.conftest import seed_org_with_admin
 
 
@@ -89,6 +96,76 @@ async def test_delete_member(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "admin-user"},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_post_member_publishes_membership_changed(
+    client: AsyncClient,
+) -> None:
+    """POST member emits one membership_changed with action=add."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/mem-org/members",
+        json={
+            "principal": "jdoe",
+            "principal_type": "user",
+            "role": "uploader",
+        },
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert response.status_code == 201
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.membership_changed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "mem-org"
+    assert event.project is None
+    assert event.action == MembershipChangeAction.add
+    assert event.role == MetricsOrgRole.uploader
+    assert event.principal_type == MetricsPrincipalType.user
+    assert event.principal == "jdoe"
+
+
+@pytest.mark.asyncio
+async def test_delete_member_publishes_membership_changed(
+    client: AsyncClient,
+) -> None:
+    """DELETE member emits one membership_changed with action=remove."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/mem-org/members",
+        json={
+            "principal": "g_spherex",
+            "principal_type": "group",
+            "role": "admin",
+        },
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    response = await client.delete(
+        "/docverse/orgs/mem-org/members/group:g_spherex",
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert response.status_code == 204
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.membership_changed
+    assert isinstance(publisher, MockEventPublisher)
+    remove_events = [
+        e
+        for e in publisher.published
+        if e.action == MembershipChangeAction.remove
+    ]
+    assert len(remove_events) == 1
+    event = remove_events[0]
+    assert event.organization == "mem-org"
+    assert event.project is None
+    assert event.role == MetricsOrgRole.admin
+    assert event.principal_type == MetricsPrincipalType.group
+    assert event.principal == "g_spherex"
 
 
 @pytest.mark.asyncio

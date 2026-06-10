@@ -17,6 +17,7 @@ from .payloads import (
     BuildUploadedEvent,
     EditionLifecycleEvent,
     EditionPublishedEvent,
+    MembershipChangedEvent,
     ProjectLifecycleEvent,
 )
 
@@ -37,6 +38,7 @@ class DocverseEvents(EventMaker):
     edition_published: EventPublisher[EditionPublishedEvent]
     project_lifecycle: EventPublisher[ProjectLifecycleEvent]
     edition_lifecycle: EventPublisher[EditionLifecycleEvent]
+    membership_changed: EventPublisher[MembershipChangedEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -60,4 +62,7 @@ class DocverseEvents(EventMaker):
         )
         self.edition_lifecycle = await manager.create_publisher(
             "edition_lifecycle", EditionLifecycleEvent
+        )
+        self.membership_changed = await manager.create_publisher(
+            "membership_changed", MembershipChangedEvent
         )

@@ -14,7 +14,14 @@ from datetime import timedelta
 
 from safir.metrics import EventPayload
 
-from .enums import EditionPublishTrigger, LifecycleAction, MetricsEditionKind
+from .enums import (
+    EditionPublishTrigger,
+    LifecycleAction,
+    MembershipChangeAction,
+    MetricsEditionKind,
+    MetricsOrgRole,
+    MetricsPrincipalType,
+)
 
 __all__ = [
     "BuildProcessedEvent",
@@ -22,6 +29,7 @@ __all__ = [
     "DocverseEventBase",
     "EditionLifecycleEvent",
     "EditionPublishedEvent",
+    "MembershipChangedEvent",
     "ProjectLifecycleEvent",
 ]
 
@@ -142,3 +150,26 @@ class EditionLifecycleEvent(DocverseEventBase):
 
     edition_kind: MetricsEditionKind
     """Kind of the edition the operation acted on."""
+
+
+class MembershipChangedEvent(DocverseEventBase):
+    """An organization member was added or removed.
+
+    Emitted from the members handler: ``post_member`` (``action=add``)
+    and ``delete_member`` (``action=remove``), each published after the
+    operation's commit. Membership is org-scoped, so ``project`` is
+    always ``None``; the principal's role and identity are carried as
+    dedicated metrics enums mapped from the API at the emission site.
+    """
+
+    action: MembershipChangeAction
+    """Whether the member was added or removed."""
+
+    role: MetricsOrgRole
+    """Role the membership grants (or granted, for a removal)."""
+
+    principal_type: MetricsPrincipalType
+    """Whether the principal is a user or a group."""
+
+    principal: str
+    """Username or group name the membership applies to."""

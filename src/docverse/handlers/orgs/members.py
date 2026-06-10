@@ -11,6 +11,12 @@ from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import MemberIdParam, OrgSlugParam
+from docverse.metrics import (
+    MembershipChangeAction,
+    MembershipChangedEvent,
+    MetricsOrgRole,
+    MetricsPrincipalType,
+)
 
 from .models import OrgMembership
 
@@ -82,6 +88,23 @@ async def post_member(
             raise ConflictError(msg)
         member = await store.create(org_id=user.org.id, data=data)
         await context.session.commit()
+    # Publish after the commit so the event reflects durably persisted
+    # state. Production runs raise_on_error=False, so a metrics-backend
+    # outage cannot fail this request (no defensive try/except). Mapped
+    # from the API enums at the emission site (SQR-112 D4); membership is
+    # org-scoped, so project is None.
+    await context.events.membership_changed.publish(
+        MembershipChangedEvent(
+            organization=org_slug,
+            project=None,
+            action=MembershipChangeAction.add,
+            role=MetricsOrgRole.from_api(member.role),
+            principal_type=MetricsPrincipalType.from_api(
+                member.principal_type
+            ),
+            principal=member.principal,
+        )
+    )
     return OrgMembership.from_domain(member, context.request, org_slug)
 
 
@@ -118,7 +141,7 @@ async def get_member(
     name="delete_member",
 )
 async def delete_member(
-    org_slug: OrgSlugParam,  # noqa: ARG001
+    org_slug: OrgSlugParam,
     member_id: MemberIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -126,12 +149,34 @@ async def delete_member(
     principal_type, principal = _parse_member_id(member_id)
     async with context.session.begin():
         store = context.factory.create_membership_store()
-        deleted = await store.delete(
+        # Capture the membership before deleting it so the removal event
+        # can carry the gone principal's role and identity.
+        member = await store.get_by_principal(
             org_id=user.org.id,
             principal_type=principal_type,
             principal=principal,
         )
-        if not deleted:
+        if member is None:
             msg = f"Member {member_id!r} not found"
             raise NotFoundError(msg)
+        await store.delete(
+            org_id=user.org.id,
+            principal_type=principal_type,
+            principal=principal,
+        )
         await context.session.commit()
+    # Publish after the commit (best-effort; raise_on_error=False). Mapped
+    # from the API enums at the emission site; membership is org-scoped,
+    # so project is None.
+    await context.events.membership_changed.publish(
+        MembershipChangedEvent(
+            organization=org_slug,
+            project=None,
+            action=MembershipChangeAction.remove,
+            role=MetricsOrgRole.from_api(member.role),
+            principal_type=MetricsPrincipalType.from_api(
+                member.principal_type
+            ),
+            principal=member.principal,
+        )
+    )

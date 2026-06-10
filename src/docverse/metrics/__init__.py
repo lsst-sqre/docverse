@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .enums import EditionPublishTrigger, LifecycleAction, MetricsEditionKind
+from .enums import (
+    EditionPublishTrigger,
+    LifecycleAction,
+    MembershipChangeAction,
+    MetricsEditionKind,
+    MetricsOrgRole,
+    MetricsPrincipalType,
+)
 from .events import DocverseEvents
 from .manager import build_event_manager
 from .payloads import (
@@ -11,6 +18,7 @@ from .payloads import (
     DocverseEventBase,
     EditionLifecycleEvent,
     EditionPublishedEvent,
+    MembershipChangedEvent,
     ProjectLifecycleEvent,
 )
 
@@ -23,7 +31,11 @@ __all__ = [
     "EditionPublishTrigger",
     "EditionPublishedEvent",
     "LifecycleAction",
+    "MembershipChangeAction",
+    "MembershipChangedEvent",
     "MetricsEditionKind",
+    "MetricsOrgRole",
+    "MetricsPrincipalType",
     "ProjectLifecycleEvent",
     "build_event_manager",
 ]

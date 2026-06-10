@@ -14,12 +14,15 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from docverse.client.models import EditionKind
+    from docverse.client.models import EditionKind, OrgRole, PrincipalType
 
 __all__ = [
     "EditionPublishTrigger",
     "LifecycleAction",
+    "MembershipChangeAction",
     "MetricsEditionKind",
+    "MetricsOrgRole",
+    "MetricsPrincipalType",
 ]
 
 
@@ -66,6 +69,65 @@ class LifecycleAction(StrEnum):
     update = "update"
     delete = "delete"
     rollback = "rollback"
+
+
+class MembershipChangeAction(StrEnum):
+    """The membership operation recorded on a ``membership_changed`` event.
+
+    Unlike the CRUD-shaped :class:`LifecycleAction`, an org membership is
+    only ever added or removed (an in-place role change is modelled as a
+    remove + add by the API), so this event carries a dedicated
+    add/remove verb. The emission site selects the action statically:
+    ``post_member`` emits ``add`` and ``delete_member`` emits ``remove``.
+    """
+
+    add = "add"
+    remove = "remove"
+
+
+class MetricsOrgRole(StrEnum):
+    """Org role recorded on a ``membership_changed`` event.
+
+    Mirrors :class:`docverse.client.models.OrgRole` value-for-value; the
+    emission site maps the API enum to this one so the metrics Avro
+    schema does not depend on the API model (SQR-112 D4).
+    """
+
+    reader = "reader"
+    uploader = "uploader"
+    admin = "admin"
+
+    @classmethod
+    def from_api(cls, role: OrgRole) -> MetricsOrgRole:
+        """Map the API :class:`~docverse.client.models.OrgRole`.
+
+        Values are identical, so this is a straight value lookup; keeping
+        the mapping explicit lets the metrics schema evolve independently
+        of the API model.
+        """
+        return cls(role.value)
+
+
+class MetricsPrincipalType(StrEnum):
+    """Principal type recorded on a ``membership_changed`` event.
+
+    Mirrors :class:`docverse.client.models.PrincipalType` value-for-value;
+    the emission site maps the API enum to this one so the metrics Avro
+    schema does not depend on the API model (SQR-112 D4).
+    """
+
+    user = "user"
+    group = "group"
+
+    @classmethod
+    def from_api(cls, principal_type: PrincipalType) -> MetricsPrincipalType:
+        """Map the API :class:`~docverse.client.models.PrincipalType`.
+
+        Values are identical, so this is a straight value lookup; keeping
+        the mapping explicit lets the metrics schema evolve independently
+        of the API model.
+        """
+        return cls(principal_type.value)
 
 
 class EditionPublishTrigger(StrEnum):
