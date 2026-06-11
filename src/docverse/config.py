@@ -10,6 +10,7 @@ from pydantic import BeforeValidator, Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from safir.arq import ArqMode, build_arq_redis_settings
 from safir.logging import LogLevel, Profile
+from safir.metrics import MetricsConfiguration, metrics_configuration_factory
 from safir.pydantic import EnvRedisDsn
 
 __all__ = ["Configuration", "config"]
@@ -45,6 +46,30 @@ class Configuration(BaseSettings):
         None,
         title="Slack webhook for alerts",
         description="If set, alerts will be posted to this Slack webhook",
+    )
+
+    metrics: MetricsConfiguration = Field(
+        default_factory=metrics_configuration_factory,
+        title="Sasquatch application-metrics configuration",
+        description=(
+            "Configures Safir's ``EventManager`` for the Docverse"
+            " application-metrics pipeline (SQR-112). The concrete"
+            " variant is selected from the environment by"
+            " ``metrics_configuration_factory``:\n\n"
+            "- ``METRICS_APPLICATION`` (e.g. ``docverse``),"
+            " ``METRICS_ENABLED``, and ``METRICS_MOCK`` choose between"
+            " the mock, disabled, and Kafka-backed managers. Set"
+            " ``METRICS_MOCK=true`` (with ``METRICS_ENABLED=false``) for"
+            " tests; set ``METRICS_ENABLED=true`` in production.\n"
+            "- When enabled, ``KAFKA_*`` (bootstrap servers, security"
+            " protocol, and any TLS material) and ``SCHEMA_MANAGER_*``"
+            " (the Confluent-compatible schema-registry URL) connect the"
+            " manager to Sasquatch.\n\n"
+            "Events publish to the ``lsst.square.metrics.events.docverse``"
+            " topic, which the ``phalanx-docverse`` deployment must"
+            " register in Sasquatch (tracked separately from this"
+            " application)."
+        ),
     )
 
     github_app_id: int | None = Field(
@@ -299,6 +324,36 @@ class Configuration(BaseSettings):
             " ships the flag false in production until the audit's"
             " GitHub API budget and per-project cost are observed in"
             " a live environment."
+        ),
+    )
+
+    inventory_census_cron_hour: int = Field(
+        4,
+        title="UTC hour for the daily resource_inventory census cron",
+        description=(
+            "Hour (UTC) at which the daily ``inventory_census`` job runs"
+            " on the maintenance pool, publishing the SQR-112"
+            " ``resource_inventory`` gauge. Paired with"
+            " ``inventory_census_cron_minute``; the 04:47 default sits"
+            " in the quiet pre-dawn UTC window, ahead of the daily"
+            " ``git_ref_audit`` tick at 05:17, and its minute is"
+            " staggered off every maintenance-pool reaper slot so the"
+            " census never co-fires with them. Config-driven so an"
+            " operator can move the census without a code change."
+        ),
+    )
+
+    inventory_census_cron_minute: int = Field(
+        47,
+        title="UTC minute for the daily resource_inventory census cron",
+        description=(
+            "Minute of ``inventory_census_cron_hour`` (UTC) at which the"
+            " daily ``inventory_census`` job runs. The default 47 is"
+            " staggered off every maintenance-pool reaper minute slot"
+            " (``{0,30}`` / ``{3,18,33,48}`` / ``{6,36}`` / ``{12,42}``"
+            " / ``{24,54}``) and the five-minute ``arq_queue_stats``"
+            " cadence so a horizontally scaled maintenance pool never"
+            " fires the census on the same minute as another cron."
         ),
     )
 

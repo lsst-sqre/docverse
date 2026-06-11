@@ -8,24 +8,36 @@ work without external context (per SQR-112 user story 12).
 
 from __future__ import annotations
 
+import time
 import traceback
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models.queue_enums import PublishStatus
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
+from docverse.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse.exceptions import NotFoundError
 from docverse.factory import Factory
+from docverse.metrics import (
+    EditionPublishedEvent,
+    EditionPublishTrigger,
+    MetricsEditionKind,
+)
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
-from docverse.services.keeper_sync_finalisation import maybe_finalise_run
+from docverse.services.keeper_sync_finalisation import (
+    maybe_finalise_run,
+    publish_run_completed,
+)
 from docverse.services.lock_service import LockKey
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -70,6 +82,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 
     queue_job_id: int = payload["queue_job_id"]
 
+    started = time.monotonic()
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
         edition_store = factory.create_edition_store()
@@ -123,6 +136,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             except Exception as exc:
                 sentry_sdk.capture_exception(exc)
                 logger.exception("Edition publish failed")
+                completion: KeeperSyncRunWithActivity | None = None
                 async with session.begin():
                     await _mark_failed(
                         edition_store=edition_store,
@@ -132,16 +146,48 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         queue_job_id=queue_job_id,
                         exc=exc,
                     )
-                    await _maybe_finalise_keeper_sync_run(
+                    completion = await _maybe_finalise_keeper_sync_run(
                         factory=factory, queue_job_id=queue_job_id
                     )
+                await publish_run_completed(
+                    events=ctx.get("events"),
+                    session=session,
+                    org_store=factory.create_org_store(),
+                    completion=completion,
+                    logger=logger,
+                )
                 return "failed"
+            completion = None
             async with session.begin():
                 await queue_job_store.complete(queue_job_id)
-                await _maybe_finalise_keeper_sync_run(
+                completion = await _maybe_finalise_keeper_sync_run(
                     factory=factory, queue_job_id=queue_job_id
                 )
             logger.info("Edition publish completed")
+            # Emit the post-commit metrics after the success transition
+            # commits. Both emitters are fully best-effort: they swallow
+            # and log any error (a metrics outage *or* a DB hiccup during
+            # their own post-commit reads), so neither can fail or retry
+            # an edition whose publish has already committed.
+            await _publish_edition_published(
+                ctx=ctx,
+                session=session,
+                factory=factory,
+                logger=logger,
+                org_id=payload["org_id"],
+                project_slug=payload["project_slug"],
+                edition=resources.edition,
+                queue_job_id=queue_job_id,
+                started=started,
+                trigger_override=payload.get("trigger"),
+            )
+            await publish_run_completed(
+                events=ctx.get("events"),
+                session=session,
+                org_store=factory.create_org_store(),
+                completion=completion,
+                logger=logger,
+            )
             await try_enqueue_dashboard_build_by_id(
                 factory=factory,
                 session=session,
@@ -258,7 +304,7 @@ async def _maybe_finalise_keeper_sync_run(
     *,
     factory: Factory,
     queue_job_id: int,
-) -> None:
+) -> KeeperSyncRunWithActivity | None:
     """Roll up the parent keeper-sync run if this publish was attributed.
 
     Publish jobs enqueued by ``keeper_sync_project`` (via the shared
@@ -280,7 +326,66 @@ async def _maybe_finalise_keeper_sync_run(
     run_store = factory.create_keeper_sync_run_store()
     queue_job = await queue_job_store.get(queue_job_id)
     if queue_job is None or queue_job.keeper_sync_run_id is None:
-        return
-    await maybe_finalise_run(
+        return None
+    return await maybe_finalise_run(
         run_store=run_store, run_id=queue_job.keeper_sync_run_id
     )
+
+
+async def _publish_edition_published(  # noqa: PLR0913
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    logger: structlog.stdlib.BoundLogger,
+    org_id: int,
+    project_slug: str,
+    edition: Edition,
+    queue_job_id: int,
+    started: float,
+    trigger_override: str | None = None,
+) -> None:
+    """Emit one ``edition_published`` metric for a successful publish.
+
+    The ``trigger`` is classified, in order:
+
+    * ``keeper_sync`` when the publish job's ``queue_jobs`` row carries a
+      ``keeper_sync_run_id`` (only the LTD-keeper backfill sets it);
+    * otherwise the explicit ``trigger_override`` from the job payload
+      (the rollback handler tags ``trigger=rollback``);
+    * otherwise ``build`` — the ordinary client-upload fan-out.
+
+    Fully best-effort: this runs *after* the publish has committed, so it
+    swallows and logs any error — a metrics-backend outage (already
+    covered by ``raise_on_error=False``) *or* a DB error during its own
+    post-commit reads — rather than letting it propagate and retry an
+    edition that has already published.
+    """
+    events = ctx.get("events")
+    if events is None:
+        return
+    try:
+        org_store = factory.create_org_store()
+        queue_job_store = factory.create_queue_job_store()
+        async with session.begin():
+            org = await org_store.get_by_id(org_id)
+            queue_job = await queue_job_store.get(queue_job_id)
+        organization = org.slug if org is not None else str(org_id)
+        if queue_job is not None and queue_job.keeper_sync_run_id is not None:
+            trigger = EditionPublishTrigger.keeper_sync
+        elif trigger_override is not None:
+            trigger = EditionPublishTrigger(trigger_override)
+        else:
+            trigger = EditionPublishTrigger.build
+        await events.edition_published.publish(
+            EditionPublishedEvent(
+                organization=organization,
+                project=project_slug,
+                edition_kind=MetricsEditionKind.from_api(edition.kind),
+                trigger=trigger,
+                elapsed=timedelta(seconds=time.monotonic() - started),
+            )
+        )
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception("Failed to publish edition_published metric")

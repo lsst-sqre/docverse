@@ -42,6 +42,11 @@ from docverse.domain.edition import Edition
 from docverse.domain.lifecycle import LifecycleRuleSet, RefDeletedRule
 from docverse.domain.project import Project
 from docverse.factory import Factory
+from docverse.metrics import (
+    LifecycleActionEvent,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+)
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -101,12 +106,20 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         async with session.begin():
             await queue_job_store.start(queue_job_id)
 
+        # Collected inside the soft-delete transaction and published only
+        # after it commits below: one (project_slug, action) per reaped
+        # edition. On the failure path ``_audit_org`` raises before its
+        # transaction commits, so the partially-filled list is discarded
+        # without ever being published (no phantom events for rolled-back
+        # reaps).
+        reaps: list[tuple[str, LifecycleReapAction]] = []
         try:
             had_failures = await _audit_org(
                 session=session,
                 factory=factory,
                 org_id=org_id,
                 org_slug=org_slug,
+                reaps=reaps,
                 logger=logger,
             )
         except Exception as exc:
@@ -136,18 +149,25 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             "Git ref audit completed for org",
             had_failures=had_failures,
         )
+        # Publish one lifecycle_action per reaped edition after the commit.
+        # Best-effort: production runs raise_on_error=False so a metrics
+        # outage never fails the audit (no defensive try/except).
+        await _publish_lifecycle_actions(
+            ctx=ctx, org_slug=org_slug, reaps=reaps
+        )
         return "completed_with_errors" if had_failures else "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
 
 
-async def _audit_org(
+async def _audit_org(  # noqa: PLR0913
     *,
     session: AsyncSession,
     factory: Factory,
     org_id: int,
     org_slug: str,
+    reaps: list[tuple[str, LifecycleReapAction]],
     logger: structlog.stdlib.BoundLogger,
 ) -> bool:
     """Audit every GitHub-bound project for the org.
@@ -209,6 +229,7 @@ async def _audit_org(
         editions_by_project=editions_by_project,
         org_id=org_id,
         org_slug=org_slug,
+        reaps=reaps,
         logger=logger,
     )
     return had_failures
@@ -340,6 +361,7 @@ async def _apply_deletions(  # noqa: PLR0913
     editions_by_project: dict[int, list[Edition]],
     org_id: int,
     org_slug: str,
+    reaps: list[tuple[str, LifecycleReapAction]],
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
     """Soft-delete every matched edition in one transaction per org.
@@ -375,6 +397,7 @@ async def _apply_deletions(  # noqa: PLR0913
                 if not deleted:
                     continue
                 deleted_count += 1
+                reaps.append((project.slug, LifecycleReapAction.ref_deleted))
                 await publishing_service.unpublish(
                     org_id=org_id,
                     project_slug=project.slug,
@@ -453,3 +476,32 @@ async def _load_org_state(
     for edition in editions:
         editions_by_project[edition.project_id].append(edition)
     return org.lifecycle_rules, projects, editions_by_project
+
+
+async def _publish_lifecycle_actions(
+    *,
+    ctx: dict[str, Any],
+    org_slug: str,
+    reaps: list[tuple[str, LifecycleReapAction]],
+) -> None:
+    """Emit one ``lifecycle_action`` metric per ref-deleted reap.
+
+    ``trigger`` is fixed to ``git_ref_audit`` (this worker) and ``action``
+    is always ``ref_deleted`` (the only rule this worker honours), and
+    ``success`` is ``True`` because each reap is published only after its
+    atomic soft-delete transaction committed. Skips silently when the
+    process has no event manager (tests that do not assert on metrics).
+    """
+    events = ctx.get("events")
+    if events is None:
+        return
+    for project_slug, action in reaps:
+        await events.lifecycle_action.publish(
+            LifecycleActionEvent(
+                organization=org_slug,
+                project=project_slug,
+                action=action,
+                trigger=LifecycleActionTrigger.git_ref_audit,
+                success=True,
+            )
+        )

@@ -18,6 +18,7 @@ from docverse.worker.functions import (
     build_processing_reaper,
     dashboard_build_reaper,
     dashboard_sync_reaper,
+    inventory_census,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
     lifecycle_reaper,
@@ -115,6 +116,75 @@ def test_lifecycle_eval_dispatcher_runs_hourly() -> None:
     ]
     assert len(dispatcher_crons) == 1
     assert dispatcher_crons[0].minute == {0}
+
+
+def test_inventory_census_registered_as_function() -> None:
+    """The daily census is registered single-attempt with the pool timeout.
+
+    Unlike the cron-only reapers, ``inventory_census`` is the pool's
+    primary cron work, so it is wrapped with :func:`arq.func` carrying
+    the configured per-job ``timeout`` (a runaway aggregate is cancelled
+    by arq) and ``max_tries=1`` so arq's default retry never republishes
+    the gauge — mirroring how the dispatchers are registered.
+    """
+    census = _function_by_coroutine(inventory_census)
+    assert census.timeout_s == float(_config.maintenance_job_timeout_seconds)
+    assert census.max_tries == 1
+
+
+def test_inventory_census_runs_daily_at_configured_time() -> None:
+    """The census cron fires once a day at the config-driven hour/minute.
+
+    The schedule is sourced from ``inventory_census_cron_hour`` /
+    ``inventory_census_cron_minute`` so operators can move the census
+    without a code change; the defaults (04:47 UTC) sit in the quiet
+    pre-dawn window and are staggered off every maintenance-pool reaper
+    slot.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    census_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is inventory_census
+    ]
+    assert len(census_crons) == 1
+    assert census_crons[0].hour == {_config.inventory_census_cron_hour}
+    assert census_crons[0].minute == {_config.inventory_census_cron_minute}
+
+
+def test_inventory_census_cron_minute_does_not_collide_with_reapers() -> None:
+    """The census minute is staggered off every maintenance-pool reaper.
+
+    On a horizontally scaled maintenance pool a shared firing minute
+    would make the census race the reapers for the same Postgres
+    connection-pool slots, so the default cadence keeps the census on
+    its own minute. Pins the invariant so a future config-default tweak
+    cannot silently re-collide the schedule.
+    """
+    reaper_minutes = {0, 30, 3, 18, 33, 48, 6, 36, 12, 42, 24, 54}
+    assert _config.inventory_census_cron_minute not in reaper_minutes
+
+
+def test_default_worker_does_not_register_inventory_census() -> None:
+    """The default queue stays free of the census cron.
+
+    The census lives exclusively on the maintenance pool so its daily
+    aggregate never contends with the default pool's publishing jobs.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert inventory_census not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert inventory_census not in coroutines
 
 
 def test_lifecycle_reaper_registered_as_function() -> None:

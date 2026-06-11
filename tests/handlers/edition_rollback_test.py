@@ -7,13 +7,16 @@ import structlog
 from httpx import AsyncClient
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildCreate
 from docverse.client.models.queue_enums import JobKind, PublishStatus
 from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.dependencies.context import context_dependency
 from docverse.domain.base32id import serialize_base32_id
+from docverse.metrics import LifecycleAction, MetricsEditionKind
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -367,6 +370,9 @@ async def test_rollback_enqueues_publish_edition_arq_job(
     assert "org_id" in payload
     assert "edition_id" in payload
     assert "queue_job_id" in payload
+    # The rollback path tags its publish so the edition_published metric
+    # reports trigger=rollback rather than the default build fan-out.
+    assert payload["trigger"] == "rollback"
 
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
@@ -374,6 +380,40 @@ async def test_rollback_enqueues_publish_edition_arq_job(
         child = await qjs.get(payload["queue_job_id"])
         assert child is not None
         assert child.kind == JobKind.publish_edition
+
+
+@pytest.mark.asyncio
+async def test_rollback_publishes_edition_lifecycle(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Rollback emits one edition_lifecycle (rollback) with edition_kind."""
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=2)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    response = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    rollback_events = [
+        e for e in publisher.published if e.action == LifecycleAction.rollback
+    ]
+    assert len(rollback_events) == 1
+    event = rollback_events[0]
+    assert event.organization == "rb-org"
+    assert event.project == "rb-proj"
+    # __main is the project's default edition (kind=main).
+    assert event.edition_kind == MetricsEditionKind.main
 
 
 @pytest.mark.asyncio

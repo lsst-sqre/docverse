@@ -16,6 +16,7 @@ import httpx
 import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import select, update
 
@@ -28,6 +29,7 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import JobKind, JobStatus
+from docverse.config import Configuration
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
@@ -41,6 +43,11 @@ from docverse.domain.lifecycle import (
     RefDeletedRule,
 )
 from docverse.factory import Factory
+from docverse.metrics import (
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+    build_event_manager,
+)
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -1051,6 +1058,102 @@ async def test_lifecycle_eval_unpublishes_each_soft_deleted_edition(
     assert recorded_slugs == ["stale-a", "stale-b"]
     for call in mock_publisher.unpublish_calls:
         assert call.project_slug == "unpub-proj"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_publishes_lifecycle_action(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Each reap publishes one ``lifecycle_action`` (trigger=lifecycle_eval).
+
+    Seeds an edition reaped by ``draft_inactivity`` (project-a, inherited
+    org rule) and an orphan build reaped by ``build_history_orphan``
+    (project-b, project rule), runs the worker with an initialized event
+    manager, and asserts one ``lifecycle_action`` event per soft-deleted
+    row carrying the matching ``action`` enum, ``trigger=lifecycle_eval``,
+    and ``success=True``.
+    """
+    org_rules = LifecycleRuleSet(
+        root=[DraftInactivityRule(max_days_inactive=30)]
+    )
+    project_b_rules = LifecycleRuleSet(
+        root=[BuildHistoryOrphanRule(min_position=1, min_age_days=30)]
+    )
+    manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, slug="lce-event-org", lifecycle_rules=org_rules
+        )
+        project_a_id = await _seed_project(
+            db_session, org_id=org_id, slug="event-project-a"
+        )
+        project_b_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="event-project-b",
+            lifecycle_rules=project_b_rules,
+        )
+        await _seed_edition(
+            db_session,
+            project_id=project_a_id,
+            slug="stale-draft",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=60),
+        )
+        current_build_id = await _seed_build(
+            db_session,
+            project_id=project_b_id,
+            project_slug="event-project-b",
+            date_completed=NOW - timedelta(days=40),
+        )
+        await _seed_build(
+            db_session,
+            project_id=project_b_id,
+            project_slug="event-project-b",
+            date_completed=NOW - timedelta(days=40),
+        )
+        await _seed_edition(
+            db_session,
+            project_id=project_b_id,
+            slug="main",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=60),
+            current_build_id=current_build_id,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client, events=events)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    publisher = events.lifecycle_action
+    assert isinstance(publisher, MockEventPublisher)
+    published = publisher.published
+    assert len(published) == 2
+    for event in published:
+        assert event.organization == org_slug
+        assert event.trigger is LifecycleActionTrigger.lifecycle_eval
+        assert event.success is True
+    by_project = {(event.project, event.action) for event in published}
+    assert by_project == {
+        ("event-project-a", LifecycleReapAction.draft_inactivity),
+        ("event-project-b", LifecycleReapAction.build_history_orphan),
+    }
+    await manager.aclose()
 
 
 @pytest.mark.asyncio

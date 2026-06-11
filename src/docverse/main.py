@@ -27,6 +27,7 @@ from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
 from .handlers.queue import queue_router
 from .handlers.webhooks import webhook_router
+from .metrics import build_event_manager
 from .sentry import initialize_sentry
 from .services.credential_encryptor import CredentialEncryptor
 from .storage.github import validate_github_app
@@ -94,6 +95,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         logger=logger,
     )
 
+    event_manager, events = await build_event_manager(config, logger=logger)
+
     await context_dependency.initialize(
         credential_encryptor=encryptor,
         superadmin_usernames=config.superadmin_usernames,
@@ -104,6 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
         github_app_id=config.github_app_id,
         github_app_private_key=config.github_app_private_key,
         github_webhook_secret=config.github_webhook_secret,
+        events=events,
     )
     github_app_html_url = await validate_github_app(
         state=context_dependency,
@@ -116,6 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
     context_dependency.set_github_app_html_url(github_app_html_url)
     yield
     await context_dependency.aclose()
+    await event_manager.aclose()
     await http_client_dependency.aclose()
     await db_session_dependency.aclose()
 

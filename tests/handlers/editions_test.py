@@ -8,14 +8,17 @@ import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import BuildCreate
 from docverse.client.models.builds import BuildAnnotations
 from docverse.dbschema.organization import SqlOrganization
+from docverse.dependencies.context import context_dependency
 from docverse.domain.base32id import serialize_base32_id
 from docverse.factory import Factory
+from docverse.metrics import LifecycleAction, MetricsEditionKind
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -185,6 +188,112 @@ async def test_delete_edition(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_post_edition_publishes_edition_lifecycle(
+    client: AsyncClient,
+) -> None:
+    """POST edition emits one edition_lifecycle (create) with edition_kind."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "lc-create-ed",
+            "title": "Lifecycle Create",
+            "kind": "release",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "main"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    create_events = [
+        e for e in publisher.published if e.action == LifecycleAction.create
+    ]
+    assert len(create_events) == 1
+    event = create_events[0]
+    assert event.organization == "ed-org"
+    assert event.project == "ed-proj"
+    assert event.edition_kind == MetricsEditionKind.release
+
+
+@pytest.mark.asyncio
+async def test_patch_edition_publishes_edition_lifecycle(
+    client: AsyncClient,
+) -> None:
+    """PATCH edition emits one edition_lifecycle (update) with edition_kind."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "lc-update-ed",
+            "title": "Original",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/lc-update-ed",
+        json={"title": "Updated"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    update_events = [
+        e for e in publisher.published if e.action == LifecycleAction.update
+    ]
+    assert len(update_events) == 1
+    event = update_events[0]
+    assert event.organization == "ed-org"
+    assert event.project == "ed-proj"
+    assert event.edition_kind == MetricsEditionKind.draft
+
+
+@pytest.mark.asyncio
+async def test_delete_edition_publishes_edition_lifecycle(
+    client: AsyncClient,
+) -> None:
+    """DELETE edition emits one edition_lifecycle (delete) + edition_kind."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "lc-delete-ed",
+            "title": "Delete Me",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.delete(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/lc-delete-ed",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    delete_events = [
+        e for e in publisher.published if e.action == LifecycleAction.delete
+    ]
+    assert len(delete_events) == 1
+    event = delete_events[0]
+    assert event.organization == "ed-org"
+    assert event.project == "ed-proj"
+    assert event.edition_kind == MetricsEditionKind.draft
 
 
 @pytest.mark.asyncio

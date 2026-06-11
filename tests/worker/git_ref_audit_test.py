@@ -18,6 +18,7 @@ import respx
 import structlog
 from pydantic import SecretStr
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +31,7 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
+from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.project import SqlProject
 from docverse.dbschema.queue_job import SqlQueueJob
@@ -40,6 +42,12 @@ from docverse.domain.lifecycle import (
     RefDeletedRule,
 )
 from docverse.domain.queue import JobStatus
+from docverse.metrics import (
+    DocverseEvents,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+    build_event_manager,
+)
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
 from docverse.storage.github import GITHUB_API_BASE_URL
@@ -224,13 +232,17 @@ def _seed_refs_500(router: respx.Router, *, owner: str, repo: str) -> None:
 
 
 def _make_ctx(
-    *, http_client: httpx.AsyncClient, mock_github: GitHubMock
+    *,
+    http_client: httpx.AsyncClient,
+    mock_github: GitHubMock,
+    events: DocverseEvents | None = None,
 ) -> dict[str, object]:
     return make_worker_ctx(
         http_client=http_client,
         github_app_id=mock_github.app_id,
         github_app_private_key=SecretStr(mock_github.private_key_pem),
         github_webhook_secret=SecretStr("webhook-secret"),
+        events=events,
     )
 
 
@@ -390,6 +402,88 @@ async def test_git_ref_audit_soft_deletes_missing_refs_only(
             run = await run_store.get(run_id)
             assert run is not None
             assert run.status is GitRefAuditRunStatus.succeeded
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_publishes_lifecycle_action(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Each ref-deleted reap publishes ``lifecycle_action`` (trigger=audit).
+
+    Seeds one GitHub-bound project with a draft tracking a live branch
+    (kept) and a draft tracking a branch absent from GitHub (reaped),
+    runs the worker with an initialized event manager, and asserts a
+    single ``lifecycle_action`` event for the reaped edition carrying
+    ``action=ref_deleted``, ``trigger=git_ref_audit``, and
+    ``success=True``.
+    """
+    manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-event-org")
+        installation_id = mock_github.seed_installation(
+            "acme", "evented", installation_id=71, owner_id=333
+        )
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="acme-evented",
+            owner="acme",
+            repo="evented",
+            installation_id=installation_id,
+        )
+        await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="kept-branch",
+            git_ref="main",
+        )
+        await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="deleted-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="evented",
+        branches=["main"],
+        tags=[],
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(
+            http_client=http_client, mock_github=mock_github, events=events
+        )
+        result = await git_ref_audit(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "git_ref_audit_run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+
+    assert result == "completed"
+
+    publisher = events.lifecycle_action
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org_slug
+    assert event.project == "acme-evented"
+    assert event.action is LifecycleReapAction.ref_deleted
+    assert event.trigger is LifecycleActionTrigger.git_ref_audit
+    assert event.success is True
+    await manager.aclose()
 
 
 @pytest.mark.asyncio

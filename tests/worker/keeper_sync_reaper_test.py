@@ -17,6 +17,7 @@ import pytest
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -24,9 +25,11 @@ from docverse.client.models import (
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
+from docverse.config import Configuration
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobStatus
+from docverse.metrics import build_event_manager
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
@@ -131,6 +134,56 @@ async def test_reaper_fails_stuck_child_and_finalises_run(
             assert run is not None
             assert run.status == KeeperSyncRunStatus.partial_failure
             assert run.date_finished is not None
+
+
+@pytest.mark.asyncio
+async def test_reaper_publishes_run_completed(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The reaper finalising a run emits one ``keeper_sync_run_completed``.
+
+    Covers the reaper's ``publish_run_completed`` wiring (untested by the
+    keeper_sync_project path): a stuck child is failed, the parent run
+    reaches ``partial_failure``, and the sweep publishes one org-scoped
+    run-completed event with ``success=False`` after the finalisation
+    transaction commits.
+    """
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-reaper-evt")
+        run_id = await _seed_run(db_session, org_id=org_id)
+        await _seed_stuck_child(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="arq-stuck-evt",
+            started_minutes_ago=600,
+        )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=http_client, arq_queue=mock_arq, events=events
+    )
+    try:
+        await keeper_sync_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "ks-reaper-evt"
+    # A keeper-sync run is org-scoped, so it carries no project.
+    assert event.project is None
+    assert event.success is False
+    assert event.total_count == 1
+    assert event.failed_count == 1
+    assert event.elapsed >= timedelta(0)
 
 
 @pytest.mark.asyncio

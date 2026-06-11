@@ -58,6 +58,12 @@ def test(session: nox.Session) -> None:
                 "REPERTOIRE_BASE_URL": (
                     "https://roundtable.lsst.cloud/repertoire"
                 ),
+                # Resolve Configuration.metrics to a MockEventManager so
+                # the app/workers start without Kafka and tests can assert
+                # on published events.
+                "METRICS_APPLICATION": "docverse",
+                "METRICS_ENABLED": "false",
+                "METRICS_MOCK": "true",
             },
         )
 
@@ -153,6 +159,12 @@ def create_migration(session: nox.Session) -> None:
             "REPERTOIRE_BASE_URL": (
                 "https://roundtable.lsst.cloud/repertoire"
             ),
+            # ``alembic/env.py`` imports ``docverse.config``, whose
+            # ``metrics`` field resolves from these vars; the mock
+            # manager keeps migration autogeneration Kafka-free.
+            "METRICS_APPLICATION": "docverse",
+            "METRICS_ENABLED": "false",
+            "METRICS_MOCK": "true",
         }
         session.run("alembic", "upgrade", "head", env=env)
         session.run(

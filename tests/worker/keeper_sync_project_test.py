@@ -12,6 +12,7 @@ failing paths — without depending on real S3 or R2.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from types import TracebackType
@@ -24,6 +25,7 @@ import sentry_sdk
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from safir.testing.sentry import (
     TestTransport,
     capture_events_fixture,
@@ -44,12 +46,14 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
+from docverse.metrics import build_event_manager
 from docverse.sentry import initialize_sentry
 from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
@@ -761,6 +765,68 @@ async def test_keeper_sync_project_failure_marks_queue_job_and_finalises_run(
 
     # Nothing was copied to the destination on the failure path.
     assert object_store.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_publishes_run_completed(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalising a run publishes one ``keeper_sync_run_completed`` event."""
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    # LTD 404 → the run's single attributed child fails, so the run
+    # finalises as partial_failure (success=False).
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(404)
+    )
+    object_store = MockObjectStore()
+    _patch_factory_io(
+        monkeypatch, object_store=object_store, source_objects={}
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=http_client, arq_queue=mock_arq, events=events
+    )
+
+    with pytest.raises(LtdNotFoundError):
+        await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org_slug
+    # A keeper-sync run is org-scoped, so the event carries no project.
+    assert event.project is None
+    assert event.success is False
+    assert event.total_count == 1
+    assert event.succeeded_count == 0
+    assert event.failed_count == 1
+    assert event.elapsed >= timedelta(0)
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,11 @@ from docverse.handlers.params import (
     OrgSlugParam,
     ProjectSlugParam,
 )
+from docverse.metrics import (
+    EditionLifecycleEvent,
+    LifecycleAction,
+    MetricsEditionKind,
+)
 from docverse.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -131,6 +136,17 @@ async def post_edition(
             org_slug=org_slug, project_slug=project_slug, data=data
         )
         await context.session.commit()
+    # Emit after the commit so the event reflects durably persisted state.
+    # Production runs raise_on_error=False, so a metrics-backend outage
+    # cannot fail this request (no defensive try/except).
+    await context.events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=org_slug,
+            project=project_slug,
+            action=LifecycleAction.create,
+            edition_kind=MetricsEditionKind.from_api(edition.kind),
+        )
+    )
     await try_enqueue_dashboard_build_by_slug(
         factory=context.factory,
         session=context.session,
@@ -265,6 +281,15 @@ async def post_edition_rollback(  # noqa: PLR0913
             build_public_id=data.build,
         )
         await context.session.commit()
+    # Publish after the commit (best-effort; raise_on_error=False).
+    await context.events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=org_slug,
+            project=project_slug,
+            action=LifecycleAction.rollback,
+            edition_kind=MetricsEditionKind.from_api(edition.kind),
+        )
+    )
     await try_enqueue_dashboard_build_by_slug(
         factory=context.factory,
         session=context.session,
@@ -308,6 +333,15 @@ async def patch_edition(  # noqa: PLR0913
             data=data,
         )
         await context.session.commit()
+    # Publish after the commit (best-effort; raise_on_error=False).
+    await context.events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=org_slug,
+            project=project_slug,
+            action=LifecycleAction.update,
+            edition_kind=MetricsEditionKind.from_api(edition.kind),
+        )
+    )
     await try_enqueue_dashboard_build_by_slug(
         factory=context.factory,
         session=context.session,
@@ -408,4 +442,16 @@ async def delete_edition(
         logger=context.logger,
         org_slug=org_slug,
         project_slug=project_slug,
+    )
+    # Delete is multi-transaction (soft-delete commit + CDN unpublish);
+    # publish only after that final step succeeds, so the event signals a
+    # fully-completed delete (best-effort, raise_on_error=False). The
+    # ``edition`` domain object was read above and stays usable here.
+    await context.events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=org_slug,
+            project=project_slug,
+            action=LifecycleAction.delete,
+            edition_kind=MetricsEditionKind.from_api(edition.kind),
+        )
     )

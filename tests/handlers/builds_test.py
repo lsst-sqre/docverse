@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient
+from safir.metrics import MockEventPublisher
 
 from docverse.client.models import BuildAnnotations
+from docverse.dependencies.context import context_dependency
 from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (
@@ -120,6 +122,69 @@ async def test_patch_build_upload_complete(client: AsyncClient) -> None:
     data = response.json()
     assert data["status"] == "processing"
     assert data["queue_url"] is not None
+
+
+@pytest.mark.asyncio
+async def test_patch_build_publishes_build_uploaded(
+    client: AsyncClient,
+) -> None:
+    """PATCH status=uploaded emits one build_uploaded with provenance."""
+    await _setup(client)
+    build_id = await seed_build(
+        "build-org",
+        "build-proj",
+        uploader="ci-bot",
+        annotations=BuildAnnotations.model_validate(
+            {
+                "commit_sha": "abc123",
+                "github_run_id": "42",
+                "ci_platform": "github-actions",
+            }
+        ),
+    )
+    response = await client.patch(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        json={"status": "uploaded"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.build_uploaded
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "build-org"
+    assert event.project == "build-proj"
+    assert event.uploader == "ci-bot"
+    assert event.commit_sha == "abc123"
+    assert event.github_run_id == "42"
+    assert event.ci_platform == "github-actions"
+    # Provenance fields the uploader did not annotate are null.
+    assert event.github_repository is None
+    assert event.github_actor is None
+
+
+@pytest.mark.asyncio
+async def test_patch_build_noop_does_not_publish_build_uploaded(
+    client: AsyncClient,
+) -> None:
+    """A non-uploaded PATCH must not emit a build_uploaded event."""
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    response = await client.patch(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        json={"status": "pending"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.build_uploaded
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 0
 
 
 @pytest.mark.asyncio

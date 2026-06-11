@@ -47,6 +47,7 @@ from docverse.client.models import (
 )
 from docverse.config import config
 from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse.domain.organization import Organization
 from docverse.factory import Factory
 from docverse.services.keeper_sync.scheduler import (
@@ -69,7 +70,10 @@ from docverse.services.keeper_sync.service import (
     EditionSyncOutcome,
     ProjectSyncResult,
 )
-from docverse.services.keeper_sync_finalisation import maybe_finalise_run
+from docverse.services.keeper_sync_finalisation import (
+    maybe_finalise_run,
+    publish_run_completed,
+)
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.services.publish_enqueue import enqueue_publish_for_edition
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
@@ -161,7 +165,9 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
         factory = ctx["factory_builder"](session=session, logger=logger)
         queue_job_store = factory.create_queue_job_store()
         run_store = factory.create_keeper_sync_run_store()
+        org_store = factory.create_org_store()
 
+        completions: list[KeeperSyncRunWithActivity] = []
         async with session.begin():
             reaped = await queue_job_store.fail_silent_run_children(
                 idle_after=threshold
@@ -176,7 +182,23 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             for run_id in run_ids:
                 if run_id is None:
                     continue
-                await maybe_finalise_run(run_store=run_store, run_id=run_id)
+                completion = await maybe_finalise_run(
+                    run_store=run_store, run_id=run_id
+                )
+                if completion is not None:
+                    completions.append(completion)
+
+        # Publish one keeper_sync_run_completed per run this sweep drove
+        # terminal, after the finalisation transaction commits.
+        events = ctx.get("events")
+        for completion in completions:
+            await publish_run_completed(
+                events=events,
+                session=session,
+                org_store=org_store,
+                completion=completion,
+                logger=logger,
+            )
 
         total_reaped = len(reaped) + len(tier_silent) + len(tier_orphans)
         if total_reaped:
@@ -443,6 +465,7 @@ async def keeper_sync_project(
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
             logger.exception("Keeper-sync project failed")
+            completion: KeeperSyncRunWithActivity | None = None
             async with session.begin():
                 await queue_job_store.fail(
                     queue_job_id,
@@ -453,15 +476,32 @@ async def keeper_sync_project(
                     },
                 )
                 if run_id is not None:
-                    await maybe_finalise_run(
+                    completion = await maybe_finalise_run(
                         run_store=run_store, run_id=run_id
                     )
+            await publish_run_completed(
+                events=ctx.get("events"),
+                session=session,
+                org_store=org_store,
+                completion=completion,
+                logger=logger,
+            )
             raise
 
+        completion = None
         async with session.begin():
             await queue_job_store.complete(queue_job_id)
             if run_id is not None:
-                await maybe_finalise_run(run_store=run_store, run_id=run_id)
+                completion = await maybe_finalise_run(
+                    run_store=run_store, run_id=run_id
+                )
+        await publish_run_completed(
+            events=ctx.get("events"),
+            session=session,
+            org_store=org_store,
+            completion=completion,
+            logger=logger,
+        )
         logger.info("Keeper-sync project completed")
         return "completed"
 
