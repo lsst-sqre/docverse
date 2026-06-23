@@ -14,7 +14,7 @@ dependencies = [
     "httpx",
     "jinja2>=3.1",
     "pydantic>=2",
-    "pydantic-settings>=2",
+    "pydantic-settings>=2.14.2",
     "base32-lib",
     "rubin-gafaelfawr",
     "rubin-repertoire",
