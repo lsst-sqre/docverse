@@ -16,12 +16,6 @@ import httpx
 import pytest
 import respx
 import structlog
-from pydantic import SecretStr
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     EditionKind,
     GitRefAuditRunStatus,
@@ -31,6 +25,12 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
+from pydantic import SecretStr
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.project import SqlProject

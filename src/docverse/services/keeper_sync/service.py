@@ -24,8 +24,6 @@ from typing import Any
 
 import sentry_sdk
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
@@ -36,6 +34,8 @@ from docverse.client.models import (
 )
 from docverse.client.models.editions import DefaultEditionConfig
 from docverse.client.models.projects import parse_github_url
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
@@ -203,7 +203,7 @@ class KeeperSyncContext:
 class KeeperSyncService:
     """Orchestrate sync for one LTD product / edition / build path."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         session: AsyncSession,
@@ -661,7 +661,7 @@ class KeeperSyncService:
             build_outcome=build_outcome,
         )
 
-    async def _ensure_edition(  # noqa: PLR0913
+    async def _ensure_edition(
         self,
         *,
         project_id: int,
@@ -744,7 +744,7 @@ class KeeperSyncService:
             tracking_params=tracking_params,
         )
 
-    async def sync_build(  # noqa: PLR0913
+    async def sync_build(
         self,
         *,
         org_id: int,

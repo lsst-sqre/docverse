@@ -62,7 +62,7 @@ class SemverVersion:
             prerelease=m.group("pre"),
         )
 
-    def __eq__(self, other: object) -> bool:  # noqa: D105
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, SemverVersion):
             return NotImplemented
         return (
@@ -72,7 +72,7 @@ class SemverVersion:
             and self.prerelease == other.prerelease
         )
 
-    def __lt__(self, other: object) -> bool:  # noqa: D105
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, SemverVersion):
             return NotImplemented
         if (self.major, self.minor, self.patch) != (
@@ -97,7 +97,7 @@ class SemverVersion:
         # Both have prereleases: compare lexicographically
         return self.prerelease < other.prerelease
 
-    def __hash__(self) -> int:  # noqa: D105
+    def __hash__(self) -> int:
         return hash((self.major, self.minor, self.patch, self.prerelease))
 
 
@@ -119,23 +119,23 @@ class EupsMajorVersion:
     minor: int
 
     @classmethod
-    def parse(cls, git_ref: str) -> Self | None:  # noqa: D102
+    def parse(cls, git_ref: str) -> Self | None:
         m = _EUPS_MAJOR_RE.match(git_ref)
         if m is None:
             return None
         return cls(major=int(m.group("major")), minor=int(m.group("minor")))
 
-    def __eq__(self, other: object) -> bool:  # noqa: D105
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, EupsMajorVersion):
             return NotImplemented
         return self.major == other.major and self.minor == other.minor
 
-    def __lt__(self, other: object) -> bool:  # noqa: D105
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, EupsMajorVersion):
             return NotImplemented
         return (self.major, self.minor) < (other.major, other.minor)
 
-    def __hash__(self) -> int:  # noqa: D105
+    def __hash__(self) -> int:
         return hash((self.major, self.minor))
 
 
@@ -155,23 +155,23 @@ class EupsWeeklyVersion:
     week: int
 
     @classmethod
-    def parse(cls, git_ref: str) -> Self | None:  # noqa: D102
+    def parse(cls, git_ref: str) -> Self | None:
         m = _EUPS_WEEKLY_RE.match(git_ref)
         if m is None:
             return None
         return cls(year=int(m.group("year")), week=int(m.group("week")))
 
-    def __eq__(self, other: object) -> bool:  # noqa: D105
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, EupsWeeklyVersion):
             return NotImplemented
         return self.year == other.year and self.week == other.week
 
-    def __lt__(self, other: object) -> bool:  # noqa: D105
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, EupsWeeklyVersion):
             return NotImplemented
         return (self.year, self.week) < (other.year, other.week)
 
-    def __hash__(self) -> int:  # noqa: D105
+    def __hash__(self) -> int:
         return hash((self.year, self.week))
 
 
@@ -194,7 +194,7 @@ class EupsDailyVersion:
     day: int
 
     @classmethod
-    def parse(cls, git_ref: str) -> Self | None:  # noqa: D102
+    def parse(cls, git_ref: str) -> Self | None:
         m = _EUPS_DAILY_RE.match(git_ref)
         if m is None:
             return None
@@ -204,7 +204,7 @@ class EupsDailyVersion:
             day=int(m.group("day")),
         )
 
-    def __eq__(self, other: object) -> bool:  # noqa: D105
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, EupsDailyVersion):
             return NotImplemented
         return (
@@ -213,7 +213,7 @@ class EupsDailyVersion:
             and self.day == other.day
         )
 
-    def __lt__(self, other: object) -> bool:  # noqa: D105
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, EupsDailyVersion):
             return NotImplemented
         return (self.year, self.month, self.day) < (
@@ -222,7 +222,7 @@ class EupsDailyVersion:
             other.day,
         )
 
-    def __hash__(self) -> int:  # noqa: D105
+    def __hash__(self) -> int:
         return hash((self.year, self.month, self.day))
 
 
@@ -246,7 +246,7 @@ class LsstDocVersion:
     patch: int = 0
 
     @classmethod
-    def parse(cls, git_ref: str) -> Self | None:  # noqa: D102
+    def parse(cls, git_ref: str) -> Self | None:
         m = _LSST_DOC_RE.match(git_ref)
         if m is None:
             return None
@@ -256,7 +256,7 @@ class LsstDocVersion:
             patch=int(m.group("patch") or "0"),
         )
 
-    def __eq__(self, other: object) -> bool:  # noqa: D105
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, LsstDocVersion):
             return NotImplemented
         return (
@@ -265,7 +265,7 @@ class LsstDocVersion:
             and self.patch == other.patch
         )
 
-    def __lt__(self, other: object) -> bool:  # noqa: D105
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, LsstDocVersion):
             return NotImplemented
         return (self.major, self.minor, self.patch) < (
@@ -274,7 +274,7 @@ class LsstDocVersion:
             other.patch,
         )
 
-    def __hash__(self) -> int:  # noqa: D105
+    def __hash__(self) -> int:
         return hash((self.major, self.minor, self.patch))
 
 

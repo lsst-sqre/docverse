@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Self
 
-from starlette.requests import Request
-
 from docverse.client.models import Organization as _OrganizationBase
 from docverse.client.models import OrganizationServiceSummary
+from starlette.requests import Request
+
 from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.domain.organization_service import (
     OrganizationService as OrganizationServiceDomain,

@@ -21,10 +21,10 @@ import httpx
 import pytest
 import respx
 import structlog
+from docverse.client.models import OrgRole
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import OrgRole
 from docverse.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     TIER_DISCOVERY_CRON_INTERVAL,

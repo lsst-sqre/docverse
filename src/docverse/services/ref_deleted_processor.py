@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
-
 from docverse.client.models.dashboard_template import normalize_github_ref
+
 from docverse.domain.project import Project
 from docverse.services.edition import EditionService
 from docverse.services.edition_publishing import EditionPublishingService
@@ -87,7 +87,7 @@ class RefDeletedWebhookProcessor:
     opens its own ``session.begin()``.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         project_store: ProjectStore,

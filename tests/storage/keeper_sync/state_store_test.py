@@ -6,10 +6,10 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore

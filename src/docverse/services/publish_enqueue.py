@@ -18,9 +18,9 @@ recoverable rows behind rather than silently dropping the publish.
 
 from __future__ import annotations
 
+from docverse.client.models.queue_enums import JobKind, PublishStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models.queue_enums import JobKind, PublishStatus
 from docverse.domain.base32id import serialize_base32_id
 from docverse.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -56,7 +56,7 @@ class PublishEnqueueResult:
         self.backend_job_id = backend_job_id
 
 
-async def enqueue_publish_for_edition(  # noqa: PLR0913
+async def enqueue_publish_for_edition(
     *,
     session: AsyncSession,
     edition_store: EditionStore,

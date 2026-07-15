@@ -7,10 +7,10 @@ from typing import Any, cast
 import httpx
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
 from docverse.exceptions import NotFoundError
 from docverse.services.dashboard_templates import sync as sync_module
 from docverse.services.dashboard_templates.sync import (
@@ -495,8 +495,8 @@ async def test_sync_unexpected_auth_error_propagates(
         async def get_installation_auth(
             self,
             *,
-            owner: str,  # noqa: ARG002
-            repo: str,  # noqa: ARG002
+            owner: str,
+            repo: str,
         ) -> InstallationAuth:
             msg = "unexpected bug during auth lookup"
             raise RuntimeError(msg)
@@ -548,7 +548,7 @@ async def test_sync_unexpected_fetch_error_propagates(
         ) -> None:
             pass
 
-        async def fetch(self, **kwargs: Any) -> Any:  # noqa: ARG002
+        async def fetch(self, **kwargs: Any) -> Any:
             msg = "unexpected bug during tree fetch"
             raise RuntimeError(msg)
 

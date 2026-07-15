@@ -161,7 +161,7 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     raise RuntimeError(msg)
 
 
-async def _audit_org(  # noqa: PLR0913
+async def _audit_org(
     *,
     session: AsyncSession,
     factory: Factory,
@@ -352,7 +352,7 @@ def _evaluate_matches(
     return matches_by_project
 
 
-async def _apply_deletions(  # noqa: PLR0913
+async def _apply_deletions(
     *,
     session: AsyncSession,
     factory: Factory,

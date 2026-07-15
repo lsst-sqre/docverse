@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.queue_enums import JobKind
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.queue_enums import JobKind
 from docverse.config import Configuration
 from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse.services.dashboard_templates.fanout import DashboardRebuildFanout

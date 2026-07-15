@@ -89,7 +89,7 @@ def _patch_github_secrets(
     *,
     app_id: int,
     private_key: str,
-    webhook_secret: str = "wh-secret",  # noqa: S107
+    webhook_secret: str = "wh-secret",
 ) -> None:
     monkeypatch.setattr(config, "github_app_id", app_id)
     monkeypatch.setattr(

@@ -13,6 +13,13 @@ import respx
 import sentry_sdk
 import structlog
 from asgi_lifespan import LifespanManager
+from docverse.client.models import (
+    BuildAnnotations,
+    BuildCreate,
+    OrgMembershipCreate,
+    OrgRole,
+    PrincipalType,
+)
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from rubin.repertoire import DiscoveryClient, register_mock_discovery
@@ -27,13 +34,6 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
-    BuildAnnotations,
-    BuildCreate,
-    OrgMembershipCreate,
-    OrgRole,
-    PrincipalType,
-)
 from docverse.config import config
 from docverse.dbschema import Base
 from docverse.dependencies.context import RequestContext, context_dependency

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from docverse.client.models import EditionKind, TrackingMode
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -18,8 +19,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
-
-from docverse.client.models import EditionKind, TrackingMode
 
 from .base import Base
 

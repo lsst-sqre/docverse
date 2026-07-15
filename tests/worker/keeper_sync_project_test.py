@@ -23,17 +23,6 @@ import pytest
 import respx
 import sentry_sdk
 import structlog
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from safir.testing.sentry import (
-    TestTransport,
-    capture_events_fixture,
-    sentry_init_fixture,
-)
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     BuildStatus,
     EditionCreate,
@@ -46,6 +35,17 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from safir.testing.sentry import (
+    TestTransport,
+    capture_events_fixture,
+    sentry_init_fixture,
+)
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
@@ -213,7 +213,7 @@ def _seed_ltd(mock_discovery: respx.Router) -> None:
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_runs_service_and_enqueues_publish(  # noqa: PLR0915
+async def test_keeper_sync_project_runs_service_and_enqueues_publish(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
@@ -577,7 +577,7 @@ async def test_keeper_sync_project_short_circuit_skips_publish_enqueue(
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_self_heals_unpublished_short_circuit(  # noqa: PLR0915
+async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,

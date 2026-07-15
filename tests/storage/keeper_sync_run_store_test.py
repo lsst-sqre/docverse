@@ -6,9 +6,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
+from docverse.client.models import KeeperSyncRunStatus, OrganizationCreate
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import KeeperSyncRunStatus, OrganizationCreate
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus

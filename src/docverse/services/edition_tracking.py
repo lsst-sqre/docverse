@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 import structlog
-
 from docverse.client.models import EditionKind, TrackingMode
+
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_tracking import (

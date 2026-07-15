@@ -5,13 +5,13 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate, ProjectCreate
 from pydantic import SecretStr
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
 from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id

@@ -95,7 +95,7 @@ class InvalidJobStateError(DocverseSlackException):
     unset because a run is not itself a queue job.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         current_state: str | None = None,
@@ -178,7 +178,7 @@ class InvalidBuildStateError(DocverseSlackException):
     code outside of a request context.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         current_state: str | None = None,

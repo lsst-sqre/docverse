@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import structlog
-
 from docverse.client.models import OrganizationCreate, OrganizationUpdate
 from docverse.client.models.infrastructure import (
     SERVICE_PROVIDER_CATEGORY,
     ServiceCategory,
 )
+
 from docverse.domain.organization import Organization
 from docverse.exceptions import ConflictError
 from docverse.storage.organization_service_store import (

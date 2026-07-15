@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
-
 from docverse.client.models import CredentialProvider
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class OrganizationCredential(BaseModel):

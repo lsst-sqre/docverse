@@ -8,12 +8,6 @@ from typing import Any
 
 import pytest
 import structlog
-from fastapi import FastAPI
-from safir.database import create_database_engine
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
 from docverse.client.models import (
     BuildCreate,
     EditionCreate,
@@ -24,6 +18,12 @@ from docverse.client.models import (
     PublishStatus,
     TrackingMode,
 )
+from fastapi import FastAPI
+from safir.database import create_database_engine
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from docverse.config import config
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition

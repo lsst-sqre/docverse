@@ -13,10 +13,10 @@ from datetime import datetime
 from typing import Any
 
 import structlog
+from docverse.client.models import GitRefAuditRunStatus
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import GitRefAuditRunStatus
 from docverse.dbschema.git_ref_audit_run import SqlGitRefAuditRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.git_ref_audit_run import (

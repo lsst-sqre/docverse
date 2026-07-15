@@ -6,10 +6,6 @@ import json
 
 import pytest
 import structlog
-from rubin.repertoire import DiscoveryClient
-from sqlalchemy.ext.asyncio import AsyncSession
-from structlog.testing import capture_logs
-
 from docverse.client.models import (
     BuildCreate,
     EditionKind,
@@ -17,6 +13,10 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from rubin.repertoire import DiscoveryClient
+from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
+
 from docverse.services.dashboard.publisher import DashboardPublisher
 from docverse.services.dashboard_templates.resolver import (
     ResolvedTemplate,

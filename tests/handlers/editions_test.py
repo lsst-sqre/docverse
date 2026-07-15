@@ -6,14 +6,14 @@ import re
 
 import pytest
 import structlog
+from docverse.client.models import BuildCreate
+from docverse.client.models.builds import BuildAnnotations
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import BuildCreate
-from docverse.client.models.builds import BuildAnnotations
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dependencies.context import context_dependency
 from docverse.domain.base32id import serialize_base32_id

@@ -16,7 +16,7 @@ def _make_publisher(
     *,
     account_id: str = "acct-123",
     namespace_id: str = "ns-456",
-    api_token: str = "token-789",  # noqa: S107
+    api_token: str = "token-789",
 ) -> tuple[CloudflareKvEditionPublisher, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=handler)
     publisher = CloudflareKvEditionPublisher(

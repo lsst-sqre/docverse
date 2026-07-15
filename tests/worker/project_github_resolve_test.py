@@ -6,13 +6,13 @@ import httpx
 import pytest
 import sentry_sdk
 import structlog
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.projects import ProjectGitHubBindingCreate
 from pydantic import SecretStr
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.dbschema.project import SqlProject
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore

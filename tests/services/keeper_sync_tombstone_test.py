@@ -6,10 +6,6 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession
-from structlog.testing import capture_logs
-
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
@@ -17,6 +13,10 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
+
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.exceptions import NotFoundError
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from docverse.client.models import DashboardTemplateBindingCreate
 from fastapi import APIRouter, Depends, Response, status
 
-from docverse.client.models import DashboardTemplateBindingCreate
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id
@@ -65,7 +65,7 @@ project_override_router = APIRouter()
 async def get_org_dashboard_template(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardTemplateBindingResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -86,7 +86,7 @@ async def put_org_dashboard_template(
     data: DashboardTemplateBindingCreate,
     response: Response,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardTemplateBindingResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -120,7 +120,7 @@ async def put_org_dashboard_template(
 async def delete_org_dashboard_template(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -138,7 +138,7 @@ async def delete_org_dashboard_template(
 async def sync_org_dashboard_template(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardTemplateSyncEnqueuedResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -166,7 +166,7 @@ async def get_project_dashboard_template(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardTemplateBindingResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -187,13 +187,13 @@ async def get_project_dashboard_template(
     summary="Create or update a project's dashboard-template binding override",
     name="put_project_dashboard_template",
 )
-async def put_project_dashboard_template(  # noqa: PLR0913
+async def put_project_dashboard_template(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     data: DashboardTemplateBindingCreate,
     response: Response,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardTemplateBindingResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -231,7 +231,7 @@ async def delete_project_dashboard_template(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()
@@ -252,7 +252,7 @@ async def sync_project_dashboard_template(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> DashboardTemplateSyncEnqueuedResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_template_binding_service()

@@ -5,12 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
+from docverse.client.models import BuildCreate, BuildStatus
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from docverse.client.models import BuildCreate, BuildStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.domain.base32id import (
     generate_base32_id,
@@ -284,7 +284,7 @@ class BuildStore:
         await self._session.refresh(row)
         return Build.model_validate(row)
 
-    async def update_inventory(  # noqa: PLR0913
+    async def update_inventory(
         self,
         *,
         build_id: int,

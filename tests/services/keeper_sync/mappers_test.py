@@ -11,9 +11,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from docverse.client.models import EditionKind, TrackingMode
 from pydantic import HttpUrl
 
-from docverse.client.models import EditionKind, TrackingMode
 from docverse.services.keeper_sync.mappers import (
     derive_edition_kind,
     derive_edition_slug,

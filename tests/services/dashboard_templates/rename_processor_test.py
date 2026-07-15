@@ -6,11 +6,11 @@ from typing import Any
 
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.projects import ProjectGitHubBindingCreate
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.dbschema.project import SqlProject
 from docverse.services.dashboard_templates.rename_processor import (
     RenameEventProcessor,

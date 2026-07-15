@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
-
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
     EditionRollback,
     EditionUpdate,
 )
+from fastapi import APIRouter, Depends, Query, status
+
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
@@ -56,11 +56,11 @@ router = APIRouter()
     summary="List editions for a project",
     name="get_editions",
 )
-async def get_editions(  # noqa: PLR0913
+async def get_editions(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
     order: Annotated[
         EditionSortOrder,
         Query(description="Sort order for results."),
@@ -128,7 +128,7 @@ async def post_edition(
     project_slug: ProjectSlugParam,
     data: EditionCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Edition:
     async with context.session.begin():
         service = context.factory.create_edition_service()
@@ -175,7 +175,7 @@ async def get_edition(
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
 ) -> Edition:
     async with context.session.begin():
         service = context.factory.create_edition_service()
@@ -200,12 +200,12 @@ async def get_edition(
     summary="List build history for an edition",
     name="get_edition_history",
 )
-async def get_edition_history(  # noqa: PLR0913
+async def get_edition_history(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
     cursor: Annotated[
         str | None,
         Query(
@@ -264,13 +264,13 @@ async def get_edition_history(  # noqa: PLR0913
     summary="Roll back an edition to a previous build",
     name="post_edition_rollback",
 )
-async def post_edition_rollback(  # noqa: PLR0913
+async def post_edition_rollback(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
     data: EditionRollback,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Edition:
     async with context.session.begin():
         service = context.factory.create_edition_service()
@@ -313,13 +313,13 @@ async def post_edition_rollback(  # noqa: PLR0913
     summary="Update an edition",
     name="patch_edition",
 )
-async def patch_edition(  # noqa: PLR0913
+async def patch_edition(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
     data: EditionUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Edition:
     if edition_slug.lower() == "__main" and data.kind is not None:
         msg = "Cannot change the kind of the default '__main' edition"
@@ -370,7 +370,7 @@ async def delete_edition(
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     if edition_slug.lower() == "__main":
         msg = "The default edition '__main' cannot be deleted"

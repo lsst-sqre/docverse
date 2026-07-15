@@ -35,7 +35,7 @@ class QueueJobStore:
         self._session = session
         self._logger = logger
 
-    async def create(  # noqa: PLR0913
+    async def create(
         self,
         *,
         kind: JobKind,

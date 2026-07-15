@@ -25,16 +25,16 @@ import pytest
 import respx
 import structlog
 from arq.cron import CronJob
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     JobKind,
     KeeperSyncConfig,
     OrganizationCreate,
 )
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService

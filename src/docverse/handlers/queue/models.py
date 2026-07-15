@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Self
 
-from starlette.requests import Request
-
 from docverse.client.models import BuildProcessingProgress
 from docverse.client.models import QueueJob as _QueueJobBase
+from starlette.requests import Request
+
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import QueueJob as QueueJobDomain
 

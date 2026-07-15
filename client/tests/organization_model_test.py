@@ -96,7 +96,7 @@ def test_organization_create_accepts_typed_lifecycle_rules() -> None:
         ],
     )
     assert isinstance(payload.lifecycle_rules, LifecycleRuleSet)
-    assert len(payload.lifecycle_rules.root) == 2  # noqa: PLR2004
+    assert len(payload.lifecycle_rules.root) == 2
 
 
 def test_organization_create_rejects_unknown_lifecycle_rule_type() -> None:

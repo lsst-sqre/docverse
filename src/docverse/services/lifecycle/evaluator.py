@@ -6,9 +6,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from docverse.client.models import EditionKind, TrackingMode
 from pydantic import BaseModel, ConfigDict, Field
 
-from docverse.client.models import EditionKind, TrackingMode
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory

@@ -26,8 +26,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import structlog
-from safir.database import CountedPaginatedList, PaginationCursor
-
 from docverse.client.models import (
     EditionKind,
     KeeperSyncEditionDiff,
@@ -35,6 +33,8 @@ from docverse.client.models import (
     KeeperSyncTierName,
     KeeperSyncTierStatus,
 )
+from safir.database import CountedPaginatedList, PaginationCursor
+
 from docverse.domain.edition import Edition
 from docverse.exceptions import NotFoundError
 from docverse.services.keeper_sync.scheduler import (
@@ -159,7 +159,7 @@ class LtdClientFactory(Protocol):
 class KeeperSyncProjectService:
     """Read-only project-status service for the org-admin GET endpoint."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         org_store: OrganizationStore,
@@ -631,7 +631,7 @@ def _explain_all_tiers(
     ]
 
 
-def _build_tier_status(  # noqa: PLR0913
+def _build_tier_status(
     *,
     tier: Tier,
     tier_name: KeeperSyncTierName,

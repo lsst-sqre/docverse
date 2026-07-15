@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.storage.organization_store import OrganizationStore

@@ -247,4 +247,4 @@ async def test_http_error() -> None:
                     content_hash="sha256:" + "a" * 64,
                 )
 
-    assert exc_info.value.status_code == 403  # noqa: PLR2004
+    assert exc_info.value.status_code == 403

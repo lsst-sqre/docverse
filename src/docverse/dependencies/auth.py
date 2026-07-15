@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated
 
+from docverse.client.models import OrgRole
 from fastapi import Depends, Request
 
-from docverse.client.models import OrgRole
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.authorization import AuthBasis, AuthorizationResult
 from docverse.domain.organization import Organization
@@ -58,7 +58,7 @@ class OrgRoleDependency:
     def __init__(self, min_role: OrgRole) -> None:
         self._min_role = min_role
 
-    async def __call__(  # noqa: D102
+    async def __call__(
         self,
         org_slug: OrgSlugParam,
         request: Request,

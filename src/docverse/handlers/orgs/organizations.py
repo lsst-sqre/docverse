@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from docverse.client.models import OrganizationUpdate
 from fastapi import APIRouter, Depends
 
-from docverse.client.models import OrganizationUpdate
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
@@ -28,7 +28,7 @@ router = APIRouter()
     name="get_organization",
 )
 async def get_organization(
-    org_slug: OrgSlugParam,  # noqa: ARG001
+    org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],
 ) -> Organization:
@@ -48,7 +48,7 @@ async def get_organization(
     name="patch_organization",
 )
 async def patch_organization(
-    org_slug: OrgSlugParam,  # noqa: ARG001
+    org_slug: OrgSlugParam,
     data: OrganizationUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],

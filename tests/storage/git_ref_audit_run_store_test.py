@@ -14,10 +14,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
+from docverse.client.models import GitRefAuditRunStatus, OrganizationCreate
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import GitRefAuditRunStatus, OrganizationCreate
 from docverse.dbschema.git_ref_audit_run import SqlGitRefAuditRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id

@@ -7,8 +7,6 @@ from typing import Self
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     BuildCreate,
     EditionCreate,
@@ -19,6 +17,8 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition

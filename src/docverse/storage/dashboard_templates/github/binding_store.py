@@ -312,7 +312,7 @@ class DashboardGitHubTemplateBindingStore:
         await self._session.flush()
         return await self.get_by_id(binding_id)
 
-    async def update_sync_state(  # noqa: PLR0913
+    async def update_sync_state(
         self,
         *,
         binding_id: int,

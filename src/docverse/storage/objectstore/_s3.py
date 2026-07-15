@@ -40,7 +40,7 @@ class S3ObjectStore:
         Bound logger for contextual logging.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         endpoint_url: str | None,

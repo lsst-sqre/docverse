@@ -9,18 +9,18 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-from structlog.testing import capture_logs
-
 from docverse.client.models import (
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
+
 from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.base32id import serialize_base32_id

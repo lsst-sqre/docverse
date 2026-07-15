@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.queue_enums import JobKind
 from safir.arq import MockArqQueue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.queue_enums import JobKind
 from docverse.config import Configuration
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer

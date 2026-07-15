@@ -20,16 +20,16 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     GitRefAuditRunStatus,
     JobKind,
     LifecycleEvalRunStatus,
     OrganizationCreate,
 )
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.config import config as runtime_config
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id

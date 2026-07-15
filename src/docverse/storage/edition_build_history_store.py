@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import structlog
+from docverse.client.models.queue_enums import PublishStatus
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.domain.edition_build_history import (

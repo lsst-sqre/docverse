@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Protocol
 
 import structlog
-
 from docverse.client.models.queue_enums import PublishStatus
+
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition

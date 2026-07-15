@@ -11,14 +11,6 @@ from typing import Any
 import pytest
 import pytest_asyncio
 import structlog
-from fastapi import FastAPI
-from httpx import AsyncClient
-from pydantic import SecretStr
-from safir.arq import MockArqQueue
-from safir.dependencies.arq import arq_dependency
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select, update
-
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
@@ -28,6 +20,14 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
+from fastapi import FastAPI
+from httpx import AsyncClient
+from pydantic import SecretStr
+from safir.arq import MockArqQueue
+from safir.dependencies.arq import arq_dependency
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select, update
+
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.dependencies.context import context_dependency
@@ -43,7 +43,7 @@ from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 
 _WEBHOOK_PATH = "/docverse/webhooks/github"
-_WEBHOOK_SECRET = "test-webhook-secret"  # noqa: S105
+_WEBHOOK_SECRET = "test-webhook-secret"
 
 
 def _sign(secret: str, body: bytes) -> str:

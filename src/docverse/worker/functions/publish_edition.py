@@ -16,10 +16,10 @@ from typing import Any
 
 import sentry_sdk
 import structlog
+from docverse.client.models.queue_enums import PublishStatus
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models.queue_enums import PublishStatus
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
@@ -273,7 +273,7 @@ async def _mark_publishing(
     )
 
 
-async def _mark_failed(  # noqa: PLR0913
+async def _mark_failed(
     *,
     edition_store: EditionStore,
     history_store: EditionBuildHistoryStore,
@@ -332,7 +332,7 @@ async def _maybe_finalise_keeper_sync_run(
     )
 
 
-async def _publish_edition_published(  # noqa: PLR0913
+async def _publish_edition_published(
     *,
     ctx: dict[str, Any],
     session: AsyncSession,

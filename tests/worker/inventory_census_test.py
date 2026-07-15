@@ -11,10 +11,6 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
-from safir.metrics import MockEventPublisher
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import func
-
 from docverse.client.models import (
     BuildCreate,
     EditionKind,
@@ -22,6 +18,10 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from safir.metrics import MockEventPublisher
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
+
 from docverse.config import Configuration
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition

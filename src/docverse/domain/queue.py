@@ -5,9 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
-
 from docverse.client.models.queue_enums import JobKind, JobStatus
+from pydantic import BaseModel
 
 from .base32id import Base32Id
 

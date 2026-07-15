@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from docverse.client.models import OrgMembershipCreate, PrincipalType
 from fastapi import APIRouter, Depends, status
 
-from docverse.client.models import OrgMembershipCreate, PrincipalType
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError

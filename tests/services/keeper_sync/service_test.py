@@ -19,10 +19,6 @@ import pytest
 import pytest_asyncio
 import respx
 import structlog
-from safir.github import GitHubAppClientFactory
-from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
@@ -32,6 +28,10 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from safir.github import GitHubAppClientFactory
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.dbschema.build import SqlBuild
 from docverse.domain.lifecycle import (
     BuildHistoryOrphanRule,
@@ -1207,7 +1207,7 @@ async def test_sync_build_does_not_reclaim_recent_pending_placeholders(
 
 
 @pytest.mark.asyncio
-async def test_dual_upload_convergence_links_existing_build_and_skips_copy(  # noqa: PLR0915
+async def test_dual_upload_convergence_links_existing_build_and_skips_copy(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,

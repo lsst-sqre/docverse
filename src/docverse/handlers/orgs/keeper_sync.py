@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Response, status
-
 from docverse.client.models import (
     JobStatus,
     KeeperSyncConfig,
@@ -13,6 +11,8 @@ from docverse.client.models import (
     KeeperSyncRunStatus,
     KeeperSyncTombstoneReason,
 )
+from fastapi import APIRouter, Depends, Path, Query, Response, status
+
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam
@@ -49,7 +49,7 @@ router = APIRouter()
 async def get_org_keeper_sync_config(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> KeeperSyncConfig:
     async with context.session.begin():
         service = context.factory.create_keeper_sync_config_service()
@@ -66,7 +66,7 @@ async def put_org_keeper_sync_config(
     org_slug: OrgSlugParam,
     data: KeeperSyncConfig,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> KeeperSyncConfig:
     async with context.session.begin():
         service = context.factory.create_keeper_sync_config_service()
@@ -85,7 +85,7 @@ async def put_org_keeper_sync_config(
 async def post_org_keeper_sync_run(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> KeeperSyncRunCreated:
     async with context.session.begin():
         service = context.factory.create_keeper_sync_run_service()
@@ -110,7 +110,7 @@ async def post_org_keeper_sync_run(
 async def get_org_keeper_sync_projects(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     cursor: Annotated[
         str | None,
         Query(
@@ -158,7 +158,7 @@ async def get_org_keeper_sync_projects(
 async def get_org_keeper_sync_project_status(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     ltd_slug: Annotated[
         str,
         Path(description="LTD project slug to inspect."),
@@ -191,10 +191,10 @@ async def get_org_keeper_sync_project_status(
     summary="List Docverse editions for one keeper-sync project",
     name="get_org_keeper_sync_project_editions",
 )
-async def get_org_keeper_sync_project_editions(  # noqa: PLR0913
+async def get_org_keeper_sync_project_editions(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     ltd_slug: Annotated[
         str,
         Path(description="LTD project slug to list editions for."),
@@ -256,7 +256,7 @@ async def get_org_keeper_sync_project_editions(  # noqa: PLR0913
 async def post_org_keeper_sync_project_refresh(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     ltd_slug: Annotated[
         str,
         Path(description="LTD project slug to refresh."),
@@ -279,10 +279,10 @@ async def post_org_keeper_sync_project_refresh(
     summary="List LTD Keeper sync runs for an organization",
     name="get_org_keeper_sync_runs",
 )
-async def get_org_keeper_sync_runs(  # noqa: PLR0913
+async def get_org_keeper_sync_runs(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     cursor: Annotated[
         str | None,
         Query(
@@ -343,7 +343,7 @@ async def get_org_keeper_sync_runs(  # noqa: PLR0913
 async def get_org_keeper_sync_run(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     run_id: Annotated[
         int, Path(description="Numeric identifier for the run.")
     ],
@@ -362,10 +362,10 @@ async def get_org_keeper_sync_run(
     summary="List child queue jobs for an LTD Keeper sync run",
     name="get_org_keeper_sync_run_jobs",
 )
-async def get_org_keeper_sync_run_jobs(  # noqa: PLR0913
+async def get_org_keeper_sync_run_jobs(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
     run_id: Annotated[
         int, Path(description="Numeric identifier for the run.")
     ],
@@ -418,7 +418,7 @@ async def get_org_keeper_sync_run_jobs(  # noqa: PLR0913
     summary="List sync tombstones for an organization",
     name="get_org_keeper_sync_tombstones",
 )
-async def get_org_keeper_sync_tombstones(  # noqa: PLR0913
+async def get_org_keeper_sync_tombstones(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],

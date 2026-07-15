@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Self
 
-from pydantic import HttpUrl
-from starlette.requests import Request
-
 from docverse.client.models import (
     KeeperSyncEditionStatus as _KeeperSyncEditionStatusBase,
 )
@@ -29,6 +26,9 @@ from docverse.client.models import (
 from docverse.client.models import (
     KeeperSyncTombstone as _KeeperSyncTombstoneBase,
 )
+from pydantic import HttpUrl
+from starlette.requests import Request
+
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.edition import Edition as EditionDomain
 from docverse.domain.keeper_sync_run import (

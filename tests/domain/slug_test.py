@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import pytest
+from docverse.client.models import EditionKind, TrackingMode
 from pydantic import ValidationError
 
-from docverse.client.models import EditionKind, TrackingMode
 from docverse.domain.slug import (
     ALTERNATE_SEPARATOR,
     IgnoreRule,

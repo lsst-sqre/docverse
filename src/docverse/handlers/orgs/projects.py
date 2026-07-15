@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from docverse.client.models import ProjectCreate, ProjectUpdate
 from fastapi import APIRouter, Depends, Query, status
 
-from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
@@ -40,10 +40,10 @@ router = APIRouter()
     summary="List projects in an organization",
     name="get_projects",
 )
-async def get_projects(  # noqa: PLR0913
+async def get_projects(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
     order: Annotated[
         ProjectSortOrder,
         Query(description="Sort order for results."),
@@ -126,7 +126,7 @@ async def post_project(
     org_slug: OrgSlugParam,
     data: ProjectCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
@@ -169,7 +169,7 @@ async def get_project(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
@@ -197,7 +197,7 @@ async def patch_project(
     project_slug: ProjectSlugParam,
     data: ProjectUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
@@ -246,7 +246,7 @@ async def delete_project(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_project_service()

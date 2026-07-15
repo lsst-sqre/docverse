@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 __all__ = ["mark_dashboard_sync_failed"]
 
 
-async def mark_dashboard_sync_failed(  # noqa: PLR0913
+async def mark_dashboard_sync_failed(
     *,
     session: AsyncSession,
     binding_store: DashboardGitHubTemplateBindingStore,

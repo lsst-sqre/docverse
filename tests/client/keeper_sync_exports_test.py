@@ -18,9 +18,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, get_args, get_origin
 
+import docverse.client.models as client_models
 from pydantic import BaseModel
 
-import docverse.client.models as client_models
 from docverse.handlers.orgs import keeper_sync as keeper_sync_handlers
 from docverse.handlers.orgs import keeper_sync_models as handler_models
 from docverse.handlers.queue import models as queue_handler_models

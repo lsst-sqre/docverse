@@ -93,7 +93,7 @@ class KeeperSyncTombstoneService:
         self._state_store = state_store
         self._logger = logger
 
-    async def record(  # noqa: PLR0913
+    async def record(
         self,
         *,
         org_id: int,

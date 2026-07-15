@@ -68,14 +68,14 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     org = await org_store.get_by_id(org_id)
                     if org is None:
                         msg = f"Organization {org_id} not found"
-                        raise NotFoundError(msg)  # noqa: TRY301
+                        raise NotFoundError(msg)
                     service_label = org.resolved_staging_store_label
                     if service_label is None:
                         msg = (
                             f"No object store service configured for "
                             f"org {org_id}"
                         )
-                        raise RuntimeError(msg)  # noqa: TRY301
+                        raise RuntimeError(msg)
 
                     publisher = factory.create_dashboard_publisher()
                     rendered_at = datetime.now(tz=UTC)
@@ -166,7 +166,7 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     raise RuntimeError(msg)
 
 
-async def _publish_dashboard_built(  # noqa: PLR0913
+async def _publish_dashboard_built(
     *,
     ctx: dict[str, Any],
     org_slug: str,

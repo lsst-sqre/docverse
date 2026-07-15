@@ -5,12 +5,12 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.projects import ProjectGitHubBindingCreate
 from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.dbschema.project import SqlProject
 from docverse.services.project_github_binding import (
     ProjectGitHubBindingResolver,
@@ -206,7 +206,7 @@ async def test_resolve_returns_binding_with_minted_auth_for_installed_project(
     assert result.installation_id == 42
     assert result.auth is not None
     assert isinstance(result.auth, InstallationAuth)
-    assert result.auth.token == "ghs_minted_token"  # noqa: S105
+    assert result.auth.token == "ghs_minted_token"
     assert result.auth.installation_id == 42
 
 

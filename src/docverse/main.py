@@ -47,7 +47,7 @@ initialize_sentry(component="api")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Context manager for application startup and shutdown."""
     logger = structlog.get_logger("docverse")
 

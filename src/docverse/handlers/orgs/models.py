@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Self
 
-from pydantic import BaseModel, Field
-from starlette.requests import Request
-
 from docverse.client.models import Build as _BuildBase
 from docverse.client.models import (
     DashboardRebuildResponse as _DashboardRebuildResponseBase,
@@ -36,6 +33,9 @@ from docverse.client.models import (
 )
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
+from pydantic import BaseModel, Field
+from starlette.requests import Request
+
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
 from docverse.domain.dashboard_github_template import (
@@ -245,7 +245,7 @@ class Build(_BuildBase):
     """Build response model with HATEOAS URLs."""
 
     @classmethod
-    def from_domain(  # noqa: PLR0913
+    def from_domain(
         cls,
         domain: BuildDomain,
         request: Request,

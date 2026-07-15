@@ -13,8 +13,8 @@ from importlib.resources import as_file, files
 from pathlib import Path
 
 import jinja2
-
 from docverse.client.models import EditionKind
+
 from docverse.domain.dashboard_context import (
     MAIN_SLUG,
     DashboardContext,

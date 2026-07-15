@@ -52,9 +52,9 @@ async def test_list_credentials(client: AsyncClient) -> None:
         }
         if provider == "aws":
             payload["credentials"]["access_key_id"] = "AKIA"
-            payload["credentials"]["secret_access_key"] = "secret"  # noqa: S105
+            payload["credentials"]["secret_access_key"] = "secret"
         else:
-            payload["credentials"]["api_token"] = "cf-token"  # noqa: S105
+            payload["credentials"]["api_token"] = "cf-token"
         await client.post(
             "/docverse/orgs/cred-org/credentials",
             json=payload,

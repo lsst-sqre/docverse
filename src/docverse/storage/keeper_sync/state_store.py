@@ -403,7 +403,7 @@ class KeeperSyncStateStore:
             return None
         return KeeperSyncState.model_validate(row)
 
-    async def upsert(  # noqa: PLR0913
+    async def upsert(
         self,
         *,
         org_id: int,

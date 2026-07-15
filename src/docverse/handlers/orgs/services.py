@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
-
 from docverse.client.models import (
     OrganizationServiceCreate,
     OrganizationServiceUpdate,
 )
 from docverse.client.models.infrastructure import ServiceProvider
+from fastapi import APIRouter, Depends, status
+
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam, ServiceLabelParam
@@ -29,7 +29,7 @@ router = APIRouter()
 async def get_services(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> list[OrganizationServiceResponse]:
     async with context.session.begin():
         service = context.factory.create_infrastructure_service()
@@ -51,7 +51,7 @@ async def post_service(
     org_slug: OrgSlugParam,
     data: OrganizationServiceCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> OrganizationServiceResponse:
     async with context.session.begin():
         infra_service = context.factory.create_infrastructure_service()
@@ -78,7 +78,7 @@ async def get_service(
     org_slug: OrgSlugParam,
     service_label: ServiceLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> OrganizationServiceResponse:
     async with context.session.begin():
         infra_service = context.factory.create_infrastructure_service()
@@ -101,7 +101,7 @@ async def patch_service(
     service_label: ServiceLabelParam,
     data: OrganizationServiceUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> OrganizationServiceResponse:
     async with context.session.begin():
         infra_service = context.factory.create_infrastructure_service()
@@ -124,7 +124,7 @@ async def delete_service(
     org_slug: OrgSlugParam,
     service_label: ServiceLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     async with context.session.begin():
         infra_service = context.factory.create_infrastructure_service()

@@ -15,16 +15,16 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     JobKind,
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.config import Configuration
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob

@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from docverse.client.models import (
+    EditionCreate,
+    EditionKind,
+    EditionUpdate,
+    TrackingMode,
+)
+from docverse.client.models.queue_enums import PublishStatus
 from safir.database import (
     CountedPaginatedList,
     CountedPaginatedQueryRunner,
@@ -15,13 +22,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from docverse.client.models import (
-    EditionCreate,
-    EditionKind,
-    EditionUpdate,
-    TrackingMode,
-)
-from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
@@ -108,7 +108,7 @@ class EditionStore:
         await self._session.refresh(row)
         return self._validate(row, None)
 
-    async def create_internal(  # noqa: PLR0913
+    async def create_internal(
         self,
         *,
         project_id: int,
@@ -629,7 +629,7 @@ class EditionStore:
         return matching
 
     @staticmethod
-    def _edition_matches(  # noqa: PLR0911
+    def _edition_matches(
         edition: Edition,
         git_ref: str,
         alternate_name: str | None,

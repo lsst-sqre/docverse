@@ -95,13 +95,16 @@ where = ["src"]
 
 [tool.ruff]
 extend = "ruff-shared.toml"
+# keeper/ is the legacy LTD Keeper codebase being migrated away from; it is
+# not linted and will be removed once the migration is complete.
+extend-exclude = ["keeper"]
 
 [tool.ruff.lint]
 ignore = [
     "INP001",  # Implicit namespace package (intentional for docverse).
 ]
 
-[tool.ruff.lint.per-file-ignores]
+[tool.ruff.lint.extend-per-file-ignores]
 "src/docverse/cli.py" = [
     "A001",   # Shadowing builtin (help command).
     "ARG001", # Unused function argument (Click pattern).

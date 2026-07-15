@@ -11,17 +11,17 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import (
     JobKind,
     LifecycleEvalRunStatus,
     OrganizationCreate,
     ProjectCreate,
 )
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.lifecycle import DraftInactivityRule, LifecycleRuleSet

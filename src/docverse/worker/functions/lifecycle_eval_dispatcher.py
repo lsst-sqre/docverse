@@ -43,11 +43,11 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from docverse.client.models import JobKind, LifecycleEvalRunStatus
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import JobKind, LifecycleEvalRunStatus
 from docverse.domain.lifecycle_eval_run import LifecycleEvalRun
 from docverse.domain.organization import Organization
 from docverse.domain.queue import QueueJob
@@ -218,7 +218,7 @@ async def _create_run_with_children(
     return run, queue_jobs
 
 
-async def _enqueue_arq_jobs(  # noqa: PLR0913
+async def _enqueue_arq_jobs(
     *,
     ctx: dict[str, Any],
     session: AsyncSession,

@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.client.models import OrganizationCreate
 from docverse.client.models.queue_enums import JobKind, JobStatus
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.services.dashboard_templates._sync_failure import (
     mark_dashboard_sync_failed,
 )

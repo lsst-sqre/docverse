@@ -18,14 +18,14 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from docverse.client.models import BuildCreate
+from docverse.client.models.queue_enums import JobKind
 from httpx import AsyncClient
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import BuildCreate
-from docverse.client.models.queue_enums import JobKind
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import serialize_base32_id
 from docverse.services.dashboard import enqueue as dashboard_enqueue

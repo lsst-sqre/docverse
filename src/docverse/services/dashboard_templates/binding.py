@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import structlog
-
 from docverse.client.models import DashboardTemplateBindingCreate
+
 from docverse.domain.dashboard_github_template import (
     DashboardGitHubTemplateBinding,
 )

@@ -19,9 +19,9 @@ from datetime import timedelta
 
 import sentry_sdk
 import structlog
+from docverse.client.models import KeeperSyncRunStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import KeeperSyncRunStatus
 from docverse.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse.exceptions import NotFoundError
 from docverse.metrics import KeeperSyncRunCompletedEvent

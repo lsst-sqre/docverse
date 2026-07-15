@@ -10,13 +10,6 @@ from typing import Any, Self
 import httpx
 import pytest
 import structlog
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-from structlog.testing import capture_logs
-
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
@@ -28,6 +21,13 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
+
 from docverse.config import Configuration
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
@@ -114,7 +114,7 @@ def _mock_create_edition_publisher(
 ) -> Any:
     """Return a patched ``create_edition_publisher_for_org`` that
     returns the given publisher.
-    """  # noqa: D205
+    """
 
     async def _create(
         self: Factory,

@@ -70,7 +70,7 @@ def extract_changed_paths_from_push(
     return sorted(paths)
 
 
-async def fetch_changed_paths_from_compare(  # noqa: PLR0913
+async def fetch_changed_paths_from_compare(
     client: httpx.AsyncClient,
     *,
     auth: InstallationAuth,

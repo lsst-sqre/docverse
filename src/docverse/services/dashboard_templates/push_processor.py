@@ -7,8 +7,8 @@ from typing import Any
 
 import httpx
 import structlog
-
 from docverse.client.models.dashboard_template import normalize_github_ref
+
 from docverse.domain.dashboard_github_template import (
     DashboardGitHubTemplateBinding,
 )

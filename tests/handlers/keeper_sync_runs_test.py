@@ -7,12 +7,12 @@ from typing import Any, Literal
 
 import pytest
 import structlog
+from docverse.client.models import OrgRole
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 from sqlalchemy import select
 
-from docverse.client.models import OrgRole
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id

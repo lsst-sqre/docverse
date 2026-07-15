@@ -87,10 +87,10 @@ class NullQueueBackend:
 
     async def enqueue(
         self,
-        job_type: str,  # noqa: ARG002
-        payload: dict[str, Any],  # noqa: ARG002
+        job_type: str,
+        payload: dict[str, Any],
         *,
-        queue_name: str | None = None,  # noqa: ARG002
+        queue_name: str | None = None,
     ) -> str:
         """Raise because this backend cannot enqueue."""
         msg = "NullQueueBackend cannot enqueue jobs"
@@ -98,14 +98,14 @@ class NullQueueBackend:
 
     async def get_job_metadata(
         self,
-        backend_job_id: str,  # noqa: ARG002
+        backend_job_id: str,
     ) -> dict[str, Any] | None:
         """Return None (no backend)."""
         return None
 
     async def get_job_result(
         self,
-        backend_job_id: str,  # noqa: ARG002
+        backend_job_id: str,
     ) -> object | None:
         """Return None (no backend)."""
         return None

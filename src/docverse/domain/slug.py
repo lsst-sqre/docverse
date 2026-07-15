@@ -11,9 +11,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
+from docverse.client.models import EditionKind, TrackingMode
 from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
-from docverse.client.models import EditionKind, TrackingMode
 from docverse.exceptions import DocverseSlackException
 
 __all__ = [

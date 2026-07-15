@@ -206,7 +206,7 @@ async def test_concurrency_observed_peak_does_not_exceed_limit() -> None:
     objects = {f"src/1/k{i}": b"x" for i in range(15)}
 
     class _Recorder(LtdSourceProtocol):
-        async def list_keys(self, *, prefix: str) -> list[str]:  # noqa: ARG002
+        async def list_keys(self, *, prefix: str) -> list[str]:
             return list(objects.keys())
 
         async def download_object(self, *, key: str) -> bytes:
