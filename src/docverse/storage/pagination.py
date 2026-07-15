@@ -130,7 +130,7 @@ class ProjectSlugCursor(PaginationCursor[Project]):
     def invert(self) -> Self:
         return type(self)(slug=self.slug, previous=not self.previous)
 
-    def __str__(self) -> str:  # noqa: D105
+    def __str__(self) -> str:
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.slug}"
 
@@ -174,7 +174,7 @@ class EditionSlugCursor(PaginationCursor[Edition]):
     def invert(self) -> Self:
         return type(self)(slug=self.slug, previous=not self.previous)
 
-    def __str__(self) -> str:  # noqa: D105
+    def __str__(self) -> str:
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.slug}"
 
@@ -232,7 +232,7 @@ class KeeperSyncProjectStateIdCursor(PaginationCursor[KeeperSyncState]):
     def invert(self) -> Self:
         return type(self)(id=self.id, previous=not self.previous)
 
-    def __str__(self) -> str:  # noqa: D105
+    def __str__(self) -> str:
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.id}"
 
@@ -309,7 +309,7 @@ class KeeperSyncEditionSlugCursor(PaginationCursor[Edition]):
             slug=self.slug, id=self.id, previous=not self.previous
         )
 
-    def __str__(self) -> str:  # noqa: D105
+    def __str__(self) -> str:
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.slug}:{self.id}"
 
@@ -577,7 +577,7 @@ class ProjectSearchCursor(PaginationCursor[Project]):
             score=self.score, id=self.id, previous=not self.previous
         )
 
-    def __str__(self) -> str:  # noqa: D105
+    def __str__(self) -> str:
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.score:.8f}:{self.id}"
 
@@ -679,7 +679,7 @@ class EditionBuildHistoryPositionCursor(
     def invert(self) -> Self:
         return type(self)(position=self.position, previous=not self.previous)
 
-    def __str__(self) -> str:  # noqa: D105
+    def __str__(self) -> str:
         prefix = "p__" if self.previous else ""
         return f"{prefix}{self.position}"
 

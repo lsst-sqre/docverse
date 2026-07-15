@@ -24,7 +24,7 @@ class OrganizationServiceStore:
         self._session = session
         self._logger = logger
 
-    async def create(  # noqa: PLR0913
+    async def create(
         self,
         *,
         organization_id: int,

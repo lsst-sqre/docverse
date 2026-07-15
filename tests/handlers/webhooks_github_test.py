@@ -29,7 +29,7 @@ from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 
 _WEBHOOK_PATH = "/docverse/webhooks/github"
-_WEBHOOK_SECRET = "test-webhook-secret"  # noqa: S105
+_WEBHOOK_SECRET = "test-webhook-secret"
 
 
 def _sign(secret: str, body: bytes) -> str:

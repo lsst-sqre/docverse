@@ -75,7 +75,7 @@ class GitHubMock:
     app_id: int = DEFAULT_APP_ID
     app_name: str = DEFAULT_APP_NAME
     default_installation_id: int = 99
-    default_token: str = "ghs_test_installation_token"  # noqa: S105
+    default_token: str = "ghs_test_installation_token"
     _installation_ids: dict[tuple[str, str], int] = field(default_factory=dict)
     _installation_tokens: dict[tuple[str, str], str] = field(
         default_factory=dict

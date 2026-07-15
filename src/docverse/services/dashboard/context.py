@@ -131,7 +131,7 @@ def _group_editions(
 class DashboardContextBuilder:
     """Assemble a :class:`DashboardContext` for one project render."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         org_store: OrganizationStore,

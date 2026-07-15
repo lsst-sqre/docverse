@@ -273,7 +273,7 @@ class LockService:
                     )
                     try:
                         await lock_conn.invalidate()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         self._logger.warning(
                             "Failed to invalidate stuck lock connection",
                             lock_id=lock_key.lock_id,

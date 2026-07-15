@@ -575,7 +575,7 @@ class ProjectStore:
         await self._session.flush()
         return [row[0] for row in result.all()]
 
-    async def update_github_metadata(  # noqa: PLR0913
+    async def update_github_metadata(
         self,
         *,
         project_id: int,

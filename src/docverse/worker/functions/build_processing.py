@@ -192,7 +192,7 @@ async def _publish_build_processed(
     )
 
 
-async def _guard_stale_build(  # noqa: PLR0913
+async def _guard_stale_build(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
@@ -233,7 +233,7 @@ async def _guard_stale_build(  # noqa: PLR0913
     return False
 
 
-async def _process_build_locked(  # noqa: PLR0913
+async def _process_build_locked(
     *,
     session: AsyncSession,
     factory: Factory,
@@ -342,7 +342,7 @@ async def _process_build_locked(  # noqa: PLR0913
         )
 
 
-async def _mark_stale_skipped(  # noqa: PLR0913
+async def _mark_stale_skipped(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
@@ -421,7 +421,7 @@ async def _resolve_api_base_url(
         return None
     try:
         api_base = await discovery.url_for_internal("docverse")
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             "Failed to resolve Docverse API URL from Repertoire; omitting "
             "HATEOAS URLs from build_processing progress",
@@ -436,7 +436,7 @@ async def _resolve_api_base_url(
     return api_base
 
 
-async def _finalize_success(  # noqa: PLR0913
+async def _finalize_success(
     *,
     session: AsyncSession,
     factory: Factory,
@@ -564,7 +564,7 @@ async def _finalize_success(  # noqa: PLR0913
     return len(tracking_result.updated), len(tracking_result.skipped)
 
 
-async def _enqueue_publish_jobs(  # noqa: PLR0913
+async def _enqueue_publish_jobs(
     *,
     session: AsyncSession,
     factory: Factory,
@@ -627,7 +627,7 @@ async def _enqueue_publish_jobs(  # noqa: PLR0913
     return publish_jobs
 
 
-async def _track_editions(  # noqa: PLR0913
+async def _track_editions(
     *,
     session: AsyncSession,
     factory: Factory,
@@ -657,7 +657,7 @@ async def _track_editions(  # noqa: PLR0913
             build = await build_store.get_by_id(build_id)
             if build is None:
                 msg = f"Build {build_id} vanished after completion"
-                raise RuntimeError(msg)  # noqa: TRY301
+                raise RuntimeError(msg)
             tracking_result = await tracking_service.track_build(build)
         logger.info(
             "Edition tracking complete",
@@ -674,7 +674,7 @@ async def _track_editions(  # noqa: PLR0913
         return tracking_result
 
 
-async def _process_build(  # noqa: PLR0913
+async def _process_build(
     *,
     object_store: ObjectStore,
     build: Build,
@@ -694,7 +694,7 @@ async def _process_build(  # noqa: PLR0913
         "Downloading staging tarball",
         staging_key=build.staging_key,
     )
-    # TODO(DM-54426): Full tarball loaded  # noqa: TD003, FIX002
+    # TODO(DM-54426): Full tarball loaded
     # into memory. Streaming the download would reduce peak memory
     # usage for large documentation builds.
     tarball_data = await object_store.download_object(key=build.staging_key)
@@ -714,7 +714,7 @@ async def _process_build(  # noqa: PLR0913
             return len(data)
 
     tasks: list[asyncio.Task[int]] = []
-    # TODO(DM-54426): All extracted files  # noqa: TD003, FIX002
+    # TODO(DM-54426): All extracted files
     # held in memory before uploads begin. Streaming extraction with
     # concurrent upload would lower peak memory for large builds.
     with tarfile.open(fileobj=io.BytesIO(tarball_data), mode="r:gz") as tar:
@@ -763,7 +763,7 @@ async def _process_build(  # noqa: PLR0913
     try:
         await object_store.delete_object(key=build.staging_key)
         logger.info("Deleted staging tarball", staging_key=build.staging_key)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             "Failed to delete staging tarball",
             staging_key=build.staging_key,

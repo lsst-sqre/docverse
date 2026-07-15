@@ -147,7 +147,7 @@ def _mock_create_objectstore(
 ) -> Any:
     """Return a patched create_objectstore_for_org that returns
     the given mock store.
-    """  # noqa: D205
+    """
 
     async def _create(
         self: Factory,
@@ -412,7 +412,7 @@ async def test_build_processing_edition_failure_no_build_fail(
 ) -> None:
     """Edition tracking failure gives completed_with_errors,
     not failed.
-    """  # noqa: D205
+    """
     logger = _logger()
     mock_store = MockObjectStore()
 
@@ -489,7 +489,7 @@ async def test_build_processing_edition_failure_no_build_fail(
 
 
 @pytest.mark.asyncio
-async def test_build_processing_enqueues_publish_edition(  # noqa: PLR0915
+async def test_build_processing_enqueues_publish_edition(
     app: None,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,

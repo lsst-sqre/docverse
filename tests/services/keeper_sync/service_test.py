@@ -1207,7 +1207,7 @@ async def test_sync_build_does_not_reclaim_recent_pending_placeholders(
 
 
 @pytest.mark.asyncio
-async def test_dual_upload_convergence_links_existing_build_and_skips_copy(  # noqa: PLR0915
+async def test_dual_upload_convergence_links_existing_build_and_skips_copy(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,

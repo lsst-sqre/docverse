@@ -159,7 +159,7 @@ class LtdClientFactory(Protocol):
 class KeeperSyncProjectService:
     """Read-only project-status service for the org-admin GET endpoint."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         org_store: OrganizationStore,
@@ -631,7 +631,7 @@ def _explain_all_tiers(
     ]
 
 
-def _build_tier_status(  # noqa: PLR0913
+def _build_tier_status(
     *,
     tier: Tier,
     tier_name: KeeperSyncTierName,

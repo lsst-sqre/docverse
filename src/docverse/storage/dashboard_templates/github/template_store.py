@@ -96,7 +96,7 @@ class DashboardGitHubTemplateStore:
             return None
         return DashboardGitHubTemplate.model_validate(row)
 
-    async def upsert(  # noqa: PLR0913
+    async def upsert(
         self,
         *,
         key: GitHubTemplateKey,

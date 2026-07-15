@@ -168,7 +168,7 @@ async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     raise RuntimeError(msg)
 
 
-async def _evaluate_org(  # noqa: PLR0913
+async def _evaluate_org(
     *,
     session: AsyncSession,
     factory: Factory,
@@ -364,7 +364,7 @@ def _index_builds_by_id(
     return {b.id: b for builds in builds_by_project.values() for b in builds}
 
 
-async def _apply_decision(  # noqa: PLR0913
+async def _apply_decision(
     *,
     edition_service: EditionService,
     build_store: BuildStore,

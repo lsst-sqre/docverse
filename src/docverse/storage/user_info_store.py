@@ -69,6 +69,6 @@ class StubUserInfoStore:
     ) -> None:
         self._groups = groups or []
 
-    async def get_groups(self, token: str) -> list[str]:  # noqa: ARG002
+    async def get_groups(self, token: str) -> list[str]:
         """Return pre-configured groups."""
         return self._groups

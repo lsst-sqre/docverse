@@ -36,8 +36,8 @@ def test_build_processing_progress_typed_fields() -> None:
     )
 
     assert progress.message == "Build processing complete"
-    assert progress.object_count == 3  # noqa: PLR2004
-    assert progress.total_size_bytes == 1024  # noqa: PLR2004
+    assert progress.object_count == 3
+    assert progress.total_size_bytes == 1024
 
     assert progress.editions_updated is not None
     assert isinstance(progress.editions_updated[0], EditionUpdateRef)
@@ -109,8 +109,8 @@ def test_non_build_progress_omits_null_build_fields() -> None:
 
     # The shared ``message`` field and the ``extra='allow'`` extras survive.
     assert dumped["message"] == "Discovery complete"
-    assert dumped["in_scope_count"] == 5  # noqa: PLR2004
-    assert dumped["enqueued_count"] == 4  # noqa: PLR2004
+    assert dumped["in_scope_count"] == 5
+    assert dumped["enqueued_count"] == 4
     # None of the six build-specific typed fields leak as ``null``.
     for key in _SIX_BUILD_KEYS:
         assert key not in dumped
@@ -125,7 +125,7 @@ def test_build_progress_keeps_set_fields_drops_unset() -> None:
     dumped = progress.model_dump(mode="json")
 
     # Set fields — including nested entries with embedded data — survive.
-    assert dumped["object_count"] == 3  # noqa: PLR2004
+    assert dumped["object_count"] == 3
     assert dumped["editions_updated"][0]["slug"] == "main"
     assert dumped["publish_jobs"][0]["edition_slug"] == "main"
     # ``edition_tracking_error`` was never set → omitted, not serialized null.
@@ -144,7 +144,7 @@ def test_build_processing_progress_allows_extra_keys() -> None:
 
     dumped = progress.model_dump(exclude_none=True)
     assert dumped["stale_skipped"] is True
-    assert dumped["latest_build_id"] == 42  # noqa: PLR2004
+    assert dumped["latest_build_id"] == 42
 
 
 def _queue_job(**overrides: object) -> dict[str, object]:
@@ -185,8 +185,8 @@ def test_queue_job_progress_preserves_non_build_payload() -> None:
 
     assert job.progress is not None
     dumped = job.progress.model_dump(exclude_none=True)
-    assert dumped["in_scope_count"] == 5  # noqa: PLR2004
-    assert dumped["enqueued_count"] == 4  # noqa: PLR2004
+    assert dumped["in_scope_count"] == 5
+    assert dumped["enqueued_count"] == 4
 
 
 def test_queue_job_progress_none() -> None:

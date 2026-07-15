@@ -122,7 +122,7 @@ def generate_base32_id(*, length: int = 12, split_every: int = 4) -> str:
     return result
 
 
-Base32Id: TypeAlias = Annotated[  # noqa: UP040
+Base32Id: TypeAlias = Annotated[
     int,
     PlainValidator(validate_base32_id),
     PlainSerializer(

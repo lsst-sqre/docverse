@@ -23,7 +23,7 @@ from docverse.validation import parse_base32_id
 class BuildService:
     """Business logic for build management."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         store: BuildStore,
         org_store: OrganizationStore,

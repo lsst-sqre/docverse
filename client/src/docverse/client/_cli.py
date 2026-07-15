@@ -106,7 +106,7 @@ def main() -> None:
     default=False,
     help="Show detailed HTTP request/response information.",
 )
-def upload(  # noqa: PLR0913
+def upload(
     org: str,
     project: str,
     git_ref: str | None,
@@ -205,7 +205,7 @@ def deploy_worker(
     click.echo(f"Packing cloudflare worker from {worker_dir}")
     try:
         pack_result = subprocess.run(
-            ["npm", "pack", "--json"],  # noqa: S607
+            ["npm", "pack", "--json"],
             check=True,
             capture_output=True,
             text=True,
@@ -224,8 +224,8 @@ def deploy_worker(
     click.echo(f"Unpacking worker into {dest_dir}")
     shutil.copy2(worker_dir / tarball_name, dest_dir / tarball_name)
     try:
-        subprocess.run(  # noqa: S603
-            ["tar", "xzf", tarball_name, "--strip-components=1"],  # noqa: S607
+        subprocess.run(
+            ["tar", "xzf", tarball_name, "--strip-components=1"],
             check=True,
             cwd=str(dest_dir),
         )
@@ -241,7 +241,7 @@ def deploy_worker(
     click.echo("Installing worker dependencies")
     try:
         subprocess.run(
-            ["npm", "install", "--production"],  # noqa: S607
+            ["npm", "install", "--production"],
             check=True,
             capture_output=True,
             text=True,
@@ -264,7 +264,7 @@ def deploy_worker(
         wrangler_cmd.extend(["--dry-run", f"--outdir={outdir}"])
     click.echo(f"Deploying worker (env={wrangler_env}, dry_run={dry_run})")
     try:
-        subprocess.run(  # noqa: S603
+        subprocess.run(
             wrangler_cmd,
             check=True,
             cwd=str(deployments_repo),
@@ -280,7 +280,7 @@ def _detect_git_ref() -> str:
     """Detect the current git ref from HEAD."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],  # noqa: S607
+            ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=True,
@@ -294,7 +294,7 @@ def _detect_git_ref() -> str:
     return result.stdout.strip()
 
 
-async def _upload_async(  # noqa: PLR0913
+async def _upload_async(
     *,
     org: str,
     project: str,
@@ -339,7 +339,7 @@ async def _upload_async(  # noqa: PLR0913
                     "The organization may not have an object "
                     "store configured."
                 )
-                raise DocverseClientError(msg)  # noqa: TRY301
+                raise DocverseClientError(msg)
 
             click.echo("Uploading tarball")
             await client.upload_tarball(build.upload_url, tarball_path)
@@ -353,7 +353,7 @@ async def _upload_async(  # noqa: PLR0913
 
             if build.queue_url is None:
                 msg = "Server did not return a queue URL after upload"
-                raise DocverseClientError(msg)  # noqa: TRY301
+                raise DocverseClientError(msg)
 
             click.echo("Waiting for build processing")
             job = await client.wait_for_job(build.queue_url)

@@ -39,11 +39,11 @@ router = APIRouter()
     summary="List builds for a project",
     name="get_builds",
 )
-async def get_builds(  # noqa: PLR0913
+async def get_builds(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
     cursor: Annotated[
         str | None,
         Query(
@@ -149,7 +149,7 @@ async def get_build(
     project_slug: ProjectSlugParam,
     build_id: BuildIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_reader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_reader)],
 ) -> Build:
     async with context.session.begin():
         service = context.factory.create_build_service()
@@ -167,13 +167,13 @@ async def get_build(
     summary="Update a build (signal upload complete)",
     name="patch_build",
 )
-async def patch_build(  # noqa: PLR0913
+async def patch_build(
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     build_id: BuildIdParam,
     data: BuildUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_uploader)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_uploader)],
 ) -> Build:
     queue_url: str | None = None
     upload_completed = False
@@ -246,7 +246,7 @@ async def delete_build(
     project_slug: ProjectSlugParam,
     build_id: BuildIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_build_service()

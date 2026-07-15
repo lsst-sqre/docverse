@@ -1,4 +1,3 @@
-# ruff: noqa: ARG001
 """Tests for the deploy-worker CLI command."""
 
 from __future__ import annotations

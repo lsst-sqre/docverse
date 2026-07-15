@@ -134,7 +134,7 @@ async def test_exchange_installation_token(mock_github: GitHubMock) -> None:
         )
         token = await client.exchange_installation_token(42)
 
-    assert token == "ghs_test_abc"  # noqa: S105
+    assert token == "ghs_test_abc"
 
 
 @pytest.mark.asyncio
@@ -167,7 +167,7 @@ async def test_get_installation_auth_returns_token_record(
         )
 
     assert isinstance(auth, InstallationAuth)
-    assert auth.token == "ghs_installtok"  # noqa: S105
+    assert auth.token == "ghs_installtok"
     assert auth.base_url == GITHUB_API_BASE_URL
     assert auth.installation_id == 42
 
@@ -316,7 +316,7 @@ async def test_factory_create_github_app_client_all_set(
             owner="acme", repo="templates"
         )
 
-    assert auth.token == "ghs_factory_test"  # noqa: S105
+    assert auth.token == "ghs_factory_test"
 
 
 @pytest.mark.parametrize(
@@ -554,5 +554,5 @@ async def test_factory_validation_failed_raises_private_key(
         )
         with pytest.raises(GitHubAppNotConfiguredError) as excinfo:
             factory.create_github_app_client()
-    assert excinfo.value.missing_secret == "private_key"  # noqa: S105
+    assert excinfo.value.missing_secret == "private_key"
     assert "validation" in str(excinfo.value)

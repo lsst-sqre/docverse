@@ -272,7 +272,7 @@ async def keeper_sync_run_discovery(
                     f"Keeper sync is disabled for organization "
                     f"{org_slug!r}; aborting discovery"
                 )
-                raise RuntimeError(msg)  # noqa: TRY301
+                raise RuntimeError(msg)
 
             ltd_slugs = await _fetch_ltd_product_slugs(
                 factory=factory, config=config, logger=logger
@@ -423,7 +423,7 @@ async def keeper_sync_project(
         try:
             if org is None:
                 msg = f"Organization {org_id} not found"
-                raise RuntimeError(msg)  # noqa: TRY301
+                raise RuntimeError(msg)
             publishing_store_label = org.publishing_store_label
             if publishing_store_label is None:
                 msg = (
@@ -431,7 +431,7 @@ async def keeper_sync_project(
                     "configured; keeper-sync requires a publishing "
                     "object store"
                 )
-                raise RuntimeError(msg)  # noqa: TRY301
+                raise RuntimeError(msg)
 
             service = factory.create_keeper_sync_service(
                 org_id=org_id,
@@ -509,7 +509,7 @@ async def keeper_sync_project(
     raise RuntimeError(msg)
 
 
-def _build_on_edition_synced(  # noqa: PLR0913
+def _build_on_edition_synced(
     *,
     factory: Factory,
     session: AsyncSession,
@@ -541,7 +541,7 @@ def _build_on_edition_synced(  # noqa: PLR0913
     return callback
 
 
-async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
+async def _enqueue_publish_for_synced_edition(
     *,
     factory: Factory,
     session: AsyncSession,
@@ -609,7 +609,7 @@ async def _enqueue_publish_for_synced_edition(  # noqa: PLR0913
     )
 
 
-async def _self_heal_unpublished_editions(  # noqa: PLR0913
+async def _self_heal_unpublished_editions(
     *,
     factory: Factory,
     session: AsyncSession,
@@ -809,7 +809,7 @@ async def _fetch_tombstoned_project_slugs(
     }
 
 
-async def _enqueue_children(  # noqa: PLR0913
+async def _enqueue_children(
     *,
     ctx: dict[str, Any],
     session: AsyncSession,
@@ -1579,7 +1579,7 @@ async def _cached_main_edition_url(
     return cached if isinstance(cached, str) else None
 
 
-async def _record_main_polled(  # noqa: PLR0913
+async def _record_main_polled(
     *,
     session: AsyncSession,
     state_store: KeeperSyncStateStore,
@@ -1640,7 +1640,7 @@ async def _record_main_polled(  # noqa: PLR0913
         )
 
 
-async def _record_tier_polled(  # noqa: PLR0913
+async def _record_tier_polled(
     *,
     session: AsyncSession,
     state_store: KeeperSyncStateStore,
@@ -1752,7 +1752,7 @@ async def _has_stale_non_main_edition(
     return any(should_refresh_other_edition(state=s, now=now) for s in states)
 
 
-async def _enqueue_tier_project_sync(  # noqa: PLR0913
+async def _enqueue_tier_project_sync(
     *,
     session: AsyncSession,
     queue_job_store: QueueJobStore,

@@ -32,7 +32,7 @@ class MockObjectStore:
         self,
         *,
         base_url: str = _DEFAULT_BASE_URL,
-        logger: structlog.stdlib.BoundLogger | None = None,  # noqa: ARG002
+        logger: structlog.stdlib.BoundLogger | None = None,
     ) -> None:
         self._base_url = base_url
         self._objects: dict[str, _StoredObject] = {}

@@ -495,8 +495,8 @@ async def test_sync_unexpected_auth_error_propagates(
         async def get_installation_auth(
             self,
             *,
-            owner: str,  # noqa: ARG002
-            repo: str,  # noqa: ARG002
+            owner: str,
+            repo: str,
         ) -> InstallationAuth:
             msg = "unexpected bug during auth lookup"
             raise RuntimeError(msg)
@@ -548,7 +548,7 @@ async def test_sync_unexpected_fetch_error_propagates(
         ) -> None:
             pass
 
-        async def fetch(self, **kwargs: Any) -> Any:  # noqa: ARG002
+        async def fetch(self, **kwargs: Any) -> Any:
             msg = "unexpected bug during tree fetch"
             raise RuntimeError(msg)
 

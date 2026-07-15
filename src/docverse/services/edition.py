@@ -31,7 +31,7 @@ from docverse.validation import parse_base32_id
 class EditionService:
     """Business logic for edition management."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         store: EditionStore,
         org_store: OrganizationStore,
@@ -120,7 +120,7 @@ class EditionService:
             raise NotFoundError(msg)
         return org, project, edition
 
-    async def list_by_project(  # noqa: PLR0913
+    async def list_by_project(
         self,
         *,
         org_slug: str,
@@ -296,7 +296,7 @@ class EditionService:
             )
         return edition
 
-    async def list_history(  # noqa: PLR0913
+    async def list_history(
         self,
         *,
         org_slug: str,

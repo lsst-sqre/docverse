@@ -39,7 +39,7 @@ class MockEditionPublisher:
     def __init__(
         self,
         *,
-        logger: structlog.stdlib.BoundLogger | None = None,  # noqa: ARG002
+        logger: structlog.stdlib.BoundLogger | None = None,
     ) -> None:
         self._calls: list[PublishCall] = []
         self._unpublish_calls: list[UnpublishCall] = []

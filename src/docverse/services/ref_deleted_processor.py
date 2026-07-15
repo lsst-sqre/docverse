@@ -87,7 +87,7 @@ class RefDeletedWebhookProcessor:
     opens its own ``session.begin()``.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         project_store: ProjectStore,

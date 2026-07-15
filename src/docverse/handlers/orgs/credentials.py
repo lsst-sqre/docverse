@@ -26,7 +26,7 @@ router = APIRouter()
 async def get_credentials(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> list[OrganizationCredentialResponse]:
     async with context.session.begin():
         service = context.factory.create_credential_service()
@@ -50,7 +50,7 @@ async def post_credential(
     org_slug: OrgSlugParam,
     data: OrganizationCredentialCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> OrganizationCredentialResponse:
     async with context.session.begin():
         service = context.factory.create_credential_service()
@@ -76,7 +76,7 @@ async def get_credential(
     org_slug: OrgSlugParam,
     credential_label: CredentialLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> OrganizationCredentialResponse:
     async with context.session.begin():
         service = context.factory.create_credential_service()
@@ -98,7 +98,7 @@ async def delete_credential(
     org_slug: OrgSlugParam,
     credential_label: CredentialLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],  # noqa: ARG001
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> None:
     async with context.session.begin():
         service = context.factory.create_credential_service()

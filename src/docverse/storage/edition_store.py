@@ -108,7 +108,7 @@ class EditionStore:
         await self._session.refresh(row)
         return self._validate(row, None)
 
-    async def create_internal(  # noqa: PLR0913
+    async def create_internal(
         self,
         *,
         project_id: int,
@@ -629,7 +629,7 @@ class EditionStore:
         return matching
 
     @staticmethod
-    def _edition_matches(  # noqa: PLR0911
+    def _edition_matches(
         edition: Edition,
         git_ref: str,
         alternate_name: str | None,

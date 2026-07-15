@@ -245,7 +245,7 @@ class Build(_BuildBase):
     """Build response model with HATEOAS URLs."""
 
     @classmethod
-    def from_domain(  # noqa: PLR0913
+    def from_domain(
         cls,
         domain: BuildDomain,
         request: Request,

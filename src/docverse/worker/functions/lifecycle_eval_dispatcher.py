@@ -218,7 +218,7 @@ async def _create_run_with_children(
     return run, queue_jobs
 
 
-async def _enqueue_arq_jobs(  # noqa: PLR0913
+async def _enqueue_arq_jobs(
     *,
     ctx: dict[str, Any],
     session: AsyncSession,

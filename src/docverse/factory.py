@@ -110,7 +110,7 @@ class WebhookDispatch:
 class Factory:
     """Build Docverse service objects."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
@@ -445,11 +445,11 @@ class Factory:
             validation marked the credentials as invalid.
         """
         if self._github_app_id is None:
-            raise GitHubAppNotConfiguredError(missing_secret="app_id")  # noqa: S106
+            raise GitHubAppNotConfiguredError(missing_secret="app_id")
         if self._github_app_private_key is None:
-            raise GitHubAppNotConfiguredError(missing_secret="private_key")  # noqa: S106
+            raise GitHubAppNotConfiguredError(missing_secret="private_key")
         if self._github_webhook_secret is None:
-            raise GitHubAppNotConfiguredError(missing_secret="webhook_secret")  # noqa: S106
+            raise GitHubAppNotConfiguredError(missing_secret="webhook_secret")
         if not self._github_app_validated:
             # The startup validator failed but does not record which
             # specific credential is to blame; the canonical failure
@@ -462,7 +462,7 @@ class Factory:
             # routes to the same operator persona as the unset-key
             # case.
             raise GitHubAppNotConfiguredError(
-                missing_secret="private_key",  # noqa: S106
+                missing_secret="private_key",
                 message="GitHub App credentials failed startup validation",
             )
         return (
@@ -944,7 +944,7 @@ class Factory:
 class HandlerFactory(Factory):
     """Factory for request handlers with arq queue and user info."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,

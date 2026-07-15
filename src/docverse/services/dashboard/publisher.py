@@ -68,7 +68,7 @@ class DashboardPublisher:
     edition.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         org_store: OrganizationStore,

@@ -58,7 +58,7 @@ class OrgRoleDependency:
     def __init__(self, min_role: OrgRole) -> None:
         self._min_role = min_role
 
-    async def __call__(  # noqa: D102
+    async def __call__(
         self,
         org_slug: OrgSlugParam,
         request: Request,

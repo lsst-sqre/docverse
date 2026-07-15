@@ -123,7 +123,7 @@ class DocverseClient:
             raise RuntimeError(msg)
         return self._http
 
-    async def create_build(  # noqa: PLR0913
+    async def create_build(
         self,
         org: str,
         project: str,
@@ -290,7 +290,7 @@ def _raise_for_status(response: httpx.Response) -> None:
         return
     try:
         detail = response.text
-    except Exception:  # noqa: BLE001
+    except Exception:
         detail = "<no body>"
     msg = f"HTTP {response.status_code}: {detail}"
     raise DocverseClientError(msg, status_code=response.status_code)

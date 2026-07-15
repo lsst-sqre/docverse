@@ -213,7 +213,7 @@ def _seed_ltd(mock_discovery: respx.Router) -> None:
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_runs_service_and_enqueues_publish(  # noqa: PLR0915
+async def test_keeper_sync_project_runs_service_and_enqueues_publish(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
@@ -577,7 +577,7 @@ async def test_keeper_sync_project_short_circuit_skips_publish_enqueue(
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_self_heals_unpublished_short_circuit(  # noqa: PLR0915
+async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,

@@ -284,7 +284,7 @@ class BuildStore:
         await self._session.refresh(row)
         return Build.model_validate(row)
 
-    async def update_inventory(  # noqa: PLR0913
+    async def update_inventory(
         self,
         *,
         build_id: int,

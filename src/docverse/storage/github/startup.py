@@ -42,7 +42,7 @@ class GitHubAppValidationState(Protocol):
         """Record the outcome of the startup-time validation."""
 
 
-async def validate_github_app(  # noqa: PLR0913
+async def validate_github_app(
     *,
     state: GitHubAppValidationState,
     app_id: int | None,
@@ -87,7 +87,7 @@ async def validate_github_app(  # noqa: PLR0913
     )
     try:
         html_url = await client.validate()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Validator must not crash the service. Known failure types
         # are ``jwt.exceptions.InvalidKeyError`` (PEM parse) and
         # ``gidgethub.GitHubException`` (non-2xx response), but

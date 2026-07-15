@@ -191,7 +191,7 @@ def test_upload_completed_with_errors(tmp_path: Path) -> None:
                 ],
             )
 
-    assert result.exit_code == 2  # noqa: PLR2004
+    assert result.exit_code == 2
 
 
 def test_upload_failed(tmp_path: Path) -> None:

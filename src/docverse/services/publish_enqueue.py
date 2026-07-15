@@ -56,7 +56,7 @@ class PublishEnqueueResult:
         self.backend_job_id = backend_job_id
 
 
-async def enqueue_publish_for_edition(  # noqa: PLR0913
+async def enqueue_publish_for_edition(
     *,
     session: AsyncSession,
     edition_store: EditionStore,

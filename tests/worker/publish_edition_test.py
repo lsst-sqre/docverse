@@ -114,7 +114,7 @@ def _mock_create_edition_publisher(
 ) -> Any:
     """Return a patched ``create_edition_publisher_for_org`` that
     returns the given publisher.
-    """  # noqa: D205
+    """
 
     async def _create(
         self: Factory,

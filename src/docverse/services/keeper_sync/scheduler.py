@@ -195,7 +195,7 @@ _TIER_ANNOTATION_KEYS: dict[Tier, str] = {
 }
 
 
-def should_poll_for_tier(  # noqa: PLR0913
+def should_poll_for_tier(
     *,
     state: KeeperSyncState | None,
     now: datetime,
@@ -434,7 +434,7 @@ class TierStatus:
     next_due_at: datetime | None
 
 
-def explain_tier_status(  # noqa: PLR0913
+def explain_tier_status(
     state: KeeperSyncState | None,
     now: datetime,
     *,

@@ -203,7 +203,7 @@ class KeeperSyncContext:
 class KeeperSyncService:
     """Orchestrate sync for one LTD product / edition / build path."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         session: AsyncSession,
@@ -661,7 +661,7 @@ class KeeperSyncService:
             build_outcome=build_outcome,
         )
 
-    async def _ensure_edition(  # noqa: PLR0913
+    async def _ensure_edition(
         self,
         *,
         project_id: int,
@@ -744,7 +744,7 @@ class KeeperSyncService:
             tracking_params=tracking_params,
         )
 
-    async def sync_build(  # noqa: PLR0913
+    async def sync_build(
         self,
         *,
         org_id: int,

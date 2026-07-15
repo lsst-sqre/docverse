@@ -20,7 +20,7 @@ _lifecycle_rule_adapter: TypeAdapter[object] = TypeAdapter(LifecycleRule)
 def test_draft_inactivity_rule_validates_minimum() -> None:
     rule = DraftInactivityRule(max_days_inactive=30)
     assert rule.type == "draft_inactivity"
-    assert rule.max_days_inactive == 30  # noqa: PLR2004
+    assert rule.max_days_inactive == 30
 
 
 def test_draft_inactivity_rule_rejects_non_positive_days() -> None:
@@ -31,8 +31,8 @@ def test_draft_inactivity_rule_rejects_non_positive_days() -> None:
 def test_build_history_orphan_rule_validates() -> None:
     rule = BuildHistoryOrphanRule(min_position=5, min_age_days=30)
     assert rule.type == "build_history_orphan"
-    assert rule.min_position == 5  # noqa: PLR2004
-    assert rule.min_age_days == 30  # noqa: PLR2004
+    assert rule.min_position == 5
+    assert rule.min_age_days == 30
 
 
 def test_build_history_orphan_rule_rejects_non_positive_position() -> None:
@@ -126,7 +126,7 @@ def test_lifecycle_rule_set_accepts_multiple_distinct_types() -> None:
         {"type": "ref_deleted"},
     ]
     rule_set = LifecycleRuleSet.model_validate(payload)
-    assert len(rule_set.root) == 3  # noqa: PLR2004
+    assert len(rule_set.root) == 3
 
 
 def test_lifecycle_rule_set_rejects_duplicate_types() -> None:
@@ -169,7 +169,7 @@ def test_project_create_accepts_typed_lifecycle_rules() -> None:
         ],
     )
     assert isinstance(payload.lifecycle_rules, LifecycleRuleSet)
-    assert len(payload.lifecycle_rules.root) == 2  # noqa: PLR2004
+    assert len(payload.lifecycle_rules.root) == 2
 
 
 def test_project_create_rejects_unknown_lifecycle_rule_type() -> None:

@@ -273,7 +273,7 @@ async def _mark_publishing(
     )
 
 
-async def _mark_failed(  # noqa: PLR0913
+async def _mark_failed(
     *,
     edition_store: EditionStore,
     history_store: EditionBuildHistoryStore,
@@ -332,7 +332,7 @@ async def _maybe_finalise_keeper_sync_run(
     )
 
 
-async def _publish_edition_published(  # noqa: PLR0913
+async def _publish_edition_published(
     *,
     ctx: dict[str, Any],
     session: AsyncSession,
