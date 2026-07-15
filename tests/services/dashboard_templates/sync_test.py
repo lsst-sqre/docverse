@@ -7,10 +7,10 @@ from typing import Any, cast
 import httpx
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate
 from docverse.exceptions import NotFoundError
 from docverse.services.dashboard_templates import sync as sync_module
 from docverse.services.dashboard_templates.sync import (

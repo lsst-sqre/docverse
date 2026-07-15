@@ -7,9 +7,9 @@ auth dependency wiring.
 from __future__ import annotations
 
 import pytest
-from docverse.client.models import OrgRole
 from httpx import AsyncClient
 
+from docverse.client.models import OrgRole
 from tests.conftest import seed_build, seed_member, seed_org_with_admin
 
 CONTENT_HASH = (

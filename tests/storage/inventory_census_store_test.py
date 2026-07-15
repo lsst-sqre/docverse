@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
+
 from docverse.client.models import (
     BuildCreate,
     EditionKind,
@@ -17,9 +20,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import func
-
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.project import SqlProject

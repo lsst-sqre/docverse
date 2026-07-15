@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 
 import structlog
-from docverse.client.models import EditionKind
 from rubin.repertoire import DiscoveryClient
 
+from docverse.client.models import EditionKind
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.dashboard_context import (

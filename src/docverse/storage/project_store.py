@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from docverse.client.models import ProjectCreate, ProjectUpdate
 from safir.database import (
     CountedPaginatedList,
     CountedPaginatedQueryRunner,
@@ -15,6 +14,7 @@ from sqlalchemy import REAL, cast, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
+from docverse.client.models import ProjectCreate, ProjectUpdate
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.dbschema.project import SqlProject
 from docverse.domain.project import Project

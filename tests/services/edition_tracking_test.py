@@ -7,6 +7,9 @@ from typing import Any
 
 import pytest
 import structlog
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     EditionCreate,
@@ -15,9 +18,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.project import SqlProject

@@ -26,6 +26,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import structlog
+from safir.database import CountedPaginatedList, PaginationCursor
+
 from docverse.client.models import (
     EditionKind,
     KeeperSyncEditionDiff,
@@ -33,8 +35,6 @@ from docverse.client.models import (
     KeeperSyncTierName,
     KeeperSyncTierStatus,
 )
-from safir.database import CountedPaginatedList, PaginationCursor
-
 from docverse.domain.edition import Edition
 from docverse.exceptions import NotFoundError
 from docverse.services.keeper_sync.scheduler import (

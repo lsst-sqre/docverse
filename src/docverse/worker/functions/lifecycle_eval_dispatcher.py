@@ -43,11 +43,11 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from docverse.client.models import JobKind, LifecycleEvalRunStatus
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import JobKind, LifecycleEvalRunStatus
 from docverse.domain.lifecycle_eval_run import LifecycleEvalRun
 from docverse.domain.organization import Organization
 from docverse.domain.queue import QueueJob

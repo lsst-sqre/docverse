@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import structlog
-from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
-from docverse.client.models.queue_enums import JobKind, PublishStatus
 from safir.database import CountedPaginatedList, PaginationCursor
 
+from docverse.client.models import EditionCreate, EditionKind, EditionUpdate
+from docverse.client.models.queue_enums import JobKind, PublishStatus
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistoryWithBuild

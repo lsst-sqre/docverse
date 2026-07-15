@@ -13,9 +13,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+
 from docverse.client.models import EditionKind, TrackingMode
 from docverse.client.models.builds import BuildStatus
-
 from docverse.domain.base32id import Base32Id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition

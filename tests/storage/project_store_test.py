@@ -6,14 +6,14 @@ import asyncio
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
     ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,

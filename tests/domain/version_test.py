@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from docverse.client.models import TrackingMode
 
+from docverse.client.models import TrackingMode
 from docverse.domain.version import (
     EupsDailyVersion,
     EupsMajorVersion,

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from docverse.client.models import DashboardTemplateBindingCreate
 from fastapi import APIRouter, Depends, Response, status
 
+from docverse.client.models import DashboardTemplateBindingCreate
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.base32id import serialize_base32_id

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate, ProjectCreate
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate, ProjectCreate
 from docverse.domain.project import Project
 from docverse.services.dashboard_templates.resolver import (
     ResolvedTemplateOrigin,

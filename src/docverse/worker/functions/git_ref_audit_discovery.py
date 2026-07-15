@@ -49,11 +49,11 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from docverse.client.models import GitRefAuditRunStatus, JobKind
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import GitRefAuditRunStatus, JobKind
 from docverse.config import config
 from docverse.domain.git_ref_audit_run import GitRefAuditRun
 from docverse.domain.organization import Organization

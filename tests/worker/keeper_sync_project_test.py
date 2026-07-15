@@ -23,6 +23,17 @@ import pytest
 import respx
 import sentry_sdk
 import structlog
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from safir.testing.sentry import (
+    TestTransport,
+    capture_events_fixture,
+    sentry_init_fixture,
+)
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildStatus,
     EditionCreate,
@@ -35,17 +46,6 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import PublishStatus
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from safir.testing.sentry import (
-    TestTransport,
-    capture_events_fixture,
-    sentry_init_fixture,
-)
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.config import Configuration
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun

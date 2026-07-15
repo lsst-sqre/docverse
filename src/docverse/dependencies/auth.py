@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated
 
-from docverse.client.models import OrgRole
 from fastapi import Depends, Request
 
+from docverse.client.models import OrgRole
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.authorization import AuthBasis, AuthorizationResult
 from docverse.domain.organization import Organization

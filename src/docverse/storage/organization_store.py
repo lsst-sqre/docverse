@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     KeeperSyncConfig,
     OrganizationCreate,
     OrganizationUpdate,
 )
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.organization import SqlOrganization
 from docverse.domain.organization import Organization
 

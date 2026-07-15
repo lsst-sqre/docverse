@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from fastapi import APIRouter, Depends, Query, status
+
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
     EditionRollback,
     EditionUpdate,
 )
-from fastapi import APIRouter, Depends, Query, status
-
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,

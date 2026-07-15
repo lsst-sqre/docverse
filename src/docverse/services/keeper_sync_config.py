@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import structlog
-from docverse.client.models import KeeperSyncConfig
 
+from docverse.client.models import KeeperSyncConfig
 from docverse.exceptions import NotFoundError
 from docverse.storage.organization_store import OrganizationStore
 

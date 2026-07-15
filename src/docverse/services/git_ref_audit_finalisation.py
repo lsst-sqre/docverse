@@ -12,7 +12,6 @@ next to the unhelpful generic shape.
 from __future__ import annotations
 
 from docverse.client.models import GitRefAuditRunStatus
-
 from docverse.exceptions import NotFoundError
 from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
 

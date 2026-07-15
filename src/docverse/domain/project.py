@@ -5,11 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from docverse.client.models.projects import (
     InstallationStatus,
     build_github_url,
 )
-from pydantic import BaseModel, ConfigDict, Field
 
 from .lifecycle import LifecycleRuleSet
 

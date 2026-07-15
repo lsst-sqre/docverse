@@ -5,13 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from docverse.client.models import (
-    EditionCreate,
-    EditionKind,
-    EditionUpdate,
-    TrackingMode,
-)
-from docverse.client.models.queue_enums import PublishStatus
 from safir.database import (
     CountedPaginatedList,
     CountedPaginatedQueryRunner,
@@ -22,6 +15,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
+from docverse.client.models import (
+    EditionCreate,
+    EditionKind,
+    EditionUpdate,
+    TrackingMode,
+)
+from docverse.client.models.queue_enums import PublishStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState

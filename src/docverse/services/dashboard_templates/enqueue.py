@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 
 import sentry_sdk
 import structlog
-from docverse.client.models.queue_enums import JobKind
 
+from docverse.client.models.queue_enums import JobKind
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import QueueJob
 from docverse.exceptions import NotFoundError

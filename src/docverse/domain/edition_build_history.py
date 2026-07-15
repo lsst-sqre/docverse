@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from docverse.client.models import BuildStatus
 from docverse.client.models.builds import BuildAnnotations
 from docverse.client.models.queue_enums import PublishStatus
-from pydantic import BaseModel, ConfigDict, Field
 
 
 class EditionBuildHistory(BaseModel):

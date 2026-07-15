@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from httpx import AsyncClient
+from safir.dependencies.db_session import db_session_dependency
+
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
@@ -14,9 +17,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from httpx import AsyncClient
-from safir.dependencies.db_session import db_session_dependency
-
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.keeper_sync import (

@@ -10,9 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from docverse.client.models import OrgRole
 from httpx import AsyncClient
 
+from docverse.client.models import OrgRole
 from docverse.dependencies.context import context_dependency
 from docverse.storage.user_info_store import StubUserInfoStore
 from tests.conftest import seed_group_member, seed_org_with_admin

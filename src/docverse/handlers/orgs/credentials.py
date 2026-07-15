@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from docverse.client.models import OrganizationCredentialCreate
-from docverse.client.models.infrastructure import CredentialProvider
 from fastapi import APIRouter, Depends, status
 
+from docverse.client.models import OrganizationCredentialCreate
+from docverse.client.models.infrastructure import CredentialProvider
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import CredentialLabelParam, OrgSlugParam

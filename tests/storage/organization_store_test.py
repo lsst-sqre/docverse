@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from docverse.client.models import KeeperSyncConfig, OrganizationCreate
 from pydantic import HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import KeeperSyncConfig, OrganizationCreate
 from docverse.storage.organization_store import OrganizationStore
 
 

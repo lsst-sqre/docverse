@@ -6,8 +6,8 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from docverse.client.models import EditionKind
 
+from docverse.client.models import EditionKind
 from docverse.domain.dashboard_context import (
     AssetsContext,
     BuildContext,

@@ -5,12 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from docverse.client.models import BuildCreate, BuildStatus
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
+from docverse.client.models import BuildCreate, BuildStatus
 from docverse.dbschema.build import SqlBuild
 from docverse.domain.base32id import (
     generate_base32_id,

@@ -5,14 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from safir.database import CountedPaginatedList, PaginationCursor
+
 from docverse.client.models import (
     DefaultEditionConfig,
     EditionKind,
     ProjectCreate,
     ProjectUpdate,
 )
-from safir.database import CountedPaginatedList, PaginationCursor
-
 from docverse.domain.edition import Edition
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project

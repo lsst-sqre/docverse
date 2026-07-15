@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import structlog
-from docverse.client.models import BuildCreate, BuildStatus, JobKind
 from safir.database import CountedPaginatedList
 
+from docverse.client.models import BuildCreate, BuildStatus, JobKind
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.project import Project

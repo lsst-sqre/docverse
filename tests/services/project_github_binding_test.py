@@ -5,12 +5,12 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
 from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.dbschema.project import SqlProject
 from docverse.services.project_github_binding import (
     ProjectGitHubBindingResolver,

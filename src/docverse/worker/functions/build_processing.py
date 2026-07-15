@@ -18,15 +18,15 @@ from typing import Any
 
 import sentry_sdk
 import structlog
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildProcessingProgress,
     BuildStatus,
     EditionUpdateRef,
     PublishJobRef,
 )
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.domain.api_urls import edition_url, queue_job_url
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult

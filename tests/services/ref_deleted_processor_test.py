@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
@@ -15,8 +17,6 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.services.edition import EditionService
 from docverse.services.ref_deleted_processor import (
     AffectedProject,

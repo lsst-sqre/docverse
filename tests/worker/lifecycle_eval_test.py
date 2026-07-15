@@ -15,6 +15,11 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 import structlog
+from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import select, update
+
 from docverse.client.models import (
     BuildCreate,
     EditionKind,
@@ -24,11 +29,6 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import JobKind, JobStatus
-from safir.dependencies.db_session import db_session_dependency
-from safir.metrics import MockEventPublisher
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import select, update
-
 from docverse.config import Configuration
 from docverse.dbschema.build import SqlBuild
 from docverse.dbschema.edition import SqlEdition

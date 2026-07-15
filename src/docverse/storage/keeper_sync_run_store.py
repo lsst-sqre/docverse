@@ -14,11 +14,11 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from docverse.client.models import KeeperSyncRunKind, KeeperSyncRunStatus
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import KeeperSyncRunKind, KeeperSyncRunStatus
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.keeper_sync_run import (

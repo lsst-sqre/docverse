@@ -6,8 +6,8 @@ import json
 from typing import Any
 
 import structlog
-from docverse.client.models import CredentialProvider
 
+from docverse.client.models import CredentialProvider
 from docverse.domain.organization_credential import OrganizationCredential
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.services.credential_encryptor import CredentialEncryptor

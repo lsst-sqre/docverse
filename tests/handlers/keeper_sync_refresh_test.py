@@ -14,11 +14,11 @@ from typing import Literal
 
 import pytest
 import structlog
-from docverse.client.models import OrgRole
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 
+from docverse.client.models import OrgRole
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.queue import JobKind
 from docverse.storage.organization_store import OrganizationStore

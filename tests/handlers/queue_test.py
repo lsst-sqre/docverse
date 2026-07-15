@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     EditionCreate,
@@ -12,9 +15,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.storage.build_store import BuildStore

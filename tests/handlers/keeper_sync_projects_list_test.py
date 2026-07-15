@@ -12,13 +12,13 @@ from typing import Any, Literal
 
 import pytest
 import structlog
-from docverse.client.models import OrgRole
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrgRole
 from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore

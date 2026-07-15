@@ -24,6 +24,8 @@ from typing import Any
 
 import sentry_sdk
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
@@ -34,8 +36,6 @@ from docverse.client.models import (
 )
 from docverse.client.models.editions import DefaultEditionConfig
 from docverse.client.models.projects import parse_github_url
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition

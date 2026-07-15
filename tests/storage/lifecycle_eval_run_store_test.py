@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
-from docverse.client.models import LifecycleEvalRunStatus, OrganizationCreate
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import LifecycleEvalRunStatus, OrganizationCreate
 from docverse.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id

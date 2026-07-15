@@ -7,12 +7,12 @@ from typing import Any
 import httpx
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate
-from docverse.client.models.queue_enums import JobKind
 from safir.arq import MockArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate
+from docverse.client.models.queue_enums import JobKind
 from docverse.config import Configuration
 from docverse.services.dashboard_templates.enqueue import DashboardSyncEnqueuer
 from docverse.services.dashboard_templates.push_processor import (

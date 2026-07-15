@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
@@ -27,10 +31,6 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.queue_enums import JobKind, PublishStatus
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.config import Configuration
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.domain.base32id import serialize_base32_id

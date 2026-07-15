@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from docverse.client.models import OrganizationUpdate
 from fastapi import APIRouter, Depends
 
+from docverse.client.models import OrganizationUpdate
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,

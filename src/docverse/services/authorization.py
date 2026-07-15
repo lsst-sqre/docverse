@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import structlog
-from docverse.client.models import OrgRole, PrincipalType
 
+from docverse.client.models import OrgRole, PrincipalType
 from docverse.domain.authorization import AuthBasis, AuthorizationResult
 from docverse.domain.membership import ROLE_RANK
 from docverse.exceptions import PermissionDeniedError

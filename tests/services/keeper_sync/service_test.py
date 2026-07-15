@@ -19,6 +19,10 @@ import pytest
 import pytest_asyncio
 import respx
 import structlog
+from safir.github import GitHubAppClientFactory
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
@@ -28,10 +32,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from safir.github import GitHubAppClientFactory
-from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.build import SqlBuild
 from docverse.domain.lifecycle import (
     BuildHistoryOrphanRule,

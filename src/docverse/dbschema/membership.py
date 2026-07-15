@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from docverse.client.models import OrgRole, PrincipalType
 from sqlalchemy import Enum, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
+
+from docverse.client.models import OrgRole, PrincipalType
 
 from .base import Base
 

@@ -16,10 +16,10 @@ from typing import Any
 
 import sentry_sdk
 import structlog
-from docverse.client.models.queue_enums import PublishStatus
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models.queue_enums import PublishStatus
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory

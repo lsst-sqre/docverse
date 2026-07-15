@@ -6,10 +6,10 @@ from typing import Any
 
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.projects import ProjectGitHubBindingCreate
 from docverse.services.dashboard_templates.installation_processor import (
     INSTALLATION_DELETED_REASON,
     INSTALLATION_SUSPENDED_REASON,

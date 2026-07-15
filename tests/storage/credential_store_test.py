@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate
 from docverse.storage.organization_credential_store import (
     OrganizationCredentialStore,
 )

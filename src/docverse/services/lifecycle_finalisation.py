@@ -11,7 +11,6 @@ pure and unaware of run-level orchestration.
 from __future__ import annotations
 
 from docverse.client.models import LifecycleEvalRunStatus
-
 from docverse.exceptions import NotFoundError
 from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
 

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     BuildStatus,
     OrganizationCreate,
     ProjectCreate,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.domain.base32id import serialize_base32_id
 from docverse.exceptions import InvalidBuildStateError
 from docverse.storage.build_store import BuildStore

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     EditionCreate,
@@ -14,8 +16,6 @@ from docverse.client.models import (
     TrackingMode,
 )
 from docverse.client.models.builds import BuildAnnotations
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
 from docverse.storage.build_store import BuildStore
 from docverse.storage.edition_build_history_store import (

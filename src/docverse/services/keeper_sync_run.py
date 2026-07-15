@@ -12,14 +12,14 @@ flow plus the read-side ``GET`` operations. The deeper per-project
 from __future__ import annotations
 
 import structlog
+from safir.database import CountedPaginatedList
+from sqlalchemy.exc import IntegrityError
+
 from docverse.client.models import (
     JobKind,
     KeeperSyncRunKind,
     KeeperSyncRunStatus,
 )
-from safir.database import CountedPaginatedList
-from sqlalchemy.exc import IntegrityError
-
 from docverse.domain.keeper_sync_run import (
     KeeperSyncRun,
     KeeperSyncRunWithActivity,

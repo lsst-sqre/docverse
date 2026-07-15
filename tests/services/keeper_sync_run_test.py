@@ -6,15 +6,15 @@ from typing import Literal
 
 import pytest
 import structlog
+from safir.arq import MockArqQueue
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     KeeperSyncConfig,
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
-from safir.arq import MockArqQueue
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind

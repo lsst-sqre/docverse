@@ -9,6 +9,10 @@ import httpx
 import pytest
 import respx
 import structlog
+from rubin.repertoire import DiscoveryClient, register_mock_discovery
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     BuildCreate,
     EditionKind,
@@ -17,10 +21,6 @@ from docverse.client.models import (
     TrackingMode,
     UrlScheme,
 )
-from rubin.repertoire import DiscoveryClient, register_mock_discovery
-from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.edition import SqlEdition
 from docverse.domain.organization import Organization
 from docverse.domain.project import Project

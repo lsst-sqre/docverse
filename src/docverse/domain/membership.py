@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from docverse.client.models import OrgRole, PrincipalType
 from pydantic import BaseModel, ConfigDict, Field
+
+from docverse.client.models import OrgRole, PrincipalType
 
 # Role hierarchy for comparison (higher value = more permissions)
 ROLE_RANK: dict[OrgRole, int] = {

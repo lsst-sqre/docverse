@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from docverse.client.models import GitRefAuditRunStatus
 from pydantic import BaseModel, ConfigDict, Field
+
+from docverse.client.models import GitRefAuditRunStatus
 
 __all__ = [
     "GitRefAuditRun",

@@ -104,6 +104,13 @@ ignore = [
     "INP001",  # Implicit namespace package (intentional for docverse).
 ]
 
+[tool.ruff.lint.isort]
+# docverse-client is a separately-distributed but co-developed package sharing
+# the docverse namespace (docverse.client.*); group its imports as first-party.
+# The shared ruff-shared.toml intentionally carries no known-first-party, so this
+# repo-specific declaration lives here (matches gafaelfawr/nublado convention).
+known-first-party = ["docverse", "docverse.client", "tests"]
+
 [tool.ruff.lint.extend-per-file-ignores]
 "src/docverse/cli.py" = [
     "A001",   # Shadowing builtin (help command).

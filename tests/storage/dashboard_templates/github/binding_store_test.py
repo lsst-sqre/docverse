@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 import structlog
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.queue_enums import JobKind
 from sqlalchemy import Table
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationCreate, ProjectCreate
+from docverse.client.models.queue_enums import JobKind
 from docverse.dbschema.dashboard_github_template_binding import (
     SqlDashboardGitHubTemplateBinding,
 )

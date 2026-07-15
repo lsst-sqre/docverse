@@ -36,15 +36,15 @@ from typing import Any, Literal, Protocol
 import httpx
 import sentry_sdk
 import structlog
+from safir.arq import ArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     JobKind,
     KeeperSyncConfig,
     KeeperSyncRunStatus,
 )
-from safir.arq import ArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.config import config
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.keeper_sync_run import KeeperSyncRunWithActivity

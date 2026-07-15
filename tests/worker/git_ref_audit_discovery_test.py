@@ -11,6 +11,11 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
+from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     GitRefAuditRunStatus,
     JobKind,
@@ -18,11 +23,6 @@ from docverse.client.models import (
     ProjectCreate,
 )
 from docverse.client.models.projects import ProjectGitHubBindingCreate
-from safir.arq import MockArqQueue
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.config import config as runtime_config
 from docverse.dbschema.git_ref_audit_run import SqlGitRefAuditRun
 from docverse.dbschema.queue_job import SqlQueueJob

@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from docverse.client.models import OrganizationServiceUpdate
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrganizationServiceUpdate
 from docverse.dbschema.organization_service import SqlOrganizationService
 from docverse.domain.organization_service import OrganizationService
 

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import structlog
-from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.client.models import OrgMembershipCreate, OrgRole, PrincipalType
 from docverse.dbschema.membership import SqlOrgMembership
 from docverse.domain.membership import ROLE_RANK, OrgMembership
 

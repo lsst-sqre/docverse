@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from docverse.client.models import (
     EditionCreate,
     EditionKind,
@@ -14,8 +16,6 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
