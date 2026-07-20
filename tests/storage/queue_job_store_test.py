@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -1891,3 +1894,73 @@ async def test_fail_orphaned_jobs_skips_other_kinds(
         await db_session.commit()
 
     assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_public_ids_are_time_ordered(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Jobs enqueued in succession carry time-ordered public IDs.
+
+    A short real-time gap guarantees the two mints land in distinct
+    milliseconds so the ordering comes from the time-ordered high bits.
+    """
+    async with db_session.begin():
+        first = await store.create(kind=JobKind.build_processing, org_id=1)
+        await asyncio.sleep(0.005)
+        second = await store.create(kind=JobKind.build_processing, org_id=1)
+        await db_session.commit()
+
+    assert second.public_id > first.public_id
+
+
+@pytest.mark.asyncio
+async def test_create_retries_on_public_id_collision(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A colliding public_id is re-minted with no error and no merged rows."""
+    collision_id = 313131
+    fresh_id = 888888
+
+    def _fake_ids() -> Iterator[int]:
+        yield from (collision_id, fresh_id)
+
+    ids = _fake_ids()
+    monkeypatch.setattr(
+        "docverse.storage._public_id.generate_resource_id",
+        lambda: next(ids),
+    )
+
+    async with db_session.begin():
+        # Pre-insert a job occupying ``collision_id`` and flush it into the
+        # outer transaction so the retried insert races a persistent row.
+        existing = SqlQueueJob(
+            public_id=collision_id,
+            kind=JobKind.build_processing.value,
+            status=JobStatus.queued.value,
+            org_id=1,
+            subject_label="pre-existing",
+        )
+        db_session.add(existing)
+        await db_session.flush()
+
+        created = await store.create(kind=JobKind.build_processing, org_id=1)
+        await db_session.commit()
+
+    # The retry minted the fresh id, leaving the pre-existing row untouched.
+    assert created.public_id == fresh_id
+
+    async with db_session.begin():
+        total = await db_session.scalar(
+            select(func.count()).select_from(SqlQueueJob)
+        )
+        preserved = await db_session.scalar(
+            select(SqlQueueJob.subject_label).where(
+                SqlQueueJob.public_id == collision_id
+            )
+        )
+    assert total == 2
+    assert preserved == "pre-existing"

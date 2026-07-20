@@ -12,13 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import (
-    generate_base32_id,
-    serialize_base32_id,
-    validate_base32_id,
-)
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus, QueueJob
 from docverse.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 from docverse.storage.pagination import QueueJobDateCreatedCursor
 
 __all__ = ["QueueJobStore"]
@@ -51,25 +48,30 @@ class QueueJobStore:
     ) -> QueueJob:
         """Insert a new QueueJob row with status=queued.
 
-        Generates a Base32 public_id. Calls flush() to get DB defaults.
+        Mints a time-ordered Base32 ``public_id`` at insert time, re-minting
+        on the (rare) same-millisecond collision. Calls flush() to get DB
+        defaults.
         """
-        public_id = validate_base32_id(generate_base32_id())
-        row = SqlQueueJob(
-            public_id=public_id,
-            backend_job_id=backend_job_id,
-            kind=kind.value,
-            status=JobStatus.queued.value,
-            org_id=org_id,
-            project_id=project_id,
-            build_id=build_id,
-            edition_id=edition_id,
-            keeper_sync_run_id=keeper_sync_run_id,
-            lifecycle_eval_run_id=lifecycle_eval_run_id,
-            git_ref_audit_run_id=git_ref_audit_run_id,
-            subject_label=subject_label,
+
+        def _make_row(public_id: int) -> SqlQueueJob:
+            return SqlQueueJob(
+                public_id=public_id,
+                backend_job_id=backend_job_id,
+                kind=kind.value,
+                status=JobStatus.queued.value,
+                org_id=org_id,
+                project_id=project_id,
+                build_id=build_id,
+                edition_id=edition_id,
+                keeper_sync_run_id=keeper_sync_run_id,
+                lifecycle_eval_run_id=lifecycle_eval_run_id,
+                git_ref_audit_run_id=git_ref_audit_run_id,
+                subject_label=subject_label,
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
         )
-        self._session.add(row)
-        await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
 
