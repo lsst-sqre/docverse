@@ -7,7 +7,6 @@
       "Bash(uv sync:*)",
       "Bash(uv run nox:*)",
       "Bash(uv run --only-group=nox nox:*)",
-      "Bash(TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox:*)",
       "Bash(npm test:*)",
       "Bash(npm run:*)",
       "Bash(npx vitest:*)",

@@ -17,10 +17,10 @@ Node/TypeScript). The named commands below target the primary
 
 ## Test commands
 
-- `focused_test`: `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test -- tests/path/to/file_test.py::test_name`
+- `focused_test`: `uv run --only-group=nox nox -s test -- tests/path/to/file_test.py::test_name`
 - `complete_test`: run only the suite(s) for the package(s) you changed,
   per `## Monorepo selectors` — server change →
-  `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test`;
+  `uv run --only-group=nox nox -s test`;
   client change → `uv run --only-group=nox nox -s client_test`; both
   changed → run both. The full cross-package suite is **not** the
   in-iteration gate (see `## Final validation`).
@@ -55,7 +55,7 @@ Additional checks by component:
 
 Scope test/lint commands to the package you changed:
 
-- **Server** (`src/docverse/`, `tests/`, `alembic/`, `noxfile.py`): `TC_HOST=localhost TESTCONTAINERS_RYUK_DISABLED=true uv run --only-group=nox nox -s test -- tests/...`
+- **Server** (`src/docverse/`, `tests/`, `alembic/`, `noxfile.py`): `uv run --only-group=nox nox -s test -- tests/...`
 - **Client** (`client/`): `uv run --only-group=nox nox -s client_test -- client/tests/...`
 - **Cloudflare worker** (`cloudflare-worker/`): `cd cloudflare-worker && npm run build && npm test`
 - Lint and typing are repo-wide regardless of which package changed (`lint_all` / `typing` above cover all components).
