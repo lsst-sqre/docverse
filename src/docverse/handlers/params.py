@@ -14,7 +14,9 @@ __all__ = [
     "MemberIdParam",
     "OrgSlugParam",
     "ProjectSlugParam",
+    "RunIdParam",
     "ServiceLabelParam",
+    "TombstoneIdParam",
 ]
 
 CredentialLabelParam = Annotated[
@@ -49,7 +51,20 @@ JobIdParam = Annotated[
     str,
     Path(alias="job", description="Base32-encoded queue job identifier."),
 ]
+RunIdParam = Annotated[
+    str,
+    Path(
+        alias="run", description="Base32-encoded keeper-sync run identifier."
+    ),
+]
 ServiceLabelParam = Annotated[
     str,
     Path(alias="service", description="Service label."),
+]
+TombstoneIdParam = Annotated[
+    str,
+    Path(
+        alias="tombstone",
+        description="Base32-encoded keeper-sync tombstone identifier.",
+    ),
 ]

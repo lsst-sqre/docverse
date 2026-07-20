@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from docverse.client.models import KeeperSyncRunKind, KeeperSyncRunStatus
 
+from .base32id import Base32Id
+
 __all__ = [
     "KeeperSyncRun",
     "KeeperSyncRunActivity",
@@ -23,6 +25,9 @@ class KeeperSyncRun(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int = Field(description="Primary key for the run.")
+    public_id: Base32Id = Field(
+        description="Time-ordered Base32 public identifier for the run."
+    )
     org_id: int = Field(description="Organization that owns the run.")
     kind: KeeperSyncRunKind = Field(description="Kind of run.")
     status: KeeperSyncRunStatus = Field(description="Lifecycle status.")

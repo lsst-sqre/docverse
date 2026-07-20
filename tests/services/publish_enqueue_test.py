@@ -33,7 +33,11 @@ from docverse.client.models import (
 from docverse.client.models.queue_enums import JobKind, PublishStatus
 from docverse.config import Configuration
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse.domain.queue import JobStatus
 from docverse.services.publish_enqueue import enqueue_publish_for_edition
 from docverse.storage.build_store import BuildStore
@@ -136,7 +140,10 @@ async def test_enqueue_publish_for_edition_records_history_when_missing(
             build_public_id,
         ) = await _seed_org_project_edition_build(db_session)
         run_row = SqlKeeperSyncRun(
-            org_id=org_id, kind="backfill", status="in_progress"
+            public_id=validate_base32_id(generate_base32_id()),
+            org_id=org_id,
+            kind="backfill",
+            status="in_progress",
         )
         db_session.add(run_row)
         await db_session.flush()

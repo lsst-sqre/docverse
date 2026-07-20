@@ -103,7 +103,9 @@ class KeeperSyncRun(BaseModel):
         )
     )
 
-    id: int = Field(description="Numeric identifier for the run.")
+    id: str = Field(
+        description="Public Crockford Base32 identifier for the run."
+    )
 
     kind: KeeperSyncRunKind = Field(description="Kind of run.")
 
@@ -513,7 +515,7 @@ class KeeperSyncTombstone(BaseModel):
     """One tombstoned ``keeper_sync_state`` row.
 
     Returned by ``GET /orgs/{org}/keeper-sync/tombstones`` and
-    ``DELETE /orgs/{org}/keeper-sync/tombstones/{state_id}`` (the
+    ``DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}`` (the
     DELETE returns 204 with no body, so this model only appears on
     list responses today; keeping it as a sibling of the list-entry
     shape lets a future "get one tombstone" endpoint reuse it).
@@ -531,11 +533,11 @@ class KeeperSyncTombstone(BaseModel):
         )
     )
 
-    state_id: int = Field(
+    id: str = Field(
         description=(
-            "Primary key of the underlying ``keeper_sync_state`` row."
-            " Use this id with the DELETE endpoint to clear the"
-            " tombstone."
+            "Public Crockford Base32 identifier for the tombstoned"
+            " ``keeper_sync_state`` row. Use this id with the DELETE"
+            " endpoint to clear the tombstone."
         )
     )
 

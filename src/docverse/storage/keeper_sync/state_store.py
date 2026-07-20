@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 
 if TYPE_CHECKING:
     from docverse.storage.pagination import (
@@ -95,6 +96,7 @@ class KeeperSyncState(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: int
     org_id: int
     resource_type: str
     ltd_id: int | None = None
@@ -403,6 +405,32 @@ class KeeperSyncStateStore:
             return None
         return KeeperSyncState.model_validate(row)
 
+    async def get_by_public_id_for_org(
+        self,
+        *,
+        public_id: int,
+        org_id: int,
+    ) -> KeeperSyncState | None:
+        """Fetch a state row by its Base32 ``public_id``, scoped to an org.
+
+        The admin tombstones DELETE endpoint addresses rows by their
+        Base32 ``public_id``; scoping to ``org_id`` keeps the lookup
+        org-isolated so a guessed id from a different org returns
+        ``None`` (404) rather than the wrong row. Tombstoned rows are
+        visible to this lookup — the admin clear path is the only
+        caller and must be able to see the row it is about to
+        un-tombstone.
+        """
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.public_id == public_id,
+            SqlKeeperSyncState.org_id == org_id,
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncState.model_validate(row)
+
     async def upsert(
         self,
         *,
@@ -423,6 +451,12 @@ class KeeperSyncStateStore:
         ``(org_id, resource_type, ltd_id)`` for editions / builds. On
         update, only non-``None`` fields overwrite the existing row;
         ``None`` arguments preserve whatever value is already stored.
+
+        A newly inserted row is minted a time-ordered Base32 ``public_id``
+        via :func:`insert_with_time_ordered_public_id`, which re-mints on
+        the (rare) same-millisecond collision. Every state row carries a
+        public id, not just tombstoned ones — a tombstone is simply a
+        state row with ``date_tombstoned`` set.
         """
         clauses = _key_clauses(
             org_id=org_id,
@@ -435,19 +469,27 @@ class KeeperSyncStateStore:
         )
         row = existing.scalar_one_or_none()
         if row is None:
-            row = SqlKeeperSyncState(
-                org_id=org_id,
-                resource_type=resource_type.value,
-                ltd_id=ltd_id,
-                ltd_slug=ltd_slug,
-                docverse_id=docverse_id,
-                date_last_synced=date_last_synced,
-                date_rebuilt_seen=date_rebuilt_seen,
-                last_seen_etag=last_seen_etag,
-                content_hash=content_hash,
-                annotations=annotations,
+
+            def _make_row(public_id: int) -> SqlKeeperSyncState:
+                return SqlKeeperSyncState(
+                    public_id=public_id,
+                    org_id=org_id,
+                    resource_type=resource_type.value,
+                    ltd_id=ltd_id,
+                    ltd_slug=ltd_slug,
+                    docverse_id=docverse_id,
+                    date_last_synced=date_last_synced,
+                    date_rebuilt_seen=date_rebuilt_seen,
+                    last_seen_etag=last_seen_etag,
+                    content_hash=content_hash,
+                    annotations=annotations,
+                )
+
+            row = await insert_with_time_ordered_public_id(
+                self._session, _make_row
             )
-            self._session.add(row)
+            await self._session.refresh(row)
+            return KeeperSyncState.model_validate(row)
         else:
             row.ltd_slug = ltd_slug
             if docverse_id is not None:

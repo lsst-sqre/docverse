@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.dbschema.project import SqlProject
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 from docverse.storage.keeper_sync import (
     KeeperSyncState,
     KeeperSyncStateStore,
@@ -131,21 +132,31 @@ class KeeperSyncTombstoneService:
         if row is None:
             # Lifecycle-preemptive path: no Docverse row exists yet, so
             # synthesise a state row carrying only the tombstone fields.
-            row = SqlKeeperSyncState(
-                org_id=org_id,
-                resource_type=resource_type.value,
-                ltd_id=ltd_id,
-                ltd_slug=ltd_slug if ltd_slug is not None else str(ltd_id),
-                date_tombstoned=now,
-                tombstone_reason=reason.value,
-                tombstone_note=note,
+            # Every state row carries a time-ordered ``public_id``, minted
+            # here with the same collision-retry helper the state store's
+            # upsert uses.
+            resolved_slug = ltd_slug if ltd_slug is not None else str(ltd_id)
+
+            def _make_row(public_id: int) -> SqlKeeperSyncState:
+                return SqlKeeperSyncState(
+                    public_id=public_id,
+                    org_id=org_id,
+                    resource_type=resource_type.value,
+                    ltd_id=ltd_id,
+                    ltd_slug=resolved_slug,
+                    date_tombstoned=now,
+                    tombstone_reason=reason.value,
+                    tombstone_note=note,
+                )
+
+            row = await insert_with_time_ordered_public_id(
+                self._session, _make_row
             )
-            self._session.add(row)
         else:
             row.date_tombstoned = now
             row.tombstone_reason = reason.value
             row.tombstone_note = note
-        await self._session.flush()
+            await self._session.flush()
         await self._session.refresh(row)
         self._logger.info(
             "Sync tombstone recorded",
@@ -259,21 +270,21 @@ class KeeperSyncTombstoneService:
     async def clear(
         self,
         *,
-        state_id: int,
+        public_id: int,
         org_id: int,
     ) -> ClearedTombstone:
         """Clear the tombstone on a state row, reviving its Docverse row.
 
-        Backs ``DELETE /orgs/{org}/keeper-sync/tombstones/{state_id}``.
-        Looks up the state row by ``(state_id, org_id)`` so a guessed
-        id from another org is invisible. The state row's
-        ``date_tombstoned`` / ``tombstone_reason`` / ``tombstone_note``
-        are cleared in-place. When the row carries a non-null
-        ``docverse_id`` and the matching ``editions`` / ``projects``
-        row is still soft-deleted, that row's ``date_deleted`` is
-        cleared in the *same* transaction — otherwise the next sync
-        iteration would crash on the slug clash because the
-        soft-deleted row still occupies the
+        Backs ``DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}``.
+        Looks up the state row by ``(public_id, org_id)`` — its Base32
+        public id scoped to the org — so a guessed id from another org
+        is invisible. The state row's ``date_tombstoned`` /
+        ``tombstone_reason`` / ``tombstone_note`` are cleared in-place.
+        When the row carries a non-null ``docverse_id`` and the
+        matching ``editions`` / ``projects`` row is still soft-deleted,
+        that row's ``date_deleted`` is cleared in the *same*
+        transaction — otherwise the next sync iteration would crash on
+        the slug clash because the soft-deleted row still occupies the
         ``uq_editions_project_lower_slug`` index slot. Soft-delete on
         builds is not modelled in this codebase, so the build branch
         only clears the tombstone fields.
@@ -281,7 +292,7 @@ class KeeperSyncTombstoneService:
         Raises
         ------
         NotFoundError
-            When no row matches ``(state_id, org_id)`` *or* the
+            When no row matches ``(public_id, org_id)`` *or* the
             matched row is not tombstoned. (Clearing an already-clear
             row is treated as "no such tombstone" — the admin URL is
             meaningful only on a tombstoned row.)
@@ -291,12 +302,13 @@ class KeeperSyncTombstoneService:
             NotFoundError,
         )
 
-        state = await self._state_store.get_by_id_for_org(
-            state_id=state_id, org_id=org_id
+        state = await self._state_store.get_by_public_id_for_org(
+            public_id=public_id, org_id=org_id
         )
         if state is None or state.date_tombstoned is None:
-            msg = f"No tombstone found for state_id={state_id}"
+            msg = f"No tombstone found for public_id={public_id}"
             raise NotFoundError(msg)
+        state_id = state.id
 
         await self._session.execute(
             update(SqlKeeperSyncState)

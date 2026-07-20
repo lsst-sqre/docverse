@@ -147,7 +147,7 @@ async def sync_org_dashboard_template(
         queue_job = await enqueuer.enqueue(binding.id)
         await context.session.commit()
     return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
-        binding.id, queue_job, context.request
+        queue_job, context.request
     )
 
 
@@ -263,5 +263,5 @@ async def sync_project_dashboard_template(
         queue_job = await enqueuer.enqueue(binding.id)
         await context.session.commit()
     return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
-        binding.id, queue_job, context.request
+        queue_job, context.request
     )
