@@ -71,6 +71,85 @@ async def test_upsert_inserts_row_first_time(
 
 
 @pytest.mark.asyncio
+async def test_upsert_mints_unique_public_id(
+    db_session: AsyncSession,
+) -> None:
+    """Every newly upserted row gets a distinct time-ordered ``public_id``."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        first = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="1",
+        )
+        second = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="2",
+        )
+    async with db_session.begin():
+        public_ids = list(
+            (
+                await db_session.execute(
+                    select(SqlKeeperSyncState.public_id)
+                    .where(SqlKeeperSyncState.org_id == org_id)
+                    .order_by(SqlKeeperSyncState.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert first.id != second.id
+    # Both inserts minted a populated, non-null, unique public_id.
+    assert len(public_ids) == 2
+    assert all(pid is not None and pid > 0 for pid in public_ids)
+    assert len(set(public_ids)) == 2
+
+
+@pytest.mark.asyncio
+async def test_upsert_reuses_public_id_on_update(
+    db_session: AsyncSession,
+) -> None:
+    """A second upsert on the same key does not re-mint ``public_id``."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        inserted = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=1,
+        )
+
+    async def _public_id() -> int:
+        async with db_session.begin():
+            return (
+                await db_session.execute(
+                    select(SqlKeeperSyncState.public_id).where(
+                        SqlKeeperSyncState.id == inserted.id
+                    )
+                )
+            ).scalar_one()
+
+    first_public_id = await _public_id()
+    async with db_session.begin():
+        await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=2,
+        )
+    assert await _public_id() == first_public_id
+
+
+@pytest.mark.asyncio
 async def test_upsert_updates_only_non_none_fields(
     db_session: AsyncSession,
 ) -> None:

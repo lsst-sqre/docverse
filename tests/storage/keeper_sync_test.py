@@ -22,6 +22,12 @@ def _make_run(**kwargs: Any) -> SqlKeeperSyncRun:
     return SqlKeeperSyncRun(**kwargs)
 
 
+def _make_state(**kwargs: Any) -> SqlKeeperSyncState:
+    """Build a state row with a minted ``public_id`` for seeding tests."""
+    kwargs.setdefault("public_id", validate_base32_id(generate_base32_id()))
+    return SqlKeeperSyncState(**kwargs)
+
+
 async def _seed_org(session: AsyncSession, *, slug: str = "ks-org") -> int:
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -118,7 +124,7 @@ async def test_keeper_sync_state_unique_constraint(
     async with db_session.begin():
         org_id = await _seed_org(db_session)
         db_session.add(
-            SqlKeeperSyncState(
+            _make_state(
                 org_id=org_id,
                 resource_type="project",
                 ltd_id=42,
@@ -129,7 +135,7 @@ async def test_keeper_sync_state_unique_constraint(
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncState(
+                _make_state(
                     org_id=org_id,
                     resource_type="project",
                     ltd_id=42,
@@ -146,7 +152,7 @@ async def test_keeper_sync_state_allows_distinct_resource_types_same_id(
     async with db_session.begin():
         org_id = await _seed_org(db_session)
         db_session.add(
-            SqlKeeperSyncState(
+            _make_state(
                 org_id=org_id,
                 resource_type="project",
                 ltd_id=1,
@@ -154,7 +160,7 @@ async def test_keeper_sync_state_allows_distinct_resource_types_same_id(
             )
         )
         db_session.add(
-            SqlKeeperSyncState(
+            _make_state(
                 org_id=org_id,
                 resource_type="edition",
                 ltd_id=1,
@@ -201,7 +207,7 @@ async def test_keeper_sync_state_resource_type_check_rejects_invalid(
     async with db_session.begin():
         org_id = await _seed_org(db_session)
         db_session.add(
-            SqlKeeperSyncState(
+            _make_state(
                 org_id=org_id,
                 resource_type="build",
                 ltd_id=7,
@@ -212,7 +218,7 @@ async def test_keeper_sync_state_resource_type_check_rejects_invalid(
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncState(
+                _make_state(
                     org_id=org_id,
                     resource_type="garbage",
                     ltd_id=99,
@@ -232,7 +238,7 @@ async def test_keeper_sync_state_tombstone_reason_check_rejects_invalid(
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncState(
+                _make_state(
                     org_id=org_id,
                     resource_type="edition",
                     ltd_id=1,
@@ -250,7 +256,7 @@ async def test_keeper_sync_state_tombstone_reason_check_allows_null(
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-tomb-check-null")
         db_session.add(
-            SqlKeeperSyncState(
+            _make_state(
                 org_id=org_id,
                 resource_type="edition",
                 ltd_id=1,

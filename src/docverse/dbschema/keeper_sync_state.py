@@ -38,6 +38,10 @@ class SqlKeeperSyncState(Base):
         Integer, primary_key=True, autoincrement=True
     )
 
+    public_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, nullable=False, autoincrement=False
+    )
+
     org_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("organizations.id", ondelete="CASCADE"),

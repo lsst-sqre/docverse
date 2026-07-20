@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 
 if TYPE_CHECKING:
     from docverse.storage.pagination import (
@@ -423,6 +424,12 @@ class KeeperSyncStateStore:
         ``(org_id, resource_type, ltd_id)`` for editions / builds. On
         update, only non-``None`` fields overwrite the existing row;
         ``None`` arguments preserve whatever value is already stored.
+
+        A newly inserted row is minted a time-ordered Base32 ``public_id``
+        via :func:`insert_with_time_ordered_public_id`, which re-mints on
+        the (rare) same-millisecond collision. Every state row carries a
+        public id, not just tombstoned ones — a tombstone is simply a
+        state row with ``date_tombstoned`` set.
         """
         clauses = _key_clauses(
             org_id=org_id,
@@ -435,19 +442,27 @@ class KeeperSyncStateStore:
         )
         row = existing.scalar_one_or_none()
         if row is None:
-            row = SqlKeeperSyncState(
-                org_id=org_id,
-                resource_type=resource_type.value,
-                ltd_id=ltd_id,
-                ltd_slug=ltd_slug,
-                docverse_id=docverse_id,
-                date_last_synced=date_last_synced,
-                date_rebuilt_seen=date_rebuilt_seen,
-                last_seen_etag=last_seen_etag,
-                content_hash=content_hash,
-                annotations=annotations,
+
+            def _make_row(public_id: int) -> SqlKeeperSyncState:
+                return SqlKeeperSyncState(
+                    public_id=public_id,
+                    org_id=org_id,
+                    resource_type=resource_type.value,
+                    ltd_id=ltd_id,
+                    ltd_slug=ltd_slug,
+                    docverse_id=docverse_id,
+                    date_last_synced=date_last_synced,
+                    date_rebuilt_seen=date_rebuilt_seen,
+                    last_seen_etag=last_seen_etag,
+                    content_hash=content_hash,
+                    annotations=annotations,
+                )
+
+            row = await insert_with_time_ordered_public_id(
+                self._session, _make_row
             )
-            self._session.add(row)
+            await self._session.refresh(row)
+            return KeeperSyncState.model_validate(row)
         else:
             row.ltd_slug = ltd_slug
             if docverse_id is not None:

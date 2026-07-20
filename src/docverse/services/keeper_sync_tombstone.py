@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse.dbschema.project import SqlProject
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 from docverse.storage.keeper_sync import (
     KeeperSyncState,
     KeeperSyncStateStore,
@@ -131,21 +132,31 @@ class KeeperSyncTombstoneService:
         if row is None:
             # Lifecycle-preemptive path: no Docverse row exists yet, so
             # synthesise a state row carrying only the tombstone fields.
-            row = SqlKeeperSyncState(
-                org_id=org_id,
-                resource_type=resource_type.value,
-                ltd_id=ltd_id,
-                ltd_slug=ltd_slug if ltd_slug is not None else str(ltd_id),
-                date_tombstoned=now,
-                tombstone_reason=reason.value,
-                tombstone_note=note,
+            # Every state row carries a time-ordered ``public_id``, minted
+            # here with the same collision-retry helper the state store's
+            # upsert uses.
+            resolved_slug = ltd_slug if ltd_slug is not None else str(ltd_id)
+
+            def _make_row(public_id: int) -> SqlKeeperSyncState:
+                return SqlKeeperSyncState(
+                    public_id=public_id,
+                    org_id=org_id,
+                    resource_type=resource_type.value,
+                    ltd_id=ltd_id,
+                    ltd_slug=resolved_slug,
+                    date_tombstoned=now,
+                    tombstone_reason=reason.value,
+                    tombstone_note=note,
+                )
+
+            row = await insert_with_time_ordered_public_id(
+                self._session, _make_row
             )
-            self._session.add(row)
         else:
             row.date_tombstoned = now
             row.tombstone_reason = reason.value
             row.tombstone_note = note
-        await self._session.flush()
+            await self._session.flush()
         await self._session.refresh(row)
         self._logger.info(
             "Sync tombstone recorded",
