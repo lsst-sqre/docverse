@@ -1125,7 +1125,7 @@ async def test_org_sync_enqueues_dashboard_sync(client: AsyncClient) -> None:
     )
     assert response.status_code == 202
     body = response.json()
-    assert body["binding_id"] == binding_id
+    assert "binding_id" not in body
     assert body["queue_job_id"]
     assert body["queue_job_url"].endswith(
         f"/queue/jobs/{body['queue_job_id']}"
@@ -1209,7 +1209,7 @@ async def test_project_sync_enqueues_dashboard_sync(
     )
     assert response.status_code == 202
     body = response.json()
-    assert body["binding_id"] == binding_id
+    assert "binding_id" not in body
     assert body["queue_job_id"]
     assert body["queue_job_url"].endswith(
         f"/queue/jobs/{body['queue_job_id']}"
