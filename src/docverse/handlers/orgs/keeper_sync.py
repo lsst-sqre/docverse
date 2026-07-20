@@ -15,7 +15,7 @@ from docverse.client.models import (
 )
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.handlers.params import OrgSlugParam, RunIdParam
+from docverse.handlers.params import OrgSlugParam, RunIdParam, TombstoneIdParam
 from docverse.handlers.queue.models import QueueJob
 from docverse.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse.storage.pagination import (
@@ -499,7 +499,7 @@ async def get_org_keeper_sync_tombstones(
 
 
 @router.delete(
-    "/orgs/{org}/keeper-sync/tombstones/{state_id}",
+    "/orgs/{org}/keeper-sync/tombstones/{tombstone}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Clear a sync tombstone",
@@ -509,20 +509,18 @@ async def delete_org_keeper_sync_tombstone(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    state_id: Annotated[
-        int,
-        Path(description="Primary key of the keeper_sync_state row."),
-    ],
+    tombstone_id: TombstoneIdParam,
 ) -> Response:
+    public_id = parse_base32_id(tombstone_id, resource="tombstone")
     context.rebind_logger(actor=user.username)
     async with context.session.begin():
         service = context.factory.create_keeper_sync_tombstone_service()
-        cleared = await service.clear(state_id=state_id, org_id=user.org.id)
+        cleared = await service.clear(public_id=public_id, org_id=user.org.id)
         await context.session.commit()
     context.logger.info(
         "Cleared sync tombstone",
         org=org_slug,
-        state_id=state_id,
+        tombstone_id=tombstone_id,
         resource_type=cleared.state.resource_type,
         ltd_id=cleared.state.ltd_id,
         ltd_slug=cleared.state.ltd_slug,

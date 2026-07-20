@@ -17,6 +17,7 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse.domain.base32id import serialize_base32_id
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from docverse.storage.edition_store import EditionStore
 from docverse.storage.keeper_sync import (
@@ -58,8 +59,13 @@ async def _record_tombstone(
     ltd_id: int | None = None,
     ltd_slug: str | None = None,
     note: str | None = None,
-) -> int:
-    """Record a tombstone via the service and return the state row id."""
+) -> tuple[int, str]:
+    """Record a tombstone; return ``(state_id, public_id_b32)``.
+
+    ``state_id`` is the internal primary key (for direct store
+    assertions); ``public_id_b32`` is the row's Base32 public id, which
+    is what the tombstone API now addresses and serializes.
+    """
     async for session in db_session_dependency():
         async with session.begin():
             state_store = KeeperSyncStateStore(
@@ -79,7 +85,7 @@ async def _record_tombstone(
                 note=note,
             )
             await session.commit()
-        return state.id
+        return state.id, serialize_base32_id(state.public_id)
     msg = "no session"
     raise AssertionError(msg)
 
@@ -227,7 +233,7 @@ async def test_list_tombstones_returns_recorded_rows(
     """A recorded tombstone appears in the listing with all expected fields."""
     await _setup(client)
     org_id = await _get_org_id()
-    state_id = await _record_tombstone(
+    _state_id, tombstone_id = await _record_tombstone(
         org_id=org_id,
         resource_type=ResourceType.edition,
         reason=TombstoneReason.lifecycle_delete,
@@ -244,7 +250,10 @@ async def test_list_tombstones_returns_recorded_rows(
     body = response.json()
     assert len(body) == 1
     entry = body[0]
-    assert entry["state_id"] == state_id
+    # The API exposes the Base32 public id only; the raw primary key
+    # never appears in the response body.
+    assert entry["id"] == tombstone_id
+    assert "state_id" not in entry
     assert entry["resource_type"] == "edition"
     assert entry["ltd_id"] == 4242
     assert entry["ltd_slug"] == "aged-out"
@@ -253,7 +262,7 @@ async def test_list_tombstones_returns_recorded_rows(
     assert entry["date_tombstoned"] is not None
     assert entry["display_path"] == "aged-out"
     assert entry["self_url"].endswith(
-        f"/orgs/{_ORG}/keeper-sync/tombstones/{state_id}"
+        f"/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}"
     )
 
 
@@ -352,7 +361,7 @@ async def test_delete_tombstone_returns_204(client: AsyncClient) -> None:
     """A successful clear returns 204 with no body."""
     await _setup(client)
     org_id = await _get_org_id()
-    state_id = await _record_tombstone(
+    _state_id, tombstone_id = await _record_tombstone(
         org_id=org_id,
         resource_type=ResourceType.edition,
         reason=TombstoneReason.manual_delete,
@@ -360,7 +369,7 @@ async def test_delete_tombstone_returns_204(client: AsyncClient) -> None:
     )
 
     response = await client.delete(
-        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{state_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 204
@@ -372,7 +381,7 @@ async def test_delete_tombstone_clears_state_row(client: AsyncClient) -> None:
     """After DELETE, the state row's tombstone fields are NULL."""
     await _setup(client)
     org_id = await _get_org_id()
-    state_id = await _record_tombstone(
+    state_id, tombstone_id = await _record_tombstone(
         org_id=org_id,
         resource_type=ResourceType.edition,
         reason=TombstoneReason.manual_delete,
@@ -381,7 +390,7 @@ async def test_delete_tombstone_clears_state_row(client: AsyncClient) -> None:
     )
 
     response = await client.delete(
-        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{state_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 204
@@ -430,10 +439,10 @@ async def test_delete_tombstone_revives_soft_deleted_edition(
             )
     assert state is not None
     assert state.date_tombstoned is not None
-    state_id = state.id
+    tombstone_id = serialize_base32_id(state.public_id)
 
     response = await client.delete(
-        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{state_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 204
@@ -451,16 +460,30 @@ async def test_delete_tombstone_revives_soft_deleted_edition(
 
 
 @pytest.mark.asyncio
-async def test_delete_tombstone_404_for_unknown_state_id(
+async def test_delete_tombstone_404_for_unknown_id(
     client: AsyncClient,
 ) -> None:
-    """A non-existent state_id returns 404."""
+    """A valid-but-unknown Base32 id returns 404."""
     await _setup(client)
+    unknown = serialize_base32_id(999999)
     response = await client.delete(
-        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/999999",
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{unknown}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_tombstone_422_for_malformed_id(
+    client: AsyncClient,
+) -> None:
+    """A malformed (non-Base32) tombstone id is rejected with 422."""
+    await _setup(client)
+    response = await client.delete(
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/not-a-valid-id",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -479,7 +502,7 @@ async def test_delete_tombstone_404_for_other_org(
         other_id = other.id
         break
 
-    state_id = await _record_tombstone(
+    _state_id, tombstone_id = await _record_tombstone(
         org_id=other_id,
         resource_type=ResourceType.edition,
         reason=TombstoneReason.manual_delete,
@@ -487,7 +510,7 @@ async def test_delete_tombstone_404_for_other_org(
     )
 
     response = await client.delete(
-        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{state_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
@@ -512,8 +535,9 @@ async def test_delete_tombstone_404_when_not_tombstoned(
             await session.commit()
         break
 
+    tombstone_id = serialize_base32_id(state.public_id)
     response = await client.delete(
-        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{state.id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404

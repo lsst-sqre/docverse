@@ -96,6 +96,7 @@ class KeeperSyncState(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: int
     org_id: int
     resource_type: str
     ltd_id: int | None = None
@@ -396,6 +397,32 @@ class KeeperSyncStateStore:
         """
         stmt = select(SqlKeeperSyncState).where(
             SqlKeeperSyncState.id == state_id,
+            SqlKeeperSyncState.org_id == org_id,
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncState.model_validate(row)
+
+    async def get_by_public_id_for_org(
+        self,
+        *,
+        public_id: int,
+        org_id: int,
+    ) -> KeeperSyncState | None:
+        """Fetch a state row by its Base32 ``public_id``, scoped to an org.
+
+        The admin tombstones DELETE endpoint addresses rows by their
+        Base32 ``public_id``; scoping to ``org_id`` keeps the lookup
+        org-isolated so a guessed id from a different org returns
+        ``None`` (404) rather than the wrong row. Tombstoned rows are
+        visible to this lookup — the admin clear path is the only
+        caller and must be able to see the row it is about to
+        un-tombstone.
+        """
+        stmt = select(SqlKeeperSyncState).where(
+            SqlKeeperSyncState.public_id == public_id,
             SqlKeeperSyncState.org_id == org_id,
         )
         result = await self._session.execute(stmt)

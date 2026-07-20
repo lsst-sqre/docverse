@@ -16,6 +16,7 @@ __all__ = [
     "ProjectSlugParam",
     "RunIdParam",
     "ServiceLabelParam",
+    "TombstoneIdParam",
 ]
 
 CredentialLabelParam = Annotated[
@@ -59,4 +60,11 @@ RunIdParam = Annotated[
 ServiceLabelParam = Annotated[
     str,
     Path(alias="service", description="Service label."),
+]
+TombstoneIdParam = Annotated[
+    str,
+    Path(
+        alias="tombstone",
+        description="Base32-encoded keeper-sync tombstone identifier.",
+    ),
 ]

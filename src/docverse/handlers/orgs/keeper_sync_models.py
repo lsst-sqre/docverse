@@ -274,20 +274,21 @@ class KeeperSyncTombstone(_KeeperSyncTombstoneBase):
         if state.date_tombstoned is None or state.tombstone_reason is None:
             msg = (
                 "KeeperSyncTombstone.from_domain requires a tombstoned "
-                f"state row; state_id={state.id} has no tombstone"
+                f"state row; public_id={state.public_id} has no tombstone"
             )
             raise KeeperSyncInvariantError(msg)
+        tombstone_public_id = serialize_base32_id(state.public_id)
         return cls(
             self_url=HttpUrl(
                 str(
                     request.url_for(
                         "delete_org_keeper_sync_tombstone",
                         org=org_slug,
-                        state_id=state.id,
+                        tombstone=tombstone_public_id,
                     )
                 )
             ),
-            state_id=state.id,
+            id=tombstone_public_id,
             resource_type=KeeperSyncResourceType(state.resource_type),
             ltd_slug=state.ltd_slug,
             ltd_id=state.ltd_id,
