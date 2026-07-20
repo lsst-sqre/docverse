@@ -308,7 +308,12 @@ async def _seed_org_and_run(
             base_domain=f"{slug}.example.com",
         )
     )
-    run = SqlKeeperSyncRun(org_id=org.id, kind="backfill", status="pending")
+    run = SqlKeeperSyncRun(
+        public_id=validate_base32_id(generate_base32_id()),
+        org_id=org.id,
+        kind="backfill",
+        status="pending",
+    )
     db_session.add(run)
     await db_session.flush()
     await db_session.refresh(run)

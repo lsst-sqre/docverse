@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import structlog
 from sqlalchemy.exc import IntegrityError
@@ -10,7 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.client.models import OrganizationCreate
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.storage.organization_store import OrganizationStore
+
+
+def _make_run(**kwargs: Any) -> SqlKeeperSyncRun:
+    """Build a run row with a minted ``public_id`` for seeding tests."""
+    kwargs.setdefault("public_id", validate_base32_id(generate_base32_id()))
+    return SqlKeeperSyncRun(**kwargs)
 
 
 async def _seed_org(session: AsyncSession, *, slug: str = "ks-org") -> int:
@@ -34,15 +43,13 @@ async def test_partial_unique_index_blocks_two_pending_runs(
     async with db_session.begin():
         org_id = await _seed_org(db_session)
         db_session.add(
-            SqlKeeperSyncRun(org_id=org_id, kind="backfill", status="pending")
+            _make_run(org_id=org_id, kind="backfill", status="pending")
         )
 
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncRun(
-                    org_id=org_id, kind="backfill", status="pending"
-                )
+                _make_run(org_id=org_id, kind="backfill", status="pending")
             )
 
 
@@ -54,17 +61,13 @@ async def test_partial_unique_index_blocks_pending_and_in_progress(
     async with db_session.begin():
         org_id = await _seed_org(db_session)
         db_session.add(
-            SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="in_progress"
-            )
+            _make_run(org_id=org_id, kind="backfill", status="in_progress")
         )
 
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncRun(
-                    org_id=org_id, kind="backfill", status="pending"
-                )
+                _make_run(org_id=org_id, kind="backfill", status="pending")
             )
 
 
@@ -76,22 +79,18 @@ async def test_partial_unique_index_allows_terminal_alongside_pending(
     async with db_session.begin():
         org_id = await _seed_org(db_session)
         db_session.add(
-            SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="succeeded"
-            )
+            _make_run(org_id=org_id, kind="backfill", status="succeeded")
         )
         db_session.add(
-            SqlKeeperSyncRun(org_id=org_id, kind="backfill", status="failed")
+            _make_run(org_id=org_id, kind="backfill", status="failed")
         )
         db_session.add(
-            SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="partial_failure"
-            )
+            _make_run(org_id=org_id, kind="backfill", status="partial_failure")
         )
 
     async with db_session.begin():
         db_session.add(
-            SqlKeeperSyncRun(org_id=org_id, kind="backfill", status="pending")
+            _make_run(org_id=org_id, kind="backfill", status="pending")
         )
 
 
@@ -104,14 +103,10 @@ async def test_partial_unique_index_allows_pending_for_distinct_orgs(
         first_org = await _seed_org(db_session, slug="ks-org-a")
         second_org = await _seed_org(db_session, slug="ks-org-b")
         db_session.add(
-            SqlKeeperSyncRun(
-                org_id=first_org, kind="backfill", status="pending"
-            )
+            _make_run(org_id=first_org, kind="backfill", status="pending")
         )
         db_session.add(
-            SqlKeeperSyncRun(
-                org_id=second_org, kind="backfill", status="pending"
-            )
+            _make_run(org_id=second_org, kind="backfill", status="pending")
         )
 
 
@@ -179,9 +174,7 @@ async def test_keeper_sync_runs_status_check_rejects_invalid(
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncRun(
-                    org_id=org_id, kind="backfill", status="pendng"
-                )
+                _make_run(org_id=org_id, kind="backfill", status="pendng")
             )
 
 
@@ -196,9 +189,7 @@ async def test_keeper_sync_runs_kind_check_rejects_invalid(
     with pytest.raises(IntegrityError):
         async with db_session.begin():
             db_session.add(
-                SqlKeeperSyncRun(
-                    org_id=org_id, kind="garbage", status="pending"
-                )
+                _make_run(org_id=org_id, kind="garbage", status="pending")
             )
 
 

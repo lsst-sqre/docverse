@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import KeeperSyncRunStatus, OrganizationCreate
+from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
 from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobKind, JobStatus
@@ -260,3 +264,117 @@ async def test_missing_run_raises_job_not_found(
         store = KeeperSyncRunStore(session=db_session, logger=_logger())
         with pytest.raises(JobNotFoundError):
             await _call(store)
+
+
+@pytest.mark.asyncio
+async def test_create_mints_public_id(
+    db_session: AsyncSession,
+) -> None:
+    """A freshly-created run carries a positive time-ordered ``public_id``."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        store = KeeperSyncRunStore(session=db_session, logger=_logger())
+        run = await store.create(org_id=org_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        public_id = await db_session.scalar(
+            select(SqlKeeperSyncRun.public_id).where(
+                SqlKeeperSyncRun.id == run.id
+            )
+        )
+    assert public_id is not None
+    assert public_id > 0
+
+
+@pytest.mark.asyncio
+async def test_public_ids_sort_in_creation_order(
+    db_session: AsyncSession,
+) -> None:
+    """Runs created in succession sort by ``public_id`` in creation order.
+
+    The partial unique index permits only one non-terminal run per org, so
+    the first run is driven to a terminal status before the second is
+    created. A short real-time gap guarantees the two mints land in distinct
+    milliseconds so the time-ordered high bits establish the ordering.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        store = KeeperSyncRunStore(session=db_session, logger=_logger())
+        first = await store.create(org_id=org_id)
+        await store.transition_status(
+            run_id=first.id, new_status=KeeperSyncRunStatus.succeeded
+        )
+        await asyncio.sleep(0.005)
+        second = await store.create(org_id=org_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        first_public_id = await db_session.scalar(
+            select(SqlKeeperSyncRun.public_id).where(
+                SqlKeeperSyncRun.id == first.id
+            )
+        )
+        second_public_id = await db_session.scalar(
+            select(SqlKeeperSyncRun.public_id).where(
+                SqlKeeperSyncRun.id == second.id
+            )
+        )
+    assert first_public_id is not None
+    assert second_public_id is not None
+    assert second_public_id > first_public_id
+
+
+@pytest.mark.asyncio
+async def test_create_retries_on_public_id_collision(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A colliding ``public_id`` is re-minted with no error and no merged rows.
+
+    The pre-existing row occupying ``collision_id`` is inserted in a terminal
+    status so it does not trip the one-non-terminal-run-per-org partial unique
+    index, isolating the collision to ``public_id``.
+    """
+    collision_id = 525252
+    fresh_id = 777777
+
+    def _fake_ids() -> Iterator[int]:
+        yield from (collision_id, fresh_id)
+
+    ids = _fake_ids()
+    monkeypatch.setattr(
+        "docverse.storage._public_id.generate_resource_id",
+        lambda: next(ids),
+    )
+
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        store = KeeperSyncRunStore(session=db_session, logger=_logger())
+        # Pre-insert a terminal run occupying ``collision_id`` and flush it
+        # into the outer transaction so the retried insert races a persistent
+        # row.
+        existing = SqlKeeperSyncRun(
+            public_id=collision_id,
+            org_id=org_id,
+            kind="backfill",
+            status=KeeperSyncRunStatus.succeeded.value,
+        )
+        db_session.add(existing)
+        await db_session.flush()
+
+        created = await store.create(org_id=org_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        created_public_id = await db_session.scalar(
+            select(SqlKeeperSyncRun.public_id).where(
+                SqlKeeperSyncRun.id == created.id
+            )
+        )
+        total = await db_session.scalar(
+            select(func.count()).select_from(SqlKeeperSyncRun)
+        )
+    # The retry minted the fresh id, leaving the pre-existing row untouched.
+    assert created_public_id == fresh_id
+    assert total == 2

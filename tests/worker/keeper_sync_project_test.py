@@ -51,6 +51,7 @@ from docverse.dbschema.edition import SqlEdition
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobStatus
 from docverse.factory import Factory
 from docverse.metrics import build_event_manager
@@ -167,7 +168,10 @@ async def _seed_org(
 
 async def _seed_run(db_session: AsyncSession, *, org_id: int) -> int:
     row = SqlKeeperSyncRun(
-        org_id=org_id, kind="backfill", status="in_progress"
+        public_id=validate_base32_id(generate_base32_id()),
+        org_id=org_id,
+        kind="backfill",
+        status="in_progress",
     )
     db_session.add(row)
     await db_session.flush()

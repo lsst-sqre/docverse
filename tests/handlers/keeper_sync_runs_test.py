@@ -24,6 +24,12 @@ _ADMIN = "admin-user"
 _ORG = "ks-org"
 
 
+def _make_run(**kwargs: Any) -> SqlKeeperSyncRun:
+    """Build a run row with a minted ``public_id`` for seeding tests."""
+    kwargs.setdefault("public_id", validate_base32_id(generate_base32_id()))
+    return SqlKeeperSyncRun(**kwargs)
+
+
 async def _setup_org(client: AsyncClient) -> None:
     await seed_org_with_admin(client, _ORG, _ADMIN)
 
@@ -231,7 +237,7 @@ async def test_get_run_date_last_activity_matches_max_child_event(
     # discovery queue-job's auto-attributed timestamps.
     async for session in db_session_dependency():
         async with session.begin():
-            row = SqlKeeperSyncRun(
+            row = _make_run(
                 org_id=org_id, kind="backfill", status="in_progress"
             )
             session.add(row)
@@ -276,9 +282,7 @@ async def test_get_run_date_last_activity_null_when_no_children(
     org_id = await _get_org_id()
     async for session in db_session_dependency():
         async with session.begin():
-            row = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="pending"
-            )
+            row = _make_run(org_id=org_id, kind="backfill", status="pending")
             session.add(row)
             await session.flush()
             run_id = row.id
@@ -309,10 +313,10 @@ async def test_list_runs_surfaces_date_last_activity_per_row(
     org_id = await _get_org_id()
     async for session in db_session_dependency():
         async with session.begin():
-            with_children = SqlKeeperSyncRun(
+            with_children = _make_run(
                 org_id=org_id, kind="backfill", status="succeeded"
             )
-            without_children = SqlKeeperSyncRun(
+            without_children = _make_run(
                 org_id=org_id, kind="backfill", status="failed"
             )
             session.add(with_children)
@@ -361,9 +365,7 @@ async def test_get_run_404_for_run_in_other_org(
             store = OrganizationStore(session=session, logger=logger)
             other = await store.get_by_slug(other_org)
             assert other is not None
-            row = SqlKeeperSyncRun(
-                org_id=other.id, kind="backfill", status="pending"
-            )
+            row = _make_run(org_id=other.id, kind="backfill", status="pending")
             session.add(row)
             await session.flush()
             run_id = row.id
@@ -387,12 +389,10 @@ async def test_list_runs_returns_per_run_counters(
     # per-run, not bleed across runs in the same org.
     async for session in db_session_dependency():
         async with session.begin():
-            row_a = SqlKeeperSyncRun(
+            row_a = _make_run(
                 org_id=org_id, kind="backfill", status="succeeded"
             )
-            row_b = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="failed"
-            )
+            row_b = _make_run(org_id=org_id, kind="backfill", status="failed")
             session.add(row_a)
             session.add(row_b)
             await session.flush()
@@ -446,9 +446,7 @@ async def test_list_runs_returns_runs_newest_first(
     async for session in db_session_dependency():
         async with session.begin():
             for status in ("succeeded", "failed", "succeeded"):
-                row = SqlKeeperSyncRun(
-                    org_id=org_id, kind="backfill", status=status
-                )
+                row = _make_run(org_id=org_id, kind="backfill", status=status)
                 session.add(row)
             await session.commit()
 
@@ -473,9 +471,7 @@ async def test_list_runs_filters_by_status(client: AsyncClient) -> None:
         async with session.begin():
             for status in ("succeeded", "failed", "succeeded"):
                 session.add(
-                    SqlKeeperSyncRun(
-                        org_id=org_id, kind="backfill", status=status
-                    )
+                    _make_run(org_id=org_id, kind="backfill", status=status)
                 )
             await session.commit()
 
@@ -498,7 +494,7 @@ async def test_list_runs_paginates_with_cursor(client: AsyncClient) -> None:
         async with session.begin():
             for _ in range(3):
                 session.add(
-                    SqlKeeperSyncRun(
+                    _make_run(
                         org_id=org_id, kind="backfill", status="succeeded"
                     )
                 )
@@ -556,7 +552,7 @@ async def test_get_run_jobs_returns_subject_label(
     org_id = await _get_org_id()
     async for session in db_session_dependency():
         async with session.begin():
-            run = SqlKeeperSyncRun(
+            run = _make_run(
                 org_id=org_id, kind="backfill", status="in_progress"
             )
             session.add(run)
@@ -600,7 +596,7 @@ async def test_get_run_jobs_filters_by_status(client: AsyncClient) -> None:
     org_id = await _get_org_id()
     async for session in db_session_dependency():
         async with session.begin():
-            run = SqlKeeperSyncRun(
+            run = _make_run(
                 org_id=org_id, kind="backfill", status="in_progress"
             )
             session.add(run)
@@ -648,7 +644,7 @@ async def test_get_run_jobs_paginates_with_cursor(
     org_id = await _get_org_id()
     async for session in db_session_dependency():
         async with session.begin():
-            run = SqlKeeperSyncRun(
+            run = _make_run(
                 org_id=org_id, kind="backfill", status="in_progress"
             )
             session.add(run)
@@ -709,9 +705,7 @@ async def test_get_run_jobs_404_for_run_in_other_org(
             store = OrganizationStore(session=session, logger=logger)
             other = await store.get_by_slug(other_org)
             assert other is not None
-            row = SqlKeeperSyncRun(
-                org_id=other.id, kind="backfill", status="pending"
-            )
+            row = _make_run(org_id=other.id, kind="backfill", status="pending")
             session.add(row)
             await session.flush()
             run_id = row.id
@@ -731,9 +725,7 @@ async def test_get_run_jobs_403_for_non_admin(client: AsyncClient) -> None:
     org_id = await _get_org_id()
     async for session in db_session_dependency():
         async with session.begin():
-            run = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="pending"
-            )
+            run = _make_run(org_id=org_id, kind="backfill", status="pending")
             session.add(run)
             await session.flush()
             run_id = run.id
