@@ -1,10 +1,60 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+from typing import TYPE_CHECKING
+
 import nox
 from nox_uv import session
-from testcontainers.postgres import PostgresContainer
+
+if TYPE_CHECKING:
+    from testcontainers.postgres import PostgresContainer
 
 nox.needs_version = ">=2024.4.15"
 nox.options.default_venv_backend = "uv"
 nox.options.sessions = ["lint", "typing", "test", "client_test"]
+
+
+def _setup_testcontainers_env() -> None:
+    """Configure testcontainers environment variables for Colima on macOS.
+
+    This must be called before any containers are started to ensure the
+    Reaper can connect properly when using Colima as the Docker runtime.
+    """
+    # Set testcontainers host override for Colima on macOS
+    # This fixes "nodename nor servname provided, or not known" errors
+    docker_host = os.getenv("DOCKER_HOST", "")
+    m = re.search(r"\.colima/(?P<profile>[^/]+)/docker\.sock$", docker_host)
+    if m:
+        # Extract the Colima VM IP address for the active profile.
+        # colima ls -j emits one JSON object per line (one per profile).
+        try:
+            result = subprocess.run(
+                ["colima", "ls", "-j"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for line in result.stdout.splitlines():
+                if not line.strip():
+                    continue
+                colima_info = json.loads(line)
+                if colima_info.get("name") == m["profile"] and colima_info.get(
+                    "address"
+                ):
+                    os.environ["TESTCONTAINERS_HOST_OVERRIDE"] = colima_info[
+                        "address"
+                    ]
+                    break
+        except (
+            subprocess.CalledProcessError,
+            json.JSONDecodeError,
+            KeyError,
+        ):
+            # If we can't get the Colima address, don't set override
+            pass
 
 
 def _install_pg_extensions(postgres: PostgresContainer) -> None:
@@ -39,6 +89,11 @@ def typing(session: nox.Session) -> None:
 
 @session(uv_groups=["dev"])
 def test(session: nox.Session) -> None:
+    _setup_testcontainers_env()
+
+    # Import after setting environment variables so config is read correctly
+    from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
+
     with PostgresContainer("postgres:17") as postgres:
         _install_pg_extensions(postgres)
         url = postgres.get_connection_url(driver="asyncpg")
@@ -145,6 +200,11 @@ def create_migration(session: nox.Session) -> None:
         )
 
     message = session.posargs[0]
+
+    _setup_testcontainers_env()
+
+    # Import after setting environment variables so config is read correctly
+    from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
     with PostgresContainer("postgres:17") as postgres:
         _install_pg_extensions(postgres)
