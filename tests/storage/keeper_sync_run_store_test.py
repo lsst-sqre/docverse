@@ -378,3 +378,30 @@ async def test_create_retries_on_public_id_collision(
     # The retry minted the fresh id, leaving the pre-existing row untouched.
     assert created_public_id == fresh_id
     assert total == 2
+
+
+@pytest.mark.asyncio
+async def test_get_by_public_id_round_trips(
+    db_session: AsyncSession,
+) -> None:
+    """``get_by_public_id`` resolves the same row ``create`` minted.
+
+    Locks the public-id addressing path the run endpoints rely on: the
+    domain object round-trips its ``public_id`` and a miss returns
+    ``None`` rather than raising.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        store = KeeperSyncRunStore(session=db_session, logger=_logger())
+        created = await store.create(org_id=org_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = KeeperSyncRunStore(session=db_session, logger=_logger())
+        fetched = await store.get_by_public_id(created.public_id)
+        missing = await store.get_by_public_id(created.public_id + 1)
+
+    assert fetched is not None
+    assert fetched.id == created.id
+    assert fetched.public_id == created.public_id
+    assert missing is None

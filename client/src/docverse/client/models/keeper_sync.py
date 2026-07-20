@@ -103,7 +103,9 @@ class KeeperSyncRun(BaseModel):
         )
     )
 
-    id: int = Field(description="Numeric identifier for the run.")
+    id: str = Field(
+        description="Public Crockford Base32 identifier for the run."
+    )
 
     kind: KeeperSyncRunKind = Field(description="Kind of run.")
 

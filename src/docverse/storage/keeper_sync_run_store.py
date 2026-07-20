@@ -94,6 +94,18 @@ class KeeperSyncRunStore:
             return None
         return KeeperSyncRun.model_validate(row)
 
+    async def get_by_public_id(self, public_id: int) -> KeeperSyncRun | None:
+        """Fetch a run by its Base32 ``public_id``."""
+        result = await self._session.execute(
+            select(SqlKeeperSyncRun).where(
+                SqlKeeperSyncRun.public_id == public_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncRun.model_validate(row)
+
     async def list_by_org(
         self,
         *,

@@ -64,13 +64,14 @@ class KeeperSyncRun(_KeeperSyncRunBase):
         org_slug: str,
     ) -> Self:
         """Compose the response from a run plus its derived activity."""
+        run_public_id = serialize_base32_id(run.public_id)
         return cls(
             self_url=HttpUrl(
                 str(
                     request.url_for(
                         "get_org_keeper_sync_run",
                         org=org_slug,
-                        run_id=run.id,
+                        run=run_public_id,
                     )
                 )
             ),
@@ -79,11 +80,11 @@ class KeeperSyncRun(_KeeperSyncRunBase):
                     request.url_for(
                         "get_org_keeper_sync_run_jobs",
                         org=org_slug,
-                        run_id=run.id,
+                        run=run_public_id,
                     )
                 )
             ),
-            id=run.id,
+            id=run_public_id,
             kind=KeeperSyncRunKind(run.kind),
             status=KeeperSyncRunStatus(run.status),
             pending_count=activity.pending_count,

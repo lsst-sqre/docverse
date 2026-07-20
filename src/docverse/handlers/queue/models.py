@@ -44,12 +44,15 @@ class QueueJob(_QueueJobBase):
         build_url, edition_url, subject_url = await _resolve_subject_urls(
             domain, request, factory
         )
+        keeper_sync_run_id = await _resolve_keeper_sync_run_public_id(
+            domain, factory
+        )
         return cls(
             self_url=str(request.url_for("get_queue_job", job=job_id_str)),
             id=job_id_str,
             kind=domain.kind,
             status=domain.status,
-            keeper_sync_run_id=domain.keeper_sync_run_id,
+            keeper_sync_run_id=keeper_sync_run_id,
             subject_label=domain.subject_label,
             subject_url=subject_url,
             build_url=build_url,
@@ -61,6 +64,26 @@ class QueueJob(_QueueJobBase):
             date_started=domain.date_started,
             date_completed=domain.date_completed,
         )
+
+
+async def _resolve_keeper_sync_run_public_id(
+    domain: QueueJobDomain,
+    factory: Factory,
+) -> str | None:
+    """Resolve a job's keeper-sync run FK to the run's Base32 public id.
+
+    Returns ``None`` for jobs not attributed to a run, or when the
+    attributed run row cannot be resolved (best-effort back-reference).
+    The raw integer FK is never surfaced in the API.
+    """
+    if domain.keeper_sync_run_id is None:
+        return None
+    run = await factory.create_keeper_sync_run_store().get(
+        domain.keeper_sync_run_id
+    )
+    if run is None:
+        return None
+    return serialize_base32_id(run.public_id)
 
 
 async def _resolve_subject_urls(

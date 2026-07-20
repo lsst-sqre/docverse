@@ -206,6 +206,24 @@ def test_queue_job_subject_back_reference_fields_default_none() -> None:
         assert name in QueueJob.model_fields
 
 
+def test_queue_job_keeper_sync_run_id_is_base32_string() -> None:
+    """``keeper_sync_run_id`` carries the run's Base32 public id as a string.
+
+    Locks the API contract change from an integer FK to the run's Base32
+    public identifier; the value round-trips through validate/dump and
+    defaults to ``None`` for jobs not attributed to a run.
+    """
+    job = QueueJob.model_validate(
+        _queue_job(keeper_sync_run_id="AAAA-BBBB-CCCC-05")
+    )
+    assert job.keeper_sync_run_id == "AAAA-BBBB-CCCC-05"
+    dumped = job.model_dump(mode="json")
+    assert dumped["keeper_sync_run_id"] == "AAAA-BBBB-CCCC-05"
+
+    unattributed = QueueJob.model_validate(_queue_job())
+    assert unattributed.keeper_sync_run_id is None
+
+
 def test_queue_job_subject_back_reference_fields_round_trip() -> None:
     """The back-reference URLs survive a validate round-trip."""
     build = "https://example.com/orgs/o/projects/p/builds/0000-0000-0000-05"

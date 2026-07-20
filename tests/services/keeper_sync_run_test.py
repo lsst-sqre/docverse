@@ -166,7 +166,9 @@ async def test_get_run_returns_aggregate_counters(
 
     async with db_session.begin():
         service = _make_service(db_session=db_session, mock_arq=mock_arq)
-        result = await service.get_run(org_slug=org_slug, run_id=run.id)
+        result = await service.get_run(
+            org_slug=org_slug, public_id=run.public_id
+        )
     # Discovery (queued) + 2 keeper_sync_project (queued) = 3 pending,
     # 1 completed, 0 failed, total 4.
     assert result.activity.pending_count == 3
@@ -185,7 +187,7 @@ async def test_get_run_404_for_unknown_run(
         _, org_slug = await _seed_org(db_session)
         service = _make_service(db_session=db_session, mock_arq=mock_arq)
         with pytest.raises(NotFoundError):
-            await service.get_run(org_slug=org_slug, run_id=9999)
+            await service.get_run(org_slug=org_slug, public_id=9999)
 
 
 @pytest.mark.asyncio
