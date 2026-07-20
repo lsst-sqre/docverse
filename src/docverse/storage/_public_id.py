@@ -34,6 +34,15 @@ unlikely to recur even once; five attempts is a generous safety margin whose
 exhaustion signals a real problem rather than an unlucky draw.
 """
 
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
+"""Postgres SQLSTATE for ``unique_violation``.
+
+Only a genuine unique-constraint violation is a re-mintable ``public_id``
+collision. Gating on this code stops a *different* integrity error that merely
+mentions ``public_id`` (e.g. a NOT NULL violation, SQLSTATE ``23502``) from
+being silently retried and masked as an "exhausted attempts" error.
+"""
+
 
 async def insert_with_time_ordered_public_id[Row](
     session: AsyncSession,
@@ -92,11 +101,37 @@ async def insert_with_time_ordered_public_id[Row](
 def _is_public_id_conflict(exc: IntegrityError) -> bool:
     """Return True when ``exc`` is a ``public_id`` unique-constraint violation.
 
-    The retry loop only re-mints for ``public_id`` collisions; any other
-    integrity violation (a real bug or a different constraint) must propagate.
+    The retry loop only re-mints for ``public_id`` *unique* collisions; any
+    other integrity violation (a real bug or a different constraint) must
+    propagate. Two conditions must both hold: the error is a Postgres
+    ``unique_violation`` (SQLSTATE ``23505``), and the offending constraint
+    names ``public_id``. Requiring the unique-violation code stops a
+    non-unique integrity error that merely mentions ``public_id`` — e.g. a
+    NOT NULL violation if a future ``make_row`` callback forgets to set it —
+    from being silently retried and surfaced as an "exhausted attempts"
+    :class:`RuntimeError` that masks the real bug.
     """
+    if not _is_unique_violation(exc):
+        return False
     for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
         name = getattr(candidate, "constraint_name", None)
         if name is not None:
             return "public_id" in name
     return "public_id" in str(exc.orig)
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """Return True when ``exc`` wraps a Postgres ``unique_violation``.
+
+    Checks the SQLSTATE on the driver exception (asyncpg exposes it as
+    ``sqlstate``; other DBAPIs as ``pgcode``) against ``23505``. Walks both
+    ``exc.orig`` and its ``__cause__`` because the driver exception may be
+    wrapped.
+    """
+    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(
+            candidate, "pgcode", None
+        )
+        if sqlstate == _UNIQUE_VIOLATION_SQLSTATE:
+            return True
+    return False

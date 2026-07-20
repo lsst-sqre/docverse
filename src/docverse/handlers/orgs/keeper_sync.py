@@ -402,8 +402,16 @@ async def get_org_keeper_sync_run_jobs(
             cursor=parsed_cursor,
             limit=limit,
         )
+        # Every job in the page belongs to the same run, so memoize the
+        # run FK -> public-id resolution to collapse an N+1 run-store query.
+        run_public_id_cache: dict[int, str | None] = {}
         jobs = [
-            await QueueJob.from_domain(job, context.request, context.factory)
+            await QueueJob.from_domain(
+                job,
+                context.request,
+                context.factory,
+                run_public_id_cache=run_public_id_cache,
+            )
             for job in result.entries
         ]
     context.response.headers["Link"] = result.link_header(context.request.url)

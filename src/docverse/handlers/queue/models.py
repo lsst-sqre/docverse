@@ -24,6 +24,8 @@ class QueueJob(_QueueJobBase):
         domain: QueueJobDomain,
         request: Request,
         factory: Factory,
+        *,
+        run_public_id_cache: dict[int, str | None] | None = None,
     ) -> Self:
         """Create from a domain object, adding the HATEOAS URLs.
 
@@ -32,6 +34,12 @@ class QueueJob(_QueueJobBase):
         stores; each is ``None`` when the job targets no such resource or
         it could not be resolved (best-effort back-reference). Must be
         called inside an open session — it issues store reads.
+
+        ``run_public_id_cache`` is an optional caller-owned dict, keyed by the
+        integer keeper-sync run FK, used to memoize run public-id lookups
+        across a page of jobs. List endpoints where many jobs share a run
+        (e.g. the run-scoped jobs listing) pass one in to avoid an N+1
+        run-store query per job; single-job callers omit it.
         """
         job_id_str = serialize_base32_id(domain.public_id)
         # JSONB progress is stored untyped; validate it into the typed
@@ -45,7 +53,7 @@ class QueueJob(_QueueJobBase):
             domain, request, factory
         )
         keeper_sync_run_id = await _resolve_keeper_sync_run_public_id(
-            domain, factory
+            domain, factory, cache=run_public_id_cache
         )
         return cls(
             self_url=str(request.url_for("get_queue_job", job=job_id_str)),
@@ -69,21 +77,29 @@ class QueueJob(_QueueJobBase):
 async def _resolve_keeper_sync_run_public_id(
     domain: QueueJobDomain,
     factory: Factory,
+    *,
+    cache: dict[int, str | None] | None = None,
 ) -> str | None:
     """Resolve a job's keeper-sync run FK to the run's Base32 public id.
 
     Returns ``None`` for jobs not attributed to a run, or when the
     attributed run row cannot be resolved (best-effort back-reference).
     The raw integer FK is never surfaced in the API.
+
+    When ``cache`` is supplied it memoizes the FK-to-public-id resolution:
+    the run store is queried at most once per distinct run across a page of
+    jobs, collapsing the otherwise N+1 lookup on the run-scoped jobs listing.
     """
-    if domain.keeper_sync_run_id is None:
+    run_fk = domain.keeper_sync_run_id
+    if run_fk is None:
         return None
-    run = await factory.create_keeper_sync_run_store().get(
-        domain.keeper_sync_run_id
-    )
-    if run is None:
-        return None
-    return serialize_base32_id(run.public_id)
+    if cache is not None and run_fk in cache:
+        return cache[run_fk]
+    run = await factory.create_keeper_sync_run_store().get(run_fk)
+    resolved = serialize_base32_id(run.public_id) if run is not None else None
+    if cache is not None:
+        cache[run_fk] = resolved
+    return resolved
 
 
 async def _resolve_subject_urls(
