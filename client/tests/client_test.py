@@ -172,18 +172,18 @@ async def test_complete_upload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_queue_job() -> None:
-    """GET to queue URL returns parsed QueueJob."""
-    queue_url = "/queue/jobs/" + JOB_ID
+async def test_get_job() -> None:
+    """GET to job URL returns parsed QueueJob."""
+    job_url = "/orgs/testorg/jobs/" + JOB_ID
     async with respx.mock(base_url=BASE_URL) as router:
-        router.get(queue_url).mock(
+        router.get(job_url).mock(
             return_value=httpx.Response(
                 200,
                 json=_job_response(status="completed"),
             )
         )
         async with DocverseClient(BASE_URL, TOKEN) as client:
-            job = await client.get_queue_job(queue_url)
+            job = await client.get_job(job_url)
 
     assert job.id == JOB_ID
     assert job.status == JobStatus.completed

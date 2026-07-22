@@ -114,9 +114,12 @@ async def get_org_jobs(
             cursor=parsed_cursor,
             limit=limit,
         )
-        # Jobs on a page frequently share a keeper-sync run, so memoize the
-        # run FK -> public-id resolution to collapse an N+1 run-store query.
+        # Jobs on a page frequently share a keeper-sync run or a target
+        # project, so memoize the run FK -> public-id and project FK -> slug
+        # resolutions to collapse the otherwise N+1 run- and project-store
+        # queries across the page.
         run_public_id_cache: dict[int, str | None] = {}
+        project_slug_cache: dict[int, str | None] = {}
         jobs = [
             await QueueJob.from_domain(
                 job,
@@ -124,6 +127,7 @@ async def get_org_jobs(
                 context.factory,
                 org_slug=org_slug,
                 run_public_id_cache=run_public_id_cache,
+                project_slug_cache=project_slug_cache,
             )
             for job in result.entries
         ]
