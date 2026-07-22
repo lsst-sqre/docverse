@@ -124,11 +124,14 @@ def test_handler_side_subclasses_are_not_exported() -> None:
     consumers.
     """
     exported_names = set(client_models.__all__)
+    # ``KeeperSyncEditionStatus`` and ``KeeperSyncRun`` no longer have
+    # handler-side subclasses: their handlers use the client model
+    # directly as ``response_model`` and build it via module-level
+    # ``*_from_domain`` functions, so only genuinely-distinct subclasses
+    # remain here.
     handler_subclasses = {
-        handler_models.KeeperSyncEditionStatus,
         handler_models.KeeperSyncProjectRefreshAccepted,
         handler_models.KeeperSyncProjectStatus,
-        handler_models.KeeperSyncRun,
         handler_models.KeeperSyncRunCreated,
         queue_handler_models.QueueJob,
     }

@@ -175,7 +175,7 @@ class Project(_ProjectBase):
         edition_response = None
         if default_edition is not None:
             project_url = project_published_url(org, domain)
-            edition_response = Edition.from_domain(
+            edition_response = edition_from_domain(
                 default_edition,
                 request,
                 org.slug,
@@ -290,75 +290,70 @@ class Build(_BuildBase):
         )
 
 
-class Edition(_EditionBase):
-    """Edition response model with HATEOAS URLs."""
-
-    @classmethod
-    def from_domain(
-        cls,
-        domain: EditionDomain,
-        request: Request,
-        org_slug: str,
-        project_slug: str,
-        *,
-        published_url: str | None = None,
-    ) -> Self:
-        """Create from a domain object, adding HATEOAS URLs."""
-        build_url: str | None = None
-        if domain.current_build_public_id is not None:
-            build_id_str = serialize_base32_id(domain.current_build_public_id)
-            build_url = str(
-                request.url_for(
-                    "get_build",
-                    org=org_slug,
-                    project=project_slug,
-                    build=build_id_str,
-                )
+def edition_from_domain(
+    domain: EditionDomain,
+    request: Request,
+    org_slug: str,
+    project_slug: str,
+    *,
+    published_url: str | None = None,
+) -> _EditionBase:
+    """Build the client ``Edition`` model from a domain object with URLs."""
+    build_url: str | None = None
+    if domain.current_build_public_id is not None:
+        build_id_str = serialize_base32_id(domain.current_build_public_id)
+        build_url = str(
+            request.url_for(
+                "get_build",
+                org=org_slug,
+                project=project_slug,
+                build=build_id_str,
             )
-        return cls(
-            self_url=str(
-                request.url_for(
-                    "get_edition",
-                    org=org_slug,
-                    project=project_slug,
-                    edition=domain.slug,
-                )
-            ),
-            project_url=str(
-                request.url_for(
-                    "get_project",
-                    org=org_slug,
-                    project=project_slug,
-                )
-            ),
-            build_url=build_url,
-            published_url=published_url,
-            history_url=str(
-                request.url_for(
-                    "get_edition_history",
-                    org=org_slug,
-                    project=project_slug,
-                    edition=domain.slug,
-                )
-            ),
-            rollback_url=str(
-                request.url_for(
-                    "post_edition_rollback",
-                    org=org_slug,
-                    project=project_slug,
-                    edition=domain.slug,
-                )
-            ),
-            slug=domain.slug,
-            title=domain.title,
-            kind=domain.kind,
-            tracking_mode=domain.tracking_mode,
-            tracking_params=domain.tracking_params,
-            lifecycle_exempt=domain.lifecycle_exempt,
-            publish_status=domain.publish_status,
-            date_created=domain.date_created,
-            date_updated=domain.date_updated,
         )
+    return _EditionBase(
+        self_url=str(
+            request.url_for(
+                "get_edition",
+                org=org_slug,
+                project=project_slug,
+                edition=domain.slug,
+            )
+        ),
+        project_url=str(
+            request.url_for(
+                "get_project",
+                org=org_slug,
+                project=project_slug,
+            )
+        ),
+        build_url=build_url,
+        published_url=published_url,
+        history_url=str(
+            request.url_for(
+                "get_edition_history",
+                org=org_slug,
+                project=project_slug,
+                edition=domain.slug,
+            )
+        ),
+        rollback_url=str(
+            request.url_for(
+                "post_edition_rollback",
+                org=org_slug,
+                project=project_slug,
+                edition=domain.slug,
+            )
+        ),
+        slug=domain.slug,
+        title=domain.title,
+        kind=domain.kind,
+        tracking_mode=domain.tracking_mode,
+        tracking_params=domain.tracking_params,
+        lifecycle_exempt=domain.lifecycle_exempt,
+        publish_status=domain.publish_status,
+        date_created=domain.date_created,
+        date_updated=domain.date_updated,
+    )
 
 
 class EditionBuildHistoryResponse(_EditionBuildHistoryEntryBase):

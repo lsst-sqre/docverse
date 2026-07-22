@@ -13,7 +13,7 @@ from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import OrgSlugParam
 
-from .models import Organization
+from .models import AdminOrganization
 
 router = APIRouter(tags=["admin"], dependencies=[Depends(require_superadmin)])
 
@@ -37,7 +37,7 @@ class SentryTestRequest(BaseModel):
 
 @router.post(
     "/admin/orgs",
-    response_model=Organization,
+    response_model=AdminOrganization,
     status_code=status.HTTP_201_CREATED,
     summary="Create an organization",
     name="admin_post_organization",
@@ -45,7 +45,7 @@ class SentryTestRequest(BaseModel):
 async def post_organization(
     data: OrganizationCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
-) -> Organization:
+) -> AdminOrganization:
     async with context.session.begin():
         service = context.factory.create_organization_service()
         existing = await service.get_by_slug(data.slug)
@@ -64,41 +64,43 @@ async def post_organization(
                 await membership_store.create(org_id=org.id, data=member)
         await context.session.commit()
     # New org has no services yet, so no need to load them
-    return Organization.from_domain(org, context.request)
+    return AdminOrganization.from_domain(org, context.request)
 
 
 @router.get(
     "/admin/orgs",
-    response_model=list[Organization],
+    response_model=list[AdminOrganization],
     summary="List all organizations",
     name="admin_get_organizations",
 )
 async def get_organizations(
     context: Annotated[RequestContext, Depends(context_dependency)],
-) -> list[Organization]:
+) -> list[AdminOrganization]:
     async with context.session.begin():
         service = context.factory.create_organization_service()
         orgs = await service.list_all()
         service_store = context.factory.create_service_store()
-        results: list[Organization] = []
+        results: list[AdminOrganization] = []
         for o in orgs:
             services = await service_store.list_by_org(o.id)
             results.append(
-                Organization.from_domain(o, context.request, services=services)
+                AdminOrganization.from_domain(
+                    o, context.request, services=services
+                )
             )
     return results
 
 
 @router.get(
     "/admin/orgs/{org}",
-    response_model=Organization,
+    response_model=AdminOrganization,
     summary="Get an organization",
     name="admin_get_organization",
 )
 async def get_organization(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
-) -> Organization:
+) -> AdminOrganization:
     async with context.session.begin():
         service = context.factory.create_organization_service()
         org = await service.get_by_slug(org_slug)
@@ -107,7 +109,9 @@ async def get_organization(
             raise NotFoundError(msg)
         service_store = context.factory.create_service_store()
         services = await service_store.list_by_org(org.id)
-    return Organization.from_domain(org, context.request, services=services)
+    return AdminOrganization.from_domain(
+        org, context.request, services=services
+    )
 
 
 @router.post(

@@ -8,7 +8,9 @@ from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from docverse.client.models import (
     KeeperSyncConfig,
+    KeeperSyncEditionStatus,
     KeeperSyncResourceType,
+    KeeperSyncRun,
     KeeperSyncRunStatus,
     KeeperSyncTombstoneReason,
 )
@@ -27,12 +29,12 @@ from docverse.storage.pagination import (
 from docverse.validation import parse_base32_id
 
 from .keeper_sync_models import (
-    KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
     KeeperSyncProjectStatus,
-    KeeperSyncRun,
     KeeperSyncRunCreated,
     KeeperSyncTombstone,
+    keeper_sync_edition_status_from_domain,
+    keeper_sync_run_from_domain,
 )
 
 router = APIRouter()
@@ -233,7 +235,7 @@ async def get_org_keeper_sync_project_editions(
     )
     context.response.headers["X-Total-Count"] = str(result.page.count)
     return [
-        KeeperSyncEditionStatus.from_domain(
+        keeper_sync_edition_status_from_domain(
             edition,
             result.state_by_docverse_id.get(edition.id),
             context.request,
@@ -325,7 +327,7 @@ async def get_org_keeper_sync_runs(
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
-        KeeperSyncRun.from_domain(
+        keeper_sync_run_from_domain(
             run, activity_by_id[run.id], context.request, org_slug
         )
         for run in result.entries
@@ -348,7 +350,7 @@ async def get_org_keeper_sync_run(
     async with context.session.begin():
         service = context.factory.create_keeper_sync_run_service()
         result = await service.get_run(org_slug=org_slug, public_id=public_id)
-    return KeeperSyncRun.from_domain(
+    return keeper_sync_run_from_domain(
         result.run, result.activity, context.request, org_slug
     )
 
