@@ -391,33 +391,6 @@ class QueueJobStore:
             self._session, stmt, cursor=cursor, limit=limit
         )
 
-    async def list_by_keeper_sync_run(
-        self,
-        *,
-        run_id: int,
-        status: JobStatus | None = None,
-        cursor: QueueJobDateCreatedCursor | None = None,
-        limit: int,
-    ) -> CountedPaginatedList[QueueJob, QueueJobDateCreatedCursor]:
-        """List queue jobs attributed to a run, newest first.
-
-        Optional ``status`` narrows to a single :class:`JobStatus`.
-        Pagination uses the standard ``date_created`` DESC keyset cursor
-        so pages are stable across concurrent inserts.
-        """
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.keeper_sync_run_id == run_id
-        )
-        if status is not None:
-            stmt = stmt.where(SqlQueueJob.status == status.value)
-        runner = CountedPaginatedQueryRunner(
-            entry_type=QueueJob,
-            cursor_type=QueueJobDateCreatedCursor,
-        )
-        return await runner.query_object(
-            self._session, stmt, cursor=cursor, limit=limit
-        )
-
     async def fail_silent_run_children(
         self,
         *,

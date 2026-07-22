@@ -3,26 +3,37 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import OrgRole, ProjectCreate
+from docverse.client.models import (
+    BuildCreate,
+    EditionCreate,
+    EditionKind,
+    OrgRole,
+    ProjectCreate,
+    TrackingMode,
+)
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.domain.base32id import (
     generate_base32_id,
     serialize_base32_id,
     validate_base32_id,
 )
-from docverse.domain.queue import JobKind
+from docverse.domain.queue import JobKind, JobStatus
+from docverse.storage.build_store import BuildStore
+from docverse.storage.edition_store import EditionStore
 from docverse.storage.organization_store import OrganizationStore
 from docverse.storage.project_store import ProjectStore
 from docverse.storage.queue_job_store import QueueJobStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"
+_HASH = "sha256:" + "a" * 64
 
 
 async def _org_id(org_slug: str) -> int:
@@ -43,9 +54,20 @@ async def _seed_job(
     *,
     kind: JobKind = JobKind.build_processing,
     project_id: int | None = None,
+    build_id: int | None = None,
+    edition_id: int | None = None,
     keeper_sync_run_id: int | None = None,
+    start: bool = False,
+    phase: str | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> str:
-    """Seed a queue job for an org; return its Base32 public id."""
+    """Seed a queue job for an org; return its Base32 public id.
+
+    ``start`` transitions the job to ``in_progress`` and ``phase`` /
+    ``progress`` record a phase snapshot, mirroring how a worker advances
+    a job — this lets the org-scoped ``GET`` be exercised over the same
+    surface the legacy ``/queue/jobs`` endpoint used to cover.
+    """
     logger = structlog.get_logger("docverse")
     async for session in db_session_dependency():
         async with session.begin():
@@ -54,10 +76,86 @@ async def _seed_job(
                 kind=kind,
                 org_id=org_id,
                 project_id=project_id,
+                build_id=build_id,
+                edition_id=edition_id,
                 keeper_sync_run_id=keeper_sync_run_id,
             )
+            if start:
+                await store.start(job.id)
+            if phase is not None:
+                await store.update_phase(job.id, phase, progress=progress)
             await session.commit()
             return serialize_base32_id(job.public_id)
+    msg = "no session"
+    raise AssertionError(msg)
+
+
+async def _seed_project_build(
+    org_id: int, project_slug: str
+) -> tuple[int, int, str]:
+    """Seed a project + build in an org.
+
+    Returns ``(project_id, build_id, build_public_id_b32)``.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            proj_store = ProjectStore(session=session, logger=logger)
+            build_store = BuildStore(session=session, logger=logger)
+            project = await proj_store.create(
+                org_id=org_id,
+                data=ProjectCreate(
+                    slug=project_slug,
+                    title=f"Project {project_slug}",
+                    source_url="https://example.com/example/repo",
+                ),
+            )
+            build = await build_store.create(
+                project_id=project.id,
+                project_slug=project_slug,
+                data=BuildCreate(git_ref="main", content_hash=_HASH),
+                uploader="tester",
+            )
+            project_id = project.id
+            build_id = build.id
+            build_public = serialize_base32_id(build.public_id)
+            await session.commit()
+            return project_id, build_id, build_public
+    msg = "no session"
+    raise AssertionError(msg)
+
+
+async def _seed_edition(project_id: int, slug: str) -> int:
+    """Seed an edition in a project; return its integer primary key."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=logger)
+            edition = await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug.title(),
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+            edition_id = edition.id
+            await session.commit()
+            return edition_id
+    msg = "no session"
+    raise AssertionError(msg)
+
+
+async def _soft_delete_build(build_id: int) -> None:
+    """Soft-delete a build so its back-reference URL degrades to null."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            build_store = BuildStore(session=session, logger=logger)
+            await build_store.soft_delete(build_id=build_id)
+            await session.commit()
+            return
     msg = "no session"
     raise AssertionError(msg)
 
@@ -407,3 +505,409 @@ async def test_list_org_jobs_no_role_returns_403(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "nobody-user"},
     )
     assert response.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Single-job representation coverage.
+#
+# These behaviors were previously exercised against the retired
+# ``GET /queue/jobs/{job}`` endpoint; they are re-homed here against the
+# org-scoped ``GET /orgs/{org}/jobs/{job}`` which is now their only surface.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_invalid_id_returns_422(client: AsyncClient) -> None:
+    """A malformed Base32 job id is rejected with 422 for an authed reader."""
+    await seed_org_with_admin(client, "badid-org", _ADMIN)
+    await seed_member("badid-org", "reader-user", OrgRole.reader)
+
+    response = await client.get(
+        "/docverse/orgs/badid-org/jobs/not-a-valid-id",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_in_progress(client: AsyncClient) -> None:
+    """A started job exposes its in_progress status, phase, and progress."""
+    await seed_org_with_admin(client, "prog-org", _ADMIN)
+    await seed_member("prog-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("prog-org")
+    job_id = await _seed_job(
+        org_id,
+        start=True,
+        phase="editions",
+        progress={"editions_total": 2, "editions_completed": []},
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/prog-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == JobStatus.in_progress
+    assert data["phase"] == "editions"
+    assert data["progress"]["editions_total"] == 2
+    assert data["date_started"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_build_processing_typed_progress(
+    client: AsyncClient,
+) -> None:
+    """A build_processing job exposes its progress via the typed fields."""
+    await seed_org_with_admin(client, "typed-org", _ADMIN)
+    await seed_member("typed-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("typed-org")
+    job_id = await _seed_job(
+        org_id,
+        phase="complete",
+        progress={
+            "message": "Build processing complete",
+            "object_count": 2,
+            "total_size_bytes": 4096,
+            "editions_updated": [{"slug": "main", "action": "created"}],
+            "editions_skipped": [{"slug": "stale"}],
+            "publish_jobs": [
+                {
+                    "edition_slug": "main",
+                    "publish_queue_job_public_id": "1000-0000-0000-05",
+                }
+            ],
+        },
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/typed-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    progress = response.json()["progress"]
+    assert progress["object_count"] == 2
+    assert progress["editions_updated"][0]["slug"] == "main"
+    assert progress["editions_updated"][0]["action"] == "created"
+    assert progress["editions_skipped"][0]["slug"] == "stale"
+    assert progress["publish_jobs"][0]["edition_slug"] == "main"
+    assert (
+        progress["publish_jobs"][0]["publish_queue_job_public_id"]
+        == "1000-0000-0000-05"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_non_build_progress_preserved(
+    client: AsyncClient,
+) -> None:
+    """A non-build kind's progress round-trips unchanged via extra='allow'."""
+    await seed_org_with_admin(client, "nb-org", _ADMIN)
+    await seed_member("nb-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("nb-org")
+    job_id = await _seed_job(
+        org_id,
+        kind=JobKind.keeper_sync_run_discovery,
+        phase="complete",
+        progress={
+            "message": "Discovery complete",
+            "in_scope_count": 5,
+            "enqueued_count": 4,
+        },
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/nb-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    progress = response.json()["progress"]
+    assert progress["message"] == "Discovery complete"
+    assert progress["in_scope_count"] == 5
+    assert progress["enqueued_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_non_build_progress_omits_null_build_fields(
+    client: AsyncClient,
+) -> None:
+    """A non-build job's progress JSON omits the six build-specific keys.
+
+    ``from_domain`` validates any non-null progress into
+    ``BuildProcessingProgress``; without the model serializer the six
+    build-specific typed fields would leak as ``null`` for a non-build kind.
+    Assert they are absent while the job's real keys survive.
+    """
+    await seed_org_with_admin(client, "nbnull-org", _ADMIN)
+    await seed_member("nbnull-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("nbnull-org")
+    job_id = await _seed_job(
+        org_id,
+        kind=JobKind.keeper_sync_run_discovery,
+        phase="complete",
+        progress={
+            "message": "Discovery complete",
+            "in_scope_count": 5,
+            "enqueued_count": 4,
+        },
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/nbnull-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    progress = response.json()["progress"]
+    assert progress["message"] == "Discovery complete"
+    assert progress["in_scope_count"] == 5
+    assert progress["enqueued_count"] == 4
+    for key in (
+        "object_count",
+        "total_size_bytes",
+        "editions_updated",
+        "editions_skipped",
+        "publish_jobs",
+        "edition_tracking_error",
+    ):
+        assert key not in progress
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_build_processing_subject_url(
+    client: AsyncClient,
+) -> None:
+    """A build_processing job links to its build via build_url/subject_url."""
+    await seed_org_with_admin(client, "bp-org", _ADMIN)
+    await seed_member("bp-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("bp-org")
+    project_id, build_id, build_public = await _seed_project_build(
+        org_id, "bp-proj"
+    )
+    job_id = await _seed_job(
+        org_id,
+        kind=JobKind.build_processing,
+        project_id=project_id,
+        build_id=build_id,
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/bp-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    suffix = f"/orgs/bp-org/projects/bp-proj/builds/{build_public}"
+    assert data["build_url"].endswith(suffix)
+    assert data["subject_url"] == data["build_url"]
+    assert data["edition_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_edition_url_when_targets_edition(
+    client: AsyncClient,
+) -> None:
+    """A job targeting an edition exposes edition_url as the subject."""
+    await seed_org_with_admin(client, "pe-org", _ADMIN)
+    await seed_member("pe-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("pe-org")
+    project_id, build_id, build_public = await _seed_project_build(
+        org_id, "pe-proj"
+    )
+    edition_id = await _seed_edition(project_id, "main")
+    job_id = await _seed_job(
+        org_id,
+        kind=JobKind.publish_edition,
+        project_id=project_id,
+        build_id=build_id,
+        edition_id=edition_id,
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/pe-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["edition_url"].endswith(
+        "/orgs/pe-org/projects/pe-proj/editions/main"
+    )
+    assert data["build_url"].endswith(
+        f"/orgs/pe-org/projects/pe-proj/builds/{build_public}"
+    )
+    assert data["subject_url"] == data["edition_url"]
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_subject_urls_null_when_no_resource(
+    client: AsyncClient,
+) -> None:
+    """A job that targets no build/edition has null back-reference URLs."""
+    await seed_org_with_admin(client, "nosub-org", _ADMIN)
+    await seed_member("nosub-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("nosub-org")
+    job_id = await _seed_job(org_id, kind=JobKind.keeper_sync_run_discovery)
+
+    response = await client.get(
+        f"/docverse/orgs/nosub-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["build_url"] is None
+    assert data["edition_url"] is None
+    assert data["subject_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_org_job_build_url_null_when_build_deleted(
+    client: AsyncClient,
+) -> None:
+    """A build_processing job whose build is soft-deleted has null URLs."""
+    await seed_org_with_admin(client, "del-org", _ADMIN)
+    await seed_member("del-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("del-org")
+    project_id, build_id, _build_public = await _seed_project_build(
+        org_id, "del-proj"
+    )
+    await _soft_delete_build(build_id)
+    job_id = await _seed_job(
+        org_id,
+        kind=JobKind.build_processing,
+        project_id=project_id,
+        build_id=build_id,
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/del-org/jobs/{job_id}",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["build_url"] is None
+    assert data["subject_url"] is None
+    assert data["edition_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_job_progress_schema_is_typed(client: AsyncClient) -> None:
+    """The OpenAPI spec types ``QueueJob.progress`` as BuildProcessingProgress.
+
+    Also guards against the schema-name collision with the unrelated
+    edition-update request body: introducing the nested ``EditionUpdateRef``
+    model must not rename the existing ``EditionUpdate`` component.
+    """
+    response = await client.get("/docverse/openapi.json")
+    assert response.status_code == 200
+    schemas = response.json()["components"]["schemas"]
+
+    assert "BuildProcessingProgress" in schemas
+    assert "EditionUpdateRef" in schemas
+    assert "PublishJobRef" in schemas
+    assert "EditionUpdate" in schemas
+
+    progress_schema = schemas["QueueJob"]["properties"]["progress"]
+    refs = {
+        option.get("$ref")
+        for option in progress_schema["anyOf"]
+        if "$ref" in option
+    }
+    assert "#/components/schemas/BuildProcessingProgress" in refs
+
+    progress_props = set(schemas["BuildProcessingProgress"]["properties"])
+    assert {
+        "message",
+        "object_count",
+        "total_size_bytes",
+        "editions_updated",
+        "editions_skipped",
+        "publish_jobs",
+        "edition_tracking_error",
+    } <= progress_props
+
+    assert schemas["BuildProcessingProgress"]["additionalProperties"] is True
+
+
+@pytest.mark.asyncio
+async def test_job_schema_exposes_subject_urls(client: AsyncClient) -> None:
+    """The OpenAPI QueueJob schema declares the back-reference URL fields."""
+    response = await client.get("/docverse/openapi.json")
+    assert response.status_code == 200
+    props = response.json()["components"]["schemas"]["QueueJob"]["properties"]
+    for name in ("subject_url", "build_url", "edition_url"):
+        assert name in props
+
+
+# ---------------------------------------------------------------------------
+# Retirement of the legacy surfaces (PRD #449).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_legacy_queue_job_endpoint_removed(client: AsyncClient) -> None:
+    """``GET /queue/jobs/{job}`` no longer routes; it is absent from spec."""
+    response = await client.get("/docverse/queue/jobs/1000-0000-0000-05")
+    assert response.status_code == 404
+
+    spec = (await client.get("/docverse/openapi.json")).json()
+    assert not any("/queue/" in path for path in spec["paths"]), (
+        "the /queue router must be fully retired from the OpenAPI spec"
+    )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_run_jobs_endpoint_removed(
+    client: AsyncClient,
+) -> None:
+    """The run-scoped jobs subresource no longer routes nor appears in spec."""
+    await seed_org_with_admin(client, "gone-org", _ADMIN)
+    response = await client.get(
+        "/docverse/orgs/gone-org/keeper-sync/runs/1000-0000-0000-05/jobs",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+
+    spec = (await client.get("/docverse/openapi.json")).json()
+    assert not any(
+        path.endswith("/keeper-sync/runs/{run}/jobs") for path in spec["paths"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_jobs_tag_replaces_queue(client: AsyncClient) -> None:
+    """The OpenAPI ``jobs`` tag replaces the retired ``queue`` tag."""
+    spec = (await client.get("/docverse/openapi.json")).json()
+    tag_names = {tag["name"] for tag in spec.get("tags", [])}
+    assert "jobs" in tag_names
+    assert "queue" not in tag_names
+
+    # The org-scoped jobs routes carry the ``jobs`` tag.
+    op = spec["paths"]["/docverse/orgs/{org}/jobs/{job}"]["get"]
+    assert "jobs" in op["tags"]
+
+
+@pytest.mark.asyncio
+async def test_events_subresource_reserved_not_implemented(
+    client: AsyncClient,
+) -> None:
+    """``{job}/events`` is documented as reserved but not implemented."""
+    await seed_org_with_admin(client, "sse-org", _ADMIN)
+    await seed_member("sse-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("sse-org")
+    job_id = await _seed_job(org_id)
+
+    # The reserved SSE subresource is not routed yet.
+    response = await client.get(
+        f"/docverse/orgs/sse-org/jobs/{job_id}/events",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 404
+
+    spec = (await client.get("/docverse/openapi.json")).json()
+    # It is documented (reserved) on the single-job endpoint's description
+    # but never registered as its own path.
+    assert "/docverse/orgs/{org}/jobs/{job}/events" not in spec["paths"]
+    description = spec["paths"]["/docverse/orgs/{org}/jobs/{job}"]["get"][
+        "description"
+    ]
+    assert "events" in description
+    assert "text/event-stream" in description

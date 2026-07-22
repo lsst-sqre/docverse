@@ -97,7 +97,8 @@ class KeeperSyncRun(BaseModel):
     jobs_url: HttpUrl = Field(
         description=(
             "URL to ``GET`` for the run's child queue-job listing"
-            " (``get_org_keeper_sync_run_jobs``). Always present so"
+            " (the org-scoped jobs collection filtered to this run,"
+            " ``GET /orgs/{org}/jobs?run={id}``). Always present so"
             " clients can paginate the run's children without"
             " constructing the URL by hand."
         )

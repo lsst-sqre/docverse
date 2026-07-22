@@ -1,4 +1,4 @@
-"""Handler-level response models for queue endpoints."""
+"""Handler-level response models for org-scoped job endpoints."""
 
 from __future__ import annotations
 

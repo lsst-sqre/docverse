@@ -10,8 +10,8 @@ from docverse.client.models import JobKind, JobStatus
 from docverse.dependencies.auth import AuthenticatedUser, require_reader
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import NotFoundError
+from docverse.handlers.orgs.job_models import QueueJob
 from docverse.handlers.params import JobIdParam, OrgSlugParam
-from docverse.handlers.queue.models import QueueJob
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -137,6 +137,18 @@ async def get_org_jobs(
     response_model=QueueJob,
     summary="Get a job",
     name="get_org_job",
+    description=(
+        "Return the current state of a single background job.\n\n"
+        "A companion subresource, ``GET /orgs/{org}/jobs/{job}/events``,"
+        " is **reserved** for a future ``text/event-stream`` (SSE)"
+        " endpoint that streams live status updates for this job. It is"
+        " documented here so clients can anticipate the path, but it is"
+        " not yet implemented and currently returns ``404``. A dedicated"
+        " subresource is used rather than a query parameter such as"
+        " ``?sse=true`` because switching the response media type on a"
+        " query parameter conflates the resource with its representation,"
+        " and a browser ``EventSource`` cannot set an ``Accept`` header."
+    ),
 )
 async def get_org_job(
     org_slug: OrgSlugParam,
