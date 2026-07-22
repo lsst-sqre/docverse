@@ -12,6 +12,7 @@ from docverse.dependencies.auth import require_superadmin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import OrgSlugParam
+from docverse.handlers.responses import error_responses
 
 from .models import AdminOrganization
 
@@ -41,6 +42,7 @@ class SentryTestRequest(BaseModel):
     status_code=status.HTTP_201_CREATED,
     summary="Create an organization",
     name="admin_post_organization",
+    responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_organization(
     data: OrganizationCreate,
@@ -96,6 +98,7 @@ async def get_organizations(
     response_model=AdminOrganization,
     summary="Get an organization",
     name="admin_get_organization",
+    responses=error_responses(status.HTTP_404_NOT_FOUND),
 )
 async def get_organization(
     org_slug: OrgSlugParam,
@@ -144,6 +147,7 @@ async def post_sentry_test(
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete an organization",
     name="admin_delete_organization",
+    responses=error_responses(status.HTTP_404_NOT_FOUND),
 )
 async def delete_organization(
     org_slug: OrgSlugParam,

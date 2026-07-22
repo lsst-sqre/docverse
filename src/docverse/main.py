@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from importlib.metadata import metadata, version
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, status
 from fastapi.routing import APIRoute
 from rubin.gafaelfawr import GafaelfawrClient
 from rubin.repertoire import DiscoveryClient
@@ -26,6 +26,7 @@ from .dependencies.context import context_dependency
 from .handlers.admin import admin_router
 from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
+from .handlers.responses import error_responses
 from .handlers.webhooks import webhook_router
 from .metrics import build_event_manager
 from .sentry import initialize_sentry
@@ -168,8 +169,23 @@ app = FastAPI(
 
 app.exception_handler(ClientRequestError)(client_request_error_handler)
 app.include_router(internal_router)
-app.include_router(admin_router, prefix=config.path_prefix)
-app.include_router(orgs_router, prefix=config.path_prefix)
+# Every admin operation sits behind the superadmin dependency, so all can
+# return 403; the per-resource 404 and create-conflict 409 are declared on
+# the individual admin routes. Orgs operations are all role-guarded and all
+# address an org (and often a sub-resource) by path, so 403 + 404 apply
+# uniformly; conflict-capable orgs routes add 409 individually.
+app.include_router(
+    admin_router,
+    prefix=config.path_prefix,
+    responses=error_responses(status.HTTP_403_FORBIDDEN),
+)
+app.include_router(
+    orgs_router,
+    prefix=config.path_prefix,
+    responses=error_responses(
+        status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND
+    ),
+)
 app.include_router(webhook_router, prefix=config.path_prefix)
 app.add_middleware(XForwardedMiddleware)
 
