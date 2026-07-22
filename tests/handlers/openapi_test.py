@@ -144,6 +144,20 @@ async def test_no_path_derived_operation_ids(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_org_dashboard_rebuild_tagged_orgs(client: AsyncClient) -> None:
+    """The org-wide dashboard rebuild is an org-level op tagged ``orgs``.
+
+    ``POST /orgs/{org}/dashboard/rebuild`` addresses the whole
+    organization (not a single project), so it must carry the ``orgs``
+    tag and must not be mis-filed under ``projects``.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    operation = spec["paths"]["/docverse/orgs/{org}/dashboard/rebuild"]["post"]
+    tags = set(operation.get("tags", []))
+    assert tags == {"orgs"}
+
+
+@pytest.mark.asyncio
 async def test_operations_document_forbidden_response(
     client: AsyncClient,
 ) -> None:

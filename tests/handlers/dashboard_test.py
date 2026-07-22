@@ -134,14 +134,16 @@ async def test_org_dashboard_rebuild_returns_one_job_per_project(
     # org-scoped jobs collection rather than a single job.
     assert response.headers["Location"].endswith("/orgs/dash-org/jobs")
     body = response.json()
-    assert isinstance(body, list)
-    assert len(body) == 3
-    by_slug = {entry["project_slug"]: entry for entry in body}
+    assert isinstance(body, dict)
+    entries = body["entries"]
+    assert isinstance(entries, list)
+    assert len(entries) == 3
+    by_slug = {entry["project_slug"]: entry for entry in entries}
     assert set(by_slug) == {"alpha", "beta", "gamma"}
-    job_ids = {entry["job_id"] for entry in body}
+    job_ids = {entry["job_id"] for entry in entries}
     assert len(job_ids) == 3
     assert all(isinstance(jid, str) and jid for jid in job_ids)
-    for entry in body:
+    for entry in entries:
         assert entry["job_url"].endswith(
             f"/orgs/dash-org/jobs/{entry['job_id']}"
         )
@@ -181,8 +183,8 @@ async def test_org_dashboard_rebuild_skips_projects_with_active_jobs(
     )
     assert response.status_code == 202
     body = response.json()
-    assert isinstance(body, list)
-    slugs = {entry["project_slug"] for entry in body}
+    assert isinstance(body, dict)
+    slugs = {entry["project_slug"] for entry in body["entries"]}
     assert slugs == {"alpha", "gamma"}
 
 
@@ -196,7 +198,7 @@ async def test_org_dashboard_rebuild_empty_when_no_projects(
         headers={"X-Auth-Request-User": "admin-user"},
     )
     assert response.status_code == 202
-    assert response.json() == []
+    assert response.json() == {"entries": []}
 
 
 @pytest.mark.asyncio
@@ -219,7 +221,7 @@ async def test_org_dashboard_rebuild_excludes_deleted_projects(
     )
     assert response.status_code == 202
     body = response.json()
-    slugs = {entry["project_slug"] for entry in body}
+    slugs = {entry["project_slug"] for entry in body["entries"]}
     assert slugs == {"keep-one", "keep-two"}
 
 
