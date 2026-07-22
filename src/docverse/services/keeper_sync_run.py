@@ -25,14 +25,11 @@ from docverse.domain.keeper_sync_run import (
     KeeperSyncRunWithActivity,
 )
 from docverse.domain.organization import Organization
-from docverse.domain.queue import JobStatus, QueueJob
+from docverse.domain.queue import QueueJob
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.pagination import (
-    KeeperSyncRunDateStartedCursor,
-    QueueJobDateCreatedCursor,
-)
+from docverse.storage.pagination import KeeperSyncRunDateStartedCursor
 from docverse.storage.queue_backend import QueueBackend
 from docverse.storage.queue_job_store import QueueJobStore
 
@@ -269,37 +266,6 @@ class KeeperSyncRunService:
         org = await self._require_org(org_slug)
         return await self._run_store.list_by_org(
             org_id=org.id,
-            status=status,
-            cursor=cursor,
-            limit=limit,
-        )
-
-    async def list_run_jobs(
-        self,
-        *,
-        org_slug: str,
-        public_id: int,
-        status: JobStatus | None = None,
-        cursor: QueueJobDateCreatedCursor | None = None,
-        limit: int,
-    ) -> CountedPaginatedList[QueueJob, QueueJobDateCreatedCursor]:
-        """List child queue jobs attributed to a run, newest-first.
-
-        Validates that the run exists and belongs to the requested org
-        before paging — cross-org access surfaces as 404 (the same
-        shape as a missing run id) rather than 403, mirroring the
-        single-run ``GET`` handler.
-        """
-        org = await self._require_org(org_slug)
-        run = await self._run_store.get_by_public_id(public_id)
-        if run is None or run.org_id != org.id:
-            msg = (
-                f"Keeper sync run {public_id} not found for organization "
-                f"{org_slug!r}"
-            )
-            raise NotFoundError(msg)
-        return await self._queue_job_store.list_by_keeper_sync_run(
-            run_id=run.id,
             status=status,
             cursor=cursor,
             limit=limit,

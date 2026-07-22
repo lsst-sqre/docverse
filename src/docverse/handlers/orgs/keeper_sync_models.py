@@ -78,10 +78,8 @@ class KeeperSyncRun(_KeeperSyncRunBase):
             jobs_url=HttpUrl(
                 str(
                     request.url_for(
-                        "get_org_keeper_sync_run_jobs",
-                        org=org_slug,
-                        run=run_public_id,
-                    )
+                        "get_org_jobs", org=org_slug
+                    ).include_query_params(run=run_public_id)
                 )
             ),
             id=run_public_id,

@@ -5,7 +5,7 @@ Every Pydantic model used as ``response_model=`` in
 model or :class:`enum.Enum` reachable from those models' field
 annotations — must be importable from :mod:`docverse.client.models`.
 Handler-side subclasses (in ``handlers/orgs/keeper_sync_models.py``
-and ``handlers/queue/models.py``) are accepted because their client-
+and ``handlers/orgs/job_models.py``) are accepted because their client-
 package base class is exported; the handler subclasses themselves
 must not be re-exported.
 
@@ -21,9 +21,9 @@ from typing import Any, get_args, get_origin
 from pydantic import BaseModel
 
 import docverse.client.models as client_models
+from docverse.handlers.orgs import job_models as queue_handler_models
 from docverse.handlers.orgs import keeper_sync as keeper_sync_handlers
 from docverse.handlers.orgs import keeper_sync_models as handler_models
-from docverse.handlers.queue import models as queue_handler_models
 
 
 def _exported_classes() -> set[type]:
