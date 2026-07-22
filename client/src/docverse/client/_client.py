@@ -11,7 +11,13 @@ import click
 import httpx
 
 from ._exceptions import BuildProcessingError, DocverseClientError
-from .models import Build, BuildStatus, BuildUpdate, QueueJob
+from .models import (
+    Build,
+    BuildStatus,
+    BuildUpdate,
+    OrganizationSummary,
+    QueueJob,
+)
 from .models.builds import BuildAnnotations
 from .models.queue_enums import JobStatus
 
@@ -122,6 +128,26 @@ class DocverseClient:
             msg = "DocverseClient must be used as an async context manager"
             raise RuntimeError(msg)
         return self._http
+
+    async def list_organizations(self) -> list[OrganizationSummary]:
+        """List organizations the caller can access.
+
+        Returns one summary per organization in which the caller holds an
+        effective role (via direct or group membership); a superadmin
+        receives every organization. An empty list is a valid response.
+
+        Returns
+        -------
+        list of OrganizationSummary
+            The accessible organizations, each with the caller's effective
+            role.
+        """
+        response = await self._client.get("/orgs")
+        _raise_for_status(response)
+        return [
+            OrganizationSummary.model_validate(item)
+            for item in response.json()
+        ]
 
     async def create_build(
         self,
