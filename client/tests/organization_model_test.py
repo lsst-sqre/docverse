@@ -8,9 +8,27 @@ from pydantic import ValidationError
 from docverse.client.models import (
     LifecycleRuleSet,
     OrganizationCreate,
+    OrganizationSummary,
     OrganizationUpdate,
+    OrgRole,
 )
 from docverse.client.models.organizations import normalize_base_domain
+
+
+def test_organization_summary_round_trip() -> None:
+    """OrganizationSummary parses the listing entry shape."""
+    summary = OrganizationSummary.model_validate(
+        {
+            "self_url": "https://example.com/docverse/orgs/lsst",
+            "slug": "lsst",
+            "title": "Rubin Observatory",
+            "role": "reader",
+        }
+    )
+    assert summary.slug == "lsst"
+    assert summary.title == "Rubin Observatory"
+    assert summary.role is OrgRole.reader
+    assert summary.self_url.endswith("/orgs/lsst")
 
 
 @pytest.mark.parametrize(

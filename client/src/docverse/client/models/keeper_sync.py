@@ -6,12 +6,13 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 from .editions import EditionKind
 
 __all__ = [
     "KeeperSyncConfig",
+    "KeeperSyncConfigUpdate",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
@@ -61,6 +62,63 @@ class KeeperSyncConfig(BaseModel):
             " visible on the LTD instance."
         ),
     )
+
+
+class KeeperSyncConfigUpdate(BaseModel):
+    """Partial update for an organization's LTD Keeper sync configuration.
+
+    Request model for ``PATCH /orgs/{org}/keeper-sync``, applied with
+    JSON-Merge-Patch semantics: every field is optional, and only the fields
+    present in the request body are changed — omitted fields are left
+    untouched. ``project_slugs``, when provided, **replaces the stored array
+    wholesale** (there is no append semantics; send the full desired list, or
+    ``"*"`` for every project). ``extra="forbid"`` rejects unknown fields, and
+    ``model_dump(exclude_unset=True)`` is what distinguishes "omitted" from an
+    explicit value. Use ``PUT`` for a full replacement of the config.
+
+    An explicit JSON ``null`` for any field is rejected with a 422: these
+    config fields are non-nullable, so RFC 7386's null-as-remove semantics
+    have no meaning here. Omit a field to leave it unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = Field(
+        default=None,
+        description="Whether LTD Keeper sync is enabled on the organization.",
+    )
+
+    ltd_base_url: HttpUrl | None = Field(
+        default=None,
+        description="Base URL of the LTD Keeper API (v1 shape).",
+    )
+
+    project_slugs: list[str] | Literal["*"] | None = Field(
+        default=None,
+        description=(
+            'LTD project slugs to sync, or ``"*"`` for every project'
+            " visible on the LTD instance. When provided, replaces the"
+            " stored list wholesale (no append semantics)."
+        ),
+    )
+
+    @field_validator("enabled", "ltd_base_url", "project_slugs")
+    @classmethod
+    def _reject_explicit_null(cls, value: object) -> object:
+        """Reject an explicit ``null`` for any config field.
+
+        The validator is skipped for unset defaults, so it only fires when
+        a field is explicitly sent as ``null``. These fields are
+        non-nullable in the stored config, so null-as-remove has no
+        meaning; omit a field to leave it unchanged.
+        """
+        if value is None:
+            msg = (
+                "keeper-sync config fields may not be null; omit a field to"
+                " leave it unchanged"
+            )
+            raise ValueError(msg)
+        return value
 
 
 class KeeperSyncRunKind(StrEnum):

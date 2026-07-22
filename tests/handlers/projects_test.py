@@ -49,6 +49,7 @@ async def test_create_project(client: AsyncClient) -> None:
     assert data["title"] == "My Docs"
     assert "id" not in data
     assert data["self_url"].endswith("/orgs/proj-org/projects/my-docs")
+    assert response.headers["Location"] == data["self_url"]
 
 
 @pytest.mark.asyncio

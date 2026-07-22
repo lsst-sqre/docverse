@@ -82,6 +82,7 @@ async def test_create_edition(client: AsyncClient) -> None:
     assert data["published_url"] == (
         "https://ed-proj.ed-org.example.com/v/main/"
     )
+    assert response.headers["Location"] == data["self_url"]
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 __all__ = [
     "DashboardRebuildResponse",
     "OrgDashboardRebuildEntry",
+    "OrgDashboardRebuildResponse",
 ]
 
 
@@ -36,3 +37,22 @@ class OrgDashboardRebuildEntry(BaseModel):
     )
 
     job_url: str = Field(description="URL to the enqueued job resource.")
+
+
+class OrgDashboardRebuildResponse(BaseModel):
+    """Response body for the org-wide dashboard rebuild endpoint.
+
+    The enqueued jobs are wrapped in an object envelope (rather than a
+    bare JSON array) so the response can grow additional fields without a
+    breaking change.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    entries: list[OrgDashboardRebuildEntry] = Field(
+        default_factory=list,
+        description=(
+            "One entry per project for which a ``dashboard_build`` job was"
+            " enqueued."
+        ),
+    )

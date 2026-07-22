@@ -43,56 +43,51 @@ from docverse.services.keeper_sync_project import KeeperSyncProjectStatusResult
 from docverse.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
-    "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncProjectStatus",
-    "KeeperSyncRun",
     "KeeperSyncRunCreated",
     "KeeperSyncTombstone",
+    "keeper_sync_edition_status_from_domain",
+    "keeper_sync_run_from_domain",
 ]
 
 
-class KeeperSyncRun(_KeeperSyncRunBase):
-    """Keeper sync run response model with HATEOAS ``self_url``."""
-
-    @classmethod
-    def from_domain(
-        cls,
-        run: KeeperSyncRunDomain,
-        activity: KeeperSyncRunActivityDomain,
-        request: Request,
-        org_slug: str,
-    ) -> Self:
-        """Compose the response from a run plus its derived activity."""
-        run_public_id = serialize_base32_id(run.public_id)
-        return cls(
-            self_url=HttpUrl(
-                str(
-                    request.url_for(
-                        "get_org_keeper_sync_run",
-                        org=org_slug,
-                        run=run_public_id,
-                    )
+def keeper_sync_run_from_domain(
+    run: KeeperSyncRunDomain,
+    activity: KeeperSyncRunActivityDomain,
+    request: Request,
+    org_slug: str,
+) -> _KeeperSyncRunBase:
+    """Compose the client ``KeeperSyncRun`` from a run plus its activity."""
+    run_public_id = serialize_base32_id(run.public_id)
+    return _KeeperSyncRunBase(
+        self_url=HttpUrl(
+            str(
+                request.url_for(
+                    "get_org_keeper_sync_run",
+                    org=org_slug,
+                    run=run_public_id,
                 )
-            ),
-            jobs_url=HttpUrl(
-                str(
-                    request.url_for(
-                        "get_org_jobs", org=org_slug
-                    ).include_query_params(run=run_public_id)
-                )
-            ),
-            id=run_public_id,
-            kind=KeeperSyncRunKind(run.kind),
-            status=KeeperSyncRunStatus(run.status),
-            pending_count=activity.pending_count,
-            succeeded_count=activity.succeeded_count,
-            failed_count=activity.failed_count,
-            total_count=activity.total_count,
-            date_started=run.date_started,
-            date_finished=run.date_finished,
-            date_last_activity=activity.date_last_activity,
-        )
+            )
+        ),
+        jobs_url=HttpUrl(
+            str(
+                request.url_for(
+                    "get_org_jobs", org=org_slug
+                ).include_query_params(run=run_public_id)
+            )
+        ),
+        id=run_public_id,
+        kind=KeeperSyncRunKind(run.kind),
+        status=KeeperSyncRunStatus(run.status),
+        pending_count=activity.pending_count,
+        succeeded_count=activity.succeeded_count,
+        failed_count=activity.failed_count,
+        total_count=activity.total_count,
+        date_started=run.date_started,
+        date_finished=run.date_finished,
+        date_last_activity=activity.date_last_activity,
+    )
 
 
 class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
@@ -110,7 +105,7 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
         """Build the 202 envelope from the run + enqueued queue-job."""
         job_id = serialize_base32_id(queue_job.public_id)
         return cls(
-            run=KeeperSyncRun.from_domain(run, activity, request, org_slug),
+            run=keeper_sync_run_from_domain(run, activity, request, org_slug),
             job_id=job_id,
             job_url=HttpUrl(
                 str(request.url_for("get_org_job", org=org_slug, job=job_id))
@@ -118,38 +113,33 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
         )
 
 
-class KeeperSyncEditionStatus(_KeeperSyncEditionStatusBase):
-    """Edition-status entry with HATEOAS ``edition_url``."""
-
-    @classmethod
-    def from_domain(
-        cls,
-        edition: EditionDomain,
-        state: KeeperSyncState | None,
-        request: Request,
-        org_slug: str,
-        project_slug: str,
-    ) -> Self:
-        """Compose the entry from a Docverse edition + optional state row."""
-        return cls(
-            edition_url=HttpUrl(
-                str(
-                    request.url_for(
-                        "get_edition",
-                        org=org_slug,
-                        project=project_slug,
-                        edition=edition.slug,
-                    )
+def keeper_sync_edition_status_from_domain(
+    edition: EditionDomain,
+    state: KeeperSyncState | None,
+    request: Request,
+    org_slug: str,
+    project_slug: str,
+) -> _KeeperSyncEditionStatusBase:
+    """Compose the client edition-status entry with a HATEOAS URL."""
+    return _KeeperSyncEditionStatusBase(
+        edition_url=HttpUrl(
+            str(
+                request.url_for(
+                    "get_edition",
+                    org=org_slug,
+                    project=project_slug,
+                    edition=edition.slug,
                 )
-            ),
-            slug=edition.slug,
-            kind=edition.kind,
-            ltd_id=state.ltd_id if state is not None else None,
-            ltd_slug=state.ltd_slug if state is not None else None,
-            date_last_synced=(
-                state.date_last_synced if state is not None else None
-            ),
-        )
+            )
+        ),
+        slug=edition.slug,
+        kind=edition.kind,
+        ltd_id=state.ltd_id if state is not None else None,
+        ltd_slug=state.ltd_slug if state is not None else None,
+        date_last_synced=(
+            state.date_last_synced if state is not None else None
+        ),
+    )
 
 
 class KeeperSyncProjectRefreshAccepted(_KeeperSyncProjectRefreshAcceptedBase):
@@ -204,7 +194,7 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
                 )
             )
             if result.main_edition_row is not None:
-                main_edition = KeeperSyncEditionStatus.from_domain(
+                main_edition = keeper_sync_edition_status_from_domain(
                     result.main_edition_row.edition,
                     result.main_edition_row.state,
                     request,

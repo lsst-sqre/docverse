@@ -17,7 +17,11 @@ from .credentials import (
     OrganizationCredentialCreate,
     S3Credentials,
 )
-from .dashboard import DashboardRebuildResponse, OrgDashboardRebuildEntry
+from .dashboard import (
+    DashboardRebuildResponse,
+    OrgDashboardRebuildEntry,
+    OrgDashboardRebuildResponse,
+)
 from .dashboard_template import (
     DashboardTemplateBinding,
     DashboardTemplateBindingCreate,
@@ -39,6 +43,7 @@ from .infrastructure import (
 )
 from .keeper_sync import (
     KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
     KeeperSyncEditionDiff,
     KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
@@ -67,12 +72,14 @@ from .lifecycle import (
 from .memberships import (
     OrgMembership,
     OrgMembershipCreate,
+    OrgMembershipUpdate,
     OrgRole,
     PrincipalType,
 )
 from .organizations import (
     Organization,
     OrganizationCreate,
+    OrganizationSummary,
     OrganizationUpdate,
     UrlScheme,
 )
@@ -130,6 +137,7 @@ __all__ = [
     "JobKind",
     "JobStatus",
     "KeeperSyncConfig",
+    "KeeperSyncConfigUpdate",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
@@ -149,8 +157,10 @@ __all__ = [
     "LifecycleRule",
     "LifecycleRuleSet",
     "OrgDashboardRebuildEntry",
+    "OrgDashboardRebuildResponse",
     "OrgMembership",
     "OrgMembershipCreate",
+    "OrgMembershipUpdate",
     "OrgRole",
     "Organization",
     "OrganizationCreate",
@@ -160,6 +170,7 @@ __all__ = [
     "OrganizationServiceCreate",
     "OrganizationServiceSummary",
     "OrganizationServiceUpdate",
+    "OrganizationSummary",
     "OrganizationUpdate",
     "PrincipalType",
     "Project",

@@ -6,22 +6,30 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
+from docverse.client.models import OrgDashboardRebuildResponse
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
+from docverse.handlers.responses import error_responses
 
 from .models import DashboardRebuildResponse, OrgDashboardRebuildEntry
 
-router = APIRouter()
+# The project-scoped rebuild is a project-level operation (tagged
+# ``projects``); the org-wide rebuild is org-level (tagged ``orgs``). They
+# live on separate routers so ``orgs/__init__.py`` can tag each at the
+# appropriate level.
+project_router = APIRouter()
+org_router = APIRouter()
 
 
-@router.post(
+@project_router.post(
     "/orgs/{org}/projects/{project}/dashboard/rebuild",
     response_model=DashboardRebuildResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Rebuild a project's dashboard",
     name="post_dashboard_rebuild",
+    responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_dashboard_rebuild(
     org_slug: OrgSlugParam,
@@ -39,14 +47,16 @@ async def post_dashboard_rebuild(
     if queue_job is None:
         msg = f"dashboard_build already queued for project {project_slug!r}"
         raise ConflictError(msg)
-    return DashboardRebuildResponse.from_queue_job(
+    response_model = DashboardRebuildResponse.from_queue_job(
         queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = response_model.job_url
+    return response_model
 
 
-@router.post(
+@org_router.post(
     "/orgs/{org}/dashboard/rebuild",
-    response_model=list[OrgDashboardRebuildEntry],
+    response_model=OrgDashboardRebuildResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Rebuild every project's dashboard in an organization",
     name="post_org_dashboard_rebuild",
@@ -55,15 +65,24 @@ async def post_org_dashboard_rebuild(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-) -> list[OrgDashboardRebuildEntry]:
+) -> OrgDashboardRebuildResponse:
     async with context.session.begin():
         service = context.factory.create_dashboard_build_enqueuer()
         results = await service.enqueue_for_org(org_id=user.org.id)
         await context.session.commit()
 
-    return [
-        OrgDashboardRebuildEntry.from_domain(
-            project, queue_job, context.request, org_slug
-        )
-        for project, queue_job in results
-    ]
+    # This batch enqueues one job per project, so there is no single job
+    # resource to point at. Per RFC 7231 the 202 ``Location`` names a status
+    # monitor for the request; the org-scoped jobs collection serves that
+    # role here.
+    context.response.headers["Location"] = str(
+        context.request.url_for("get_org_jobs", org=org_slug)
+    )
+    return OrgDashboardRebuildResponse(
+        entries=[
+            OrgDashboardRebuildEntry.from_domain(
+                project, queue_job, context.request, org_slug
+            )
+            for project, queue_job in results
+        ]
+    )
