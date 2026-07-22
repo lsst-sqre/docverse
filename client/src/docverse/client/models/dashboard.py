@@ -15,13 +15,11 @@ class DashboardRebuildResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    queue_job_id: str = Field(
+    job_id: str = Field(
         description="Public Base32 identifier for the enqueued job."
     )
 
-    queue_job_url: str = Field(
-        description="URL to the enqueued queue job resource."
-    )
+    job_url: str = Field(description="URL to the enqueued job resource.")
 
 
 class OrgDashboardRebuildEntry(BaseModel):
@@ -33,10 +31,8 @@ class OrgDashboardRebuildEntry(BaseModel):
         description="Slug of the project the job will rebuild."
     )
 
-    queue_job_id: str = Field(
+    job_id: str = Field(
         description="Public Base32 identifier for the enqueued job."
     )
 
-    queue_job_url: str = Field(
-        description="URL to the enqueued queue job resource."
-    )
+    job_url: str = Field(description="URL to the enqueued job resource.")

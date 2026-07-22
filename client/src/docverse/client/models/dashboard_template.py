@@ -142,10 +142,10 @@ class DashboardTemplateBinding(BaseModel):
         description="Operator-readable error from the most recent sync.",
     )
 
-    last_sync_queue_job_url: str | None = Field(
+    last_sync_job_url: str | None = Field(
         default=None,
         description=(
-            "URL of the most-recently-enqueued ``dashboard_sync`` queue "
+            "URL of the most-recently-enqueued ``dashboard_sync`` "
             "job, or ``None`` if no sync has been enqueued for this "
             "binding yet (or the referenced job has been pruned)."
         ),

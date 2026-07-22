@@ -102,7 +102,7 @@ async def try_enqueue_dashboard_sync(
     """Enqueue one ``dashboard_sync`` job in its own transaction.
 
     Returns the freshly-created :class:`QueueJob` on success so the
-    caller can surface ``last_sync_queue_job_url`` in its response.
+    caller can surface ``last_sync_job_url`` in its response.
     Returns ``None`` on any failure — exceptions are logged but never
     re-raised, so the caller's flow (typically a binding PUT handler)
     is not broken by an enqueue failure.
