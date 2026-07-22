@@ -76,6 +76,8 @@ async def test_org_put_creates_binding(client: AsyncClient) -> None:
     assert "date_created" in body
     assert "date_updated" in body
     assert body["self_url"].endswith(f"/orgs/{_ORG}/dashboard-template")
+    # A create (201) carries a Location header equal to the self_url.
+    assert response.headers["Location"] == body["self_url"]
     # ``web_url`` is derived from the binding source coordinates; ``/``
     # root_path collapses to a bare ``/tree/{ref}`` URL with no trailing
     # path segment.
@@ -320,6 +322,8 @@ async def test_org_put_is_idempotent_no_op(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert second.status_code == 200
+    # A no-op update returns 200, not 201, so no Location header is set.
+    assert "Location" not in second.headers
     second_body = second.json()
 
     assert second_body["date_created"] == first_body["date_created"]
@@ -627,6 +631,7 @@ async def test_project_put_creates_binding(client: AsyncClient) -> None:
     )
     assert response.status_code == 201
     body = response.json()
+    assert response.headers["Location"] == body["self_url"]
     assert body["github_owner"] == "lsst-sqre"
     assert body["root_path"] == "/"
     assert body["last_sync_status"] == "pending"
@@ -1128,6 +1133,7 @@ async def test_org_sync_enqueues_dashboard_sync(client: AsyncClient) -> None:
     assert "binding_id" not in body
     assert body["job_id"]
     assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    assert response.headers["Location"] == body["job_url"]
     # The job_url resolves via the org-scoped GET.
     job_response = await client.get(
         body["job_url"],
@@ -1217,6 +1223,7 @@ async def test_project_sync_enqueues_dashboard_sync(
     assert "binding_id" not in body
     assert body["job_id"]
     assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    assert response.headers["Location"] == body["job_url"]
     # The job_url resolves via the org-scoped GET.
     job_response = await client.get(
         body["job_url"],

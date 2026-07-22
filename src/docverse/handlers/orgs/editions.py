@@ -156,13 +156,15 @@ async def post_edition(
         project_slug=project_slug,
     )
     project_url = project_published_url(org, project)
-    return edition_from_domain(
+    response_model = edition_from_domain(
         edition,
         context.request,
         org_slug,
         project_slug,
         published_url=edition_published_url(project_url, edition),
     )
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(

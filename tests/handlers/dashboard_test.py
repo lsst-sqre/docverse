@@ -37,6 +37,7 @@ async def test_dashboard_rebuild_returns_202_with_queue_id(
     assert isinstance(body["job_id"], str)
     assert len(body["job_id"]) > 0
     assert body["job_url"].endswith(f"/orgs/dash-org/jobs/{body['job_id']}")
+    assert response.headers["Location"] == body["job_url"]
     # The job_url resolves via the org-scoped GET.
     job_response = await client.get(
         body["job_url"],
@@ -129,6 +130,9 @@ async def test_org_dashboard_rebuild_returns_one_job_per_project(
         headers={"X-Auth-Request-User": "admin-user"},
     )
     assert response.status_code == 202
+    # The batch enqueues one job per project, so Location points at the
+    # org-scoped jobs collection rather than a single job.
+    assert response.headers["Location"].endswith("/orgs/dash-org/jobs")
     body = response.json()
     assert isinstance(body, list)
     assert len(body) == 3

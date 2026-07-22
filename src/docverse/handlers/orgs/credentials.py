@@ -61,9 +61,11 @@ async def post_credential(
             credentials=data.credentials.model_dump(exclude={"provider"}),
         )
         await context.session.commit()
-    return OrganizationCredentialResponse.from_domain(
+    response_model = OrganizationCredentialResponse.from_domain(
         credential, context.request, org_slug
     )
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(

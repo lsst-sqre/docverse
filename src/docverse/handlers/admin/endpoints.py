@@ -66,7 +66,9 @@ async def post_organization(
                 await membership_store.create(org_id=org.id, data=member)
         await context.session.commit()
     # New org has no services yet, so no need to load them
-    return AdminOrganization.from_domain(org, context.request)
+    response_model = AdminOrganization.from_domain(org, context.request)
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(
