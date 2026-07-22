@@ -507,6 +507,58 @@ async def test_list_org_jobs_no_role_returns_403(client: AsyncClient) -> None:
     assert response.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_list_org_jobs_memoizes_project_lookup(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page of jobs sharing one project resolves its slug with one query.
+
+    Guards the ``project_slug_cache`` memoization threaded from the list
+    handler: subject-URL resolution must not issue a per-job project-store
+    query when many jobs on a page share a project. Spy on
+    ``ProjectStore.get_by_id`` and assert exactly one lookup across three
+    jobs that all target the same project.
+    """
+    await seed_org_with_admin(client, "cache-org", _ADMIN)
+    await seed_member("cache-org", "reader-user", OrgRole.reader)
+    org_id = await _org_id("cache-org")
+    project_id, build_id, _build_public = await _seed_project_build(
+        org_id, "cache-proj"
+    )
+    # Three build_processing jobs all sharing the one project (and build),
+    # so each one's subject-URL resolution needs the project's slug.
+    for _ in range(3):
+        await _seed_job(
+            org_id,
+            kind=JobKind.build_processing,
+            project_id=project_id,
+            build_id=build_id,
+        )
+
+    lookups: list[int] = []
+    original_get_by_id = ProjectStore.get_by_id
+
+    async def counting_get_by_id(self: ProjectStore, project_pk: int) -> Any:
+        lookups.append(project_pk)
+        return await original_get_by_id(self, project_pk)
+
+    monkeypatch.setattr(ProjectStore, "get_by_id", counting_get_by_id)
+
+    response = await client.get(
+        "/docverse/orgs/cache-org/jobs",
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Total-Count"] == "3"
+    # All three jobs resolve their build_url (and thus the project slug)...
+    data = response.json()
+    assert len(data) == 3
+    for job in data:
+        assert job["build_url"] is not None
+    # ...but the shared project's slug is fetched exactly once.
+    assert lookups == [project_id]
+
+
 # ---------------------------------------------------------------------------
 # Single-job representation coverage.
 #
