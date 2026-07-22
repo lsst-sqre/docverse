@@ -66,18 +66,18 @@ def test_edition_update_ref_has_typed_edition_url() -> None:
     assert ref.model_dump(exclude_none=True)["edition_url"] == url
 
 
-def test_publish_job_ref_has_typed_queue_job_url() -> None:
-    """``queue_job_url`` is a declared field, not merely an ``extra`` key."""
-    url = "https://docverse.example/api/queue/jobs/0000-0000-0000-05"
+def test_publish_job_ref_has_typed_job_url() -> None:
+    """``job_url`` is a declared field, not merely an ``extra`` key."""
+    url = "https://docverse.example/api/orgs/o/jobs/0000-0000-0000-05"
     ref = PublishJobRef(
         edition_slug="main",
         publish_queue_job_public_id="0000-0000-0000-05",
-        queue_job_url=url,
+        job_url=url,
     )
 
-    assert ref.queue_job_url == url
-    assert "queue_job_url" in PublishJobRef.model_fields
-    assert ref.model_dump(exclude_none=True)["queue_job_url"] == url
+    assert ref.job_url == url
+    assert "job_url" in PublishJobRef.model_fields
+    assert ref.model_dump(exclude_none=True)["job_url"] == url
 
 
 _SIX_BUILD_KEYS = (

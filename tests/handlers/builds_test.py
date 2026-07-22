@@ -121,7 +121,14 @@ async def test_patch_build_upload_complete(client: AsyncClient) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "processing"
-    assert data["queue_url"] is not None
+    assert data["job_url"] is not None
+    assert "/orgs/build-org/jobs/" in data["job_url"]
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        data["job_url"],
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert job_response.status_code == 200
 
 
 @pytest.mark.asyncio

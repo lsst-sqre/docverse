@@ -75,10 +75,15 @@ async def test_post_refresh_returns_202_with_queue_job_link(
     )
     assert response.status_code == 202
     body = response.json()
-    assert body["queue_job_id"]
-    assert body["queue_job_url"].endswith(
-        f"/queue/jobs/{body['queue_job_id']}"
+    assert body["job_id"]
+    assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        body["job_url"],
+        headers={"X-Auth-Request-User": _ADMIN},
     )
+    assert job_response.status_code == 200
+    assert job_response.json()["id"] == body["job_id"]
 
     org_id = await _get_org_id()
     async for session in db_session_dependency():

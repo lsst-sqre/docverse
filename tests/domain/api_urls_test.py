@@ -2,7 +2,7 @@
 
 The drift-guard tests pin each builder's path template to the live
 FastAPI route of the same resource (``get_edition`` / ``get_build`` /
-``get_queue_job``). Each builder composes a resource URL as
+``get_org_job``). Each builder composes a resource URL as
 ``base + <route path minus the application path prefix>``; the base that
 Repertoire hands back already carries that prefix. A route rename — of
 either a path segment or the route's name — therefore fails these tests.
@@ -11,7 +11,7 @@ either a path segment or the route's name — therefore fails these tests.
 from __future__ import annotations
 
 from docverse.config import config
-from docverse.domain.api_urls import build_url, edition_url, queue_job_url
+from docverse.domain.api_urls import build_url, edition_url, job_url
 from docverse.main import app
 
 _BASE = "https://docverse.example/api"
@@ -44,9 +44,9 @@ def test_build_url_pins_to_get_build_route() -> None:
     assert url == f"{_BASE}{suffix}"
 
 
-def test_queue_job_url_pins_to_get_queue_job_route() -> None:
-    url = queue_job_url(_BASE, job="JOBID")
-    suffix = _route_suffix("get_queue_job", job="JOBID")
+def test_job_url_pins_to_get_org_job_route() -> None:
+    url = job_url(_BASE, org="org-slug", job="JOBID")
+    suffix = _route_suffix("get_org_job", org="org-slug", job="JOBID")
     assert url == f"{_BASE}{suffix}"
 
 

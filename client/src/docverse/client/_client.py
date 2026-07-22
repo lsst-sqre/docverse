@@ -207,7 +207,7 @@ class DocverseClient:
         Returns
         -------
         Build
-            Updated build with ``queue_url`` populated.
+            Updated build with ``job_url`` populated.
         """
         update = BuildUpdate(status=BuildStatus.uploaded)
         response = await self._client.patch(
@@ -217,32 +217,32 @@ class DocverseClient:
         _raise_for_status(response)
         return Build.model_validate(response.json())
 
-    async def get_queue_job(self, queue_url: str) -> QueueJob:
+    async def get_queue_job(self, job_url: str) -> QueueJob:
         """Fetch the current state of a queue job.
 
         Parameters
         ----------
-        queue_url
-            URL to the queue job resource.
+        job_url
+            URL to the job resource.
 
         Returns
         -------
         QueueJob
             Current job state.
         """
-        response = await self._client.get(queue_url)
+        response = await self._client.get(job_url)
         _raise_for_status(response)
         return QueueJob.model_validate(response.json())
 
-    async def wait_for_job(self, queue_url: str) -> QueueJob:
+    async def wait_for_job(self, job_url: str) -> QueueJob:
         """Poll a queue job until it reaches a terminal state.
 
         Uses exponential backoff with jitter (1 s initial, 15 s max).
 
         Parameters
         ----------
-        queue_url
-            URL to the queue job resource.
+        job_url
+            URL to the job resource.
 
         Returns
         -------
@@ -256,7 +256,7 @@ class DocverseClient:
         """
         delay = _BACKOFF_INITIAL
         while True:
-            job = await self.get_queue_job(queue_url)
+            job = await self.get_queue_job(job_url)
             if job.status == JobStatus.failed:
                 msg = f"Build processing failed (phase={job.phase})"
                 raise BuildProcessingError(msg, job=job)

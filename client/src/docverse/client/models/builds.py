@@ -161,9 +161,9 @@ class Build(BaseModel):
         description="Pre-signed URL for uploading the build tarball.",
     )
 
-    queue_url: str | None = Field(
+    job_url: str | None = Field(
         default=None,
-        description="URL to the queue job processing this build.",
+        description="URL to the job processing this build.",
     )
 
     object_count: int | None = Field(

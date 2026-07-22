@@ -270,7 +270,7 @@ async def post_org_keeper_sync_project_refresh(
         )
         await context.session.commit()
     return KeeperSyncProjectRefreshAccepted.from_domain(
-        queue_job, context.request
+        queue_job, context.request, org_slug
     )
 
 

@@ -35,7 +35,7 @@ def _build_response(**overrides: Any) -> dict[str, Any]:
         "content_hash": "sha256:" + "a" * 64,
         "status": "pending",
         "upload_url": "https://storage.example.com/presigned-put",
-        "queue_url": None,
+        "job_url": None,
         "object_count": None,
         "total_size_bytes": None,
         "uploader": "ci-bot",
@@ -50,7 +50,7 @@ def _build_response(**overrides: Any) -> dict[str, Any]:
 
 def _job_response(**overrides: Any) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "self_url": "/queue/jobs/" + JOB_ID,
+        "self_url": f"/orgs/{ORG}/jobs/" + JOB_ID,
         "id": JOB_ID,
         "kind": "build_processing",
         "status": "completed",
@@ -75,7 +75,7 @@ def _setup_routes(
     """Set up standard respx routes for a full upload flow."""
     build_url = f"/orgs/{ORG}/projects/{PROJECT}/builds"
     build_self = f"/orgs/{ORG}/projects/{PROJECT}/builds/{BUILD_ID}"
-    queue_url = "/queue/jobs/" + JOB_ID
+    job_url = f"/orgs/{ORG}/jobs/" + JOB_ID
 
     router.post(build_url).mock(
         return_value=httpx.Response(
@@ -87,14 +87,14 @@ def _setup_routes(
     )
     complete_data = {
         "status": "uploaded",
-        "queue_url": queue_url,
+        "job_url": job_url,
         **(complete_overrides or {}),
     }
     router.patch(build_self).mock(
         return_value=httpx.Response(200, json=_build_response(**complete_data))
     )
     if job_overrides is not None or complete_overrides is None:
-        router.get(queue_url).mock(
+        router.get(job_url).mock(
             return_value=httpx.Response(
                 200, json=_job_response(**(job_overrides or {}))
             )
@@ -245,14 +245,14 @@ def test_upload_with_annotations(tmp_path: Path) -> None:
             return_value=httpx.Response(200)
         )
         build_self = f"/orgs/{ORG}/projects/{PROJECT}/builds/{BUILD_ID}"
-        queue_url = "/queue/jobs/" + JOB_ID
+        job_url = f"/orgs/{ORG}/jobs/" + JOB_ID
         router.patch(build_self).mock(
             return_value=httpx.Response(
                 200,
-                json=_build_response(status="uploaded", queue_url=queue_url),
+                json=_build_response(status="uploaded", job_url=job_url),
             )
         )
-        router.get(queue_url).mock(
+        router.get(job_url).mock(
             return_value=httpx.Response(
                 200, json=_job_response(status="completed")
             )
@@ -303,14 +303,14 @@ def test_upload_no_auto_annotations(tmp_path: Path) -> None:
             return_value=httpx.Response(200)
         )
         build_self = f"/orgs/{ORG}/projects/{PROJECT}/builds/{BUILD_ID}"
-        queue_url = "/queue/jobs/" + JOB_ID
+        job_url = f"/orgs/{ORG}/jobs/" + JOB_ID
         router.patch(build_self).mock(
             return_value=httpx.Response(
                 200,
-                json=_build_response(status="uploaded", queue_url=queue_url),
+                json=_build_response(status="uploaded", job_url=job_url),
             )
         )
-        router.get(queue_url).mock(
+        router.get(job_url).mock(
             return_value=httpx.Response(
                 200, json=_job_response(status="completed")
             )

@@ -173,11 +173,16 @@ async def test_post_run_returns_202_with_run_and_queue_job_link(
             f"/docverse/orgs/{_ORG}/keeper-sync/runs/{body['run']['id']}/jobs"
         )
     )
-    assert "queue_job_url" in body
-    assert body["queue_job_id"]
-    assert body["queue_job_url"].endswith(
-        f"/queue/jobs/{body['queue_job_id']}"
+    assert "job_url" in body
+    assert body["job_id"]
+    assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        body["job_url"],
+        headers={"X-Auth-Request-User": _ADMIN},
     )
+    assert job_response.status_code == 200
+    assert job_response.json()["id"] == body["job_id"]
 
 
 @pytest.mark.asyncio
@@ -751,8 +756,8 @@ async def test_keeper_sync_url_fields_report_format_uri(
 ) -> None:
     """The three HATEOAS URL fields advertise ``format: uri`` in OpenAPI.
 
-    ``KeeperSyncRun.self_url``, ``KeeperSyncRunCreated.queue_job_url``,
-    and ``KeeperSyncProjectRefreshAccepted.queue_job_url`` are typed
+    ``KeeperSyncRun.self_url``, ``KeeperSyncRunCreated.job_url``,
+    and ``KeeperSyncProjectRefreshAccepted.job_url`` are typed
     ``HttpUrl`` on the client mirror so Pydantic emits the standard
     URL format string in the generated schema. The peer fields on the
     same models (``KeeperSyncRun.jobs_url`` and the URL fields on
@@ -780,8 +785,8 @@ async def test_keeper_sync_url_fields_report_format_uri(
 
     targets: list[tuple[str, str]] = [
         *((name, "self_url") for name in keeper_sync_run_schema_names),
-        ("KeeperSyncRunCreated", "queue_job_url"),
-        ("KeeperSyncProjectRefreshAccepted", "queue_job_url"),
+        ("KeeperSyncRunCreated", "job_url"),
+        ("KeeperSyncProjectRefreshAccepted", "job_url"),
     ]
     for model_name, field_name in targets:
         field_schema = schemas[model_name]["properties"][field_name]

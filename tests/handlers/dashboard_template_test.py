@@ -87,8 +87,8 @@ async def test_org_put_creates_binding(client: AsyncClient) -> None:
     # links a template content row.
     assert body["commit_sha"] is None
     # The PUT enqueues an initial sync, so the URL points at that job.
-    assert body["last_sync_queue_job_url"] is not None
-    assert "/queue/jobs/" in body["last_sync_queue_job_url"]
+    assert body["last_sync_job_url"] is not None
+    assert f"/orgs/{_ORG}/jobs/" in body["last_sync_job_url"]
 
 
 @pytest.mark.asyncio
@@ -906,7 +906,7 @@ async def test_project_put_enqueues_dashboard_sync(
 async def test_org_put_response_url_matches_enqueued_queue_job(
     client: AsyncClient,
 ) -> None:
-    """Response ``last_sync_queue_job_url`` ends in the enqueued job's id."""
+    """Response ``last_sync_job_url`` ends in the enqueued job's id."""
     await _setup_org(client)
     mock_arq: MockArqQueue = arq_dependency._arq_queue  # type: ignore[assignment]
     response = await client.put(
@@ -918,9 +918,9 @@ async def test_org_put_response_url_matches_enqueued_queue_job(
     enqueues = _dashboard_sync_enqueues(mock_arq)
     queue_job_public_id = enqueues[-1].kwargs["payload"]["queue_job_public_id"]
     body = response.json()
-    assert body["last_sync_queue_job_url"] is not None
-    assert body["last_sync_queue_job_url"].endswith(
-        f"/queue/jobs/{queue_job_public_id}"
+    assert body["last_sync_job_url"] is not None
+    assert body["last_sync_job_url"].endswith(
+        f"/orgs/{_ORG}/jobs/{queue_job_public_id}"
     )
 
 
@@ -928,7 +928,7 @@ async def test_org_put_response_url_matches_enqueued_queue_job(
 async def test_org_get_returns_same_queue_job_url_as_put(
     client: AsyncClient,
 ) -> None:
-    """GET surfaces the same ``last_sync_queue_job_url`` PUT returned.
+    """GET surfaces the same ``last_sync_job_url`` PUT returned.
 
     The URL persists across reads until a follow-up sync overwrites it.
     """
@@ -939,14 +939,14 @@ async def test_org_get_returns_same_queue_job_url_as_put(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert put_response.status_code == 201
-    expected_url = put_response.json()["last_sync_queue_job_url"]
+    expected_url = put_response.json()["last_sync_job_url"]
     assert expected_url is not None
     get_response = await client.get(
         f"/docverse/orgs/{_ORG}/dashboard-template",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert get_response.status_code == 200
-    assert get_response.json()["last_sync_queue_job_url"] == expected_url
+    assert get_response.json()["last_sync_job_url"] == expected_url
 
 
 @pytest.mark.asyncio
@@ -961,7 +961,7 @@ async def test_org_put_overwrites_queue_job_url_on_resync(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert first.status_code == 201
-    first_url = first.json()["last_sync_queue_job_url"]
+    first_url = first.json()["last_sync_job_url"]
 
     second = await client.put(
         f"/docverse/orgs/{_ORG}/dashboard-template",
@@ -969,7 +969,7 @@ async def test_org_put_overwrites_queue_job_url_on_resync(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert second.status_code == 200
-    second_url = second.json()["last_sync_queue_job_url"]
+    second_url = second.json()["last_sync_job_url"]
     assert second_url is not None
     assert second_url != first_url
 
@@ -982,7 +982,7 @@ async def test_org_put_enqueue_failure_leaves_url_null(
     """When ``try_enqueue_dashboard_sync`` fails, the URL stays ``null``.
 
     Pairs with ``test_org_put_enqueue_failure_marks_binding_failed``: a
-    silently-dropped enqueue must surface ``last_sync_queue_job_url:
+    silently-dropped enqueue must surface ``last_sync_job_url:
     null`` so an operator does not chase a non-existent queue job.
     """
     await _setup_org(client)
@@ -1003,7 +1003,7 @@ async def test_org_put_enqueue_failure_leaves_url_null(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 201
-    assert response.json()["last_sync_queue_job_url"] is None
+    assert response.json()["last_sync_job_url"] is None
 
 
 @pytest.mark.asyncio
@@ -1126,10 +1126,15 @@ async def test_org_sync_enqueues_dashboard_sync(client: AsyncClient) -> None:
     assert response.status_code == 202
     body = response.json()
     assert "binding_id" not in body
-    assert body["queue_job_id"]
-    assert body["queue_job_url"].endswith(
-        f"/queue/jobs/{body['queue_job_id']}"
+    assert body["job_id"]
+    assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        body["job_url"],
+        headers={"X-Auth-Request-User": _ADMIN},
     )
+    assert job_response.status_code == 200
+    assert job_response.json()["id"] == body["job_id"]
 
     enqueues = _dashboard_sync_enqueues(mock_arq)
     assert len(enqueues) == before + 1
@@ -1210,10 +1215,15 @@ async def test_project_sync_enqueues_dashboard_sync(
     assert response.status_code == 202
     body = response.json()
     assert "binding_id" not in body
-    assert body["queue_job_id"]
-    assert body["queue_job_url"].endswith(
-        f"/queue/jobs/{body['queue_job_id']}"
+    assert body["job_id"]
+    assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        body["job_url"],
+        headers={"X-Auth-Request-User": _ADMIN},
     )
+    assert job_response.status_code == 200
+    assert job_response.json()["id"] == body["job_id"]
 
     enqueues = _dashboard_sync_enqueues(mock_arq)
     assert len(enqueues) == before + 1
