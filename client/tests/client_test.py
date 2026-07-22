@@ -39,7 +39,7 @@ def _build_response(**overrides: Any) -> dict[str, Any]:
         "content_hash": "sha256:" + "a" * 64,
         "status": "pending",
         "upload_url": "https://storage.example.com/presigned-put",
-        "queue_url": None,
+        "job_url": None,
         "object_count": None,
         "total_size_bytes": None,
         "uploader": "ci-bot",
@@ -55,7 +55,7 @@ def _build_response(**overrides: Any) -> dict[str, Any]:
 def _job_response(**overrides: Any) -> dict[str, Any]:
     """Return a dict matching the QueueJob model shape."""
     data: dict[str, Any] = {
-        "self_url": "/queue/jobs/" + JOB_ID,
+        "self_url": "/orgs/testorg/jobs/" + JOB_ID,
         "id": JOB_ID,
         "kind": "build_processing",
         "status": "completed",
@@ -159,7 +159,7 @@ async def test_complete_upload() -> None:
                 200,
                 json=_build_response(
                     status="uploaded",
-                    queue_url="/queue/jobs/" + JOB_ID,
+                    job_url="/orgs/testorg/jobs/" + JOB_ID,
                 ),
             )
         )
@@ -168,22 +168,22 @@ async def test_complete_upload() -> None:
 
         assert route.called
         assert build.status == BuildStatus.uploaded
-        assert build.queue_url == "/queue/jobs/" + JOB_ID
+        assert build.job_url == "/orgs/testorg/jobs/" + JOB_ID
 
 
 @pytest.mark.asyncio
-async def test_get_queue_job() -> None:
-    """GET to queue URL returns parsed QueueJob."""
-    queue_url = "/queue/jobs/" + JOB_ID
+async def test_get_job() -> None:
+    """GET to job URL returns parsed QueueJob."""
+    job_url = "/orgs/testorg/jobs/" + JOB_ID
     async with respx.mock(base_url=BASE_URL) as router:
-        router.get(queue_url).mock(
+        router.get(job_url).mock(
             return_value=httpx.Response(
                 200,
                 json=_job_response(status="completed"),
             )
         )
         async with DocverseClient(BASE_URL, TOKEN) as client:
-            job = await client.get_queue_job(queue_url)
+            job = await client.get_job(job_url)
 
     assert job.id == JOB_ID
     assert job.status == JobStatus.completed

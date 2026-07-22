@@ -27,7 +27,7 @@ from docverse.client.models import (
     EditionUpdateRef,
     PublishJobRef,
 )
-from docverse.domain.api_urls import edition_url, queue_job_url
+from docverse.domain.api_urls import edition_url, job_url
 from docverse.domain.build import Build
 from docverse.domain.edition_tracking import EditionTrackingResult
 from docverse.exceptions import NotFoundError
@@ -478,7 +478,7 @@ async def _finalize_success(
     #
     # Resolve the Docverse API base URL once for every HATEOAS link in this
     # job's progress payload, but only when there are updated editions to
-    # link: a build that updates nothing has no edition_url / queue_job_url
+    # link: a build that updates nothing has no edition_url / job_url
     # to embed, so it skips the Repertoire discovery round-trip (and its
     # "unregistered" warning) entirely. ``None`` means discovery is
     # unavailable or Docverse is unregistered, in which case the URL fields
@@ -495,6 +495,7 @@ async def _finalize_success(
             queue_job_store=queue_job_store,
             tracking_result=tracking_result,
             org_id=org_id,
+            org_slug=org_slug,
             project_id=project_id,
             project_slug=project_slug,
             build_id=build_id,
@@ -571,6 +572,7 @@ async def _enqueue_publish_jobs(
     queue_job_store: QueueJobStore,
     tracking_result: EditionTrackingResult,
     org_id: int,
+    org_slug: str,
     project_id: int,
     project_slug: str,
     build_id: int,
@@ -587,7 +589,7 @@ async def _enqueue_publish_jobs(
     backend-job-id write-back) sequencing.
 
     Returns a list of ``{edition_slug, publish_queue_job_public_id}``
-    entries (plus a ``queue_job_url`` HATEOAS link when ``api_base`` is
+    entries (plus a ``job_url`` HATEOAS link when ``api_base`` is
     set) suitable for embedding in the parent build job's progress.
     """
     edition_store = factory.create_edition_store()
@@ -615,8 +617,8 @@ async def _enqueue_publish_jobs(
             "publish_queue_job_public_id": result.queue_job_public_id,
         }
         if api_base is not None:
-            entry["queue_job_url"] = queue_job_url(
-                api_base, job=result.queue_job_public_id
+            entry["job_url"] = job_url(
+                api_base, org=org_slug, job=result.queue_job_public_id
             )
         publish_jobs.append(entry)
         logger.info(

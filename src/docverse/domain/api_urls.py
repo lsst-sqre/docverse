@@ -7,7 +7,7 @@ Repertoire ``DiscoveryClient.url_for_internal("docverse")`` — plus the
 resource identifiers.
 
 The path templates mirror the live FastAPI routes ``get_edition`` /
-``get_build`` / ``get_queue_job`` minus the application path prefix
+``get_build`` / ``get_org_job`` minus the application path prefix
 (``config.path_prefix``), which the Repertoire-supplied base already
 carries. ``tests/domain/api_urls_test.py`` pins these templates to those
 routes so a route rename fails the test rather than silently shipping a
@@ -16,7 +16,7 @@ stale link.
 
 from __future__ import annotations
 
-__all__ = ["build_url", "edition_url", "queue_job_url"]
+__all__ = ["build_url", "edition_url", "job_url"]
 
 
 def edition_url(base: str, *, org: str, project: str, edition: str) -> str:
@@ -41,7 +41,7 @@ def edition_url(base: str, *, org: str, project: str, edition: str) -> str:
 def build_url(base: str, *, org: str, project: str, build: str) -> str:
     """Compose the URL of a build resource.
 
-    Provided alongside :func:`edition_url` / :func:`queue_job_url` for
+    Provided alongside :func:`edition_url` / :func:`job_url` for
     symmetry and future request-less (worker) use. The request-time
     ``QueueJob.build_url`` is minted via ``request.url_for``, so this builder
     currently has no production caller — only its drift-guard test pins it to
@@ -61,14 +61,18 @@ def build_url(base: str, *, org: str, project: str, build: str) -> str:
     return f"{base.rstrip('/')}/orgs/{org}/projects/{project}/builds/{build}"
 
 
-def queue_job_url(base: str, *, job: str) -> str:
-    """Compose the URL of a queue-job resource.
+def job_url(base: str, *, org: str, job: str) -> str:
+    """Compose the URL of an org-scoped job resource.
+
+    Mirrors the live ``get_org_job`` route (``/orgs/{org}/jobs/{job}``).
 
     Parameters
     ----------
     base
         Base Docverse API URL (already including any path prefix).
+    org
+        Organization slug.
     job
-        Queue-job public identifier.
+        Job public identifier.
     """
-    return f"{base.rstrip('/')}/queue/jobs/{job}"
+    return f"{base.rstrip('/')}/orgs/{org}/jobs/{job}"

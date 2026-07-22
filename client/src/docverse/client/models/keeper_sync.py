@@ -97,7 +97,8 @@ class KeeperSyncRun(BaseModel):
     jobs_url: HttpUrl = Field(
         description=(
             "URL to ``GET`` for the run's child queue-job listing"
-            " (``get_org_keeper_sync_run_jobs``). Always present so"
+            " (the org-scoped jobs collection filtered to this run,"
+            " ``GET /orgs/{org}/jobs?run={id}``). Always present so"
             " clients can paginate the run's children without"
             " constructing the URL by hand."
         )
@@ -163,15 +164,15 @@ class KeeperSyncRunCreated(BaseModel):
 
     run: KeeperSyncRun = Field(description="The newly created run.")
 
-    queue_job_id: str = Field(
+    job_id: str = Field(
         description=(
             "Public Base32 identifier for the enqueued"
             " ``keeper_sync_run_discovery`` queue job."
         )
     )
 
-    queue_job_url: HttpUrl = Field(
-        description="URL of the enqueued discovery queue job resource."
+    job_url: HttpUrl = Field(
+        description="URL of the enqueued discovery job resource."
     )
 
 
@@ -463,16 +464,14 @@ class KeeperSyncProjectRefreshAccepted(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    queue_job_id: str = Field(
+    job_id: str = Field(
         description=(
             "Public Base32 identifier for the enqueued"
             " ``keeper_sync_project`` queue job."
         )
     )
 
-    queue_job_url: HttpUrl = Field(
-        description="URL of the enqueued queue job resource."
-    )
+    job_url: HttpUrl = Field(description="URL of the enqueued job resource.")
 
 
 class KeeperSyncResourceType(StrEnum):

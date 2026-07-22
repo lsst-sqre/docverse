@@ -7,7 +7,6 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from docverse.client.models import (
-    JobStatus,
     KeeperSyncConfig,
     KeeperSyncResourceType,
     KeeperSyncRunStatus,
@@ -16,7 +15,6 @@ from docverse.client.models import (
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.handlers.params import OrgSlugParam, RunIdParam, TombstoneIdParam
-from docverse.handlers.queue.models import QueueJob
 from docverse.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
@@ -25,7 +23,6 @@ from docverse.storage.pagination import (
     KEEPER_SYNC_RUN_CURSOR_TYPE,
     KEEPER_SYNC_TOMBSTONE_CURSOR_TYPE,
     MAX_PAGE_LIMIT,
-    QUEUE_JOB_CURSOR_TYPE,
 )
 from docverse.validation import parse_base32_id
 
@@ -270,7 +267,7 @@ async def post_org_keeper_sync_project_refresh(
         )
         await context.session.commit()
     return KeeperSyncProjectRefreshAccepted.from_domain(
-        queue_job, context.request
+        queue_job, context.request, org_slug
     )
 
 
@@ -354,69 +351,6 @@ async def get_org_keeper_sync_run(
     return KeeperSyncRun.from_domain(
         result.run, result.activity, context.request, org_slug
     )
-
-
-@router.get(
-    "/orgs/{org}/keeper-sync/runs/{run}/jobs",
-    response_model=list[QueueJob],
-    summary="List child queue jobs for an LTD Keeper sync run",
-    name="get_org_keeper_sync_run_jobs",
-)
-async def get_org_keeper_sync_run_jobs(
-    org_slug: OrgSlugParam,
-    context: Annotated[RequestContext, Depends(context_dependency)],
-    user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    run_id: RunIdParam,
-    cursor: Annotated[
-        str | None,
-        Query(
-            description=(
-                "Opaque pagination cursor from a previous response's"
-                " ``Link`` header."
-            ),
-        ),
-    ] = None,
-    limit: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=MAX_PAGE_LIMIT,
-            description="Maximum number of results per page.",
-        ),
-    ] = DEFAULT_PAGE_LIMIT,
-    status_filter: Annotated[
-        JobStatus | None,
-        Query(alias="status", description="Filter jobs by status."),
-    ] = None,
-) -> list[QueueJob]:
-    public_id = parse_base32_id(run_id, resource="run")
-    parsed_cursor = (
-        QUEUE_JOB_CURSOR_TYPE.from_str(cursor) if cursor is not None else None
-    )
-    async with context.session.begin():
-        service = context.factory.create_keeper_sync_run_service()
-        result = await service.list_run_jobs(
-            org_slug=org_slug,
-            public_id=public_id,
-            status=status_filter,
-            cursor=parsed_cursor,
-            limit=limit,
-        )
-        # Every job in the page belongs to the same run, so memoize the
-        # run FK -> public-id resolution to collapse an N+1 run-store query.
-        run_public_id_cache: dict[int, str | None] = {}
-        jobs = [
-            await QueueJob.from_domain(
-                job,
-                context.request,
-                context.factory,
-                run_public_id_cache=run_public_id_cache,
-            )
-            for job in result.entries
-        ]
-    context.response.headers["Link"] = result.link_header(context.request.url)
-    context.response.headers["X-Total-Count"] = str(result.count)
-    return jobs
 
 
 @router.get(

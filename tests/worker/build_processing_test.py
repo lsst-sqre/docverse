@@ -33,7 +33,7 @@ from docverse.config import Configuration
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.project import SqlProject
 from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.api_urls import edition_url, queue_job_url
+from docverse.domain.api_urls import edition_url, job_url
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.factory import Factory
@@ -616,12 +616,12 @@ async def test_build_processing_embeds_hateoas_urls(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Progress entries carry HATEOAS ``edition_url`` / ``queue_job_url``.
+    """Progress entries carry HATEOAS ``edition_url`` / ``job_url``.
 
     The autouse ``mock_discovery`` fixture registers the ``docverse``
     internal service, so the worker resolves the API base from Repertoire
     and embeds an absolute edition link on each ``editions_updated`` entry
-    and an absolute queue-job link on each ``publish_jobs`` entry.
+    and an absolute job link on each ``publish_jobs`` entry.
     """
     logger = _logger()
     mock_store = MockObjectStore()
@@ -687,8 +687,8 @@ async def test_build_processing_embeds_hateoas_urls(
 
             entry = parent.progress["publish_jobs"][0]
             child_public_id = entry["publish_queue_job_public_id"]
-            assert entry["queue_job_url"] == queue_job_url(
-                _DISCOVERY_BASE, job=child_public_id
+            assert entry["job_url"] == job_url(
+                _DISCOVERY_BASE, org=org.slug, job=child_public_id
             )
 
 
@@ -702,7 +702,7 @@ async def test_build_processing_omits_urls_when_docverse_unregistered(
     """No Docverse Repertoire registration => URL fields omitted, no fail.
 
     The build still completes and the existing slug/ID fields remain; only
-    the HATEOAS ``edition_url`` / ``queue_job_url`` links are dropped.
+    the HATEOAS ``edition_url`` / ``job_url`` links are dropped.
     """
     # Re-register discovery with no internal ``docverse`` service so the
     # worker's ``url_for_internal("docverse")`` resolves to ``None``.
@@ -769,7 +769,7 @@ async def test_build_processing_omits_urls_when_docverse_unregistered(
 
             entry = parent.progress["publish_jobs"][0]
             assert "publish_queue_job_public_id" in entry
-            assert "queue_job_url" not in entry
+            assert "job_url" not in entry
 
 
 @pytest.mark.asyncio

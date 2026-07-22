@@ -1,4 +1,4 @@
-"""Handler-level response models for queue endpoints."""
+"""Handler-level response models for org-scoped job endpoints."""
 
 from __future__ import annotations
 
@@ -25,9 +25,16 @@ class QueueJob(_QueueJobBase):
         request: Request,
         factory: Factory,
         *,
+        org_slug: str,
         run_public_id_cache: dict[int, str | None] | None = None,
+        project_slug_cache: dict[int, str | None] | None = None,
     ) -> Self:
         """Create from a domain object, adding the HATEOAS URLs.
+
+        ``self_url`` is the job's canonical org-scoped URL
+        (``/orgs/{org}/jobs/{id}``). ``org_slug`` supplies the org segment
+        and is required: every caller is org-scoped and already holds the
+        slug it resolved in ``require_reader``.
 
         ``build_url`` / ``edition_url`` / ``subject_url`` are resolved at
         request time from the job's stored identifiers via the factory
@@ -40,6 +47,11 @@ class QueueJob(_QueueJobBase):
         across a page of jobs. List endpoints where many jobs share a run
         (e.g. the run-scoped jobs listing) pass one in to avoid an N+1
         run-store query per job; single-job callers omit it.
+
+        ``project_slug_cache`` is an analogous optional caller-owned dict,
+        keyed by the integer project FK, memoizing project-slug lookups
+        across a page of jobs so the subject-URL resolution does not issue a
+        per-job project-store query; single-job callers omit it.
         """
         job_id_str = serialize_base32_id(domain.public_id)
         # JSONB progress is stored untyped; validate it into the typed
@@ -50,13 +62,19 @@ class QueueJob(_QueueJobBase):
             else None
         )
         build_url, edition_url, subject_url = await _resolve_subject_urls(
-            domain, request, factory
+            domain,
+            request,
+            factory,
+            org_slug=org_slug,
+            project_slug_cache=project_slug_cache,
         )
         keeper_sync_run_id = await _resolve_keeper_sync_run_public_id(
             domain, factory, cache=run_public_id_cache
         )
         return cls(
-            self_url=str(request.url_for("get_queue_job", job=job_id_str)),
+            self_url=str(
+                request.url_for("get_org_job", org=org_slug, job=job_id_str)
+            ),
             id=job_id_str,
             kind=domain.kind,
             status=domain.status,
@@ -102,28 +120,62 @@ async def _resolve_keeper_sync_run_public_id(
     return resolved
 
 
+async def _resolve_project_slug(
+    project_id: int,
+    factory: Factory,
+    *,
+    cache: dict[int, str | None] | None = None,
+) -> str | None:
+    """Resolve a project's integer FK to its slug.
+
+    Returns ``None`` when the project row cannot be resolved (best-effort
+    back-reference).
+
+    When ``cache`` is supplied it memoizes the FK-to-slug resolution: the
+    project store is queried at most once per distinct project across a page
+    of jobs, collapsing the otherwise N+1 lookup on the jobs listing.
+    """
+    if cache is not None and project_id in cache:
+        return cache[project_id]
+    project = await factory.create_project_store().get_by_id(project_id)
+    resolved = project.slug if project is not None else None
+    if cache is not None:
+        cache[project_id] = resolved
+    return resolved
+
+
 async def _resolve_subject_urls(
     domain: QueueJobDomain,
     request: Request,
     factory: Factory,
+    *,
+    org_slug: str,
+    project_slug_cache: dict[int, str | None] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Resolve ``(build_url, edition_url, subject_url)`` for a queue job.
 
     Returns ``(None, None, None)`` immediately for jobs that target no
     build or edition (e.g. keeper-sync run/project jobs), so list
-    endpoints incur no extra queries for them. Otherwise the org/project
-    slugs and the build public-id / edition slug are resolved via the
-    factory stores; any identifier that cannot be resolved degrades its
-    URL to ``None``.
+    endpoints incur no extra queries for them. ``org_slug`` is the org the
+    job belongs to, already resolved by the caller, so no org-store query is
+    issued here. The project slug and the build public-id / edition slug are
+    resolved via the factory stores; any identifier that cannot be resolved
+    degrades its URL to ``None``.
+
+    When ``project_slug_cache`` is supplied it memoizes the project FK -> slug
+    resolution across a page of jobs, so a listing where many jobs share a
+    project issues at most one project-store query per distinct project
+    rather than one per job.
     """
     if domain.build_id is None and domain.edition_id is None:
         return None, None, None
     if domain.project_id is None:
         return None, None, None
 
-    org = await factory.create_org_store().get_by_id(domain.org_id)
-    project = await factory.create_project_store().get_by_id(domain.project_id)
-    if org is None or project is None:
+    project_slug = await _resolve_project_slug(
+        domain.project_id, factory, cache=project_slug_cache
+    )
+    if project_slug is None:
         return None, None, None
 
     build_url: str | None = None
@@ -139,8 +191,8 @@ async def _resolve_subject_urls(
             build_url = str(
                 request.url_for(
                     "get_build",
-                    org=org.slug,
-                    project=project.slug,
+                    org=org_slug,
+                    project=project_slug,
                     build=serialize_base32_id(build.public_id),
                 )
             )
@@ -154,8 +206,8 @@ async def _resolve_subject_urls(
             edition_url = str(
                 request.url_for(
                     "get_edition",
-                    org=org.slug,
-                    project=project.slug,
+                    org=org_slug,
+                    project=project_slug,
                     edition=edition.slug,
                 )
             )

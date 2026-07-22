@@ -12,6 +12,7 @@ from .dashboard_template import (
     project_override_router as dashboard_template_project_override_router,
 )
 from .editions import router as editions_router
+from .jobs import router as jobs_router
 from .keeper_sync import router as keeper_sync_router
 from .members import router as members_router
 from .organizations import router as organizations_router
@@ -34,5 +35,6 @@ orgs_router.include_router(
     dashboard_template_project_override_router, tags=["projects"]
 )
 orgs_router.include_router(keeper_sync_router, tags=["orgs"])
+orgs_router.include_router(jobs_router, tags=["jobs"])
 
 __all__ = ["orgs_router"]
