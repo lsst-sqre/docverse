@@ -114,6 +114,50 @@ async def test_list_by_org(
 
 
 @pytest.mark.asyncio
+async def test_update_role(
+    db_session: AsyncSession,
+    membership_store: OrgMembershipStore,
+) -> None:
+    async with db_session.begin():
+        org_id = await _create_org(db_session)
+        await membership_store.create(
+            org_id=org_id,
+            data=OrgMembershipCreate(
+                principal="carol",
+                principal_type=PrincipalType.user,
+                role=OrgRole.reader,
+            ),
+        )
+        updated = await membership_store.update_role(
+            org_id=org_id,
+            principal_type=PrincipalType.user,
+            principal="carol",
+            role=OrgRole.admin,
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.role == OrgRole.admin
+    assert updated.principal == "carol"
+
+
+@pytest.mark.asyncio
+async def test_update_role_not_found(
+    db_session: AsyncSession,
+    membership_store: OrgMembershipStore,
+) -> None:
+    async with db_session.begin():
+        org_id = await _create_org(db_session)
+        updated = await membership_store.update_role(
+            org_id=org_id,
+            principal_type=PrincipalType.user,
+            principal="ghost",
+            role=OrgRole.admin,
+        )
+        await db_session.commit()
+    assert updated is None
+
+
+@pytest.mark.asyncio
 async def test_delete_membership(
     db_session: AsyncSession,
     membership_store: OrgMembershipStore,
