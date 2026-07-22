@@ -17,7 +17,11 @@ from .credentials import (
     OrganizationCredentialCreate,
     S3Credentials,
 )
-from .dashboard import DashboardRebuildResponse, OrgDashboardRebuildEntry
+from .dashboard import (
+    DashboardRebuildResponse,
+    OrgDashboardRebuildEntry,
+    OrgDashboardRebuildResponse,
+)
 from .dashboard_template import (
     DashboardTemplateBinding,
     DashboardTemplateBindingCreate,
@@ -149,6 +153,7 @@ __all__ = [
     "LifecycleRule",
     "LifecycleRuleSet",
     "OrgDashboardRebuildEntry",
+    "OrgDashboardRebuildResponse",
     "OrgMembership",
     "OrgMembershipCreate",
     "OrgRole",
