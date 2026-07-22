@@ -80,7 +80,9 @@ class MembershipChangeAction(StrEnum):
     only ever added or removed (an in-place role change is modelled as a
     remove + add by the API), so this event carries a dedicated
     add/remove verb. The emission site selects the action statically:
-    ``post_member`` emits ``add`` and ``delete_member`` emits ``remove``.
+    ``post_member`` emits ``add``, ``delete_member`` emits ``remove``, and
+    ``patch_member`` emits a ``remove`` of the old role followed by an
+    ``add`` of the new one when a role actually changes.
     """
 
     add = "add"

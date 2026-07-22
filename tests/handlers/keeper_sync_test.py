@@ -251,6 +251,24 @@ async def test_patch_rejects_unknown_field(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["enabled", "ltd_base_url", "project_slugs"],
+)
+async def test_patch_rejects_explicit_null(
+    client: AsyncClient, field: str
+) -> None:
+    """An explicit ``null`` for any field is a 422, not a 500 or no-op."""
+    await _setup(client)
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={field: None},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_patch_403_for_non_admin(client: AsyncClient) -> None:
     await _setup(client)
     await seed_member(_ORG, "reader-user", OrgRole.reader)

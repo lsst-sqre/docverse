@@ -112,6 +112,17 @@ The choice between `PUT` and `PATCH` follows the nature of the target:
   `{"enabled": false}` leaves `ltd_base_url` and `project_slugs`
   unchanged, while providing `project_slugs` replaces the entire list.
 
+  **Explicit `null` is rejected, not honoured.** RFC 7386 merge-patch gives
+  an explicit `null` remove-the-member semantics, but the fields these PATCH
+  endpoints expose map onto non-nullable storage (a member's `role`, the
+  keeper-sync config's `enabled` / `ltd_base_url` / `project_slugs`), so
+  there is nothing to remove. Sending `null` for such a field is a client
+  error and returns **422 Unprocessable Entity**; it is *not* silently
+  treated as "unset". To leave a field unchanged, omit it from the request
+  body. (The request models distinguish the two with a field validator that
+  fires on an explicit `null` but is skipped for the unset default — see
+  `OrgMembershipUpdate` and `KeeperSyncConfigUpdate` in the client models.)
+
 ## Asynchronous operations: 202 with a `Location` job URL
 
 Operations that enqueue background work return **`202 Accepted`**. The
