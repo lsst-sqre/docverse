@@ -11,6 +11,7 @@ from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
 from docverse.handlers.params import MemberIdParam, OrgSlugParam
+from docverse.handlers.responses import error_responses
 from docverse.metrics import (
     MembershipChangeAction,
     MembershipChangedEvent,
@@ -66,6 +67,7 @@ async def get_members(
     status_code=status.HTTP_201_CREATED,
     summary="Add an organization member",
     name="post_member",
+    responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_member(
     org_slug: OrgSlugParam,

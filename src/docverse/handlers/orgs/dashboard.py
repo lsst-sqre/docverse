@@ -10,6 +10,7 @@ from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError
 from docverse.handlers.params import OrgSlugParam, ProjectSlugParam
+from docverse.handlers.responses import error_responses
 
 from .models import DashboardRebuildResponse, OrgDashboardRebuildEntry
 
@@ -22,6 +23,7 @@ router = APIRouter()
     status_code=status.HTTP_202_ACCEPTED,
     summary="Rebuild a project's dashboard",
     name="post_dashboard_rebuild",
+    responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_dashboard_rebuild(
     org_slug: OrgSlugParam,

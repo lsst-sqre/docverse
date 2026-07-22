@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -10,6 +12,43 @@ from httpx import AsyncClient
 __all__ = []
 
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete"})
+
+# Tags identifying the orgs sub-routers and admin router — the operations
+# whose 403/404/409 error contract this spec-lint covers. Internal and
+# webhook routes are deliberately excluded.
+_IN_SCOPE_TAGS = frozenset({"orgs", "projects", "jobs", "admin"})
+
+_ERROR_MODEL_REF = "#/components/schemas/ErrorModel"
+
+
+def _in_scope_operations(
+    spec: dict[str, Any],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Return ``(path, method, operation)`` for in-scope operations."""
+    operations: list[tuple[str, str, dict[str, Any]]] = []
+    for path, methods in spec["paths"].items():
+        for method, operation in methods.items():
+            if method.lower() not in _HTTP_METHODS:
+                continue
+            tags = set(operation.get("tags", []))
+            if tags & _IN_SCOPE_TAGS:
+                operations.append((path, method, operation))
+    return operations
+
+
+def _documents_error_model(
+    operation: dict[str, Any], status_code: str
+) -> bool:
+    """Whether an operation documents ``status_code`` with ``ErrorModel``."""
+    response = operation.get("responses", {}).get(status_code)
+    if response is None:
+        return False
+    schema = (
+        response.get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+    )
+    return bool(schema.get("$ref") == _ERROR_MODEL_REF)
 
 
 @pytest.mark.asyncio
@@ -101,4 +140,81 @@ async def test_no_path_derived_operation_ids(client: AsyncClient) -> None:
     assert path_derived == [], (
         f"default path-derived operationIds must not appear in openapi.json: "
         f"{path_derived}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_operations_document_forbidden_response(
+    client: AsyncClient,
+) -> None:
+    """Every in-scope operation documents a 403 with the error body.
+
+    Orgs and admin operations all sit behind a role dependency, so each
+    can return 403 for an insufficiently-privileged caller. That contract
+    must be documented from the shared error-responses helper with safir's
+    ``ErrorModel`` body schema.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    missing = [
+        f"{method.upper()} {path}"
+        for path, method, operation in _in_scope_operations(spec)
+        if not _documents_error_model(operation, "403")
+    ]
+    assert missing == [], (
+        "operations must document a 403 ErrorModel response:\n"
+        + "\n".join(missing)
+    )
+
+
+@pytest.mark.asyncio
+async def test_resource_operations_document_not_found_response(
+    client: AsyncClient,
+) -> None:
+    """Every in-scope operation with a path parameter documents 404.
+
+    An operation addressing a resource by a path parameter (e.g.
+    ``/orgs/{org}/...``) can always miss, so it must document a 404 with
+    the shared ``ErrorModel`` body schema. Collection endpoints without a
+    path parameter (e.g. ``POST /admin/orgs``) are exempt.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    missing = [
+        f"{method.upper()} {path}"
+        for path, method, operation in _in_scope_operations(spec)
+        if "{" in path and not _documents_error_model(operation, "404")
+    ]
+    assert missing == [], (
+        "resource operations must document a 404 ErrorModel response:\n"
+        + "\n".join(missing)
+    )
+
+
+@pytest.mark.asyncio
+async def test_conflict_operations_document_conflict_response(
+    client: AsyncClient,
+) -> None:
+    """Operations that can conflict document a 409 with the error body.
+
+    The create/enqueue operations that raise ``ConflictError`` must
+    surface that in the contract via the shared helper. Keyed by
+    operationId (which equals the route name).
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    by_op_id = {
+        operation["operationId"]: operation
+        for _, _, operation in _in_scope_operations(spec)
+    }
+    conflict_op_ids = [
+        "admin_post_organization",
+        "post_member",
+        "post_dashboard_rebuild",
+    ]
+    missing = [
+        op_id
+        for op_id in conflict_op_ids
+        if not _documents_error_model(by_op_id[op_id], "409")
+    ]
+    assert missing == [], (
+        "conflict operations must document a 409 ErrorModel response: "
+        f"{missing}"
     )
