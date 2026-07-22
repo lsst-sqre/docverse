@@ -6,7 +6,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
-from docverse.client.models import OrgMembershipCreate, PrincipalType
+from docverse.client.models import (
+    OrgMembershipCreate,
+    OrgMembershipUpdate,
+    PrincipalType,
+)
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.exceptions import ConflictError, NotFoundError
@@ -137,6 +141,51 @@ async def get_member(
         if member is None:
             msg = f"Member {member_id!r} not found"
             raise NotFoundError(msg)
+    return OrgMembership.from_domain(member, context.request, org_slug)
+
+
+@router.patch(
+    "/orgs/{org}/members/{member}",
+    response_model=OrgMembership,
+    summary="Update an organization member",
+    name="patch_member",
+)
+async def patch_member(
+    org_slug: OrgSlugParam,
+    member_id: MemberIdParam,
+    data: OrgMembershipUpdate,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> OrgMembership:
+    """Update a member's role.
+
+    Only ``role`` is mutable; ``principal`` and ``principal_type`` are
+    immutable and rejected by the request model's ``extra="forbid"``.
+    Follows the merge-patch house style: unset fields leave the member
+    unchanged.
+    """
+    principal_type, principal = _parse_member_id(member_id)
+    updates = data.model_dump(exclude_unset=True)
+    async with context.session.begin():
+        store = context.factory.create_membership_store()
+        if "role" in updates:
+            member = await store.update_role(
+                org_id=user.org.id,
+                principal_type=principal_type,
+                principal=principal,
+                role=updates["role"],
+            )
+        else:
+            # Empty merge patch: return the current membership unchanged.
+            member = await store.get_by_principal(
+                org_id=user.org.id,
+                principal_type=principal_type,
+                principal=principal,
+            )
+        if member is None:
+            msg = f"Member {member_id!r} not found"
+            raise NotFoundError(msg)
+        await context.session.commit()
     return OrgMembership.from_domain(member, context.request, org_slug)
 
 

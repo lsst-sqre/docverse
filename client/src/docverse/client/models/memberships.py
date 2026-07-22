@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 __all__ = [
     "OrgMembership",
     "OrgMembershipCreate",
+    "OrgMembershipUpdate",
     "OrgRole",
     "PrincipalType",
 ]
@@ -46,6 +47,23 @@ class OrgMembershipCreate(BaseModel):
     )
 
     role: OrgRole = Field(description="Role to assign.")
+
+
+class OrgMembershipUpdate(BaseModel):
+    """Request model for updating an organization membership (PATCH).
+
+    Only ``role`` is mutable. ``principal`` and ``principal_type`` identify
+    the membership and are immutable — changing identity is a delete plus a
+    re-add. ``extra="forbid"`` rejects attempts to patch those or any other
+    field. Applied with JSON-Merge-Patch semantics: omitted fields are left
+    untouched.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: OrgRole | None = Field(
+        default=None, description="New role to assign to the member."
+    )
 
 
 class OrgMembership(BaseModel):

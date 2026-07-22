@@ -16,6 +16,9 @@ from .models import (
     BuildStatus,
     BuildUpdate,
     OrganizationSummary,
+    OrgMembership,
+    OrgMembershipUpdate,
+    OrgRole,
     QueueJob,
 )
 from .models.builds import BuildAnnotations
@@ -148,6 +151,38 @@ class DocverseClient:
             OrganizationSummary.model_validate(item)
             for item in response.json()
         ]
+
+    async def update_member(
+        self, org: str, member: str, *, role: OrgRole
+    ) -> OrgMembership:
+        """Update an organization member's role.
+
+        Only the ``role`` is mutable; a member's ``principal`` and
+        ``principal_type`` are immutable (changing identity is a delete plus
+        re-add).
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        member
+            Membership identifier in the ``{principal_type}:{principal}``
+            format (e.g. ``user:jdoe``).
+        role
+            The new role to assign.
+
+        Returns
+        -------
+        OrgMembership
+            The updated membership.
+        """
+        update = OrgMembershipUpdate(role=role)
+        url = f"/orgs/{org}/members/{member}"
+        response = await self._client.patch(
+            url, json=update.model_dump(exclude_unset=True)
+        )
+        _raise_for_status(response)
+        return OrgMembership.model_validate(response.json())
 
     async def create_build(
         self,

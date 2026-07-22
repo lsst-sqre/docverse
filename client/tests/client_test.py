@@ -11,13 +11,14 @@ from unittest.mock import patch
 import httpx
 import pytest
 import respx
+from pydantic import ValidationError
 
 from docverse.client._client import DocverseClient
 from docverse.client._exceptions import (
     BuildProcessingError,
     DocverseClientError,
 )
-from docverse.client.models import OrgRole
+from docverse.client.models import OrgMembershipUpdate, OrgRole
 from docverse.client.models.builds import BuildAnnotations, BuildStatus
 from docverse.client.models.queue_enums import JobKind, JobStatus
 
@@ -272,6 +273,40 @@ async def test_list_organizations_empty() -> None:
             orgs = await client.list_organizations()
 
     assert orgs == []
+
+
+@pytest.mark.asyncio
+async def test_update_member() -> None:
+    """PATCH a member's role returns the updated OrgMembership."""
+    payload = {
+        "self_url": "/orgs/myorg/members/user:jdoe",
+        "org_url": "/orgs/myorg",
+        "id": "user:jdoe",
+        "principal": "jdoe",
+        "principal_type": "user",
+        "role": "admin",
+    }
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.patch("/orgs/myorg/members/user:jdoe").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            member = await client.update_member(
+                "myorg", "user:jdoe", role=OrgRole.admin
+            )
+
+    assert route.called
+    assert json.loads(route.calls[0].request.content) == {"role": "admin"}
+    assert member.role == OrgRole.admin
+    assert member.principal == "jdoe"
+
+
+def test_org_membership_update_forbids_identity_fields() -> None:
+    """OrgMembershipUpdate rejects principal/principal_type fields."""
+    with pytest.raises(ValidationError):
+        OrgMembershipUpdate.model_validate({"principal": "someone-else"})
+    with pytest.raises(ValidationError):
+        OrgMembershipUpdate.model_validate({"principal_type": "group"})
 
 
 @pytest.mark.asyncio

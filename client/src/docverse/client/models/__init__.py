@@ -71,6 +71,7 @@ from .lifecycle import (
 from .memberships import (
     OrgMembership,
     OrgMembershipCreate,
+    OrgMembershipUpdate,
     OrgRole,
     PrincipalType,
 )
@@ -157,6 +158,7 @@ __all__ = [
     "OrgDashboardRebuildResponse",
     "OrgMembership",
     "OrgMembershipCreate",
+    "OrgMembershipUpdate",
     "OrgRole",
     "Organization",
     "OrganizationCreate",

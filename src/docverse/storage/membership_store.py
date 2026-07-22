@@ -57,6 +57,37 @@ class OrgMembershipStore:
             return None
         return OrgMembership.model_validate(row)
 
+    async def update_role(
+        self,
+        *,
+        org_id: int,
+        principal_type: PrincipalType,
+        principal: str,
+        role: OrgRole,
+    ) -> OrgMembership | None:
+        """Update a membership's role in place.
+
+        Returns
+        -------
+        OrgMembership or None
+            The updated membership, or None if no matching membership
+            exists.
+        """
+        result = await self._session.execute(
+            select(SqlOrgMembership).where(
+                SqlOrgMembership.org_id == org_id,
+                SqlOrgMembership.principal_type == principal_type,
+                SqlOrgMembership.principal == principal,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        row.role = role
+        await self._session.flush()
+        await self._session.refresh(row)
+        return OrgMembership.model_validate(row)
+
     async def list_by_org(self, org_id: int) -> list[OrgMembership]:
         """List all memberships for an organization."""
         result = await self._session.execute(

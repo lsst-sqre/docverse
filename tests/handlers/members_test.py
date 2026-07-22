@@ -170,6 +170,95 @@ async def test_delete_member_publishes_membership_changed(
 
 
 @pytest.mark.asyncio
+async def test_patch_member_role(client: AsyncClient) -> None:
+    """PATCH with a new role updates and returns the membership."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/mem-org/members",
+        json={
+            "principal": "promote-me",
+            "principal_type": "user",
+            "role": "reader",
+        },
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/mem-org/members/user:promote-me",
+        json={"role": "admin"},
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "admin"
+    assert data["principal"] == "promote-me"
+    assert data["id"] == "user:promote-me"
+
+    # The change is durable.
+    response = await client.get(
+        "/docverse/orgs/mem-org/members/user:promote-me",
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert response.json()["role"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_patch_member_rejects_principal_change(
+    client: AsyncClient,
+) -> None:
+    """Attempts to change identity fields are rejected by extra=forbid."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/mem-org/members",
+        json={
+            "principal": "immutable-user",
+            "principal_type": "user",
+            "role": "reader",
+        },
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    for body in ({"principal": "someone-else"}, {"principal_type": "group"}):
+        response = await client.patch(
+            "/docverse/orgs/mem-org/members/user:immutable-user",
+            json=body,
+            headers={"X-Auth-Request-User": "admin-user"},
+        )
+        assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_member_not_found(client: AsyncClient) -> None:
+    """PATCH on a missing member returns 404."""
+    await _setup(client)
+    response = await client.patch(
+        "/docverse/orgs/mem-org/members/user:nobody",
+        json={"role": "admin"},
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_patch_member_requires_admin(client: AsyncClient) -> None:
+    """A non-admin member cannot change roles."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/mem-org/members",
+        json={
+            "principal": "reader-user",
+            "principal_type": "user",
+            "role": "reader",
+        },
+        headers={"X-Auth-Request-User": "admin-user"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/mem-org/members/user:reader-user",
+        json={"role": "admin"},
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_duplicate_member(client: AsyncClient) -> None:
     await _setup(client)
     await client.post(
