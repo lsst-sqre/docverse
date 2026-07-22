@@ -12,6 +12,7 @@ from .editions import EditionKind
 
 __all__ = [
     "KeeperSyncConfig",
+    "KeeperSyncConfigUpdate",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
@@ -59,6 +60,41 @@ class KeeperSyncConfig(BaseModel):
         description=(
             'LTD project slugs to sync, or ``"*"`` for every project'
             " visible on the LTD instance."
+        ),
+    )
+
+
+class KeeperSyncConfigUpdate(BaseModel):
+    """Partial update for an organization's LTD Keeper sync configuration.
+
+    Request model for ``PATCH /orgs/{org}/keeper-sync``, applied with
+    JSON-Merge-Patch semantics: every field is optional, and only the fields
+    present in the request body are changed — omitted fields are left
+    untouched. ``project_slugs``, when provided, **replaces the stored array
+    wholesale** (there is no append semantics; send the full desired list, or
+    ``"*"`` for every project). ``extra="forbid"`` rejects unknown fields, and
+    ``model_dump(exclude_unset=True)`` is what distinguishes "omitted" from an
+    explicit value. Use ``PUT`` for a full replacement of the config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = Field(
+        default=None,
+        description="Whether LTD Keeper sync is enabled on the organization.",
+    )
+
+    ltd_base_url: HttpUrl | None = Field(
+        default=None,
+        description="Base URL of the LTD Keeper API (v1 shape).",
+    )
+
+    project_slugs: list[str] | Literal["*"] | None = Field(
+        default=None,
+        description=(
+            'LTD project slugs to sync, or ``"*"`` for every project'
+            " visible on the LTD instance. When provided, replaces the"
+            " stored list wholesale (no append semantics)."
         ),
     )
 
