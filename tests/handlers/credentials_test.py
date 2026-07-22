@@ -36,6 +36,7 @@ async def test_create_credential(client: AsyncClient) -> None:
     assert data["provider"] == "aws"
     assert "self_url" in data
     assert "org_url" in data
+    assert response.headers["Location"] == data["self_url"]
     # Credential payload should NOT be in the response
     assert "credentials" not in data
     assert "encrypted_credentials" not in data

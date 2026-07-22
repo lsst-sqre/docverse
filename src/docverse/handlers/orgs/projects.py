@@ -150,13 +150,15 @@ async def post_project(
         logger=context.logger,
         project_id=project.id,
     )
-    return Project.from_domain(
+    response_model = Project.from_domain(
         project,
         context.request,
         org,
         default_edition=default_edition,
         app_url=context.factory.github_app_html_url,
     )
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(

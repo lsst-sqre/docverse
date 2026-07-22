@@ -129,13 +129,15 @@ async def post_build(
             )
 
         await context.session.commit()
-    return Build.from_domain(
+    response_model = Build.from_domain(
         build,
         context.request,
         org_slug,
         project_slug,
         upload_url=upload_url,
     )
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(

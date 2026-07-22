@@ -104,11 +104,14 @@ async def put_org_dashboard_template(
     response.status_code = (
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
-    return DashboardTemplateBindingResponse.from_domain(
+    response_model = DashboardTemplateBindingResponse.from_domain(
         _attach_queue_job(result.binding, queue_job),
         context.request,
         org_slug=org_slug,
     )
+    if result.created:
+        response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @org_default_router.delete(
@@ -146,9 +149,11 @@ async def sync_org_dashboard_template(
         enqueuer = context.factory.create_dashboard_sync_enqueuer()
         queue_job = await enqueuer.enqueue(binding.id)
         await context.session.commit()
-    return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
+    response_model = DashboardTemplateSyncEnqueuedResponse.from_queue_job(
         queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = response_model.job_url
+    return response_model
 
 
 # ---------------------------------------------------------------------------
@@ -213,12 +218,15 @@ async def put_project_dashboard_template(
     response.status_code = (
         status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     )
-    return DashboardTemplateBindingResponse.from_domain(
+    response_model = DashboardTemplateBindingResponse.from_domain(
         _attach_queue_job(result.binding, queue_job),
         context.request,
         org_slug=org_slug,
         project_slug=project_slug,
     )
+    if result.created:
+        response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @project_override_router.delete(
@@ -262,6 +270,8 @@ async def sync_project_dashboard_template(
         enqueuer = context.factory.create_dashboard_sync_enqueuer()
         queue_job = await enqueuer.enqueue(binding.id)
         await context.session.commit()
-    return DashboardTemplateSyncEnqueuedResponse.from_queue_job(
+    response_model = DashboardTemplateSyncEnqueuedResponse.from_queue_job(
         queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = response_model.job_url
+    return response_model

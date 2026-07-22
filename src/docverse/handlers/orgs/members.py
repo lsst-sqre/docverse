@@ -107,7 +107,11 @@ async def post_member(
             principal=member.principal,
         )
     )
-    return OrgMembership.from_domain(member, context.request, org_slug)
+    response_model = OrgMembership.from_domain(
+        member, context.request, org_slug
+    )
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(

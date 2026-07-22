@@ -96,9 +96,11 @@ async def post_org_keeper_sync_run(
         run_store = context.factory.create_keeper_sync_run_store()
         activity = await run_store.aggregate_activity(run_id=run.id)
         await context.session.commit()
-    return KeeperSyncRunCreated.from_domain(
+    response_model = KeeperSyncRunCreated.from_domain(
         run, activity, queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = str(response_model.job_url)
+    return response_model
 
 
 @router.get(
@@ -268,9 +270,11 @@ async def post_org_keeper_sync_project_refresh(
             org_slug=org_slug, ltd_slug=ltd_slug
         )
         await context.session.commit()
-    return KeeperSyncProjectRefreshAccepted.from_domain(
+    response_model = KeeperSyncProjectRefreshAccepted.from_domain(
         queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = str(response_model.job_url)
+    return response_model
 
 
 @router.get(

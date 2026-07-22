@@ -41,9 +41,11 @@ async def post_dashboard_rebuild(
     if queue_job is None:
         msg = f"dashboard_build already queued for project {project_slug!r}"
         raise ConflictError(msg)
-    return DashboardRebuildResponse.from_queue_job(
+    response_model = DashboardRebuildResponse.from_queue_job(
         queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = response_model.job_url
+    return response_model
 
 
 @router.post(
@@ -63,6 +65,13 @@ async def post_org_dashboard_rebuild(
         results = await service.enqueue_for_org(org_id=user.org.id)
         await context.session.commit()
 
+    # This batch enqueues one job per project, so there is no single job
+    # resource to point at. Per RFC 7231 the 202 ``Location`` names a status
+    # monitor for the request; the org-scoped jobs collection serves that
+    # role here.
+    context.response.headers["Location"] = str(
+        context.request.url_for("get_org_jobs", org=org_slug)
+    )
     return [
         OrgDashboardRebuildEntry.from_domain(
             project, queue_job, context.request, org_slug

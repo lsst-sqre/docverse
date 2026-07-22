@@ -65,6 +65,7 @@ async def test_create_service(client: AsyncClient) -> None:
     assert data["credential_label"] == "primary-aws"
     assert "self_url" in data
     assert "org_url" in data
+    assert response.headers["Location"] == data["self_url"]
 
 
 @pytest.mark.asyncio

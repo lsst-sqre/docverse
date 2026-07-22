@@ -37,6 +37,7 @@ async def test_create_member(client: AsyncClient) -> None:
     assert data["principal"] == "jdoe"
     assert data["id"] == "user:jdoe"
     assert data["self_url"].endswith("/orgs/mem-org/members/user:jdoe")
+    assert response.headers["Location"] == data["self_url"]
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,64 @@ async def test_create_build(client: AsyncClient) -> None:
     assert "object store" in data["detail"][0]["msg"].lower()
 
 
+async def _configure_staging_store(client: AsyncClient) -> None:
+    """Give ``build-org`` an aws_s3 staging store so POST build can 201.
+
+    Presigned-URL generation signs locally (no network), so an
+    ``aws_s3`` service with placeholder credentials is enough to drive
+    the create path end-to-end.
+    """
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/build-org/credentials",
+        json={
+            "label": "aws-cred",
+            "credentials": {
+                "provider": "aws",
+                "access_key_id": "AKIAEXAMPLE",
+                "secret_access_key": "secret",
+            },
+        },
+        headers=headers,
+    )
+    await client.post(
+        "/docverse/orgs/build-org/services",
+        json={
+            "label": "my-s3",
+            "credential_label": "aws-cred",
+            "config": {
+                "provider": "aws_s3",
+                "bucket": "my-bucket",
+                "region": "us-east-1",
+            },
+        },
+        headers=headers,
+    )
+    await client.patch(
+        "/docverse/orgs/build-org",
+        json={"staging_store_label": "my-s3"},
+        headers=headers,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_build_sets_location_header(client: AsyncClient) -> None:
+    """POST build returns 201 with ``Location`` == the build's self_url."""
+    await _setup(client)
+    await _configure_staging_store(client)
+    response = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        json={
+            "git_ref": "main",
+            "content_hash": CONTENT_HASH,
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert response.headers["Location"] == data["self_url"]
+
+
 @pytest.mark.asyncio
 async def test_create_build_with_annotations(client: AsyncClient) -> None:
     """Annotations round-trip via DB seeding + GET (POST needs a store)."""
