@@ -96,7 +96,9 @@ async def test_get_queue_job(
     assert data["id"] == job_id_str
     assert data["kind"] == "build_processing"
     assert data["status"] == "queued"
-    assert data["self_url"].endswith(f"/queue/jobs/{job_id_str}")
+    # self_url is now the canonical org-scoped job URL even via the
+    # legacy endpoint; org_id=1 is the "test-org" created above.
+    assert data["self_url"].endswith(f"/orgs/test-org/jobs/{job_id_str}")
     assert data["date_created"] is not None
     assert data["date_started"] is None
     assert data["date_completed"] is None

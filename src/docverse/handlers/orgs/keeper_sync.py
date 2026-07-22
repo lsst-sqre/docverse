@@ -410,6 +410,7 @@ async def get_org_keeper_sync_run_jobs(
                 job,
                 context.request,
                 context.factory,
+                org_slug=org_slug,
                 run_public_id_cache=run_public_id_cache,
             )
             for job in result.entries

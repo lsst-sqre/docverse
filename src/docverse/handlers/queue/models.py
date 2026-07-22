@@ -25,9 +25,15 @@ class QueueJob(_QueueJobBase):
         request: Request,
         factory: Factory,
         *,
+        org_slug: str | None = None,
         run_public_id_cache: dict[int, str | None] | None = None,
     ) -> Self:
         """Create from a domain object, adding the HATEOAS URLs.
+
+        ``self_url`` is the job's canonical org-scoped URL
+        (``/orgs/{org}/jobs/{id}``). ``org_slug`` supplies the org segment;
+        callers that already hold it (org-scoped handlers) pass it in, and
+        it is otherwise resolved from ``domain.org_id`` via the org store.
 
         ``build_url`` / ``edition_url`` / ``subject_url`` are resolved at
         request time from the job's stored identifiers via the factory
@@ -42,6 +48,15 @@ class QueueJob(_QueueJobBase):
         run-store query per job; single-job callers omit it.
         """
         job_id_str = serialize_base32_id(domain.public_id)
+        if org_slug is None:
+            org = await factory.create_org_store().get_by_id(domain.org_id)
+            if org is None:
+                msg = (
+                    f"Organization {domain.org_id} for queue job "
+                    f"{job_id_str} not found"
+                )
+                raise RuntimeError(msg)
+            org_slug = org.slug
         # JSONB progress is stored untyped; validate it into the typed
         # model here. Non-build kinds round-trip via ``extra="allow"``.
         progress = (
@@ -56,7 +71,9 @@ class QueueJob(_QueueJobBase):
             domain, factory, cache=run_public_id_cache
         )
         return cls(
-            self_url=str(request.url_for("get_queue_job", job=job_id_str)),
+            self_url=str(
+                request.url_for("get_org_job", org=org_slug, job=job_id_str)
+            ),
             id=job_id_str,
             kind=domain.kind,
             status=domain.status,
