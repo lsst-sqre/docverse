@@ -17,6 +17,7 @@ from docverse.client._exceptions import (
     BuildProcessingError,
     DocverseClientError,
 )
+from docverse.client.models import OrgRole
 from docverse.client.models.builds import BuildAnnotations, BuildStatus
 from docverse.client.models.queue_enums import JobKind, JobStatus
 
@@ -229,6 +230,48 @@ async def test_wait_for_job_failed(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert exc_info.value.job.status == JobStatus.failed
     assert exc_info.value.job.phase == "inventory"
+
+
+@pytest.mark.asyncio
+async def test_list_organizations() -> None:
+    """GET /orgs returns parsed OrganizationSummary entries."""
+    payload = [
+        {
+            "self_url": "/orgs/org-a",
+            "slug": "org-a",
+            "title": "Org A",
+            "role": "admin",
+        },
+        {
+            "self_url": "/orgs/org-b",
+            "slug": "org-b",
+            "title": "Org B",
+            "role": "reader",
+        },
+    ]
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.get("/orgs").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            orgs = await client.list_organizations()
+
+    assert route.called
+    assert [o.slug for o in orgs] == ["org-a", "org-b"]
+    assert orgs[0].role == OrgRole.admin
+    assert orgs[1].role == OrgRole.reader
+    assert orgs[0].title == "Org A"
+
+
+@pytest.mark.asyncio
+async def test_list_organizations_empty() -> None:
+    """GET /orgs with no memberships returns an empty list."""
+    async with respx.mock(base_url=BASE_URL) as router:
+        router.get("/orgs").mock(return_value=httpx.Response(200, json=[]))
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            orgs = await client.list_organizations()
+
+    assert orgs == []
 
 
 @pytest.mark.asyncio

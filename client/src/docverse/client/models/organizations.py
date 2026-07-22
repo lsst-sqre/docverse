@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .editions import DefaultEditionConfig
 from .lifecycle import LifecycleRuleSet
-from .memberships import OrgMembershipCreate
+from .memberships import OrgMembershipCreate, OrgRole
 from .services import OrganizationServiceSummary
 
 
@@ -244,6 +244,29 @@ class Organization(BaseModel):
 
     date_updated: datetime = Field(
         description="Timestamp of the most recent update."
+    )
+
+
+class OrganizationSummary(BaseModel):
+    """Summary of an organization the caller can access.
+
+    Returned by the non-admin ``GET /orgs`` listing, one entry per
+    organization in which the caller holds an effective role (via direct
+    membership or a group). It carries only the identifying fields plus
+    the caller's effective ``role`` — the full organization resource is
+    available at ``self_url``.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    self_url: str = Field(description="URL to this organization resource.")
+
+    slug: str = Field(description="URL-safe identifier for the organization.")
+
+    title: str = Field(description="Display title for the organization.")
+
+    role: OrgRole = Field(
+        description="The caller's effective role in the organization."
     )
 
 

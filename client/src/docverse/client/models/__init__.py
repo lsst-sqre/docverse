@@ -77,6 +77,7 @@ from .memberships import (
 from .organizations import (
     Organization,
     OrganizationCreate,
+    OrganizationSummary,
     OrganizationUpdate,
     UrlScheme,
 )
@@ -165,6 +166,7 @@ __all__ = [
     "OrganizationServiceCreate",
     "OrganizationServiceSummary",
     "OrganizationServiceUpdate",
+    "OrganizationSummary",
     "OrganizationUpdate",
     "PrincipalType",
     "Project",
