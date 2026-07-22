@@ -8,6 +8,7 @@ from importlib.metadata import metadata, version
 
 import structlog
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from rubin.gafaelfawr import GafaelfawrClient
 from rubin.repertoire import DiscoveryClient
 from safir.database import create_database_engine, is_database_current
@@ -126,8 +127,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 _metadata = metadata("docverse")
 
+
+def _operation_id_from_route_name(route: APIRoute) -> str:
+    """Use a route's declared ``name`` as its OpenAPI ``operationId``.
+
+    FastAPI's default derives the operationId from the route name *and* its
+    path plus HTTP method, leaking the URL structure into the public contract
+    and producing unwieldy client codegen. Every route declares an explicit
+    ``name``, so returning it yields clean, stable operationIds.
+    """
+    return route.name
+
+
 app = FastAPI(
     title="Docverse",
+    generate_unique_id_function=_operation_id_from_route_name,
     description=_metadata.get("Summary", ""),
     version=version("docverse"),
     openapi_url=f"{config.path_prefix}/openapi.json",
