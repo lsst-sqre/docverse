@@ -15,6 +15,8 @@ from .models import (
     Build,
     BuildStatus,
     BuildUpdate,
+    KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
     OrganizationSummary,
     OrgMembership,
     OrgMembershipUpdate,
@@ -183,6 +185,35 @@ class DocverseClient:
         )
         _raise_for_status(response)
         return OrgMembership.model_validate(response.json())
+
+    async def update_keeper_sync_config(
+        self, org: str, update: KeeperSyncConfigUpdate
+    ) -> KeeperSyncConfig:
+        """Update an organization's LTD Keeper sync config in part.
+
+        Applies JSON-Merge-Patch semantics: only the fields set on ``update``
+        are changed; omitted fields are left untouched. ``project_slugs``,
+        when provided, replaces the stored list wholesale (no append). Send a
+        full ``KeeperSyncConfig`` via ``PUT`` for a complete replacement.
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        update
+            The partial update; construct it with only the fields to change.
+
+        Returns
+        -------
+        KeeperSyncConfig
+            The updated configuration.
+        """
+        url = f"/orgs/{org}/keeper-sync"
+        response = await self._client.patch(
+            url, json=update.model_dump(exclude_unset=True, mode="json")
+        )
+        _raise_for_status(response)
+        return KeeperSyncConfig.model_validate(response.json())
 
     async def create_build(
         self,

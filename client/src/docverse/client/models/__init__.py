@@ -43,6 +43,7 @@ from .infrastructure import (
 )
 from .keeper_sync import (
     KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
     KeeperSyncEditionDiff,
     KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
@@ -136,6 +137,7 @@ __all__ = [
     "JobKind",
     "JobStatus",
     "KeeperSyncConfig",
+    "KeeperSyncConfigUpdate",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",

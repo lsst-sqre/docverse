@@ -142,6 +142,137 @@ async def test_put_can_disable_without_clearing_other_fields(
 
 
 @pytest.mark.asyncio
+async def test_patch_only_enabled_leaves_other_fields(
+    client: AsyncClient,
+) -> None:
+    """A merge patch of only ``enabled`` leaves the other fields untouched."""
+    await _setup(client)
+    await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={
+            "enabled": True,
+            "ltd_base_url": "https://keeper.example.com/",
+            "project_slugs": ["dmtn-001", "sqr-112"],
+        },
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={"enabled": False},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is False
+    assert body["ltd_base_url"] == "https://keeper.example.com/"
+    assert body["project_slugs"] == ["dmtn-001", "sqr-112"]
+
+
+@pytest.mark.asyncio
+async def test_patch_project_slugs_replaces_wholesale(
+    client: AsyncClient,
+) -> None:
+    """Providing ``project_slugs`` replaces the whole list (no append)."""
+    await _setup(client)
+    await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={
+            "enabled": True,
+            "ltd_base_url": "https://keeper.lsst.codes/",
+            "project_slugs": ["alpha", "beta"],
+        },
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={"project_slugs": ["gamma"]},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["project_slugs"] == ["gamma"]
+    # Untouched fields survive the merge.
+    assert body["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_patch_empty_body_leaves_config_unchanged(
+    client: AsyncClient,
+) -> None:
+    """An empty merge patch is a no-op that returns the current config."""
+    await _setup(client)
+    payload = {
+        "enabled": True,
+        "ltd_base_url": "https://keeper.lsst.codes/",
+        "project_slugs": ["only"],
+    }
+    await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json=payload,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json() == {**payload}
+
+
+@pytest.mark.asyncio
+async def test_patch_on_never_set_org_merges_onto_defaults(
+    client: AsyncClient,
+) -> None:
+    """Patching a never-configured org merges onto the default config."""
+    await _setup(client)
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={"enabled": True},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["ltd_base_url"] == "https://keeper.lsst.codes/"
+    assert body["project_slugs"] == []
+
+
+@pytest.mark.asyncio
+async def test_patch_rejects_unknown_field(client: AsyncClient) -> None:
+    """An unknown field is rejected with a 422 (``extra=forbid``)."""
+    await _setup(client)
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={"unknown": True},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_403_for_non_admin(client: AsyncClient) -> None:
+    await _setup(client)
+    await seed_member(_ORG, "reader-user", OrgRole.reader)
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={"enabled": False},
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_patch_404_for_unknown_org(client: AsyncClient) -> None:
+    response = await client.patch(
+        "/docverse/orgs/missing-org/keeper-sync",
+        json={"enabled": False},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_get_403_for_non_admin(client: AsyncClient) -> None:
     await _setup(client)
     await seed_member(_ORG, "reader-user", OrgRole.reader)

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from docverse.client.models import (
     KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
     KeeperSyncRun,
     KeeperSyncTombstone,
 )
@@ -62,6 +63,39 @@ def test_rejects_invalid_url() -> None:
             ltd_base_url="not-a-url",  # type: ignore[arg-type]
             project_slugs=[],
         )
+
+
+def test_config_update_all_fields_default_unset() -> None:
+    """An empty update dumps to nothing under ``exclude_unset``."""
+    update = KeeperSyncConfigUpdate()
+    assert update.model_dump(exclude_unset=True) == {}
+
+
+def test_config_update_omits_untouched_fields() -> None:
+    """Only the provided field survives ``model_dump(exclude_unset=True)``."""
+    update = KeeperSyncConfigUpdate(enabled=False)
+    assert update.model_dump(exclude_unset=True) == {"enabled": False}
+
+
+def test_config_update_project_slugs_replaces_wholesale() -> None:
+    """``project_slugs`` carries the full replacement list, or ``"*"``."""
+    update = KeeperSyncConfigUpdate(project_slugs=["alpha", "beta"])
+    assert update.model_dump(exclude_unset=True) == {
+        "project_slugs": ["alpha", "beta"]
+    }
+    wildcard = KeeperSyncConfigUpdate(project_slugs="*")
+    assert wildcard.model_dump(exclude_unset=True) == {"project_slugs": "*"}
+
+
+def test_config_update_forbids_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        KeeperSyncConfigUpdate.model_validate({"unknown": True})
+
+
+def test_config_update_rejects_unknown_string_token() -> None:
+    """Only the literal ``"*"`` is accepted for ``project_slugs``."""
+    with pytest.raises(ValidationError):
+        KeeperSyncConfigUpdate(project_slugs="ALL")  # type: ignore[arg-type]
 
 
 def test_keeper_sync_run_id_is_base32_string() -> None:

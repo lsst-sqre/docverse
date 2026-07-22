@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from docverse.client.models import (
     KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
     KeeperSyncEditionStatus,
     KeeperSyncResourceType,
     KeeperSyncRun,
@@ -71,6 +72,31 @@ async def put_org_keeper_sync_config(
     async with context.session.begin():
         service = context.factory.create_keeper_sync_config_service()
         result = await service.put(org_slug=org_slug, config=data)
+        await context.session.commit()
+    return result
+
+
+@router.patch(
+    "/orgs/{org}/keeper-sync",
+    response_model=KeeperSyncConfig,
+    summary="Partially update the LTD Keeper sync configuration",
+    name="patch_org_keeper_sync_config",
+)
+async def patch_org_keeper_sync_config(
+    org_slug: OrgSlugParam,
+    data: KeeperSyncConfigUpdate,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> KeeperSyncConfig:
+    """Merge-patch the org's keeper-sync config.
+
+    Applies JSON-Merge-Patch semantics: omitted fields are left untouched;
+    ``project_slugs``, when provided, replaces the stored array wholesale (no
+    append). ``PUT`` remains available for a full replacement.
+    """
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_config_service()
+        result = await service.patch(org_slug=org_slug, update=data)
         await context.session.commit()
     return result
 

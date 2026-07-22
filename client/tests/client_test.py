@@ -18,7 +18,11 @@ from docverse.client._exceptions import (
     BuildProcessingError,
     DocverseClientError,
 )
-from docverse.client.models import OrgMembershipUpdate, OrgRole
+from docverse.client.models import (
+    KeeperSyncConfigUpdate,
+    OrgMembershipUpdate,
+    OrgRole,
+)
 from docverse.client.models.builds import BuildAnnotations, BuildStatus
 from docverse.client.models.queue_enums import JobKind, JobStatus
 
@@ -299,6 +303,29 @@ async def test_update_member() -> None:
     assert json.loads(route.calls[0].request.content) == {"role": "admin"}
     assert member.role == OrgRole.admin
     assert member.principal == "jdoe"
+
+
+@pytest.mark.asyncio
+async def test_update_keeper_sync_config() -> None:
+    """PATCH keeper-sync sends only set fields and returns the config."""
+    payload = {
+        "enabled": False,
+        "ltd_base_url": "https://keeper.lsst.codes/",
+        "project_slugs": ["dmtn-001"],
+    }
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.patch("/orgs/myorg/keeper-sync").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            config = await client.update_keeper_sync_config(
+                "myorg", KeeperSyncConfigUpdate(enabled=False)
+            )
+
+    assert route.called
+    assert json.loads(route.calls[0].request.content) == {"enabled": False}
+    assert config.enabled is False
+    assert config.project_slugs == ["dmtn-001"]
 
 
 def test_org_membership_update_forbids_identity_fields() -> None:
