@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
     "OrgMembership",
@@ -64,6 +64,21 @@ class OrgMembershipUpdate(BaseModel):
     role: OrgRole | None = Field(
         default=None, description="New role to assign to the member."
     )
+
+    @field_validator("role")
+    @classmethod
+    def _reject_explicit_null(cls, value: OrgRole | None) -> OrgRole | None:
+        """Reject an explicit ``null`` for ``role``.
+
+        The validator is skipped for the unset default, so it only fires
+        when the client sends ``{"role": null}``. The column is
+        non-nullable, so RFC 7386's null-as-remove semantics have no
+        meaning here; omit the field to leave the role unchanged.
+        """
+        if value is None:
+            msg = "role may not be null; omit it to leave the role unchanged"
+            raise ValueError(msg)
+        return value
 
 
 class OrgMembership(BaseModel):

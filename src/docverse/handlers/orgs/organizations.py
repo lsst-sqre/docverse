@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request
 
 from docverse.client.models import (
     OrganizationSummary,
@@ -20,7 +20,6 @@ from docverse.dependencies.context import RequestContext, context_dependency
 from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.exceptions import NotFoundError, PermissionDeniedError
 from docverse.handlers.params import OrgSlugParam
-from docverse.handlers.responses import error_responses
 
 from .models import Organization
 
@@ -44,7 +43,8 @@ def _organization_summary(
     response_model=list[OrganizationSummary],
     summary="List organizations the caller can access",
     name="get_organizations",
-    responses=error_responses(status.HTTP_403_FORBIDDEN),
+    # 403 is already declared at the orgs router level (see main.py), so no
+    # route-level responses= is needed here — matching the sibling routes.
 )
 async def get_organizations(
     request: Request,

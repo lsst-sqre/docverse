@@ -166,9 +166,22 @@ async def patch_member(
     """
     principal_type, principal = _parse_member_id(member_id)
     updates = data.model_dump(exclude_unset=True)
+    previous_role = None
     async with context.session.begin():
         store = context.factory.create_membership_store()
+        # Read the current membership first so an in-place role change can
+        # carry the prior role on the remove event, and so not-found is
+        # handled uniformly for both the update and empty-patch paths.
+        current = await store.get_by_principal(
+            org_id=user.org.id,
+            principal_type=principal_type,
+            principal=principal,
+        )
+        if current is None:
+            msg = f"Member {member_id!r} not found"
+            raise NotFoundError(msg)
         if "role" in updates:
+            previous_role = current.role
             member = await store.update_role(
                 org_id=user.org.id,
                 principal_type=principal_type,
@@ -177,15 +190,39 @@ async def patch_member(
             )
         else:
             # Empty merge patch: return the current membership unchanged.
-            member = await store.get_by_principal(
-                org_id=user.org.id,
-                principal_type=principal_type,
-                principal=principal,
-            )
+            member = current
         if member is None:
             msg = f"Member {member_id!r} not found"
             raise NotFoundError(msg)
         await context.session.commit()
+    # An in-place role change is modelled as a remove of the old role plus
+    # an add of the new one (MembershipChangeAction carries no update verb).
+    # Publish after the commit (best-effort; raise_on_error=False) and only
+    # when the role actually changed, so a no-op patch stays silent.
+    if previous_role is not None and previous_role != member.role:
+        metrics_principal_type = MetricsPrincipalType.from_api(
+            member.principal_type
+        )
+        await context.events.membership_changed.publish(
+            MembershipChangedEvent(
+                organization=org_slug,
+                project=None,
+                action=MembershipChangeAction.remove,
+                role=MetricsOrgRole.from_api(previous_role),
+                principal_type=metrics_principal_type,
+                principal=member.principal,
+            )
+        )
+        await context.events.membership_changed.publish(
+            MembershipChangedEvent(
+                organization=org_slug,
+                project=None,
+                action=MembershipChangeAction.add,
+                role=MetricsOrgRole.from_api(member.role),
+                principal_type=metrics_principal_type,
+                principal=member.principal,
+            )
+        )
     return OrgMembership.from_domain(member, context.request, org_slug)
 
 
