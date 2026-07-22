@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 
 from docverse.client.models import (
+    Edition,
     EditionCreate,
     EditionKind,
     EditionRollback,
@@ -45,7 +46,7 @@ from docverse.storage.pagination import (
     EditionSortOrder,
 )
 
-from .models import Edition, EditionBuildHistoryResponse
+from .models import EditionBuildHistoryResponse, edition_from_domain
 
 router = APIRouter()
 
@@ -105,7 +106,7 @@ async def get_editions(
     context.response.headers["X-Total-Count"] = str(result.count)
     project_url = project_published_url(org, project)
     return [
-        Edition.from_domain(
+        edition_from_domain(
             e,
             context.request,
             org_slug,
@@ -155,7 +156,7 @@ async def post_edition(
         project_slug=project_slug,
     )
     project_url = project_published_url(org, project)
-    return Edition.from_domain(
+    return edition_from_domain(
         edition,
         context.request,
         org_slug,
@@ -185,7 +186,7 @@ async def get_edition(
             slug=edition_slug,
         )
     project_url = project_published_url(org, project)
-    return Edition.from_domain(
+    return edition_from_domain(
         edition,
         context.request,
         org_slug,
@@ -298,7 +299,7 @@ async def post_edition_rollback(
         project_slug=project_slug,
     )
     project_url = project_published_url(org, project)
-    return Edition.from_domain(
+    return edition_from_domain(
         edition,
         context.request,
         org_slug,
@@ -350,7 +351,7 @@ async def patch_edition(
         project_slug=project_slug,
     )
     project_url = project_published_url(org, project)
-    return Edition.from_domain(
+    return edition_from_domain(
         edition,
         context.request,
         org_slug,

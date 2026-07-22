@@ -14,8 +14,13 @@ from docverse.domain.organization_service import (
 )
 
 
-class Organization(_OrganizationBase):
-    """Organization response model with HATEOAS self_url."""
+class AdminOrganization(_OrganizationBase):
+    """Admin organization response model with HATEOAS self_url.
+
+    Distinct from the orgs-scoped ``Organization`` model: the admin
+    shape adds ``org_url`` (a link to the org-scoped endpoint) and omits
+    the orgs sub-collection links, so it registers as its own schema.
+    """
 
     org_url: str
     """URL to the org-scoped API endpoint."""
