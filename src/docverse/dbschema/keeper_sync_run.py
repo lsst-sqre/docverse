@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -37,6 +38,10 @@ class SqlKeeperSyncRun(Base):
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
+    )
+
+    public_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, nullable=False, autoincrement=False
     )
 
     org_id: Mapped[int] = mapped_column(

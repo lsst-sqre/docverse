@@ -15,13 +15,58 @@ from sqlalchemy import select
 from docverse.client.models import OrgRole
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
+from docverse.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse.domain.queue import JobKind, JobStatus
 from docverse.storage.organization_store import OrganizationStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"
 _ORG = "ks-org"
+
+
+def _make_run(**kwargs: Any) -> SqlKeeperSyncRun:
+    """Build a run row with a minted ``public_id`` for seeding tests."""
+    kwargs.setdefault("public_id", validate_base32_id(generate_base32_id()))
+    return SqlKeeperSyncRun(**kwargs)
+
+
+async def _seed_run(
+    org_id: int, *, kind: str = "backfill", status: str = "pending"
+) -> tuple[int, str]:
+    """Seed a run row directly; return ``(primary_key, public_id_b32)``.
+
+    The primary key is used to attribute seeded ``queue_jobs`` (the FK
+    is the integer PK); the Base32 ``public_id`` is what the public API
+    addresses the run by.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = _make_run(org_id=org_id, kind=kind, status=status)
+            session.add(row)
+            await session.flush()
+            pk = row.id
+            public = serialize_base32_id(row.public_id)
+            await session.commit()
+            return pk, public
+    msg = "no session"
+    raise AssertionError(msg)
+
+
+async def _run_pk_for_public_id(public_id_b32: str) -> int:
+    """Resolve a run's primary key from its Base32 ``public_id``."""
+    public_id = validate_base32_id(public_id_b32)
+    async for session in db_session_dependency():
+        async with session.begin():
+            stmt = select(SqlKeeperSyncRun.id).where(
+                SqlKeeperSyncRun.public_id == public_id
+            )
+            return (await session.execute(stmt)).scalar_one()
+    msg = "no session"
+    raise AssertionError(msg)
 
 
 async def _setup_org(client: AsyncClient) -> None:
@@ -118,6 +163,11 @@ async def test_post_run_returns_202_with_run_and_queue_job_link(
     assert body["run"]["failed_count"] == 0
     assert body["run"]["total_count"] == 1
     assert "self_url" in body["run"]
+    # The run id is the Base32 public identifier, not the raw integer PK:
+    # it is a hyphen-grouped string that decodes back to a non-negative int.
+    assert isinstance(body["run"]["id"], str)
+    assert "-" in body["run"]["id"]
+    assert validate_base32_id(body["run"]["id"]) >= 0
     assert body["run"]["jobs_url"] == str(
         client.base_url.join(
             f"/docverse/orgs/{_ORG}/keeper-sync/runs/{body['run']['id']}/jobs"
@@ -176,31 +226,32 @@ async def test_get_run_returns_aggregate_counters(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert create_response.status_code == 202
-    run_id: int = create_response.json()["run"]["id"]
+    run_b32: str = create_response.json()["run"]["id"]
+    run_pk = await _run_pk_for_public_id(run_b32)
     org_id = await _get_org_id()
 
     # Seed mixed-status queue_jobs attributed to this run.
     await _seed_queue_job(
-        org_id=org_id, run_id=run_id, status=JobStatus.queued
+        org_id=org_id, run_id=run_pk, status=JobStatus.queued
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_id, status=JobStatus.in_progress
+        org_id=org_id, run_id=run_pk, status=JobStatus.in_progress
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_id, status=JobStatus.completed
+        org_id=org_id, run_id=run_pk, status=JobStatus.completed
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_id, status=JobStatus.completed
+        org_id=org_id, run_id=run_pk, status=JobStatus.completed
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_id, status=JobStatus.failed
+        org_id=org_id, run_id=run_pk, status=JobStatus.failed
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_id, status=JobStatus.cancelled
+        org_id=org_id, run_id=run_pk, status=JobStatus.cancelled
     )
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
@@ -215,7 +266,7 @@ async def test_get_run_returns_aggregate_counters(
     assert body["date_last_activity"] is not None
     assert body["jobs_url"] == str(
         client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs"
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs"
         )
     )
 
@@ -229,27 +280,19 @@ async def test_get_run_date_last_activity_matches_max_child_event(
     org_id = await _get_org_id()
     # Seed a run directly so the response shape doesn't depend on the
     # discovery queue-job's auto-attributed timestamps.
-    async for session in db_session_dependency():
-        async with session.begin():
-            row = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="in_progress"
-            )
-            session.add(row)
-            await session.flush()
-            run_id = row.id
-            await session.commit()
+    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
 
     # Three children, each completing at successively later instants.
     # The MAX(coalesce(...)) post-condition picks the latest one.
     completed_ids: list[int] = [
         await _seed_queue_job(
-            org_id=org_id, run_id=run_id, status=JobStatus.completed
+            org_id=org_id, run_id=run_pk, status=JobStatus.completed
         )
         for _ in range(3)
     ]
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
@@ -274,18 +317,10 @@ async def test_get_run_date_last_activity_null_when_no_children(
     """``date_last_activity`` is null on a run with no attributed jobs."""
     await _setup_org(client)
     org_id = await _get_org_id()
-    async for session in db_session_dependency():
-        async with session.begin():
-            row = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="pending"
-            )
-            session.add(row)
-            await session.flush()
-            run_id = row.id
-            await session.commit()
+    _, run_b32 = await _seed_run(org_id, status="pending")
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
@@ -307,23 +342,11 @@ async def test_list_runs_surfaces_date_last_activity_per_row(
     """
     await _setup_org(client)
     org_id = await _get_org_id()
-    async for session in db_session_dependency():
-        async with session.begin():
-            with_children = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="succeeded"
-            )
-            without_children = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="failed"
-            )
-            session.add(with_children)
-            session.add(without_children)
-            await session.flush()
-            with_id = with_children.id
-            without_id = without_children.id
-            await session.commit()
+    with_pk, with_b32 = await _seed_run(org_id, status="succeeded")
+    _, without_b32 = await _seed_run(org_id, status="failed")
 
     await _seed_queue_job(
-        org_id=org_id, run_id=with_id, status=JobStatus.completed
+        org_id=org_id, run_id=with_pk, status=JobStatus.completed
     )
 
     response = await client.get(
@@ -332,18 +355,31 @@ async def test_list_runs_surfaces_date_last_activity_per_row(
     )
     assert response.status_code == 200
     runs = {r["id"]: r for r in response.json()}
-    assert runs[with_id]["date_last_activity"] is not None
-    assert runs[without_id]["date_last_activity"] is None
+    assert runs[with_b32]["date_last_activity"] is not None
+    assert runs[without_b32]["date_last_activity"] is None
 
 
 @pytest.mark.asyncio
 async def test_get_run_404_for_unknown_run(client: AsyncClient) -> None:
+    """A valid Base32 id with no matching run resolves to 404."""
     await _setup_org(client)
+    unknown = serialize_base32_id(999999)
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/999",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{unknown}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_run_422_for_malformed_run_id(client: AsyncClient) -> None:
+    """A malformed (non-Base32) run id is rejected with 422, not 404/500."""
+    await _setup_org(client)
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/not-a-valid-id",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -361,16 +397,14 @@ async def test_get_run_404_for_run_in_other_org(
             store = OrganizationStore(session=session, logger=logger)
             other = await store.get_by_slug(other_org)
             assert other is not None
-            row = SqlKeeperSyncRun(
-                org_id=other.id, kind="backfill", status="pending"
-            )
+            row = _make_run(org_id=other.id, kind="backfill", status="pending")
             session.add(row)
             await session.flush()
-            run_id = row.id
+            run_b32 = serialize_base32_id(row.public_id)
             await session.commit()
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
@@ -385,29 +419,17 @@ async def test_list_runs_returns_per_run_counters(
     org_id = await _get_org_id()
     # Seed two terminal runs directly — counter aggregation must scope
     # per-run, not bleed across runs in the same org.
-    async for session in db_session_dependency():
-        async with session.begin():
-            row_a = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="succeeded"
-            )
-            row_b = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="failed"
-            )
-            session.add(row_a)
-            session.add(row_b)
-            await session.flush()
-            run_a_id = row_a.id
-            run_b_id = row_b.id
-            await session.commit()
+    run_a_pk, run_a_b32 = await _seed_run(org_id, status="succeeded")
+    run_b_pk, run_b_b32 = await _seed_run(org_id, status="failed")
 
     await _seed_queue_job(
-        org_id=org_id, run_id=run_a_id, status=JobStatus.completed
+        org_id=org_id, run_id=run_a_pk, status=JobStatus.completed
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_a_id, status=JobStatus.completed
+        org_id=org_id, run_id=run_a_pk, status=JobStatus.completed
     )
     await _seed_queue_job(
-        org_id=org_id, run_id=run_b_id, status=JobStatus.failed
+        org_id=org_id, run_id=run_b_pk, status=JobStatus.failed
     )
 
     response = await client.get(
@@ -416,20 +438,20 @@ async def test_list_runs_returns_per_run_counters(
     )
     assert response.status_code == 200
     runs = {r["id"]: r for r in response.json()}
-    assert runs[run_a_id]["succeeded_count"] == 2
-    assert runs[run_a_id]["failed_count"] == 0
-    assert runs[run_a_id]["total_count"] == 2
-    assert runs[run_b_id]["succeeded_count"] == 0
-    assert runs[run_b_id]["failed_count"] == 1
-    assert runs[run_b_id]["total_count"] == 1
-    assert runs[run_a_id]["jobs_url"] == str(
+    assert runs[run_a_b32]["succeeded_count"] == 2
+    assert runs[run_a_b32]["failed_count"] == 0
+    assert runs[run_a_b32]["total_count"] == 2
+    assert runs[run_b_b32]["succeeded_count"] == 0
+    assert runs[run_b_b32]["failed_count"] == 1
+    assert runs[run_b_b32]["total_count"] == 1
+    assert runs[run_a_b32]["jobs_url"] == str(
         client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_a_id}/jobs"
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_a_b32}/jobs"
         )
     )
-    assert runs[run_b_id]["jobs_url"] == str(
+    assert runs[run_b_b32]["jobs_url"] == str(
         client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b_id}/jobs"
+            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b_b32}/jobs"
         )
     )
 
@@ -446,9 +468,7 @@ async def test_list_runs_returns_runs_newest_first(
     async for session in db_session_dependency():
         async with session.begin():
             for status in ("succeeded", "failed", "succeeded"):
-                row = SqlKeeperSyncRun(
-                    org_id=org_id, kind="backfill", status=status
-                )
+                row = _make_run(org_id=org_id, kind="backfill", status=status)
                 session.add(row)
             await session.commit()
 
@@ -473,9 +493,7 @@ async def test_list_runs_filters_by_status(client: AsyncClient) -> None:
         async with session.begin():
             for status in ("succeeded", "failed", "succeeded"):
                 session.add(
-                    SqlKeeperSyncRun(
-                        org_id=org_id, kind="backfill", status=status
-                    )
+                    _make_run(org_id=org_id, kind="backfill", status=status)
                 )
             await session.commit()
 
@@ -498,7 +516,7 @@ async def test_list_runs_paginates_with_cursor(client: AsyncClient) -> None:
         async with session.begin():
             for _ in range(3):
                 session.add(
-                    SqlKeeperSyncRun(
+                    _make_run(
                         org_id=org_id, kind="backfill", status="succeeded"
                     )
                 )
@@ -554,31 +572,23 @@ async def test_get_run_jobs_returns_subject_label(
     """``GET /runs/{id}/jobs`` round-trips ``subject_label`` per child."""
     await _setup_org(client)
     org_id = await _get_org_id()
-    async for session in db_session_dependency():
-        async with session.begin():
-            run = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="in_progress"
-            )
-            session.add(run)
-            await session.flush()
-            run_id = run.id
-            await session.commit()
+    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
 
     await _seed_queue_job(
         org_id=org_id,
-        run_id=run_id,
+        run_id=run_pk,
         status=JobStatus.completed,
         subject_label="sqr-001",
     )
     await _seed_queue_job(
         org_id=org_id,
-        run_id=run_id,
+        run_id=run_pk,
         status=JobStatus.in_progress,
         subject_label="sqr-002",
     )
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
@@ -589,8 +599,8 @@ async def test_get_run_jobs_returns_subject_label(
     # Newest first: in_progress was inserted second.
     assert jobs[0]["subject_label"] == "sqr-002"
     assert response.headers["X-Total-Count"] == "2"
-    # The keeper_sync_run_id field is exposed on the response.
-    assert all(job["keeper_sync_run_id"] == run_id for job in jobs)
+    # keeper_sync_run_id is exposed as the run's Base32 public id, not the PK.
+    assert all(job["keeper_sync_run_id"] == run_b32 for job in jobs)
 
 
 @pytest.mark.asyncio
@@ -598,37 +608,29 @@ async def test_get_run_jobs_filters_by_status(client: AsyncClient) -> None:
     """``?status=failed`` narrows the result set to failed children."""
     await _setup_org(client)
     org_id = await _get_org_id()
-    async for session in db_session_dependency():
-        async with session.begin():
-            run = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="in_progress"
-            )
-            session.add(run)
-            await session.flush()
-            run_id = run.id
-            await session.commit()
+    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
 
     await _seed_queue_job(
         org_id=org_id,
-        run_id=run_id,
+        run_id=run_pk,
         status=JobStatus.completed,
         subject_label="ok-1",
     )
     await _seed_queue_job(
         org_id=org_id,
-        run_id=run_id,
+        run_id=run_pk,
         status=JobStatus.failed,
         subject_label="bad-1",
     )
     await _seed_queue_job(
         org_id=org_id,
-        run_id=run_id,
+        run_id=run_pk,
         status=JobStatus.failed,
         subject_label="bad-2",
     )
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs?status=failed",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs?status=failed",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
@@ -646,26 +648,18 @@ async def test_get_run_jobs_paginates_with_cursor(
     """``limit`` + ``cursor`` paginate through child queue jobs."""
     await _setup_org(client)
     org_id = await _get_org_id()
-    async for session in db_session_dependency():
-        async with session.begin():
-            run = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="in_progress"
-            )
-            session.add(run)
-            await session.flush()
-            run_id = run.id
-            await session.commit()
+    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
 
     for index in range(3):
         await _seed_queue_job(
             org_id=org_id,
-            run_id=run_id,
+            run_id=run_pk,
             status=JobStatus.completed,
             subject_label=f"slug-{index}",
         )
 
     first = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs?limit=2",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs?limit=2",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert first.status_code == 200
@@ -687,12 +681,27 @@ async def test_get_run_jobs_paginates_with_cursor(
 
 @pytest.mark.asyncio
 async def test_get_run_jobs_404_for_unknown_run(client: AsyncClient) -> None:
+    """A valid Base32 id with no matching run resolves to 404."""
     await _setup_org(client)
+    unknown = serialize_base32_id(999999)
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/999/jobs",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{unknown}/jobs",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_run_jobs_422_for_malformed_run_id(
+    client: AsyncClient,
+) -> None:
+    """A malformed (non-Base32) run id is rejected with 422, not 404/500."""
+    await _setup_org(client)
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/not-a-valid-id/jobs",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -709,16 +718,14 @@ async def test_get_run_jobs_404_for_run_in_other_org(
             store = OrganizationStore(session=session, logger=logger)
             other = await store.get_by_slug(other_org)
             assert other is not None
-            row = SqlKeeperSyncRun(
-                org_id=other.id, kind="backfill", status="pending"
-            )
+            row = _make_run(org_id=other.id, kind="backfill", status="pending")
             session.add(row)
             await session.flush()
-            run_id = row.id
+            run_b32 = serialize_base32_id(row.public_id)
             await session.commit()
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs",
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
@@ -729,18 +736,10 @@ async def test_get_run_jobs_403_for_non_admin(client: AsyncClient) -> None:
     await _setup_org(client)
     await seed_member(_ORG, "reader-user", OrgRole.reader)
     org_id = await _get_org_id()
-    async for session in db_session_dependency():
-        async with session.begin():
-            run = SqlKeeperSyncRun(
-                org_id=org_id, kind="backfill", status="pending"
-            )
-            session.add(run)
-            await session.flush()
-            run_id = run.id
-            await session.commit()
+    _, run_b32 = await _seed_run(org_id, status="pending")
 
     response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_id}/jobs",
+        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs",
         headers={"X-Auth-Request-User": "reader-user"},
     )
     assert response.status_code == 403

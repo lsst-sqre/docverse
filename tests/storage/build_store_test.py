@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+
 import pytest
 import structlog
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.client.models import (
@@ -12,6 +16,7 @@ from docverse.client.models import (
     OrganizationCreate,
     ProjectCreate,
 )
+from docverse.dbschema.build import SqlBuild
 from docverse.domain.base32id import serialize_base32_id
 from docverse.exceptions import InvalidBuildStateError
 from docverse.storage.build_store import BuildStore
@@ -398,3 +403,92 @@ async def test_get_latest_build_id_for_ref(
             project_id=project_id + 9999, git_ref="main"
         )
         assert missing_project is None
+
+
+@pytest.mark.asyncio
+async def test_public_ids_sort_in_creation_order(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Two builds created in succession sort by public_id in creation order.
+
+    A short real-time gap guarantees the two mints land in distinct
+    milliseconds so the time-ordered high bits establish the ordering
+    independent of the random low bits.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        first = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await asyncio.sleep(0.005)
+        second = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await db_session.commit()
+
+    assert second.public_id > first.public_id
+
+
+@pytest.mark.asyncio
+async def test_create_retries_on_public_id_collision(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A colliding public_id is re-minted with no error and no merged rows."""
+    collision_id = 424242
+    fresh_id = 999999
+
+    def _fake_ids() -> Iterator[int]:
+        yield from (collision_id, fresh_id)
+
+    ids = _fake_ids()
+    monkeypatch.setattr(
+        "docverse.storage._public_id.generate_resource_id",
+        lambda: next(ids),
+    )
+
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        # Pre-insert a build occupying ``collision_id`` and flush it into the
+        # outer transaction so the retried insert races a persistent row.
+        existing = SqlBuild(
+            public_id=collision_id,
+            project_id=project_id,
+            git_ref="pre-existing",
+            content_hash="sha256:0",
+            status=BuildStatus.pending,
+            staging_key="__staging/pre.tar.gz",
+            storage_prefix="build-proj/__builds/pre/",
+            uploader="pre",
+        )
+        db_session.add(existing)
+        await db_session.flush()
+
+        created = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await db_session.commit()
+
+    # The retry minted the fresh id, leaving the pre-existing row untouched.
+    assert created.public_id == fresh_id
+
+    async with db_session.begin():
+        total = await db_session.scalar(
+            select(func.count()).select_from(SqlBuild)
+        )
+        preserved = await db_session.scalar(
+            select(SqlBuild.git_ref).where(SqlBuild.public_id == collision_id)
+        )
+    assert total == 2
+    assert preserved == "pre-existing"

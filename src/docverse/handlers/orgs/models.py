@@ -489,7 +489,6 @@ class OrgDashboardRebuildEntry(_OrgDashboardRebuildEntryBase):
 class DashboardTemplateSyncEnqueuedResponse(BaseModel):
     """Response body for the dashboard-template force-sync endpoints."""
 
-    binding_id: int = Field(description="ID of the binding that was synced.")
     queue_job_id: str = Field(
         description="Base32 public ID of the enqueued ``dashboard_sync`` job."
     )
@@ -500,14 +499,12 @@ class DashboardTemplateSyncEnqueuedResponse(BaseModel):
     @classmethod
     def from_queue_job(
         cls,
-        binding_id: int,
         queue_job: QueueJobDomain,
         request: Request,
     ) -> Self:
-        """Create from a binding id + queue job, attaching the URL."""
+        """Create from a queue job, attaching the URL."""
         queue_job_id = serialize_base32_id(queue_job.public_id)
         return cls(
-            binding_id=binding_id,
             queue_job_id=queue_job_id,
             queue_job_url=str(
                 request.url_for("get_queue_job", job=queue_job_id)

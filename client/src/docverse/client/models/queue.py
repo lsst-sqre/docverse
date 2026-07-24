@@ -198,11 +198,11 @@ class QueueJob(BaseModel):
 
     status: JobStatus = Field(description="Current status of the job.")
 
-    keeper_sync_run_id: int | None = Field(
+    keeper_sync_run_id: str | None = Field(
         default=None,
         description=(
-            "Identifier of the keeper-sync run this job is attributed to,"
-            " or ``null`` for jobs not part of a run."
+            "Public Crockford Base32 identifier of the keeper-sync run this"
+            " job is attributed to, or ``null`` for jobs not part of a run."
         ),
     )
 

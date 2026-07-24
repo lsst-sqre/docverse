@@ -23,6 +23,7 @@ from docverse.client.models import (
 )
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.queue_job import SqlQueueJob
+from docverse.domain.base32id import generate_base32_id, validate_base32_id
 from docverse.domain.queue import JobStatus
 from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
@@ -68,7 +69,12 @@ async def _seed_org(
 
 
 async def _seed_run(db_session: AsyncSession, *, org_id: int) -> int:
-    row = SqlKeeperSyncRun(org_id=org_id, kind="backfill", status="pending")
+    row = SqlKeeperSyncRun(
+        public_id=validate_base32_id(generate_base32_id()),
+        org_id=org_id,
+        kind="backfill",
+        status="pending",
+    )
     db_session.add(row)
     await db_session.flush()
     await db_session.refresh(row)

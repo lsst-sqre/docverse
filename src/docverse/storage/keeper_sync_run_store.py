@@ -27,6 +27,7 @@ from docverse.domain.keeper_sync_run import (
 )
 from docverse.domain.queue import JobStatus
 from docverse.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 from docverse.storage.pagination import KeeperSyncRunDateStartedCursor
 
 __all__ = ["KeeperSyncRunStore"]
@@ -56,19 +57,30 @@ class KeeperSyncRunStore:
     ) -> KeeperSyncRun:
         """Insert a new run row in ``pending`` status.
 
+        Mints a time-ordered Base32 ``public_id`` at insert time, re-minting
+        on the (rare) same-millisecond collision.
+
         The DB-side partial unique index on ``(org_id) WHERE status IN
         ('pending', 'in_progress')`` enforces the
-        one-non-terminal-run-per-org invariant. The caller is expected
-        to translate the resulting ``IntegrityError`` into a 409 — the
-        store itself stays low-level and lets the constraint speak.
+        one-non-terminal-run-per-org invariant. A violation of that index is
+        not a ``public_id`` collision, so
+        :func:`insert_with_time_ordered_public_id` re-raises it untouched; the
+        caller is expected to translate the resulting ``IntegrityError`` into
+        a 409 — the store itself stays low-level and lets the constraint
+        speak.
         """
-        row = SqlKeeperSyncRun(
-            org_id=org_id,
-            kind=kind.value,
-            status=KeeperSyncRunStatus.pending.value,
+
+        def _make_row(public_id: int) -> SqlKeeperSyncRun:
+            return SqlKeeperSyncRun(
+                public_id=public_id,
+                org_id=org_id,
+                kind=kind.value,
+                status=KeeperSyncRunStatus.pending.value,
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
         )
-        self._session.add(row)
-        await self._session.flush()
         await self._session.refresh(row)
         return KeeperSyncRun.model_validate(row)
 
@@ -76,6 +88,18 @@ class KeeperSyncRunStore:
         """Fetch a run by primary key."""
         result = await self._session.execute(
             select(SqlKeeperSyncRun).where(SqlKeeperSyncRun.id == run_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return KeeperSyncRun.model_validate(row)
+
+    async def get_by_public_id(self, public_id: int) -> KeeperSyncRun | None:
+        """Fetch a run by its Base32 ``public_id``."""
+        result = await self._session.execute(
+            select(SqlKeeperSyncRun).where(
+                SqlKeeperSyncRun.public_id == public_id
+            )
         )
         row = result.scalar_one_or_none()
         if row is None:

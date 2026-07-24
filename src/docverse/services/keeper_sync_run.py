@@ -243,14 +243,14 @@ class KeeperSyncRunService:
         self,
         *,
         org_slug: str,
-        run_id: int,
+        public_id: int,
     ) -> KeeperSyncRunWithActivity:
-        """Fetch a run by id, with derived ``queue_jobs`` activity."""
+        """Fetch a run by public id, with derived ``queue_jobs`` activity."""
         org = await self._require_org(org_slug)
-        run = await self._run_store.get(run_id)
+        run = await self._run_store.get_by_public_id(public_id)
         if run is None or run.org_id != org.id:
             msg = (
-                f"Keeper sync run {run_id} not found for organization "
+                f"Keeper sync run {public_id} not found for organization "
                 f"{org_slug!r}"
             )
             raise NotFoundError(msg)
@@ -278,7 +278,7 @@ class KeeperSyncRunService:
         self,
         *,
         org_slug: str,
-        run_id: int,
+        public_id: int,
         status: JobStatus | None = None,
         cursor: QueueJobDateCreatedCursor | None = None,
         limit: int,
@@ -291,10 +291,10 @@ class KeeperSyncRunService:
         single-run ``GET`` handler.
         """
         org = await self._require_org(org_slug)
-        run = await self._run_store.get(run_id)
+        run = await self._run_store.get_by_public_id(public_id)
         if run is None or run.org_id != org.id:
             msg = (
-                f"Keeper sync run {run_id} not found for organization "
+                f"Keeper sync run {public_id} not found for organization "
                 f"{org_slug!r}"
             )
             raise NotFoundError(msg)

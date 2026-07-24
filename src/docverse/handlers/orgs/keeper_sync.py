@@ -15,7 +15,7 @@ from docverse.client.models import (
 )
 from docverse.dependencies.auth import AuthenticatedUser, require_admin
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.handlers.params import OrgSlugParam
+from docverse.handlers.params import OrgSlugParam, RunIdParam, TombstoneIdParam
 from docverse.handlers.queue.models import QueueJob
 from docverse.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse.storage.pagination import (
@@ -27,6 +27,7 @@ from docverse.storage.pagination import (
     MAX_PAGE_LIMIT,
     QUEUE_JOB_CURSOR_TYPE,
 )
+from docverse.validation import parse_base32_id
 
 from .keeper_sync_models import (
     KeeperSyncEditionStatus,
@@ -335,7 +336,7 @@ async def get_org_keeper_sync_runs(
 
 
 @router.get(
-    "/orgs/{org}/keeper-sync/runs/{run_id}",
+    "/orgs/{org}/keeper-sync/runs/{run}",
     response_model=KeeperSyncRun,
     summary="Get an LTD Keeper sync run with aggregate counters",
     name="get_org_keeper_sync_run",
@@ -344,20 +345,19 @@ async def get_org_keeper_sync_run(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    run_id: Annotated[
-        int, Path(description="Numeric identifier for the run.")
-    ],
+    run_id: RunIdParam,
 ) -> KeeperSyncRun:
+    public_id = parse_base32_id(run_id, resource="run")
     async with context.session.begin():
         service = context.factory.create_keeper_sync_run_service()
-        result = await service.get_run(org_slug=org_slug, run_id=run_id)
+        result = await service.get_run(org_slug=org_slug, public_id=public_id)
     return KeeperSyncRun.from_domain(
         result.run, result.activity, context.request, org_slug
     )
 
 
 @router.get(
-    "/orgs/{org}/keeper-sync/runs/{run_id}/jobs",
+    "/orgs/{org}/keeper-sync/runs/{run}/jobs",
     response_model=list[QueueJob],
     summary="List child queue jobs for an LTD Keeper sync run",
     name="get_org_keeper_sync_run_jobs",
@@ -366,9 +366,7 @@ async def get_org_keeper_sync_run_jobs(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    run_id: Annotated[
-        int, Path(description="Numeric identifier for the run.")
-    ],
+    run_id: RunIdParam,
     cursor: Annotated[
         str | None,
         Query(
@@ -391,6 +389,7 @@ async def get_org_keeper_sync_run_jobs(
         Query(alias="status", description="Filter jobs by status."),
     ] = None,
 ) -> list[QueueJob]:
+    public_id = parse_base32_id(run_id, resource="run")
     parsed_cursor = (
         QUEUE_JOB_CURSOR_TYPE.from_str(cursor) if cursor is not None else None
     )
@@ -398,13 +397,21 @@ async def get_org_keeper_sync_run_jobs(
         service = context.factory.create_keeper_sync_run_service()
         result = await service.list_run_jobs(
             org_slug=org_slug,
-            run_id=run_id,
+            public_id=public_id,
             status=status_filter,
             cursor=parsed_cursor,
             limit=limit,
         )
+        # Every job in the page belongs to the same run, so memoize the
+        # run FK -> public-id resolution to collapse an N+1 run-store query.
+        run_public_id_cache: dict[int, str | None] = {}
         jobs = [
-            await QueueJob.from_domain(job, context.request, context.factory)
+            await QueueJob.from_domain(
+                job,
+                context.request,
+                context.factory,
+                run_public_id_cache=run_public_id_cache,
+            )
             for job in result.entries
         ]
     context.response.headers["Link"] = result.link_header(context.request.url)
@@ -500,7 +507,7 @@ async def get_org_keeper_sync_tombstones(
 
 
 @router.delete(
-    "/orgs/{org}/keeper-sync/tombstones/{state_id}",
+    "/orgs/{org}/keeper-sync/tombstones/{tombstone}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Clear a sync tombstone",
@@ -510,20 +517,18 @@ async def delete_org_keeper_sync_tombstone(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    state_id: Annotated[
-        int,
-        Path(description="Primary key of the keeper_sync_state row."),
-    ],
+    tombstone_id: TombstoneIdParam,
 ) -> Response:
+    public_id = parse_base32_id(tombstone_id, resource="tombstone")
     context.rebind_logger(actor=user.username)
     async with context.session.begin():
         service = context.factory.create_keeper_sync_tombstone_service()
-        cleared = await service.clear(state_id=state_id, org_id=user.org.id)
+        cleared = await service.clear(public_id=public_id, org_id=user.org.id)
         await context.session.commit()
     context.logger.info(
         "Cleared sync tombstone",
         org=org_slug,
-        state_id=state_id,
+        tombstone_id=tombstone_id,
         resource_type=cleared.state.resource_type,
         ltd_id=cleared.state.ltd_id,
         ltd_slug=cleared.state.ltd_slug,

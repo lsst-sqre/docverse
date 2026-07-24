@@ -58,6 +58,7 @@ def _state(
     """Build a ``KeeperSyncState`` with sane defaults for assertions."""
     return KeeperSyncState(
         id=1,
+        public_id=1,
         org_id=1,
         resource_type=resource_type,
         ltd_id=ltd_id,

@@ -12,13 +12,10 @@ from sqlalchemy.sql import func
 
 from docverse.client.models import BuildCreate, BuildStatus
 from docverse.dbschema.build import SqlBuild
-from docverse.domain.base32id import (
-    generate_base32_id,
-    serialize_base32_id,
-    validate_base32_id,
-)
+from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build
 from docverse.exceptions import InvalidBuildStateError
+from docverse.storage._public_id import insert_with_time_ordered_public_id
 from docverse.storage.pagination import BuildDateCreatedCursor
 
 # Valid status transitions
@@ -47,29 +44,37 @@ class BuildStore:
         data: BuildCreate,
         uploader: str,
     ) -> Build:
-        """Insert a new build row with status=pending."""
-        public_id = validate_base32_id(generate_base32_id())
-        base32_str = serialize_base32_id(public_id)
-        staging_key = f"__staging/{base32_str}.tar.gz"
-        storage_prefix = f"{project_slug}/__builds/{base32_str}/"
-        row = SqlBuild(
-            public_id=public_id,
-            project_id=project_id,
-            git_ref=data.git_ref,
-            alternate_name=data.alternate_name,
-            content_hash=data.content_hash,
-            status=BuildStatus.pending,
-            staging_key=staging_key,
-            storage_prefix=storage_prefix,
-            uploader=uploader,
-            annotations=(
-                data.annotations.model_dump(mode="json", exclude_none=True)
-                if data.annotations is not None
-                else None
-            ),
+        """Insert a new build row with status=pending.
+
+        The ``public_id`` is a time-ordered Crockford Base32 resource ID
+        minted at insert time. Because that ID is embedded in ``staging_key``
+        and ``storage_prefix``, the object-store keys are recomputed for each
+        mint attempt inside :func:`insert_with_time_ordered_public_id`, which
+        re-mints on the (rare) same-millisecond ``public_id`` collision.
+        """
+
+        def _make_row(public_id: int) -> SqlBuild:
+            base32_str = serialize_base32_id(public_id)
+            return SqlBuild(
+                public_id=public_id,
+                project_id=project_id,
+                git_ref=data.git_ref,
+                alternate_name=data.alternate_name,
+                content_hash=data.content_hash,
+                status=BuildStatus.pending,
+                staging_key=f"__staging/{base32_str}.tar.gz",
+                storage_prefix=f"{project_slug}/__builds/{base32_str}/",
+                uploader=uploader,
+                annotations=(
+                    data.annotations.model_dump(mode="json", exclude_none=True)
+                    if data.annotations is not None
+                    else None
+                ),
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
         )
-        self._session.add(row)
-        await self._session.flush()
         await self._session.refresh(row)
         return Build.model_validate(row)
 

@@ -32,7 +32,11 @@ from docverse.config import Configuration
 from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse.dbschema.organization import SqlOrganization
 from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import serialize_base32_id
+from docverse.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse.domain.build import Build
 from docverse.domain.edition import Edition
 from docverse.domain.edition_build_history import EditionBuildHistory
@@ -247,7 +251,10 @@ async def _seed_keeper_sync_run(
 ) -> int:
     """Seed an ``in_progress`` keeper-sync run to attribute a publish to."""
     row = SqlKeeperSyncRun(
-        org_id=org_id, kind="backfill", status="in_progress"
+        public_id=validate_base32_id(generate_base32_id()),
+        org_id=org_id,
+        kind="backfill",
+        status="in_progress",
     )
     db_session.add(row)
     await db_session.flush()

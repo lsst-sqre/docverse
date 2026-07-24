@@ -629,7 +629,9 @@ async def test_clear_un_tombstones_state_row(
         )
 
     async with db_session.begin():
-        cleared = await service.clear(state_id=recorded.id, org_id=org_id)
+        cleared = await service.clear(
+            public_id=recorded.public_id, org_id=org_id
+        )
 
     assert cleared.state.date_tombstoned is None
     assert cleared.state.tombstone_reason is None
@@ -701,7 +703,7 @@ async def test_clear_revives_soft_deleted_edition(
 
     service = _build_service(db_session, logger=logger)
     async with db_session.begin():
-        cleared = await service.clear(state_id=state.id, org_id=org.id)
+        cleared = await service.clear(public_id=state.public_id, org_id=org.id)
 
     assert cleared.revived_docverse_row is True
     # Edition is now visible via the default (date_deleted IS NULL) read.
@@ -763,7 +765,7 @@ async def test_clear_revives_soft_deleted_project(
 
     service = _build_service(db_session, logger=logger)
     async with db_session.begin():
-        cleared = await service.clear(state_id=state.id, org_id=org.id)
+        cleared = await service.clear(public_id=state.public_id, org_id=org.id)
 
     assert cleared.revived_docverse_row is True
     async with db_session.begin():
@@ -776,7 +778,7 @@ async def test_clear_revives_soft_deleted_project(
 async def test_clear_raises_when_state_not_found(
     db_session: AsyncSession,
 ) -> None:
-    """A non-existent state_id raises NotFoundError."""
+    """A non-existent public_id raises NotFoundError."""
     logger = structlog.get_logger("test")
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-clear-miss")
@@ -784,7 +786,7 @@ async def test_clear_raises_when_state_not_found(
     service = _build_service(db_session, logger=logger)
     with pytest.raises(NotFoundError):
         async with db_session.begin():
-            await service.clear(state_id=999_999, org_id=org_id)
+            await service.clear(public_id=999_999, org_id=org_id)
 
 
 @pytest.mark.asyncio
@@ -807,7 +809,7 @@ async def test_clear_raises_when_row_not_tombstoned(
     service = _build_service(db_session, logger=logger)
     with pytest.raises(NotFoundError):
         async with db_session.begin():
-            await service.clear(state_id=state.id, org_id=org_id)
+            await service.clear(public_id=state.public_id, org_id=org_id)
 
 
 @pytest.mark.asyncio
@@ -831,7 +833,7 @@ async def test_clear_is_org_scoped(
 
     with pytest.raises(NotFoundError):
         async with db_session.begin():
-            await service.clear(state_id=recorded.id, org_id=org_b)
+            await service.clear(public_id=recorded.public_id, org_id=org_b)
 
 
 @pytest.mark.asyncio
@@ -854,7 +856,7 @@ async def test_clear_emits_structured_log(
 
     with capture_logs() as captured:
         async with db_session.begin():
-            await service.clear(state_id=recorded.id, org_id=org_id)
+            await service.clear(public_id=recorded.public_id, org_id=org_id)
 
     events = [
         e for e in captured if e.get("event") == "Sync tombstone cleared"

@@ -64,13 +64,14 @@ class KeeperSyncRun(_KeeperSyncRunBase):
         org_slug: str,
     ) -> Self:
         """Compose the response from a run plus its derived activity."""
+        run_public_id = serialize_base32_id(run.public_id)
         return cls(
             self_url=HttpUrl(
                 str(
                     request.url_for(
                         "get_org_keeper_sync_run",
                         org=org_slug,
-                        run_id=run.id,
+                        run=run_public_id,
                     )
                 )
             ),
@@ -79,11 +80,11 @@ class KeeperSyncRun(_KeeperSyncRunBase):
                     request.url_for(
                         "get_org_keeper_sync_run_jobs",
                         org=org_slug,
-                        run_id=run.id,
+                        run=run_public_id,
                     )
                 )
             ),
-            id=run.id,
+            id=run_public_id,
             kind=KeeperSyncRunKind(run.kind),
             status=KeeperSyncRunStatus(run.status),
             pending_count=activity.pending_count,
@@ -273,20 +274,21 @@ class KeeperSyncTombstone(_KeeperSyncTombstoneBase):
         if state.date_tombstoned is None or state.tombstone_reason is None:
             msg = (
                 "KeeperSyncTombstone.from_domain requires a tombstoned "
-                f"state row; state_id={state.id} has no tombstone"
+                f"state row; public_id={state.public_id} has no tombstone"
             )
             raise KeeperSyncInvariantError(msg)
+        tombstone_public_id = serialize_base32_id(state.public_id)
         return cls(
             self_url=HttpUrl(
                 str(
                     request.url_for(
                         "delete_org_keeper_sync_tombstone",
                         org=org_slug,
-                        state_id=state.id,
+                        tombstone=tombstone_public_id,
                     )
                 )
             ),
-            state_id=state.id,
+            id=tombstone_public_id,
             resource_type=KeeperSyncResourceType(state.resource_type),
             ltd_slug=state.ltd_slug,
             ltd_id=state.ltd_id,
