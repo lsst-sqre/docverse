@@ -170,14 +170,19 @@ async def test_post_run_returns_202_with_run_and_queue_job_link(
     assert validate_base32_id(body["run"]["id"]) >= 0
     assert body["run"]["jobs_url"] == str(
         client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{body['run']['id']}/jobs"
+            f"/docverse/orgs/{_ORG}/jobs?run={body['run']['id']}"
         )
     )
-    assert "queue_job_url" in body
-    assert body["queue_job_id"]
-    assert body["queue_job_url"].endswith(
-        f"/queue/jobs/{body['queue_job_id']}"
+    assert "job_url" in body
+    assert body["job_id"]
+    assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        body["job_url"],
+        headers={"X-Auth-Request-User": _ADMIN},
     )
+    assert job_response.status_code == 200
+    assert job_response.json()["id"] == body["job_id"]
 
 
 @pytest.mark.asyncio
@@ -265,9 +270,7 @@ async def test_get_run_returns_aggregate_counters(
     # children and is non-null because the run has attributed jobs.
     assert body["date_last_activity"] is not None
     assert body["jobs_url"] == str(
-        client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs"
-        )
+        client.base_url.join(f"/docverse/orgs/{_ORG}/jobs?run={run_b32}")
     )
 
 
@@ -445,14 +448,10 @@ async def test_list_runs_returns_per_run_counters(
     assert runs[run_b_b32]["failed_count"] == 1
     assert runs[run_b_b32]["total_count"] == 1
     assert runs[run_a_b32]["jobs_url"] == str(
-        client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_a_b32}/jobs"
-        )
+        client.base_url.join(f"/docverse/orgs/{_ORG}/jobs?run={run_a_b32}")
     )
     assert runs[run_b_b32]["jobs_url"] == str(
-        client.base_url.join(
-            f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b_b32}/jobs"
-        )
+        client.base_url.join(f"/docverse/orgs/{_ORG}/jobs?run={run_b_b32}")
     )
 
 
@@ -566,193 +565,13 @@ async def test_get_runs_403_for_non_admin(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_run_jobs_returns_subject_label(
-    client: AsyncClient,
-) -> None:
-    """``GET /runs/{id}/jobs`` round-trips ``subject_label`` per child."""
-    await _setup_org(client)
-    org_id = await _get_org_id()
-    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
-
-    await _seed_queue_job(
-        org_id=org_id,
-        run_id=run_pk,
-        status=JobStatus.completed,
-        subject_label="sqr-001",
-    )
-    await _seed_queue_job(
-        org_id=org_id,
-        run_id=run_pk,
-        status=JobStatus.in_progress,
-        subject_label="sqr-002",
-    )
-
-    response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs",
-        headers={"X-Auth-Request-User": _ADMIN},
-    )
-    assert response.status_code == 200
-    jobs = response.json()
-    assert len(jobs) == 2
-    labels = {job["subject_label"] for job in jobs}
-    assert labels == {"sqr-001", "sqr-002"}
-    # Newest first: in_progress was inserted second.
-    assert jobs[0]["subject_label"] == "sqr-002"
-    assert response.headers["X-Total-Count"] == "2"
-    # keeper_sync_run_id is exposed as the run's Base32 public id, not the PK.
-    assert all(job["keeper_sync_run_id"] == run_b32 for job in jobs)
-
-
-@pytest.mark.asyncio
-async def test_get_run_jobs_filters_by_status(client: AsyncClient) -> None:
-    """``?status=failed`` narrows the result set to failed children."""
-    await _setup_org(client)
-    org_id = await _get_org_id()
-    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
-
-    await _seed_queue_job(
-        org_id=org_id,
-        run_id=run_pk,
-        status=JobStatus.completed,
-        subject_label="ok-1",
-    )
-    await _seed_queue_job(
-        org_id=org_id,
-        run_id=run_pk,
-        status=JobStatus.failed,
-        subject_label="bad-1",
-    )
-    await _seed_queue_job(
-        org_id=org_id,
-        run_id=run_pk,
-        status=JobStatus.failed,
-        subject_label="bad-2",
-    )
-
-    response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs?status=failed",
-        headers={"X-Auth-Request-User": _ADMIN},
-    )
-    assert response.status_code == 200
-    jobs = response.json()
-    assert len(jobs) == 2
-    assert {job["subject_label"] for job in jobs} == {"bad-1", "bad-2"}
-    assert all(job["status"] == "failed" for job in jobs)
-    assert response.headers["X-Total-Count"] == "2"
-
-
-@pytest.mark.asyncio
-async def test_get_run_jobs_paginates_with_cursor(
-    client: AsyncClient,
-) -> None:
-    """``limit`` + ``cursor`` paginate through child queue jobs."""
-    await _setup_org(client)
-    org_id = await _get_org_id()
-    run_pk, run_b32 = await _seed_run(org_id, status="in_progress")
-
-    for index in range(3):
-        await _seed_queue_job(
-            org_id=org_id,
-            run_id=run_pk,
-            status=JobStatus.completed,
-            subject_label=f"slug-{index}",
-        )
-
-    first = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs?limit=2",
-        headers={"X-Auth-Request-User": _ADMIN},
-    )
-    assert first.status_code == 200
-    page_one = first.json()
-    assert len(page_one) == 2
-    links = PaginationLinkData.from_header(first.headers.get("link"))
-    assert links.next_url is not None
-
-    second = await client.get(
-        links.next_url, headers={"X-Auth-Request-User": _ADMIN}
-    )
-    assert second.status_code == 200
-    page_two = second.json()
-    assert len(page_two) == 1
-    page_one_ids = {job["id"] for job in page_one}
-    page_two_ids = {job["id"] for job in page_two}
-    assert page_one_ids.isdisjoint(page_two_ids)
-
-
-@pytest.mark.asyncio
-async def test_get_run_jobs_404_for_unknown_run(client: AsyncClient) -> None:
-    """A valid Base32 id with no matching run resolves to 404."""
-    await _setup_org(client)
-    unknown = serialize_base32_id(999999)
-    response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{unknown}/jobs",
-        headers={"X-Auth-Request-User": _ADMIN},
-    )
-    assert response.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_get_run_jobs_422_for_malformed_run_id(
-    client: AsyncClient,
-) -> None:
-    """A malformed (non-Base32) run id is rejected with 422, not 404/500."""
-    await _setup_org(client)
-    response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/not-a-valid-id/jobs",
-        headers={"X-Auth-Request-User": _ADMIN},
-    )
-    assert response.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_get_run_jobs_404_for_run_in_other_org(
-    client: AsyncClient,
-) -> None:
-    """Cross-org access surfaces as 404, not 403."""
-    await _setup_org(client)
-    other_org = "ks-org-other"
-    await seed_org_with_admin(client, other_org, _ADMIN)
-    logger = structlog.get_logger("test")
-    async for session in db_session_dependency():
-        async with session.begin():
-            store = OrganizationStore(session=session, logger=logger)
-            other = await store.get_by_slug(other_org)
-            assert other is not None
-            row = _make_run(org_id=other.id, kind="backfill", status="pending")
-            session.add(row)
-            await session.flush()
-            run_b32 = serialize_base32_id(row.public_id)
-            await session.commit()
-
-    response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs",
-        headers={"X-Auth-Request-User": _ADMIN},
-    )
-    assert response.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_get_run_jobs_403_for_non_admin(client: AsyncClient) -> None:
-    await _setup_org(client)
-    await seed_member(_ORG, "reader-user", OrgRole.reader)
-    org_id = await _get_org_id()
-    _, run_b32 = await _seed_run(org_id, status="pending")
-
-    response = await client.get(
-        f"/docverse/orgs/{_ORG}/keeper-sync/runs/{run_b32}/jobs",
-        headers={"X-Auth-Request-User": "reader-user"},
-    )
-    assert response.status_code == 403
-
-
-@pytest.mark.asyncio
 async def test_keeper_sync_url_fields_report_format_uri(
     client: AsyncClient,
 ) -> None:
     """The three HATEOAS URL fields advertise ``format: uri`` in OpenAPI.
 
-    ``KeeperSyncRun.self_url``, ``KeeperSyncRunCreated.queue_job_url``,
-    and ``KeeperSyncProjectRefreshAccepted.queue_job_url`` are typed
+    ``KeeperSyncRun.self_url``, ``KeeperSyncRunCreated.job_url``,
+    and ``KeeperSyncProjectRefreshAccepted.job_url`` are typed
     ``HttpUrl`` on the client mirror so Pydantic emits the standard
     URL format string in the generated schema. The peer fields on the
     same models (``KeeperSyncRun.jobs_url`` and the URL fields on
@@ -780,8 +599,8 @@ async def test_keeper_sync_url_fields_report_format_uri(
 
     targets: list[tuple[str, str]] = [
         *((name, "self_url") for name in keeper_sync_run_schema_names),
-        ("KeeperSyncRunCreated", "queue_job_url"),
-        ("KeeperSyncProjectRefreshAccepted", "queue_job_url"),
+        ("KeeperSyncRunCreated", "job_url"),
+        ("KeeperSyncProjectRefreshAccepted", "job_url"),
     ]
     for model_name, field_name in targets:
         field_schema = schemas[model_name]["properties"][field_name]

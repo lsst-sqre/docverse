@@ -351,12 +351,12 @@ async def _upload_async(
                 click.echo("Upload complete (--no-wait specified)")
                 return
 
-            if build.queue_url is None:
-                msg = "Server did not return a queue URL after upload"
+            if build.job_url is None:
+                msg = "Server did not return a job URL after upload"
                 raise DocverseClientError(msg)
 
             click.echo("Waiting for build processing")
-            job = await client.wait_for_job(build.queue_url)
+            job = await client.wait_for_job(build.job_url)
 
             if job.status == JobStatus.completed_with_errors:
                 click.echo(

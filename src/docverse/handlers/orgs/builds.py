@@ -175,7 +175,7 @@ async def patch_build(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_uploader)],
 ) -> Build:
-    queue_url: str | None = None
+    job_url: str | None = None
     upload_completed = False
     async with context.session.begin():
         service = context.factory.create_build_service()
@@ -186,9 +186,10 @@ async def patch_build(
                 project_slug=project_slug,
                 build_id=build_id,
             )
-            queue_url = str(
+            job_url = str(
                 context.request.url_for(
-                    "get_queue_job",
+                    "get_org_job",
+                    org=org_slug,
                     job=serialize_base32_id(queue_job.public_id),
                 )
             )
@@ -231,7 +232,7 @@ async def patch_build(
         context.request,
         org_slug,
         project_slug,
-        queue_url=queue_url,
+        job_url=job_url,
     )
 
 

@@ -1969,3 +1969,226 @@ async def test_create_retries_on_public_id_collision(
         )
     assert total == 2
     assert preserved == "pre-existing"
+
+
+async def _seed_org_project(
+    db_session: AsyncSession, *, slug: str = "lbo-org"
+) -> tuple[int, int]:
+    """Seed an org with one project; return ``(org_id, project_id)``."""
+    logger = structlog.get_logger("docverse")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    org = await org_store.create(
+        OrganizationCreate(
+            slug=slug,
+            title="LBO Org",
+            base_domain=f"{slug}.example.com",
+        )
+    )
+    project = await proj_store.create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug="lbo-proj",
+            title="LBO Project",
+            source_url="https://example.com/example/repo",
+        ),
+    )
+    return org.id, project.id
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_newest_first(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Jobs for an org are returned newest-first with a total count."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session)
+        first = await store.create(
+            kind=JobKind.build_processing, org_id=org_id
+        )
+        second = await store.create(
+            kind=JobKind.publish_edition, org_id=org_id
+        )
+        third = await store.create(kind=JobKind.dashboard_build, org_id=org_id)
+        result = await store.list_by_org(org_id=org_id, limit=10)
+        await db_session.commit()
+
+    assert result.count == 3
+    ids = [job.id for job in result.entries]
+    assert ids == [third.id, second.id, first.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_excludes_other_orgs(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Jobs belonging to other orgs never appear in the listing."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session, slug="lbo-mine")
+        other_id, _ = await _seed_org_project(db_session, slug="lbo-other")
+        mine = await store.create(kind=JobKind.build_processing, org_id=org_id)
+        await store.create(kind=JobKind.build_processing, org_id=other_id)
+        result = await store.list_by_org(org_id=org_id, limit=10)
+        await db_session.commit()
+
+    assert result.count == 1
+    assert [job.id for job in result.entries] == [mine.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_filters_by_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The ``kind`` filter narrows results to a single JobKind."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session)
+        build = await store.create(
+            kind=JobKind.build_processing, org_id=org_id
+        )
+        await store.create(kind=JobKind.publish_edition, org_id=org_id)
+        result = await store.list_by_org(
+            org_id=org_id, kind=JobKind.build_processing, limit=10
+        )
+        await db_session.commit()
+
+    assert result.count == 1
+    assert [job.id for job in result.entries] == [build.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_filters_by_status(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The ``status`` filter narrows results to a single JobStatus."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session)
+        await store.create(kind=JobKind.build_processing, org_id=org_id)
+        started = await store.create(
+            kind=JobKind.build_processing, org_id=org_id
+        )
+        await store.start(started.id)
+        result = await store.list_by_org(
+            org_id=org_id, status=JobStatus.in_progress, limit=10
+        )
+        await db_session.commit()
+
+    assert result.count == 1
+    assert [job.id for job in result.entries] == [started.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_filters_by_project(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The ``project_id`` filter narrows results to one project."""
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_project(db_session)
+        scoped = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=project_id,
+        )
+        await store.create(kind=JobKind.build_processing, org_id=org_id)
+        result = await store.list_by_org(
+            org_id=org_id, project_id=project_id, limit=10
+        )
+        await db_session.commit()
+
+    assert result.count == 1
+    assert [job.id for job in result.entries] == [scoped.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_filters_by_run(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The ``keeper_sync_run_id`` filter narrows results to one run."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(db_session, slug="lbo-run")
+        attributed = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+        )
+        await store.create(kind=JobKind.build_processing, org_id=org_id)
+        result = await store.list_by_org(
+            org_id=org_id, keeper_sync_run_id=run_id, limit=10
+        )
+        await db_session.commit()
+
+    assert result.count == 1
+    assert [job.id for job in result.entries] == [attributed.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_filters_combine(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Multiple filters combine conjunctively."""
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_project(db_session)
+        match = await store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=project_id,
+        )
+        # Same kind, wrong project.
+        await store.create(kind=JobKind.dashboard_build, org_id=org_id)
+        # Right project, wrong kind.
+        await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            project_id=project_id,
+        )
+        result = await store.list_by_org(
+            org_id=org_id,
+            kind=JobKind.dashboard_build,
+            project_id=project_id,
+            limit=10,
+        )
+        await db_session.commit()
+
+    assert result.count == 1
+    assert [job.id for job in result.entries] == [match.id]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_paginates(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A keyset cursor pages through the org's jobs newest-first."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session)
+        created = [
+            await store.create(kind=JobKind.build_processing, org_id=org_id)
+            for _ in range(5)
+        ]
+        first_page = await store.list_by_org(org_id=org_id, limit=2)
+        await db_session.commit()
+
+    assert first_page.count == 5
+    newest = list(reversed(created))
+    assert [job.id for job in first_page.entries] == [
+        newest[0].id,
+        newest[1].id,
+    ]
+    assert first_page.next_cursor is not None
+
+    async with db_session.begin():
+        second_page = await store.list_by_org(
+            org_id=org_id, cursor=first_page.next_cursor, limit=2
+        )
+        await db_session.commit()
+
+    assert [job.id for job in second_page.entries] == [
+        newest[2].id,
+        newest[3].id,
+    ]

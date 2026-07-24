@@ -39,7 +39,9 @@ async def post_dashboard_rebuild(
     if queue_job is None:
         msg = f"dashboard_build already queued for project {project_slug!r}"
         raise ConflictError(msg)
-    return DashboardRebuildResponse.from_queue_job(queue_job, context.request)
+    return DashboardRebuildResponse.from_queue_job(
+        queue_job, context.request, org_slug
+    )
 
 
 @router.post(
@@ -61,7 +63,7 @@ async def post_org_dashboard_rebuild(
 
     return [
         OrgDashboardRebuildEntry.from_domain(
-            project, queue_job, context.request
+            project, queue_job, context.request, org_slug
         )
         for project, queue_job in results
     ]

@@ -83,10 +83,10 @@ class PublishJobRef(BaseModel):
         ),
     )
 
-    queue_job_url: str | None = Field(
+    job_url: str | None = Field(
         default=None,
         description=(
-            "Absolute URL of the publish_edition queue-job resource (a"
+            "Absolute URL of the publish_edition job resource (a"
             " HATEOAS link clients follow instead of reconstructing the"
             " path). Omitted when the Docverse API base URL could not be"
             " resolved."

@@ -48,7 +48,7 @@ def _select_with_joins() -> Any:
     Two left joins materialize the read-side fields the response layer
     needs without a second round-trip:
 
-    * ``queue_jobs.public_id`` → builds ``last_sync_queue_job_url``.
+    * ``queue_jobs.public_id`` → builds ``last_sync_job_url``.
     * ``dashboard_github_templates.commit_sha`` → exposes the latest
       synced commit on the binding response.
 

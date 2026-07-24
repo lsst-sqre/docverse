@@ -253,7 +253,7 @@ class Build(_BuildBase):
         project_slug: str,
         *,
         upload_url: str | None = None,
-        queue_url: str | None = None,
+        job_url: str | None = None,
     ) -> Self:
         """Create from a domain object, adding HATEOAS URLs."""
         build_id_str = serialize_base32_id(domain.public_id)
@@ -279,7 +279,7 @@ class Build(_BuildBase):
             content_hash=domain.content_hash,
             status=domain.status,
             upload_url=upload_url,
-            queue_url=queue_url,
+            job_url=job_url,
             object_count=domain.object_count,
             total_size_bytes=domain.total_size_bytes,
             uploader=domain.uploader,
@@ -453,14 +453,14 @@ class DashboardRebuildResponse(_DashboardRebuildResponseBase):
 
     @classmethod
     def from_queue_job(
-        cls, queue_job: QueueJobDomain, request: Request
+        cls, queue_job: QueueJobDomain, request: Request, org_slug: str
     ) -> Self:
-        """Create from a domain queue job, adding the queue_job_url."""
-        queue_job_id = serialize_base32_id(queue_job.public_id)
+        """Create from a domain queue job, adding the job_url."""
+        job_id = serialize_base32_id(queue_job.public_id)
         return cls(
-            queue_job_id=queue_job_id,
-            queue_job_url=str(
-                request.url_for("get_queue_job", job=queue_job_id)
+            job_id=job_id,
+            job_url=str(
+                request.url_for("get_org_job", org=org_slug, job=job_id)
             ),
         )
 
@@ -474,14 +474,15 @@ class OrgDashboardRebuildEntry(_OrgDashboardRebuildEntryBase):
         project: ProjectDomain,
         queue_job: QueueJobDomain,
         request: Request,
+        org_slug: str,
     ) -> Self:
-        """Create from a domain project + queue job, adding queue_job_url."""
-        queue_job_id = serialize_base32_id(queue_job.public_id)
+        """Create from a domain project + queue job, adding job_url."""
+        job_id = serialize_base32_id(queue_job.public_id)
         return cls(
             project_slug=project.slug,
-            queue_job_id=queue_job_id,
-            queue_job_url=str(
-                request.url_for("get_queue_job", job=queue_job_id)
+            job_id=job_id,
+            job_url=str(
+                request.url_for("get_org_job", org=org_slug, job=job_id)
             ),
         )
 
@@ -489,11 +490,11 @@ class OrgDashboardRebuildEntry(_OrgDashboardRebuildEntryBase):
 class DashboardTemplateSyncEnqueuedResponse(BaseModel):
     """Response body for the dashboard-template force-sync endpoints."""
 
-    queue_job_id: str = Field(
+    job_id: str = Field(
         description="Base32 public ID of the enqueued ``dashboard_sync`` job."
     )
-    queue_job_url: str = Field(
-        description="URL of the enqueued ``dashboard_sync`` queue job."
+    job_url: str = Field(
+        description="URL of the enqueued ``dashboard_sync`` job."
     )
 
     @classmethod
@@ -501,13 +502,14 @@ class DashboardTemplateSyncEnqueuedResponse(BaseModel):
         cls,
         queue_job: QueueJobDomain,
         request: Request,
+        org_slug: str,
     ) -> Self:
         """Create from a queue job, attaching the URL."""
-        queue_job_id = serialize_base32_id(queue_job.public_id)
+        job_id = serialize_base32_id(queue_job.public_id)
         return cls(
-            queue_job_id=queue_job_id,
-            queue_job_url=str(
-                request.url_for("get_queue_job", job=queue_job_id)
+            job_id=job_id,
+            job_url=str(
+                request.url_for("get_org_job", org=org_slug, job=job_id)
             ),
         )
 
@@ -538,8 +540,12 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
                 )
             )
         queue_job_public_id = domain.last_sync_queue_job_public_id
-        last_sync_queue_job_url = (
-            str(request.url_for("get_queue_job", job=queue_job_public_id))
+        last_sync_job_url = (
+            str(
+                request.url_for(
+                    "get_org_job", org=org_slug, job=queue_job_public_id
+                )
+            )
             if queue_job_public_id is not None
             else None
         )
@@ -559,7 +565,7 @@ class DashboardTemplateBindingResponse(_DashboardTemplateBindingBase):
             commit_sha=domain.commit_sha,
             last_sync_status=domain.last_sync_status,
             last_sync_error=domain.last_sync_error,
-            last_sync_queue_job_url=last_sync_queue_job_url,
+            last_sync_job_url=last_sync_job_url,
             github_owner_id=domain.github_owner_id,
             github_repo_id=domain.github_repo_id,
             github_installation_id=domain.github_installation_id,

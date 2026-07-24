@@ -350,25 +350,39 @@ class QueueJobStore:
         result = await self._session.execute(stmt)
         return result.first() is not None
 
-    async def list_by_keeper_sync_run(
+    async def list_by_org(
         self,
         *,
-        run_id: int,
+        org_id: int,
+        kind: JobKind | None = None,
         status: JobStatus | None = None,
+        project_id: int | None = None,
+        keeper_sync_run_id: int | None = None,
         cursor: QueueJobDateCreatedCursor | None = None,
         limit: int,
     ) -> CountedPaginatedList[QueueJob, QueueJobDateCreatedCursor]:
-        """List queue jobs attributed to a run, newest first.
+        """List an organization's queue jobs, newest first.
 
-        Optional ``status`` narrows to a single :class:`JobStatus`.
-        Pagination uses the standard ``date_created`` DESC keyset cursor
-        so pages are stable across concurrent inserts.
+        Scoped to a single ``org_id`` so cross-org rows never appear.
+        Each optional filter narrows the result set and they combine
+        conjunctively: ``kind`` and ``status`` match a single
+        :class:`JobKind` / :class:`JobStatus`, ``project_id`` matches the
+        job's target project, and ``keeper_sync_run_id`` matches the
+        attributed keeper-sync run. Pagination uses the standard
+        ``date_created`` DESC keyset cursor so pages are stable across
+        concurrent inserts.
         """
-        stmt = select(SqlQueueJob).where(
-            SqlQueueJob.keeper_sync_run_id == run_id
-        )
+        stmt = select(SqlQueueJob).where(SqlQueueJob.org_id == org_id)
+        if kind is not None:
+            stmt = stmt.where(SqlQueueJob.kind == kind.value)
         if status is not None:
             stmt = stmt.where(SqlQueueJob.status == status.value)
+        if project_id is not None:
+            stmt = stmt.where(SqlQueueJob.project_id == project_id)
+        if keeper_sync_run_id is not None:
+            stmt = stmt.where(
+                SqlQueueJob.keeper_sync_run_id == keeper_sync_run_id
+            )
         runner = CountedPaginatedQueryRunner(
             entry_type=QueueJob,
             cursor_type=QueueJobDateCreatedCursor,

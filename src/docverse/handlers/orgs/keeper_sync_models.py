@@ -78,10 +78,8 @@ class KeeperSyncRun(_KeeperSyncRunBase):
             jobs_url=HttpUrl(
                 str(
                     request.url_for(
-                        "get_org_keeper_sync_run_jobs",
-                        org=org_slug,
-                        run=run_public_id,
-                    )
+                        "get_org_jobs", org=org_slug
+                    ).include_query_params(run=run_public_id)
                 )
             ),
             id=run_public_id,
@@ -110,12 +108,12 @@ class KeeperSyncRunCreated(_KeeperSyncRunCreatedBase):
         org_slug: str,
     ) -> Self:
         """Build the 202 envelope from the run + enqueued queue-job."""
-        queue_job_id = serialize_base32_id(queue_job.public_id)
+        job_id = serialize_base32_id(queue_job.public_id)
         return cls(
             run=KeeperSyncRun.from_domain(run, activity, request, org_slug),
-            queue_job_id=queue_job_id,
-            queue_job_url=HttpUrl(
-                str(request.url_for("get_queue_job", job=queue_job_id))
+            job_id=job_id,
+            job_url=HttpUrl(
+                str(request.url_for("get_org_job", org=org_slug, job=job_id))
             ),
         )
 
@@ -162,13 +160,14 @@ class KeeperSyncProjectRefreshAccepted(_KeeperSyncProjectRefreshAcceptedBase):
         cls,
         queue_job: QueueJobDomain,
         request: Request,
+        org_slug: str,
     ) -> Self:
         """Build the 202 envelope from the enqueued queue-job."""
-        queue_job_id = serialize_base32_id(queue_job.public_id)
+        job_id = serialize_base32_id(queue_job.public_id)
         return cls(
-            queue_job_id=queue_job_id,
-            queue_job_url=HttpUrl(
-                str(request.url_for("get_queue_job", job=queue_job_id))
+            job_id=job_id,
+            job_url=HttpUrl(
+                str(request.url_for("get_org_job", org=org_slug, job=job_id))
             ),
         )
 

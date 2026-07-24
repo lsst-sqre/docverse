@@ -33,12 +33,17 @@ async def test_dashboard_rebuild_returns_202_with_queue_id(
     )
     assert response.status_code == 202
     body = response.json()
-    assert "queue_job_id" in body
-    assert isinstance(body["queue_job_id"], str)
-    assert len(body["queue_job_id"]) > 0
-    assert body["queue_job_url"].endswith(
-        f"/queue/jobs/{body['queue_job_id']}"
+    assert "job_id" in body
+    assert isinstance(body["job_id"], str)
+    assert len(body["job_id"]) > 0
+    assert body["job_url"].endswith(f"/orgs/dash-org/jobs/{body['job_id']}")
+    # The job_url resolves via the org-scoped GET.
+    job_response = await client.get(
+        body["job_url"],
+        headers={"X-Auth-Request-User": "admin-user"},
     )
+    assert job_response.status_code == 200
+    assert job_response.json()["id"] == body["job_id"]
 
 
 @pytest.mark.asyncio
@@ -129,13 +134,20 @@ async def test_org_dashboard_rebuild_returns_one_job_per_project(
     assert len(body) == 3
     by_slug = {entry["project_slug"]: entry for entry in body}
     assert set(by_slug) == {"alpha", "beta", "gamma"}
-    job_ids = {entry["queue_job_id"] for entry in body}
+    job_ids = {entry["job_id"] for entry in body}
     assert len(job_ids) == 3
     assert all(isinstance(jid, str) and jid for jid in job_ids)
     for entry in body:
-        assert entry["queue_job_url"].endswith(
-            f"/queue/jobs/{entry['queue_job_id']}"
+        assert entry["job_url"].endswith(
+            f"/orgs/dash-org/jobs/{entry['job_id']}"
         )
+        # Each entry's job_url resolves via the org-scoped GET.
+        job_response = await client.get(
+            entry["job_url"],
+            headers={"X-Auth-Request-User": "admin-user"},
+        )
+        assert job_response.status_code == 200
+        assert job_response.json()["id"] == entry["job_id"]
 
 
 @pytest.mark.asyncio
