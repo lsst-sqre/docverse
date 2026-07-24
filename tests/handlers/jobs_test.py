@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
+from safir.http import PaginationLinkData
 
 from docverse.client.models import (
     BuildCreate,
@@ -492,17 +492,12 @@ async def test_list_org_jobs_paginates(client: AsyncClient) -> None:
     assert first.headers["X-Total-Count"] == "5"
     assert [job["id"] for job in first.json()] == [newest[0], newest[1]]
 
-    # Follow the "next" cursor from the Link header. On the first page
-    # only the "next" link carries a cursor, so the first match is it.
-    link = first.headers["Link"]
-    assert 'rel="next"' in link
-    match = re.search(r"cursor=([^&>]+)", link)
-    assert match is not None
-    cursor = match.group(1)
+    # Follow the "next" link from the Link header.
+    links = PaginationLinkData.from_header(first.headers.get("link"))
+    assert links.next_url is not None
 
     second = await client.get(
-        "/docverse/orgs/page-org/jobs",
-        params={"limit": 2, "cursor": cursor},
+        links.next_url,
         headers={"X-Auth-Request-User": "reader-user"},
     )
     assert second.status_code == 200
