@@ -433,6 +433,22 @@ async def test_list_org_jobs_cross_org_run_returns_404(
 
 
 @pytest.mark.asyncio
+async def test_list_org_jobs_malformed_run_returns_422(
+    client: AsyncClient,
+) -> None:
+    """A malformed (non-Base32) ``run`` query value is rejected with 422."""
+    await seed_org_with_admin(client, "badrun-org", _ADMIN)
+    await seed_member("badrun-org", "reader-user", OrgRole.reader)
+
+    response = await client.get(
+        "/docverse/orgs/badrun-org/jobs",
+        params={"run": "not-a-valid-id"},
+        headers={"X-Auth-Request-User": "reader-user"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_list_org_jobs_filters_combine(client: AsyncClient) -> None:
     """The ``kind`` and ``project`` filters combine conjunctively."""
     await seed_org_with_admin(client, "combo-org", _ADMIN)
