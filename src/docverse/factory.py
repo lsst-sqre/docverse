@@ -112,6 +112,7 @@ class Factory:
 
     def __init__(
         self,
+        *,
         session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
         credential_encryptor: CredentialEncryptor | None = None,
@@ -123,7 +124,6 @@ class Factory:
         github_app_private_key: SecretStr | None = None,
         github_webhook_secret: SecretStr | None = None,
         github_app_name: str = "lsst-sqre/docverse",
-        *,
         github_app_validated: bool = True,
         default_queue_name: str,
     ) -> None:
@@ -946,6 +946,7 @@ class HandlerFactory(Factory):
 
     def __init__(
         self,
+        *,
         session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
         arq_queue: ArqQueue,
@@ -958,7 +959,6 @@ class HandlerFactory(Factory):
         github_app_private_key: SecretStr | None = None,
         github_webhook_secret: SecretStr | None = None,
         github_app_html_url: str | None = None,
-        *,
         github_app_validated: bool = True,
         default_queue_name: str,
     ) -> None:

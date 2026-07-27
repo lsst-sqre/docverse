@@ -166,6 +166,7 @@ class ContextDependency:
 
     async def initialize(  # noqa: C901
         self,
+        *,
         user_info_store: UserInfoStore | None = None,
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,

@@ -25,6 +25,7 @@ class BuildService:
 
     def __init__(
         self,
+        *,
         store: BuildStore,
         org_store: OrganizationStore,
         project_store: ProjectStore,

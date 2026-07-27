@@ -47,6 +47,12 @@ where = ["src"]
 [tool.ruff]
 extend = "../ruff-shared.toml"
 
+[tool.ruff.lint.extend-per-file-ignores]
+"src/docverse/client/_cli.py" = [
+    "PLR0917", # Too many positional arguments (Click builds the CLI from
+               # the decorated command signature; nothing calls it directly).
+]
+
 [tool.coverage.run]
 parallel = true
 branch = true
