@@ -10,7 +10,11 @@ dependencies = [
     "click>=8",
     "cryptography>=48.0.1",
     "docverse-client",
-    "fastapi>=0.115",
+    # FastAPI 0.140 made Dependant a slots dataclass; FastStream's FastAPI
+    # plugin monkey-patches attributes onto Dependant and now raises
+    # AttributeError at import/startup.
+    # TODO: remove when ag2ai/faststream#2959 is fixed
+    "fastapi>=0.115,<0.140",
     "httpx",
     "jinja2>=3.1",
     "pydantic>=2",
