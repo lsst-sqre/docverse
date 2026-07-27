@@ -33,6 +33,7 @@ class EditionService:
 
     def __init__(
         self,
+        *,
         store: EditionStore,
         org_store: OrganizationStore,
         project_store: ProjectStore,
