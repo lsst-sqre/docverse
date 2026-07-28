@@ -10,6 +10,7 @@ update: update-deps init
 update-deps:
 	uv lock --upgrade
 	uv run --only-group=lint prek autoupdate
+	./scripts/update-uv-version.sh
 
 .PHONY: lint
 lint:
