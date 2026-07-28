@@ -1,5 +1,12 @@
 name: CI
 
+env:
+  # Current supported uv version. The uv documentation recommends pinning
+  # this. The version should match the version used in
+  # .pre-commit-config.yaml and frozen in uv.lock. It is updated by
+  # make update-deps.
+  UV_VERSION: "0.11.33"
+
 "on":
   merge_group: {}
   pull_request: {}
@@ -43,6 +50,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
 
       - name: Run linters
         run: uv run --only-group=lint prek run --all-files
@@ -63,6 +72,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
 
       - name: Run typing
         run: uv run --only-group=nox nox -s typing
@@ -88,6 +99,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
 
       - name: Run client tests
         run: >-
@@ -122,6 +135,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
 
       - name: Run deploy-worker integration test
         run: uv run --only-group=nox nox -s deploy_worker_test
