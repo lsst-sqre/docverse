@@ -44,10 +44,10 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "respx",
+    "uv",
 ]
 lint = [
-    "pre-commit",
-    "pre-commit-uv",
+    "prek",
     "ruff>=0.12",
 ]
 typing = [

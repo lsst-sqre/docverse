@@ -1,7 +1,7 @@
 .PHONY: init
 init:
 	uv sync --frozen --all-groups
-	uv run --only-group=lint pre-commit install
+	uv run --only-group=lint prek install
 
 .PHONY: update
 update: update-deps init
@@ -9,11 +9,11 @@ update: update-deps init
 .PHONY: update-deps
 update-deps:
 	uv lock --upgrade
-	uv run --only-group=lint pre-commit autoupdate
+	uv run --only-group=lint prek autoupdate
 
 .PHONY: lint
 lint:
-	uv run --only-group=lint pre-commit run --all-files
+	uv run --only-group=lint prek run --all-files
 
 .PHONY: typing
 typing:

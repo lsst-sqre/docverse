@@ -45,7 +45,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Run linters
-        run: uv run --only-group=lint pre-commit run --all-files
+        run: uv run --only-group=lint prek run --all-files
 
   test:
     runs-on: ubuntu-latest
