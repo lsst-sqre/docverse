@@ -153,11 +153,15 @@ class LifecycleRuleSet(RootModel[list[LifecycleRule]]):
 class LifecycleEvalRunStatus(StrEnum):
     """Lifecycle status of a ``lifecycle_eval_runs`` aggregate row.
 
-    ``pending`` — the dispatcher has created the run row but has not yet
-    enqueued any per-org child jobs. ``in_progress`` — at least one
-    per-org child has been enqueued. ``succeeded`` /
-    ``partial_failure`` / ``failed`` are terminal states set by
-    ``maybe_finalise_lifecycle_run`` when every child is terminal.
+    - ``pending`` — the dispatcher has created the run row but has not
+      yet enqueued any per-org child jobs.
+    - ``in_progress`` — at least one per-org child has been enqueued.
+    - ``succeeded`` — terminal; every per-org child succeeded.
+    - ``partial_failure`` — terminal; some per-org children failed.
+    - ``failed`` — terminal; the run failed outright.
+
+    Terminal states are set by ``maybe_finalise_lifecycle_run`` when
+    every child is terminal.
     """
 
     pending = "pending"
@@ -172,11 +176,16 @@ class GitRefAuditRunStatus(StrEnum):
 
     Shape mirrors :class:`LifecycleEvalRunStatus` so the daily
     ``git_ref_audit`` dispatcher / per-org / reaper pattern transfers
-    between the two subsystems without operator re-training. ``pending``
-    — discovery has created the run row but has not yet enqueued any
-    per-org child jobs. ``in_progress`` — at least one per-org child
-    has been enqueued. ``succeeded`` / ``partial_failure`` / ``failed``
-    are terminal states set by ``maybe_finalise_git_ref_audit_run``
+    between the two subsystems without operator re-training.
+
+    - ``pending`` — discovery has created the run row but has not yet
+      enqueued any per-org child jobs.
+    - ``in_progress`` — at least one per-org child has been enqueued.
+    - ``succeeded`` — terminal; every per-org child succeeded.
+    - ``partial_failure`` — terminal; some per-org children failed.
+    - ``failed`` — terminal; the run failed outright.
+
+    Terminal states are set by ``maybe_finalise_git_ref_audit_run``
     when every child is terminal.
     """
 

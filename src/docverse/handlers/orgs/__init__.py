@@ -37,6 +37,6 @@ orgs_router.include_router(
     dashboard_template_project_override_router, tags=["projects"]
 )
 orgs_router.include_router(keeper_sync_router, tags=["orgs"])
-orgs_router.include_router(jobs_router, tags=["jobs"])
+orgs_router.include_router(jobs_router, tags=["orgs"])
 
 __all__ = ["orgs_router"]

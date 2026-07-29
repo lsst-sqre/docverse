@@ -77,6 +77,78 @@ and sub-collections use a **`{relation}_url`** suffix, for example:
 All `*_url` fields are absolute URLs, built from the incoming request so
 they honour the deployment's scheme and host.
 
+## Public identifiers: no database IDs on the wire
+
+Response bodies never expose integer database row IDs. Resources that
+need a public identifier carry a **Crockford Base32 public ID** (12
+characters plus a 2-character checksum, hyphenated every 4, e.g.
+`1txq-55pj-1x5m-16`), minted from the `public_id` column via
+`docverse.domain.base32id`. Fields holding these IDs are named `id` on
+the resource itself and `{relation}_id` when referencing another
+resource (`job_id`, `build_id`, `keeper_sync_run_id`).
+
+Numeric IDs from *foreign* systems are allowed but must be clearly
+labelled as such in the field name and description: `ltd_id` (legacy
+LTD Keeper), `github_owner_id` / `github_repo_id` /
+`github_installation_id` (GitHub). When a response needs to point at
+another Docverse resource, prefer a `{relation}_url` HATEOAS link (or
+the resource's Base32 public ID) — never its integer row id.
+
+## Example values in the generated OpenAPI schema
+
+Every `*_url`, public-ID, and slug-like field declares
+`Field(examples=[...])` so the rendered OpenAPI docs show realistic
+values instead of `"string"`. The examples share one vocabulary,
+defined as constants in
+`client/src/docverse/client/models/_examples.py`:
+
+- The example deployment is `https://example.org/docverse/api`.
+- The example organization is `lsst`, its project `pipelines`, and its
+  edition `v1`.
+- Example Base32 IDs are genuine minted values (they round-trip through
+  the real validators), one distinct constant per resource type so
+  cross-references line up — e.g. a build's `self_url` embeds the same
+  id shown in the build's `id` field.
+
+When adding a field that fits this vocabulary, reuse the constants
+rather than inventing new example values inline.
+
+## Documenting enums
+
+Pydantic emits an enum's **class docstring** as the description of the
+enum's component schema in the OpenAPI document, but **member
+docstrings are dropped**. Therefore every public (wire-visible) enum
+documents its values as a bulleted list in the class docstring:
+
+```python
+class KeeperSyncTombstoneReason(StrEnum):
+    """Why a ``keeper_sync_state`` row was tombstoned.
+
+    - ``manual_delete`` — an operator soft-deleted ...
+    - ``lifecycle_delete`` — an automated process ...
+    """
+```
+
+Do not put value semantics only in member docstrings — they are
+invisible to API consumers. The list format renders as Markdown in
+Swagger UI and Redoc.
+
+## OpenAPI tags
+
+Operations are grouped under three tags, declared in
+`src/docverse/main.py` and applied per sub-router in
+`src/docverse/handlers/orgs/__init__.py`:
+
+- **`orgs`** — organization-scoped resources: the org itself, members,
+  credentials, services, keeper-sync, the org dashboard, and the
+  org-scoped jobs collection (`/orgs/{org}/jobs`).
+- **`projects`** — projects and their sub-resources (builds, editions,
+  project dashboards and template overrides).
+- **`admin`** — superuser organization administration.
+
+There is deliberately no separate `jobs` tag: jobs are org-scoped
+resources and document under `orgs`.
+
 ## Timestamp field naming
 
 Timestamp fields are prefixed with **`date_`** and carry timezone-aware

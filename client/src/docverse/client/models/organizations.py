@@ -8,6 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ._examples import EXAMPLE_ORG_URL
 from .editions import DefaultEditionConfig
 from .lifecycle import LifecycleRuleSet
 from .memberships import OrgMembershipCreate, OrgRole
@@ -41,13 +42,16 @@ def normalize_base_domain(value: str) -> str:
 
 
 class UrlScheme(StrEnum):
-    """URL scheme for serving documentation within an organization."""
+    """URL scheme for serving documentation within an organization.
+
+    - ``subdomain`` — each project is served on its own subdomain of the
+      organization's base domain (e.g. ``https://pipelines.lsst.io``).
+    - ``path_prefix`` — each project is served under a path prefix on a
+      shared host (e.g. ``https://lsst.io/pipelines``).
+    """
 
     subdomain = "subdomain"
-    """Each project is served on its own subdomain."""
-
     path_prefix = "path_prefix"
-    """Each project is served under a path prefix."""
 
 
 class OrganizationCreate(BaseModel):
@@ -123,21 +127,25 @@ class OrganizationCreate(BaseModel):
     publishing_store_label: str | None = Field(
         default=None,
         description="Label of the object_storage service for publishing.",
+        examples=["docs-bucket"],
     )
 
     staging_store_label: str | None = Field(
         default=None,
         description="Label of the object_storage service for staging.",
+        examples=["staging-bucket"],
     )
 
     cdn_service_label: str | None = Field(
         default=None,
         description="Label of the cdn service.",
+        examples=["cdn"],
     )
 
     dns_service_label: str | None = Field(
         default=None,
         description="Label of the dns service.",
+        examples=["dns"],
     )
 
     default_edition_config: DefaultEditionConfig | None = Field(
@@ -159,26 +167,38 @@ class Organization(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this organization resource.")
+    self_url: str = Field(
+        description="URL to this organization resource.",
+        examples=[EXAMPLE_ORG_URL],
+    )
 
     dashboard_template_url: str = Field(
         description=(
             "URL to the organization's default dashboard-template binding."
         ),
+        examples=[f"{EXAMPLE_ORG_URL}/dashboard-template"],
     )
 
     keeper_sync_url: str = Field(
         description=(
             "URL to the organization's LTD Keeper sync configuration."
         ),
+        examples=[f"{EXAMPLE_ORG_URL}/keeper-sync"],
     )
 
-    slug: str = Field(description="URL-safe identifier for the organization.")
+    slug: str = Field(
+        description="URL-safe identifier for the organization.",
+        examples=["lsst"],
+    )
 
-    title: str = Field(description="Display title for the organization.")
+    title: str = Field(
+        description="Display title for the organization.",
+        examples=["Rubin Observatory"],
+    )
 
     base_domain: str = Field(
-        description="Base domain for documentation sites."
+        description="Base domain for documentation sites.",
+        examples=["lsst.io"],
     )
 
     url_scheme: UrlScheme = Field(
@@ -221,21 +241,53 @@ class Organization(BaseModel):
     publishing_store: OrganizationServiceSummary | None = Field(
         default=None,
         description="Object storage service used for publishing.",
+        examples=[
+            {
+                "self_url": f"{EXAMPLE_ORG_URL}/services/docs-bucket",
+                "label": "docs-bucket",
+                "category": "object_storage",
+                "provider": "aws_s3",
+            }
+        ],
     )
 
     staging_store: OrganizationServiceSummary | None = Field(
         default=None,
         description="Object storage service used for staging uploads.",
+        examples=[
+            {
+                "self_url": f"{EXAMPLE_ORG_URL}/services/staging-bucket",
+                "label": "staging-bucket",
+                "category": "object_storage",
+                "provider": "aws_s3",
+            }
+        ],
     )
 
     cdn_service: OrganizationServiceSummary | None = Field(
         default=None,
         description="CDN service for cache purging and edge data.",
+        examples=[
+            {
+                "self_url": f"{EXAMPLE_ORG_URL}/services/cdn",
+                "label": "cdn",
+                "category": "cdn",
+                "provider": "fastly",
+            }
+        ],
     )
 
     dns_service: OrganizationServiceSummary | None = Field(
         default=None,
         description="DNS service for subdomain registration.",
+        examples=[
+            {
+                "self_url": f"{EXAMPLE_ORG_URL}/services/dns",
+                "label": "dns",
+                "category": "dns",
+                "provider": "route53",
+            }
+        ],
     )
 
     date_created: datetime = Field(
@@ -259,11 +311,20 @@ class OrganizationSummary(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this organization resource.")
+    self_url: str = Field(
+        description="URL to this organization resource.",
+        examples=[EXAMPLE_ORG_URL],
+    )
 
-    slug: str = Field(description="URL-safe identifier for the organization.")
+    slug: str = Field(
+        description="URL-safe identifier for the organization.",
+        examples=["lsst"],
+    )
 
-    title: str = Field(description="Display title for the organization.")
+    title: str = Field(
+        description="Display title for the organization.",
+        examples=["Rubin Observatory"],
+    )
 
     role: OrgRole = Field(
         description="The caller's effective role in the organization."
@@ -323,21 +384,25 @@ class OrganizationUpdate(BaseModel):
     publishing_store_label: str | None = Field(
         default=None,
         description="Label of the object_storage service for publishing.",
+        examples=["docs-bucket"],
     )
 
     staging_store_label: str | None = Field(
         default=None,
         description="Label of the object_storage service for staging.",
+        examples=["staging-bucket"],
     )
 
     cdn_service_label: str | None = Field(
         default=None,
         description="Label of the cdn service.",
+        examples=["cdn"],
     )
 
     dns_service_label: str | None = Field(
         default=None,
         description="Label of the dns service.",
+        examples=["dns"],
     )
 
     default_edition_config: DefaultEditionConfig | None = Field(

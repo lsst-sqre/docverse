@@ -6,6 +6,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ._examples import EXAMPLE_ORG_URL
+
 __all__ = [
     "OrgMembership",
     "OrgMembershipCreate",
@@ -16,14 +18,30 @@ __all__ = [
 
 
 class PrincipalType(StrEnum):
-    """Type of principal in an organization membership."""
+    """Type of principal in an organization membership.
+
+    - ``user`` — the principal is an individual username.
+    - ``group`` — the principal is a group name; every member of the
+      group holds the membership's role.
+    """
 
     user = "user"
     group = "group"
 
 
 class OrgRole(StrEnum):
-    """Role within an organization."""
+    """Role within an organization.
+
+    Roles are ordered: each level includes the permissions of the
+    levels below it.
+
+    - ``reader`` — read access to the organization's resources.
+    - ``uploader`` — reader plus creating builds and uploading build
+      content.
+    - ``admin`` — full control of the organization, including
+      projects, editions, membership, services, credentials, and
+      configuration.
+    """
 
     reader = "reader"
     uploader = "uploader"
@@ -86,9 +104,15 @@ class OrgMembership(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this membership resource.")
+    self_url: str = Field(
+        description="URL to this membership resource.",
+        examples=[f"{EXAMPLE_ORG_URL}/members/user:jdoe"],
+    )
 
-    org_url: str = Field(description="URL to the parent organization.")
+    org_url: str = Field(
+        description="URL to the parent organization.",
+        examples=[EXAMPLE_ORG_URL],
+    )
 
     id: str = Field(
         description=(
@@ -98,7 +122,10 @@ class OrgMembership(BaseModel):
         examples=["user:jdoe", "group:g_spherex"],
     )
 
-    principal: str = Field(description="Username or group name.")
+    principal: str = Field(
+        description="Username or group name.",
+        examples=["jdoe"],
+    )
 
     principal_type: PrincipalType = Field(
         description="Whether the principal is a user or group."

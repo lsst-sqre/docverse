@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ._examples import EXAMPLE_JOB_ID, EXAMPLE_JOB_URL
+
 __all__ = [
     "DashboardRebuildResponse",
     "OrgDashboardRebuildEntry",
@@ -17,10 +19,14 @@ class DashboardRebuildResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     job_id: str = Field(
-        description="Public Base32 identifier for the enqueued job."
+        description="Public Base32 identifier for the enqueued job.",
+        examples=[EXAMPLE_JOB_ID],
     )
 
-    job_url: str = Field(description="URL to the enqueued job resource.")
+    job_url: str = Field(
+        description="URL to the enqueued job resource.",
+        examples=[EXAMPLE_JOB_URL],
+    )
 
 
 class OrgDashboardRebuildEntry(BaseModel):
@@ -29,14 +35,19 @@ class OrgDashboardRebuildEntry(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     project_slug: str = Field(
-        description="Slug of the project the job will rebuild."
+        description="Slug of the project the job will rebuild.",
+        examples=["pipelines"],
     )
 
     job_id: str = Field(
-        description="Public Base32 identifier for the enqueued job."
+        description="Public Base32 identifier for the enqueued job.",
+        examples=[EXAMPLE_JOB_ID],
     )
 
-    job_url: str = Field(description="URL to the enqueued job resource.")
+    job_url: str = Field(
+        description="URL to the enqueued job resource.",
+        examples=[EXAMPLE_JOB_URL],
+    )
 
 
 class OrgDashboardRebuildResponse(BaseModel):

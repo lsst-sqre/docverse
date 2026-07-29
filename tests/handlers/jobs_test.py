@@ -936,16 +936,21 @@ async def test_keeper_sync_run_jobs_endpoint_removed(
 
 
 @pytest.mark.asyncio
-async def test_jobs_tag_replaces_queue(client: AsyncClient) -> None:
-    """The OpenAPI ``jobs`` tag replaces the retired ``queue`` tag."""
+async def test_jobs_routes_carry_orgs_tag(client: AsyncClient) -> None:
+    """The org-scoped jobs routes are folded into the ``orgs`` tag.
+
+    The standalone ``jobs`` tag (and the older ``queue`` tag) are
+    retired: ``/orgs/{org}/jobs`` endpoints are org-scoped, so they
+    document under ``orgs`` alongside the rest of the org surface.
+    """
     spec = (await client.get("/docverse/openapi.json")).json()
     tag_names = {tag["name"] for tag in spec.get("tags", [])}
-    assert "jobs" in tag_names
+    assert "jobs" not in tag_names
     assert "queue" not in tag_names
 
-    # The org-scoped jobs routes carry the ``jobs`` tag.
     op = spec["paths"]["/docverse/orgs/{org}/jobs/{job}"]["get"]
-    assert "jobs" in op["tags"]
+    assert "orgs" in op["tags"]
+    assert "jobs" not in op["tags"]
 
 
 @pytest.mark.asyncio

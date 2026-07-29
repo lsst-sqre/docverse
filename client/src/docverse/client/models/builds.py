@@ -8,6 +8,13 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ._examples import (
+    EXAMPLE_BUILD_ID,
+    EXAMPLE_BUILD_URL,
+    EXAMPLE_JOB_URL,
+    EXAMPLE_PROJECT_URL,
+)
+
 __all__ = [
     "Build",
     "BuildAnnotations",
@@ -27,20 +34,30 @@ class BuildAnnotations(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     commit_sha: str | None = Field(
-        default=None, description="Git commit SHA for the build."
+        default=None,
+        description="Git commit SHA for the build.",
+        examples=["6c8b2f01a5d34e1c9f0b2ad37e8c5d914f6a7b3c"],
     )
 
     github_repository: str | None = Field(
         default=None,
         description="GitHub repository (owner/repo) that produced the build.",
+        examples=["lsst/pipelines_lsst_io"],
     )
 
     github_run_id: str | None = Field(
-        default=None, description="GitHub Actions run ID."
+        default=None,
+        description="GitHub Actions run ID.",
+        examples=["16768139904"],
     )
 
     github_run_url: str | None = Field(
-        default=None, description="Full URL to the GitHub Actions run."
+        default=None,
+        description="Full URL to the GitHub Actions run.",
+        examples=[
+            "https://github.com/lsst/pipelines_lsst_io/actions/runs/"
+            "16768139904"
+        ],
     )
 
     github_run_attempt: str | None = Field(
@@ -69,17 +86,22 @@ class BuildAnnotations(BaseModel):
 
 
 class BuildStatus(StrEnum):
-    """Status of a documentation build."""
+    """Status of a documentation build.
+
+    - ``pending`` — the build row exists and Docverse is waiting for the
+      tarball upload.
+    - ``uploaded`` — signal value used in PATCH requests to indicate
+      upload completion. Never persisted or returned: the server
+      transitions the build directly from ``pending`` to ``processing``
+      when it receives this signal.
+    - ``processing`` — a background job is unpacking the upload and
+      updating tracking editions.
+    - ``completed`` — processing finished successfully.
+    - ``failed`` — processing failed; see the build's job for errors.
+    """
 
     pending = "pending"
     uploaded = "uploaded"
-    """Signal value used in PATCH requests to indicate upload completion.
-
-    This status is never persisted to the database. The server transitions
-    the build directly from ``pending`` to ``processing`` when it receives
-    this signal.
-    """
-
     processing = "processing"
     completed = "completed"
     failed = "failed"
@@ -131,16 +153,24 @@ class Build(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this build resource.")
+    self_url: str = Field(
+        description="URL to this build resource.",
+        examples=[EXAMPLE_BUILD_URL],
+    )
 
-    project_url: str = Field(description="URL to the parent project.")
+    project_url: str = Field(
+        description="URL to the parent project.",
+        examples=[EXAMPLE_PROJECT_URL],
+    )
 
     id: str = Field(
-        description="Public Crockford Base32 identifier for the build."
+        description="Public Crockford Base32 identifier for the build.",
+        examples=[EXAMPLE_BUILD_ID],
     )
 
     git_ref: str = Field(
-        description="Git ref (branch, tag, or SHA) for this build."
+        description="Git ref (branch, tag, or SHA) for this build.",
+        examples=["main"],
     )
 
     alternate_name: str | None = Field(
@@ -151,7 +181,11 @@ class Build(BaseModel):
     )
 
     content_hash: str = Field(
-        description="SHA-256 hash of the uploaded tarball."
+        description="SHA-256 hash of the uploaded tarball.",
+        examples=[
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789"
+            "abcdef0123456789"
+        ],
     )
 
     status: BuildStatus = Field(description="Current status of the build.")
@@ -159,11 +193,16 @@ class Build(BaseModel):
     upload_url: str | None = Field(
         default=None,
         description="Pre-signed URL for uploading the build tarball.",
+        examples=[
+            "https://staging-bucket.s3.amazonaws.com/uploads/"
+            "1txq-55pj-1x5m-16.tar.gz?X-Amz-Signature=0ad34c"
+        ],
     )
 
     job_url: str | None = Field(
         default=None,
         description="URL to the job processing this build.",
+        examples=[EXAMPLE_JOB_URL],
     )
 
     object_count: int | None = Field(
@@ -177,7 +216,8 @@ class Build(BaseModel):
     )
 
     uploader: str = Field(
-        description="Username of the person who uploaded the build."
+        description="Username of the person who uploaded the build.",
+        examples=["jdoe"],
     )
 
     annotations: BuildAnnotations | None = Field(

@@ -14,39 +14,44 @@ __all__ = [
 
 
 class CredentialProvider(StrEnum):
-    """Cloud provider for authentication credentials."""
+    """Cloud provider for authentication credentials.
+
+    - ``aws`` — Amazon Web Services (S3, Route 53, CloudFront).
+    - ``cloudflare`` — Cloudflare (R2, Workers, DNS).
+    - ``fastly`` — Fastly CDN.
+    - ``gcp`` — Google Cloud Platform (GCS, Cloud CDN).
+    - ``s3`` — generic S3-compatible storage (access key ID + secret
+      access key).
+    """
 
     aws = "aws"
-    """Amazon Web Services (S3, Route 53, CloudFront)."""
-
     cloudflare = "cloudflare"
-    """Cloudflare (R2, Workers, DNS)."""
-
     fastly = "fastly"
-    """Fastly CDN."""
-
     gcp = "gcp"
-    """Google Cloud Platform (GCS, Cloud CDN)."""
-
     s3 = "s3"
-    """Generic S3-compatible (access key ID + secret access key)."""
 
 
 class ServiceCategory(StrEnum):
-    """Category of infrastructure service."""
+    """Category of infrastructure service.
+
+    - ``object_storage`` — object storage for documentation content.
+    - ``cdn`` — content delivery network for cache purging and edge
+      data.
+    - ``dns`` — DNS management for subdomain registration.
+    """
 
     object_storage = "object_storage"
-    """Object storage for documentation content."""
-
     cdn = "cdn"
-    """Content delivery network for cache purging and edge data."""
-
     dns = "dns"
-    """DNS management for subdomain registration."""
 
 
 class ServiceProvider(StrEnum):
-    """Specific infrastructure service provider."""
+    """Specific infrastructure service provider.
+
+    Object storage: ``aws_s3``, ``cloudflare_r2``, ``minio``, ``gcs``.
+    CDN: ``fastly``, ``cloudflare_workers``, ``cloudfront``,
+    ``google_cloud_cdn``. DNS: ``route53``, ``cloudflare_dns``.
+    """
 
     # Object storage
     aws_s3 = "aws_s3"

@@ -15,8 +15,9 @@ _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete"})
 
 # Tags identifying the orgs sub-routers and admin router — the operations
 # whose 403/404/409 error contract this spec-lint covers. Internal and
-# webhook routes are deliberately excluded.
-_IN_SCOPE_TAGS = frozenset({"orgs", "projects", "jobs", "admin"})
+# webhook routes are deliberately excluded. (Org-scoped jobs routes are
+# tagged ``orgs``.)
+_IN_SCOPE_TAGS = frozenset({"orgs", "projects", "admin"})
 
 _ERROR_MODEL_REF = "#/components/schemas/ErrorModel"
 

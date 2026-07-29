@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ._examples import EXAMPLE_ORG_URL, EXAMPLE_PROJECT_URL
 from .editions import DefaultEditionConfig
 from .editions import Edition as EditionResponse
 from .lifecycle import LifecycleRuleSet
@@ -65,6 +66,7 @@ _GITHUB_OWNER_FIELD = Field(
     max_length=39,
     pattern=r"^[A-Za-z0-9](?:-?[A-Za-z0-9])*$",
     description="GitHub owner (user or organization login).",
+    examples=["lsst"],
 )
 
 _GITHUB_REPO_FIELD = Field(
@@ -72,6 +74,7 @@ _GITHUB_REPO_FIELD = Field(
     max_length=100,
     pattern=r"^[A-Za-z0-9._-]+$",
     description="GitHub repository name.",
+    examples=["pipelines_lsst_io"],
 )
 
 
@@ -88,11 +91,15 @@ class ProjectGitHubBindingCreate(BaseModel):
 class InstallationStatus(StrEnum):
     """Whether the Docverse GitHub App is installed on a repository.
 
-    Derived per response from the project's GitHub binding. Today only
-    ``not_installed`` and ``installed`` are ever returned;
-    ``suspended`` and ``needs_permissions`` are reserved enum values
-    for a later slice (projects currently have no suspended state — the
-    suspend/unsuspend webhooks only touch dashboard-template bindings).
+    Derived per response from the project's GitHub binding.
+
+    - ``not_installed`` — the App is not installed on the repository (or
+      its installation has not yet been resolved).
+    - ``installed`` — the App is installed on the repository.
+    - ``suspended`` — reserved; not returned today (projects currently
+      have no suspended state — the suspend/unsuspend webhooks only
+      touch dashboard-template bindings).
+    - ``needs_permissions`` — reserved; not returned today.
     """
 
     not_installed = "not_installed"
@@ -116,6 +123,7 @@ class ProjectGitHubBinding(BaseModel):
             "GitHub App installation id for the repository. ``None`` when"
             " the App is not installed or has not yet been resolved."
         ),
+        examples=[42150081],
     )
 
     installation_status: InstallationStatus = Field(
@@ -135,6 +143,7 @@ class ProjectGitHubBinding(BaseModel):
             " GitHub App feature is unconfigured or its credentials"
             " failed startup validation."
         ),
+        examples=["https://github.com/apps/docverse"],
     )
 
 
@@ -248,25 +257,42 @@ class Project(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this project resource.")
-
-    org_url: str = Field(description="URL to the parent organization.")
-
-    editions_url: str = Field(
-        description="URL to list editions for this project."
+    self_url: str = Field(
+        description="URL to this project resource.",
+        examples=[EXAMPLE_PROJECT_URL],
     )
 
-    builds_url: str = Field(description="URL to list builds for this project.")
+    org_url: str = Field(
+        description="URL to the parent organization.",
+        examples=[EXAMPLE_ORG_URL],
+    )
+
+    editions_url: str = Field(
+        description="URL to list editions for this project.",
+        examples=[f"{EXAMPLE_PROJECT_URL}/editions"],
+    )
+
+    builds_url: str = Field(
+        description="URL to list builds for this project.",
+        examples=[f"{EXAMPLE_PROJECT_URL}/builds"],
+    )
 
     dashboard_template_url: str = Field(
         description=(
             "URL to the project's dashboard-template binding override."
         ),
+        examples=[f"{EXAMPLE_PROJECT_URL}/dashboard-template"],
     )
 
-    slug: str = Field(description="URL-safe identifier for the project.")
+    slug: str = Field(
+        description="URL-safe identifier for the project.",
+        examples=["pipelines"],
+    )
 
-    title: str = Field(description="Display title for the project.")
+    title: str = Field(
+        description="Display title for the project.",
+        examples=["LSST Science Pipelines"],
+    )
 
     source_url: str | None = Field(
         default=None,
@@ -276,6 +302,7 @@ class Project(BaseModel):
             " (``https://github.com/{owner}/{repo}``); otherwise the"
             " stored non-GitHub URL. ``None`` when neither is set."
         ),
+        examples=["https://github.com/lsst/pipelines_lsst_io"],
     )
 
     github: ProjectGitHubBinding | None = Field(

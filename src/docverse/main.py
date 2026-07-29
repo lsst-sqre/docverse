@@ -151,13 +151,15 @@ app = FastAPI(
     openapi_tags=[
         {
             "name": "orgs",
-            "description": "Organization and membership management.",
+            "description": (
+                "Organization and membership management, including"
+                " org-scoped background job status."
+            ),
         },
         {
             "name": "projects",
             "description": "Projects, builds, and editions.",
         },
-        {"name": "jobs", "description": "Background job status."},
         {
             "name": "admin",
             "description": "Superuser organization administration.",

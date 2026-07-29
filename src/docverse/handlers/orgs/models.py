@@ -36,6 +36,11 @@ from docverse.client.models import (
 )
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
+from docverse.client.models._examples import (
+    EXAMPLE_JOB_ID,
+    EXAMPLE_JOB_URL,
+    EXAMPLE_ORG_URL,
+)
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
 from docverse.domain.dashboard_github_template import (
@@ -65,10 +70,22 @@ from docverse.storage.github import build_github_browse_url
 class Organization(_OrganizationBase):
     """Organization response model with HATEOAS URLs."""
 
-    services_url: str
-    credentials_url: str
-    projects_url: str
-    members_url: str
+    services_url: str = Field(
+        description="URL to list services for this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/services"],
+    )
+    credentials_url: str = Field(
+        description="URL to list credentials for this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/credentials"],
+    )
+    projects_url: str = Field(
+        description="URL to list projects for this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/projects"],
+    )
+    members_url: str = Field(
+        description="URL to list members of this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/members"],
+    )
 
     @classmethod
     def from_domain(
@@ -486,10 +503,12 @@ class DashboardTemplateSyncEnqueuedResponse(BaseModel):
     """Response body for the dashboard-template force-sync endpoints."""
 
     job_id: str = Field(
-        description="Base32 public ID of the enqueued ``dashboard_sync`` job."
+        description="Base32 public ID of the enqueued ``dashboard_sync`` job.",
+        examples=[EXAMPLE_JOB_ID],
     )
     job_url: str = Field(
-        description="URL of the enqueued ``dashboard_sync`` job."
+        description="URL of the enqueued ``dashboard_sync`` job.",
+        examples=[EXAMPLE_JOB_URL],
     )
 
     @classmethod

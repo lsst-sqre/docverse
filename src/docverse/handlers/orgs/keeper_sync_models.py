@@ -281,7 +281,6 @@ class KeeperSyncTombstone(_KeeperSyncTombstoneBase):
             resource_type=KeeperSyncResourceType(state.resource_type),
             ltd_slug=state.ltd_slug,
             ltd_id=state.ltd_id,
-            docverse_id=state.docverse_id,
             date_tombstoned=state.date_tombstoned,
             tombstone_reason=KeeperSyncTombstoneReason(state.tombstone_reason),
             tombstone_note=state.tombstone_note,
