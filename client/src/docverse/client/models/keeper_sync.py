@@ -6,12 +6,22 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
+from ._examples import (
+    EXAMPLE_EDITION_URL,
+    EXAMPLE_JOB_ID,
+    EXAMPLE_JOB_URL,
+    EXAMPLE_ORG_URL,
+    EXAMPLE_PROJECT_URL,
+    EXAMPLE_RUN_ID,
+    EXAMPLE_TOMBSTONE_ID,
+)
 from .editions import EditionKind
 
 __all__ = [
     "KeeperSyncConfig",
+    "KeeperSyncConfigUpdate",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
@@ -63,8 +73,74 @@ class KeeperSyncConfig(BaseModel):
     )
 
 
+class KeeperSyncConfigUpdate(BaseModel):
+    """Partial update for an organization's LTD Keeper sync configuration.
+
+    Request model for ``PATCH /orgs/{org}/keeper-sync``, applied with
+    JSON-Merge-Patch semantics: every field is optional, and only the fields
+    present in the request body are changed — omitted fields are left
+    untouched. ``project_slugs``, when provided, **replaces the stored array
+    wholesale** (there is no append semantics; send the full desired list, or
+    ``"*"`` for every project). ``extra="forbid"`` rejects unknown fields, and
+    ``model_dump(exclude_unset=True)`` is what distinguishes "omitted" from an
+    explicit value. Use ``PUT`` for a full replacement of the config.
+
+    An explicit JSON ``null`` for any field is rejected with a 422: these
+    config fields are non-nullable, so RFC 7386's null-as-remove semantics
+    have no meaning here. Omit a field to leave it unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = Field(
+        default=None,
+        description="Whether LTD Keeper sync is enabled on the organization.",
+    )
+
+    ltd_base_url: HttpUrl | None = Field(
+        default=None,
+        description="Base URL of the LTD Keeper API (v1 shape).",
+    )
+
+    project_slugs: list[str] | Literal["*"] | None = Field(
+        default=None,
+        description=(
+            'LTD project slugs to sync, or ``"*"`` for every project'
+            " visible on the LTD instance. When provided, replaces the"
+            " stored list wholesale (no append semantics)."
+        ),
+    )
+
+    @field_validator("enabled", "ltd_base_url", "project_slugs")
+    @classmethod
+    def _reject_explicit_null(cls, value: object) -> object:
+        """Reject an explicit ``null`` for any config field.
+
+        The validator is skipped for unset defaults, so it only fires when
+        a field is explicitly sent as ``null``. These fields are
+        non-nullable in the stored config, so null-as-remove has no
+        meaning; omit a field to leave it unchanged.
+        """
+        if value is None:
+            msg = (
+                "keeper-sync config fields may not be null; omit a field to"
+                " leave it unchanged"
+            )
+            raise ValueError(msg)
+        return value
+
+
 class KeeperSyncRunKind(StrEnum):
-    """Kind of LTD Keeper sync run."""
+    """Kind of LTD Keeper sync run.
+
+    - ``backfill`` — full import of the configured LTD projects into
+      Docverse; the kind created by ``POST /orgs/{org}/keeper-sync/
+      runs`` today.
+    - ``resync`` — reserved for a re-import of already-synced projects;
+      not created today.
+    - ``reconcile`` — reserved for a diff-and-repair pass against LTD;
+      not created today.
+    """
 
     backfill = "backfill"
     resync = "resync"
@@ -74,10 +150,14 @@ class KeeperSyncRunKind(StrEnum):
 class KeeperSyncRunStatus(StrEnum):
     """Lifecycle status of a keeper sync run.
 
-    ``pending`` — the discovery job has been enqueued but has not yet
-    fanned out any children. ``in_progress`` — discovery has enqueued
-    at least one child sync job. ``succeeded`` / ``partial_failure`` /
-    ``failed`` are terminal states.
+    - ``pending`` — the discovery job has been enqueued but has not yet
+      fanned out any children.
+    - ``in_progress`` — discovery has enqueued at least one child sync
+      job.
+    - ``succeeded`` — terminal; every child job succeeded.
+    - ``partial_failure`` — terminal; some child jobs failed.
+    - ``failed`` — terminal; the run failed outright (e.g. the
+      discovery job itself failed).
     """
 
     pending = "pending"
@@ -92,7 +172,10 @@ class KeeperSyncRun(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: HttpUrl = Field(description="URL to this run resource.")
+    self_url: HttpUrl = Field(
+        description="URL to this run resource.",
+        examples=[f"{EXAMPLE_ORG_URL}/keeper-sync/runs/{EXAMPLE_RUN_ID}"],
+    )
 
     jobs_url: HttpUrl = Field(
         description=(
@@ -101,11 +184,13 @@ class KeeperSyncRun(BaseModel):
             " ``GET /orgs/{org}/jobs?run={id}``). Always present so"
             " clients can paginate the run's children without"
             " constructing the URL by hand."
-        )
+        ),
+        examples=[f"{EXAMPLE_ORG_URL}/jobs?run={EXAMPLE_RUN_ID}"],
     )
 
     id: str = Field(
-        description="Public Crockford Base32 identifier for the run."
+        description="Public Crockford Base32 identifier for the run.",
+        examples=[EXAMPLE_RUN_ID],
     )
 
     kind: KeeperSyncRunKind = Field(description="Kind of run.")
@@ -168,11 +253,13 @@ class KeeperSyncRunCreated(BaseModel):
         description=(
             "Public Base32 identifier for the enqueued"
             " ``keeper_sync_run_discovery`` queue job."
-        )
+        ),
+        examples=[EXAMPLE_JOB_ID],
     )
 
     job_url: HttpUrl = Field(
-        description="URL of the enqueued discovery job resource."
+        description="URL of the enqueued discovery job resource.",
+        examples=[EXAMPLE_JOB_URL],
     )
 
 
@@ -251,7 +338,10 @@ class KeeperSyncProjectStateSummary(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    ltd_slug: str = Field(description="LTD product slug for this project.")
+    ltd_slug: str = Field(
+        description="LTD product slug for this project.",
+        examples=["pipelines"],
+    )
 
     date_last_synced: datetime | None = Field(
         default=None,
@@ -291,10 +381,14 @@ class KeeperSyncEditionStatus(BaseModel):
         description=(
             "Canonical ``GET /orgs/{org}/projects/{project}/editions/"
             "{edition}`` URL for this edition."
-        )
+        ),
+        examples=[EXAMPLE_EDITION_URL],
     )
 
-    slug: str = Field(description="Docverse edition slug.")
+    slug: str = Field(
+        description="Docverse edition slug.",
+        examples=["v1"],
+    )
 
     kind: EditionKind = Field(
         description="Docverse edition kind (``main``, ``draft``, ...)."
@@ -304,8 +398,11 @@ class KeeperSyncEditionStatus(BaseModel):
         default=None,
         description=(
             "LTD edition id from the linked ``keeper_sync_state`` row,"
-            " or ``null`` when no row links this edition."
+            " or ``null`` when no row links this edition. This is the"
+            " numeric id from the legacy LTD Keeper API, not a Docverse"
+            " identifier."
         ),
+        examples=[4289],
     )
 
     ltd_slug: str | None = Field(
@@ -314,6 +411,7 @@ class KeeperSyncEditionStatus(BaseModel):
             "LTD edition slug from the linked state row, or ``null``"
             " when no row links this edition."
         ),
+        examples=["v1"],
     )
 
     date_last_synced: datetime | None = Field(
@@ -374,14 +472,16 @@ class KeeperSyncProjectStatus(BaseModel):
             " URL for this project's keeper-sync status. Lets clients"
             " paginating the org-wide project listing drill into a"
             " single project without constructing the URL by hand."
-        )
+        ),
+        examples=[f"{EXAMPLE_ORG_URL}/keeper-sync/projects/pipelines"],
     )
 
     org_url: HttpUrl = Field(
         description=(
             "Canonical ``GET /orgs/{org}`` URL for the Docverse"
             " organization this report is scoped to."
-        )
+        ),
+        examples=[EXAMPLE_ORG_URL],
     )
 
     project_url: HttpUrl | None = Field(
@@ -391,6 +491,7 @@ class KeeperSyncProjectStatus(BaseModel):
             " the Docverse project, or ``null`` when no Docverse"
             " project has been imported yet for this LTD slug."
         ),
+        examples=[EXAMPLE_PROJECT_URL],
     )
 
     sync_refresh_url: HttpUrl = Field(
@@ -399,7 +500,8 @@ class KeeperSyncProjectStatus(BaseModel):
             " project (``post_org_keeper_sync_project_refresh``). Always"
             " present so operators can trigger a refresh from the"
             " status response without constructing the URL by hand."
-        )
+        ),
+        examples=[f"{EXAMPLE_ORG_URL}/keeper-sync/projects/pipelines/refresh"],
     )
 
     editions_sync_url: HttpUrl = Field(
@@ -409,11 +511,15 @@ class KeeperSyncProjectStatus(BaseModel):
             " (``get_org_keeper_sync_project_editions``). Always"
             " present so operators can scan the full edition list"
             " without constructing the URL by hand."
-        )
+        ),
+        examples=[
+            f"{EXAMPLE_ORG_URL}/keeper-sync/projects/pipelines/editions"
+        ],
     )
 
     ltd_slug: str = Field(
-        description="LTD product slug the report is scoped to."
+        description="LTD product slug the report is scoped to.",
+        examples=["pipelines"],
     )
 
     project_state: KeeperSyncProjectStateSummary | None = Field(
@@ -468,21 +574,25 @@ class KeeperSyncProjectRefreshAccepted(BaseModel):
         description=(
             "Public Base32 identifier for the enqueued"
             " ``keeper_sync_project`` queue job."
-        )
+        ),
+        examples=[EXAMPLE_JOB_ID],
     )
 
-    job_url: HttpUrl = Field(description="URL of the enqueued job resource.")
+    job_url: HttpUrl = Field(
+        description="URL of the enqueued job resource.",
+        examples=[EXAMPLE_JOB_URL],
+    )
 
 
 class KeeperSyncResourceType(StrEnum):
     """LTD resource types tracked by keeper-sync.
 
-    Mirrors :class:`docverse.storage.keeper_sync.ResourceType` as a
-    public wire value so the admin tombstone API can filter requests
-    and shape responses without leaking the server-side enum's import
-    path. Builds are not tombstoned today, but the value is kept so
-    operator-facing filters do not silently reject a valid resource
-    type the schema otherwise carries.
+    - ``project`` — the tombstone vetoes re-import of the LTD product
+      entirely.
+    - ``edition`` — the tombstone vetoes one specific LTD edition.
+    - ``build`` — reserved; builds are not tombstoned today, but the
+      value is kept so operator-facing filters do not silently reject
+      a valid resource type the schema otherwise carries.
     """
 
     project = "project"
@@ -493,21 +603,20 @@ class KeeperSyncResourceType(StrEnum):
 class KeeperSyncTombstoneReason(StrEnum):
     """Why a ``keeper_sync_state`` row was tombstoned.
 
-    Wire-stable enum surfaced by the admin tombstone API. Mirrors
-    :class:`docverse.storage.keeper_sync.TombstoneReason`.
+    - ``manual_delete`` — an operator soft-deleted the Docverse-side
+      resource; the tombstone stops sync from re-importing it.
+    - ``lifecycle_delete`` — an automated process (``lifecycle_eval``,
+      ``git_ref_audit``, or the ``ref_deleted`` webhook) soft-deleted
+      the Docverse-side resource.
+    - ``lifecycle_preemptive`` — sync itself short-circuited an LTD
+      edition that the lifecycle rules would immediately delete,
+      before the build content was copied. No matching Docverse row
+      exists in this case.
     """
 
     manual_delete = "manual_delete"
-    """Operator-driven soft-delete of the Docverse-side resource."""
-
     lifecycle_delete = "lifecycle_delete"
-    """Automated soft-delete by ``lifecycle_eval`` / ``git_ref_audit`` /
-    the ``ref_deleted`` webhook."""
-
     lifecycle_preemptive = "lifecycle_preemptive"
-    """Sync itself short-circuited an LTD edition that the lifecycle
-    rules would immediately delete, before the build content was
-    copied. No matching Docverse row exists in this case."""
 
 
 class KeeperSyncTombstone(BaseModel):
@@ -529,7 +638,10 @@ class KeeperSyncTombstone(BaseModel):
             " endpoint accepts only ``DELETE``; GET-on-self is not"
             " modelled because the list response already carries every"
             " field a single-tombstone fetch would return."
-        )
+        ),
+        examples=[
+            f"{EXAMPLE_ORG_URL}/keeper-sync/tombstones/{EXAMPLE_TOMBSTONE_ID}"
+        ],
     )
 
     id: str = Field(
@@ -537,7 +649,8 @@ class KeeperSyncTombstone(BaseModel):
             "Public Crockford Base32 identifier for the tombstoned"
             " ``keeper_sync_state`` row. Use this id with the DELETE"
             " endpoint to clear the tombstone."
-        )
+        ),
+        examples=[EXAMPLE_TOMBSTONE_ID],
     )
 
     resource_type: KeeperSyncResourceType = Field(
@@ -554,26 +667,19 @@ class KeeperSyncTombstone(BaseModel):
             "LTD-side slug for the tombstoned resource. For ``project``"
             " rows this is the LTD product slug; for ``edition`` rows"
             " it is the LTD edition slug (e.g. ``main`` or ``v1.0``)."
-        )
+        ),
+        examples=["v1"],
     )
 
     ltd_id: int | None = Field(
         default=None,
         description=(
-            "LTD-side numeric id for the tombstoned resource."
+            "LTD-side numeric id for the tombstoned resource,"
+            " from the legacy LTD Keeper API."
             " Populated for ``edition`` and ``build`` rows; ``null``"
             " for ``project`` rows (LTD products are slug-only)."
         ),
-    )
-
-    docverse_id: int | None = Field(
-        default=None,
-        description=(
-            "Docverse-side row id the tombstone is paired to."
-            " ``null`` for ``lifecycle_preemptive`` rows that veto an"
-            " LTD edition that was never imported (so no Docverse row"
-            " exists)."
-        ),
+        examples=[4289],
     )
 
     date_tombstoned: datetime = Field(
@@ -601,5 +707,6 @@ class KeeperSyncTombstone(BaseModel):
             " Falls back to the LTD slug when no Docverse row is"
             " linked (``lifecycle_preemptive`` rows) or the linked"
             " row has been hard-deleted out from under the tombstone."
-        )
+        ),
+        examples=["pipelines/v1"],
     )

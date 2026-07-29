@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
 
+from ._examples import EXAMPLE_ORG_URL
 from .infrastructure import ServiceCategory, ServiceProvider
 
 __all__ = [
@@ -162,7 +163,7 @@ class OrganizationServiceCreate(BaseModel):
                 "Human-readable label for the service, unique per"
                 " organization."
             ),
-            examples=["docs-bucket", "cdn", "dns"],
+            examples=["docs-bucket", "staging-bucket", "cdn", "dns"],
         ),
     ]
 
@@ -207,8 +208,14 @@ class OrganizationServiceUpdate(BaseModel):
 class OrganizationServiceSummary(BaseModel):
     """Lightweight service reference embedded in Organization responses."""
 
-    self_url: str = Field(description="URL to the full service resource.")
-    label: str = Field(description="Service label.")
+    self_url: str = Field(
+        description="URL to the full service resource.",
+        examples=[f"{EXAMPLE_ORG_URL}/services/docs-bucket"],
+    )
+    label: str = Field(
+        description="Service label.",
+        examples=["docs-bucket", "staging-bucket", "cdn", "dns"],
+    )
     category: ServiceCategory = Field(description="Service category.")
     provider: ServiceProvider = Field(description="Service provider.")
 
@@ -221,18 +228,26 @@ class OrganizationService(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this service resource.")
+    self_url: str = Field(
+        description="URL to this service resource.",
+        examples=[f"{EXAMPLE_ORG_URL}/services/docs-bucket"],
+    )
 
-    org_url: str = Field(description="URL to the parent organization.")
+    org_url: str = Field(
+        description="URL to the parent organization.",
+        examples=[EXAMPLE_ORG_URL],
+    )
 
     credential_url: str = Field(
-        description="URL to the credential this service uses."
+        description="URL to the credential this service uses.",
+        examples=[f"{EXAMPLE_ORG_URL}/credentials/aws"],
     )
 
     label: str = Field(
         description=(
             "Human-readable label for the service, unique per organization."
         ),
+        examples=["docs-bucket", "staging-bucket", "cdn", "dns"],
     )
 
     category: ServiceCategory = Field(description="Service category.")
@@ -240,11 +255,19 @@ class OrganizationService(BaseModel):
     provider: ServiceProvider = Field(description="Service provider.")
 
     config: dict[str, Any] = Field(
-        description="Provider-specific non-secret configuration."
+        description="Provider-specific non-secret configuration.",
+        examples=[
+            {
+                "provider": "aws_s3",
+                "bucket": "lsst-the-docs",
+                "region": "us-east-1",
+            }
+        ],
     )
 
     credential_label: str = Field(
-        description="Label of the credential used for authentication."
+        description="Label of the credential used for authentication.",
+        examples=["aws"],
     )
 
     date_created: datetime = Field(

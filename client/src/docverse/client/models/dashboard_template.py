@@ -7,6 +7,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ._examples import EXAMPLE_JOB_URL, EXAMPLE_ORG_URL
+
 __all__ = [
     "DashboardTemplateBinding",
     "DashboardTemplateBindingCreate",
@@ -104,7 +106,10 @@ class DashboardTemplateBinding(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this binding resource.")
+    self_url: str = Field(
+        description="URL to this binding resource.",
+        examples=[f"{EXAMPLE_ORG_URL}/dashboard-template"],
+    )
 
     web_url: str = Field(
         description=(
@@ -112,17 +117,28 @@ class DashboardTemplateBinding(BaseModel):
             "Always present once a binding exists; derived from the "
             "binding's source coordinates rather than the synced "
             "content row, so it is meaningful before the first sync."
-        )
+        ),
+        examples=["https://github.com/lsst/templates/tree/main/dashboard"],
     )
 
-    github_owner: str = Field(description="GitHub owner (user or org).")
+    github_owner: str = Field(
+        description="GitHub owner (user or org).",
+        examples=["lsst"],
+    )
 
-    github_repo: str = Field(description="GitHub repository name.")
+    github_repo: str = Field(
+        description="GitHub repository name.",
+        examples=["templates"],
+    )
 
-    github_ref: str = Field(description="Git ref (branch, tag, or SHA).")
+    github_ref: str = Field(
+        description="Git ref (branch, tag, or SHA).",
+        examples=["main"],
+    )
 
     root_path: str = Field(
-        description="Path within the repo where the template lives."
+        description="Path within the repo where the template lives.",
+        examples=["/dashboard"],
     )
 
     commit_sha: str | None = Field(
@@ -131,6 +147,7 @@ class DashboardTemplateBinding(BaseModel):
             "Commit SHA of the most-recently-synced template content. "
             "``None`` until the first successful sync."
         ),
+        examples=["6c8b2f01a5d34e1c9f0b2ad37e8c5d914f6a7b3c"],
     )
 
     last_sync_status: str = Field(
@@ -149,6 +166,7 @@ class DashboardTemplateBinding(BaseModel):
             "job, or ``None`` if no sync has been enqueued for this "
             "binding yet (or the referenced job has been pruned)."
         ),
+        examples=[EXAMPLE_JOB_URL],
     )
 
     github_owner_id: int | None = Field(
@@ -158,6 +176,7 @@ class DashboardTemplateBinding(BaseModel):
             "successful sync; ``None`` for un-synced bindings. Informational "
             "only — the public API remains keyed on ``github_owner``."
         ),
+        examples=[1745714],
     )
 
     github_repo_id: int | None = Field(
@@ -168,6 +187,7 @@ class DashboardTemplateBinding(BaseModel):
             "Informational only — the public API remains keyed on "
             "``github_repo``."
         ),
+        examples=[73902645],
     )
 
     github_installation_id: int | None = Field(
@@ -177,6 +197,7 @@ class DashboardTemplateBinding(BaseModel):
             "first successful sync; ``None`` for un-synced bindings or when "
             "the GitHub App is not installed. Informational only."
         ),
+        examples=[42150081],
     )
 
     date_created: datetime = Field(

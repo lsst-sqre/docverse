@@ -4,21 +4,93 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
-from docverse.client.models import OrganizationUpdate
+from docverse.client.models import (
+    OrganizationSummary,
+    OrganizationUpdate,
+    OrgRole,
+)
 from docverse.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
     require_reader,
 )
 from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.exceptions import NotFoundError
+from docverse.domain.organization import Organization as OrganizationDomain
+from docverse.exceptions import NotFoundError, PermissionDeniedError
 from docverse.handlers.params import OrgSlugParam
 
 from .models import Organization
 
 router = APIRouter()
+
+
+def _organization_summary(
+    org: OrganizationDomain, request: Request, *, role: OrgRole
+) -> OrganizationSummary:
+    """Build an ``OrganizationSummary`` for a listing entry."""
+    return OrganizationSummary(
+        self_url=str(request.url_for("get_organization", org=org.slug)),
+        slug=org.slug,
+        title=org.title,
+        role=role,
+    )
+
+
+@router.get(
+    "/orgs",
+    response_model=list[OrganizationSummary],
+    summary="List organizations the caller can access",
+    name="get_organizations",
+    # 403 is already declared at the orgs router level (see main.py), so no
+    # route-level responses= is needed here — matching the sibling routes.
+)
+async def get_organizations(
+    request: Request,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+) -> list[OrganizationSummary]:
+    """List organizations in which the caller holds an effective role.
+
+    Any authenticated user may call this. A caller sees each organization
+    where they have a direct or group membership, along with their
+    effective role; a superadmin sees every organization (role reported as
+    ``admin``). An empty list is a valid response.
+    """
+    username = request.headers.get("X-Auth-Request-User")
+    if not username:
+        msg = "Authentication required"
+        raise PermissionDeniedError(msg)
+    context.rebind_logger(username=username)
+
+    async with context.session.begin():
+        org_service = context.factory.create_organization_service()
+        auth_service = context.factory.create_authorization_service()
+        if auth_service.is_superadmin(username):
+            orgs = await org_service.list_all()
+            summaries = [
+                _organization_summary(org, request, role=OrgRole.admin)
+                for org in orgs
+            ]
+        else:
+            token = request.headers.get("X-Auth-Request-Token", "")
+            user_info_store = context.factory.get_user_info_store()
+            groups = await user_info_store.get_groups(token)
+            membership_store = context.factory.create_membership_store()
+            role_map = await membership_store.list_effective_roles(
+                username=username, groups=groups
+            )
+            org_store = context.factory.create_org_store()
+            summaries = []
+            for org_id, role in role_map.items():
+                org = await org_store.get_by_id(org_id)
+                if org is None:
+                    continue
+                summaries.append(
+                    _organization_summary(org, request, role=role)
+                )
+    summaries.sort(key=lambda summary: summary.slug)
+    return summaries
 
 
 @router.get(

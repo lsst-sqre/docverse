@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import structlog
 
-from docverse.client.models import KeeperSyncConfig
+from docverse.client.models import KeeperSyncConfig, KeeperSyncConfigUpdate
 from docverse.exceptions import NotFoundError
 from docverse.storage.organization_store import OrganizationStore
 
@@ -62,3 +62,23 @@ class KeeperSyncConfigService:
             )
             raise RuntimeError(msg)
         return updated.keeper_sync_config
+
+    async def patch(
+        self, org_slug: str, update: KeeperSyncConfigUpdate
+    ) -> KeeperSyncConfig:
+        """Apply a JSON-Merge-Patch to the persisted config.
+
+        Fields left unset on ``update`` are carried over unchanged from the
+        current (or default-disabled) config; ``project_slugs``, when
+        provided, replaces the stored list wholesale. Returns the
+        round-tripped merged value.
+
+        Raises
+        ------
+        NotFoundError
+            If the organization does not exist.
+        """
+        current = await self.get(org_slug=org_slug)
+        changes = update.model_dump(exclude_unset=True)
+        merged = current.model_copy(update=changes)
+        return await self.put(org_slug=org_slug, config=merged)

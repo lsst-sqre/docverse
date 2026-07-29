@@ -8,7 +8,10 @@ from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from docverse.client.models import (
     KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
+    KeeperSyncEditionStatus,
     KeeperSyncResourceType,
+    KeeperSyncRun,
     KeeperSyncRunStatus,
     KeeperSyncTombstoneReason,
 )
@@ -27,12 +30,12 @@ from docverse.storage.pagination import (
 from docverse.validation import parse_base32_id
 
 from .keeper_sync_models import (
-    KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
     KeeperSyncProjectStatus,
-    KeeperSyncRun,
     KeeperSyncRunCreated,
     KeeperSyncTombstone,
+    keeper_sync_edition_status_from_domain,
+    keeper_sync_run_from_domain,
 )
 
 router = APIRouter()
@@ -73,6 +76,31 @@ async def put_org_keeper_sync_config(
     return result
 
 
+@router.patch(
+    "/orgs/{org}/keeper-sync",
+    response_model=KeeperSyncConfig,
+    summary="Partially update the LTD Keeper sync configuration",
+    name="patch_org_keeper_sync_config",
+)
+async def patch_org_keeper_sync_config(
+    org_slug: OrgSlugParam,
+    data: KeeperSyncConfigUpdate,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> KeeperSyncConfig:
+    """Merge-patch the org's keeper-sync config.
+
+    Applies JSON-Merge-Patch semantics: omitted fields are left untouched;
+    ``project_slugs``, when provided, replaces the stored array wholesale (no
+    append). ``PUT`` remains available for a full replacement.
+    """
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_config_service()
+        result = await service.patch(org_slug=org_slug, update=data)
+        await context.session.commit()
+    return result
+
+
 @router.post(
     "/orgs/{org}/keeper-sync/runs",
     response_model=KeeperSyncRunCreated,
@@ -94,9 +122,11 @@ async def post_org_keeper_sync_run(
         run_store = context.factory.create_keeper_sync_run_store()
         activity = await run_store.aggregate_activity(run_id=run.id)
         await context.session.commit()
-    return KeeperSyncRunCreated.from_domain(
+    response_model = KeeperSyncRunCreated.from_domain(
         run, activity, queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = str(response_model.job_url)
+    return response_model
 
 
 @router.get(
@@ -233,7 +263,7 @@ async def get_org_keeper_sync_project_editions(
     )
     context.response.headers["X-Total-Count"] = str(result.page.count)
     return [
-        KeeperSyncEditionStatus.from_domain(
+        keeper_sync_edition_status_from_domain(
             edition,
             result.state_by_docverse_id.get(edition.id),
             context.request,
@@ -266,9 +296,11 @@ async def post_org_keeper_sync_project_refresh(
             org_slug=org_slug, ltd_slug=ltd_slug
         )
         await context.session.commit()
-    return KeeperSyncProjectRefreshAccepted.from_domain(
+    response_model = KeeperSyncProjectRefreshAccepted.from_domain(
         queue_job, context.request, org_slug
     )
+    context.response.headers["Location"] = str(response_model.job_url)
+    return response_model
 
 
 @router.get(
@@ -325,7 +357,7 @@ async def get_org_keeper_sync_runs(
     context.response.headers["Link"] = result.link_header(context.request.url)
     context.response.headers["X-Total-Count"] = str(result.count)
     return [
-        KeeperSyncRun.from_domain(
+        keeper_sync_run_from_domain(
             run, activity_by_id[run.id], context.request, org_slug
         )
         for run in result.entries
@@ -348,7 +380,7 @@ async def get_org_keeper_sync_run(
     async with context.session.begin():
         service = context.factory.create_keeper_sync_run_service()
         result = await service.get_run(org_slug=org_slug, public_id=public_id)
-    return KeeperSyncRun.from_domain(
+    return keeper_sync_run_from_domain(
         result.run, result.activity, context.request, org_slug
     )
 

@@ -176,6 +176,7 @@ async def test_post_run_returns_202_with_run_and_queue_job_link(
     assert "job_url" in body
     assert body["job_id"]
     assert body["job_url"].endswith(f"/orgs/{_ORG}/jobs/{body['job_id']}")
+    assert response.headers["Location"] == body["job_url"]
     # The job_url resolves via the org-scoped GET.
     job_response = await client.get(
         body["job_url"],

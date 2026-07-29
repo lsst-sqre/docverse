@@ -63,9 +63,11 @@ async def post_service(
             credential_label=data.credential_label,
         )
         await context.session.commit()
-    return OrganizationServiceResponse.from_domain(
+    response_model = OrganizationServiceResponse.from_domain(
         svc, context.request, org_slug
     )
+    context.response.headers["Location"] = response_model.self_url
+    return response_model
 
 
 @router.get(

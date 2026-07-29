@@ -13,6 +13,15 @@ from pydantic import (
     model_serializer,
 )
 
+from ._examples import (
+    EXAMPLE_BUILD_URL,
+    EXAMPLE_EDITION_URL,
+    EXAMPLE_JOB_ID,
+    EXAMPLE_JOB_URL,
+    EXAMPLE_PUBLISH_JOB_ID,
+    EXAMPLE_PUBLISH_JOB_URL,
+    EXAMPLE_RUN_ID,
+)
 from .queue_enums import JobKind, JobStatus
 
 if TYPE_CHECKING:
@@ -58,6 +67,7 @@ class EditionUpdateRef(BaseModel):
             " follow instead of reconstructing the path). Omitted when the"
             " Docverse API base URL could not be resolved."
         ),
+        examples=[EXAMPLE_EDITION_URL],
     )
 
 
@@ -81,6 +91,7 @@ class PublishJobRef(BaseModel):
         description=(
             "Public Crockford Base32 identifier of the publish_edition job."
         ),
+        examples=[EXAMPLE_PUBLISH_JOB_ID],
     )
 
     job_url: str | None = Field(
@@ -91,6 +102,7 @@ class PublishJobRef(BaseModel):
             " path). Omitted when the Docverse API base URL could not be"
             " resolved."
         ),
+        examples=[EXAMPLE_PUBLISH_JOB_URL],
     )
 
 
@@ -188,10 +200,14 @@ class QueueJob(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this queue job resource.")
+    self_url: str = Field(
+        description="URL to this queue job resource.",
+        examples=[EXAMPLE_JOB_URL],
+    )
 
     id: str = Field(
-        description="Public Crockford Base32 identifier for the job."
+        description="Public Crockford Base32 identifier for the job.",
+        examples=[EXAMPLE_JOB_ID],
     )
 
     kind: JobKind = Field(description="Kind of background job.")
@@ -204,6 +220,7 @@ class QueueJob(BaseModel):
             "Public Crockford Base32 identifier of the keeper-sync run this"
             " job is attributed to, or ``null`` for jobs not part of a run."
         ),
+        examples=[EXAMPLE_RUN_ID],
     )
 
     subject_label: str | None = Field(
@@ -212,6 +229,7 @@ class QueueJob(BaseModel):
             "Human-readable identifier for the resource this job targets"
             " (e.g. an LTD slug for keeper-sync project jobs)."
         ),
+        examples=["pipelines"],
     )
 
     subject_url: str | None = Field(
@@ -223,6 +241,7 @@ class QueueJob(BaseModel):
             " publish jobs. ``null`` when no API resource exists or it could"
             " not be resolved."
         ),
+        examples=[EXAMPLE_BUILD_URL],
     )
 
     build_url: str | None = Field(
@@ -231,6 +250,7 @@ class QueueJob(BaseModel):
             "Absolute URL of the build this job processes, or ``null`` when"
             " the job targets no build or it could not be resolved."
         ),
+        examples=[EXAMPLE_BUILD_URL],
     )
 
     edition_url: str | None = Field(
@@ -239,6 +259,7 @@ class QueueJob(BaseModel):
             "Absolute URL of the edition this job targets, or ``null`` when"
             " the job targets no edition or it could not be resolved."
         ),
+        examples=[EXAMPLE_EDITION_URL],
     )
 
     phase: str | None = Field(
@@ -247,6 +268,7 @@ class QueueJob(BaseModel):
             "Current processing phase (e.g., inventory, tracking,"
             " editions, dashboard)."
         ),
+        examples=["editions"],
     )
 
     progress: BuildProcessingProgress | None = Field(

@@ -36,6 +36,11 @@ from docverse.client.models import (
 )
 from docverse.client.models import OrgMembership as _OrgMembershipBase
 from docverse.client.models import Project as _ProjectBase
+from docverse.client.models._examples import (
+    EXAMPLE_JOB_ID,
+    EXAMPLE_JOB_URL,
+    EXAMPLE_ORG_URL,
+)
 from docverse.domain.base32id import serialize_base32_id
 from docverse.domain.build import Build as BuildDomain
 from docverse.domain.dashboard_github_template import (
@@ -65,10 +70,22 @@ from docverse.storage.github import build_github_browse_url
 class Organization(_OrganizationBase):
     """Organization response model with HATEOAS URLs."""
 
-    services_url: str
-    credentials_url: str
-    projects_url: str
-    members_url: str
+    services_url: str = Field(
+        description="URL to list services for this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/services"],
+    )
+    credentials_url: str = Field(
+        description="URL to list credentials for this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/credentials"],
+    )
+    projects_url: str = Field(
+        description="URL to list projects for this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/projects"],
+    )
+    members_url: str = Field(
+        description="URL to list members of this organization.",
+        examples=[f"{EXAMPLE_ORG_URL}/members"],
+    )
 
     @classmethod
     def from_domain(
@@ -175,7 +192,7 @@ class Project(_ProjectBase):
         edition_response = None
         if default_edition is not None:
             project_url = project_published_url(org, domain)
-            edition_response = Edition.from_domain(
+            edition_response = edition_from_domain(
                 default_edition,
                 request,
                 org.slug,
@@ -290,75 +307,70 @@ class Build(_BuildBase):
         )
 
 
-class Edition(_EditionBase):
-    """Edition response model with HATEOAS URLs."""
-
-    @classmethod
-    def from_domain(
-        cls,
-        domain: EditionDomain,
-        request: Request,
-        org_slug: str,
-        project_slug: str,
-        *,
-        published_url: str | None = None,
-    ) -> Self:
-        """Create from a domain object, adding HATEOAS URLs."""
-        build_url: str | None = None
-        if domain.current_build_public_id is not None:
-            build_id_str = serialize_base32_id(domain.current_build_public_id)
-            build_url = str(
-                request.url_for(
-                    "get_build",
-                    org=org_slug,
-                    project=project_slug,
-                    build=build_id_str,
-                )
+def edition_from_domain(
+    domain: EditionDomain,
+    request: Request,
+    org_slug: str,
+    project_slug: str,
+    *,
+    published_url: str | None = None,
+) -> _EditionBase:
+    """Build the client ``Edition`` model from a domain object with URLs."""
+    build_url: str | None = None
+    if domain.current_build_public_id is not None:
+        build_id_str = serialize_base32_id(domain.current_build_public_id)
+        build_url = str(
+            request.url_for(
+                "get_build",
+                org=org_slug,
+                project=project_slug,
+                build=build_id_str,
             )
-        return cls(
-            self_url=str(
-                request.url_for(
-                    "get_edition",
-                    org=org_slug,
-                    project=project_slug,
-                    edition=domain.slug,
-                )
-            ),
-            project_url=str(
-                request.url_for(
-                    "get_project",
-                    org=org_slug,
-                    project=project_slug,
-                )
-            ),
-            build_url=build_url,
-            published_url=published_url,
-            history_url=str(
-                request.url_for(
-                    "get_edition_history",
-                    org=org_slug,
-                    project=project_slug,
-                    edition=domain.slug,
-                )
-            ),
-            rollback_url=str(
-                request.url_for(
-                    "post_edition_rollback",
-                    org=org_slug,
-                    project=project_slug,
-                    edition=domain.slug,
-                )
-            ),
-            slug=domain.slug,
-            title=domain.title,
-            kind=domain.kind,
-            tracking_mode=domain.tracking_mode,
-            tracking_params=domain.tracking_params,
-            lifecycle_exempt=domain.lifecycle_exempt,
-            publish_status=domain.publish_status,
-            date_created=domain.date_created,
-            date_updated=domain.date_updated,
         )
+    return _EditionBase(
+        self_url=str(
+            request.url_for(
+                "get_edition",
+                org=org_slug,
+                project=project_slug,
+                edition=domain.slug,
+            )
+        ),
+        project_url=str(
+            request.url_for(
+                "get_project",
+                org=org_slug,
+                project=project_slug,
+            )
+        ),
+        build_url=build_url,
+        published_url=published_url,
+        history_url=str(
+            request.url_for(
+                "get_edition_history",
+                org=org_slug,
+                project=project_slug,
+                edition=domain.slug,
+            )
+        ),
+        rollback_url=str(
+            request.url_for(
+                "post_edition_rollback",
+                org=org_slug,
+                project=project_slug,
+                edition=domain.slug,
+            )
+        ),
+        slug=domain.slug,
+        title=domain.title,
+        kind=domain.kind,
+        tracking_mode=domain.tracking_mode,
+        tracking_params=domain.tracking_params,
+        lifecycle_exempt=domain.lifecycle_exempt,
+        publish_status=domain.publish_status,
+        date_created=domain.date_created,
+        date_updated=domain.date_updated,
+    )
 
 
 class EditionBuildHistoryResponse(_EditionBuildHistoryEntryBase):
@@ -491,10 +503,12 @@ class DashboardTemplateSyncEnqueuedResponse(BaseModel):
     """Response body for the dashboard-template force-sync endpoints."""
 
     job_id: str = Field(
-        description="Base32 public ID of the enqueued ``dashboard_sync`` job."
+        description="Base32 public ID of the enqueued ``dashboard_sync`` job.",
+        examples=[EXAMPLE_JOB_ID],
     )
     job_url: str = Field(
-        description="URL of the enqueued ``dashboard_sync`` job."
+        description="URL of the enqueued ``dashboard_sync`` job.",
+        examples=[EXAMPLE_JOB_URL],
     )
 
     @classmethod

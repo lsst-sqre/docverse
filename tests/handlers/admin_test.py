@@ -32,6 +32,7 @@ async def test_create_organization(client: AsyncClient) -> None:
     assert data["date_updated"] is not None
     assert "/admin/orgs/test-org" in data["self_url"]
     assert "/orgs/test-org" in data["org_url"]
+    assert response.headers["Location"] == data["self_url"]
 
 
 @pytest.mark.asyncio

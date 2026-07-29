@@ -4,21 +4,35 @@ from __future__ import annotations
 
 from typing import Self
 
+from pydantic import Field
 from starlette.requests import Request
 
 from docverse.client.models import Organization as _OrganizationBase
 from docverse.client.models import OrganizationServiceSummary
+from docverse.client.models._examples import EXAMPLE_API_URL, EXAMPLE_ORG_URL
 from docverse.domain.organization import Organization as OrganizationDomain
 from docverse.domain.organization_service import (
     OrganizationService as OrganizationServiceDomain,
 )
 
 
-class Organization(_OrganizationBase):
-    """Organization response model with HATEOAS self_url."""
+class AdminOrganization(_OrganizationBase):
+    """Admin organization response model with HATEOAS self_url.
 
-    org_url: str
-    """URL to the org-scoped API endpoint."""
+    Distinct from the orgs-scoped ``Organization`` model: the admin
+    shape adds ``org_url`` (a link to the org-scoped endpoint) and omits
+    the orgs sub-collection links, so it registers as its own schema.
+    """
+
+    self_url: str = Field(
+        description="URL to this admin organization resource.",
+        examples=[f"{EXAMPLE_API_URL}/admin/orgs/lsst"],
+    )
+
+    org_url: str = Field(
+        description="URL to the org-scoped API endpoint.",
+        examples=[EXAMPLE_ORG_URL],
+    )
 
     @classmethod
     def from_domain(

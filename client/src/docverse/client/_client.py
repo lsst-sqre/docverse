@@ -11,7 +11,18 @@ import click
 import httpx
 
 from ._exceptions import BuildProcessingError, DocverseClientError
-from .models import Build, BuildStatus, BuildUpdate, QueueJob
+from .models import (
+    Build,
+    BuildStatus,
+    BuildUpdate,
+    KeeperSyncConfig,
+    KeeperSyncConfigUpdate,
+    OrganizationSummary,
+    OrgMembership,
+    OrgMembershipUpdate,
+    OrgRole,
+    QueueJob,
+)
 from .models.builds import BuildAnnotations
 from .models.queue_enums import JobStatus
 
@@ -122,6 +133,87 @@ class DocverseClient:
             msg = "DocverseClient must be used as an async context manager"
             raise RuntimeError(msg)
         return self._http
+
+    async def list_organizations(self) -> list[OrganizationSummary]:
+        """List organizations the caller can access.
+
+        Returns one summary per organization in which the caller holds an
+        effective role (via direct or group membership); a superadmin
+        receives every organization. An empty list is a valid response.
+
+        Returns
+        -------
+        list of OrganizationSummary
+            The accessible organizations, each with the caller's effective
+            role.
+        """
+        response = await self._client.get("/orgs")
+        _raise_for_status(response)
+        return [
+            OrganizationSummary.model_validate(item)
+            for item in response.json()
+        ]
+
+    async def update_member(
+        self, org: str, member: str, *, role: OrgRole
+    ) -> OrgMembership:
+        """Update an organization member's role.
+
+        Only the ``role`` is mutable; a member's ``principal`` and
+        ``principal_type`` are immutable (changing identity is a delete plus
+        re-add).
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        member
+            Membership identifier in the ``{principal_type}:{principal}``
+            format (e.g. ``user:jdoe``).
+        role
+            The new role to assign.
+
+        Returns
+        -------
+        OrgMembership
+            The updated membership.
+        """
+        update = OrgMembershipUpdate(role=role)
+        url = f"/orgs/{org}/members/{member}"
+        response = await self._client.patch(
+            url, json=update.model_dump(exclude_unset=True)
+        )
+        _raise_for_status(response)
+        return OrgMembership.model_validate(response.json())
+
+    async def update_keeper_sync_config(
+        self, org: str, update: KeeperSyncConfigUpdate
+    ) -> KeeperSyncConfig:
+        """Update an organization's LTD Keeper sync config in part.
+
+        Applies JSON-Merge-Patch semantics: only the fields set on ``update``
+        are changed; omitted fields are left untouched. ``project_slugs``,
+        when provided, replaces the stored list wholesale (no append). Send a
+        full ``KeeperSyncConfig`` via ``PUT`` for a complete replacement.
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        update
+            The partial update; construct it with only the fields to change.
+
+        Returns
+        -------
+        KeeperSyncConfig
+            The updated configuration.
+        """
+        url = f"/orgs/{org}/keeper-sync"
+        response = await self._client.patch(
+            url, json=update.model_dump(exclude_unset=True, mode="json")
+        )
+        _raise_for_status(response)
+        return KeeperSyncConfig.model_validate(response.json())
 
     async def create_build(
         self,

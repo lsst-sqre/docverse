@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
 
+from ._examples import EXAMPLE_ORG_URL
 from .infrastructure import CredentialProvider
 
 __all__ = [
@@ -112,14 +113,21 @@ class OrganizationCredential(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    self_url: str = Field(description="URL to this credential resource.")
+    self_url: str = Field(
+        description="URL to this credential resource.",
+        examples=[f"{EXAMPLE_ORG_URL}/credentials/aws"],
+    )
 
-    org_url: str = Field(description="URL to the parent organization.")
+    org_url: str = Field(
+        description="URL to the parent organization.",
+        examples=[EXAMPLE_ORG_URL],
+    )
 
     label: str = Field(
         description=(
             "Human-readable label for the credential, unique per organization."
         ),
+        examples=["aws"],
     )
 
     provider: CredentialProvider = Field(
