@@ -9,12 +9,12 @@ import pytest
 import structlog
 from safir.github import GitHubAppClientFactory
 
-from docverse.storage.github import (
+from docverse_server.storage.github import (
     GitHubAppClient,
     GitHubTreeFetcher,
     InstallationAuth,
 )
-from docverse.storage.github import tree_fetcher as tree_fetcher_module
+from docverse_server.storage.github import tree_fetcher as tree_fetcher_module
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 

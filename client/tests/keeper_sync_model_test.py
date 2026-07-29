@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import (
+from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
     KeeperSyncRun,

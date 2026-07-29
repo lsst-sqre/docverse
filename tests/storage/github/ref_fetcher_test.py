@@ -7,7 +7,7 @@ import pytest
 import respx
 import structlog
 
-from docverse.storage.github import (
+from docverse_server.storage.github import (
     GITHUB_API_BASE_URL,
     GitHubRefSetFetcher,
     InstallationAuth,

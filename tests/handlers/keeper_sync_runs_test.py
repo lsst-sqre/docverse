@@ -12,16 +12,16 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 from sqlalchemy import select
 
-from docverse.client.models import OrgRole
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import (
+from docverse.models import OrgRole
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
     generate_base32_id,
     serialize_base32_id,
     validate_base32_id,
 )
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.storage.organization_store import OrganizationStore
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.storage.organization_store import OrganizationStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

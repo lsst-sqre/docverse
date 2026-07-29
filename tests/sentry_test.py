@@ -21,11 +21,11 @@ from safir.testing.sentry import (
     sentry_init_fixture,
 )
 
-from docverse.dependencies.auth import require_superadmin
-from docverse.dependencies.context import context_dependency
-from docverse.exceptions import InvalidBuildStateError
-from docverse.handlers.admin import admin_router
-from docverse.sentry import initialize_sentry
+from docverse_server.dependencies.auth import require_superadmin
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.exceptions import InvalidBuildStateError
+from docverse_server.handlers.admin import admin_router
+from docverse_server.sentry import initialize_sentry
 
 
 class _StubContext:
@@ -77,7 +77,7 @@ async def test_api_initialize_sentry_captures_event_with_release_and_tags(
 
     Locks the contract:
 
-    * ``release`` matches ``importlib.metadata.version("docverse")``.
+    * ``release`` matches ``importlib.metadata.version("docverse-server")``.
     * ``tags.component == "api"`` distinguishes API events from worker /
       CLI ones once the same wrapper runs from those entry points.
     * ``tags.service == "docverse"`` separates Docverse from sibling
@@ -107,7 +107,7 @@ async def test_api_initialize_sentry_captures_event_with_release_and_tags(
 
     assert len(captured.errors) == 1
     event = captured.errors[0]
-    assert event["release"] == version("docverse")
+    assert event["release"] == version("docverse-server")
     assert event["tags"]["component"] == "api"
     assert event["tags"]["service"] == "docverse"
 
@@ -156,7 +156,7 @@ async def test_admin_sentry_test_endpoint_captures_event_with_marker(
 
     assert len(captured.errors) == 1
     event = captured.errors[0]
-    assert event["release"] == version("docverse")
+    assert event["release"] == version("docverse-server")
     assert event["tags"]["service"] == "docverse"
     assert event["tags"]["component"] == "api"
     exc_values = event["exception"]["values"]
@@ -201,7 +201,7 @@ async def test_docverse_slack_exception_subclass_captures_with_release(
 
     assert len(captured.errors) == 1
     event = captured.errors[0]
-    assert event["release"] == version("docverse")
+    assert event["release"] == version("docverse-server")
     assert event["tags"]["service"] == "docverse"
     assert event["tags"]["component"] == "api"
     exc_values = event["exception"]["values"]

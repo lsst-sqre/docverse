@@ -21,7 +21,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     BuildStatus,
     EditionCreate,
@@ -30,25 +30,27 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import JobKind, PublishStatus
-from docverse.config import Configuration
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.domain.base32id import (
+from docverse.models.queue_enums import JobKind, PublishStatus
+from docverse_server.config import Configuration
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.domain.base32id import (
     generate_base32_id,
     serialize_base32_id,
     validate_base32_id,
 )
-from docverse.domain.queue import JobStatus
-from docverse.services.publish_enqueue import enqueue_publish_for_edition
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse_server.domain.queue import JobStatus
+from docverse_server.services.publish_enqueue import (
+    enqueue_publish_for_edition,
+)
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
 
 _HASH = "sha256:" + "a" * 64
 _config = Configuration()

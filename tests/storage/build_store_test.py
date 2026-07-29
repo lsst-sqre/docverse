@@ -10,18 +10,18 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     BuildStatus,
     OrganizationCreate,
     ProjectCreate,
 )
-from docverse.dbschema.build import SqlBuild
-from docverse.domain.base32id import serialize_base32_id
-from docverse.exceptions import InvalidBuildStateError
-from docverse.storage.build_store import BuildStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.exceptions import InvalidBuildStateError
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 
 @pytest.fixture
@@ -451,7 +451,7 @@ async def test_create_retries_on_public_id_collision(
 
     ids = _fake_ids()
     monkeypatch.setattr(
-        "docverse.storage._public_id.generate_resource_id",
+        "docverse_server.storage._public_id.generate_resource_id",
         lambda: next(ids),
     )
 

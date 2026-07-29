@@ -6,17 +6,17 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     OrganizationCreate,
     OrgMembershipCreate,
     OrgRole,
     PrincipalType,
 )
-from docverse.domain.authorization import AuthBasis
-from docverse.exceptions import PermissionDeniedError
-from docverse.services.authorization import AuthorizationService
-from docverse.storage.membership_store import OrgMembershipStore
-from docverse.storage.organization_store import OrganizationStore
+from docverse_server.domain.authorization import AuthBasis
+from docverse_server.exceptions import PermissionDeniedError
+from docverse_server.services.authorization import AuthorizationService
+from docverse_server.storage.membership_store import OrgMembershipStore
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 async def _setup(

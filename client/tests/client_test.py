@@ -1,4 +1,4 @@
-"""Tests for docverse.client._client."""
+"""Tests for docverse._client."""
 
 from __future__ import annotations
 
@@ -13,18 +13,15 @@ import pytest
 import respx
 from pydantic import ValidationError
 
-from docverse.client._client import DocverseClient
-from docverse.client._exceptions import (
-    BuildProcessingError,
-    DocverseClientError,
-)
-from docverse.client.models import (
+from docverse._client import DocverseClient
+from docverse._exceptions import BuildProcessingError, DocverseClientError
+from docverse.models import (
     KeeperSyncConfigUpdate,
     OrgMembershipUpdate,
     OrgRole,
 )
-from docverse.client.models.builds import BuildAnnotations, BuildStatus
-from docverse.client.models.queue_enums import JobKind, JobStatus
+from docverse.models.builds import BuildAnnotations, BuildStatus
+from docverse.models.queue_enums import JobKind, JobStatus
 
 BASE_URL = "https://docverse.example.com"
 TOKEN = "test-token"
@@ -199,7 +196,7 @@ async def test_get_job() -> None:
 @pytest.mark.asyncio
 async def test_wait_for_job_completed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Polls twice then returns completed job."""
-    monkeypatch.setattr("docverse.client._client._BACKOFF_INITIAL", 0)
+    monkeypatch.setattr("docverse._client._BACKOFF_INITIAL", 0)
 
     queue_url = "/queue/jobs/" + JOB_ID
     responses = [
@@ -209,7 +206,7 @@ async def test_wait_for_job_completed(monkeypatch: pytest.MonkeyPatch) -> None:
     async with respx.mock(base_url=BASE_URL) as router:
         router.get(queue_url).mock(side_effect=responses)
 
-        with patch("docverse.client._client.asyncio.sleep"):
+        with patch("docverse._client.asyncio.sleep"):
             async with DocverseClient(BASE_URL, TOKEN) as client:
                 job = await client.wait_for_job(queue_url)
 
@@ -219,7 +216,7 @@ async def test_wait_for_job_completed(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_wait_for_job_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Failed status raises BuildProcessingError with the job attached."""
-    monkeypatch.setattr("docverse.client._client._BACKOFF_INITIAL", 0)
+    monkeypatch.setattr("docverse._client._BACKOFF_INITIAL", 0)
 
     queue_url = "/queue/jobs/" + JOB_ID
     async with respx.mock(base_url=BASE_URL) as router:

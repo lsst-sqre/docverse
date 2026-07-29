@@ -8,10 +8,10 @@ from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 
-from docverse.client.models import BuildCreate
-from docverse.storage.build_store import BuildStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse.models import BuildCreate
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (

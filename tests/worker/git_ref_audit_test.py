@@ -22,7 +22,7 @@ from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     EditionKind,
     GitRefAuditRunStatus,
     JobKind,
@@ -30,32 +30,38 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.config import Configuration
-from docverse.dbschema.edition import SqlEdition
-from docverse.dbschema.project import SqlProject
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.lifecycle import (
+from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse_server.config import Configuration
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.lifecycle import (
     DraftInactivityRule,
     LifecycleRuleSet,
     RefDeletedRule,
 )
-from docverse.domain.queue import JobStatus
-from docverse.metrics import (
+from docverse_server.domain.queue import JobStatus
+from docverse_server.metrics import (
     DocverseEvents,
     LifecycleActionTrigger,
     LifecycleReapAction,
     build_event_manager,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
-from docverse.storage.github import GITHUB_API_BASE_URL
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.git_ref_audit import git_ref_audit
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.git_ref_audit_run_store import GitRefAuditRunStore
+from docverse_server.storage.github import GITHUB_API_BASE_URL
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.git_ref_audit import git_ref_audit
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
 

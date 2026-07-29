@@ -19,13 +19,13 @@ from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.config import Configuration
-from docverse.services.credential_encryptor import CredentialEncryptor
-from docverse.storage.github import (
+from docverse_server.config import Configuration
+from docverse_server.services.credential_encryptor import CredentialEncryptor
+from docverse_server.storage.github import (
     GitHubAppNotConfiguredError,
     validate_github_app,
 )
-from docverse.worker.main import WorkerFactoryBuilder
+from docverse_server.worker.main import WorkerFactoryBuilder
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 _config = Configuration()

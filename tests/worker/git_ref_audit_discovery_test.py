@@ -16,25 +16,25 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     GitRefAuditRunStatus,
     JobKind,
     OrganizationCreate,
     ProjectCreate,
 )
-from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.config import config as runtime_config
-from docverse.dbschema.git_ref_audit_run import SqlGitRefAuditRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.queue import JobStatus
-from docverse.storage.git_ref_audit_run_store import GitRefAuditRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.git_ref_audit_discovery import (
+from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse_server.config import config as runtime_config
+from docverse_server.dbschema.git_ref_audit_run import SqlGitRefAuditRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.queue import JobStatus
+from docverse_server.storage.git_ref_audit_run_store import GitRefAuditRunStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.git_ref_audit_discovery import (
     git_ref_audit_discovery,
 )
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 

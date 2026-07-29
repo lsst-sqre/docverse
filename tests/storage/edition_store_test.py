@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
@@ -24,19 +24,19 @@ from docverse.client.models import (
     PublishStatus,
     TrackingMode,
 )
-from docverse.config import config
-from docverse.dbschema.build import SqlBuild
-from docverse.dbschema.edition import SqlEdition
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import (
+from docverse_server.config import config
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.pagination import EditionSlugCursor
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.pagination import EditionSlugCursor
+from docverse_server.storage.project_store import ProjectStore
 
 _HASH = "sha256:" + "a" * 64
 

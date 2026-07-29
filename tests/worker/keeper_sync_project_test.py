@@ -34,7 +34,7 @@ from safir.testing.sentry import (
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildStatus,
     EditionCreate,
     EditionKind,
@@ -45,33 +45,39 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import PublishStatus
-from docverse.config import Configuration
-from docverse.dbschema.edition import SqlEdition
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobStatus
-from docverse.factory import Factory
-from docverse.metrics import build_event_manager
-from docverse.sentry import initialize_sentry
-from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse.models.queue_enums import PublishStatus
+from docverse_server.config import Configuration
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.queue import JobStatus
+from docverse_server.factory import Factory
+from docverse_server.metrics import build_event_manager
+from docverse_server.sentry import initialize_sentry
+from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.ltd import LtdNotFoundError
-from docverse.storage.objectstore import MockObjectStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.keeper_sync import keeper_sync_project
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.ltd import LtdNotFoundError
+from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 
@@ -908,7 +914,7 @@ async def test_keeper_sync_project_failure_captures_to_sentry(
 
         assert len(captured.errors) == 1
         event = captured.errors[0]
-        assert event["release"] == pkg_version("docverse")
+        assert event["release"] == pkg_version("docverse-server")
         assert event["tags"]["service"] == "docverse"
         assert event["tags"]["component"] == "worker-keeper-sync"
         exc_values = event["exception"]["values"]

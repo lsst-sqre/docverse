@@ -11,12 +11,12 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.dbschema.project import SqlProject
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.worker.functions.project_github_resolve import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.worker.functions.project_github_resolve import (
     project_github_resolve,
 )
 from tests.support.github_mock import GitHubMock

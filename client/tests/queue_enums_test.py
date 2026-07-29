@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from docverse.client.models.queue_enums import JobKind, PublishStatus
+from docverse.models.queue_enums import JobKind, PublishStatus
 
 
 def test_publish_status_members() -> None:

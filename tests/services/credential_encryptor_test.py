@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from cryptography.fernet import Fernet
 
-from docverse.services.credential_encryptor import CredentialEncryptor
+from docverse_server.services.credential_encryptor import CredentialEncryptor
 
 
 def test_encrypt_decrypt_roundtrip() -> None:

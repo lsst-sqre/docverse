@@ -13,9 +13,9 @@ from pydantic import SecretStr
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.exceptions import DocverseSlackException
-from docverse.factory import Factory
-from docverse.storage.github import (
+from docverse_server.exceptions import DocverseSlackException
+from docverse_server.factory import Factory
+from docverse_server.storage.github import (
     GITHUB_API_BASE_URL,
     GitHubAppClient,
     GitHubAppNotConfiguredError,

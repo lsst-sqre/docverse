@@ -24,19 +24,19 @@ from safir.dependencies.arq import arq_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import BuildCreate
-from docverse.client.models.queue_enums import JobKind
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import serialize_base32_id
-from docverse.services.dashboard import enqueue as dashboard_enqueue
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse.models import BuildCreate
+from docverse.models.queue_enums import JobKind
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.services.dashboard import enqueue as dashboard_enqueue
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
 from tests.conftest import seed_org_with_admin
 from tests.support.arq_testing import count_jobs_by_name
 

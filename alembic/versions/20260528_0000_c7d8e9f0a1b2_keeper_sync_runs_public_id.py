@@ -34,7 +34,7 @@ Create Date: 2026-05-28 00:00:00.000000+00:00
 import sqlalchemy as sa
 
 from alembic import op
-from docverse.domain.base32id import mint_time_ordered_resource_ids
+from docverse_server.domain.base32id import mint_time_ordered_resource_ids
 
 # revision identifiers, used by Alembic.
 revision: str = "c7d8e9f0a1b2"

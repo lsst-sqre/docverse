@@ -18,13 +18,13 @@ from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import OrganizationCreate
-from docverse.dependencies.context import context_dependency
-from docverse.storage.dashboard_templates.github import (
+from docverse.models import OrganizationCreate
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
 )
-from docverse.storage.organization_store import OrganizationStore
+from docverse_server.storage.organization_store import OrganizationStore
 from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 

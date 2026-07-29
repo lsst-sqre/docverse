@@ -18,10 +18,10 @@ from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import MockArqQueue
 
-from docverse.config import Configuration
-from docverse.metrics.events import DocverseEvents
-from docverse.services.credential_encryptor import CredentialEncryptor
-from docverse.worker.main import WorkerFactoryBuilder
+from docverse_server.config import Configuration
+from docverse_server.metrics.events import DocverseEvents
+from docverse_server.services.credential_encryptor import CredentialEncryptor
+from docverse_server.worker.main import WorkerFactoryBuilder
 
 __all__ = ["make_worker_ctx"]
 

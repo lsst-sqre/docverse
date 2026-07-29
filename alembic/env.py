@@ -3,10 +3,10 @@
 from safir.database import run_migrations_offline, run_migrations_online
 
 from alembic import context
-from docverse.config import config
+from docverse_server.config import config
 
 # Load all ORM models so that Base.metadata is populated.
-from docverse.dbschema import Base
+from docverse_server.dbschema import Base
 
 if context.is_offline_mode():
     run_migrations_offline(Base.metadata, config.database_url)

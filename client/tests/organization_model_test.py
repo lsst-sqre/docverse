@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import (
+from docverse.models import (
     LifecycleRuleSet,
     OrganizationCreate,
     OrganizationSummary,
     OrganizationUpdate,
     OrgRole,
 )
-from docverse.client.models.organizations import normalize_base_domain
+from docverse.models.organizations import normalize_base_domain
 
 
 def test_organization_summary_round_trip() -> None:

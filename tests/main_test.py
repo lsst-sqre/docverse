@@ -28,11 +28,11 @@ from safir.dependencies.arq import arq_dependency
 from sqlalchemy import text
 from structlog.testing import capture_logs
 
-from docverse.config import config
-from docverse.dbschema import Base
-from docverse.dependencies.context import context_dependency
-from docverse.main import app as docverse_app
-from docverse.storage.user_info_store import StubUserInfoStore
+from docverse_server.config import config
+from docverse_server.dbschema import Base
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.main import app as docverse_app
+from docverse_server.storage.user_info_store import StubUserInfoStore
 from tests.support.github_mock import GitHubMock
 
 

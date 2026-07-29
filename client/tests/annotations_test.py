@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from docverse.client._annotations import (
+from docverse._annotations import (
     detect_github_actions_annotations,
     merge_annotations,
 )
-from docverse.client.models.builds import BuildAnnotations
+from docverse.models.builds import BuildAnnotations
 
 
 class TestBuildAnnotations:

@@ -8,7 +8,7 @@ from itertools import pairwise
 
 import pytest
 
-from docverse.domain.base32id import (
+from docverse_server.domain.base32id import (
     RESOURCE_ID_EPOCH,
     RESOURCE_ID_RANDOM_BITS,
     RESOURCE_ID_TIMESTAMP_BITS,

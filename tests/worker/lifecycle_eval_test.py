@@ -20,7 +20,7 @@ from safir.metrics import MockEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import select, update
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionKind,
     LifecycleEvalRunStatus,
@@ -28,41 +28,51 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import JobKind, JobStatus
-from docverse.config import Configuration
-from docverse.dbschema.build import SqlBuild
-from docverse.dbschema.edition import SqlEdition
-from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.lifecycle import (
+from docverse.models.queue_enums import JobKind, JobStatus
+from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.edition_build_history import (
+    SqlEditionBuildHistory,
+)
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     LifecycleRuleSet,
     RefDeletedRule,
 )
-from docverse.factory import Factory
-from docverse.metrics import (
+from docverse_server.factory import Factory
+from docverse_server.metrics import (
     LifecycleActionTrigger,
     LifecycleReapAction,
     build_event_manager,
 )
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.editionpublisher import (
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.lifecycle_eval import lifecycle_eval
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.lifecycle_eval_run_store import (
+    LifecycleEvalRunStore,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.lifecycle_eval import lifecycle_eval
 from tests.worker.conftest import make_worker_ctx
 
 NOW = datetime(2026, 5, 12, 12, 0, 0, tzinfo=UTC)
@@ -84,7 +94,7 @@ def _freeze_eval_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     # function, shadowing the submodule, so a dotted-string monkeypatch
     # target would resolve to the function and miss ``_utcnow``.
     module = importlib.import_module(
-        "docverse.worker.functions.lifecycle_eval"
+        "docverse_server.worker.functions.lifecycle_eval"
     )
     monkeypatch.setattr(module, "_utcnow", lambda: NOW)
 

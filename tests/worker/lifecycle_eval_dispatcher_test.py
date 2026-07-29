@@ -16,25 +16,30 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     JobKind,
     LifecycleEvalRunStatus,
     OrganizationCreate,
     ProjectCreate,
 )
-from docverse.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.lifecycle import DraftInactivityRule, LifecycleRuleSet
-from docverse.domain.queue import JobStatus
-from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.lifecycle_eval_dispatcher import (
+from docverse_server.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.lifecycle import (
+    DraftInactivityRule,
+    LifecycleRuleSet,
+)
+from docverse_server.domain.queue import JobStatus
+from docverse_server.storage.lifecycle_eval_run_store import (
+    LifecycleEvalRunStore,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.lifecycle_eval_dispatcher import (
     _create_run_with_children,
     lifecycle_eval_dispatcher,
 )
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 

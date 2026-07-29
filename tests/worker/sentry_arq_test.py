@@ -35,14 +35,14 @@ from safir.testing.sentry import (
     sentry_init_fixture,
 )
 
-from docverse.sentry import initialize_sentry, instrument_arq_task
-from docverse.worker.main import (
+from docverse_server.sentry import initialize_sentry, instrument_arq_task
+from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
     MaintenanceWorkerSettings,
     WorkerSettings,
     startup_maintenance,
 )
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 
 def _patch_sentry_init_with_test_transport(
@@ -249,7 +249,7 @@ async def test_startup_maintenance_uses_worker_maintenance_component(
         captured["component"] = component
         captured["queue_name"] = queue_name
 
-    monkeypatch.setattr("docverse.worker.main._startup", fake_startup)
+    monkeypatch.setattr("docverse_server.worker.main._startup", fake_startup)
     await startup_maintenance({})
     assert captured["component"] == "worker-maintenance"
     assert captured["queue_name"] == MAINTENANCE_QUEUE_NAME

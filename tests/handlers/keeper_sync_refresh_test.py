@@ -18,10 +18,10 @@ from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 
-from docverse.client.models import OrgRole
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.queue import JobKind
-from docverse.storage.organization_store import OrganizationStore
+from docverse.models import OrgRole
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.queue import JobKind
+from docverse_server.storage.organization_store import OrganizationStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

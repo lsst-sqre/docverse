@@ -12,8 +12,12 @@ import pytest_asyncio
 import respx
 import structlog
 
-from docverse.exceptions import DocverseSlackException
-from docverse.storage.ltd import LtdClient, LtdClientError, LtdNotFoundError
+from docverse_server.exceptions import DocverseSlackException
+from docverse_server.storage.ltd import (
+    LtdClient,
+    LtdClientError,
+    LtdNotFoundError,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 LTD_BASE = "https://keeper.lsst.codes"

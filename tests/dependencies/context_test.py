@@ -12,9 +12,9 @@ from pydantic import SecretStr
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.dependencies.context import ContextDependency
-from docverse.metrics.events import DocverseEvents
-from docverse.storage.github import (
+from docverse_server.dependencies.context import ContextDependency
+from docverse_server.metrics.events import DocverseEvents
+from docverse_server.storage.github import (
     GitHubAppClient,
     GitHubAppNotConfiguredError,
 )

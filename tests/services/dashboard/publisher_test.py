@@ -10,31 +10,31 @@ from rubin.repertoire import DiscoveryClient
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
-from docverse.services.dashboard.publisher import DashboardPublisher
-from docverse.services.dashboard_templates.resolver import (
+from docverse_server.services.dashboard.publisher import DashboardPublisher
+from docverse_server.services.dashboard_templates.resolver import (
     ResolvedTemplate,
     ResolvedTemplateOrigin,
     TemplateResolver,
 )
-from docverse.storage.build_store import BuildStore
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.objectstore import MockObjectStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 _HASH = "sha256:" + "a" * 64
 

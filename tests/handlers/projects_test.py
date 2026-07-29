@@ -11,18 +11,21 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.project import SqlProject
-from docverse.dependencies.context import context_dependency
-from docverse.factory import Factory
-from docverse.metrics import LifecycleAction
-from docverse.storage.editionpublisher import (
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.factory import Factory
+from docverse_server.metrics import LifecycleAction
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
 
 

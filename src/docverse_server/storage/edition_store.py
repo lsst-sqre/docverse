@@ -1,0 +1,699 @@
+"""Database operations for the editions table."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import structlog
+from safir.database import (
+    CountedPaginatedList,
+    CountedPaginatedQueryRunner,
+    PaginationCursor,
+)
+from sqlalchemy import Select, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
+
+from docverse.models import (
+    EditionCreate,
+    EditionKind,
+    EditionUpdate,
+    TrackingMode,
+)
+from docverse.models.queue_enums import PublishStatus
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.version import (
+    EupsDailyVersion,
+    EupsMajorVersion,
+    EupsWeeklyVersion,
+    LsstDocVersion,
+    SemverVersion,
+)
+from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
+
+
+class EditionStore:
+    """Direct database operations for editions."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> None:
+        self._session = session
+        self._logger = logger
+
+    def _base_query(self) -> Select[tuple[SqlEdition, int | None, str | None]]:
+        """Build the base query with optional build public_id + git_ref."""
+        return select(  # type: ignore[return-value]
+            SqlEdition,
+            SqlBuild.public_id.label("current_build_public_id"),
+            SqlBuild.git_ref.label("current_build_git_ref"),
+        ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+
+    def _column_query(self) -> Select[tuple[Any, ...]]:
+        """Build a column-based query for paginated results.
+
+        Returns all Edition domain fields as flat columns, including
+        the joined build public_id. Suitable for use with
+        ``query_row`` so the flat row validates directly into Edition.
+        """
+        return select(
+            SqlEdition.id,
+            SqlEdition.slug,
+            SqlEdition.title,
+            SqlEdition.project_id,
+            SqlEdition.kind,
+            SqlEdition.tracking_mode,
+            SqlEdition.tracking_params,
+            SqlEdition.alternate_name,
+            SqlEdition.current_build_id,
+            SqlBuild.public_id.label("current_build_public_id"),
+            SqlBuild.git_ref.label("current_build_git_ref"),
+            SqlEdition.lifecycle_exempt,
+            SqlEdition.date_created,
+            SqlEdition.date_updated,
+            SqlEdition.date_deleted,
+        ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+
+    def _validate(
+        self,
+        row: SqlEdition,
+        build_public_id: int | None,
+        build_git_ref: str | None = None,
+    ) -> Edition:
+        """Validate a row into an Edition domain model."""
+        edition = Edition.model_validate(row)
+        edition.current_build_public_id = build_public_id
+        edition.current_build_git_ref = build_git_ref
+        return edition
+
+    async def create(self, *, project_id: int, data: EditionCreate) -> Edition:
+        """Insert a new edition row."""
+        row = SqlEdition(
+            slug=data.slug,
+            title=data.title,
+            project_id=project_id,
+            kind=data.kind,
+            tracking_mode=data.tracking_mode,
+            tracking_params=data.tracking_params,
+            lifecycle_exempt=data.lifecycle_exempt,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return self._validate(row, None)
+
+    async def create_internal(
+        self,
+        *,
+        project_id: int,
+        slug: str,
+        title: str,
+        kind: EditionKind,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any] | None = None,
+        alternate_name: str | None = None,
+        lifecycle_exempt: bool = False,
+    ) -> Edition:
+        """Insert an edition row, bypassing slug validation.
+
+        Used for system-created editions like ``__main`` where the slug
+        does not conform to the user-facing pattern constraints in
+        ``EditionCreate``.
+
+        Race-tolerant: a concurrent transaction that already inserted
+        the same ``(project_id, lower(slug))`` makes this insert a
+        no-op via ``ON CONFLICT DO NOTHING`` against
+        ``uq_editions_project_lower_slug``. The lost-race branch
+        re-fetches the winning row so callers always observe a
+        non-``None`` :class:`Edition`. A naive
+        ``try/except IntegrityError`` would poison the surrounding
+        ``session.begin()`` transaction, so the savepoint-free
+        ``ON CONFLICT`` is the right primitive here.
+        """
+        stmt = (
+            pg_insert(SqlEdition)
+            .values(
+                slug=slug,
+                title=title,
+                project_id=project_id,
+                kind=kind,
+                tracking_mode=tracking_mode,
+                tracking_params=tracking_params,
+                alternate_name=alternate_name,
+                lifecycle_exempt=lifecycle_exempt,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    SqlEdition.project_id,
+                    func.lower(SqlEdition.slug),
+                ],
+            )
+        )
+        await self._session.execute(stmt)
+        existing = await self.get_by_slug(project_id=project_id, slug=slug)
+        if existing is None:
+            msg = (
+                "create_internal lost ON CONFLICT race but no existing "
+                f"edition found for project_id={project_id} slug={slug!r}"
+            )
+            raise RuntimeError(msg)
+        return existing
+
+    async def get_by_slug(
+        self, *, project_id: int, slug: str
+    ) -> Edition | None:
+        """Fetch an edition by project_id and slug.
+
+        Slug matching is case-insensitive: the row stores the canonical
+        creation-time casing, but any case from the caller resolves to
+        the same row. The returned ``Edition.slug`` is always the
+        canonical stored value, never the caller's input.
+        """
+        stmt = self._base_query().where(
+            SqlEdition.project_id == project_id,
+            func.lower(SqlEdition.slug) == slug.lower(),
+            SqlEdition.date_deleted.is_(None),
+        )
+        result = await self._session.execute(stmt)
+        row_tuple = result.one_or_none()
+        if row_tuple is None:
+            return None
+        edition_row, build_public_id, build_git_ref = row_tuple
+        return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def get_by_id(self, edition_id: int) -> Edition | None:
+        """Fetch an edition by its internal ID.
+
+        Soft-deleted editions (``date_deleted`` set) are excluded so a
+        best-effort HATEOAS back-reference never points at a removed
+        resource; callers resolving a link treat ``None`` as "no API
+        resource exists".
+        """
+        stmt = self._base_query().where(
+            SqlEdition.id == edition_id,
+            SqlEdition.date_deleted.is_(None),
+        )
+        result = await self._session.execute(stmt)
+        row_tuple = result.one_or_none()
+        if row_tuple is None:
+            return None
+        edition_row, build_public_id, build_git_ref = row_tuple
+        return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def list_by_project_ids_and_kind(
+        self, *, project_ids: list[int], kind: EditionKind
+    ) -> list[Edition]:
+        """Return non-deleted editions for the given projects + kind.
+
+        Single-query batch that callers use to resolve "the ``main``
+        edition for each of these N projects" without issuing N
+        separate ``get_by_slug`` round-trips. Returns editions ordered
+        by ``project_id`` for stable iteration; the
+        ``ck_editions_main_slug_kind`` constraint guarantees at most
+        one row per ``project_id`` when ``kind == EditionKind.main``.
+        Passing an empty ``project_ids`` returns ``[]`` without hitting
+        the database.
+        """
+        if not project_ids:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id.in_(project_ids),
+                SqlEdition.kind == kind,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.project_id)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
+    async def list_all_by_project(self, project_id: int) -> list[Edition]:
+        """List every non-deleted edition for a project.
+
+        Returns editions ordered by slug. Used by the dashboard pipeline
+        which needs the full set of editions to group and sort, not a
+        paginated window.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
+    async def list_all_by_project_ids(
+        self, project_ids: list[int]
+    ) -> list[Edition]:
+        """List every non-deleted edition across the given projects.
+
+        Single-query batch over multiple projects, ordered by
+        ``(project_id, slug)`` for stable iteration. Used by the
+        ``lifecycle_eval`` per-org worker to load every project's
+        editions in one round-trip rather than N. Passing an empty
+        ``project_ids`` returns ``[]`` without hitting the database.
+        """
+        if not project_ids:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id.in_(project_ids),
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.project_id, SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
+    async def list_by_project(
+        self,
+        project_id: int,
+        *,
+        cursor_type: type[PaginationCursor[Edition]],
+        cursor: PaginationCursor[Edition] | None = None,
+        limit: int,
+        kind: EditionKind | None = None,
+    ) -> CountedPaginatedList[Edition, PaginationCursor[Edition]]:
+        """List non-deleted editions for a project with pagination."""
+        stmt = self._column_query().where(
+            SqlEdition.project_id == project_id,
+            SqlEdition.date_deleted.is_(None),
+        )
+        if kind is not None:
+            stmt = stmt.where(SqlEdition.kind == kind)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=Edition, cursor_type=cursor_type
+        )
+        return await runner.query_row(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
+
+    async def update(
+        self, *, project_id: int, slug: str, data: EditionUpdate
+    ) -> Edition | None:
+        """Update an edition by project_id and slug.
+
+        Slug matching is case-insensitive (see :meth:`get_by_slug`).
+        """
+        result = await self._session.execute(
+            select(SqlEdition).where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug) == slug.lower(),
+                SqlEdition.date_deleted.is_(None),
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        updates = data.model_dump(mode="json", exclude_unset=True)
+        for key, value in updates.items():
+            setattr(row, key, value)
+        await self._session.flush()
+        await self._session.refresh(row)
+        # Re-query to get current_build_public_id via join
+        return await self.get_by_slug(project_id=project_id, slug=row.slug)
+
+    async def set_current_build(
+        self,
+        *,
+        edition_id: int,
+        build_id: int,
+        skip_date_guard: bool = False,
+    ) -> Edition | None:
+        """Set the current build for an edition.
+
+        Compares the incoming build's ``date_created`` against the
+        current build's ``date_created``.  If the edition already points
+        to a build that is equally new or newer, the update is skipped
+        and ``None`` is returned (stale-build guard per SQR-112).
+
+        Parameters
+        ----------
+        edition_id
+            The edition to update.
+        build_id
+            The build to point to.
+        skip_date_guard
+            When ``True``, bypass the date-based stale guard.  Used by
+            version-based tracking modes where the version comparison
+            in the service layer is the authoritative ordering.
+
+        Returns
+        -------
+        Edition or None
+            The updated edition, or ``None`` if the update was skipped
+            because the edition already points to a newer build.
+        """
+        # Fetch edition row
+        stmt = (
+            select(
+                SqlEdition,
+                SqlBuild.date_created.label("current_build_date"),
+            )
+            .outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+            .where(SqlEdition.id == edition_id)
+        )
+        result = await self._session.execute(stmt)
+        row, current_build_date = result.one()
+
+        if not skip_date_guard:
+            # Fetch incoming build's date_created
+            incoming_result = await self._session.execute(
+                select(SqlBuild.date_created).where(SqlBuild.id == build_id)
+            )
+            incoming_date = incoming_result.scalar_one()
+
+            # Stale-build guard: skip if current build is equally new or newer
+            if (
+                current_build_date is not None
+                and current_build_date >= incoming_date
+            ):
+                return None
+
+        row.current_build_id = build_id
+        await self._session.flush()
+        await self._session.refresh(row)
+        # Re-query to get current_build_public_id + git_ref
+        stmt2 = self._base_query().where(SqlEdition.id == edition_id)
+        result2 = await self._session.execute(stmt2)
+        edition_row, build_public_id, build_git_ref = result2.one()
+        return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def update_tracking(
+        self,
+        *,
+        edition_id: int,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any],
+    ) -> None:
+        """Set the tracking columns on an edition row."""
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.tracking_mode = tracking_mode
+        row.tracking_params = tracking_params
+        await self._session.flush()
+
+    async def set_publish_status(
+        self, *, edition_id: int, status: PublishStatus
+    ) -> None:
+        """Set the ``publish_status`` column on an edition row."""
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.publish_status = status.value
+        await self._session.flush()
+
+    async def set_alternate_name(
+        self, *, edition_id: int, alternate_name: str
+    ) -> None:
+        """Set the ``alternate_name`` column on an edition row."""
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.alternate_name = alternate_name
+        await self._session.flush()
+
+    async def soft_delete(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        slug: str,
+        reason: TombstoneReason,
+    ) -> bool:
+        """Soft-delete an edition and stamp the keeper-sync tombstone.
+
+        Slug matching is case-insensitive (see :meth:`get_by_slug`).
+        The physical chokepoint for centralized soft-delete (PRD #332):
+        in the same flush that stamps ``date_deleted``, this records
+        the tombstone fields on the matching ``keeper_sync_state`` row
+        (located by ``(org_id, resource_type='edition', docverse_id=
+        <edition.id>)``). The tombstone write is a no-op when no state
+        row exists for this edition (e.g. a manually-created edition
+        never imported from LTD).
+
+        Returns
+        -------
+        bool
+            True if the edition was soft-deleted, False if not found.
+        """
+        result = await self._session.execute(
+            select(SqlEdition).where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug) == slug.lower(),
+                SqlEdition.date_deleted.is_(None),
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        row.date_deleted = func.now()
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id == row.id,
+            )
+            .values(
+                date_tombstoned=func.now(),
+                tombstone_reason=reason.value,
+                tombstone_note=None,
+            )
+        )
+        await self._session.flush()
+        return True
+
+    async def list_draft_editions_by_git_ref(
+        self, *, project_id: int, git_ref: str
+    ) -> list[Edition]:
+        """List draft editions whose literal ref tracks ``git_ref``.
+
+        Server-side filter for the GitHub ``delete`` webhook fast path
+        in :class:`docverse_server.services.ref_deleted_processor
+        .RefDeletedWebhookProcessor`. Returns editions where
+        ``kind='draft'``, ``tracking_mode IN ('git_ref',
+        'alternate_git_ref')``, ``lifecycle_exempt=False``,
+        ``date_deleted IS NULL``, and ``tracking_params->>'git_ref'``
+        equals ``git_ref``. The webhook delivers one ref name; this
+        method keeps the JSON-path filter in the database so the
+        processor never loads non-matching rows.
+
+        The filter mirrors :func:`docverse_server.services.lifecycle.evaluator
+        ._eval_ref_deleted`'s candidate selection so the webhook and
+        the daily audit can never disagree on which editions a deleted
+        ref should sweep.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.kind == EditionKind.draft,
+                SqlEdition.tracking_mode.in_(
+                    [TrackingMode.git_ref, TrackingMode.alternate_git_ref]
+                ),
+                SqlEdition.lifecycle_exempt.is_(False),
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.tracking_params["git_ref"].astext == git_ref,
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in rows
+        ]
+
+    async def get_git_ref_tracking_edition(
+        self, *, project_id: int, git_ref: str
+    ) -> Edition | None:
+        """Return the ``git_ref``-mode edition tracking ``git_ref``, if any.
+
+        The shared "is any ``git_ref``-mode edition already tracking this
+        ref?" lookup. keeper-sync consults it after a ``get_by_slug`` miss
+        so it adopts a differently-slugged existing edition rather than
+        inserting a duplicate that tracks the same ref (PRD #409): native
+        auto-creation and keeper-sync derive an edition's slug from a
+        branch differently, so the same branch can otherwise yield two
+        editions on one ``git_ref``.
+
+        The ``tracking_params->>'git_ref'`` equality is applied as a
+        server-side JSONB filter — non-matching rows never leave the
+        database — mirroring
+        :meth:`list_draft_editions_by_git_ref`. Unlike that method this
+        restricts to ``tracking_mode = git_ref`` (no ``alternate_git_ref``,
+        no ``lifecycle_exempt`` filter) so it answers exactly whether a
+        literal-ref-tracking edition holds the ref. Soft-deleted rows
+        (``date_deleted IS NULL``) are ignored.
+
+        The auto-created default ``__main`` edition (``kind = main``,
+        tracking ``{'git_ref': 'main'}``) is excluded: an imported LTD
+        edition that maps to ``git_ref = 'main'`` under a non-``main`` slug
+        (e.g. a manual edition pinned to a build built from ``main``, or a
+        ``git_refs`` edition tracking ``['main']`` under another slug) must
+        get its own row rather than adopt — and silently alias onto — the
+        project's default edition. An LTD edition actually slugged ``main``
+        folds to ``__main`` via ``derive_edition_slug`` and is updated
+        directly through ``get_by_slug``, never reaching this adoption path.
+
+        Returns the earliest-created match (``date_created``, then ``id``)
+        so adoption is deterministic and keeps the first-created slug when
+        a duplicate already exists; ``None`` when no edition tracks the
+        ref.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.tracking_mode == TrackingMode.git_ref,
+                SqlEdition.kind != EditionKind.main,
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.tracking_params["git_ref"].astext == git_ref,
+            )
+            .order_by(SqlEdition.date_created, SqlEdition.id)
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        row_tuple = result.first()
+        if row_tuple is None:
+            return None
+        edition_row, build_public_id, build_git_ref = row_tuple
+        return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def find_matching_editions(
+        self,
+        *,
+        project_id: int,
+        git_ref: str,
+        alternate_name: str | None = None,
+    ) -> list[Edition]:
+        """Find editions that match a git_ref or alternate_name.
+
+        Used by the build processing worker to determine which editions
+        should be updated when a build completes.
+        """
+        conditions = [
+            SqlEdition.project_id == project_id,
+            SqlEdition.date_deleted.is_(None),
+        ]
+
+        stmt = self._base_query().where(*conditions).order_by(SqlEdition.slug)
+        result = await self._session.execute(stmt)
+        rows = result.all()
+
+        matching = []
+        for edition_row, build_public_id, build_git_ref in rows:
+            edition = self._validate(
+                edition_row, build_public_id, build_git_ref
+            )
+            if self._edition_matches(edition, git_ref, alternate_name):
+                matching.append(edition)
+
+        return matching
+
+    @staticmethod
+    def _edition_matches(
+        edition: Edition,
+        git_ref: str,
+        alternate_name: str | None,
+    ) -> bool:
+        """Test whether *edition* matches the given git ref."""
+        mode = edition.tracking_mode
+        params = edition.tracking_params or {}
+
+        if mode == TrackingMode.git_ref:
+            return alternate_name is None and params.get("git_ref") == git_ref
+
+        if mode == TrackingMode.alternate_git_ref:
+            return (
+                alternate_name is not None
+                and params.get("git_ref") == git_ref
+                and params.get("alternate_name") == alternate_name
+            )
+
+        if mode in (
+            TrackingMode.semver_release,
+            TrackingMode.semver_major,
+            TrackingMode.semver_minor,
+        ):
+            return _semver_matches(mode, params, git_ref)
+
+        if mode == TrackingMode.eups_major_release:
+            return EupsMajorVersion.parse(git_ref) is not None
+
+        if mode == TrackingMode.eups_weekly_release:
+            return EupsWeeklyVersion.parse(git_ref) is not None
+
+        if mode == TrackingMode.eups_daily_release:
+            return EupsDailyVersion.parse(git_ref) is not None
+
+        if mode == TrackingMode.lsst_doc:
+            return _lsst_doc_matches(edition, git_ref)
+
+        return False
+
+
+def _semver_matches(
+    mode: TrackingMode,
+    params: dict[str, Any],
+    git_ref: str,
+) -> bool:
+    """Check whether *git_ref* matches a semver-based tracking mode."""
+    v = SemverVersion.parse(git_ref)
+    if v is None or v.prerelease is not None:
+        return False
+    if mode == TrackingMode.semver_release:
+        return True
+    if mode == TrackingMode.semver_major:
+        return v.major == params.get("major_version")
+    # semver_minor
+    return v.major == params.get("major_version") and v.minor == params.get(
+        "minor_version"
+    )
+
+
+def _lsst_doc_matches(edition: Edition, git_ref: str) -> bool:
+    """Check whether *git_ref* matches an lsst_doc edition."""
+    if LsstDocVersion.parse(git_ref) is not None:
+        return True
+    return git_ref == "main" and (
+        edition.current_build_id is None
+        or edition.current_build_git_ref == "main"
+    )

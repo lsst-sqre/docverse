@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from sqlalchemy.exc import IntegrityError
 
-from docverse.storage._public_id import _is_public_id_conflict
+from docverse_server.storage._public_id import _is_public_id_conflict
 
 
 class _FakeOrigError(Exception):

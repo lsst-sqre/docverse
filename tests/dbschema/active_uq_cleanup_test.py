@@ -37,8 +37,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from alembic import command
-from docverse.config import config
-from docverse.dbschema import Base
+from docverse_server.config import config
+from docverse_server.dbschema import Base
 
 # Revision immediately before the two migrations under test.
 PRE_CLEANUP_REVISION = "s7t8u9v0w1x2"

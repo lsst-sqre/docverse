@@ -17,16 +17,14 @@ from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 
-from docverse.client.models import (
-    EditionCreate,
-    EditionKind,
-    OrgRole,
-    TrackingMode,
+from docverse.models import EditionCreate, EditionKind, OrgRole, TrackingMode
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

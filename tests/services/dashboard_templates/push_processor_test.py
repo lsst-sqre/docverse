@@ -11,21 +11,23 @@ from safir.arq import MockArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
-from docverse.client.models.queue_enums import JobKind
-from docverse.config import Configuration
-from docverse.services.dashboard_templates.enqueue import DashboardSyncEnqueuer
-from docverse.services.dashboard_templates.push_processor import (
+from docverse.models import OrganizationCreate
+from docverse.models.queue_enums import JobKind
+from docverse_server.config import Configuration
+from docverse_server.services.dashboard_templates.enqueue import (
+    DashboardSyncEnqueuer,
+)
+from docverse_server.services.dashboard_templates.push_processor import (
     PushEventProcessor,
 )
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
 )
-from docverse.storage.github import GitHubAppClient
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.github import GitHubAppClient
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 _config = Configuration()

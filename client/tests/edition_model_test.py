@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import (
+from docverse.models import (
     Edition,
     EditionCreate,
     EditionKind,
@@ -15,7 +15,7 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import PublishStatus
+from docverse.models.queue_enums import PublishStatus
 
 
 def _base_edition(**overrides: object) -> Edition:

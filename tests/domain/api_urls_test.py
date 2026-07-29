@@ -10,9 +10,9 @@ either a path segment or the route's name — therefore fails these tests.
 
 from __future__ import annotations
 
-from docverse.config import config
-from docverse.domain.api_urls import build_url, edition_url, job_url
-from docverse.main import app
+from docverse_server.config import config
+from docverse_server.domain.api_urls import build_url, edition_url, job_url
+from docverse_server.main import app
 
 _BASE = "https://docverse.example/api"
 

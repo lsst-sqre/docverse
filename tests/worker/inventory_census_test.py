@@ -15,23 +15,23 @@ from safir.metrics import MockEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
-from docverse.config import Configuration
-from docverse.dbschema.build import SqlBuild
-from docverse.dbschema.edition import SqlEdition
-from docverse.dbschema.project import SqlProject
-from docverse.metrics import build_event_manager
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.worker.functions.inventory_census import inventory_census
+from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.metrics import build_event_manager
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.worker.functions.inventory_census import inventory_census
 from tests.worker.conftest import make_worker_ctx
 
 _CONTENT_HASH = (

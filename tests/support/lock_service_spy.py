@@ -22,8 +22,8 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.factory import Factory
-from docverse.services.lock_service import LockKey, LockService
+from docverse_server.factory import Factory
+from docverse_server.services.lock_service import LockKey, LockService
 
 __all__ = [
     "LockEvent",

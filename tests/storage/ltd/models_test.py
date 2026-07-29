@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from docverse.storage.ltd import (
+from docverse_server.storage.ltd import (
     LtdBuild,
     LtdEdition,
     LtdEditionMode,

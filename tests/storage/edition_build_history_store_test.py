@@ -6,7 +6,7 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
@@ -15,15 +15,17 @@ from docverse.client.models import (
     PublishStatus,
     TrackingMode,
 )
-from docverse.client.models.builds import BuildAnnotations
-from docverse.dbschema.edition_build_history import SqlEditionBuildHistory
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse.models.builds import BuildAnnotations
+from docverse_server.dbschema.edition_build_history import (
+    SqlEditionBuildHistory,
+)
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 
 @pytest.fixture

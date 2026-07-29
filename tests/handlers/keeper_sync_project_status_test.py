@@ -24,18 +24,21 @@ import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import OrgRole
-from docverse.services.keeper_sync.scheduler import (
+from docverse.models import OrgRole
+from docverse_server.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_MAIN_CRON_INTERVAL,
     TIER_MAIN_DORMANT_INTERVAL,
     TIER_OTHER_CRON_INTERVAL,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

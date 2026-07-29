@@ -9,7 +9,11 @@ otherwise only be caught by the integration tests at runtime.
 
 from __future__ import annotations
 
-from docverse.services.lock_service import LockClass, LockKey, compute_lock_id
+from docverse_server.services.lock_service import (
+    LockClass,
+    LockKey,
+    compute_lock_id,
+)
 
 SIGNED_INT64_MIN = -(1 << 63)
 SIGNED_INT64_MAX = (1 << 63) - 1

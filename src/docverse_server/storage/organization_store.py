@@ -1,0 +1,133 @@
+"""Database operations for the organizations table."""
+
+from __future__ import annotations
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from docverse.models import (
+    KeeperSyncConfig,
+    OrganizationCreate,
+    OrganizationUpdate,
+)
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.domain.organization import Organization
+
+
+class OrganizationStore:
+    """Direct database operations for organizations."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> None:
+        self._session = session
+        self._logger = logger
+
+    async def create(self, data: OrganizationCreate) -> Organization:
+        """Insert a new organization row."""
+        default_edition_config = None
+        if data.default_edition_config is not None:
+            default_edition_config = data.default_edition_config.model_dump(
+                mode="json"
+            )
+        lifecycle_rules = None
+        if data.lifecycle_rules is not None:
+            lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
+        row = SqlOrganization(
+            slug=data.slug,
+            title=data.title,
+            base_domain=data.base_domain,
+            url_scheme=data.url_scheme,
+            root_path_prefix=data.root_path_prefix,
+            slug_rewrite_rules=data.slug_rewrite_rules,
+            lifecycle_rules=lifecycle_rules,
+            default_edition_config=default_edition_config,
+            purgatory_retention=data.purgatory_retention,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return Organization.model_validate(row)
+
+    async def get_by_id(self, org_id: int) -> Organization | None:
+        """Fetch an organization by ID."""
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.id == org_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Organization.model_validate(row)
+
+    async def get_by_slug(self, slug: str) -> Organization | None:
+        """Fetch an organization by slug."""
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.slug == slug)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Organization.model_validate(row)
+
+    async def list_all(self) -> list[Organization]:
+        """List all organizations ordered by slug."""
+        result = await self._session.execute(
+            select(SqlOrganization).order_by(SqlOrganization.slug)
+        )
+        rows = result.scalars().all()
+        return [Organization.model_validate(r) for r in rows]
+
+    async def update(
+        self, slug: str, data: OrganizationUpdate
+    ) -> Organization | None:
+        """Update an organization by slug."""
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.slug == slug)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        updates = data.model_dump(mode="json", exclude_unset=True)
+        for key, value in updates.items():
+            setattr(row, key, value)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Organization.model_validate(row)
+
+    async def update_keeper_sync_config(
+        self, slug: str, config: KeeperSyncConfig
+    ) -> Organization | None:
+        """Replace an organization's ``keeper_sync_config`` JSONB column.
+
+        Returns the updated :class:`Organization`, or ``None`` if no row
+        with the given slug exists.
+        """
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.slug == slug)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        row.keeper_sync_config = config.model_dump(mode="json")
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Organization.model_validate(row)
+
+    async def delete(self, slug: str) -> bool:
+        """Delete an organization by slug.
+
+        Returns
+        -------
+        bool
+            True if the organization was deleted, False if not found.
+        """
+        result = await self._session.execute(
+            select(SqlOrganization).where(SqlOrganization.slug == slug)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        await self._session.delete(row)
+        return True

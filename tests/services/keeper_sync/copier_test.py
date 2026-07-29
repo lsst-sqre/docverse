@@ -13,9 +13,9 @@ import hashlib
 import pytest
 import structlog
 
-from docverse.services.keeper_sync.copier import BuildContentCopier
-from docverse.storage.ltd import LtdSourceProtocol
-from docverse.storage.objectstore import MockObjectStore
+from docverse_server.services.keeper_sync.copier import BuildContentCopier
+from docverse_server.storage.ltd import LtdSourceProtocol
+from docverse_server.storage.objectstore import MockObjectStore
 
 
 class _FakeSource(LtdSourceProtocol):

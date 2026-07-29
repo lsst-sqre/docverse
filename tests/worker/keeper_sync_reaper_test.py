@@ -20,22 +20,21 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
-    JobKind,
-    KeeperSyncRunStatus,
-    OrganizationCreate,
+from docverse.models import JobKind, KeeperSyncRunStatus, OrganizationCreate
+from docverse_server.config import Configuration
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
 )
-from docverse.config import Configuration
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobStatus
-from docverse.metrics import build_event_manager
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.keeper_sync import keeper_sync_reaper
+from docverse_server.domain.queue import JobStatus
+from docverse_server.metrics import build_event_manager
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.keeper_sync import keeper_sync_reaper
 from tests.support.arq_testing import register_queue
 from tests.worker.conftest import make_worker_ctx
 

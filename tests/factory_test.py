@@ -8,9 +8,12 @@ import structlog
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.factory import Factory
-from docverse.storage.ltd import LtdClient, LtdS3Source
-from docverse.storage.queue_backend import ArqQueueBackend, NullQueueBackend
+from docverse_server.factory import Factory
+from docverse_server.storage.ltd import LtdClient, LtdS3Source
+from docverse_server.storage.queue_backend import (
+    ArqQueueBackend,
+    NullQueueBackend,
+)
 
 
 def _logger() -> structlog.stdlib.BoundLogger:

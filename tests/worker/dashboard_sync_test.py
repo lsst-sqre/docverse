@@ -11,20 +11,20 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.config import Configuration
-from docverse.dbschema.organization import SqlOrganization
-from docverse.domain.base32id import serialize_base32_id
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.services.lock_service import LockClass, LockKey
-from docverse.storage.dashboard_templates.github import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse_server.config import Configuration
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.services.lock_service import LockClass, LockKey
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.dashboard_sync import dashboard_sync
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.dashboard_sync import dashboard_sync
 from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.support.lock_service_spy import install_recording_lock_service
@@ -434,7 +434,7 @@ async def test_dashboard_sync_unhandled_syncer_exception_marks_binding_failed(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(
-        "docverse.services.dashboard_templates.sync."
+        "docverse_server.services.dashboard_templates.sync."
         "DashboardTemplateSyncer.sync",
         _exploding_sync,
     )

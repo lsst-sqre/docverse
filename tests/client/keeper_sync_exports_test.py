@@ -1,9 +1,9 @@
 """Lock the keeper-sync handler response surface to ``__all__``.
 
 Every Pydantic model used as ``response_model=`` in
-``docverse.handlers.orgs.keeper_sync.router`` — and every Pydantic
+``docverse_server.handlers.orgs.keeper_sync.router`` — and every Pydantic
 model or :class:`enum.Enum` reachable from those models' field
-annotations — must be importable from :mod:`docverse.client.models`.
+annotations — must be importable from :mod:`docverse.models`.
 Handler-side subclasses (in ``handlers/orgs/keeper_sync_models.py``
 and ``handlers/orgs/job_models.py``) are accepted because their client-
 package base class is exported; the handler subclasses themselves
@@ -20,10 +20,10 @@ from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel
 
-import docverse.client.models as client_models
-from docverse.handlers.orgs import job_models as queue_handler_models
-from docverse.handlers.orgs import keeper_sync as keeper_sync_handlers
-from docverse.handlers.orgs import keeper_sync_models as handler_models
+import docverse.models as client_models
+from docverse_server.handlers.orgs import job_models as queue_handler_models
+from docverse_server.handlers.orgs import keeper_sync as keeper_sync_handlers
+from docverse_server.handlers.orgs import keeper_sync_models as handler_models
 
 
 def _exported_classes() -> set[type]:
@@ -110,8 +110,7 @@ def test_every_response_model_is_in_client_export_surface() -> None:
     assert missing == [], (
         "These types are referenced (directly or transitively) by"
         " ``handlers/orgs/keeper_sync.py`` response models but are not"
-        " importable from ``docverse.client.models``:\n  - "
-        + "\n  - ".join(missing)
+        " importable from ``docverse.models``:\n  - " + "\n  - ".join(missing)
     )
 
 
@@ -142,6 +141,6 @@ def test_handler_side_subclasses_are_not_exported() -> None:
         )
         assert exported is not cls, (
             f"{cls.__module__}.{cls.__name__} is a handler-side"
-            " subclass; ``docverse.client.models`` must export the"
+            " subclass; ``docverse.models`` must export the"
             " client-package base, not the handler subclass."
         )

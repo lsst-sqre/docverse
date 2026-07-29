@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from safir.database import InvalidCursorError
 
-from docverse.storage.pagination import (
+from docverse_server.storage.pagination import (
     BuildDateCreatedCursor,
     EditionBuildHistoryPositionCursor,
     EditionDateCreatedCursor,

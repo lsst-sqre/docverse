@@ -17,7 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     BuildStatus,
     EditionCreate,
@@ -27,43 +27,43 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import PublishStatus
-from docverse.config import Configuration
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import (
+from docverse.models.queue_enums import PublishStatus
+from docverse_server.config import Configuration
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
     generate_base32_id,
     serialize_base32_id,
     validate_base32_id,
 )
-from docverse.domain.build import Build
-from docverse.domain.edition import Edition
-from docverse.domain.edition_build_history import EditionBuildHistory
-from docverse.domain.organization import Organization
-from docverse.domain.project import Project
-from docverse.domain.queue import JobKind, JobStatus, QueueJob
-from docverse.factory import Factory
-from docverse.metrics import (
+from docverse_server.domain.build import Build
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.organization import Organization
+from docverse_server.domain.project import Project
+from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
+from docverse_server.factory import Factory
+from docverse_server.metrics import (
     EditionPublishTrigger,
     MetricsEditionKind,
     build_event_manager,
 )
-from docverse.services.lock_service import LockClass, LockKey
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse_server.services.lock_service import LockClass, LockKey
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.editionpublisher import (
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
-from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.publish_edition import publish_edition
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.publish_edition import publish_edition
 from tests.support.arq_testing import get_jobs_by_name
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx

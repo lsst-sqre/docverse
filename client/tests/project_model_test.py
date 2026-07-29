@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import (
+from docverse.models import (
     InstallationStatus,
     ProjectCreate,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
-from docverse.client.models.projects import build_github_url, parse_github_url
+from docverse.models.projects import build_github_url, parse_github_url
 
 
 @pytest.mark.parametrize(

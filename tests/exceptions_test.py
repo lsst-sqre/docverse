@@ -21,8 +21,8 @@ from collections.abc import Callable
 import pytest
 from safir.slack.blockkit import SlackException, SlackMessage
 
-from docverse.domain.slug import InvalidSlugError
-from docverse.exceptions import (
+from docverse_server.domain.slug import InvalidSlugError
+from docverse_server.exceptions import (
     DocverseSlackException,
     InvalidBuildStateError,
     InvalidJobStateError,

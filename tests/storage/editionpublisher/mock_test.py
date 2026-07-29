@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from docverse.storage.editionpublisher import (
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
     PublishCall,

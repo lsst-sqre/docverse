@@ -8,20 +8,20 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     OrganizationCreate,
     ProjectCreate,
     ProjectGitHubBindingCreate,
     ProjectUpdate,
 )
-from docverse.storage.keeper_sync import (
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.pagination import ProjectSlugCursor
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.pagination import ProjectSlugCursor
+from docverse_server.storage.project_store import ProjectStore
 
 
 @pytest.fixture

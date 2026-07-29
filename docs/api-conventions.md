@@ -7,7 +7,7 @@ have a documentation build; a future Sphinx/documenteer or mkdocs tree can
 absorb it unchanged.
 
 The conventions below are grounded in the handlers under
-`src/docverse/handlers/`. When adding an endpoint, follow the pattern of
+`src/docverse_server/handlers/`. When adding an endpoint, follow the pattern of
 the closest existing handler and keep this document in sync.
 
 ## Async-action verb rule
@@ -38,7 +38,7 @@ introduce a new async verb without a distinct source to justify it.
 Path parameters are **bare nouns** naming the resource at that position,
 not `{noun}_id` or `{noun}_slug`. The parameter's actual type (slug,
 Base32 identifier, label) is documented on the `Path(...)` alias in
-`src/docverse/handlers/params.py`, not encoded in the URL:
+`src/docverse_server/handlers/params.py`, not encoded in the URL:
 
 ```
 /orgs/{org}/projects/{project}/builds/{build}
@@ -83,7 +83,7 @@ Response bodies never expose integer database row IDs. Resources that
 need a public identifier carry a **Crockford Base32 public ID** (12
 characters plus a 2-character checksum, hyphenated every 4, e.g.
 `1txq-55pj-1x5m-16`), minted from the `public_id` column via
-`docverse.domain.base32id`. Fields holding these IDs are named `id` on
+`docverse_server.domain.base32id`. Fields holding these IDs are named `id` on
 the resource itself and `{relation}_id` when referencing another
 resource (`job_id`, `build_id`, `keeper_sync_run_id`).
 
@@ -100,7 +100,7 @@ Every `*_url`, public-ID, and slug-like field declares
 `Field(examples=[...])` so the rendered OpenAPI docs show realistic
 values instead of `"string"`. The examples share one vocabulary,
 defined as constants in
-`client/src/docverse/client/models/_examples.py`:
+`client/src/docverse/models/_examples.py`:
 
 - The example deployment is `https://example.org/docverse/api`.
 - The example organization is `lsst`, its project `pipelines`, and its
@@ -136,8 +136,8 @@ Swagger UI and Redoc.
 ## OpenAPI tags
 
 Operations are grouped under three tags, declared in
-`src/docverse/main.py` and applied per sub-router in
-`src/docverse/handlers/orgs/__init__.py`:
+`src/docverse_server/main.py` and applied per sub-router in
+`src/docverse_server/handlers/orgs/__init__.py`:
 
 - **`orgs`** — organization-scoped resources: the org itself, members,
   credentials, services, keeper-sync, the org dashboard, and the
@@ -229,7 +229,7 @@ header pointing at the job so a client can poll for progress:
 Client-error responses are declared with FastAPI's `responses=` argument
 so they appear in the OpenAPI spec with safir's `ErrorModel` body shape,
 rather than being left undocumented. The shared helper
-`error_responses(*status_codes)` in `src/docverse/handlers/responses.py`
+`error_responses(*status_codes)` in `src/docverse_server/handlers/responses.py`
 builds these declarations for:
 
 - **403 Forbidden** — the caller lacks the role required for the
@@ -245,7 +245,7 @@ Each operation declares the subset of these codes it can actually return.
 
 Unbounded collections are paginated with **keyset (cursor) pagination**,
 never offset/limit. The mechanics (see
-`src/docverse/storage/pagination.py`):
+`src/docverse_server/storage/pagination.py`):
 
 - **Query parameters:** `cursor` (an opaque token copied from a previous
   response — clients must not construct or parse it) and `limit` (default

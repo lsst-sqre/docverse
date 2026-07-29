@@ -7,22 +7,24 @@ import structlog
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.queue_enums import JobKind
-from docverse.config import Configuration
-from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
-from docverse.services.dashboard_templates.fanout import DashboardRebuildFanout
-from docverse.storage.dashboard_templates.github import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models.queue_enums import JobKind
+from docverse_server.config import Configuration
+from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
+from docverse_server.services.dashboard_templates.fanout import (
+    DashboardRebuildFanout,
+)
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
 
 _config = Configuration()
 

@@ -14,17 +14,17 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
-from docverse.client.models.queue_enums import JobKind, JobStatus
-from docverse.services.dashboard_templates._sync_failure import (
+from docverse.models import OrganizationCreate
+from docverse.models.queue_enums import JobKind, JobStatus
+from docverse_server.services.dashboard_templates._sync_failure import (
     mark_dashboard_sync_failed,
 )
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_job_store import QueueJobStore
 
 
 def _logger() -> structlog.stdlib.BoundLogger:

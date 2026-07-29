@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from docverse.config import Configuration
+from docverse_server.config import Configuration
 
 
 def test_keeper_sync_timeout_defaults() -> None:
