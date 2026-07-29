@@ -1,6 +1,6 @@
 """Tests for ``DashboardBuildEnqueuer`` per-project dedup.
 
-The cascade in :func:`docverse.worker.functions.publish_edition` calls
+The cascade in :func:`docverse_server.worker.functions.publish_edition` calls
 ``try_enqueue_dashboard_build_by_id`` after every successful publish; on
 a 1000-edition keeper-sync project that is 1000 redundant
 ``dashboard_build`` rows, only the last carrying final state. The

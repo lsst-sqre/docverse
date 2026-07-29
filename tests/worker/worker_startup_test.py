@@ -1,9 +1,9 @@
 """Tests for the GitHub App startup-validation path in the arq worker.
 
-The full ``docverse.worker.main.startup`` function requires a real
+The full ``docverse_server.worker.main.startup`` function requires a real
 Redis instance to call ``RedisArqQueue.initialize``; these tests
 exercise the GitHub-App validation seam by driving the validator
-against a real :class:`docverse.worker.main.WorkerFactoryBuilder`,
+against a real :class:`docverse_server.worker.main.WorkerFactoryBuilder`,
 mirroring how the worker's ``startup`` wires the two together.
 """
 

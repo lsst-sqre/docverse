@@ -1,4 +1,4 @@
-"""Tests for ``docverse.config.Configuration``.
+"""Tests for ``docverse_server.config.Configuration``.
 
 Smoke-tests the keeper-sync timeout knobs that were introduced for
 the run-finalisation guarantees on ``KeeperSyncWorkerSettings``. Both

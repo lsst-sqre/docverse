@@ -212,7 +212,7 @@ async def _seed_run_and_queue_job(
     """Create one ``lifecycle_eval_runs`` row + a per-org queue_jobs row.
 
     Mirrors the dispatcher contract documented on
-    :mod:`docverse.worker.functions.lifecycle_eval`: ``subject_label``
+    :mod:`docverse_server.worker.functions.lifecycle_eval`: ``subject_label``
     is the org's slug so the per-org mutex stays human-meaningful for
     operators inspecting ``queue_jobs`` and the internal ``org_id``
     is never reused as the queue's user-visible subject.
