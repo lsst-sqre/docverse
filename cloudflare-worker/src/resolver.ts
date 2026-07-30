@@ -9,14 +9,21 @@
  *   3. Try exact path, then `{path}/index.html` for directory index
  *      resolution.
  *   4. Return the R2 object with `Content-Type` inferred from the file
- *      extension and `Cache-Control: public, max-age=60`.
+ *      extension and `Cache-Control` derived from the KV value's
+ *      `cache_profile` field: `CACHE_CONTROL_LONG` for `"long"`,
+ *      `CACHE_CONTROL_SHORT` for `"short"` or an absent field.
  *   5. Route any 404 (missing KV entry, malformed KV JSON, missing R2
  *      object after the index-html fallback) through `notFoundResponse`.
+ *
+ * Edition responses are the only profile-sensitive responses. Dashboard-family
+ * (dashboard HTML, `switcher.json`, `_docverse.json`) and 404 responses always
+ * emit `CACHE_CONTROL_SHORT` so rebuilds stay visible within a minute without
+ * any purge machinery.
  *
  * - `dashboard` routes delegate to `DashboardStore.getDashboard()`, which
  *   encapsulates the `__`-prefixed R2 key layout. The response body is the
  *   R2 object with `Content-Type: text/html; charset=utf-8` and
- *   `Cache-Control: public, max-age=60`. When the request carries an
+ *   `Cache-Control: CACHE_CONTROL_SHORT`. When the request carries an
  *   `If-None-Match` header whose full value exactly matches the R2 object's
  *   `httpEtag`, the resolver returns a bodiless 304 with the same `ETag` and
  *   `Cache-Control` headers instead.
@@ -38,7 +45,7 @@
  * `notFoundResponse(project, dashboardStore, ctx)`, which serves the
  * project's branded `{project}/__404.html` when present and degrades to
  * plain-text `Not Found` otherwise. Both variants apply the same
- * `Cache-Control: public, max-age=60` so dashboard rebuilds and newly
+ * `CACHE_CONTROL_SHORT` so dashboard rebuilds and newly
  * published editions become visible within one minute and 404s don't get
  * CDN-stuck. Unroutable requests (no extractable project slug) bypass this
  * helper at the worker entry point, since there's no project to fall back
@@ -63,10 +70,47 @@ import mime from "mime";
 import type { DashboardStore } from "./dashboardStore";
 import type { Route, EditionRoute } from "./router";
 
+/**
+ * `Cache-Control` for short-lived responses: edition responses whose KV value
+ * carries `cache_profile: "short"` (or omits it), plus every dashboard-family
+ * and 404 response unconditionally.
+ */
+export const CACHE_CONTROL_SHORT = "public, max-age=60";
+
+/**
+ * `Cache-Control` for edition responses whose KV value carries
+ * `cache_profile: "long"`: 5 minutes in the browser, 1 day at the edge.
+ * Safe because Docverse issues a hostname-wide Cloudflare purge whenever a
+ * long-profile edition is published.
+ */
+export const CACHE_CONTROL_LONG = "public, max-age=300, s-maxage=86400";
+
+/** Edge-caching policy for an edition, as recorded in its KV value. */
+type CacheProfile = "long" | "short";
+
 /** Shape of the JSON value stored in the editions KV namespace. */
 interface EditionMapping {
   build_id: string;
   r2_prefix: string;
+  /**
+   * Edge-caching policy for this edition. Optional: KV values written before
+   * this field existed (or by an older publisher) omit it, in which case the
+   * resolver falls back to the short profile, which is always safe.
+   */
+  cache_profile?: CacheProfile;
+}
+
+/**
+ * Select the `Cache-Control` header for an edition response.
+ *
+ * Anything other than an explicit `"long"` — `"short"`, a missing field, or an
+ * unrecognized value from a future publisher — maps to the short profile so
+ * ambiguous KV state never over-caches.
+ */
+function editionCacheControl(mapping: EditionMapping): string {
+  return mapping.cache_profile === "long"
+    ? CACHE_CONTROL_LONG
+    : CACHE_CONTROL_SHORT;
 }
 
 /**
@@ -153,7 +197,7 @@ async function resolveDashboardFamily(
       status: 304,
       headers: {
         "ETag": object.httpEtag,
-        "Cache-Control": "public, max-age=60",
+        "Cache-Control": CACHE_CONTROL_SHORT,
       },
     });
   }
@@ -162,7 +206,7 @@ async function resolveDashboardFamily(
     headers: {
       "Content-Type": contentType,
       "ETag": object.httpEtag,
-      "Cache-Control": "public, max-age=60",
+      "Cache-Control": CACHE_CONTROL_SHORT,
     },
   });
 }
@@ -231,7 +275,7 @@ async function resolveEdition(
     headers: {
       "Content-Type": contentType,
       "ETag": object.httpEtag,
-      "Cache-Control": "public, max-age=60",
+      "Cache-Control": editionCacheControl(mapping),
     },
   });
 }
@@ -239,8 +283,9 @@ async function resolveEdition(
 /**
  * Build a 404 response for a routable request, preferring the project's
  * branded `__404.html` and degrading to plain text on miss. Both variants
- * apply the same `Cache-Control: public, max-age=60` so CDN behavior is
- * uniform across the `/v/` namespace.
+ * apply the same `CACHE_CONTROL_SHORT` so CDN behavior is
+ * uniform across the `/v/` namespace, regardless of any edition's
+ * `cache_profile`.
  *
  * Consults `caches.default` before calling `get404` so repeated 404s for the
  * same project don't re-hit R2 within the 60-second TTL. The cache key is a
@@ -272,14 +317,14 @@ export async function notFoundResponse(
             "Content-Type": "text/html; charset=utf-8",
             "Content-Length": object.size.toString(),
             "ETag": object.httpEtag,
-            "Cache-Control": "public, max-age=60",
+            "Cache-Control": CACHE_CONTROL_SHORT,
           },
         })
       : new Response("Not Found", {
           status: 404,
           headers: {
             "Content-Type": "text/plain",
-            "Cache-Control": "public, max-age=60",
+            "Cache-Control": CACHE_CONTROL_SHORT,
           },
         });
   ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
