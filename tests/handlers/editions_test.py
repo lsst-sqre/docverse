@@ -12,25 +12,28 @@ from safir.metrics import MockEventPublisher
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import BuildCreate
-from docverse.client.models.builds import BuildAnnotations
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dependencies.context import context_dependency
-from docverse.domain.base32id import serialize_base32_id
-from docverse.factory import Factory
-from docverse.metrics import LifecycleAction, MetricsEditionKind
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse.models import BuildCreate
+from docverse.models.builds import BuildAnnotations
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.factory import Factory
+from docverse_server.metrics import LifecycleAction, MetricsEditionKind
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.editionpublisher import (
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_org_with_admin
 
 

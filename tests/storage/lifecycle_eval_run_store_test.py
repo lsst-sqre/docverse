@@ -9,14 +9,19 @@ import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import LifecycleEvalRunStatus, OrganizationCreate
-from docverse.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.exceptions import InvalidJobStateError, JobNotFoundError
-from docverse.storage.lifecycle_eval_run_store import LifecycleEvalRunStore
-from docverse.storage.organization_store import OrganizationStore
+from docverse.models import LifecycleEvalRunStatus, OrganizationCreate
+from docverse_server.dbschema.lifecycle_eval_run import SqlLifecycleEvalRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse_server.storage.lifecycle_eval_run_store import (
+    LifecycleEvalRunStore,
+)
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 def _logger() -> structlog.stdlib.BoundLogger:

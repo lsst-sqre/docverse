@@ -30,27 +30,25 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
-    JobKind,
-    KeeperSyncConfig,
-    OrganizationCreate,
+from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.services.keeper_sync_tombstone import (
+    KeeperSyncTombstoneService,
 )
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
-from docverse.storage.keeper_sync import (
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.keeper_sync import (
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.keeper_sync import (
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
     keeper_sync_tier_other,
 )
-from docverse.worker.main import KeeperSyncWorkerSettings
+from docverse_server.worker.main import KeeperSyncWorkerSettings
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 

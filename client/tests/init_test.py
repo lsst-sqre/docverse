@@ -1,8 +1,8 @@
-"""Smoke tests for the docverse-client package."""
+"""Smoke tests for the docverse package."""
 
 from __future__ import annotations
 
-from docverse.client import __version__
+from docverse import __version__
 
 
 def test_version() -> None:

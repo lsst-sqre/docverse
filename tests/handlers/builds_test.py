@@ -6,8 +6,8 @@ import pytest
 from httpx import AsyncClient
 from safir.metrics import MockEventPublisher
 
-from docverse.client.models import BuildAnnotations
-from docverse.dependencies.context import context_dependency
+from docverse.models import BuildAnnotations
+from docverse_server.dependencies.context import context_dependency
 from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (

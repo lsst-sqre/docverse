@@ -27,27 +27,30 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildAnnotations,
     BuildCreate,
     OrgMembershipCreate,
     OrgRole,
     PrincipalType,
 )
-from docverse.config import config
-from docverse.dbschema import Base
-from docverse.dependencies.context import RequestContext, context_dependency
-from docverse.domain.base32id import serialize_base32_id
-from docverse.main import app as docverse_app
-from docverse.metrics import build_event_manager
-from docverse.metrics.events import DocverseEvents
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.storage.build_store import BuildStore
-from docverse.storage.membership_store import OrgMembershipStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.user_info_store import StubUserInfoStore
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.config import config
+from docverse_server.dbschema import Base
+from docverse_server.dependencies.context import (
+    RequestContext,
+    context_dependency,
+)
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.main import app as docverse_app
+from docverse_server.metrics import build_event_manager
+from docverse_server.metrics.events import DocverseEvents
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.membership_store import OrgMembershipStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.user_info_store import StubUserInfoStore
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 from .support.arq_testing import register_queue
 from .support.github_mock import GitHubMock, make_rsa_pem

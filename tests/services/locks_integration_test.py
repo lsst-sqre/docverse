@@ -21,8 +21,8 @@ from safir.database import create_database_engine
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from docverse.config import config
-from docverse.services.lock_service import LockKey, LockService
+from docverse_server.config import config
+from docverse_server.services.lock_service import LockKey, LockService
 
 
 def _logger() -> structlog.stdlib.BoundLogger:

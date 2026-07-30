@@ -9,21 +9,21 @@ import structlog
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.dbschema.project import SqlProject
-from docverse.services.dashboard_templates.rename_processor import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.services.dashboard_templates.rename_processor import (
     RenameEventProcessor,
 )
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 
 def _logger() -> structlog.stdlib.BoundLogger:

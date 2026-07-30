@@ -8,13 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.dbschema.dashboard_github_template import (
+from docverse_server.dbschema.dashboard_github_template import (
     SqlDashboardGitHubTemplate,
 )
-from docverse.dbschema.dashboard_github_template_file import (
+from docverse_server.dbschema.dashboard_github_template_file import (
     SqlDashboardGitHubTemplateFile,
 )
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,

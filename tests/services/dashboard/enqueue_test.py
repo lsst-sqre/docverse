@@ -1,6 +1,6 @@
 """Tests for ``DashboardBuildEnqueuer`` per-project dedup.
 
-The cascade in :func:`docverse.worker.functions.publish_edition` calls
+The cascade in :func:`docverse_server.worker.functions.publish_edition` calls
 ``try_enqueue_dashboard_build_by_id`` after every successful publish; on
 a 1000-edition keeper-sync project that is 1000 redundant
 ``dashboard_build`` rows, only the last carrying final state. The
@@ -18,15 +18,15 @@ from safir.arq import MockArqQueue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.queue_enums import JobKind
-from docverse.config import Configuration
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.services.dashboard.enqueue import DashboardBuildEnqueuer
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models.queue_enums import JobKind
+from docverse_server.config import Configuration
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
 
 _config = Configuration()
 

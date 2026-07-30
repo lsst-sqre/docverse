@@ -10,23 +10,26 @@ from safir.arq import MockArqQueue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobKind
-from docverse.exceptions import ConflictError, NotFoundError
-from docverse.services.keeper_sync_run import (
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.queue import JobKind
+from docverse_server.exceptions import ConflictError, NotFoundError
+from docverse_server.services.keeper_sync_run import (
     KEEPER_SYNC_QUEUE_NAME,
     KeeperSyncRunService,
 )
-from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
 from tests.support.arq_testing import register_queue
 
 

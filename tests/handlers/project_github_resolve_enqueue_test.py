@@ -18,8 +18,8 @@ from httpx import AsyncClient
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 
-from docverse.config import Configuration
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.config import Configuration
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.conftest import seed_org_with_admin
 from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
 

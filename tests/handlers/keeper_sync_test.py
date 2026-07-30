@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from docverse.client.models import OrgRole
+from docverse.models import OrgRole
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

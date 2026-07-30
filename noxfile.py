@@ -219,7 +219,7 @@ def create_migration(session: nox.Session) -> None:
             "REPERTOIRE_BASE_URL": (
                 "https://roundtable.lsst.cloud/repertoire"
             ),
-            # ``alembic/env.py`` imports ``docverse.config``, whose
+            # ``alembic/env.py`` imports ``docverse_server.config``, whose
             # ``metrics`` field resolves from these vars; the mock
             # manager keeps migration autogeneration Kafka-free.
             "METRICS_APPLICATION": "docverse",

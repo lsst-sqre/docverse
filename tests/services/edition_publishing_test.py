@@ -9,7 +9,7 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
@@ -18,23 +18,25 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import PublishStatus
-from docverse.domain.base32id import serialize_base32_id
-from docverse.domain.build import Build
-from docverse.domain.edition import Edition
-from docverse.domain.edition_build_history import EditionBuildHistory
-from docverse.services.edition_publishing import EditionPublishingService
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse.models.queue_enums import PublishStatus
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.build import Build
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.services.edition_publishing import (
+    EditionPublishingService,
+)
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.editionpublisher import (
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 _HASH = "sha256:" + "a" * 64
 _PROJECT_SLUG = "pub-proj"

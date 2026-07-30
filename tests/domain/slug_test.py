@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import EditionKind, TrackingMode
-from docverse.domain.slug import (
+from docverse.models import EditionKind, TrackingMode
+from docverse_server.domain.slug import (
     ALTERNATE_SEPARATOR,
     IgnoreRule,
     InvalidSlugError,

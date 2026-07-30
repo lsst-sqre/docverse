@@ -10,7 +10,7 @@ github.com repository URL — exactly the values the ``ProjectCreate`` /
 ``ProjectUpdate`` validators now reject on the way in.
 
 The parse mirrors
-:func:`docverse.client.models.projects.parse_github_url` (host is
+:func:`docverse.models.projects.parse_github_url` (host is
 ``github.com``, case-insensitive; at least two non-empty path segments)
 so the rows nulled here are precisely the rows the API would now refuse
 to accept. A copy of the predicate lives in this module so the migration

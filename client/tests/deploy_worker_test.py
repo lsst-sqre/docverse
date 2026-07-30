@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from click.testing import CliRunner
 
-from docverse.client._cli import main
+from docverse._cli import main
 
 
 @pytest.fixture
@@ -91,8 +91,8 @@ def test_deploy_worker_invalid_env_name(
     assert "Invalid environment name" in result.output
 
 
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_happy_path(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -163,8 +163,8 @@ def test_deploy_worker_happy_path(
     )
 
 
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_npm_pack_fails(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -197,8 +197,8 @@ def test_deploy_worker_npm_pack_fails(
     "bad_stdout",
     ["not json at all\n", "[]\n", '[{"no_filename": true}]\n'],
 )
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_npm_pack_bad_json(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -228,8 +228,8 @@ def test_deploy_worker_npm_pack_bad_json(
     assert "Failed to parse npm pack output" in result.output
 
 
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_tar_extract_fails(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -265,8 +265,8 @@ def test_deploy_worker_tar_extract_fails(
     assert "Failed to unpack worker tarball" in result.output
 
 
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_wrangler_deploy_fails(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -328,8 +328,8 @@ def test_deploy_worker_missing_cloudflare_worker_dir(
     assert "cloudflare-worker/ not found" in result.output
 
 
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_creates_worker_dest_dir(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -359,8 +359,8 @@ def test_deploy_worker_creates_worker_dest_dir(
 
 
 @pytest.mark.parametrize("env_name", ["dev", "production"])
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_env_passed_to_wrangler(
     mock_run: MagicMock,
     mock_copy: MagicMock,
@@ -394,8 +394,8 @@ def test_deploy_worker_env_passed_to_wrangler(
     )
 
 
-@patch("docverse.client._cli.shutil.copy2")
-@patch("docverse.client._cli.subprocess.run")
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
 def test_deploy_worker_dry_run(
     mock_run: MagicMock,
     mock_copy: MagicMock,

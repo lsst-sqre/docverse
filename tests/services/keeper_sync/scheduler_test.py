@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from docverse.services.keeper_sync.scheduler import (
+from docverse_server.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     ANNOTATION_DATE_OTHER_LAST_POLLED,
@@ -42,7 +42,7 @@ from docverse.services.keeper_sync.scheduler import (
     should_refresh_other_edition,
     stable_hash_fraction,
 )
-from docverse.storage.keeper_sync import KeeperSyncState
+from docverse_server.storage.keeper_sync import KeeperSyncState
 
 
 def _state(

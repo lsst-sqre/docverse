@@ -7,14 +7,14 @@ from typing import Any
 from arq.cron import CronJob
 from arq.worker import Function
 
-from docverse.config import Configuration
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.worker.functions import (
+from docverse_server.config import Configuration
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.worker.functions import (
     keeper_sync_project,
     keeper_sync_reaper,
     keeper_sync_run_discovery,
 )
-from docverse.worker.main import (
+from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
     WorkerSettings,
     shutdown,

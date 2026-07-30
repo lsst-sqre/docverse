@@ -23,7 +23,7 @@ from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     BuildStatus,
     EditionCreate,
@@ -32,40 +32,42 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.dbschema.build import SqlBuild
-from docverse.domain.lifecycle import (
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     LifecycleRuleSet,
     RefDeletedRule,
 )
-from docverse.services.keeper_sync.copier import BuildContentCopier
-from docverse.services.keeper_sync.service import (
+from docverse_server.services.keeper_sync.copier import BuildContentCopier
+from docverse_server.services.keeper_sync.service import (
     KeeperSyncContext,
     KeeperSyncService,
     _now,
 )
-from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
-from docverse.services.project import ProjectService
-from docverse.services.project_github_binding import (
+from docverse_server.services.keeper_sync_tombstone import (
+    KeeperSyncTombstoneService,
+)
+from docverse_server.services.project import ProjectService
+from docverse_server.services.project_github_binding import (
     ProjectGitHubBindingResolver,
 )
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.github import (
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.github import (
     GITHUB_API_BASE_URL,
     GitHubAppClient,
     GitHubRefSetFetcher,
 )
-from docverse.storage.keeper_sync import (
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.ltd import LtdClient, LtdSourceProtocol
-from docverse.storage.objectstore import MockObjectStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.ltd import LtdClient, LtdSourceProtocol
+from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 FIXTURES_DIR = (

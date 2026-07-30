@@ -18,7 +18,10 @@ import respx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from docverse.storage.github import GITHUB_API_BASE_URL, InstallationAuth
+from docverse_server.storage.github import (
+    GITHUB_API_BASE_URL,
+    InstallationAuth,
+)
 
 __all__ = ["DEFAULT_APP_ID", "DEFAULT_APP_NAME", "GitHubMock", "make_rsa_pem"]
 

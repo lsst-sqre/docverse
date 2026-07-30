@@ -29,23 +29,26 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.client.models import OrganizationCreate
-from docverse.config import config as runtime_config
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.build_processing_reaper import (
+from docverse.models import OrganizationCreate
+from docverse_server.config import config as runtime_config
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.build_processing_reaper import (
     build_processing_reaper,
 )
-from docverse.worker.functions.dashboard_build_reaper import (
+from docverse_server.worker.functions.dashboard_build_reaper import (
     dashboard_build_reaper,
 )
-from docverse.worker.functions.dashboard_sync_reaper import (
+from docverse_server.worker.functions.dashboard_sync_reaper import (
     dashboard_sync_reaper,
 )
-from docverse.worker.functions.publish_edition_reaper import (
+from docverse_server.worker.functions.publish_edition_reaper import (
     publish_edition_reaper,
 )
 from tests.worker.conftest import make_worker_ctx

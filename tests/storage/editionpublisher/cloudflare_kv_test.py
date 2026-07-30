@@ -8,7 +8,9 @@ import httpx
 import pytest
 import structlog
 
-from docverse.storage.editionpublisher import CloudflareKvEditionPublisher
+from docverse_server.storage.editionpublisher import (
+    CloudflareKvEditionPublisher,
+)
 
 
 def _make_publisher(

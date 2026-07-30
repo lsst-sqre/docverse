@@ -10,7 +10,7 @@ import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
@@ -18,23 +18,23 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.dbschema.build import SqlBuild
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.project import SqlProject
-from docverse.domain.build import Build
-from docverse.domain.organization import Organization
-from docverse.domain.project import Project
-from docverse.services.edition_tracking import (
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.build import Build
+from docverse_server.domain.organization import Organization
+from docverse_server.domain.project import Project
+from docverse_server.services.edition_tracking import (
     EditionTrackingDeps,
     EditionTrackingService,
 )
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 _HASH = "sha256:" + "a" * 64
 

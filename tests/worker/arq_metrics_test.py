@@ -17,15 +17,15 @@ from arq.cron import CronJob
 from safir.metrics import EventManager, MockEventPublisher
 from safir.metrics.arq import ARQ_EVENTS_CONTEXT_KEY, initialize_arq_metrics
 
-from docverse.config import Configuration
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.worker.main import (
+from docverse_server.config import Configuration
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
     MaintenanceWorkerSettings,
     WorkerSettings,
     publish_queue_stats_cron,
 )
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 _config = Configuration()
 

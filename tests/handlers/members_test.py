@@ -6,8 +6,8 @@ import pytest
 from httpx import AsyncClient
 from safir.metrics import MockEventPublisher
 
-from docverse.dependencies.context import context_dependency
-from docverse.metrics import (
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.metrics import (
     MembershipChangeAction,
     MetricsOrgRole,
     MetricsPrincipalType,

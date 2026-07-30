@@ -10,23 +10,25 @@ import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import (
+from docverse.models import (
     EditionCreate,
     EditionKind,
     OrgRole,
     ProjectCreate,
     TrackingMode,
 )
-from docverse.domain.base32id import serialize_base32_id
-from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import (
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.services.keeper_sync_tombstone import (
+    KeeperSyncTombstoneService,
+)
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

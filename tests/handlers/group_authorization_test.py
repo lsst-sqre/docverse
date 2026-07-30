@@ -10,9 +10,9 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from docverse.client.models import OrgRole
-from docverse.dependencies.context import context_dependency
-from docverse.storage.user_info_store import StubUserInfoStore
+from docverse.models import OrgRole
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.storage.user_info_store import StubUserInfoStore
 from tests.conftest import seed_group_member, seed_org_with_admin
 
 CONTENT_HASH = (

@@ -35,9 +35,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from alembic import command
-from docverse.config import config
-from docverse.dbschema import Base
-from docverse.domain.project import Project as ProjectDomain
+from docverse_server.config import config
+from docverse_server.dbschema import Base
+from docverse_server.domain.project import Project as ProjectDomain
 
 # Revision immediately before the null-github-source_url migration.
 PRE_NULL_REVISION = "x2y3z4a5b6c7"

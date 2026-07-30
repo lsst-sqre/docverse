@@ -9,16 +9,16 @@ from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.dbschema.project import SqlProject
-from docverse.services.project_github_binding import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.services.project_github_binding import (
     ProjectGitHubBindingResolver,
     ResolvedProjectGitHubBinding,
 )
-from docverse.storage.github import GitHubAppClient, InstallationAuth
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.github import GitHubAppClient, InstallationAuth
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 

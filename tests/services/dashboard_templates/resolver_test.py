@@ -6,14 +6,16 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.domain.project import Project
-from docverse.services.dashboard_templates.resolver import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse_server.domain.project import Project
+from docverse_server.services.dashboard_templates.resolver import (
     ResolvedTemplateOrigin,
     TemplateResolver,
 )
-from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.builtin import (
+    BuiltInTemplateSource,
+)
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
@@ -21,8 +23,8 @@ from docverse.storage.dashboard_templates.github import (
     GitHubTemplateKey,
     GitHubTemplateSource,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 _TEMPLATE_TOML = b"""\
 [dashboard]

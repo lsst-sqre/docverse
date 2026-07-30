@@ -1,0 +1,1 @@
+"""Docverse server application."""

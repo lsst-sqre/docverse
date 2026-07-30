@@ -9,16 +9,18 @@ from safir.arq import JobMetadata, MockArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 
-from docverse.client.models import OrgRole
-from docverse.services.dashboard_templates.enqueue import DashboardSyncEnqueuer
-from docverse.storage.dashboard_templates.github import (
+from docverse.models import OrgRole
+from docverse_server.services.dashboard_templates.enqueue import (
+    DashboardSyncEnqueuer,
+)
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_member, seed_org_with_admin
 from tests.support.arq_testing import get_jobs_by_name
 

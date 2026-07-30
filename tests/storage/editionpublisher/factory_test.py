@@ -6,7 +6,7 @@ import httpx
 import pytest
 import structlog
 
-from docverse.storage.editionpublisher import (
+from docverse_server.storage.editionpublisher import (
     CloudflareKvEditionPublisher,
     create_edition_publisher,
 )

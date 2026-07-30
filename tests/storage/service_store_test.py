@@ -6,11 +6,11 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
-from docverse.storage.organization_service_store import (
+from docverse.models import OrganizationCreate
+from docverse_server.storage.organization_service_store import (
     OrganizationServiceStore,
 )
-from docverse.storage.organization_store import OrganizationStore
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 async def _create_org(

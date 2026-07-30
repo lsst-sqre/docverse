@@ -7,8 +7,8 @@ import structlog
 from pydantic import HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import KeeperSyncConfig, OrganizationCreate
-from docverse.storage.organization_store import OrganizationStore
+from docverse.models import KeeperSyncConfig, OrganizationCreate
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 async def _seed_org(session: AsyncSession, *, slug: str = "ks-org") -> int:

@@ -11,14 +11,17 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import KeeperSyncRunStatus, OrganizationCreate
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.exceptions import JobNotFoundError
-from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.organization_store import OrganizationStore
+from docverse.models import KeeperSyncRunStatus, OrganizationCreate
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.exceptions import JobNotFoundError
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -344,7 +347,7 @@ async def test_create_retries_on_public_id_collision(
 
     ids = _fake_ids()
     monkeypatch.setattr(
-        "docverse.storage._public_id.generate_resource_id",
+        "docverse_server.storage._public_id.generate_resource_id",
         lambda: next(ids),
     )
 

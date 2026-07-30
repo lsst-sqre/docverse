@@ -11,7 +11,7 @@ Create Date: 2026-04-07 00:00:00.000000+00:00
 import sqlalchemy as sa
 
 from alembic import op
-from docverse.domain.base32id import serialize_base32_id
+from docverse_server.domain.base32id import serialize_base32_id
 
 # revision identifiers, used by Alembic.
 revision: str = "a1b2c3d4e5f7"

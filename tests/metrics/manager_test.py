@@ -21,8 +21,8 @@ from safir.metrics import (
 from safir.metrics._event_manager import _State
 from structlog.testing import capture_logs
 
-from docverse.config import Configuration
-from docverse.metrics import (
+from docverse_server.config import Configuration
+from docverse_server.metrics import (
     BuildProcessedEvent,
     BuildUploadedEvent,
     DocverseEvents,

@@ -18,10 +18,13 @@ from safir.http import PaginationLinkData
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrgRole
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse.models import OrgRole
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

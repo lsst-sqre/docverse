@@ -19,7 +19,7 @@ from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     BuildStatus,
     EditionCreate,
@@ -28,29 +28,29 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.queue_enums import PublishStatus
-from docverse.config import Configuration
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.project import SqlProject
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.api_urls import edition_url, job_url
-from docverse.domain.base32id import serialize_base32_id
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.factory import Factory
-from docverse.metrics import build_event_manager
-from docverse.services.edition_tracking import EditionTrackingService
-from docverse.services.lock_service import LockClass, LockKey
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_build_history_store import (
+from docverse.models.queue_enums import PublishStatus
+from docverse_server.config import Configuration
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.api_urls import edition_url, job_url
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.factory import Factory
+from docverse_server.metrics import build_event_manager
+from docverse_server.services.edition_tracking import EditionTrackingService
+from docverse_server.services.lock_service import LockClass, LockKey
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.objectstore import MockObjectStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_backend import ArqQueueBackend
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.build_processing import build_processing
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.build_processing import build_processing
 from tests.support.arq_testing import (
     count_jobs_by_name,
     get_jobs_by_name,

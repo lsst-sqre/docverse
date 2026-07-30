@@ -31,8 +31,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from alembic import command
-from docverse.config import config
-from docverse.dbschema import Base
+from docverse_server.config import config
+from docverse_server.dbschema import Base
 
 # Revision immediately before this PR's public_id migration.
 PRE_PUBLIC_ID_REVISION = "b6c7d8e9f0a1"

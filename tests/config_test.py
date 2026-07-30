@@ -1,4 +1,4 @@
-"""Tests for ``docverse.config.Configuration``.
+"""Tests for ``docverse_server.config.Configuration``.
 
 Smoke-tests the keeper-sync timeout knobs that were introduced for
 the run-finalisation guarantees on ``KeeperSyncWorkerSettings``. Both
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from docverse.config import Configuration
+from docverse_server.config import Configuration
 
 
 def test_keeper_sync_timeout_defaults() -> None:

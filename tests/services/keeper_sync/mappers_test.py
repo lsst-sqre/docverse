@@ -13,13 +13,13 @@ from typing import Any
 import pytest
 from pydantic import HttpUrl
 
-from docverse.client.models import EditionKind, TrackingMode
-from docverse.services.keeper_sync.mappers import (
+from docverse.models import EditionKind, TrackingMode
+from docverse_server.services.keeper_sync.mappers import (
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
 )
-from docverse.storage.ltd import LtdBuild, LtdEdition
+from docverse_server.storage.ltd import LtdBuild, LtdEdition
 
 
 def _edition(

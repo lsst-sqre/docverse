@@ -9,7 +9,7 @@ resolution-markers = [
 [manifest]
 members = [
     "docverse",
-    "docverse-client",
+    "docverse-server",
 ]
 
 [[package]]
@@ -712,13 +712,45 @@ wheels = [
 
 [[package]]
 name = "docverse"
+source = { editable = "client" }
+dependencies = [
+    { name = "click" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "coverage" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "respx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "click", specifier = ">=8" },
+    { name = "httpx", specifier = ">=0.25" },
+    { name = "pydantic", specifier = ">=2.5" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "coverage", extras = ["toml"] },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "respx" },
+]
+
+[[package]]
+name = "docverse-server"
 source = { editable = "." }
 dependencies = [
     { name = "aiobotocore" },
     { name = "base32-lib" },
     { name = "click" },
     { name = "cryptography" },
-    { name = "docverse-client" },
+    { name = "docverse" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -760,7 +792,7 @@ requires-dist = [
     { name = "base32-lib" },
     { name = "click", specifier = ">=8" },
     { name = "cryptography", specifier = ">=48.0.1" },
-    { name = "docverse-client", editable = "client" },
+    { name = "docverse", editable = "client" },
     { name = "fastapi", specifier = ">=0.115,<0.140" },
     { name = "httpx" },
     { name = "jinja2", specifier = ">=3.1" },
@@ -793,38 +825,6 @@ nox = [
     { name = "testcontainers", extras = ["postgres"] },
 ]
 typing = [{ name = "mypy", specifier = ">=1.15" }]
-
-[[package]]
-name = "docverse-client"
-source = { editable = "client" }
-dependencies = [
-    { name = "click" },
-    { name = "httpx" },
-    { name = "pydantic" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "coverage" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "respx" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8" },
-    { name = "httpx", specifier = ">=0.25" },
-    { name = "pydantic", specifier = ">=2.5" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "coverage", extras = ["toml"] },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "respx" },
-]
 
 [[package]]
 name = "fast-depends"

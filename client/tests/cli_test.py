@@ -12,8 +12,8 @@ import httpx
 import respx
 from click.testing import CliRunner
 
-from docverse.client._cli import main
-from docverse.client.models.queue_enums import JobStatus
+from docverse._cli import main
+from docverse.models.queue_enums import JobStatus
 
 BASE_URL = "https://docverse.example.com"
 TOKEN = "test-token"
@@ -135,7 +135,7 @@ def test_upload_success(tmp_path: Path) -> None:
 
     with respx.mock() as router:
         _setup_routes(router, job_overrides={"status": "completed"})
-        with patch("docverse.client._client.asyncio.sleep"):
+        with patch("docverse._client.asyncio.sleep"):
             result = _invoke(source)
 
     assert result.exit_code == 0
@@ -170,7 +170,7 @@ def test_upload_completed_with_errors(tmp_path: Path) -> None:
                 "phase": "editions",
             },
         )
-        with patch("docverse.client._client.asyncio.sleep"):
+        with patch("docverse._client.asyncio.sleep"):
             runner = CliRunner()
             result = runner.invoke(
                 main,
@@ -205,7 +205,7 @@ def test_upload_failed(tmp_path: Path) -> None:
             router,
             job_overrides={"status": "failed", "phase": "inventory"},
         )
-        with patch("docverse.client._client.asyncio.sleep"):
+        with patch("docverse._client.asyncio.sleep"):
             runner = CliRunner()
             result = runner.invoke(
                 main,
@@ -257,7 +257,7 @@ def test_upload_with_annotations(tmp_path: Path) -> None:
                 200, json=_job_response(status="completed")
             )
         )
-        with patch("docverse.client._client.asyncio.sleep"):
+        with patch("docverse._client.asyncio.sleep"):
             result = _invoke(
                 source,
                 extra_args=[
@@ -324,7 +324,7 @@ def test_upload_no_auto_annotations(tmp_path: Path) -> None:
                     "GITHUB_REPOSITORY": "owner/repo",
                 },
             ),
-            patch("docverse.client._client.asyncio.sleep"),
+            patch("docverse._client.asyncio.sleep"),
         ):
             result = _invoke(source, extra_args=["--no-auto-annotations"])
 
@@ -348,10 +348,10 @@ def test_upload_git_ref_detection(tmp_path: Path) -> None:
 
         with (
             patch(
-                "docverse.client._cli._detect_git_ref",
+                "docverse._cli._detect_git_ref",
                 return_value=detected_sha,
             ),
-            patch("docverse.client._client.asyncio.sleep"),
+            patch("docverse._client.asyncio.sleep"),
         ):
             runner = CliRunner()
             result = runner.invoke(

@@ -19,7 +19,7 @@ from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select, update
 
-from docverse.client.models import (
+from docverse.models import (
     EditionCreate,
     EditionKind,
     JobKind,
@@ -27,18 +27,18 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.client.models.projects import ProjectGitHubBindingCreate
-from docverse.dbschema.organization import SqlOrganization
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.dependencies.context import context_dependency
-from docverse.factory import Factory
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.editionpublisher import (
+from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.dependencies.context import context_dependency
+from docverse_server.factory import Factory
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from docverse.client.models.services import CloudflareWorkersConfig
+from docverse.models.services import CloudflareWorkersConfig
 
 
 def test_cloudflare_workers_config_with_kv_namespace() -> None:

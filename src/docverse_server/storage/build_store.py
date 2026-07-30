@@ -1,0 +1,399 @@
+"""Database operations for the builds table."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import structlog
+from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
+
+from docverse.models import BuildCreate, BuildStatus
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.build import Build
+from docverse_server.exceptions import InvalidBuildStateError
+from docverse_server.storage._public_id import (
+    insert_with_time_ordered_public_id,
+)
+from docverse_server.storage.pagination import BuildDateCreatedCursor
+
+# Valid status transitions
+_VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
+    BuildStatus.pending: {BuildStatus.processing, BuildStatus.failed},
+    BuildStatus.processing: {BuildStatus.completed, BuildStatus.failed},
+}
+
+
+class BuildStore:
+    """Direct database operations for builds."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> None:
+        self._session = session
+        self._logger = logger
+
+    async def create(
+        self,
+        *,
+        project_id: int,
+        project_slug: str,
+        data: BuildCreate,
+        uploader: str,
+    ) -> Build:
+        """Insert a new build row with status=pending.
+
+        The ``public_id`` is a time-ordered Crockford Base32 resource ID
+        minted at insert time. Because that ID is embedded in ``staging_key``
+        and ``storage_prefix``, the object-store keys are recomputed for each
+        mint attempt inside :func:`insert_with_time_ordered_public_id`, which
+        re-mints on the (rare) same-millisecond ``public_id`` collision.
+        """
+
+        def _make_row(public_id: int) -> SqlBuild:
+            base32_str = serialize_base32_id(public_id)
+            return SqlBuild(
+                public_id=public_id,
+                project_id=project_id,
+                git_ref=data.git_ref,
+                alternate_name=data.alternate_name,
+                content_hash=data.content_hash,
+                status=BuildStatus.pending,
+                staging_key=f"__staging/{base32_str}.tar.gz",
+                storage_prefix=f"{project_slug}/__builds/{base32_str}/",
+                uploader=uploader,
+                annotations=(
+                    data.annotations.model_dump(mode="json", exclude_none=True)
+                    if data.annotations is not None
+                    else None
+                ),
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
+        )
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
+    async def get_by_id(self, build_id: int) -> Build | None:
+        """Fetch a build by internal ID."""
+        result = await self._session.execute(
+            select(SqlBuild).where(SqlBuild.id == build_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
+    async def get_by_public_id(
+        self, *, project_id: int, public_id: int
+    ) -> Build | None:
+        """Fetch a build by project_id and public_id."""
+        result = await self._session.execute(
+            select(SqlBuild).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.public_id == public_id,
+                SqlBuild.date_deleted.is_(None),
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
+    async def list_all_by_project_ids(
+        self, project_ids: list[int]
+    ) -> list[Build]:
+        """List every non-deleted build across the given projects.
+
+        Single-query batch over multiple projects, ordered by
+        ``(project_id, id)`` for stable iteration. Used by the
+        ``lifecycle_eval`` per-org worker to load every project's
+        builds in one round-trip rather than N. Passing an empty
+        ``project_ids`` returns ``[]`` without hitting the database.
+        """
+        if not project_ids:
+            return []
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id.in_(project_ids),
+                SqlBuild.date_deleted.is_(None),
+            )
+            .order_by(SqlBuild.project_id, SqlBuild.id)
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
+
+    async def list_pending_older_than(
+        self,
+        *,
+        project_id: int,
+        git_ref: str,
+        uploader: str,
+        older_than: datetime,
+    ) -> list[Build]:
+        """Return stale ``pending`` builds matching the given filters.
+
+        Filters by ``(project_id, git_ref, uploader)`` and returns rows
+        whose ``date_created`` is strictly before ``older_than``. The
+        keeper-sync engine uses this to find placeholder builds left
+        behind by a run that crashed between placeholder creation and
+        finalize, so they can be transitioned to ``failed`` before a
+        retry creates a fresh placeholder. Soft-deleted rows are
+        excluded.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+                SqlBuild.uploader == uploader,
+                SqlBuild.status == BuildStatus.pending,
+                SqlBuild.date_created < older_than,
+                SqlBuild.date_deleted.is_(None),
+            )
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
+
+    async def get_completed_by_content_hash(
+        self, *, project_id: int, content_hash: str
+    ) -> Build | None:
+        """Return the oldest non-deleted ``completed`` build with this hash.
+
+        Used by the keeper-sync engine for dual-upload convergence:
+        when an inbound LTD build's content hash matches a build that
+        already exists in Docverse for the same project (typically from
+        a direct Docverse upload), the sync links its state row to that
+        build instead of re-copying the same content into a fresh row.
+        Soft-deleted rows and builds that haven't reached ``completed``
+        are excluded so the linked-to row is canonical and stable.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.content_hash == content_hash,
+                SqlBuild.status == BuildStatus.completed,
+                SqlBuild.date_deleted.is_(None),
+            )
+            .order_by(SqlBuild.date_created.asc(), SqlBuild.id.asc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
+    async def get_latest_build_id_for_ref(
+        self, *, project_id: int, git_ref: str
+    ) -> int | None:
+        """Return the max build id for a ``(project_id, git_ref)`` pair.
+
+        Used by the ``build_processing`` stale-build guard: a job whose
+        build id is less than the latest known id for the same ref has
+        been superseded and must skip its expensive work. Includes
+        soft-deleted rows so a deletion mid-processing cannot make a
+        superseded build look current.
+        """
+        result = await self._session.execute(
+            select(func.max(SqlBuild.id)).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def list_by_project(
+        self,
+        project_id: int,
+        *,
+        cursor: BuildDateCreatedCursor | None = None,
+        limit: int,
+        status: BuildStatus | None = None,
+    ) -> CountedPaginatedList[Build, BuildDateCreatedCursor]:
+        """List non-deleted builds for a project with pagination."""
+        stmt = select(SqlBuild).where(
+            SqlBuild.project_id == project_id,
+            SqlBuild.date_deleted.is_(None),
+        )
+        if status is not None:
+            stmt = stmt.where(SqlBuild.status == status)
+        runner = CountedPaginatedQueryRunner(
+            entry_type=Build, cursor_type=BuildDateCreatedCursor
+        )
+        return await runner.query_object(
+            self._session, stmt, cursor=cursor, limit=limit
+        )
+
+    async def transition_status(
+        self,
+        *,
+        build_id: int,
+        new_status: BuildStatus,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
+    ) -> Build:
+        """Transition a build to a new status.
+
+        Validates the transition is allowed. Sets ``date_uploaded`` on
+        transition to ``processing`` and ``date_completed`` on transition
+        to ``completed`` or ``failed``.
+
+        ``org_slug`` / ``project_slug`` / ``edition_slug`` are optional
+        API-facing identifiers carried into :class:`InvalidBuildStateError`
+        so a Sentry triager sees slugs rather than internal row ids.
+
+        Raises
+        ------
+        InvalidBuildStateError
+            If the build is not found or the transition is not valid.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(SqlBuild.id == build_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise InvalidBuildStateError(
+                target_state=new_status.value,
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=f"Build id={build_id} not found",
+            )
+
+        current = BuildStatus(row.status)
+        build_public_id = serialize_base32_id(row.public_id)
+        allowed = _VALID_TRANSITIONS.get(current, set())
+        if new_status not in allowed:
+            raise InvalidBuildStateError(
+                current_state=current.value,
+                target_state=new_status.value,
+                build_public_id=build_public_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+            )
+
+        row.status = new_status
+        now = datetime.now(tz=UTC)
+
+        if new_status == BuildStatus.processing:
+            row.date_uploaded = now
+        elif new_status in (BuildStatus.completed, BuildStatus.failed):
+            row.date_completed = now
+
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
+    async def update_inventory(
+        self,
+        *,
+        build_id: int,
+        object_count: int,
+        total_size_bytes: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
+    ) -> Build:
+        """Update the inventory counts for a build."""
+        result = await self._session.execute(
+            select(SqlBuild).where(SqlBuild.id == build_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise InvalidBuildStateError(
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=f"Build id={build_id} not found",
+            )
+        row.object_count = object_count
+        row.total_size_bytes = total_size_bytes
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
+    async def update_content_hash(
+        self,
+        *,
+        build_id: int,
+        content_hash: str,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
+    ) -> Build:
+        """Overwrite the content hash on a build row.
+
+        Used by the keeper-sync engine: the synced build is created
+        with a placeholder hash before the bucket-to-bucket copy runs,
+        then this method writes the deterministic manifest hash the
+        copier produces. The regular upload-signalling path never
+        needs this — the client supplies the hash up front.
+
+        Only permitted while the build is ``pending``; once it has
+        moved to ``processing`` or beyond, the hash is part of the
+        committed build identity and must not change.
+
+        Raises
+        ------
+        InvalidBuildStateError
+            If the build is not found or is not in ``pending`` status.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(SqlBuild.id == build_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise InvalidBuildStateError(
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=f"Build id={build_id} not found",
+            )
+        if row.status != BuildStatus.pending:
+            current = BuildStatus(row.status)
+            raise InvalidBuildStateError(
+                current_state=current.value,
+                target_state=BuildStatus.pending.value,
+                build_public_id=serialize_base32_id(row.public_id),
+                org_slug=org_slug,
+                project_slug=project_slug,
+                edition_slug=edition_slug,
+                message=(
+                    f"Cannot update content hash on build "
+                    f"{serialize_base32_id(row.public_id)}: "
+                    f"status is {current.value!r}, expected "
+                    f"{BuildStatus.pending.value!r}"
+                ),
+            )
+        row.content_hash = content_hash
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
+    async def soft_delete(self, *, build_id: int) -> bool:
+        """Soft-delete a build by setting date_deleted.
+
+        Returns
+        -------
+        bool
+            True if the build was soft-deleted, False if not found.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(
+                SqlBuild.id == build_id,
+                SqlBuild.date_deleted.is_(None),
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        row.date_deleted = func.now()
+        await self._session.flush()
+        return True

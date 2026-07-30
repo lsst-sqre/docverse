@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import pytest
 
-from docverse.storage.github import (
+from docverse_server.storage.github import (
     InstallationAuth,
     extract_changed_paths_from_push,
     fetch_changed_paths_from_compare,

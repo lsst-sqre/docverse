@@ -26,4 +26,4 @@ test:
 
 .PHONY: run
 run:
-	uv run uvicorn docverse.main:app --reload --port 8080
+	uv run uvicorn docverse_server.main:app --reload --port 8080

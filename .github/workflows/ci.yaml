@@ -146,15 +146,15 @@ jobs:
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
     with:
       images: ghcr.io/${{ github.repository }}
-      # Only push on server releases and ticket branch PRs (exclude client
-      # releases). Non-matching PRs still build the image as validation but
+      # Only push on server releases (tags like "server/0.1.0") and ticket
+      # branch PRs. Non-matching PRs still build the image as validation but
       # skip the push + manifest steps — this lets the required
       # `build / manifest` check report as "Skipped" (which counts as
       # passing) instead of hanging in "Expected" forever on dependabot
       # and similar PRs.
       push: >-
         ${{ (github.event_name == 'release'
-             && !startsWith(github.event.release.tag_name, 'client/'))
+             && startsWith(github.event.release.tag_name, 'server/'))
             || (github.event_name != 'merge_group'
                 && (startsWith(github.head_ref, 'tickets/')
                     || startsWith(github.head_ref, 't/'))) }}
@@ -183,7 +183,7 @@ jobs:
     needs: [lint, test, client-test, client-test-packaging]
     environment:
       name: pypi
-      url: https://pypi.org/p/docverse-client
+      url: https://pypi.org/p/docverse
     permissions:
       id-token: write
     if: >

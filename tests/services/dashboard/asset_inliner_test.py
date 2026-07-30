@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from docverse.services.dashboard.asset_inliner import AssetInliner
-from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
-from docverse.storage.dashboard_templates.template_source import (
+from docverse_server.services.dashboard.asset_inliner import AssetInliner
+from docverse_server.storage.dashboard_templates.builtin import (
+    BuiltInTemplateSource,
+)
+from docverse_server.storage.dashboard_templates.template_source import (
     ParsedTemplateConfig,
 )
 

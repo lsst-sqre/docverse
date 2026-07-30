@@ -15,27 +15,34 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     JobKind,
     KeeperSyncConfig,
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.queue_job import SqlQueueJob
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.domain.queue import JobStatus
-from docverse.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
-from docverse.storage.keeper_sync import (
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.queue import JobStatus
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.services.keeper_sync_tombstone import (
+    KeeperSyncTombstoneService,
+)
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.keeper_sync import keeper_sync_run_discovery
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.keeper_sync import (
+    keeper_sync_run_discovery,
+)
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 

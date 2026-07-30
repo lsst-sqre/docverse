@@ -9,10 +9,13 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
-from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
-from docverse.storage.keeper_sync import KeeperSyncStateStore, ResourceType
-from docverse.storage.organization_store import OrganizationStore
+from docverse.models import OrganizationCreate
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 async def _seed_org(session: AsyncSession, *, slug: str = "ks-state") -> int:

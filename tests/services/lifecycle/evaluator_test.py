@@ -14,19 +14,19 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from docverse.client.models import EditionKind, TrackingMode
-from docverse.client.models.builds import BuildStatus
-from docverse.domain.base32id import Base32Id
-from docverse.domain.build import Build
-from docverse.domain.edition import Edition
-from docverse.domain.edition_build_history import EditionBuildHistory
-from docverse.domain.lifecycle import (
+from docverse.models import EditionKind, TrackingMode
+from docverse.models.builds import BuildStatus
+from docverse_server.domain.base32id import Base32Id
+from docverse_server.domain.build import Build
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     LifecycleRuleSet,
     RefDeletedRule,
 )
-from docverse.services.lifecycle import (
+from docverse_server.services.lifecycle import (
     LifecycleEvaluationContext,
     evaluate_lifecycle,
     filter_rule_set,

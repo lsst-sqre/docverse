@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from docverse.client.models import (
+from docverse.models import (
     BuildProcessingProgress,
     EditionUpdateRef,
     PublishJobRef,
     QueueJob,
 )
-from docverse.client.models.queue_enums import JobKind, JobStatus
+from docverse.models.queue_enums import JobKind, JobStatus
 
 
 def _build_processing_progress() -> dict[str, object]:

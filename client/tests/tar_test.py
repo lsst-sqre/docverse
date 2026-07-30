@@ -1,4 +1,4 @@
-"""Tests for docverse.client._tar."""
+"""Tests for docverse._tar."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import re
 import tarfile
 from pathlib import Path
 
-from docverse.client._tar import create_tarball
+from docverse._tar import create_tarball
 
 
 def test_create_tarball(tmp_path: Path) -> None:

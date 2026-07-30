@@ -1,7 +1,7 @@
 """Shared fixtures and helpers for ``tests/worker``.
 
 The ``make_worker_ctx`` helper here matches the dependency wiring
-``docverse.worker.main.startup`` performs in production: it builds a
+``docverse_server.worker.main.startup`` performs in production: it builds a
 ``WorkerFactoryBuilder`` capturing the supplied process-lifetime deps
 (or sensible test defaults) and returns a ctx dict with the same shape
 each worker function expects (``factory_builder`` plus the ``http_client``
@@ -18,10 +18,10 @@ from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import MockArqQueue
 
-from docverse.config import Configuration
-from docverse.metrics.events import DocverseEvents
-from docverse.services.credential_encryptor import CredentialEncryptor
-from docverse.worker.main import WorkerFactoryBuilder
+from docverse_server.config import Configuration
+from docverse_server.metrics.events import DocverseEvents
+from docverse_server.services.credential_encryptor import CredentialEncryptor
+from docverse_server.worker.main import WorkerFactoryBuilder
 
 __all__ = ["make_worker_ctx"]
 

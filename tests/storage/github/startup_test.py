@@ -11,7 +11,7 @@ import structlog
 from pydantic import SecretStr
 from structlog.testing import capture_logs
 
-from docverse.storage.github import validate_github_app
+from docverse_server.storage.github import validate_github_app
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 

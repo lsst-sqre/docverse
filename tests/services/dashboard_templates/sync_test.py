@@ -10,20 +10,20 @@ import structlog
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
-from docverse.exceptions import NotFoundError
-from docverse.services.dashboard_templates import sync as sync_module
-from docverse.services.dashboard_templates.sync import (
+from docverse.models import OrganizationCreate
+from docverse_server.exceptions import NotFoundError
+from docverse_server.services.dashboard_templates import sync as sync_module
+from docverse_server.services.dashboard_templates.sync import (
     DashboardSyncStatus,
     DashboardTemplateSyncer,
 )
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
 )
-from docverse.storage.github import GitHubAppClient, InstallationAuth
-from docverse.storage.organization_store import OrganizationStore
+from docverse_server.storage.github import GitHubAppClient, InstallationAuth
+from docverse_server.storage.organization_store import OrganizationStore
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 _VALID_TEMPLATE_TOML = b"""\

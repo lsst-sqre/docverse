@@ -6,13 +6,15 @@ import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
     GitHubTemplateSource,
 )
-from docverse.storage.dashboard_templates.template_source import TemplateSource
+from docverse_server.storage.dashboard_templates.template_source import (
+    TemplateSource,
+)
 
 _KEY = GitHubTemplateKey(
     github_owner="acme",

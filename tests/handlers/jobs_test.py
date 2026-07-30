@@ -10,7 +10,7 @@ from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.http import PaginationLinkData
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
@@ -18,18 +18,18 @@ from docverse.client.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.domain.base32id import (
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.domain.base32id import (
     generate_base32_id,
     serialize_base32_id,
     validate_base32_id,
 )
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
 from tests.conftest import seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"

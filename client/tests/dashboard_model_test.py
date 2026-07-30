@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from docverse.client.models import (
+from docverse.models import (
     OrgDashboardRebuildEntry,
     OrgDashboardRebuildResponse,
 )

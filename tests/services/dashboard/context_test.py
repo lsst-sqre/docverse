@@ -13,7 +13,7 @@ from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import (
+from docverse.models import (
     BuildCreate,
     EditionKind,
     OrganizationCreate,
@@ -21,15 +21,15 @@ from docverse.client.models import (
     TrackingMode,
     UrlScheme,
 )
-from docverse.dbschema.edition import SqlEdition
-from docverse.domain.organization import Organization
-from docverse.domain.project import Project
-from docverse.domain.published_url import project_published_url
-from docverse.services.dashboard.context import DashboardContextBuilder
-from docverse.storage.build_store import BuildStore
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.domain.organization import Organization
+from docverse_server.domain.project import Project
+from docverse_server.domain.published_url import project_published_url
+from docverse_server.services.dashboard.context import DashboardContextBuilder
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 _HASH = "sha256:" + "a" * 64
 

@@ -10,24 +10,26 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.client.models import (
+from docverse.models import (
     EditionCreate,
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
-from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
-from docverse.exceptions import NotFoundError
-from docverse.services.keeper_sync_tombstone import KeeperSyncTombstoneService
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.keeper_sync import (
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.exceptions import NotFoundError
+from docverse_server.services.keeper_sync_tombstone import (
+    KeeperSyncTombstoneService,
+)
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 
 
 async def _seed_org(session: AsyncSession, *, slug: str = "ks-tomb") -> int:

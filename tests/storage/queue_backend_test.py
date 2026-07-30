@@ -3,7 +3,7 @@
 import pytest
 from safir.arq import MockArqQueue
 
-from docverse.storage.queue_backend import ArqQueueBackend
+from docverse_server.storage.queue_backend import ArqQueueBackend
 from tests.support.arq_testing import get_jobs_by_name
 
 

@@ -1,5 +1,5 @@
 [project]
-name = "docverse"
+name = "docverse-server"
 description = "Docverse documentation hosting platform server."
 license = "MIT"
 readme = "README.md"
@@ -9,7 +9,7 @@ dependencies = [
     "aiobotocore>=2.18",
     "click>=8",
     "cryptography>=48.0.1",
-    "docverse-client",
+    "docverse",
     # FastAPI 0.140 made Dependant a slots dataclass; FastStream's FastAPI
     # plugin monkey-patches attributes onto Dependant and now raises
     # AttributeError at import/startup.
@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
-docverse-admin = "docverse.cli:main_with_sentry"
+docverse-admin = "docverse_server.cli:main_with_sentry"
 
 [build-system]
 requires = [
@@ -64,10 +64,11 @@ nox = [
 members = ["client"]
 
 [tool.uv.sources]
-docverse-client = { workspace = true }
+docverse = { workspace = true }
 
 [tool.setuptools_scm]
-# Match server release tags (e.g. "3.0.0")
+# Match server release tags (e.g. "server/0.1.0"). The explicit tag_regex is
+# required because setuptools_scm's default cannot parse slash-prefixed tags.
 git_describe_command = [
     "git",
     "describe",
@@ -75,15 +76,16 @@ git_describe_command = [
     "--tags",
     "--long",
     "--match",
-    "[0-9]*",
+    "server/[0-9]*",
 ]
+tag_regex = '^server/(?P<version>[0-9].*)$'
 fallback_version = "0.0.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-"docverse.storage.dashboard_templates.builtin" = [
+"docverse_server.storage.dashboard_templates.builtin" = [
     "*.toml",
     "*.jinja",
     "*.html",
@@ -103,27 +105,23 @@ extend = "ruff-shared.toml"
 # not linted and will be removed once the migration is complete.
 extend-exclude = ["keeper"]
 
-[tool.ruff.lint]
-ignore = [
-    "INP001",  # Implicit namespace package (intentional for docverse).
-]
-
 [tool.ruff.lint.isort]
-# docverse-client is a separately-distributed but co-developed package sharing
-# the docverse namespace (docverse.client.*); group its imports as first-party.
-# The shared ruff-shared.toml intentionally carries no known-first-party, so this
-# repo-specific declaration lives here (matches gafaelfawr/nublado convention).
-known-first-party = ["docverse", "docverse.client", "tests"]
+# ``docverse`` is the separately-distributed but co-developed client package
+# (it owns the plain ``docverse`` import root); ``docverse_server`` is this
+# server package. Group both as first-party. The shared ruff-shared.toml
+# intentionally carries no known-first-party, so this repo-specific
+# declaration lives here (matches gafaelfawr/nublado convention).
+known-first-party = ["docverse", "docverse_server", "tests"]
 
 [tool.ruff.lint.extend-per-file-ignores]
-"src/docverse/cli.py" = [
+"src/docverse_server/cli.py" = [
     "A001",   # Shadowing builtin (help command).
     "ARG001", # Unused function argument (Click pattern).
     "D103",   # Missing docstring in public function (Click commands).
     "S603",   # Subprocess call with variable args (deploy-worker).
     "S607",   # Partial executable path (alembic CLI).
 ]
-"src/docverse/handlers/**" = [
+"src/docverse_server/handlers/**" = [
     "D103",  # Missing docstring in public function (handlers).
 ]
 "tests/**" = [
@@ -154,7 +152,7 @@ known-first-party = ["docverse", "docverse.client", "tests"]
     "INP001",  # Alembic versions directory has no __init__.py.
     "D103",    # Missing docstring in public function.
 ]
-"src/docverse/worker/**" = [
+"src/docverse_server/worker/**" = [
     "ARG001",  # ctx argument required by arq worker signatures.
     "RUF012", # Mutable class attributes required by arq WorkerSettings.
 ]
@@ -163,8 +161,6 @@ known-first-party = ["docverse", "docverse.client", "tests"]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 ignore_missing_imports = true
-namespace_packages = true
-explicit_package_bases = true
 mypy_path = ["src", "client/src"]
 strict = true
 plugins = ["pydantic.mypy"]
@@ -189,7 +185,7 @@ asyncio_mode = "strict"
 [tool.coverage.run]
 parallel = true
 branch = true
-source = ["docverse"]
+source = ["docverse_server"]
 
 [tool.coverage.paths]
 source = ["src"]

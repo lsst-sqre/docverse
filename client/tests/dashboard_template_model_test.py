@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.client.models import DashboardTemplateBindingCreate
-from docverse.client.models.dashboard_template import normalize_github_ref
+from docverse.models import DashboardTemplateBindingCreate
+from docverse.models.dashboard_template import normalize_github_ref
 
 
 @pytest.mark.parametrize(

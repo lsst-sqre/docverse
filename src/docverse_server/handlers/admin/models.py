@@ -1,0 +1,108 @@
+"""Handler-level response models for admin endpoints."""
+
+from __future__ import annotations
+
+from typing import Self
+
+from pydantic import Field
+from starlette.requests import Request
+
+from docverse.models import Organization as _OrganizationBase
+from docverse.models import OrganizationServiceSummary
+from docverse.models._examples import EXAMPLE_API_URL, EXAMPLE_ORG_URL
+from docverse_server.domain.organization import (
+    Organization as OrganizationDomain,
+)
+from docverse_server.domain.organization_service import (
+    OrganizationService as OrganizationServiceDomain,
+)
+
+
+class AdminOrganization(_OrganizationBase):
+    """Admin organization response model with HATEOAS self_url.
+
+    Distinct from the orgs-scoped ``Organization`` model: the admin
+    shape adds ``org_url`` (a link to the org-scoped endpoint) and omits
+    the orgs sub-collection links, so it registers as its own schema.
+    """
+
+    self_url: str = Field(
+        description="URL to this admin organization resource.",
+        examples=[f"{EXAMPLE_API_URL}/admin/orgs/lsst"],
+    )
+
+    org_url: str = Field(
+        description="URL to the org-scoped API endpoint.",
+        examples=[EXAMPLE_ORG_URL],
+    )
+
+    @classmethod
+    def from_domain(
+        cls,
+        domain: OrganizationDomain,
+        request: Request,
+        *,
+        services: list[OrganizationServiceDomain] | None = None,
+    ) -> Self:
+        """Create from a domain object, adding the self_url.
+
+        Parameters
+        ----------
+        domain
+            The organization domain model.
+        request
+            The current request (for URL generation).
+        services
+            All services for this org, used to build embedded
+            service summaries for the slot assignments.
+        """
+        # Build a lookup of services by label
+        svc_by_label: dict[str, OrganizationServiceDomain] = {}
+        if services:
+            svc_by_label = {s.label: s for s in services}
+
+        def _make_summary(
+            label: str | None,
+        ) -> OrganizationServiceSummary | None:
+            if label is None or label not in svc_by_label:
+                return None
+            svc = svc_by_label[label]
+            return OrganizationServiceSummary(
+                self_url=str(
+                    request.url_for(
+                        "get_service", org=domain.slug, service=svc.label
+                    )
+                ),
+                label=svc.label,
+                category=svc.category,
+                provider=svc.provider,
+            )
+
+        return cls(
+            self_url=str(
+                request.url_for("admin_get_organization", org=domain.slug)
+            ),
+            org_url=str(request.url_for("get_organization", org=domain.slug)),
+            dashboard_template_url=str(
+                request.url_for("get_org_dashboard_template", org=domain.slug)
+            ),
+            keeper_sync_url=str(
+                request.url_for("get_org_keeper_sync_config", org=domain.slug)
+            ),
+            slug=domain.slug,
+            title=domain.title,
+            base_domain=domain.base_domain,
+            url_scheme=domain.url_scheme,
+            root_path_prefix=domain.root_path_prefix,
+            slug_rewrite_rules=domain.slug_rewrite_rules,
+            lifecycle_rules=domain.lifecycle_rules,
+            purgatory_retention=int(
+                domain.purgatory_retention.total_seconds()
+            ),
+            publishing_store=_make_summary(domain.publishing_store_label),
+            staging_store=_make_summary(domain.staging_store_label),
+            cdn_service=_make_summary(domain.cdn_service_label),
+            dns_service=_make_summary(domain.dns_service_label),
+            date_created=domain.date_created,
+            date_updated=domain.date_updated,
+        )

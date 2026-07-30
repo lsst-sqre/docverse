@@ -13,8 +13,8 @@ from typing import Any
 from arq.cron import CronJob
 from arq.worker import Function
 
-from docverse.config import Configuration
-from docverse.worker.functions import (
+from docverse_server.config import Configuration
+from docverse_server.worker.functions import (
     build_processing_reaper,
     dashboard_build_reaper,
     dashboard_sync_reaper,
@@ -25,14 +25,14 @@ from docverse.worker.functions import (
     project_github_resolve,
     publish_edition_reaper,
 )
-from docverse.worker.main import (
+from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
     MaintenanceWorkerSettings,
     WorkerSettings,
     shutdown,
     startup_maintenance,
 )
-from docverse.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 _config = Configuration()
 

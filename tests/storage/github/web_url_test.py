@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from docverse.storage.github import build_github_browse_url
+from docverse_server.storage.github import build_github_browse_url
 
 
 def test_root_path_omits_path_segment() -> None:

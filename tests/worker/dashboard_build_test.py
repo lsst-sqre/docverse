@@ -15,32 +15,32 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.client.models import (
+from docverse.models import (
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
-from docverse.config import Configuration
-from docverse.dbschema.organization import SqlOrganization
-from docverse.domain.base32id import serialize_base32_id
-from docverse.domain.queue import JobKind, JobStatus
-from docverse.factory import Factory
-from docverse.metrics import build_event_manager
-from docverse.services.lock_service import LockClass, LockKey
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.config import Configuration
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.factory import Factory
+from docverse_server.metrics import build_event_manager
+from docverse_server.services.lock_service import LockClass, LockKey
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
 )
-from docverse.storage.edition_store import EditionStore
-from docverse.storage.objectstore import MockObjectStore
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
-from docverse.worker.functions.dashboard_build import dashboard_build
+from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions.dashboard_build import dashboard_build
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
 

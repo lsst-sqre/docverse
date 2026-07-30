@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from docverse.client.models import (
+from docverse.models import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     LifecycleRuleSet,
     ProjectCreate,
     RefDeletedRule,
 )
-from docverse.client.models.lifecycle import LifecycleRule
+from docverse.models.lifecycle import LifecycleRule
 
 _lifecycle_rule_adapter: TypeAdapter[object] = TypeAdapter(LifecycleRule)
 

@@ -8,22 +8,22 @@ from sqlalchemy import Table
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate, ProjectCreate
-from docverse.client.models.queue_enums import JobKind
-from docverse.dbschema.dashboard_github_template_binding import (
+from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models.queue_enums import JobKind
+from docverse_server.dbschema.dashboard_github_template_binding import (
     SqlDashboardGitHubTemplateBinding,
 )
-from docverse.domain.base32id import serialize_base32_id
-from docverse.storage.dashboard_templates.github import (
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
     GitHubTemplateFileInput,
     GitHubTemplateKey,
 )
-from docverse.storage.organization_store import OrganizationStore
-from docverse.storage.project_store import ProjectStore
-from docverse.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
 
 
 async def _seed_org_and_project(

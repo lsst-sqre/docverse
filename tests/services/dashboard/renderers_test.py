@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from docverse.client.models import EditionKind
-from docverse.domain.dashboard_context import (
+from docverse.models import EditionKind
+from docverse_server.domain.dashboard_context import (
     AssetsContext,
     BuildContext,
     DashboardContext,
@@ -18,14 +18,16 @@ from docverse.domain.dashboard_context import (
     OrgContext,
     ProjectContext,
 )
-from docverse.services.dashboard.renderers import (
+from docverse_server.services.dashboard.renderers import (
     DashboardHtmlRenderer,
     EditionJsonRenderer,
     ErrorPageRenderer,
     SwitcherJsonRenderer,
 )
-from docverse.storage.dashboard_templates.builtin import BuiltInTemplateSource
-from docverse.storage.dashboard_templates.template_source import (
+from docverse_server.storage.dashboard_templates.builtin import (
+    BuiltInTemplateSource,
+)
+from docverse_server.storage.dashboard_templates.template_source import (
     DashboardTemplateConfig,
     ParsedTemplateConfig,
     Switcher404Config,

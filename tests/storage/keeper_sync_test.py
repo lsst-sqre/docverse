@@ -9,11 +9,14 @@ import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.client.models import OrganizationCreate
-from docverse.dbschema.keeper_sync_run import SqlKeeperSyncRun
-from docverse.dbschema.keeper_sync_state import SqlKeeperSyncState
-from docverse.domain.base32id import generate_base32_id, validate_base32_id
-from docverse.storage.organization_store import OrganizationStore
+from docverse.models import OrganizationCreate
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    validate_base32_id,
+)
+from docverse_server.storage.organization_store import OrganizationStore
 
 
 def _make_run(**kwargs: Any) -> SqlKeeperSyncRun:
