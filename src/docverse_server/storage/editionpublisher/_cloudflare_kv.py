@@ -54,6 +54,7 @@ class CloudflareKvEditionPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: str,
     ) -> None:
         """Write the edition pointer to the configured KV namespace."""
         url = (
@@ -63,13 +64,16 @@ class CloudflareKvEditionPublisher:
             f"/values/{project_slug}/{edition_slug}"
         )
         # The Cloudflare Worker resolver reads the object-store prefix
-        # from the ``r2_prefix`` KV field; see cloudflare-worker/src/
-        # resolver.ts.
+        # from the ``r2_prefix`` KV field and the edge cache policy from
+        # ``cache_profile``; see cloudflare-worker/src/resolver.ts. The
+        # ``cache_profile`` field is additive — a Worker that predates it
+        # falls back to the short profile.
         response = await self._http_client.put(
             url,
             json={
                 "build_id": build_public_id,
                 "r2_prefix": object_key_prefix,
+                "cache_profile": cache_profile,
             },
             headers={"Authorization": f"Bearer {self._api_token}"},
         )

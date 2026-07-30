@@ -36,6 +36,7 @@ class EditionPublisher(Protocol):
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: str,
     ) -> None:
         """Publish an edition pointer to the backing store.
 
@@ -50,6 +51,12 @@ class EditionPublisher(Protocol):
         object_key_prefix
             Object-store key prefix for the build's rendered artifacts
             (e.g. an R2 or S3 prefix).
+        cache_profile
+            Edge cache profile for the edition (``"long"`` or
+            ``"short"``), derived by
+            `docverse_server.domain.cache_profile.compute_cache_profile`.
+            Implementations record it alongside the pointer so the CDN
+            layer can choose a ``Cache-Control`` policy per edition.
         """
         ...
 

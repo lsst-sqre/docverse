@@ -95,8 +95,15 @@ class _FailingPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: str,
     ) -> None:
-        _ = (project_slug, edition_slug, build_public_id, object_key_prefix)
+        _ = (
+            project_slug,
+            edition_slug,
+            build_public_id,
+            object_key_prefix,
+            cache_profile,
+        )
         raise self._exc
 
     async def unpublish(
@@ -865,6 +872,7 @@ class _RecordingMockEditionPublisher(MockEditionPublisher):
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: str,
     ) -> None:
         self._publish_timestamps.append(time.monotonic())
         await super().publish(
@@ -872,6 +880,7 @@ class _RecordingMockEditionPublisher(MockEditionPublisher):
             edition_slug=edition_slug,
             build_public_id=build_public_id,
             object_key_prefix=object_key_prefix,
+            cache_profile=cache_profile,
         )
 
 

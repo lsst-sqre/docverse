@@ -46,6 +46,7 @@ async def test_publish_issues_put_to_kv_endpoint() -> None:
             edition_slug="main",
             build_public_id="ABC123",
             object_key_prefix="myproject/__builds/ABC123/",
+            cache_profile="long",
         )
 
     request = seen["request"]
@@ -60,6 +61,32 @@ async def test_publish_issues_put_to_kv_endpoint() -> None:
     assert json.loads(request.content) == {
         "build_id": "ABC123",
         "r2_prefix": "myproject/__builds/ABC123/",
+        "cache_profile": "long",
+    }
+
+
+@pytest.mark.asyncio
+async def test_publish_writes_short_cache_profile() -> None:
+    seen: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = request
+        return httpx.Response(200, json={"success": True})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        await pub.publish(
+            project_slug="myproject",
+            edition_slug="tickets-dm-1",
+            build_public_id="ABC123",
+            object_key_prefix="myproject/__builds/ABC123/",
+            cache_profile="short",
+        )
+
+    assert json.loads(seen["request"].content) == {
+        "build_id": "ABC123",
+        "r2_prefix": "myproject/__builds/ABC123/",
+        "cache_profile": "short",
     }
 
 
@@ -76,6 +103,7 @@ async def test_publish_raises_on_4xx() -> None:
                 edition_slug="e",
                 build_public_id="B",
                 object_key_prefix="p/__builds/B/",
+                cache_profile="long",
             )
 
 
@@ -92,6 +120,7 @@ async def test_publish_raises_on_5xx() -> None:
                 edition_slug="e",
                 build_public_id="B",
                 object_key_prefix="p/__builds/B/",
+                cache_profile="long",
             )
 
 

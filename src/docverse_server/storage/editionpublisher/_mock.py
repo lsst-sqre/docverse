@@ -19,6 +19,7 @@ class PublishCall:
     edition_slug: str
     build_public_id: str
     object_key_prefix: str
+    cache_profile: str
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ class MockEditionPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: str,
     ) -> None:
         """Record a publish call."""
         self._calls.append(
@@ -80,6 +82,7 @@ class MockEditionPublisher:
                 edition_slug=edition_slug,
                 build_public_id=build_public_id,
                 object_key_prefix=object_key_prefix,
+                cache_profile=cache_profile,
             )
         )
 

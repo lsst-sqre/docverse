@@ -9,6 +9,7 @@ import structlog
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
+from docverse_server.domain.cache_profile import compute_cache_profile
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.storage.edition_build_history_store import (
@@ -73,6 +74,10 @@ class EditionPublishingService:
         ``EditionPublisher`` is resolved via ``publisher_provider`` and
         used as an async context manager to publish the pointer.
 
+        The edge cache profile written with the pointer is derived from
+        the edition's ``kind`` (see
+        `docverse_server.domain.cache_profile.compute_cache_profile`).
+
         On a successful publish both the edition row and the supplied
         history entry are updated to ``PublishStatus.published``. When
         the publisher raises, the exception propagates — the caller is
@@ -101,6 +106,7 @@ class EditionPublishingService:
             )
             return
 
+        cache_profile = compute_cache_profile(edition.kind)
         publisher = await self._publisher_provider(
             org_id=org_id, service_label=org.cdn_service_label
         )
@@ -110,6 +116,7 @@ class EditionPublishingService:
                 edition_slug=edition.slug,
                 build_public_id=serialize_base32_id(build.public_id),
                 object_key_prefix=build.storage_prefix,
+                cache_profile=cache_profile,
             )
         await self._mark_published(
             edition_id=edition.id, history_id=history_entry.id
@@ -121,6 +128,7 @@ class EditionPublishingService:
             edition_slug=edition.slug,
             build_id=build.id,
             cdn_service_label=org.cdn_service_label,
+            cache_profile=cache_profile,
         )
 
     async def unpublish(

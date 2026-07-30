@@ -66,8 +66,15 @@ class _FailingPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: str,
     ) -> None:
-        _ = (project_slug, edition_slug, build_public_id, object_key_prefix)
+        _ = (
+            project_slug,
+            edition_slug,
+            build_public_id,
+            object_key_prefix,
+            cache_profile,
+        )
         raise self._exc
 
     async def unpublish(
@@ -119,6 +126,7 @@ async def _setup(
     *,
     org_slug: str,
     cdn_service_label: str | None = None,
+    edition_kind: EditionKind = EditionKind.release,
 ) -> tuple[int, Edition, Build, EditionBuildHistory]:
     logger = _logger()
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -152,7 +160,7 @@ async def _setup(
         data=EditionCreate(
             slug="main",
             title="Latest",
-            kind=EditionKind.release,
+            kind=edition_kind,
             tracking_mode=TrackingMode.git_ref,
             tracking_params={"git_ref": "main"},
         ),
@@ -323,6 +331,7 @@ async def test_publish_successful_calls_publisher_and_marks_published(
     assert call.edition_slug == edition.slug
     assert call.build_public_id == serialize_base32_id(build.public_id)
     assert call.object_key_prefix == build.storage_prefix
+    assert call.cache_profile == "long"
 
     async with db_session.begin():
         refreshed = await _fetch_edition(
@@ -331,3 +340,30 @@ async def test_publish_successful_calls_publisher_and_marks_published(
         assert refreshed.publish_status == PublishStatus.published
         refreshed_history = await _fetch_history(db_session, edition.id)
         assert refreshed_history.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_publish_draft_edition_uses_short_cache_profile(
+    db_session: AsyncSession,
+) -> None:
+    """A draft edition's pointer carries the short cache profile."""
+    mock_publisher = MockEditionPublisher()
+    service = _make_service(db_session, publisher=mock_publisher)
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="draft-pub-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.draft,
+        )
+        await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
+        await db_session.commit()
+
+    assert len(mock_publisher.calls) == 1
+    assert mock_publisher.calls[0].cache_profile == "short"
