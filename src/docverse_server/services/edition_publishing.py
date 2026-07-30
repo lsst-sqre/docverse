@@ -9,9 +9,15 @@ import structlog
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
-from docverse_server.domain.cache_profile import compute_cache_profile
+from docverse_server.domain.cache_profile import (
+    CACHE_PROFILE_LONG,
+    compute_cache_profile,
+)
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.organization import Organization
+from docverse_server.domain.published_url import compute_project_hostname
+from docverse_server.storage.cdncachepurger import CdnCachePurger
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -19,7 +25,11 @@ from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.editionpublisher import EditionPublisher
 from docverse_server.storage.organization_store import OrganizationStore
 
-__all__ = ["EditionPublisherProvider", "EditionPublishingService"]
+__all__ = [
+    "CdnCachePurgerProvider",
+    "EditionPublisherProvider",
+    "EditionPublishingService",
+]
 
 
 class EditionPublisherProvider(Protocol):
@@ -29,6 +39,16 @@ class EditionPublisherProvider(Protocol):
         self, *, org_id: int, service_label: str
     ) -> EditionPublisher:
         """Return an unopened ``EditionPublisher`` for the org."""
+        ...
+
+
+class CdnCachePurgerProvider(Protocol):
+    """Callable that resolves a ``CdnCachePurger`` for an org."""
+
+    async def __call__(
+        self, *, org_id: int, service_label: str
+    ) -> CdnCachePurger:
+        """Return an unopened ``CdnCachePurger`` for the org."""
         ...
 
 
@@ -49,12 +69,14 @@ class EditionPublishingService:
         edition_store: EditionStore,
         history_store: EditionBuildHistoryStore,
         publisher_provider: EditionPublisherProvider,
+        purger_provider: CdnCachePurgerProvider,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
         self._edition_store = edition_store
         self._history_store = history_store
         self._publisher_provider = publisher_provider
+        self._purger_provider = purger_provider
         self._logger = logger
 
     async def publish(
@@ -77,6 +99,12 @@ class EditionPublishingService:
         The edge cache profile written with the pointer is derived from
         the edition's ``kind`` (see
         `docverse_server.domain.cache_profile.compute_cache_profile`).
+        Long-profile editions are cached at the CDN edge for far longer
+        than the publish cadence, so after a successful publish this
+        method also purges the project's hostname from the CDN cache.
+        Short-profile editions expire quickly on their own and are never
+        purged. Purge failures are logged and swallowed: a CDN hiccup
+        leaves a stale edge copy rather than failing the publish.
 
         On a successful publish both the edition row and the supplied
         history entry are updated to ``PublishStatus.published``. When
@@ -117,6 +145,14 @@ class EditionPublishingService:
                 build_public_id=serialize_base32_id(build.public_id),
                 object_key_prefix=build.storage_prefix,
                 cache_profile=cache_profile,
+            )
+        if cache_profile == CACHE_PROFILE_LONG:
+            await self._purge_cdn_cache(
+                org=org,
+                service_label=org.cdn_service_label,
+                project_slug=project_slug,
+                edition=edition,
+                build=build,
             )
         await self._mark_published(
             edition_id=edition.id, history_id=history_entry.id
@@ -186,6 +222,42 @@ class EditionPublishingService:
             edition_slug=edition_slug,
             cdn_service_label=org.cdn_service_label,
         )
+
+    async def _purge_cdn_cache(
+        self,
+        *,
+        org: Organization,
+        service_label: str,
+        project_slug: str,
+        edition: Edition,
+        build: Build,
+    ) -> None:
+        """Purge the project's hostname from the CDN edge cache.
+
+        Best-effort: any failure resolving or invoking the purger is
+        logged at ERROR with the full publish context and swallowed, so
+        a CDN outage degrades to a stale edge copy instead of a failed
+        publish. Every attempt is logged, success or failure.
+        """
+        hostname = compute_project_hostname(org, project_slug)
+        logger = self._logger.bind(
+            org_id=org.id,
+            project_slug=project_slug,
+            edition_slug=edition.slug,
+            build_id=build.id,
+            cdn_service_label=service_label,
+            hostname=hostname,
+        )
+        try:
+            purger = await self._purger_provider(
+                org_id=org.id, service_label=service_label
+            )
+            async with purger:
+                await purger.purge_hostname(hostname)
+        except Exception:
+            logger.exception("CDN cache purge failed")
+        else:
+            logger.info("Purged CDN cache")
 
     async def _mark_published(
         self, *, edition_id: int, history_id: int

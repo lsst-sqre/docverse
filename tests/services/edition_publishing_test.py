@@ -8,6 +8,7 @@ from typing import Self
 import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
     BuildCreate,
@@ -21,12 +22,17 @@ from docverse.models import (
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
+from docverse_server.domain.dashboard_context import MAIN_SLUG
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.services.edition_publishing import (
     EditionPublishingService,
 )
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.cdncachepurger import (
+    CdnCachePurger,
+    MockCdnCachePurger,
+)
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -87,6 +93,28 @@ class _FailingPublisher:
         raise self._exc
 
 
+class _FailingPurger:
+    """A CdnCachePurger whose ``purge_hostname`` raises."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def purge_hostname(self, hostname: str) -> None:
+        _ = hostname
+        raise self._exc
+
+
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
@@ -96,6 +124,7 @@ def _make_service(
     *,
     publisher: EditionPublisher | None = None,
     provider_raises: bool = False,
+    purger: CdnCachePurger | None = None,
 ) -> EditionPublishingService:
     async def provider(*, org_id: int, service_label: str) -> EditionPublisher:
         if provider_raises:
@@ -109,6 +138,14 @@ def _make_service(
             raise AssertionError(msg)
         return publisher
 
+    resolved_purger = purger if purger is not None else MockCdnCachePurger()
+
+    async def purger_provider(
+        *, org_id: int, service_label: str
+    ) -> CdnCachePurger:
+        _ = (org_id, service_label)
+        return resolved_purger
+
     logger = _logger()
     return EditionPublishingService(
         org_store=OrganizationStore(session=db_session, logger=logger),
@@ -117,6 +154,7 @@ def _make_service(
             session=db_session, logger=logger
         ),
         publisher_provider=provider,
+        purger_provider=purger_provider,
         logger=logger,
     )
 
@@ -155,16 +193,30 @@ async def _setup(
             source_url="https://example.com/example/repo",
         ),
     )
-    edition = await edition_store.create(
-        project_id=project.id,
-        data=EditionCreate(
-            slug="main",
+    if edition_kind is EditionKind.main:
+        # The database constrains main-kind editions to the reserved
+        # ``__main`` slug, which ``EditionCreate`` rejects — project
+        # creation seeds it through ``create_internal`` for the same
+        # reason.
+        edition = await edition_store.create_internal(
+            project_id=project.id,
+            slug=MAIN_SLUG,
             title="Latest",
             kind=edition_kind,
             tracking_mode=TrackingMode.git_ref,
             tracking_params={"git_ref": "main"},
-        ),
-    )
+        )
+    else:
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Latest",
+                kind=edition_kind,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
     build = await build_store.create(
         project_id=project.id,
         data=BuildCreate(git_ref="main", content_hash=_HASH),
@@ -367,3 +419,216 @@ async def test_publish_draft_edition_uses_short_cache_profile(
 
     assert len(mock_publisher.calls) == 1
     assert mock_publisher.calls[0].cache_profile == "short"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("edition_kind", "org_slug"),
+    [
+        (EditionKind.main, "purge-main-org"),
+        (EditionKind.release, "purge-release-org"),
+        (EditionKind.major, "purge-major-org"),
+        (EditionKind.minor, "purge-minor-org"),
+    ],
+)
+async def test_publish_long_profile_purges_project_hostname(
+    db_session: AsyncSession,
+    edition_kind: EditionKind,
+    org_slug: str,
+) -> None:
+    """Long-profile publishes purge the project's hostname exactly once."""
+    mock_purger = MockCdnCachePurger()
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=mock_purger,
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug=org_slug,
+            cdn_service_label="cdn-prod",
+            edition_kind=edition_kind,
+        )
+        await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
+        await db_session.commit()
+
+    assert mock_purger.purge_calls == [
+        f"{_PROJECT_SLUG}.{org_slug}.example.com"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("edition_kind", "org_slug"),
+    [
+        (EditionKind.draft, "nopurge-draft-org"),
+        (EditionKind.alternate, "nopurge-alternate-org"),
+    ],
+)
+async def test_publish_short_profile_does_not_purge(
+    db_session: AsyncSession,
+    edition_kind: EditionKind,
+    org_slug: str,
+) -> None:
+    """Short-profile publishes make no purge call."""
+    mock_purger = MockCdnCachePurger()
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=mock_purger,
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug=org_slug,
+            cdn_service_label="cdn-prod",
+            edition_kind=edition_kind,
+        )
+        await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
+        await db_session.commit()
+
+    assert mock_purger.purge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_publish_without_cdn_service_label_does_not_purge(
+    db_session: AsyncSession,
+) -> None:
+    """Orgs with no cdn_service_label never reach the purge step."""
+    mock_purger = MockCdnCachePurger()
+    service = _make_service(
+        db_session, provider_raises=True, purger=mock_purger
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session, org_slug="nopurge-no-cdn-org"
+        )
+        await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
+        await db_session.commit()
+
+    assert mock_purger.purge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_publish_logs_successful_purge(
+    db_session: AsyncSession,
+) -> None:
+    """A successful purge emits a structured log with full context."""
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-log-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        with capture_logs() as logs:
+            service = _make_service(
+                db_session,
+                publisher=MockEditionPublisher(),
+                purger=MockCdnCachePurger(),
+            )
+            await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+        await db_session.commit()
+
+    entries = [e for e in logs if e["event"] == "Purged CDN cache"]
+    assert len(entries) == 1
+    assert (
+        entries[0]["hostname"] == f"{_PROJECT_SLUG}.purge-log-org.example.com"
+    )
+    assert entries[0]["edition_slug"] == edition.slug
+    assert entries[0]["build_id"] == build.id
+
+
+@pytest.mark.asyncio
+async def test_publish_logs_failed_purge(
+    db_session: AsyncSession,
+) -> None:
+    """A failed purge emits a structured error log with full context."""
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-log-fail-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        with capture_logs() as logs:
+            service = _make_service(
+                db_session,
+                publisher=MockEditionPublisher(),
+                purger=_FailingPurger(RuntimeError("purge exploded")),
+            )
+            await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+        await db_session.commit()
+
+    entries = [e for e in logs if e["event"] == "CDN cache purge failed"]
+    assert len(entries) == 1
+    assert entries[0]["log_level"] == "error"
+    assert entries[0]["hostname"] == (
+        f"{_PROJECT_SLUG}.purge-log-fail-org.example.com"
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_purge_failure_does_not_propagate(
+    db_session: AsyncSession,
+) -> None:
+    """A failing purge still leaves the edition and history published."""
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=_FailingPurger(RuntimeError("purge exploded")),
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-fail-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        refreshed = await _fetch_edition(
+            db_session, edition.id, edition.project_id, edition.slug
+        )
+        assert refreshed.publish_status == PublishStatus.published
+        refreshed_history = await _fetch_history(db_session, edition.id)
+        assert refreshed_history.publish_status == PublishStatus.published
