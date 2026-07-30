@@ -8,6 +8,8 @@ from typing import Self
 import httpx
 import structlog
 
+from docverse_server.domain.cache_profile import CacheProfile
+
 __all__ = ["CloudflareKvEditionPublisher"]
 
 _HTTP_NOT_FOUND = 404
@@ -54,7 +56,7 @@ class CloudflareKvEditionPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
-        cache_profile: str,
+        cache_profile: CacheProfile,
     ) -> None:
         """Write the edition pointer to the configured KV namespace."""
         url = (

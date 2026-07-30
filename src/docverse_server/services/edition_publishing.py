@@ -147,6 +147,16 @@ class EditionPublishingService:
                 cache_profile=cache_profile,
             )
         if cache_profile == CACHE_PROFILE_LONG:
+            # The purge fires as soon as the KV write returns. Workers KV
+            # is eventually consistent, so for a short window afterwards
+            # an edge colo can still read the previous pointer and
+            # re-populate its cache with the old build under the long
+            # profile, where it lives until the next publish purges it.
+            # That window is accepted for now: PRD #183 puts purge
+            # retries and scheduling machinery out of scope, and a
+            # delayed second purge would need a job-queue mechanism this
+            # story does not build. Revisit if the stale window is
+            # observed in practice.
             await self._purge_cdn_cache(
                 org=org,
                 service_label=org.cdn_service_label,

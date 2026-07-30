@@ -22,6 +22,7 @@ from docverse.models import (
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
+from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.dashboard_context import MAIN_SLUG
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
@@ -72,7 +73,7 @@ class _FailingPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
-        cache_profile: str,
+        cache_profile: CacheProfile,
     ) -> None:
         _ = (
             project_slug,

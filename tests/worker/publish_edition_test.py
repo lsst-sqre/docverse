@@ -38,6 +38,7 @@ from docverse_server.domain.base32id import (
     validate_base32_id,
 )
 from docverse_server.domain.build import Build
+from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.organization import Organization
@@ -95,7 +96,7 @@ class _FailingPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
-        cache_profile: str,
+        cache_profile: CacheProfile,
     ) -> None:
         _ = (
             project_slug,
@@ -872,7 +873,7 @@ class _RecordingMockEditionPublisher(MockEditionPublisher):
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
-        cache_profile: str,
+        cache_profile: CacheProfile,
     ) -> None:
         self._publish_timestamps.append(time.monotonic())
         await super().publish(

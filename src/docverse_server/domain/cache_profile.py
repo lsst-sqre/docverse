@@ -14,6 +14,8 @@ docs can name the policy without re-deriving it.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from docverse.models import EditionKind
 
 __all__ = [
@@ -21,13 +23,24 @@ __all__ = [
     "CACHE_CONTROL_SHORT",
     "CACHE_PROFILE_LONG",
     "CACHE_PROFILE_SHORT",
+    "CacheProfile",
     "compute_cache_profile",
 ]
 
-CACHE_PROFILE_LONG = "long"
+CacheProfile = Literal["long", "short"]
+"""Name of an edge cache profile.
+
+Threaded from `compute_cache_profile` through the
+`~docverse_server.storage.editionpublisher.EditionPublisher` protocol
+into the Cloudflare Workers KV pointer payload. Typing it as a literal
+keeps a misspelled profile from silently degrading to the Worker's
+``short`` fallback.
+"""
+
+CACHE_PROFILE_LONG: CacheProfile = "long"
 """Profile for read-heavy editions whose content rarely changes."""
 
-CACHE_PROFILE_SHORT = "short"
+CACHE_PROFILE_SHORT: CacheProfile = "short"
 """Profile for frequently-rebuilt editions (the safe default)."""
 
 CACHE_CONTROL_SHORT = "public, max-age=60"
@@ -58,7 +71,7 @@ hostname.
 """
 
 
-def compute_cache_profile(edition_kind: EditionKind) -> str:
+def compute_cache_profile(edition_kind: EditionKind) -> CacheProfile:
     """Derive the edge cache profile for an edition kind.
 
     Parameters
@@ -68,7 +81,7 @@ def compute_cache_profile(edition_kind: EditionKind) -> str:
 
     Returns
     -------
-    str
+    CacheProfile
         ``"long"`` for ``main``, ``release``, ``major``, and ``minor``
         editions; ``"short"`` for ``draft`` and ``alternate`` editions,
         which are rebuilt often enough that maintainers should see

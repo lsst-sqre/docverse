@@ -5,8 +5,6 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Self
 
-import structlog
-
 __all__ = ["MockCdnCachePurger"]
 
 
@@ -17,11 +15,7 @@ class MockCdnCachePurger:
     tests can assert both that a purge happened and what its scope was.
     """
 
-    def __init__(
-        self,
-        *,
-        logger: structlog.stdlib.BoundLogger | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         self._purge_calls: list[str] = []
 
     async def __aenter__(self) -> Self:

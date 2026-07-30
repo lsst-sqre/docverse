@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Protocol, Self, runtime_checkable
 
+from docverse_server.domain.cache_profile import CacheProfile
+
 __all__ = ["EditionPublisher"]
 
 
@@ -36,7 +38,7 @@ class EditionPublisher(Protocol):
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
-        cache_profile: str,
+        cache_profile: CacheProfile,
     ) -> None:
         """Publish an edition pointer to the backing store.
 
