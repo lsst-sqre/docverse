@@ -14,7 +14,7 @@ dependencies = [
     # plugin monkey-patches attributes onto Dependant and now raises
     # AttributeError at import/startup.
     # TODO: remove when ag2ai/faststream#2959 is fixed
-    "fastapi>=0.115,<0.140",
+    "fastapi>=0.115,<0.141",
     "httpx",
     "jinja2>=3.1",
     "pydantic>=2",
