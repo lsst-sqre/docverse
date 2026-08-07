@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 import tarfile
+import time
 from pathlib import Path
+
+import pytest
 
 from docverse._tar import create_tarball
 
@@ -40,9 +43,52 @@ def test_create_tarball_hash_determinism(tmp_path: Path) -> None:
     source.mkdir()
     (source / "page.html").write_text("<p>content</p>")
 
-    _, hash1 = create_tarball(source)
+    path1, hash1 = create_tarball(source)
     path2, hash2 = create_tarball(source)
     try:
         assert hash1 == hash2
     finally:
+        path1.unlink(missing_ok=True)
         path2.unlink(missing_ok=True)
+
+
+def test_create_tarball_hash_ignores_wall_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identical content hashes alike however far apart it is archived.
+
+    ``test_create_tarball_hash_determinism`` only catches a time-dependent
+    digest when its two calls happen to straddle an integer second, so it
+    fails intermittently rather than reliably. Move the clock explicitly.
+    """
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "page.html").write_text("<p>content</p>")
+
+    monkeypatch.setattr(time, "time", lambda: 1_000_000_000.0)
+    path1, hash1 = create_tarball(source)
+    monkeypatch.setattr(time, "time", lambda: 2_000_000_000.0)
+    path2, hash2 = create_tarball(source)
+    try:
+        assert hash1 == hash2
+    finally:
+        path1.unlink(missing_ok=True)
+        path2.unlink(missing_ok=True)
+
+
+def test_create_tarball_gzip_header_has_no_timestamp(tmp_path: Path) -> None:
+    """The gzip MTIME field is zeroed so the digest stays content-only."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "page.html").write_text("<p>content</p>")
+
+    tarball_path, _ = create_tarball(source)
+    try:
+        header = tarball_path.read_bytes()[:10]
+        assert header[:2] == b"\x1f\x8b"  # gzip magic
+        # Bytes 4-7 are the little-endian MTIME field.
+        assert header[4:8] == b"\x00\x00\x00\x00"
+        # Bit 3 of FLG would mean an original filename is embedded.
+        assert not header[3] & 0x08
+    finally:
+        tarball_path.unlink(missing_ok=True)
