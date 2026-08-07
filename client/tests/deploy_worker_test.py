@@ -21,6 +21,9 @@ def mock_monorepo(tmp_path: Path) -> Path:
     (worker_dir / "package.json").write_text(
         '{"name": "docverse-worker", "version": "0.0.0"}'
     )
+    (worker_dir / "package-lock.json").write_text(
+        '{"name": "docverse-worker", "lockfileVersion": 3}'
+    )
     return monorepo
 
 
@@ -143,7 +146,7 @@ def test_deploy_worker_happy_path(
                 cwd=str(dest_dir),
             ),
             call(
-                ["npm", "install", "--production"],
+                ["npm", "ci", "--omit=dev"],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -157,10 +160,16 @@ def test_deploy_worker_happy_path(
         ]
     )
 
-    mock_copy.assert_called_once_with(
-        worker_dir / "docverse-worker-0.0.0.tgz",
-        dest_dir / "docverse-worker-0.0.0.tgz",
-    )
+    assert mock_copy.call_args_list == [
+        call(
+            worker_dir / "docverse-worker-0.0.0.tgz",
+            dest_dir / "docverse-worker-0.0.0.tgz",
+        ),
+        call(
+            worker_dir / "package-lock.json",
+            dest_dir / "package-lock.json",
+        ),
+    ]
 
 
 @patch("docverse._cli.shutil.copy2")
@@ -301,6 +310,79 @@ def test_deploy_worker_wrangler_deploy_fails(
 
     assert result.exit_code == 1
     assert "wrangler deploy failed" in result.output
+
+
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
+def test_deploy_worker_npm_ci_fails(
+    mock_run: MagicMock,
+    mock_copy: MagicMock,
+    mock_monorepo: Path,
+    mock_deployments_repo: Path,
+) -> None:
+    call_count = 0
+    succeed_count = 2
+
+    def side_effect(*args: object, **kwargs: object) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= succeed_count:
+            return _npm_pack_side_effect(*args)
+        raise subprocess.CalledProcessError(
+            1, "npm ci", stderr="npm ERR! ERESOLVE"
+        )
+
+    mock_run.side_effect = side_effect
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "deploy-worker",
+            "--docverse-repo",
+            str(mock_monorepo),
+            "--deployments-repo",
+            str(mock_deployments_repo),
+            "--env",
+            "dev",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "npm ci failed" in result.output
+
+
+@patch("docverse._cli.shutil.copy2")
+@patch("docverse._cli.subprocess.run")
+def test_deploy_worker_missing_lockfile(
+    mock_run: MagicMock,
+    mock_copy: MagicMock,
+    mock_monorepo: Path,
+    mock_deployments_repo: Path,
+) -> None:
+    """A worker without a lockfile cannot be installed reproducibly."""
+    (mock_monorepo / "cloudflare-worker" / "package-lock.json").unlink()
+    mock_run.side_effect = _npm_pack_side_effect
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "deploy-worker",
+            "--docverse-repo",
+            str(mock_monorepo),
+            "--deployments-repo",
+            str(mock_deployments_repo),
+            "--env",
+            "dev",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "package-lock.json not found" in result.output
+    # Bailed out before npm ci and wrangler deploy.
+    expected_call_count = 2
+    assert mock_run.call_count == expected_call_count
 
 
 def test_deploy_worker_missing_cloudflare_worker_dir(
