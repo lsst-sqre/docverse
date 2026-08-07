@@ -61,13 +61,19 @@ PACKAGE_JSON = textwrap.dedent("""\
 
 @pytest.fixture
 def docverse_repo() -> Path:
-    """Find the monorepo root by walking up from this file."""
+    """Find the monorepo root by walking up from this file.
+
+    The root is identified by ``cloudflare-worker/`` rather than by
+    ``pyproject.toml``: the client is its own package, so a walk looking
+    for ``pyproject.toml`` stops at ``client/`` and never reaches the
+    monorepo root.
+    """
     current = Path(__file__).resolve().parent
     while current != current.parent:
-        if (current / "pyproject.toml").is_file():
+        if (current / "cloudflare-worker").is_dir():
             return current
         current = current.parent
-    msg = "Could not find monorepo root (no pyproject.toml found)"
+    msg = "Could not find monorepo root (no cloudflare-worker/ found)"
     raise RuntimeError(msg)
 
 
@@ -120,6 +126,13 @@ def test_deploy_worker_dry_run_integration(
     assert worker_dir.is_dir()
     assert (worker_dir / "src" / "index.ts").is_file()
     assert (worker_dir / "package.json").is_file()
+
+    # ``npm pack`` excludes the lockfile, so the deploy has to place it
+    # explicitly; without it ``npm ci`` cannot install reproducibly.
+    deployed_lock = worker_dir / "package-lock.json"
+    assert deployed_lock.is_file()
+    source_lock = docverse_repo / "cloudflare-worker" / "package-lock.json"
+    assert deployed_lock.read_bytes() == source_lock.read_bytes()
 
     # Verify the tarball was cleaned up
     assert not list(worker_dir.glob("*.tgz"))

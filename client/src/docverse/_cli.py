@@ -151,6 +151,87 @@ def upload(
     )
 
 
+def _stage_worker_source(*, worker_dir: Path, dest_dir: Path) -> None:
+    """Pack the worker source and install it into the deployments repo.
+
+    Parameters
+    ----------
+    worker_dir
+        The monorepo's ``cloudflare-worker/`` directory.
+    dest_dir
+        The ``worker/`` directory inside the deployments repo.
+
+    Raises
+    ------
+    click.ClickException
+        If packing, unpacking, or dependency installation fails.
+    """
+    # Phase 1: npm pack
+    click.echo(f"Packing cloudflare worker from {worker_dir}")
+    try:
+        pack_result = subprocess.run(
+            ["npm", "pack", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(worker_dir),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"npm pack failed: {exc.stderr}"
+        raise click.ClickException(msg) from exc
+    try:
+        tarball_name = json.loads(pack_result.stdout)[0]["filename"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        msg = f"Failed to parse npm pack output: {pack_result.stdout!r}"
+        raise click.ClickException(msg) from exc
+
+    # Phase 2: copy and unpack into deployments repo
+    click.echo(f"Unpacking worker into {dest_dir}")
+    shutil.copy2(worker_dir / tarball_name, dest_dir / tarball_name)
+    try:
+        subprocess.run(
+            ["tar", "xzf", tarball_name, "--strip-components=1"],
+            check=True,
+            cwd=str(dest_dir),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"Failed to unpack worker tarball: {exc}"
+        raise click.ClickException(msg) from exc
+    finally:
+        for tgz in dest_dir.glob("*.tgz"):
+            tgz.unlink()
+    (worker_dir / tarball_name).unlink(missing_ok=True)
+
+    # Phase 2a: copy the lockfile alongside the unpacked source. ``npm
+    # pack`` always excludes package-lock.json, so without this the
+    # destination keeps whatever lockfile an earlier deploy left behind.
+    # Once that stale lockfile disagrees with the freshly packed
+    # package.json, npm re-resolves the whole tree and deploys stop being
+    # reproducible.
+    lockfile = worker_dir / "package-lock.json"
+    if not lockfile.is_file():
+        msg = f"package-lock.json not found in {worker_dir}"
+        raise click.ClickException(msg)
+    click.echo("Copying worker lockfile")
+    shutil.copy2(lockfile, dest_dir / "package-lock.json")
+
+    # Phase 2b: install worker runtime dependencies. ``npm ci`` installs
+    # exactly what the lockfile pins and wipes node_modules first, so no
+    # stale packages survive from an earlier deploy.
+    click.echo("Installing worker dependencies")
+    try:
+        subprocess.run(
+            ["npm", "ci", "--omit=dev"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(dest_dir),
+        )
+    except subprocess.CalledProcessError as exc:
+        msg = f"npm ci failed: {exc.stderr}"
+        raise click.ClickException(msg) from exc
+
+
 @main.command()
 @click.option(
     "--docverse-repo",
@@ -201,55 +282,8 @@ def deploy_worker(
     dest_dir = deployments_repo / "worker"
     dest_dir.mkdir(exist_ok=True)
 
-    # Phase 1: npm pack
-    click.echo(f"Packing cloudflare worker from {worker_dir}")
-    try:
-        pack_result = subprocess.run(
-            ["npm", "pack", "--json"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(worker_dir),
-        )
-    except subprocess.CalledProcessError as exc:
-        msg = f"npm pack failed: {exc.stderr}"
-        raise click.ClickException(msg) from exc
-    try:
-        tarball_name = json.loads(pack_result.stdout)[0]["filename"]
-    except (json.JSONDecodeError, KeyError, IndexError) as exc:
-        msg = f"Failed to parse npm pack output: {pack_result.stdout!r}"
-        raise click.ClickException(msg) from exc
-
-    # Phase 2: copy and unpack into deployments repo
-    click.echo(f"Unpacking worker into {dest_dir}")
-    shutil.copy2(worker_dir / tarball_name, dest_dir / tarball_name)
-    try:
-        subprocess.run(
-            ["tar", "xzf", tarball_name, "--strip-components=1"],
-            check=True,
-            cwd=str(dest_dir),
-        )
-    except subprocess.CalledProcessError as exc:
-        msg = f"Failed to unpack worker tarball: {exc}"
-        raise click.ClickException(msg) from exc
-    finally:
-        for tgz in dest_dir.glob("*.tgz"):
-            tgz.unlink()
-    (worker_dir / tarball_name).unlink(missing_ok=True)
-
-    # Phase 2b: install worker runtime dependencies
-    click.echo("Installing worker dependencies")
-    try:
-        subprocess.run(
-            ["npm", "install", "--production"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(dest_dir),
-        )
-    except subprocess.CalledProcessError as exc:
-        msg = f"npm install failed: {exc.stderr}"
-        raise click.ClickException(msg) from exc
+    # Phases 1 and 2: pack the worker and stage it in the deployments repo
+    _stage_worker_source(worker_dir=worker_dir, dest_dir=dest_dir)
 
     # Phase 3: wrangler deploy
     wrangler_cmd = [
