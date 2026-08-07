@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import tarfile
@@ -51,6 +52,14 @@ def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
         ``(tarball_path, content_hash)`` where *content_hash* is formatted
         as ``sha256:<hex>``. The caller is responsible for deleting the
         temporary file.
+
+    Notes
+    -----
+    The digest covers the compressed bytes, so the gzip header has to be
+    stable for identical content to hash identically. ``tarfile``'s own
+    ``w:gz`` mode stamps the current time into that header, which made the
+    digest change every second; the gzip stream is therefore built
+    explicitly with ``mtime=0``.
     """
     source = Path(source_dir).resolve()
     tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
@@ -59,7 +68,12 @@ def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
     try:
         with Path(tmp.name).open("wb", buffering=0) as raw:
             writer = _HashingWriter(raw)
-            with tarfile.open(mode="w:gz", fileobj=writer) as tar:
+            with (
+                gzip.GzipFile(
+                    filename="", mode="wb", fileobj=writer, mtime=0
+                ) as gz,
+                tarfile.open(mode="w", fileobj=gz) as tar,
+            ):
                 tar.add(str(source), arcname=".")
     except BaseException:
         Path(tmp.name).unlink(missing_ok=True)
