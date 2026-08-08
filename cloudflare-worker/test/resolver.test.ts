@@ -185,7 +185,7 @@ describe("resolve — edition routes", () => {
     path: "getting-started.html",
   };
 
-  it("returns R2 object with correct Content-Type and Cache-Control", async () => {
+  it("returns R2 object with correct Content-Type and the short Cache-Control when cache_profile is absent", async () => {
     const kv = createMockKV({
       "pipelines/__main": JSON.stringify({
         build_id: "b123",
@@ -210,6 +210,66 @@ describe("resolve — edition routes", () => {
     );
     expect(response.headers.get("Cache-Control")).toBe(
       "public, max-age=60",
+    );
+    expect(await response.text()).toBe("<html>hello</html>");
+  });
+
+  it("emits the long Cache-Control when the KV value carries cache_profile long", async () => {
+    const kv = createMockKV({
+      "pipelines/__main": JSON.stringify({
+        build_id: "b123",
+        r2_prefix: "pipelines/__main/b123/",
+        cache_profile: "long",
+      }),
+    });
+    const r2 = createMockR2({
+      "pipelines/__main/b123/getting-started.html": {
+        body: streamFromString("<html>hello</html>"),
+        size: 18,
+      },
+    });
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://example.com/pipelines/getting-started.html");
+
+    const response = await resolve(route, request, kv, r2, dashboardStore, ctx);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=300, s-maxage=86400",
+    );
+    // ETag and Content-Type are unchanged by the cache profile.
+    expect(response.headers.get("Content-Type")).toBe("text/html");
+    expect(response.headers.get("ETag")).toBe(
+      '"pipelines/__main/b123/getting-started.html-etag"',
+    );
+    expect(await response.text()).toBe("<html>hello</html>");
+  });
+
+  it("emits the short Cache-Control when the KV value carries cache_profile short", async () => {
+    const kv = createMockKV({
+      "pipelines/__main": JSON.stringify({
+        build_id: "b123",
+        r2_prefix: "pipelines/__main/b123/",
+        cache_profile: "short",
+      }),
+    });
+    const r2 = createMockR2({
+      "pipelines/__main/b123/getting-started.html": {
+        body: streamFromString("<html>hello</html>"),
+        size: 18,
+      },
+    });
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://example.com/pipelines/getting-started.html");
+
+    const response = await resolve(route, request, kv, r2, dashboardStore, ctx);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    // ETag and Content-Type are unchanged by the cache profile.
+    expect(response.headers.get("Content-Type")).toBe("text/html");
+    expect(response.headers.get("ETag")).toBe(
+      '"pipelines/__main/b123/getting-started.html-etag"',
     );
     expect(await response.text()).toBe("<html>hello</html>");
   });

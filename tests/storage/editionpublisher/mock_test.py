@@ -20,12 +20,14 @@ async def test_records_publish_calls() -> None:
             edition_slug="main",
             build_public_id="ABC123",
             object_key_prefix="myproject/__builds/ABC123/",
+            cache_profile="long",
         )
         await pub.publish(
             project_slug="myproject",
             edition_slug="v1",
             build_public_id="DEF456",
             object_key_prefix="myproject/__builds/DEF456/",
+            cache_profile="short",
         )
 
     assert publisher.calls == [
@@ -34,12 +36,14 @@ async def test_records_publish_calls() -> None:
             edition_slug="main",
             build_public_id="ABC123",
             object_key_prefix="myproject/__builds/ABC123/",
+            cache_profile="long",
         ),
         PublishCall(
             project_slug="myproject",
             edition_slug="v1",
             build_public_id="DEF456",
             object_key_prefix="myproject/__builds/DEF456/",
+            cache_profile="short",
         ),
     ]
 

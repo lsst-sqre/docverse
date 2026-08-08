@@ -8,6 +8,8 @@ from typing import Self
 
 import structlog
 
+from docverse_server.domain.cache_profile import CacheProfile
+
 __all__ = ["MockEditionPublisher", "PublishCall", "UnpublishCall"]
 
 
@@ -19,6 +21,7 @@ class PublishCall:
     edition_slug: str
     build_public_id: str
     object_key_prefix: str
+    cache_profile: CacheProfile
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,7 @@ class MockEditionPublisher:
         edition_slug: str,
         build_public_id: str,
         object_key_prefix: str,
+        cache_profile: CacheProfile,
     ) -> None:
         """Record a publish call."""
         self._calls.append(
@@ -80,6 +84,7 @@ class MockEditionPublisher:
                 edition_slug=edition_slug,
                 build_public_id=build_public_id,
                 object_key_prefix=object_key_prefix,
+                cache_profile=cache_profile,
             )
         )
 

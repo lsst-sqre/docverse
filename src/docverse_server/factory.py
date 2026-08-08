@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 import structlog
@@ -54,6 +55,7 @@ from .services.project import ProjectService
 from .services.project_github_binding import ProjectGitHubBindingResolver
 from .services.ref_deleted_processor import RefDeletedWebhookProcessor
 from .storage.build_store import BuildStore
+from .storage.cdncachepurger import CdnCachePurger, create_cdn_cache_purger
 from .storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
@@ -544,6 +546,7 @@ class Factory:
                 session=self._session, logger=self._logger
             ),
             publisher_provider=self.create_edition_publisher_for_org,
+            purger_provider=self.create_cdn_cache_purger_for_org,
             logger=self._logger,
         )
 
@@ -740,7 +743,70 @@ class Factory:
             msg = "HTTP client is required to build an EditionPublisher"
             raise RuntimeError(msg)
 
-        # Step 1: Load the service config
+        provider, config, credentials = await self._resolve_cdn_service(
+            org_id=org_id, service_label=service_label
+        )
+        return create_edition_publisher(
+            provider=provider,
+            config=config,
+            credentials=credentials,
+            logger=self._logger,
+            http_client=self._http_client,
+        )
+
+    async def create_cdn_cache_purger_for_org(
+        self, *, org_id: int, service_label: str
+    ) -> CdnCachePurger:
+        """Resolve an org's CdnCachePurger from its service configuration.
+
+        Shares the org's CDN service row (and therefore its API token)
+        with `create_edition_publisher_for_org`, so operators manage one
+        Cloudflare service rather than two.
+
+        Parameters
+        ----------
+        org_id
+            Organization ID.
+        service_label
+            Service label to use (typically the org's
+            ``cdn_service_label``).
+
+        Returns
+        -------
+        CdnCachePurger
+            An unopened CdnCachePurger. Caller must use as async context
+            manager. Organizations whose service has no ``zone_id`` get a
+            no-op purger rather than an error.
+        """
+        if self._http_client is None:
+            msg = "HTTP client is required to build a CdnCachePurger"
+            raise RuntimeError(msg)
+
+        provider, config, credentials = await self._resolve_cdn_service(
+            org_id=org_id, service_label=service_label
+        )
+        return create_cdn_cache_purger(
+            provider=provider,
+            config=config,
+            credentials=credentials,
+            logger=self._logger,
+            http_client=self._http_client,
+        )
+
+    async def _resolve_cdn_service(
+        self, *, org_id: int, service_label: str
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Load a service row and decrypt its credential.
+
+        Returns the service's provider, its non-secret config, and the
+        decrypted credential payload — the three inputs every CDN
+        storage factory takes.
+
+        Raises
+        ------
+        RuntimeError
+            If no service with ``service_label`` exists for the org.
+        """
         service_store = self.create_service_store()
         svc = await service_store.get_by_label(
             organization_id=org_id, label=service_label
@@ -749,20 +815,11 @@ class Factory:
             msg = f"Service {service_label!r} not found"
             raise RuntimeError(msg)
 
-        # Step 2: Decrypt the credential
         credential_service = self.create_credential_service()
         _cred, cred_payload = await credential_service.get_decrypted(
             org_id=org_id, label=svc.credential_label
         )
-
-        # Step 3: Build the EditionPublisher from config + credentials
-        return create_edition_publisher(
-            provider=svc.provider,
-            config=svc.config,
-            credentials=cred_payload,
-            logger=self._logger,
-            http_client=self._http_client,
-        )
+        return svc.provider, svc.config, cred_payload
 
     async def create_objectstore_for_org(
         self, *, org_id: int, service_label: str
