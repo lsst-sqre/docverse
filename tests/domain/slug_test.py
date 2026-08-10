@@ -19,6 +19,7 @@ from docverse_server.domain.slug import (
     RegexRule,
     SemverRule,
     VersionRule,
+    derive_edition_kind_from_ref,
     derive_edition_slug,
     parse_slug_rewrite_rules,
     validate_slug,
@@ -615,6 +616,42 @@ class TestBuiltinPrecedenceAgainstUserRules:
         result = derive_edition_slug("1.2.3", rules)
         assert result is not None
         assert result.edition_kind == EditionKind.draft
+
+
+class TestDeriveEditionKindFromRef:
+    """Kind-only derivation shares the rule chain with slug derivation."""
+
+    def test_stable_semver_is_a_release(self) -> None:
+        derivation = derive_edition_kind_from_ref("15.2.1")
+        assert derivation.edition_kind == EditionKind.release
+        assert derivation.matched_rule_type == "semver"
+
+    def test_unmatched_ref_falls_back_to_draft(self) -> None:
+        derivation = derive_edition_kind_from_ref("tickets/DM-12345")
+        assert derivation.edition_kind == EditionKind.draft
+        assert derivation.matched_rule_type is None
+
+    def test_user_rule_wins_over_builtin(self) -> None:
+        rules: list[AnySlugRewriteRule] = [
+            SemverRule(type="semver", edition_kind=EditionKind.draft)
+        ]
+        derivation = derive_edition_kind_from_ref("15.2.1", rules)
+        assert derivation.edition_kind == EditionKind.draft
+        assert derivation.matched_rule_type == "semver"
+
+    def test_ignore_rule_reports_draft_rather_than_suppressing(self) -> None:
+        """Ignore rules gate auto-creation, not classification."""
+        rules: list[AnySlugRewriteRule] = [
+            IgnoreRule(type="ignore", glob="v*")
+        ]
+        derivation = derive_edition_kind_from_ref("v1.2.3", rules)
+        assert derivation.edition_kind == EditionKind.draft
+        assert derivation.matched_rule_type is None
+
+    def test_unslugifiable_ref_still_classifies(self) -> None:
+        """No ``validate_slug`` call, so odd refs classify instead of raise."""
+        derivation = derive_edition_kind_from_ref("release/")
+        assert derivation.edition_kind == EditionKind.draft
 
 
 class TestVersionRuleParsing:

@@ -17,7 +17,7 @@ are filled in by issue #289.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -45,6 +45,10 @@ from docverse_server.domain.lifecycle import (
 )
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
+from docverse_server.domain.slug import (
+    AnySlugRewriteRule,
+    parse_slug_rewrite_rules,
+)
 from docverse_server.exceptions import KeeperSyncInvariantError, NotFoundError
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -292,6 +296,10 @@ class KeeperSyncService:
             org, project = await self._ensure_project(
                 org_id=org_id, ltd_product=ltd_product
             )
+        # Resolved once per project and threaded through both kind
+        # derivation call sites (the proactive pass and sync_edition)
+        # so the rule set is parsed a single time per sync.
+        rewrite_rules = _resolve_rewrite_rules(org=org, project=project)
         ltd_editions = await self._ltd_client.list_editions_for_product(
             ltd_slug
         )
@@ -299,6 +307,7 @@ class KeeperSyncService:
             org=org,
             project=project,
             ltd_editions=ltd_editions,
+            rewrite_rules=rewrite_rules,
         )
         outcomes: list[EditionSyncOutcome] = []
         for ltd_edition in ltd_editions:
@@ -309,6 +318,7 @@ class KeeperSyncService:
                 org_slug=org.slug,
                 project=project,
                 ltd_edition=ltd_edition,
+                rewrite_rules=rewrite_rules,
             )
             outcomes.append(outcome)
             if on_edition_synced is not None:
@@ -332,6 +342,7 @@ class KeeperSyncService:
         org: Organization,
         project: Project,
         ltd_editions: list[LtdEdition],
+        rewrite_rules: Sequence[AnySlugRewriteRule] = (),
     ) -> set[int]:
         """Tombstone LTD editions a lifecycle rule would delete on import.
 
@@ -411,7 +422,9 @@ class KeeperSyncService:
             ):
                 continue
             transient = _transient_edition_from_ltd(
-                ltd_edition=ltd_edition, project_id=project.id
+                ltd_edition=ltd_edition,
+                project_id=project.id,
+                rewrite_rules=rewrite_rules,
             )
             if transient is None:
                 continue
@@ -565,8 +578,14 @@ class KeeperSyncService:
         project: Project,
         ltd_edition: LtdEdition,
         org_slug: str | None = None,
+        rewrite_rules: Sequence[AnySlugRewriteRule] = (),
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse.
+
+        ``rewrite_rules`` are the project's resolved slug-rewrite rules,
+        consulted when deriving the edition's kind for ``git_refs`` /
+        ``manual`` editions. The empty default still picks up the
+        built-in version heuristics.
 
         Short-circuits *before* ``_ensure_edition`` runs when the
         edition's ``keeper_sync_state`` row is tombstoned. The check
@@ -615,14 +634,29 @@ class KeeperSyncService:
         tracking_mode, tracking_params = map_edition_tracking(
             ltd_edition, build=ltd_build_for_mapping
         )
-        kind = derive_edition_kind(ltd_edition.slug)
+        kind_derivation = derive_edition_kind(
+            ltd_edition,
+            git_ref=tracking_params.get("git_ref"),
+            rules=rewrite_rules,
+        )
         docverse_slug = derive_edition_slug(ltd_edition.slug)
+        self._logger.debug(
+            "Derived keeper-sync edition kind",
+            ltd_edition_id=ltd_edition.ltd_id,
+            ltd_edition_slug=ltd_edition.slug,
+            ltd_mode=ltd_edition.mode,
+            edition_kind=kind_derivation.kind.value,
+            kind_source=kind_derivation.source.value,
+            kind_detail=kind_derivation.detail,
+            docverse_slug=docverse_slug,
+            project_id=project.id,
+        )
 
         async with self._session.begin():
             edition = await self._ensure_edition(
                 project_id=project.id,
                 docverse_slug=docverse_slug,
-                kind=kind,
+                kind=kind_derivation.kind,
                 title=ltd_edition.title,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
@@ -1056,8 +1090,24 @@ def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
 
 
+def _resolve_rewrite_rules(
+    *, org: Organization, project: Project
+) -> list[AnySlugRewriteRule]:
+    """Resolve the project's effective slug-rewrite rules.
+
+    Mirrors :class:`~docverse_server.services.edition_tracking.EditionTrackingService`:
+    a project's rule list, when set, entirely replaces the org's — there
+    is no merging (SQR-112 inheritance rule).
+    """  # noqa: E501
+    raw_rules = project.slug_rewrite_rules or org.slug_rewrite_rules
+    return parse_slug_rewrite_rules(raw_rules)
+
+
 def _transient_edition_from_ltd(
-    *, ltd_edition: LtdEdition, project_id: int
+    *,
+    ltd_edition: LtdEdition,
+    project_id: int,
+    rewrite_rules: Sequence[AnySlugRewriteRule] = (),
 ) -> Edition | None:
     """Build a transient ``Edition`` from an LTD edition for proactive eval.
 
@@ -1069,6 +1119,11 @@ def _transient_edition_from_ltd(
     those two predicates read: ``kind``, ``tracking_mode``,
     ``tracking_params``, ``lifecycle_exempt``, ``date_deleted``, and
     ``date_updated``.
+
+    ``kind`` in particular must come from the same mode-first
+    derivation :meth:`KeeperSyncService.sync_edition` uses, or the
+    proactive pass would evaluate a release-to-be as a ``draft`` and
+    tombstone it ``lifecycle_preemptive`` before it is ever imported.
 
     Returns ``None`` when the LTD edition's mode requires the
     currently-published build to map (``manual``) — the proactive
@@ -1090,7 +1145,11 @@ def _transient_edition_from_ltd(
         slug=derive_edition_slug(ltd_edition.slug),
         title=ltd_edition.title,
         project_id=project_id,
-        kind=derive_edition_kind(ltd_edition.slug),
+        kind=derive_edition_kind(
+            ltd_edition,
+            git_ref=tracking_params.get("git_ref"),
+            rules=rewrite_rules,
+        ).kind,
         tracking_mode=tracking_mode,
         tracking_params=tracking_params or None,
         lifecycle_exempt=False,

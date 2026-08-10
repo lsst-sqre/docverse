@@ -14,7 +14,9 @@ import pytest
 from pydantic import HttpUrl
 
 from docverse.models import EditionKind, TrackingMode
+from docverse_server.domain.slug import parse_slug_rewrite_rules
 from docverse_server.services.keeper_sync.mappers import (
+    EditionKindSource,
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
@@ -54,17 +56,108 @@ def _build(*, git_refs: list[str] | None = None) -> LtdBuild:
     )
 
 
-@pytest.mark.parametrize(
-    ("ltd_slug", "expected"),
-    [
-        ("main", EditionKind.main),
-        ("u-jsick-feature", EditionKind.draft),
-        ("DM-54112", EditionKind.draft),
-        ("v1.0", EditionKind.draft),
-    ],
-)
-def test_derive_edition_kind(ltd_slug: str, expected: EditionKind) -> None:
-    assert derive_edition_kind(ltd_slug) == expected
+class TestDeriveEditionKind:
+    """``derive_edition_kind`` is mode-first, then rule-driven."""
+
+    def test_git_refs_version_ref_is_a_release(self) -> None:
+        edition = _edition(
+            slug="15.2.1", mode="git_refs", tracked_refs=["15.2.1"]
+        )
+        derivation = derive_edition_kind(edition, git_ref="15.2.1")
+        assert derivation.kind == EditionKind.release
+        assert derivation.source == EditionKindSource.rule
+        assert derivation.detail == "semver"
+
+    def test_main_edition_is_main(self) -> None:
+        edition = _edition(slug="main", tracked_refs=["main"])
+        derivation = derive_edition_kind(edition, git_ref="main")
+        assert derivation.kind == EditionKind.main
+        assert derivation.source == EditionKindSource.ltd_main
+
+    def test_git_refs_ticket_branch_is_a_draft(self) -> None:
+        edition = _edition(
+            slug="DM-54112",
+            mode="git_refs",
+            tracked_refs=["tickets/DM-54112"],
+        )
+        derivation = derive_edition_kind(edition, git_ref="tickets/DM-54112")
+        assert derivation.kind == EditionKind.draft
+        assert derivation.source == EditionKindSource.fallback
+        assert derivation.detail is None
+
+    @pytest.mark.parametrize(
+        ("ltd_mode", "expected"),
+        [
+            ("lsst_doc", EditionKind.release),
+            ("eups_major_release", EditionKind.release),
+            ("eups_weekly_release", EditionKind.release),
+            ("eups_daily_release", EditionKind.draft),
+        ],
+    )
+    def test_version_modes_map_directly(
+        self, ltd_mode: str, expected: EditionKind
+    ) -> None:
+        """Version modes decide the kind without consulting the ref.
+
+        The tracked ref here is deliberately ticket-shaped: a mode match
+        must win before the ref heuristic ever runs.
+        """
+        edition = _edition(
+            slug="v1.0", mode=ltd_mode, tracked_refs=["tickets/DM-1"]
+        )
+        derivation = derive_edition_kind(edition, git_ref="tickets/DM-1")
+        assert derivation.kind == expected
+        assert derivation.source == EditionKindSource.ltd_mode
+        assert derivation.detail == ltd_mode
+
+    def test_manual_uses_the_supplied_build_ref(self) -> None:
+        """``manual`` editions classify on the ref their tracking pins."""
+        edition = _edition(slug="current", mode="manual", tracked_refs=None)
+        derivation = derive_edition_kind(edition, git_ref="v22_0")
+        assert derivation.kind == EditionKind.release
+        assert derivation.source == EditionKindSource.rule
+        assert derivation.detail == "eups_major"
+
+    def test_falls_back_to_tracked_ref_when_git_ref_omitted(self) -> None:
+        edition = _edition(
+            slug="w-2026-10", mode="git_refs", tracked_refs=["w_2026_10"]
+        )
+        derivation = derive_edition_kind(edition)
+        assert derivation.kind == EditionKind.release
+        assert derivation.detail == "eups_weekly"
+
+    def test_falls_back_to_ltd_slug_without_any_ref(self) -> None:
+        edition = _edition(slug="1.2.3", mode="manual", tracked_refs=None)
+        derivation = derive_edition_kind(edition)
+        assert derivation.kind == EditionKind.release
+        assert derivation.detail == "semver"
+
+    def test_user_rule_overrides_the_builtin_heuristic(self) -> None:
+        rules = parse_slug_rewrite_rules(
+            [{"type": "semver", "edition_kind": "draft"}]
+        )
+        edition = _edition(
+            slug="15.2.1", mode="git_refs", tracked_refs=["15.2.1"]
+        )
+        derivation = derive_edition_kind(
+            edition, git_ref="15.2.1", rules=rules
+        )
+        assert derivation.kind == EditionKind.draft
+        assert derivation.source == EditionKindSource.rule
+
+    def test_unknown_mode_degrades_to_the_rule_chain(self) -> None:
+        """Schema drift must not crash kind derivation.
+
+        ``map_edition_tracking`` — which every caller runs first —
+        already raises on an unknown mode, so this only pins the
+        defensive branch.
+        """
+        edition = _edition(
+            slug="1.2.3", mode="some_future_mode", tracked_refs=["1.2.3"]
+        )
+        derivation = derive_edition_kind(edition, git_ref="1.2.3")
+        assert derivation.kind == EditionKind.release
+        assert derivation.source == EditionKindSource.rule
 
 
 @pytest.mark.parametrize(

@@ -12,13 +12,22 @@ mode (PRD #275 "Out of scope") and is collapsed onto a pinned
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from docverse.models import EditionKind, TrackingMode
+from docverse_server.domain.slug import (
+    AnySlugRewriteRule,
+    derive_edition_kind_from_ref,
+)
 from docverse_server.storage.ltd import LtdBuild, LtdEdition, LtdEditionMode
 
 __all__ = [
     "LTD_MAIN_SLUG",
+    "EditionKindDerivation",
+    "EditionKindSource",
     "derive_edition_kind",
     "derive_edition_slug",
     "map_edition_tracking",
@@ -28,16 +37,131 @@ LTD_MAIN_SLUG = "main"
 """LTD slug that corresponds to Docverse's auto-created ``__main`` edition."""
 
 
-def derive_edition_kind(ltd_slug: str) -> EditionKind:
-    """Pick the Docverse :class:`EditionKind` for an LTD edition slug.
+class EditionKindSource(StrEnum):
+    """Where a derived Docverse edition kind came from.
 
-    LTD's ``main`` edition maps onto Docverse's auto-created ``__main``
-    edition (``EditionKind.main``). All other LTD editions are imported
-    as ``EditionKind.draft``; the LTD slug is preserved verbatim.
+    Carried on :class:`EditionKindDerivation` purely for observability:
+    operators triaging a mis-kinded import need to know whether LTD's
+    tracking mode or a slug-rewrite rule decided the kind.
     """
-    if ltd_slug == LTD_MAIN_SLUG:
-        return EditionKind.main
-    return EditionKind.draft
+
+    ltd_main = "ltd_main"
+    """LTD's ``main`` edition, which always maps to ``EditionKind.main``."""
+
+    ltd_mode = "ltd_mode"
+    """An LTD version tracking mode mapped directly onto a kind."""
+
+    rule = "rule"
+    """A slug-rewrite rule (user-configured or built-in) matched the ref."""
+
+    fallback = "fallback"
+    """No mode mapping and no rule matched; the draft fallback applied."""
+
+
+@dataclass(frozen=True, slots=True)
+class EditionKindDerivation:
+    """A derived Docverse edition kind plus its provenance."""
+
+    kind: EditionKind
+    """The Docverse edition kind to import the LTD edition as."""
+
+    source: EditionKindSource
+    """Which derivation arm produced :attr:`kind`."""
+
+    detail: str | None = None
+    """LTD mode for ``ltd_mode``, matched rule ``type`` for ``rule``."""
+
+
+#: LTD version tracking modes that imply a Docverse kind on their own,
+#: with no ref inspection. LTD only ever points these editions at
+#: releases of the matching grammar, so the mode *is* the classification.
+#: ``eups_daily_release`` is deliberately ``draft`` — dailies should keep
+#: aging out under the ``draft_inactivity`` lifecycle rule.
+_MODE_KIND_TABLE: dict[LtdEditionMode, EditionKind] = {
+    LtdEditionMode.lsst_doc: EditionKind.release,
+    LtdEditionMode.eups_major_release: EditionKind.release,
+    LtdEditionMode.eups_weekly_release: EditionKind.release,
+    LtdEditionMode.eups_daily_release: EditionKind.draft,
+}
+
+
+def derive_edition_kind(
+    ltd_edition: LtdEdition,
+    *,
+    git_ref: str | None = None,
+    rules: Sequence[AnySlugRewriteRule] = (),
+) -> EditionKindDerivation:
+    """Pick the Docverse :class:`EditionKind` for an LTD edition.
+
+    Mode-first, then rule-driven:
+
+    1. LTD's ``main`` edition maps onto Docverse's auto-created
+       ``__main`` edition (``EditionKind.main``).
+    2. An LTD version tracking mode (``lsst_doc``, ``eups_*``) maps
+       straight onto a kind via ``_MODE_KIND_TABLE``, without
+       consulting the ref at all.
+    3. Everything else (``git_refs``, ``manual``) runs the full
+       slug-rewrite rule chain — org/project rules then the built-in
+       version heuristics — against the tracked ref.
+
+    Parameters
+    ----------
+    ltd_edition
+        The LTD edition being imported.
+    git_ref
+        The ref the Docverse tracking pair pins, as returned by
+        :func:`map_edition_tracking`. Falls back to the edition's first
+        ``tracked_refs`` entry and finally to the LTD slug, so an
+        edition with no ref at all still gets classified on its slug.
+    rules
+        Ordered org/project-configured slug rewrite rules. The built-in
+        version rules are always appended by the domain layer.
+
+    Returns
+    -------
+    EditionKindDerivation
+        The derived kind and where it came from.
+    """
+    if ltd_edition.slug == LTD_MAIN_SLUG:
+        return EditionKindDerivation(
+            kind=EditionKind.main, source=EditionKindSource.ltd_main
+        )
+
+    ltd_mode = _parse_mode(ltd_edition.mode)
+    if ltd_mode is not None:
+        mode_kind = _MODE_KIND_TABLE.get(ltd_mode)
+        if mode_kind is not None:
+            return EditionKindDerivation(
+                kind=mode_kind,
+                source=EditionKindSource.ltd_mode,
+                detail=ltd_mode.value,
+            )
+
+    tracked = ltd_edition.tracked_refs[0] if ltd_edition.tracked_refs else None
+    ref = git_ref or tracked or ltd_edition.slug
+    derivation = derive_edition_kind_from_ref(ref, rules)
+    if derivation.matched_rule_type is None:
+        return EditionKindDerivation(
+            kind=derivation.edition_kind, source=EditionKindSource.fallback
+        )
+    return EditionKindDerivation(
+        kind=derivation.edition_kind,
+        source=EditionKindSource.rule,
+        detail=derivation.matched_rule_type,
+    )
+
+
+def _parse_mode(mode: str) -> LtdEditionMode | None:
+    """Parse LTD's ``mode`` string, tolerating schema drift.
+
+    Unknown modes return ``None`` so kind derivation degrades to the
+    rule chain. :func:`map_edition_tracking` — which every caller runs
+    first — raises on the same input, so this is a defensive branch.
+    """
+    try:
+        return LtdEditionMode(mode)
+    except ValueError:
+        return None
 
 
 def derive_edition_slug(ltd_slug: str) -> str:

@@ -105,6 +105,7 @@ async def _seed_org(
     *,
     slug: str = "ks-svc",
     lifecycle_rules: LifecycleRuleSet | None = None,
+    slug_rewrite_rules: list[dict[str, object]] | None = None,
 ) -> int:
     logger = structlog.get_logger("test")
     store = OrganizationStore(session=session, logger=logger)
@@ -114,6 +115,7 @@ async def _seed_org(
             title="ks-svc",
             base_domain=f"{slug}.example.com",
             lifecycle_rules=lifecycle_rules,
+            slug_rewrite_rules=slug_rewrite_rules,
         )
     )
     return org.id
@@ -877,7 +879,12 @@ async def test_sync_edition_imports_lsst_doc_branch_edition(
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """A non-main ``lsst_doc`` edition imports as a Docverse draft."""
+    """A non-main ``lsst_doc`` edition imports as a Docverse release.
+
+    The LTD tracking mode alone decides the kind: this fixture's ref is
+    an ordinary ``u/jsick/feature`` branch, which the ref heuristic
+    would classify as a draft.
+    """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
 
@@ -923,13 +930,13 @@ async def test_sync_edition_imports_lsst_doc_branch_edition(
             org_id=org_id, slug="pipelines"
         )
         assert project is not None
-        draft = await edition_store.get_by_slug(
+        edition = await edition_store.get_by_slug(
             project_id=project.id, slug="u-jsick-feature"
         )
-        assert draft is not None
-        assert draft.kind == EditionKind.draft
-        assert draft.tracking_mode == TrackingMode.lsst_doc
-        assert draft.tracking_params == {}
+        assert edition is not None
+        assert edition.kind == EditionKind.release
+        assert edition.tracking_mode == TrackingMode.lsst_doc
+        assert edition.tracking_params == {}
 
     outcome = result.edition_outcomes[0]
     assert outcome.docverse_slug == "u-jsick-feature"
@@ -1961,6 +1968,242 @@ _LSST_OWNER = "lsst"
 _LSST_REPO = "pipelines_lsst_io"
 
 
+def _version_edition_payload(
+    *, slug: str, git_ref: str, mode: str = "git_refs"
+) -> dict:  # type: ignore[type-arg]
+    """Build an LTD edition payload at ``/editions/2`` on a given ref."""
+    payload = _load("edition_branch_git_refs.json")
+    payload["slug"] = slug
+    payload["title"] = slug
+    payload["tracked_refs"] = [git_ref]
+    payload["mode"] = mode
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_sync_imports_version_ref_edition_as_release(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A ``git_refs`` edition tracking ``15.2.1`` imports as a release.
+
+    No slug-rewrite rules are configured, so the classification comes
+    entirely from the built-in version heuristics reached through
+    ``derive_edition_kind``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-kind-release")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.release
+        assert edition.tracking_mode == TrackingMode.git_ref
+        assert edition.tracking_params == {"git_ref": "15.2.1"}
+
+
+@pytest.mark.asyncio
+async def test_sync_kind_honors_org_slug_rewrite_rules(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An org-configured rule beats the built-in version heuristic.
+
+    Keeper-sync resolves the same project-over-org rule set the native
+    upload path uses, so an operator who has deliberately re-tagged a
+    grammar keeps that decision on imported editions too.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-kind-rules",
+            slug_rewrite_rules=[{"type": "semver", "edition_kind": "draft"}],
+        )
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.draft
+
+
+@pytest.mark.asyncio
+async def test_sync_imports_ticket_branch_edition_as_draft(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Ticket-branch editions keep importing as drafts.
+
+    The version heuristics must not sweep up ordinary branches — these
+    editions still need to age out under ``draft_inactivity``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-kind-draft")
+
+    _seed_two_editions_main_and_draft(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>draft</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="u-jsick-feature"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.draft
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ltd_mode", "expected_kind", "expected_tracking_mode"),
+    [
+        ("lsst_doc", EditionKind.release, TrackingMode.lsst_doc),
+        (
+            "eups_daily_release",
+            EditionKind.draft,
+            TrackingMode.eups_daily_release,
+        ),
+    ],
+    ids=["lsst-doc-release", "eups-daily-draft"],
+)
+async def test_sync_imports_version_mode_editions_by_mode(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    ltd_mode: str,
+    expected_kind: EditionKind,
+    expected_tracking_mode: TrackingMode,
+) -> None:
+    """LTD version tracking modes decide the kind on their own.
+
+    The tracked ref is deliberately ticket-shaped so a mode-derived
+    kind cannot be confused with a ref-heuristic one: ``lsst_doc``
+    still imports as a release, ``eups_daily_release`` still as a
+    draft.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session, slug=f"ks-mode-{ltd_mode.replace('_', '-')}"
+        )
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(
+            slug="current", git_ref="tickets/DM-1", mode=ltd_mode
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>versioned</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="current"
+        )
+        assert edition is not None
+        assert edition.kind == expected_kind
+        assert edition.tracking_mode == expected_tracking_mode
+
+
 @pytest.mark.asyncio
 async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
     db_session: AsyncSession,
@@ -2154,6 +2397,104 @@ async def test_proactive_draft_inactivity_tombstones_and_skips(
         assert tombstone.tombstone_reason == (
             TombstoneReason.lifecycle_preemptive.value
         )
+
+
+@pytest.mark.asyncio
+async def test_proactive_draft_inactivity_exempts_version_slugged_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A stale version-slugged LTD edition is imported, not tombstoned.
+
+    This is the regression the PRD was written for: the transient
+    edition the proactive pass evaluates used to be hardcoded
+    ``draft``, so ``draft_inactivity`` tombstoned every old LTD release
+    ``lifecycle_preemptive`` and it never imported. The transient now
+    derives ``release`` from the tracked ref, and ``draft_inactivity``
+    only matches drafts — so age is irrelevant here.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-release",
+            lifecycle_rules=LifecycleRuleSet(
+                root=[DraftInactivityRule(max_days_inactive=30)]
+            ),
+        )
+
+    release_payload = _version_edition_payload(slug="15.2.1", git_ref="15.2.1")
+    # Far older than the inactivity threshold — under the old
+    # derivation this alone was enough to tombstone the edition.
+    stale_date = (datetime.now(tz=UTC) - timedelta(days=900)).isoformat()
+    release_payload["date_rebuilt"] = stale_date
+    release_payload["date_created"] = stale_date
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=release_payload
+    )
+    _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+        tags=["15.2.1"],
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Both editions synced — the release was never vetoed.
+    assert len(result.edition_outcomes) == 2
+    assert "15.2.1" in {o.docverse_slug for o in result.edition_outcomes}
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert state is not None
+        assert state.date_tombstoned is None
+
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.release
 
 
 @pytest.mark.asyncio

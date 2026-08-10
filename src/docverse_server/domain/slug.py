@@ -34,11 +34,13 @@ __all__ = [
     "InvalidSlugError",
     "LsstDocRule",
     "PrefixStripRule",
+    "RefKindDerivation",
     "RegexRule",
     "SemverRule",
     "SlugDerivationResult",
     "SlugRewriteRule",
     "VersionRule",
+    "derive_edition_kind_from_ref",
     "derive_edition_slug",
     "parse_slug_rewrite_rules",
     "validate_slug",
@@ -256,11 +258,36 @@ class SlugDerivationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RefKindDerivation:
+    """The edition kind a git ref resolves to under the rule chain."""
+
+    edition_kind: EditionKind
+    """The kind the first matching rule assigns (``draft`` if none do)."""
+
+    matched_rule_type: str | None = None
+    """``type`` of the rule that matched, or ``None`` for the fallback."""
+
+
+@dataclass(frozen=True, slots=True)
 class _RuleMatch:
     """A rewrite rule's contribution when it matches a git ref."""
 
     base_slug: str
     edition_kind: EditionKind
+
+
+@dataclass(frozen=True, slots=True)
+class _ChainOutcome:
+    """What the ordered rule chain decided for one git ref.
+
+    The all-defaults instance is the "no rule matched" verdict: the
+    caller supplies its own fallback slug and keeps ``draft``.
+    """
+
+    base_slug: str | None = None
+    edition_kind: EditionKind = EditionKind.draft
+    matched_rule_type: str | None = None
+    suppressed: bool = False
 
 
 # --- Public functions ---
@@ -351,6 +378,67 @@ def _match_rewrite_rule(
     return _RuleMatch(base_slug=git_ref, edition_kind=rule.edition_kind)
 
 
+def _run_rule_chain(
+    git_ref: str, rules: Sequence[AnySlugRewriteRule]
+) -> _ChainOutcome:
+    """Walk *rules* then the built-ins; the first match wins.
+
+    Shared by `derive_edition_slug` and `derive_edition_kind_from_ref`
+    so both agree on precedence: org/project-configured rules first,
+    then `BUILTIN_SLUG_REWRITE_RULES`, then "nothing matched".
+    """
+    for rule in chain(rules, BUILTIN_SLUG_REWRITE_RULES):
+        if isinstance(rule, IgnoreRule):
+            if fnmatch.fnmatchcase(git_ref, rule.glob):
+                return _ChainOutcome(suppressed=True)
+            continue
+        match = _match_rewrite_rule(rule, git_ref)
+        if match is not None:
+            return _ChainOutcome(
+                base_slug=match.base_slug,
+                edition_kind=match.edition_kind,
+                matched_rule_type=rule.type,
+            )
+    return _ChainOutcome()
+
+
+def derive_edition_kind_from_ref(
+    git_ref: str, rules: Sequence[AnySlugRewriteRule] = ()
+) -> RefKindDerivation:
+    """Classify a git ref's edition kind without deriving a slug.
+
+    Runs the same first-match-wins chain as `derive_edition_slug`
+    (caller-supplied *rules*, then `BUILTIN_SLUG_REWRITE_RULES`) but
+    reports only the kind. Callers that already own the slug — notably
+    keeper-sync, which preserves LTD's slug verbatim — use this instead
+    of `derive_edition_slug` so ref shapes that would not survive
+    `validate_slug` still get classified rather than raising.
+
+    An ignore rule reports ``draft`` rather than suppressing: ignore
+    rules gate *auto-creation*, and a caller asking only for a kind has
+    already decided the edition exists.
+
+    Parameters
+    ----------
+    git_ref
+        The git ref (branch or tag name) to classify.
+    rules
+        Ordered org/project-configured rewrite rules.
+
+    Returns
+    -------
+    RefKindDerivation
+        The derived kind and the ``type`` of the rule that produced it.
+    """
+    outcome = _run_rule_chain(git_ref, rules)
+    if outcome.suppressed:
+        return RefKindDerivation(edition_kind=EditionKind.draft)
+    return RefKindDerivation(
+        edition_kind=outcome.edition_kind,
+        matched_rule_type=outcome.matched_rule_type,
+    )
+
+
 def derive_edition_slug(
     git_ref: str,
     rules: Sequence[AnySlugRewriteRule],
@@ -383,26 +471,16 @@ def derive_edition_slug(
     InvalidSlugError
         If the derived slug fails validation.
     """
-    base_slug: str | None = None
-    edition_kind = EditionKind.draft
-    matched_rule_type: str | None = None
-
-    for rule in chain(rules, BUILTIN_SLUG_REWRITE_RULES):
-        if isinstance(rule, IgnoreRule):
-            if fnmatch.fnmatchcase(git_ref, rule.glob):
-                return None
-            continue
-        match = _match_rewrite_rule(rule, git_ref)
-        if match is not None:
-            base_slug = match.base_slug
-            edition_kind = match.edition_kind
-            matched_rule_type = rule.type
-            break
+    outcome = _run_rule_chain(git_ref, rules)
+    if outcome.suppressed:
+        return None
+    edition_kind = outcome.edition_kind
+    matched_rule_type = outcome.matched_rule_type
 
     # Default fallback: replace slashes with hyphens
+    base_slug = outcome.base_slug
     if base_slug is None:
         base_slug = git_ref.replace("/", "-")
-        edition_kind = EditionKind.draft
 
     # Compound slug for alternates
     if alternate_name is not None:
