@@ -146,6 +146,7 @@ class EditionTrackingService:
             "Derived edition slug",
             slug=derivation.slug,
             edition_kind=derivation.edition_kind,
+            matched_rule_type=derivation.matched_rule_type,
             git_ref=build.git_ref,
             build_id=build.id,
             project_id=project.id,

@@ -1177,3 +1177,116 @@ async def test_track_build_unparseable_ref_no_match(
         assert ed is not None
         assert ed.current_build_id == build_valid.id
         await db_session.commit()
+
+
+# ── Built-in version rule tests ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_track_build_builtin_semver_release(
+    db_session: AsyncSession,
+) -> None:
+    """A stable semver ref auto-creates a release edition with no config."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="builtin-rel-org")
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert result.derived_slug == "1.0.0"
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.release
+        assert edition.tracking_mode == TrackingMode.git_ref
+        assert edition.tracking_params == {"git_ref": "1.0.0"}
+        assert edition.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_builtin_semver_prerelease_is_draft(
+    db_session: AsyncSession,
+) -> None:
+    """A semver prerelease falls through the built-ins to a draft."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="builtin-pre-org")
+        build = await _create_build(
+            db_session, project.id, git_ref="1.0.0-rc.1"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert result.derived_slug == "1.0.0-rc.1"
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0-rc.1"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_user_rule_beats_builtin(
+    db_session: AsyncSession,
+) -> None:
+    """A configured rule matching a version-like ref wins over built-ins."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="builtin-override-org",
+            org_slug_rewrite_rules=[
+                {
+                    "type": "regex",
+                    "pattern": r"^(?P<slug>\d+\.\d+\.\d+)$",
+                    "edition_kind": "draft",
+                }
+            ],
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_logs_matched_rule_type(
+    db_session: AsyncSession,
+) -> None:
+    """The derivation log event names the rule type that matched."""
+    service = _make_service(db_session)
+    with structlog.testing.capture_logs() as logs:
+        async with db_session.begin():
+            _org, project = await _setup(
+                db_session, org_slug="builtin-log-org"
+            )
+            build = await _create_build(
+                db_session, project.id, git_ref="w_2026_10"
+            )
+            await service.track_build(build)
+            await db_session.commit()
+
+    derivations = [
+        entry for entry in logs if entry["event"] == "Derived edition slug"
+    ]
+    assert len(derivations) == 1
+    assert derivations[0]["matched_rule_type"] == "eups_weekly"
+    assert derivations[0]["edition_kind"] == EditionKind.release

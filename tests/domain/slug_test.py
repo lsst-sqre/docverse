@@ -8,10 +8,17 @@ from pydantic import ValidationError
 from docverse.models import EditionKind, TrackingMode
 from docverse_server.domain.slug import (
     ALTERNATE_SEPARATOR,
+    BUILTIN_SLUG_REWRITE_RULES,
+    AnySlugRewriteRule,
+    EupsMajorRule,
+    EupsWeeklyRule,
     IgnoreRule,
     InvalidSlugError,
+    LsstDocRule,
     PrefixStripRule,
     RegexRule,
+    SemverRule,
+    VersionRule,
     derive_edition_slug,
     parse_slug_rewrite_rules,
     validate_slug,
@@ -19,23 +26,21 @@ from docverse_server.domain.slug import (
 
 # ---- Rubin example rules (reused across tests) ----
 
-RUBIN_RULES: list[IgnoreRule | PrefixStripRule | RegexRule] = (
-    parse_slug_rewrite_rules(
-        [
-            {"type": "ignore", "glob": "dependabot/**"},
-            {"type": "ignore", "glob": "renovate/**"},
-            {
-                "type": "prefix_strip",
-                "prefix": "tickets/",
-                "edition_kind": "draft",
-            },
-            {
-                "type": "regex",
-                "pattern": r"^v?(?P<slug>\d+\.\d+\.\d+)$",
-                "edition_kind": "release",
-            },
-        ]
-    )
+RUBIN_RULES: list[AnySlugRewriteRule] = parse_slug_rewrite_rules(
+    [
+        {"type": "ignore", "glob": "dependabot/**"},
+        {"type": "ignore", "glob": "renovate/**"},
+        {
+            "type": "prefix_strip",
+            "prefix": "tickets/",
+            "edition_kind": "draft",
+        },
+        {
+            "type": "regex",
+            "pattern": r"^v?(?P<slug>\d+\.\d+\.\d+)$",
+            "edition_kind": "release",
+        },
+    ]
 )
 
 
@@ -333,7 +338,7 @@ class TestRuleOrdering:
         assert result.edition_kind == EditionKind.draft
 
     def test_ignore_before_prefix_strip_suppresses(self) -> None:
-        rules: list[IgnoreRule | PrefixStripRule | RegexRule] = [
+        rules: list[AnySlugRewriteRule] = [
             IgnoreRule(type="ignore", glob="tickets/*"),
             PrefixStripRule(type="prefix_strip", prefix="tickets/"),
         ]
@@ -341,7 +346,7 @@ class TestRuleOrdering:
         assert result is None
 
     def test_ignore_after_prefix_strip_does_not_suppress(self) -> None:
-        rules: list[IgnoreRule | PrefixStripRule | RegexRule] = [
+        rules: list[AnySlugRewriteRule] = [
             PrefixStripRule(type="prefix_strip", prefix="tickets/"),
             IgnoreRule(type="ignore", glob="tickets/*"),
         ]
@@ -487,3 +492,164 @@ def test_rubin_alternate() -> None:
         "git_ref": "tickets/DM-12345",
         "alternate_name": "usdf-dev",
     }
+
+
+# ---- Built-in version rules ----
+
+
+@pytest.mark.parametrize(
+    ("git_ref", "expected_slug", "expected_kind", "expected_rule_type"),
+    [
+        ("1.2.3", "1.2.3", EditionKind.release, "semver"),
+        ("v1.2.3", "v1.2.3", EditionKind.release, "semver"),
+        ("0.1.0", "0.1.0", EditionKind.release, "semver"),
+        ("1.0.0-rc.1", "1.0.0-rc.1", EditionKind.draft, None),
+        ("v2.0.0-beta.3", "v2.0.0-beta.3", EditionKind.draft, None),
+        ("v1.0", "v1.0", EditionKind.release, "lsst_doc"),
+        ("1.0", "1.0", EditionKind.release, "lsst_doc"),
+        ("v27_0", "v27_0", EditionKind.release, "eups_major"),
+        ("27.0", "27.0", EditionKind.release, "lsst_doc"),
+        ("w_2026_10", "w_2026_10", EditionKind.release, "eups_weekly"),
+        ("d_2026_08_10", "d_2026_08_10", EditionKind.draft, None),
+        ("tickets/DM-12345", "tickets-DM-12345", EditionKind.draft, None),
+        ("DM-12345", "DM-12345", EditionKind.draft, None),
+        ("t-DM-12345", "t-DM-12345", EditionKind.draft, None),
+        ("main", "main", EditionKind.draft, None),
+    ],
+    ids=[
+        "semver-stable",
+        "semver-stable-v-prefix",
+        "semver-zero-major",
+        "semver-prerelease-draft",
+        "semver-prerelease-v-prefix-draft",
+        "lsstdoc-v-prefix",
+        "lsstdoc-bare",
+        "eups-major-underscore",
+        "eups-major-dotted-matches-lsstdoc-first",
+        "eups-weekly",
+        "eups-daily-draft",
+        "ticket-branch-draft",
+        "bare-ticket-key-draft",
+        "prefixed-ticket-key-draft",
+        "main-draft",
+    ],
+)
+def test_builtin_version_rules(
+    git_ref: str,
+    expected_slug: str,
+    expected_kind: EditionKind,
+    expected_rule_type: str | None,
+) -> None:
+    """Built-in rules classify version-like refs with no user config."""
+    result = derive_edition_slug(git_ref, [])
+    assert result is not None
+    assert result.slug == expected_slug
+    assert result.edition_kind == expected_kind
+    assert result.matched_rule_type == expected_rule_type
+
+
+def test_builtin_precedence_order() -> None:
+    """Built-ins are ordered semver → lsst_doc → eups_major → eups_weekly."""
+    assert [rule.type for rule in BUILTIN_SLUG_REWRITE_RULES] == [
+        "semver",
+        "lsst_doc",
+        "eups_major",
+        "eups_weekly",
+    ]
+
+
+def test_builtin_release_keeps_git_ref_tracking() -> None:
+    """A built-in release match keeps verbatim slug + pinned git_ref."""
+    result = derive_edition_slug("v1.2.3", [])
+    assert result is not None
+    assert result.slug == "v1.2.3"
+    assert result.tracking_mode == TrackingMode.git_ref
+    assert result.tracking_params == {"git_ref": "v1.2.3"}
+
+
+def test_builtin_applies_to_alternate_editions() -> None:
+    """Alternate builds still get a compound slug and alternate tracking."""
+    result = derive_edition_slug("1.2.3", [], alternate_name="usdf-dev")
+    assert result is not None
+    assert result.slug == f"usdf-dev{ALTERNATE_SEPARATOR}1.2.3"
+    assert result.edition_kind == EditionKind.release
+    assert result.tracking_mode == TrackingMode.alternate_git_ref
+
+
+class TestBuiltinPrecedenceAgainstUserRules:
+    def test_user_rule_wins_over_builtin(self) -> None:
+        """An earlier user rule beats the built-in semver rule."""
+        rules: list[AnySlugRewriteRule] = [
+            RegexRule(
+                type="regex",
+                pattern=r"^(?P<slug>\d+\.\d+\.\d+)$",
+                edition_kind=EditionKind.draft,
+            )
+        ]
+        result = derive_edition_slug("1.2.3", rules)
+        assert result is not None
+        assert result.edition_kind == EditionKind.draft
+        assert result.matched_rule_type == "regex"
+
+    def test_user_ignore_rule_suppresses_builtin_match(self) -> None:
+        rules: list[AnySlugRewriteRule] = [
+            IgnoreRule(type="ignore", glob="v*")
+        ]
+        assert derive_edition_slug("v1.2.3", rules) is None
+
+    def test_non_matching_user_rules_fall_through_to_builtins(self) -> None:
+        rules: list[AnySlugRewriteRule] = [
+            IgnoreRule(type="ignore", glob="dependabot/**"),
+            PrefixStripRule(type="prefix_strip", prefix="tickets/"),
+        ]
+        result = derive_edition_slug("1.2.3", rules)
+        assert result is not None
+        assert result.edition_kind == EditionKind.release
+        assert result.matched_rule_type == "semver"
+
+    def test_user_version_rule_can_override_kind(self) -> None:
+        """Operators can re-tag a built-in grammar with a different kind."""
+        rules: list[AnySlugRewriteRule] = [
+            SemverRule(type="semver", edition_kind=EditionKind.draft)
+        ]
+        result = derive_edition_slug("1.2.3", rules)
+        assert result is not None
+        assert result.edition_kind == EditionKind.draft
+
+
+class TestVersionRuleParsing:
+    """The new rule types round-trip through parse_slug_rewrite_rules."""
+
+    def test_round_trip(self) -> None:
+        rules = parse_slug_rewrite_rules(
+            [
+                {"type": "semver"},
+                {"type": "lsst_doc"},
+                {"type": "eups_major"},
+                {"type": "eups_weekly"},
+            ]
+        )
+        assert [type(rule) for rule in rules] == [
+            SemverRule,
+            LsstDocRule,
+            EupsMajorRule,
+            EupsWeeklyRule,
+        ]
+
+    def test_default_edition_kind_is_release(self) -> None:
+        rule = parse_slug_rewrite_rules([{"type": "semver"}])[0]
+        assert isinstance(rule, VersionRule)
+        assert rule.edition_kind == EditionKind.release
+
+    def test_explicit_edition_kind(self) -> None:
+        rule = parse_slug_rewrite_rules(
+            [{"type": "eups_weekly", "edition_kind": "draft"}]
+        )[0]
+        assert isinstance(rule, VersionRule)
+        assert rule.edition_kind == EditionKind.draft
+
+    def test_invalid_edition_kind_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            parse_slug_rewrite_rules(
+                [{"type": "semver", "edition_kind": "nonsense"}]
+            )

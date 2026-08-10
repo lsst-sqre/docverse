@@ -9,22 +9,36 @@ import fnmatch
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from docverse.models import EditionKind, TrackingMode
+from docverse_server.domain.version import (
+    EupsMajorVersion,
+    EupsWeeklyVersion,
+    LsstDocVersion,
+    SemverVersion,
+)
 from docverse_server.exceptions import DocverseSlackException
 
 __all__ = [
     "ALTERNATE_SEPARATOR",
+    "BUILTIN_SLUG_REWRITE_RULES",
     "MAX_SLUG_LENGTH",
+    "AnySlugRewriteRule",
+    "EupsMajorRule",
+    "EupsWeeklyRule",
     "IgnoreRule",
     "InvalidSlugError",
+    "LsstDocRule",
     "PrefixStripRule",
     "RegexRule",
+    "SemverRule",
     "SlugDerivationResult",
     "SlugRewriteRule",
+    "VersionRule",
     "derive_edition_slug",
     "parse_slug_rewrite_rules",
     "validate_slug",
@@ -121,8 +135,80 @@ class RegexRule(BaseModel):
         return v
 
 
+class VersionRule(BaseModel):
+    """Base for rules that match a ref against a version grammar.
+
+    Version rules are *kind-only*: the slug stays verbatim (version refs
+    never contain slashes) and tracking stays pinned to the ref, so the
+    only thing a match contributes is ``edition_kind``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    edition_kind: EditionKind = EditionKind.release
+
+    def matches(self, git_ref: str) -> bool:
+        """Report whether *git_ref* satisfies this rule's grammar."""
+        raise NotImplementedError
+
+
+class SemverRule(VersionRule):
+    """Match stable semantic-version refs (``1.2.3``, ``v1.2.3``).
+
+    Prereleases such as ``1.0.0-rc.1`` deliberately do not match so they
+    fall through to the draft fallback.
+    """
+
+    type: Literal["semver"] = "semver"
+
+    def matches(self, git_ref: str) -> bool:
+        version = SemverVersion.parse(git_ref)
+        return version is not None and version.prerelease is None
+
+
+class LsstDocRule(VersionRule):
+    """Match LSST document version refs (``v1.0``, ``1.0``, ``1.0.1``)."""
+
+    type: Literal["lsst_doc"] = "lsst_doc"
+
+    def matches(self, git_ref: str) -> bool:
+        return LsstDocVersion.parse(git_ref) is not None
+
+
+class EupsMajorRule(VersionRule):
+    """Match EUPS major release refs (``v27_0``, ``27.0``)."""
+
+    type: Literal["eups_major"] = "eups_major"
+
+    def matches(self, git_ref: str) -> bool:
+        return EupsMajorVersion.parse(git_ref) is not None
+
+
+class EupsWeeklyRule(VersionRule):
+    """Match EUPS weekly release refs (``w_2026_10``)."""
+
+    type: Literal["eups_weekly"] = "eups_weekly"
+
+    def matches(self, git_ref: str) -> bool:
+        return EupsWeeklyVersion.parse(git_ref) is not None
+
+
+AnySlugRewriteRule = (
+    IgnoreRule
+    | PrefixStripRule
+    | RegexRule
+    | SemverRule
+    | LsstDocRule
+    | EupsMajorRule
+    | EupsWeeklyRule
+)
+"""Any concrete slug rewrite rule, as an undiscriminated union.
+
+Use this in function signatures; use `SlugRewriteRule` for validation.
+"""
+
 SlugRewriteRule = Annotated[
-    IgnoreRule | PrefixStripRule | RegexRule,
+    AnySlugRewriteRule,
     Field(discriminator="type"),
 ]
 """A single slug rewrite rule (discriminated union on ``type``)."""
@@ -130,6 +216,20 @@ SlugRewriteRule = Annotated[
 _rule_list_adapter: TypeAdapter[list[SlugRewriteRule]] = TypeAdapter(
     list[SlugRewriteRule]
 )
+
+BUILTIN_SLUG_REWRITE_RULES: tuple[AnySlugRewriteRule, ...] = (
+    SemverRule(),
+    LsstDocRule(),
+    EupsMajorRule(),
+    EupsWeeklyRule(),
+)
+"""Version-heuristic rules applied to every project.
+
+`derive_edition_slug` consults these *after* the org/project-configured
+rules and *before* the draft fallback, so an explicit user rule always
+wins. EUPS dailies and ticket branches match nothing here and therefore
+fall through to the draft fallback.
+"""
 
 
 # --- Result dataclass ---
@@ -151,13 +251,24 @@ class SlugDerivationResult:
     tracking_params: dict[str, str]
     """Parameters for the tracking mode."""
 
+    matched_rule_type: str | None = None
+    """``type`` of the rule that matched, or ``None`` for the fallback."""
+
+
+@dataclass(frozen=True, slots=True)
+class _RuleMatch:
+    """A rewrite rule's contribution when it matches a git ref."""
+
+    base_slug: str
+    edition_kind: EditionKind
+
 
 # --- Public functions ---
 
 
 def parse_slug_rewrite_rules(
     raw: list[dict[str, Any]] | None,
-) -> list[IgnoreRule | PrefixStripRule | RegexRule]:
+) -> list[AnySlugRewriteRule]:
     """Parse JSONB slug rewrite rules into typed rule objects.
 
     Parameters
@@ -214,20 +325,50 @@ def validate_slug(slug: str) -> str:
     return slug
 
 
+def _match_rewrite_rule(
+    rule: PrefixStripRule | RegexRule | VersionRule, git_ref: str
+) -> _RuleMatch | None:
+    """Apply a non-ignore rule, returning ``None`` when it does not match."""
+    if isinstance(rule, PrefixStripRule):
+        if not git_ref.startswith(rule.prefix):
+            return None
+        remainder = git_ref[len(rule.prefix) :]
+        return _RuleMatch(
+            base_slug=remainder.replace("/", rule.slash_replacement),
+            edition_kind=rule.edition_kind,
+        )
+    if isinstance(rule, RegexRule):
+        m = re.match(rule.pattern, git_ref)
+        if m is None:
+            return None
+        return _RuleMatch(
+            base_slug=m.group("slug").replace("/", rule.slash_replacement),
+            edition_kind=rule.edition_kind,
+        )
+    if not rule.matches(git_ref):
+        return None
+    # Version rules are kind-only: the ref becomes the slug verbatim.
+    return _RuleMatch(base_slug=git_ref, edition_kind=rule.edition_kind)
+
+
 def derive_edition_slug(
     git_ref: str,
-    rules: Sequence[IgnoreRule | PrefixStripRule | RegexRule],
+    rules: Sequence[AnySlugRewriteRule],
     *,
     alternate_name: str | None = None,
 ) -> SlugDerivationResult | None:
     """Derive an edition slug from a git ref using rewrite rules.
+
+    Rules are consulted in order and the first match wins:
+    the caller-supplied *rules*, then `BUILTIN_SLUG_REWRITE_RULES`, then
+    a draft fallback that only replaces slashes with hyphens.
 
     Parameters
     ----------
     git_ref
         The git ref (branch or tag name) from the build.
     rules
-        Ordered rewrite rules; first match wins.
+        Ordered org/project-configured rewrite rules.
     alternate_name
         If set, produces a compound slug for an alternate edition.
 
@@ -244,24 +385,19 @@ def derive_edition_slug(
     """
     base_slug: str | None = None
     edition_kind = EditionKind.draft
+    matched_rule_type: str | None = None
 
-    for rule in rules:
+    for rule in chain(rules, BUILTIN_SLUG_REWRITE_RULES):
         if isinstance(rule, IgnoreRule):
             if fnmatch.fnmatchcase(git_ref, rule.glob):
                 return None
-        elif isinstance(rule, PrefixStripRule):
-            if git_ref.startswith(rule.prefix):
-                remainder = git_ref[len(rule.prefix) :]
-                base_slug = remainder.replace("/", rule.slash_replacement)
-                edition_kind = rule.edition_kind
-                break
-        elif isinstance(rule, RegexRule):
-            m = re.match(rule.pattern, git_ref)
-            if m:
-                base_slug = m.group("slug")
-                base_slug = base_slug.replace("/", rule.slash_replacement)
-                edition_kind = rule.edition_kind
-                break
+            continue
+        match = _match_rewrite_rule(rule, git_ref)
+        if match is not None:
+            base_slug = match.base_slug
+            edition_kind = match.edition_kind
+            matched_rule_type = rule.type
+            break
 
     # Default fallback: replace slashes with hyphens
     if base_slug is None:
@@ -288,4 +424,5 @@ def derive_edition_slug(
         edition_kind=edition_kind,
         tracking_mode=tracking_mode,
         tracking_params=tracking_params,
+        matched_rule_type=matched_rule_type,
     )
