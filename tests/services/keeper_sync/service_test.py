@@ -33,6 +33,8 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
@@ -106,6 +108,7 @@ async def _seed_org(
     slug: str = "ks-svc",
     lifecycle_rules: LifecycleRuleSet | None = None,
     slug_rewrite_rules: list[dict[str, object]] | None = None,
+    edition_autocreation: dict[str, object] | None = None,
 ) -> int:
     logger = structlog.get_logger("test")
     store = OrganizationStore(session=session, logger=logger)
@@ -118,6 +121,15 @@ async def _seed_org(
             slug_rewrite_rules=slug_rewrite_rules,
         )
     )
+    # ``edition_autocreation`` is PATCH-only (not on OrganizationCreate),
+    # so it goes on with a direct UPDATE — same shape the edition-tracking
+    # tests use.
+    if edition_autocreation is not None:
+        await session.execute(
+            update(SqlOrganization)
+            .where(SqlOrganization.id == org.id)
+            .values(edition_autocreation=edition_autocreation)
+        )
     return org.id
 
 
@@ -2473,6 +2485,385 @@ async def test_resync_kind_refresh_covers_adopted_editions(
     assert edition.kind == expected_kind
     # Adoption, not a second row under the keeper-derived slug.
     assert keeper_slugged is None
+
+
+# ---------------------------------------------------------------------------
+# Semver aggregate backfill (PRD #498 / DM-55772). Syncing a stable-semver
+# release edition creates/points the ``N`` / ``N.M`` aggregates the native
+# upload path would have created, so migrated projects render the same
+# dashboard groups. Gated on the resolved ``edition_autocreation`` config.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_project(
+    session: AsyncSession,
+    *,
+    org_id: int,
+    edition_autocreation: dict[str, object] | None = None,
+) -> int:
+    """Create the ``pipelines`` project before sync ever walks it.
+
+    Pairs with :func:`_seed_ltd_one_edition` (which omits LTD's ``main``
+    edition), because ``ProjectStore.create`` does not auto-create the
+    ``__main`` edition that ``ProjectService.create`` would.
+    """
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=session, logger=logger)
+    async with session.begin():
+        project = await project_store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        if edition_autocreation is not None:
+            await session.execute(
+                update(SqlProject)
+                .where(SqlProject.id == project.id)
+                .values(edition_autocreation=edition_autocreation)
+            )
+    return project.id
+
+
+def _seed_ltd_two_releases(
+    mock_discovery: respx.Router,
+    *,
+    first_ref: str,
+    second_ref: str,
+) -> None:
+    """Stub ``pipelines`` with two semver release editions, in order.
+
+    Edition 2 tracks ``first_ref`` (build 43) and edition 3 tracks
+    ``second_ref`` (build 44); LTD lists them in that order. The build
+    bodies differ so dual-upload convergence does not collapse the two
+    onto one Docverse build row.
+    """
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/2",
+                    f"{LTD_BASE}/editions/3",
+                ]
+            },
+        )
+    )
+    for ltd_id, build_id, ref in (
+        (2, 43, first_ref),
+        (3, 44, second_ref),
+    ):
+        edition_payload = _version_edition_payload(slug=ref, git_ref=ref)
+        edition_payload["self_url"] = f"{LTD_BASE}/editions/{ltd_id}"
+        edition_payload["build_url"] = f"{LTD_BASE}/builds/{build_id}"
+        build_payload = _load("build.json")
+        build_payload["self_url"] = f"{LTD_BASE}/builds/{build_id}"
+        build_payload["slug"] = str(build_id)
+        build_payload["bucket_root_dir"] = f"pipelines/builds/{build_id}"
+        mock_discovery.get(f"{LTD_BASE}/editions/{ltd_id}").mock(
+            return_value=httpx.Response(200, json=edition_payload)
+        )
+        mock_discovery.get(f"{LTD_BASE}/builds/{build_id}").mock(
+            return_value=httpx.Response(200, json=build_payload)
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_backfills_semver_aggregate_editions(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Syncing ``15.2.1`` creates ``15`` and ``15.2`` on the same build."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-create")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+        major = await edition_store.get_by_slug(
+            project_id=project.id, slug="15"
+        )
+        minor = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2"
+        )
+    assert release is not None
+    assert major is not None
+    assert major.kind == EditionKind.major
+    assert major.tracking_mode == TrackingMode.semver_major
+    assert major.tracking_params == {"major_version": 15}
+    assert major.current_build_id == release.current_build_id
+    assert minor is not None
+    assert minor.kind == EditionKind.minor
+    assert minor.tracking_mode == TrackingMode.semver_minor
+    assert minor.tracking_params == {"major_version": 15, "minor_version": 2}
+    assert minor.current_build_id == release.current_build_id
+
+
+@pytest.mark.asyncio
+async def test_sync_aggregates_suppressed_by_project_config(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A project opting out imports the release with no aggregates."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-off-proj")
+
+    project_id = await _seed_project(
+        db_session,
+        org_id=org_id,
+        edition_autocreation={"semver_aggregates": False},
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {"15.2.1"}
+
+
+@pytest.mark.asyncio
+async def test_sync_aggregates_suppressed_by_org_config(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The org value applies when the project leaves its own null."""
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-agg-off-org",
+            edition_autocreation={"semver_aggregates": False},
+        )
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {"15.2.1"}
+
+
+@pytest.mark.asyncio
+async def test_sync_leaves_non_aggregate_edition_on_aggregate_slug(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An operator's own ``15`` edition is never converted or repointed."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-occupied")
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="15",
+        kind=EditionKind.release,
+        git_ref="v15",
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        occupant = await edition_store.get_by_id(edition_id)
+    assert occupant is not None
+    assert occupant.kind == EditionKind.release
+    assert occupant.tracking_mode == TrackingMode.git_ref
+    assert occupant.tracking_params == {"git_ref": "v15"}
+    assert occupant.current_build_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("edition_slug", "git_ref", "ltd_mode"),
+    [
+        ("15.2.1-rc.1", "15.2.1-rc.1", "git_refs"),
+        ("v1.0", "v1.0", "lsst_doc"),
+        ("w_2026_10", "w_2026_10", "git_refs"),
+    ],
+    ids=["semver-prerelease", "lsst-doc", "eups-weekly"],
+)
+async def test_sync_creates_no_aggregates_for_non_semver_releases(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    edition_slug: str,
+    git_ref: str,
+    ltd_mode: str,
+) -> None:
+    """Only stable semver implies aggregates.
+
+    A prerelease is not a release at all; lsstdoc and EUPS releases are,
+    but their grammars have no ``N`` / ``N.M`` rollup — the PRD leaves
+    EUPS aggregates out of scope.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session, slug=f"ks-no-agg-{ltd_mode.replace('_', '-')}"
+        )
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug=edition_slug, git_ref=git_ref, mode=ltd_mode
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>versioned</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {edition_slug}
+
+
+@pytest.mark.asyncio
+async def test_sync_aggregate_never_moves_backwards(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A later-listed older release must not pull ``15`` back.
+
+    LTD lists editions in no version order, so the aggregate needs the
+    same version guard the native tracking path applies.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-guard")
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_two_releases(
+        mock_discovery, first_ref="15.2.1", second_ref="15.0.0"
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>15.2.1</html>",
+        "pipelines/builds/44/index.html": b"<html>15.0.0</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        newest = await edition_store.get_by_slug(
+            project_id=project_id, slug="15.2.1"
+        )
+        major = await edition_store.get_by_slug(
+            project_id=project_id, slug="15"
+        )
+    assert newest is not None
+    assert major is not None
+    assert major.current_build_id == newest.current_build_id
 
 
 @pytest.mark.asyncio

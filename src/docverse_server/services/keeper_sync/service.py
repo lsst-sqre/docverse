@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.models import (
     BuildCreate,
     BuildStatus,
+    EditionAutocreationConfig,
     EditionKind,
     ProjectCreate,
     ProjectGitHubBindingCreate,
@@ -39,16 +40,25 @@ from docverse.models.projects import parse_github_url
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_autocreation import (
+    DEFAULT_EDITION_AUTOCREATION,
+    resolve_edition_autocreation,
+)
 from docverse_server.domain.lifecycle import (
     DraftInactivityRule,
     RefDeletedRule,
 )
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
+from docverse_server.domain.semver_aggregate import (
+    SemverAggregateSpec,
+    semver_aggregate_specs,
+)
 from docverse_server.domain.slug import (
     AnySlugRewriteRule,
     parse_slug_rewrite_rules,
 )
+from docverse_server.domain.version import SemverVersion
 from docverse_server.exceptions import KeeperSyncInvariantError, NotFoundError
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -98,6 +108,7 @@ from .mappers import (
 
 __all__ = [
     "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",
+    "AggregateEditionOutcome",
     "BuildSyncOutcome",
     "CopyCallable",
     "EditionSyncOutcome",
@@ -171,6 +182,23 @@ class BuildSyncOutcome:
 
 
 @dataclass(frozen=True)
+class AggregateEditionOutcome:
+    """One semver aggregate edition the backfill created or advanced.
+
+    Emitted only when the pass actually moved a row — a freshly created
+    ``N`` / ``N.M`` edition, or an existing aggregate whose pointer
+    advanced onto this build. The steady state (aggregate already on the
+    build, or held back by the version guard) emits nothing, so the
+    worker's publish fan-out stays a no-op on repeat polls.
+    """
+
+    docverse_edition_id: int
+    docverse_slug: str
+    docverse_build_id: int
+    docverse_build_public_id: str
+
+
+@dataclass(frozen=True)
 class EditionSyncOutcome:
     """What ``sync_edition`` did with one LTD edition.
 
@@ -191,6 +219,14 @@ class EditionSyncOutcome:
     docverse_project_id: int
     docverse_project_slug: str
     build_outcome: BuildSyncOutcome | None
+    aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
+    """Semver aggregates this edition's release build created or moved.
+
+    Empty on every path that did not run the backfill (no build, a
+    tombstone short-circuit, a non-semver ref, aggregates switched off)
+    and in the steady state where the aggregates already point at the
+    build.
+    """
 
 
 @dataclass(frozen=True)
@@ -315,6 +351,12 @@ class KeeperSyncService:
         # derivation call sites (the proactive pass and sync_edition)
         # so the rule set is parsed a single time per sync.
         rewrite_rules = _resolve_rewrite_rules(org=org, project=project)
+        # Same story for the autocreation config: project-over-org, one
+        # resolution per sync, threaded into every sync_edition call.
+        autocreation = resolve_edition_autocreation(
+            project=project.edition_autocreation,
+            org=org.edition_autocreation,
+        )
         ltd_editions = await self._ltd_client.list_editions_for_product(
             ltd_slug
         )
@@ -334,6 +376,7 @@ class KeeperSyncService:
                 project=project,
                 ltd_edition=ltd_edition,
                 rewrite_rules=rewrite_rules,
+                autocreation=autocreation,
             )
             outcomes.append(outcome)
             if on_edition_synced is not None:
@@ -594,6 +637,7 @@ class KeeperSyncService:
         ltd_edition: LtdEdition,
         org_slug: str | None = None,
         rewrite_rules: Sequence[AnySlugRewriteRule] = (),
+        autocreation: EditionAutocreationConfig | None = None,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse.
 
@@ -601,6 +645,12 @@ class KeeperSyncService:
         consulted when deriving the edition's kind for ``git_refs`` /
         ``manual`` editions. The empty default still picks up the
         built-in version heuristics.
+
+        ``autocreation`` is the project's resolved edition-autocreation
+        config, which gates the semver aggregate backfill;
+        :meth:`sync_project` resolves it project-over-org once per
+        project and passes it in. ``None`` falls back to the built-in
+        defaults for the direct callers that do not resolve it.
 
         Short-circuits *before* ``_ensure_edition`` runs when the
         edition's ``keeper_sync_state`` row is tombstoned. The check
@@ -691,6 +741,7 @@ class KeeperSyncService:
             )
 
         build_outcome: BuildSyncOutcome | None = None
+        aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
         if ltd_edition.build_url is not None:
             build_outcome = await self.sync_build(
                 org_id=org_id,
@@ -700,6 +751,14 @@ class KeeperSyncService:
                 ltd_edition=ltd_edition,
                 ltd_build=ltd_build_for_mapping,
             )
+            if build_outcome.docverse_build_id is not None:
+                aggregate_outcomes = await self._backfill_semver_aggregates(
+                    project_id=project.id,
+                    git_ref=tracking_params.get("git_ref"),
+                    derived_kind=kind_derivation.kind,
+                    build_id=build_outcome.docverse_build_id,
+                    autocreation=autocreation or DEFAULT_EDITION_AUTOCREATION,
+                )
 
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
@@ -716,6 +775,132 @@ class KeeperSyncService:
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             build_outcome=build_outcome,
+            aggregate_outcomes=aggregate_outcomes,
+        )
+
+    async def _backfill_semver_aggregates(
+        self,
+        *,
+        project_id: int,
+        git_ref: str | None,
+        derived_kind: EditionKind,
+        build_id: int,
+        autocreation: EditionAutocreationConfig,
+    ) -> tuple[AggregateEditionOutcome, ...]:
+        """Create/point the ``N`` / ``N.M`` aggregates for a release.
+
+        The migration counterpart of
+        ``EditionTrackingService._auto_create_version_editions``: without
+        it, an imported project's dashboard would list bare release
+        editions where a natively built one groups them under ``15`` and
+        ``15.2``. Both paths build their rows from
+        :func:`~docverse_server.domain.semver_aggregate.semver_aggregate_specs`
+        so they cannot drift.
+
+        The gate is the *derived* kind, not the persisted one: a
+        ``semver`` rule an operator re-pointed at ``draft`` means "these
+        refs are not releases here", and that decision must suppress the
+        aggregates too. Reading the persisted kind instead would couple
+        the aggregates to unrelated manual PATCHes of a single edition.
+
+        Returns one outcome per aggregate this call actually moved, for
+        the worker to publish; see :class:`AggregateEditionOutcome`.
+        """
+        if not autocreation.semver_aggregates:
+            return ()
+        if derived_kind != EditionKind.release or git_ref is None:
+            return ()
+        version = SemverVersion.parse(git_ref)
+        if version is None:
+            return ()
+        specs = semver_aggregate_specs(version)
+        if not specs:
+            return ()
+        outcomes: list[AggregateEditionOutcome] = []
+        async with self._session.begin():
+            build = await self._build_store.get_by_id(build_id)
+            if build is not None:
+                for spec in specs:
+                    outcome = await self._ensure_aggregate_edition(
+                        project_id=project_id,
+                        spec=spec,
+                        build=build,
+                        version=version,
+                    )
+                    if outcome is not None:
+                        outcomes.append(outcome)
+        return tuple(outcomes)
+
+    async def _ensure_aggregate_edition(
+        self,
+        *,
+        project_id: int,
+        spec: SemverAggregateSpec,
+        build: Build,
+        version: SemverVersion,
+    ) -> AggregateEditionOutcome | None:
+        """Ensure one aggregate exists and points at *build*.
+
+        Returns ``None`` — leaving the row untouched — when the slug is
+        occupied by an edition that is not this aggregate (an operator's
+        own ``15``, or a natively created one on a different tracking
+        mode), when the version guard rejects an older release, or when
+        the pointer is already where it should be.
+        """
+        edition = await self._edition_store.get_by_slug(
+            project_id=project_id, slug=spec.slug
+        )
+        if edition is None:
+            edition = await self._edition_store.create_internal(
+                project_id=project_id,
+                slug=spec.slug,
+                title=spec.title,
+                kind=spec.kind,
+                tracking_mode=spec.tracking_mode,
+                tracking_params=spec.tracking_params,
+            )
+            self._logger.info(
+                "Auto-created semver aggregate edition for synced release",
+                project_id=project_id,
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                edition_kind=spec.kind.value,
+                tracking_mode=spec.tracking_mode.value,
+            )
+        # Also catches ``create_internal`` losing its ON CONFLICT race to
+        # a concurrent writer that inserted a differently-tracked row.
+        if edition.tracking_mode != spec.tracking_mode:
+            self._logger.info(
+                "Semver aggregate slug held by a non-aggregate edition;"
+                " leaving it untouched",
+                project_id=project_id,
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                edition_kind=edition.kind.value,
+                tracking_mode=edition.tracking_mode.value,
+            )
+            return None
+        if not _aggregate_accepts(edition, version):
+            return None
+        if edition.current_build_id == build.id:
+            return None
+        updated = await self._edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id, skip_date_guard=True
+        )
+        if updated is None:
+            return None
+        self._logger.info(
+            "Pointed semver aggregate at synced release build",
+            project_id=project_id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            build_id=build.id,
+        )
+        return AggregateEditionOutcome(
+            docverse_edition_id=edition.id,
+            docverse_slug=edition.slug,
+            docverse_build_id=build.id,
+            docverse_build_public_id=serialize_base32_id(build.public_id),
         )
 
     async def _ensure_edition(
@@ -1149,6 +1334,24 @@ def _now() -> datetime:
 
 def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
+
+
+def _aggregate_accepts(edition: Edition, candidate: SemverVersion) -> bool:
+    """Report whether *candidate* may advance an aggregate's pointer.
+
+    LTD hands editions back in no particular version order, so without a
+    guard a project with 81 releases would leave ``15`` pointing at
+    whichever ``15.x.y`` happened to sync last. Mirrors the version-mode
+    arm of ``EditionTrackingService._should_update``: an aggregate with
+    no current build — or one whose current ref no longer parses as
+    semver — accepts anything; otherwise the candidate must not be
+    older.
+    """
+    current_ref = edition.current_build_git_ref
+    if edition.current_build_id is None or current_ref is None:
+        return True
+    current = SemverVersion.parse(current_ref)
+    return current is None or candidate >= current
 
 
 def _resolve_rewrite_rules(

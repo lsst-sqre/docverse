@@ -7,11 +7,7 @@ from typing import Literal
 
 import structlog
 
-from docverse.models import (
-    EditionAutocreationConfig,
-    EditionKind,
-    TrackingMode,
-)
+from docverse.models import EditionAutocreationConfig, TrackingMode
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
@@ -21,6 +17,7 @@ from docverse_server.domain.edition_tracking import (
     EditionTrackingOutcome,
     EditionTrackingResult,
 )
+from docverse_server.domain.semver_aggregate import semver_aggregate_specs
 from docverse_server.domain.slug import (
     InvalidSlugError,
     SlugDerivationResult,
@@ -495,61 +492,33 @@ class EditionTrackingService:
             return [], set()
 
         sv = SemverVersion.parse(build.git_ref)
-        if sv is None or sv.prerelease is not None:
+        if sv is None:
             return [], set()
 
         matched: list[Edition] = []
         created_ids: set[int] = set()
-
-        # --- semver_major ---
-        major_slug = str(sv.major)
-        major_edition = await self._deps.edition_store.get_by_slug(
-            project_id=project_id, slug=major_slug
-        )
-        if major_edition is None:
-            major_edition = await self._deps.edition_store.create_internal(
-                project_id=project_id,
-                slug=major_slug,
-                title=f"Latest {sv.major}.x",
-                kind=EditionKind.major,
-                tracking_mode=TrackingMode.semver_major,
-                tracking_params={"major_version": sv.major},
+        for spec in semver_aggregate_specs(sv):
+            edition = await self._deps.edition_store.get_by_slug(
+                project_id=project_id, slug=spec.slug
             )
-            self._deps.logger.info(
-                "Auto-created semver_major edition",
-                slug=major_slug,
-                project_id=project_id,
-            )
-            matched.append(major_edition)
-            created_ids.add(major_edition.id)
-        elif major_edition.tracking_mode == TrackingMode.semver_major:
-            matched.append(major_edition)
-
-        # --- semver_minor ---
-        minor_slug = f"{sv.major}.{sv.minor}"
-        minor_edition = await self._deps.edition_store.get_by_slug(
-            project_id=project_id, slug=minor_slug
-        )
-        if minor_edition is None:
-            minor_edition = await self._deps.edition_store.create_internal(
-                project_id=project_id,
-                slug=minor_slug,
-                title=f"Latest {sv.major}.{sv.minor}.x",
-                kind=EditionKind.minor,
-                tracking_mode=TrackingMode.semver_minor,
-                tracking_params={
-                    "major_version": sv.major,
-                    "minor_version": sv.minor,
-                },
-            )
-            self._deps.logger.info(
-                "Auto-created semver_minor edition",
-                slug=minor_slug,
-                project_id=project_id,
-            )
-            matched.append(minor_edition)
-            created_ids.add(minor_edition.id)
-        elif minor_edition.tracking_mode == TrackingMode.semver_minor:
-            matched.append(minor_edition)
+            if edition is None:
+                edition = await self._deps.edition_store.create_internal(
+                    project_id=project_id,
+                    slug=spec.slug,
+                    title=spec.title,
+                    kind=spec.kind,
+                    tracking_mode=spec.tracking_mode,
+                    tracking_params=spec.tracking_params,
+                )
+                self._deps.logger.info(
+                    "Auto-created semver aggregate edition",
+                    slug=spec.slug,
+                    tracking_mode=spec.tracking_mode,
+                    project_id=project_id,
+                )
+                matched.append(edition)
+                created_ids.add(edition.id)
+            elif edition.tracking_mode == spec.tracking_mode:
+                matched.append(edition)
 
         return matched, created_ids

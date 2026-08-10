@@ -538,6 +538,15 @@ def _build_on_edition_synced(
             outcome=outcome,
             logger=logger,
         )
+        await _enqueue_publish_for_aggregates(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            outcome=outcome,
+            logger=logger,
+        )
 
     return callback
 
@@ -608,6 +617,60 @@ async def _enqueue_publish_for_synced_edition(
         build_id=build_outcome.docverse_build_id,
         phase="synced",
     )
+
+
+async def _enqueue_publish_for_aggregates(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    outcome: EditionSyncOutcome,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Publish the semver aggregates the synced release just moved.
+
+    The ``15`` / ``15.2`` editions keeper-sync backfills carry a current
+    build but are not LTD resources, so they never appear as their own
+    :class:`EditionSyncOutcome` — without this pass the dashboard would
+    link to an unpublished aggregate.
+
+    Runs regardless of ``build_outcome.short_circuited``: an aggregate
+    can be created on a re-sync whose build short-circuited (the release
+    was imported before this backfill existed). The service only emits
+    an outcome when it actually created or advanced the row, so the
+    steady state enqueues nothing and the tail-end self-heal pass has no
+    aggregate case to cover.
+    """
+    if not outcome.aggregate_outcomes:
+        return
+    edition_store = factory.create_edition_store()
+    history_store = factory.create_edition_build_history_store()
+    queue_backend = factory.create_queue_backend()
+
+    for aggregate in outcome.aggregate_outcomes:
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=edition_store,
+            history_store=history_store,
+            queue_job_store=queue_job_store,
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=outcome.docverse_project_id,
+            project_slug=outcome.docverse_project_slug,
+            edition_id=aggregate.docverse_edition_id,
+            edition_slug=aggregate.docverse_slug,
+            build_id=aggregate.docverse_build_id,
+            build_public_id=aggregate.docverse_build_public_id,
+            keeper_sync_run_id=run_id,
+        )
+        logger.info(
+            "Enqueued publish_edition for synced build",
+            edition_slug=aggregate.docverse_slug,
+            build_id=aggregate.docverse_build_id,
+            phase="semver_aggregate",
+        )
 
 
 async def _self_heal_unpublished_editions(

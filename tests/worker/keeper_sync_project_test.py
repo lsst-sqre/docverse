@@ -1196,6 +1196,122 @@ async def test_keeper_sync_project_publishes_each_edition_per_iteration(
                 assert qj.keeper_sync_run_id == run_id
 
 
+def _seed_release_edition_ltd(mock_discovery: respx.Router) -> None:
+    """Stub LTD with the main edition + one ``15.2.1`` release edition."""
+    release_edition = _load("edition_branch_git_refs.json")
+    release_edition["slug"] = "15.2.1"
+    release_edition["title"] = "15.2.1"
+    release_edition["tracked_refs"] = ["15.2.1"]
+    release_build = _load("build.json")
+    release_build["self_url"] = f"{LTD_BASE}/builds/43"
+    release_build["bucket_root_dir"] = "pipelines/builds/43"
+    release_edition["build_url"] = f"{LTD_BASE}/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=release_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=release_build)
+    )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_publishes_backfilled_aggregates(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``15`` / ``15.2`` aggregates get published, not just created.
+
+    The dashboard lists any edition with a current build, so an
+    aggregate keeper-sync creates but never publishes would render as a
+    link to a 404.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    publish_slugs = sorted(
+        job.kwargs["payload"]["edition_slug"] for job in publish_jobs
+    )
+    assert publish_slugs == ["15", "15.2", "15.2.1", "__main"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            for slug in ("15", "15.2"):
+                aggregate = await edition_store.get_by_slug(
+                    project_id=project.id, slug=slug
+                )
+                assert aggregate is not None
+                assert aggregate.publish_status == PublishStatus.pending
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_dedups_dashboard_build_cascade(
     app: None,
