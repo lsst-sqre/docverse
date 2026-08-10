@@ -1452,3 +1452,39 @@ async def test_patch_project_version_slug_rules(
         for rule in parsed
         if isinstance(rule, VersionRule)
     )
+
+
+@pytest.mark.asyncio
+async def test_patch_project_edition_autocreation(
+    client: AsyncClient,
+) -> None:
+    """``edition_autocreation`` round-trips through project PATCH/GET."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "autocreate-proj",
+            "title": "Autocreate",
+            "source_url": "https://gitlab.com/lsst/autocreate-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/autocreate-proj",
+        json={"edition_autocreation": {"semver_aggregates": False}},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }
+
+    get_response = await client.get(
+        "/docverse/orgs/proj-org/projects/autocreate-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }

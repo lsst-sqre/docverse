@@ -7,7 +7,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from docverse.models import KeeperSyncConfig, UrlScheme
+from docverse.models import (
+    EditionAutocreationConfig,
+    KeeperSyncConfig,
+    UrlScheme,
+)
 
 from .lifecycle import LifecycleRuleSet
 
@@ -47,6 +51,15 @@ class Organization(BaseModel):
         default=None,
         description=(
             "Default configuration for the __main edition on new projects."
+        ),
+    )
+
+    edition_autocreation: EditionAutocreationConfig | None = Field(
+        default=None,
+        description=(
+            "Org-level defaults for which editions are auto-created."
+            " ``None`` means the built-in defaults apply, unless a"
+            " project overrides them."
         ),
     )
 

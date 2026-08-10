@@ -29,6 +29,7 @@ from .dashboard_template import (
 from .editions import (
     DefaultEditionConfig,
     Edition,
+    EditionAutocreationConfig,
     EditionBuildHistoryEntry,
     EditionCreate,
     EditionKind,
@@ -124,6 +125,7 @@ __all__ = [
     "DefaultEditionConfig",
     "DraftInactivityRule",
     "Edition",
+    "EditionAutocreationConfig",
     "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",

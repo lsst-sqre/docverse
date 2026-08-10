@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from docverse.models import (
     Edition,
+    EditionAutocreationConfig,
     EditionCreate,
     EditionKind,
     OrganizationCreate,
@@ -123,4 +124,18 @@ def test_relaxed_edition_slug_chars_stay_edition_only(slug: str) -> None:
             slug=slug,
             title="T",
             base_domain="lsst.io",
+        )
+
+
+def test_edition_autocreation_defaults_semver_aggregates_true() -> None:
+    """An empty autocreation config still enables semver aggregates."""
+    config = EditionAutocreationConfig()
+    assert config.semver_aggregates is True
+
+
+def test_edition_autocreation_rejects_unknown_keys() -> None:
+    """An unrecognized knob is a validation error, not a silent no-op."""
+    with pytest.raises(ValidationError):
+        EditionAutocreationConfig.model_validate(
+            {"semver_aggregates": False, "eups_aggregates": True}
         )

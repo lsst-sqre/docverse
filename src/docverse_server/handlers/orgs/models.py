@@ -159,6 +159,7 @@ class Organization(_OrganizationBase):
                 if domain.default_edition_config is not None
                 else None
             ),
+            edition_autocreation=domain.edition_autocreation,
             purgatory_retention=int(
                 domain.purgatory_retention.total_seconds()
             ),
@@ -254,6 +255,7 @@ class Project(_ProjectBase):
             github=github_binding,
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
+            edition_autocreation=domain.edition_autocreation,
             default_edition=edition_response,
             date_created=domain.date_created,
             date_updated=domain.date_updated,

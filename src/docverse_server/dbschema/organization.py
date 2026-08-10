@@ -52,6 +52,10 @@ class SqlOrganization(Base):
         JSONB, nullable=True
     )
 
+    edition_autocreation: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+
     keeper_sync_config: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True
     )

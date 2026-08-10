@@ -329,3 +329,45 @@ async def test_patch_organization_version_slug_rules(
         "eups_major",
         "eups_weekly",
     ]
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_edition_autocreation(
+    client: AsyncClient,
+) -> None:
+    """``edition_autocreation`` round-trips through org PATCH and GET."""
+    await seed_org_with_admin(client, "patch-autocreate-org", "admin")
+
+    response = await client.patch(
+        "/docverse/orgs/patch-autocreate-org",
+        json={"edition_autocreation": {"semver_aggregates": False}},
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 200
+    assert response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }
+
+    get_response = await client.get(
+        "/docverse/orgs/patch-autocreate-org",
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_edition_autocreation_invalid_shape(
+    client: AsyncClient,
+) -> None:
+    """An unknown autocreation knob is rejected with a 422."""
+    await seed_org_with_admin(client, "bad-autocreate-org", "admin")
+
+    response = await client.patch(
+        "/docverse/orgs/bad-autocreate-org",
+        json={"edition_autocreation": {"semver_aggregate": False}},
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 422

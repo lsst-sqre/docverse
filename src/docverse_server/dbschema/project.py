@@ -68,6 +68,10 @@ class SqlProject(Base):
         JSONB, nullable=True
     )
 
+    edition_autocreation: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+
     date_created: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

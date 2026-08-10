@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ._examples import EXAMPLE_ORG_URL, EXAMPLE_PROJECT_URL
-from .editions import DefaultEditionConfig
+from .editions import DefaultEditionConfig, EditionAutocreationConfig
 from .editions import Edition as EditionResponse
 from .lifecycle import LifecycleRuleSet
 
@@ -323,6 +323,15 @@ class Project(BaseModel):
         description="Rules governing build lifecycle.",
     )
 
+    edition_autocreation: EditionAutocreationConfig | None = Field(
+        default=None,
+        description=(
+            "Which editions Docverse auto-creates for this project when a"
+            " build lands. ``null`` defers to the organization's config,"
+            " then to the built-in defaults."
+        ),
+    )
+
     default_edition: EditionResponse | None = Field(
         default=None,
         description=(
@@ -379,6 +388,15 @@ class ProjectUpdate(BaseModel):
     lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
+    )
+
+    edition_autocreation: EditionAutocreationConfig | None = Field(
+        default=None,
+        description=(
+            "Which editions Docverse auto-creates for this project when a"
+            " build lands. Pass ``null`` to clear the override and defer"
+            " to the organization's config."
+        ),
     )
 
     @model_validator(mode="after")

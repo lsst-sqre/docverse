@@ -20,6 +20,7 @@ from .queue_enums import PublishStatus
 __all__ = [
     "DefaultEditionConfig",
     "Edition",
+    "EditionAutocreationConfig",
     "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
@@ -123,6 +124,27 @@ class DefaultEditionConfig(BaseModel):
         default=True,
         description=(
             "Whether the default edition is exempt from lifecycle rules."
+        ),
+    )
+
+
+class EditionAutocreationConfig(BaseModel):
+    """Which editions Docverse auto-creates when a build lands.
+
+    Set on an organization and/or a project; the project value wins
+    whole-object when both are present, and ``null`` at both levels
+    means "use the defaults" (every knob below at its default).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    semver_aggregates: bool = Field(
+        default=True,
+        description=(
+            "Whether a stable semver release (e.g. ``1.2.3``) also"
+            " auto-creates its ``N`` (major) and ``N.M`` (minor) aggregate"
+            " editions. Set to ``false`` for projects that publish only"
+            " concrete versions."
         ),
     )
 

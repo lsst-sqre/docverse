@@ -1,0 +1,3 @@
+### New features
+
+- Semver major/minor aggregate editions are now configurable. Organizations and projects gain a nullable `edition_autocreation` object, readable and writable through the existing org/project `GET`/`PATCH` endpoints and currently holding a single knob, `semver_aggregates` (default `true`). Setting `{"semver_aggregates": false}` stops a stable semver release like `1.0.0` from auto-creating its `1` and `1.0` aggregate editions; the project value overrides the organization's whole-object, and `null` at both levels keeps today's behavior. Aggregate editions that already exist keep tracking new releases — only the implicit creation is gated. Unknown keys in the object are rejected with a 422.

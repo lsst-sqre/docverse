@@ -64,6 +64,8 @@ async def _setup(
     *,
     org_slug: str = "track-org",
     org_slug_rewrite_rules: list[dict[str, Any]] | None = None,
+    org_edition_autocreation: dict[str, Any] | None = None,
+    project_edition_autocreation: dict[str, Any] | None = None,
 ) -> tuple[Organization, Project]:
     """Create an org and project, returning both."""
     logger = _logger()
@@ -78,11 +80,18 @@ async def _setup(
     )
     # Set slug_rewrite_rules directly on the SQL row because the
     # Pydantic model types the field as dict but the DB stores a list.
+    # ``edition_autocreation`` goes the same way because it is settable
+    # only through PATCH, not through the create models.
+    org_values: dict[str, Any] = {}
     if org_slug_rewrite_rules is not None:
+        org_values["slug_rewrite_rules"] = org_slug_rewrite_rules
+    if org_edition_autocreation is not None:
+        org_values["edition_autocreation"] = org_edition_autocreation
+    if org_values:
         await db_session.execute(
             update(SqlOrganization)
             .where(SqlOrganization.id == org.id)
-            .values(slug_rewrite_rules=org_slug_rewrite_rules)
+            .values(**org_values)
         )
         await db_session.flush()
     project = await proj_store.create(
@@ -93,6 +102,18 @@ async def _setup(
             source_url="https://example.com/example/repo",
         ),
     )
+    if project_edition_autocreation is not None:
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(edition_autocreation=project_edition_autocreation)
+        )
+        await db_session.flush()
+        reloaded = await proj_store.get_by_id(project.id)
+        if reloaded is None:
+            msg = f"Project id={project.id} vanished after update"
+            raise RuntimeError(msg)
+        project = reloaded
     return org, project
 
 
@@ -1290,3 +1311,115 @@ async def test_track_build_logs_matched_rule_type(
     assert len(derivations) == 1
     assert derivations[0]["matched_rule_type"] == "eups_weekly"
     assert derivations[0]["edition_kind"] == EditionKind.release
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_disabled_on_project(
+    db_session: AsyncSession,
+) -> None:
+    """A project opting out gets the release edition but no aggregates."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="no-agg-proj-org",
+            project_edition_autocreation={"semver_aggregates": False},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0"}
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        assert (
+            await edition_store.get_by_slug(project_id=project.id, slug="1")
+        ) is None
+        assert (
+            await edition_store.get_by_slug(project_id=project.id, slug="1.0")
+        ) is None
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_disabled_still_updates_existing(
+    db_session: AsyncSession,
+) -> None:
+    """The knob gates autocreation only, not existing aggregates."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="keep-agg-org",
+            project_edition_autocreation={"semver_aggregates": False},
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="1",
+            title="Latest 1.x",
+            kind=EditionKind.major,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 1},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    outcomes_by_slug = {o.slug: o for o in result.outcomes}
+    assert outcomes_by_slug["1"].action == "updated"
+    assert "1.0" not in outcomes_by_slug
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_disabled_on_org(
+    db_session: AsyncSession,
+) -> None:
+    """An org-level opt-out applies when the project value is null."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="no-agg-org",
+            org_edition_autocreation={"semver_aggregates": False},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_project_overrides_org(
+    db_session: AsyncSession,
+) -> None:
+    """A project opting in beats an org that opted out."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-override-org",
+            org_edition_autocreation={"semver_aggregates": False},
+            project_edition_autocreation={"semver_aggregates": True},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_default_when_unconfigured(
+    db_session: AsyncSession,
+) -> None:
+    """All-null config leaves aggregate creation on, as before."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="agg-default-org")
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}

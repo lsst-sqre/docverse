@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ._examples import EXAMPLE_ORG_URL
-from .editions import DefaultEditionConfig
+from .editions import DefaultEditionConfig, EditionAutocreationConfig
 from .lifecycle import LifecycleRuleSet
 from .memberships import OrgMembershipCreate, OrgRole
 from .services import OrganizationServiceSummary
@@ -224,6 +224,15 @@ class Organization(BaseModel):
         ),
     )
 
+    edition_autocreation: EditionAutocreationConfig | None = Field(
+        default=None,
+        description=(
+            "Org-level defaults for which editions Docverse auto-creates"
+            " when a build lands. ``null`` means the built-in defaults"
+            " apply. A project's own value overrides this whole-object."
+        ),
+    )
+
     purgatory_retention: int = Field(
         description=(
             "Duration in seconds to retain inactive builds in purgatory"
@@ -409,5 +418,14 @@ class OrganizationUpdate(BaseModel):
         default=None,
         description=(
             "Default configuration for the __main edition on new projects."
+        ),
+    )
+
+    edition_autocreation: EditionAutocreationConfig | None = Field(
+        default=None,
+        description=(
+            "Org-level defaults for which editions Docverse auto-creates"
+            " when a build lands. Pass ``null`` to clear the config and"
+            " fall back to the built-in defaults."
         ),
     )

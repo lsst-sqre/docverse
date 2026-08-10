@@ -7,9 +7,16 @@ from typing import Literal
 
 import structlog
 
-from docverse.models import EditionKind, TrackingMode
+from docverse.models import (
+    EditionAutocreationConfig,
+    EditionKind,
+    TrackingMode,
+)
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_autocreation import (
+    resolve_edition_autocreation,
+)
 from docverse_server.domain.edition_tracking import (
     EditionTrackingOutcome,
     EditionTrackingResult,
@@ -170,11 +177,15 @@ class EditionTrackingService:
                 created_ids.add(new_edition.id)
 
         # 7. Auto-create semver_major / semver_minor editions
+        autocreation = resolve_edition_autocreation(
+            project=project.edition_autocreation,
+            org=org.edition_autocreation,
+        )
         (
             version_editions,
             version_created_ids,
         ) = await self._auto_create_version_editions(
-            project_id=project.id, build=build
+            project_id=project.id, build=build, autocreation=autocreation
         )
         created_ids |= version_created_ids
         for ve in version_editions:
@@ -462,15 +473,27 @@ class EditionTrackingService:
         *,
         project_id: int,
         build: Build,
+        autocreation: EditionAutocreationConfig,
     ) -> tuple[list[Edition], set[int]]:
         """Auto-create ``semver_major`` / ``semver_minor`` editions.
 
-        Only triggers for stable semver tags (no prerelease).  Uses
-        ``create_internal`` because single-digit slugs like ``"2"``
-        don't pass ``EditionCreate``'s slug pattern.
+        Only triggers for stable semver tags (no prerelease), and only
+        when the resolved ``autocreation`` config enables
+        ``semver_aggregates``.  Uses ``create_internal`` because
+        single-digit slugs like ``"2"`` don't pass ``EditionCreate``'s
+        slug pattern.
+
+        The gate is autocreation-only, matching the config's name: an
+        aggregate edition that already exists — auto-created before the
+        knob was turned off, or created by hand — is still matched and
+        advanced by ``find_matching_editions`` in ``track_build``. Only
+        the implicit creation of new ``N`` / ``N.M`` rows stops.
 
         Returns a tuple of (matched editions, IDs of newly created ones).
         """
+        if not autocreation.semver_aggregates:
+            return [], set()
+
         sv = SemverVersion.parse(build.git_ref)
         if sv is None or sv.prerelease is not None:
             return [], set()
