@@ -187,6 +187,7 @@ async def _handle_delete(
     name="github_webhook",
 )
 async def post_github_webhook(
+    *,
     request: Request,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> dict[str, str]:

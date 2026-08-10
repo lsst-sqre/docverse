@@ -55,6 +55,7 @@ def _parse_member_id(member_id: str) -> tuple[PrincipalType, str]:
     name="get_members",
 )
 async def get_members(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -77,6 +78,7 @@ async def get_members(
     responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_member(
+    *,
     org_slug: OrgSlugParam,
     data: OrgMembershipCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -128,6 +130,7 @@ async def post_member(
     name="get_member",
 )
 async def get_member(
+    *,
     org_slug: OrgSlugParam,
     member_id: MemberIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -154,6 +157,7 @@ async def get_member(
     name="patch_member",
 )
 async def patch_member(
+    *,
     org_slug: OrgSlugParam,
     member_id: MemberIdParam,
     data: OrgMembershipUpdate,
@@ -236,6 +240,7 @@ async def patch_member(
     name="delete_member",
 )
 async def delete_member(
+    *,
     org_slug: OrgSlugParam,
     member_id: MemberIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],

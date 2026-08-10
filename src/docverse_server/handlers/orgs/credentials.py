@@ -27,6 +27,7 @@ router = APIRouter()
     name="get_credentials",
 )
 async def get_credentials(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -50,6 +51,7 @@ async def get_credentials(
     name="post_credential",
 )
 async def post_credential(
+    *,
     org_slug: OrgSlugParam,
     data: OrganizationCredentialCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -78,6 +80,7 @@ async def post_credential(
     name="get_credential",
 )
 async def get_credential(
+    *,
     org_slug: OrgSlugParam,
     credential_label: CredentialLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -100,6 +103,7 @@ async def get_credential(
     name="delete_credential",
 )
 async def delete_credential(
+    *,
     org_slug: OrgSlugParam,
     credential_label: CredentialLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],

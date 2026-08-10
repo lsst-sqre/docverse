@@ -32,6 +32,7 @@ router = APIRouter()
     name="get_org_jobs",
 )
 async def get_org_jobs(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],
@@ -158,6 +159,7 @@ async def get_org_jobs(
     ),
 )
 async def get_org_job(
+    *,
     org_slug: OrgSlugParam,
     job_id: JobIdParam,
     context: Annotated[RequestContext, Depends(context_dependency)],

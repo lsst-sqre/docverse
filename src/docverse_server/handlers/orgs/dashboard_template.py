@@ -66,6 +66,7 @@ project_override_router = APIRouter()
     name="get_org_dashboard_template",
 )
 async def get_org_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -85,6 +86,7 @@ async def get_org_dashboard_template(
     name="put_org_dashboard_template",
 )
 async def put_org_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     data: DashboardTemplateBindingCreate,
     response: Response,
@@ -124,6 +126,7 @@ async def put_org_dashboard_template(
     name="delete_org_dashboard_template",
 )
 async def delete_org_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -142,6 +145,7 @@ async def delete_org_dashboard_template(
     name="sync_org_dashboard_template",
 )
 async def sync_org_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -171,6 +175,7 @@ async def sync_org_dashboard_template(
     name="get_project_dashboard_template",
 )
 async def get_project_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -196,6 +201,7 @@ async def get_project_dashboard_template(
     name="put_project_dashboard_template",
 )
 async def put_project_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     data: DashboardTemplateBindingCreate,
@@ -239,6 +245,7 @@ async def put_project_dashboard_template(
     name="delete_project_dashboard_template",
 )
 async def delete_project_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -260,6 +267,7 @@ async def delete_project_dashboard_template(
     name="sync_project_dashboard_template",
 )
 async def sync_project_dashboard_template(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],

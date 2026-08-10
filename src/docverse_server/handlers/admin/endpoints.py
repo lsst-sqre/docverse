@@ -48,6 +48,7 @@ class SentryTestRequest(BaseModel):
     responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_organization(
+    *,
     data: OrganizationCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> AdminOrganization:
@@ -81,6 +82,7 @@ async def post_organization(
     name="admin_get_organizations",
 )
 async def get_organizations(
+    *,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> list[AdminOrganization]:
     async with context.session.begin():
@@ -106,6 +108,7 @@ async def get_organizations(
     responses=error_responses(status.HTTP_404_NOT_FOUND),
 )
 async def get_organization(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> AdminOrganization:
@@ -138,6 +141,7 @@ async def get_organization(
     },
 )
 async def post_sentry_test(
+    *,
     data: SentryTestRequest,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> None:
@@ -155,6 +159,7 @@ async def post_sentry_test(
     responses=error_responses(status.HTTP_404_NOT_FOUND),
 )
 async def delete_organization(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> None:

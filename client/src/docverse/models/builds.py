@@ -55,8 +55,10 @@ class BuildAnnotations(BaseModel):
         default=None,
         description="Full URL to the GitHub Actions run.",
         examples=[
-            "https://github.com/lsst/pipelines_lsst_io/actions/runs/"
-            "16768139904"
+            (
+                "https://github.com/lsst/pipelines_lsst_io/actions/runs/"
+                "16768139904"
+            )
         ],
     )
 
@@ -183,8 +185,10 @@ class Build(BaseModel):
     content_hash: str = Field(
         description="SHA-256 hash of the uploaded tarball.",
         examples=[
-            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789"
-            "abcdef0123456789"
+            (
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789"
+                "abcdef0123456789"
+            )
         ],
     )
 
@@ -194,8 +198,10 @@ class Build(BaseModel):
         default=None,
         description="Pre-signed URL for uploading the build tarball.",
         examples=[
-            "https://staging-bucket.s3.amazonaws.com/uploads/"
-            "1txq-55pj-1x5m-16.tar.gz?X-Amz-Signature=0ad34c"
+            (
+                "https://staging-bucket.s3.amazonaws.com/uploads/"
+                "1txq-55pj-1x5m-16.tar.gz?X-Amz-Signature=0ad34c"
+            )
         ],
     )
 
