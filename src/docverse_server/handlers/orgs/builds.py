@@ -43,6 +43,7 @@ router = APIRouter()
     name="get_builds",
 )
 async def get_builds(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -97,6 +98,7 @@ async def get_builds(
     name="post_build",
 )
 async def post_build(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     data: BuildCreate,
@@ -150,6 +152,7 @@ async def post_build(
     name="get_build",
 )
 async def get_build(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     build_id: BuildIdParam,
@@ -173,6 +176,7 @@ async def get_build(
     name="patch_build",
 )
 async def patch_build(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     build_id: BuildIdParam,
@@ -248,6 +252,7 @@ async def patch_build(
     name="delete_build",
 )
 async def delete_build(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     build_id: BuildIdParam,

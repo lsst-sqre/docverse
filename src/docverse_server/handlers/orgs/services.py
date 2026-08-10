@@ -30,6 +30,7 @@ router = APIRouter()
     name="get_services",
 )
 async def get_services(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -51,6 +52,7 @@ async def get_services(
     name="post_service",
 )
 async def post_service(
+    *,
     org_slug: OrgSlugParam,
     data: OrganizationServiceCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -80,6 +82,7 @@ async def post_service(
     name="get_service",
 )
 async def get_service(
+    *,
     org_slug: OrgSlugParam,
     service_label: ServiceLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -102,6 +105,7 @@ async def get_service(
     name="patch_service",
 )
 async def patch_service(
+    *,
     org_slug: OrgSlugParam,
     service_label: ServiceLabelParam,
     data: OrganizationServiceUpdate,
@@ -126,6 +130,7 @@ async def patch_service(
     name="delete_service",
 )
 async def delete_service(
+    *,
     org_slug: OrgSlugParam,
     service_label: ServiceLabelParam,
     context: Annotated[RequestContext, Depends(context_dependency)],

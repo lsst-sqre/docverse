@@ -55,6 +55,7 @@ router = APIRouter()
     name="get_org_keeper_sync_config",
 )
 async def get_org_keeper_sync_config(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -71,6 +72,7 @@ async def get_org_keeper_sync_config(
     name="put_org_keeper_sync_config",
 )
 async def put_org_keeper_sync_config(
+    *,
     org_slug: OrgSlugParam,
     data: KeeperSyncConfig,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -90,6 +92,7 @@ async def put_org_keeper_sync_config(
     name="patch_org_keeper_sync_config",
 )
 async def patch_org_keeper_sync_config(
+    *,
     org_slug: OrgSlugParam,
     data: KeeperSyncConfigUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -116,6 +119,7 @@ async def patch_org_keeper_sync_config(
     name="post_org_keeper_sync_run",
 )
 async def post_org_keeper_sync_run(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -143,6 +147,7 @@ async def post_org_keeper_sync_run(
     name="get_org_keeper_sync_projects",
 )
 async def get_org_keeper_sync_projects(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -191,6 +196,7 @@ async def get_org_keeper_sync_projects(
     name="get_org_keeper_sync_project_status",
 )
 async def get_org_keeper_sync_project_status(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -198,7 +204,7 @@ async def get_org_keeper_sync_project_status(
         str,
         Path(description="LTD project slug to inspect."),
     ],
-    ltd: Annotated[  # noqa: FBT002
+    ltd: Annotated[
         bool,
         Query(
             description=(
@@ -227,6 +233,7 @@ async def get_org_keeper_sync_project_status(
     name="get_org_keeper_sync_project_editions",
 )
 async def get_org_keeper_sync_project_editions(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -289,6 +296,7 @@ async def get_org_keeper_sync_project_editions(
     name="post_org_keeper_sync_project_refresh",
 )
 async def post_org_keeper_sync_project_refresh(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -317,6 +325,7 @@ async def post_org_keeper_sync_project_refresh(
     name="get_org_keeper_sync_runs",
 )
 async def get_org_keeper_sync_runs(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -378,6 +387,7 @@ async def get_org_keeper_sync_runs(
     name="get_org_keeper_sync_run",
 )
 async def get_org_keeper_sync_run(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -399,6 +409,7 @@ async def get_org_keeper_sync_run(
     name="get_org_keeper_sync_tombstones",
 )
 async def get_org_keeper_sync_tombstones(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
@@ -487,6 +498,7 @@ async def get_org_keeper_sync_tombstones(
     name="delete_org_keeper_sync_tombstone",
 )
 async def delete_org_keeper_sync_tombstone(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],

@@ -48,6 +48,7 @@ def _organization_summary(
     # route-level responses= is needed here — matching the sibling routes.
 )
 async def get_organizations(
+    *,
     request: Request,
     context: Annotated[RequestContext, Depends(context_dependency)],
 ) -> list[OrganizationSummary]:
@@ -101,6 +102,7 @@ async def get_organizations(
     name="get_organization",
 )
 async def get_organization(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],
@@ -121,6 +123,7 @@ async def get_organization(
     name="patch_organization",
 )
 async def patch_organization(
+    *,
     org_slug: OrgSlugParam,
     data: OrganizationUpdate,
     context: Annotated[RequestContext, Depends(context_dependency)],

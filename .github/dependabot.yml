@@ -11,15 +11,14 @@ updates:
         patterns:
           - "*"
 
-  - package-ecosystem: "pip"
-    directory: "/"
-    versioning-strategy: "increase-if-necessary"
+  - package-ecosystem: "npm"
+    directory: "/cloudflare-worker"
     schedule:
       interval: "monthly"
       time: "03:00"
       timezone: "America/New_York"
     groups:
-      pip:
+      npm:
         patterns:
           - "*"
 

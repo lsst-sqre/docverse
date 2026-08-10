@@ -44,6 +44,7 @@ router = APIRouter()
     name="get_projects",
 )
 async def get_projects(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],
@@ -126,6 +127,7 @@ async def get_projects(
     name="post_project",
 )
 async def post_project(
+    *,
     org_slug: OrgSlugParam,
     data: ProjectCreate,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -171,6 +173,7 @@ async def post_project(
     name="get_project",
 )
 async def get_project(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -198,6 +201,7 @@ async def get_project(
     name="patch_project",
 )
 async def patch_project(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     data: ProjectUpdate,
@@ -248,6 +252,7 @@ async def patch_project(
     name="delete_project",
 )
 async def delete_project(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],

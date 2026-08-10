@@ -2,7 +2,7 @@
 name: stoker-create-pr
 description: Create or update a pull request with a Summary / Validation steps / References body, including `Closes #<task_issue>`, `PRD: #<parent_prd>`, and `Jira: <url>` trailers, and a `DM-XXXXX:`-prefixed title for ticket branches. Use when invoked from `stoker-implement`'s PR step or when the user asks to create a PR, open a pull request, or update a PR body — and you are working in a Rubin stoker-installed repo.
 ---
-<!-- stoker-managed: skills:.claude/skills/stoker-create-pr/SKILL.md:7d81a5cae898a687 -->
+<!-- stoker-managed: skills:.claude/skills/stoker-create-pr/SKILL.md:f4cd55824c7492db -->
 
 # stoker-create-pr — the Rubin PR-creation primitive
 
@@ -88,7 +88,9 @@ Three cases:
 
 ### 4. Create a new PR
 
-**Title.**
+**Title.** Derive it from the branch's cumulative scope. This is the
+canonical title rule; step 5 regenerates the title under the same rule
+when a PR already exists.
 
 - When a **Jira key** is known, prefix the title: `DM-XXXXX: <concise
   description>`. The description is a concise summary of what this PR
@@ -107,9 +109,11 @@ EOF
 
 ### 5. Update an existing OPEN PR
 
-Regenerate the body from the branch's full scope so Summary,
-Validation steps, and References reflect every task that has landed,
-not just the first.
+Regenerate the **title and body** from the branch's full scope so the
+title, Summary, Validation steps, and References all reflect every task
+that has landed, not just the first. The title is regenerated here (not
+left as the first task's title) so it does not go stale as tasks stack
+onto the PR.
 
 1. Enumerate every commit since the PR's base. Use `baseRefName` from
    the `gh pr list` JSON; do not hardcode `origin/main`:
@@ -148,17 +152,23 @@ not just the first.
      `Jira: <url>` (omit if no Jira key). Sorted + deduped is
      idempotent by construction.
 
-5. Apply:
+5. Regenerate the title from the same cumulative branch scope, applying
+   the same rule as step 4 — including the `DM-XXXXX:` prefix when a
+   Jira key is known, and the same <70-character limit. Do **not**
+   reuse the existing PR title; recompute it so it reflects every task
+   that has landed. All tasks on a branch share one ticket, so the
+   `DM-XXXXX:` prefix is stable across regenerations — only the
+   description after it changes.
+
+6. Apply the title and body together (`--title` and `--body` in one
+   `gh pr edit`, so the title never lags the body):
 
    ```
-   gh pr edit <pr_number> --body "$(cat <<'EOF'
+   gh pr edit <pr_number> --title "<title>" --body "$(cat <<'EOF'
    <body>
    EOF
    )"
    ```
-
-   Leave the existing PR **title** unchanged on update — it already
-   carries the `DM-XXXXX:` prefix from creation.
 
 ### 6. Report the URL
 

@@ -35,6 +35,7 @@ org_router = APIRouter()
     responses=error_responses(status.HTTP_409_CONFLICT),
 )
 async def post_dashboard_rebuild(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -65,6 +66,7 @@ async def post_dashboard_rebuild(
     name="post_org_dashboard_rebuild",
 )
 async def post_org_dashboard_rebuild(
+    *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],

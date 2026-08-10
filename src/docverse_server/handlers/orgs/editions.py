@@ -61,6 +61,7 @@ router = APIRouter()
     name="get_editions",
 )
 async def get_editions(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
@@ -128,6 +129,7 @@ async def get_editions(
     name="post_edition",
 )
 async def post_edition(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     data: EditionCreate,
@@ -177,6 +179,7 @@ async def post_edition(
     name="get_edition",
 )
 async def get_edition(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
@@ -207,6 +210,7 @@ async def get_edition(
     name="get_edition_history",
 )
 async def get_edition_history(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
@@ -229,7 +233,7 @@ async def get_edition_history(
             description="Maximum number of results per page.",
         ),
     ] = DEFAULT_PAGE_LIMIT,
-    include_deleted: Annotated[  # noqa: FBT002
+    include_deleted: Annotated[
         bool,
         Query(
             description=(
@@ -271,6 +275,7 @@ async def get_edition_history(
     name="post_edition_rollback",
 )
 async def post_edition_rollback(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
@@ -320,6 +325,7 @@ async def post_edition_rollback(
     name="patch_edition",
 )
 async def patch_edition(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,
@@ -372,6 +378,7 @@ async def patch_edition(
     name="delete_edition",
 )
 async def delete_edition(
+    *,
     org_slug: OrgSlugParam,
     project_slug: ProjectSlugParam,
     edition_slug: EditionSlugParam,

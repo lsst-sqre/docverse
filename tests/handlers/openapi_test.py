@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 from fastapi import FastAPI
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, iter_route_contexts
 from httpx import AsyncClient
 
 __all__ = []
@@ -95,12 +95,14 @@ async def test_operation_ids_match_route_names(
     returns ``route.name`` makes each operationId the clean route name.
     """
     expected: dict[tuple[str, str], str] = {}
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or not route.include_in_schema:
+    for ctx in iter_route_contexts(app.routes):
+        if not isinstance(ctx.original_route, APIRoute):
             continue
-        for method in route.methods:
+        if not ctx.include_in_schema or ctx.path is None or ctx.name is None:
+            continue
+        for method in ctx.methods or ():
             if method.lower() in _HTTP_METHODS:
-                expected[(route.path, method.lower())] = route.name
+                expected[(ctx.path, method.lower())] = ctx.name
 
     spec = (await client.get("/docverse/openapi.json")).json()
     mismatches: list[str] = []
