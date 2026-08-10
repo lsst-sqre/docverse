@@ -421,6 +421,26 @@ class EditionStore:
         row.tracking_params = tracking_params
         await self._session.flush()
 
+    async def update_kind(self, *, edition_id: int, kind: EditionKind) -> None:
+        """Set the ``kind`` column on an edition row.
+
+        Deliberately narrower than :meth:`update`: keeper-sync's
+        promote-only kind refresh must rewrite ``kind`` and nothing
+        else, and it holds an edition id rather than a ``(project_id,
+        slug)`` pair (an adopted edition's slug is not the keeper-derived
+        one). The promote-only policy lives in the caller — this method
+        writes whatever kind it is given.
+        """
+        result = await self._session.execute(
+            select(SqlEdition).where(SqlEdition.id == edition_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            msg = f"Edition id={edition_id} not found"
+            raise RuntimeError(msg)
+        row.kind = kind
+        await self._session.flush()
+
     async def set_publish_status(
         self, *, edition_id: int, status: PublishStatus
     ) -> None:

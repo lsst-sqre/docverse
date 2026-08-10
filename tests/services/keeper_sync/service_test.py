@@ -2204,6 +2204,277 @@ async def test_sync_imports_version_mode_editions_by_mode(
         assert edition.tracking_mode == expected_tracking_mode
 
 
+# ---------------------------------------------------------------------------
+# Promote-only kind refresh on re-sync (PRD #498 / DM-55772). Editions
+# imported before the kind derivation was fixed carry ``draft``; every
+# subsequent sync recomputes the derived kind and applies it as a
+# ``draft`` -> ``release`` promotion only. Demotions never happen, and
+# ``main`` / ``major`` / ``minor`` / ``alternate`` editions — including a
+# kind an operator set by hand through the editions PATCH API — are never
+# rewritten.
+# ---------------------------------------------------------------------------
+
+
+def _seed_ltd_one_edition(
+    mock_discovery: respx.Router,
+    *,
+    edition_payload: dict,  # type: ignore[type-arg]
+) -> None:
+    """Stub LTD's view of ``pipelines`` with exactly one edition.
+
+    Deliberately omits LTD's ``main`` edition so these tests can create
+    the Docverse project through ``ProjectStore`` (no auto-created
+    ``__main``) and still keep the assertions on the one edition under
+    test.
+    """
+    build_payload = _load("build.json")
+    build_payload["self_url"] = f"{LTD_BASE}/builds/43"
+    build_payload["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/2"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=edition_payload)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build_payload)
+    )
+
+
+async def _seed_project_with_edition(
+    session: AsyncSession,
+    *,
+    org_id: int,
+    edition_slug: str,
+    kind: EditionKind,
+    git_ref: str,
+) -> int:
+    """Create ``pipelines`` plus one already-imported edition on a ref.
+
+    Stands in for a project keeper-sync has already walked at least
+    once: the edition row exists with whatever kind that earlier sync
+    (or an operator's PATCH) left behind. Returns the edition id so the
+    caller can assert on the same row regardless of slug.
+    """
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=session, logger=logger)
+    edition_store = EditionStore(session=session, logger=logger)
+    async with session.begin():
+        project = await project_store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=edition_slug,
+                title=edition_slug,
+                kind=kind,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": git_ref},
+            ),
+        )
+    return edition.id
+
+
+@pytest.mark.asyncio
+async def test_resync_promotes_draft_edition_to_release(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A keeper-managed ``draft`` on a version ref heals to ``release``.
+
+    The healing case from PRD #498: safir's 15.x editions were imported
+    as drafts before the derivation was mode/rule-driven. Re-syncing
+    recomputes the kind and promotes them without any operator action.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-promote")
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="15.2.1",
+        kind=EditionKind.draft,
+        git_ref="15.2.1",
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.kind == EditionKind.release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_kind", "edition_slug", "git_ref"),
+    [
+        (EditionKind.release, "u-jsick-feature", "u/jsick/feature"),
+        (EditionKind.major, "15", "15.2.1"),
+        (EditionKind.minor, "15.2", "15.2.1"),
+        (EditionKind.alternate, "15.2.1", "15.2.1"),
+    ],
+    ids=[
+        "never-demote-release",
+        "major-untouched",
+        "minor-untouched",
+        "alternate-untouched",
+    ],
+)
+async def test_resync_kind_refresh_is_promote_only(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    existing_kind: EditionKind,
+    edition_slug: str,
+    git_ref: str,
+) -> None:
+    """Only ``draft`` -> ``release`` is applied; every other kind holds.
+
+    ``never-demote-release`` derives ``draft`` from a ticket branch
+    against an edition already marked ``release`` — the exact shape of a
+    manual PATCH that must survive. The aggregate and alternate cases
+    derive ``release`` from a version ref but must not disturb a kind
+    Docverse itself assigned.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session, slug=f"ks-hold-{existing_kind.value}"
+        )
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug=edition_slug,
+        kind=existing_kind,
+        git_ref=git_ref,
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug=edition_slug, git_ref=git_ref
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>held</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.kind == existing_kind
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_kind", "expected_kind"),
+    [
+        (EditionKind.draft, EditionKind.release),
+        (EditionKind.major, EditionKind.major),
+    ],
+    ids=["adopted-draft-promoted", "adopted-major-untouched"],
+)
+async def test_resync_kind_refresh_covers_adopted_editions(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    existing_kind: EditionKind,
+    expected_kind: EditionKind,
+) -> None:
+    """The refresh reaches editions adopted by ``git_ref`` too.
+
+    PRD #409 adoption keeps a differently-slugged existing edition
+    (``v15.2.1``) rather than inserting the keeper-derived ``15.2.1``.
+    That edition is keeper-managed from then on, so the same promote-only
+    refresh applies to it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session, slug=f"ks-adopt-{existing_kind.value}"
+        )
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="v15.2.1",
+        kind=existing_kind,
+        git_ref="15.2.1",
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>adopted</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+        assert edition is not None
+        keeper_slugged = await edition_store.get_by_slug(
+            project_id=edition.project_id, slug="15.2.1"
+        )
+    assert edition.kind == expected_kind
+    # Adoption, not a second row under the keeper-derived slug.
+    assert keeper_slugged is None
+
+
 @pytest.mark.asyncio
 async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
     db_session: AsyncSession,

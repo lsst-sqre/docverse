@@ -90,6 +90,7 @@ from docverse_server.storage.project_store import ProjectStore
 
 from .copier import CopyResult
 from .mappers import (
+    EditionKindDerivation,
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
@@ -132,6 +133,20 @@ _PLACEHOLDER_CONTENT_HASH = f"sha256:{'0' * 64}"
 
 #: Username recorded as the build's uploader for synced builds.
 _SYNC_UPLOADER = "keeper-sync"
+
+#: ``(current kind, derived kind)`` pairs the per-sync kind refresh is
+#: allowed to write. Promote-only by construction (PRD #498): editions
+#: imported before keeper-sync derived kinds properly are all ``draft``,
+#: so promoting them to ``release`` is the whole healing story. Encoding
+#: the policy as an allow-list of transitions — rather than "derived !=
+#: current" — is what makes every other case safe without a special
+#: case: demotions never appear here, ``main`` / ``major`` / ``minor`` /
+#: ``alternate`` are never a source kind, and a ``release`` an operator
+#: set by hand through the editions PATCH API is never a source kind
+#: either, so manual decisions survive every subsequent sync.
+_KIND_PROMOTIONS: frozenset[tuple[EditionKind, EditionKind]] = frozenset(
+    {(EditionKind.draft, EditionKind.release)}
+)
 
 
 @dataclass(frozen=True)
@@ -656,7 +671,7 @@ class KeeperSyncService:
             edition = await self._ensure_edition(
                 project_id=project.id,
                 docverse_slug=docverse_slug,
-                kind=kind_derivation.kind,
+                kind_derivation=kind_derivation,
                 title=ltd_edition.title,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
@@ -708,12 +723,18 @@ class KeeperSyncService:
         *,
         project_id: int,
         docverse_slug: str,
-        kind: EditionKind,
+        kind_derivation: EditionKindDerivation,
         title: str,
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
     ) -> Edition:
-        """Look up or create an edition; refresh its tracking config."""
+        """Look up or create an edition; refresh its tracking and kind.
+
+        ``kind_derivation`` seeds a newly created edition's kind
+        outright. On an existing edition — whether matched by slug or
+        adopted by ``git_ref`` — it is applied through
+        :meth:`_refresh_kind`, which only ever promotes.
+        """
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
         )
@@ -755,12 +776,14 @@ class KeeperSyncService:
                         keeper_slug=docverse_slug,
                         edition_id=adopted.id,
                     )
-                    return adopted
+                    return await self._refresh_kind(
+                        edition=adopted, kind_derivation=kind_derivation
+                    )
             edition = await self._edition_store.create_internal(
                 project_id=project_id,
                 slug=docverse_slug,
                 title=title,
-                kind=kind,
+                kind=kind_derivation.kind,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
             )
@@ -769,6 +792,9 @@ class KeeperSyncService:
                 edition=edition,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
+            )
+            edition = await self._refresh_kind(
+                edition=edition, kind_derivation=kind_derivation
             )
         return edition
 
@@ -785,6 +811,41 @@ class KeeperSyncService:
             tracking_mode=tracking_mode,
             tracking_params=tracking_params,
         )
+
+    async def _refresh_kind(
+        self,
+        *,
+        edition: Edition,
+        kind_derivation: EditionKindDerivation,
+    ) -> Edition:
+        """Apply a freshly derived kind to an existing edition.
+
+        Promote-only: the ``(current, derived)`` pair must be listed in
+        :data:`_KIND_PROMOTIONS`, so the only write this can make is
+        ``draft`` -> ``release``. Everything else is a no-op that
+        returns ``edition`` unchanged — see :data:`_KIND_PROMOTIONS` for
+        why that single rule covers demotions, aggregate kinds, and
+        manually PATCHed kinds alike.
+
+        Returns the edition with the promoted kind applied so the caller
+        reports the row's post-sync state rather than the stale read.
+        """
+        if (edition.kind, kind_derivation.kind) not in _KIND_PROMOTIONS:
+            return edition
+        await self._edition_store.update_kind(
+            edition_id=edition.id, kind=kind_derivation.kind
+        )
+        self._logger.info(
+            "Promoted keeper-sync edition kind",
+            project_id=edition.project_id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            previous_kind=edition.kind.value,
+            edition_kind=kind_derivation.kind.value,
+            kind_source=kind_derivation.source.value,
+            kind_detail=kind_derivation.detail,
+        )
+        return edition.model_copy(update={"kind": kind_derivation.kind})
 
     async def sync_build(
         self,

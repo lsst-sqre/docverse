@@ -328,6 +328,50 @@ async def test_update_tracking_missing_raises(
 
 
 @pytest.mark.asyncio
+async def test_update_kind(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``update_kind`` rewrites only the ``kind`` column."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="kind-ed",
+                title="Kind",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            ),
+        )
+        await edition_store.update_kind(
+            edition_id=edition.id, kind=EditionKind.release
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        refetched = await edition_store.get_by_slug(
+            project_id=project_id, slug="kind-ed"
+        )
+    assert refetched is not None
+    assert refetched.kind == EditionKind.release
+    assert refetched.tracking_mode == TrackingMode.git_ref
+    assert refetched.tracking_params == {"git_ref": "1.0.0"}
+
+
+@pytest.mark.asyncio
+async def test_update_kind_missing_raises(
+    edition_store: EditionStore,
+) -> None:
+    """``update_kind`` raises when the edition id is unknown."""
+    with pytest.raises(RuntimeError, match="Edition id=999999 not found"):
+        await edition_store.update_kind(
+            edition_id=999999, kind=EditionKind.release
+        )
+
+
+@pytest.mark.asyncio
 async def test_set_current_build(
     db_session: AsyncSession,
     edition_store: EditionStore,
