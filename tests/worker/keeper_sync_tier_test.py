@@ -2626,3 +2626,94 @@ def test_cron_registration_matches_documented_cadence() -> None:
     assert by_name["keeper_sync_tier_discovery"].minute == {0, 30}
     # tier_other fires once an hour at :00.
     assert by_name["keeper_sync_tier_other"].minute == {0}
+
+
+# ---------------------------------------------------------------------------
+# Lost active-job race (issue #508)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tier_lost_race_does_not_truncate_the_org_pass(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the per-slug race skips that slug, not the rest of the org.
+
+    The ``has_active_for_subject`` pre-check is stubbed to always miss,
+    which is exactly what a genuine race looks like from the enqueuing
+    worker's point of view: the ``SELECT`` sees no active row, but by the
+    time the ``INSERT`` lands another worker holds
+    ``idx_queue_jobs_keeper_sync_project_active_uq``. The first slug is
+    already taken, so its insert loses; the second slug must still be
+    enqueued rather than being dropped along with the rest of the tick.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-race",
+            project_slugs=["aaa", "bbb"],
+        )
+        # Another worker already holds the mutex for "aaa".
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            subject_label="aaa",
+        )
+
+    async def always_miss(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(QueueJobStore, "has_active_for_subject", always_miss)
+
+    _stub_products(mock_discovery, ["aaa", "bbb"])
+    for product_slug, edition_id in (("aaa", 1), ("bbb", 2)):
+        _stub_editions_listing(
+            mock_discovery, product_slug=product_slug, edition_ids=[edition_id]
+        )
+        _stub_edition(
+            mock_discovery,
+            edition_id=edition_id,
+            slug="main",
+            date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    arq_queue = ctx["arq_queue"]
+    children = get_jobs_by_name(
+        arq_queue, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    # "aaa" lost the race and was skipped; "bbb" — which comes after it
+    # in the per-slug loop — is still enqueued.
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["bbb"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            rows = (
+                (
+                    await session.execute(
+                        select(SqlQueueJob).where(
+                            SqlQueueJob.org_id == org_id,
+                            SqlQueueJob.kind
+                            == JobKind.keeper_sync_project.value,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert sorted(row.subject_label or "" for row in rows) == [
+                "aaa",
+                "bbb",
+            ]
+        break

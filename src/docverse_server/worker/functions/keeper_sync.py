@@ -1963,6 +1963,15 @@ async def _enqueue_tier_project_sync(
     ``uq_editions_project_lower_slug`` race. Returns ``True`` on
     enqueue, ``False`` on skip so the caller can update its
     ``enqueued`` counter accurately.
+
+    The pre-check is the fast path, not the guarantee: another worker
+    can claim the slug between the ``SELECT`` and the ``INSERT``. The
+    insert therefore goes through
+    :meth:`~docverse_server.storage.queue_job_store.QueueJobStore.create_unless_active`,
+    which turns that lost race into the same ``False`` skip. Letting the
+    ``IntegrityError`` escape instead would unwind the caller's per-slug
+    loop and — because ``_run_tier`` catches per *org* — silently drop
+    every remaining project in that org for the tick.
     """
     async with session.begin():
         if await queue_job_store.has_active_for_subject(
@@ -1978,12 +1987,21 @@ async def _enqueue_tier_project_sync(
                 tier=tier,
             )
             return False
-        queue_job = await queue_job_store.create(
+        queue_job = await queue_job_store.create_unless_active(
             kind=JobKind.keeper_sync_project,
             org_id=org_id,
             keeper_sync_run_id=None,
             subject_label=ltd_slug,
         )
+        if queue_job is None:
+            logger.info(
+                "Skipping keeper_sync_project enqueue: "
+                "lost the race for this project's active-job slot",
+                org=org_slug,
+                ltd_slug=ltd_slug,
+                tier=tier,
+            )
+            return False
     metadata = await arq_queue.enqueue(
         "keeper_sync_project",
         _queue_name=KEEPER_SYNC_QUEUE_NAME,
