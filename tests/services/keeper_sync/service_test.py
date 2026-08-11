@@ -3130,6 +3130,52 @@ async def test_sync_aggregates_suppressed_by_org_config(
 
 
 @pytest.mark.asyncio
+async def test_sync_aggregates_suppressed_by_kind_rule(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A rule declaring semver tags non-releases suppresses aggregates.
+
+    The gate is the *derived* kind, so an operator who re-points the
+    ``semver`` rule at ``draft`` gets no ``15`` / ``15.2`` rows. The
+    native upload path gates on the same derivation.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-agg-kind-rule",
+            slug_rewrite_rules=[{"type": "semver", "edition_kind": "draft"}],
+        )
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {"15.2.1"}
+
+
+@pytest.mark.asyncio
 async def test_sync_leaves_non_aggregate_edition_on_aggregate_slug(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,

@@ -7,7 +7,11 @@ from typing import Literal
 
 import structlog
 
-from docverse.models import EditionAutocreationConfig, TrackingMode
+from docverse.models import (
+    EditionAutocreationConfig,
+    EditionKind,
+    TrackingMode,
+)
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
@@ -27,6 +31,7 @@ from docverse_server.domain.slug import (
 from docverse_server.domain.version import (
     LsstDocVersion,
     SemverVersion,
+    accepts_version_advance,
     parse_version_for_mode,
 )
 from docverse_server.services.lock_service import LockKey, LockService
@@ -186,7 +191,10 @@ class EditionTrackingService:
             version_editions,
             version_created_ids,
         ) = await self._auto_create_version_editions(
-            project_id=project.id, build=build, autocreation=autocreation
+            project_id=project.id,
+            build=build,
+            derived_kind=derivation.edition_kind,
+            autocreation=autocreation,
         )
         created_ids |= version_created_ids
         for ve in version_editions:
@@ -361,9 +369,10 @@ class EditionTrackingService:
         always returns ``True`` — the date-based stale guard in
         ``set_current_build`` handles ordering.
 
-        For version-based modes, parses both the candidate and current
-        git refs and returns ``True`` only when the candidate is >=
-        the current version.
+        For version-based modes, parses the candidate ref and defers to
+        `accepts_version_advance` — the guard keeper-sync's aggregate
+        backfill shares, so migrated and natively built editions cannot
+        end up on different releases.
         """
         if edition.tracking_mode not in _VERSION_MODES:
             return True
@@ -378,21 +387,12 @@ class EditionTrackingService:
         if candidate is None:
             return False
 
-        # No current build → accept any parseable version
-        if (
-            edition.current_build_id is None
-            or edition.current_build_git_ref is None
-        ):
-            return True
-
-        current = parse_version_for_mode(
-            edition.current_build_git_ref, edition.tracking_mode
+        return accepts_version_advance(
+            candidate=candidate,
+            current_build_id=edition.current_build_id,
+            current_build_git_ref=edition.current_build_git_ref,
+            mode=edition.tracking_mode,
         )
-        if current is None:
-            # Current ref is unparseable (e.g. leftover "main") → accept
-            return True
-
-        return candidate >= current
 
     def _should_update_lsst_doc(self, edition: Edition, build: Build) -> bool:
         """Version guard for ``lsst_doc`` tracking mode.
@@ -474,25 +474,37 @@ class EditionTrackingService:
         *,
         project_id: int,
         build: Build,
+        derived_kind: EditionKind,
         autocreation: EditionAutocreationConfig,
     ) -> tuple[list[Edition], set[int]]:
         """Auto-create ``semver_major`` / ``semver_minor`` editions.
 
-        Only triggers for stable semver tags (no prerelease), and only
-        when the resolved ``autocreation`` config enables
-        ``semver_aggregates``.  Uses ``create_internal`` because
-        single-digit slugs like ``"2"`` don't pass ``EditionCreate``'s
-        slug pattern.
+        Only triggers for stable semver tags (no prerelease) the rule
+        chain classified as releases, and only when the resolved
+        ``autocreation`` config enables ``semver_aggregates``.  Uses
+        ``create_internal`` because single-digit slugs like ``"2"``
+        don't pass ``EditionCreate``'s slug pattern.
 
-        The gate is autocreation-only, matching the config's name: an
-        aggregate edition that already exists — auto-created before the
-        knob was turned off, or created by hand — is still matched and
-        advanced by ``find_matching_editions`` in ``track_build``. Only
-        the implicit creation of new ``N`` / ``N.M`` rows stops.
+        ``derived_kind`` is the kind ``track_build``'s slug derivation
+        assigned this ref, and it gates the aggregates exactly as it
+        does in keeper-sync's ``_backfill_semver_aggregates``: a
+        ``semver`` rule an operator re-pointed at ``draft`` means "these
+        refs are not releases here", and that decision must suppress the
+        aggregates on both paths or a migrated project would stop
+        matching a natively built one.
+
+        The autocreation gate is autocreation-only, matching the
+        config's name: an aggregate edition that already exists —
+        auto-created before the knob was turned off, or created by hand
+        — is still matched and advanced by ``find_matching_editions`` in
+        ``track_build``. Only the implicit creation of new ``N`` /
+        ``N.M`` rows stops.
 
         Returns a tuple of (matched editions, IDs of newly created ones).
         """
         if not autocreation.semver_aggregates:
+            return [], set()
+        if derived_kind != EditionKind.release:
             return [], set()
 
         sv = SemverVersion.parse(build.git_ref)

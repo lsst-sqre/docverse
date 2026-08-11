@@ -1460,3 +1460,40 @@ async def test_semver_aggregates_default_when_unconfigured(
         await db_session.commit()
 
     assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_suppressed_by_kind_rule(
+    db_session: AsyncSession,
+) -> None:
+    """A rule declaring semver tags non-releases suppresses aggregates.
+
+    Parity with keeper-sync's ``_backfill_semver_aggregates``, which
+    gates on the same rule-derived kind: an operator who re-points the
+    ``semver`` rule at ``draft`` has declared these refs are not
+    releases here, and that decision must suppress the ``1`` / ``1.0``
+    aggregates on the native upload path too.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-kind-rule-org",
+            org_slug_rewrite_rules=[
+                {"type": "semver", "edition_kind": "draft"}
+            ],
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0"}
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        assert (
+            await edition_store.get_by_slug(project_id=project.id, slug="1")
+        ) is None
+        assert (
+            await edition_store.get_by_slug(project_id=project.id, slug="1.0")
+        ) is None
+        await db_session.commit()

@@ -58,7 +58,10 @@ from docverse_server.domain.slug import (
     AnySlugRewriteRule,
     resolve_slug_rewrite_rules,
 )
-from docverse_server.domain.version import SemverVersion
+from docverse_server.domain.version import (
+    SemverVersion,
+    accepts_version_advance,
+)
 from docverse_server.exceptions import (
     KeeperSyncInvariantError,
     KeeperSyncSystemicFailureError,
@@ -1490,17 +1493,23 @@ def _aggregate_accepts(edition: Edition, candidate: SemverVersion) -> bool:
 
     LTD hands editions back in no particular version order, so without a
     guard a project with 81 releases would leave ``15`` pointing at
-    whichever ``15.x.y`` happened to sync last. Mirrors the version-mode
-    arm of ``EditionTrackingService._should_update``: an aggregate with
-    no current build — or one whose current ref no longer parses as
-    semver — accepts anything; otherwise the candidate must not be
-    older.
+    whichever ``15.x.y`` happened to sync last.
+
+    The policy itself lives in
+    :func:`~docverse_server.domain.version.accepts_version_advance`,
+    shared with the version-mode arm of
+    ``EditionTrackingService._should_update`` so a change to one cannot
+    drift migrated aggregate pointers away from natively built ones.
+    Callers reach here only once ``edition.tracking_mode`` has been
+    confirmed to equal the aggregate spec's, so the mode is always a
+    semver one.
     """
-    current_ref = edition.current_build_git_ref
-    if edition.current_build_id is None or current_ref is None:
-        return True
-    current = SemverVersion.parse(current_ref)
-    return current is None or candidate >= current
+    return accepts_version_advance(
+        candidate=candidate,
+        current_build_id=edition.current_build_id,
+        current_build_git_ref=edition.current_build_git_ref,
+        mode=edition.tracking_mode,
+    )
 
 
 def _resolve_rewrite_rules(
