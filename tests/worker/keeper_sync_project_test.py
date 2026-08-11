@@ -31,7 +31,7 @@ from safir.testing.sentry import (
     capture_events_fixture,
     sentry_init_fixture,
 )
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -48,6 +48,9 @@ from docverse.models import (
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
 from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.edition_build_history import (
+    SqlEditionBuildHistory,
+)
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -1702,3 +1705,221 @@ async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
                 )
                 assert edition is not None
                 assert edition.publish_status == PublishStatus.pending
+
+
+async def _clear_publish_traces(
+    *, org_id: int, edition_slug: str
+) -> tuple[int, int]:
+    """Erase every trace that a publish was enqueued for one edition.
+
+    Simulates the lost-enqueue shapes described on
+    ``_self_heal_unpublished_aggregates``: the aggregate row still points
+    at the release build, but the edition's ``publish_status``, its
+    ``edition_build_history`` row for that build, and the
+    ``publish_edition`` queue job all never happened. Returns the
+    ``(project_id, edition_id)`` pair for follow-up assertions.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug=edition_slug
+            )
+            assert edition is not None
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(publish_status=None)
+            )
+            await session.execute(
+                delete(SqlEditionBuildHistory).where(
+                    SqlEditionBuildHistory.edition_id == edition.id
+                )
+            )
+            await session.execute(
+                delete(SqlQueueJob).where(
+                    SqlQueueJob.edition_id == edition.id,
+                    SqlQueueJob.kind == JobKind.publish_edition.value,
+                )
+            )
+            return project.id, edition.id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heals_unpublished_aggregate(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A semver aggregate whose publish enqueue was lost is re-enqueued.
+
+    The ``15`` / ``15.2`` aggregates are enqueued exactly once, from the
+    ``on_edition_synced`` callback, and ``sync_project`` deliberately
+    swallows callback failures — so a failed enqueue (or a worker death
+    between the backfill's commit and the enqueue) leaves the aggregate
+    pointing at the release build with no KV pointer ever written. On
+    re-sync ``_ensure_aggregate_edition`` returns ``None`` (the pointer
+    is already where it should be), so nothing re-enqueues it via the
+    outcome path; the tail-end self-heal pass must recover it from
+    persistent state instead.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # Rewind the ``15.2`` aggregate to the lost-enqueue shape.
+    project_id, aggregate_id = await _clear_publish_traces(
+        org_id=org_id, edition_slug="15.2"
+    )
+    publish_before = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    healed = publish_after[len(publish_before) :]
+    healed_slugs = [job.kwargs["payload"]["edition_slug"] for job in healed]
+    assert healed_slugs == ["15.2"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            aggregate = await edition_store.get_by_slug(
+                project_id=project_id, slug="15.2"
+            )
+            assert aggregate is not None
+            assert aggregate.id == aggregate_id
+            assert aggregate.publish_status == PublishStatus.pending
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            healed_qj = await queue_job_store.get_by_backend_job_id(
+                healed[0].id
+            )
+            assert healed_qj is not None
+            assert healed_qj.kind == JobKind.publish_edition
+            assert healed_qj.keeper_sync_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heal_skips_published_aggregates(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aggregates with a publish already in flight are not re-enqueued.
+
+    The first sync leaves ``15`` / ``15.2`` with a ``pending``
+    ``edition_build_history`` row for the build they point at. The
+    aggregate self-heal must read that as "the publish for this pair was
+    already enqueued" and leave the pair alone, so a steady-state
+    re-sync does not enqueue a duplicate ``publish_edition`` on every
+    reconciliation tick.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert sorted(
+        job.kwargs["payload"]["edition_slug"] for job in publish_after_first
+    ) == ["15", "15.2", "15.2.1", "__main"]
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_second) == len(publish_after_first)
