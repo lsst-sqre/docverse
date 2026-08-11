@@ -35,6 +35,7 @@ from docverse_server.sentry import (
     initialize_sentry,
     instrument_arq_task,
 )
+from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.services.credential_encryptor import CredentialEncryptor
 from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
@@ -152,8 +153,14 @@ class WorkerFactoryBuilder:
         github_app_id: int | None,
         github_app_private_key: SecretStr | None,
         github_webhook_secret: SecretStr | None,
+        purge_coalescer: CdnPurgeCoalescer | None = None,
         default_queue_name: str,
     ) -> None:
+        # Process-lifetime, like ``http_client``: keeper-sync enqueues one
+        # ``publish_edition`` job per synced edition, so folding a publish
+        # burst's redundant per-project CDN purges needs state that spans
+        # jobs rather than living inside one.
+        self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
         self._encryptor = encryptor
         self._http_client = http_client
         self._arq_queue = arq_queue
@@ -206,6 +213,7 @@ class WorkerFactoryBuilder:
             github_app_private_key=self._github_app_private_key,
             github_webhook_secret=self._github_webhook_secret,
             github_app_validated=self._github_app_validated,
+            purge_coalescer=self._purge_coalescer,
             default_queue_name=self._default_queue_name,
         )
 
@@ -290,6 +298,9 @@ async def _startup(
         github_app_id=config.github_app_id,
         github_app_private_key=config.github_app_private_key,
         github_webhook_secret=config.github_webhook_secret,
+        purge_coalescer=CdnPurgeCoalescer(
+            min_interval=config.cdn_purge_min_interval_seconds
+        ),
         default_queue_name=config.arq_queue_name,
     )
     await validate_github_app(

@@ -13,6 +13,8 @@ from safir.logging import LogLevel, Profile
 from safir.metrics import MetricsConfiguration, metrics_configuration_factory
 from safir.pydantic import EnvRedisDsn
 
+from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
+
 __all__ = ["Configuration", "config"]
 
 
@@ -165,6 +167,27 @@ class Configuration(BaseSettings):
     arq_queue_name: str = Field(
         "docverse:queue",
         title="Name of the arq queue",
+    )
+
+    cdn_purge_min_interval_seconds: float = Field(
+        DEFAULT_PURGE_MIN_INTERVAL_SECONDS,
+        ge=0.0,
+        title="Minimum spacing between CDN purges of one hostname",
+        description=(
+            "CDN cache purging is hostname-scoped (the only mechanism"
+            " available on every Cloudflare plan tier), so every edition"
+            " of a project emits a byte-identical purge and a publish"
+            " burst — a release plus its semver aggregates, or a bulk"
+            " keeper-sync backfill — is almost entirely redundant. Each"
+            " worker process folds those into at most one purge per"
+            " hostname per this interval; requests arriving during the"
+            " wait are absorbed by the pending purge, and a request"
+            " arriving after it fired always gets its own. Raise this to"
+            " cut purge volume further at the cost of up to this many"
+            " seconds of added publish latency for a project that was"
+            " just purged; set to 0 to disable coalescing entirely and"
+            " purge once per publish."
+        ),
     )
 
     keeper_sync_job_timeout_seconds: int = Field(

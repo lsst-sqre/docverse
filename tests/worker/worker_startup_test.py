@@ -208,3 +208,22 @@ async def test_worker_startup_skips_validation_when_secrets_unset(
         if call.request.url.path == "/app"
     ]
     assert app_calls == []
+
+
+@pytest.mark.asyncio
+async def test_worker_factory_builder_shares_one_purge_coalescer(
+    db_session: AsyncSession,
+) -> None:
+    """Per-job factories share the builder's process-lifetime coalescer.
+
+    Coalescing CDN purges only reduces call volume if the state outlives
+    a single job: keeper-sync enqueues one ``publish_edition`` job per
+    synced edition, so a publish burst is many jobs rather than one
+    in-process loop.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client)
+        first = builder(session=db_session, logger=_logger())
+        second = builder(session=db_session, logger=_logger())
+
+    assert first.purge_coalescer is second.purge_coalescer

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Self, override
 
 import pytest
 import sentry_sdk
@@ -33,6 +34,7 @@ from docverse_server.domain.dashboard_context import MAIN_SLUG
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.sentry import initialize_sentry
+from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.services.edition_publishing import (
     EditionPublishingService,
 )
@@ -124,6 +126,24 @@ class _FailingPurger:
         raise self._exc
 
 
+class _AbsorbingCoalescer(CdnPurgeCoalescer):
+    """A coalescer that absorbs every request into a concurrent purge."""
+
+    def __init__(self) -> None:
+        super().__init__(min_interval=0.0)
+        self.hostnames: list[str] = []
+
+    @override
+    async def purge(
+        self,
+        hostname: str,
+        purge: Callable[[], Awaitable[None]],
+    ) -> bool:
+        _ = purge
+        self.hostnames.append(hostname)
+        return False
+
+
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
@@ -134,6 +154,7 @@ def _make_service(
     publisher: EditionPublisher | None = None,
     provider_raises: bool = False,
     purger: CdnCachePurger | None = None,
+    coalescer: CdnPurgeCoalescer | None = None,
 ) -> EditionPublishingService:
     async def provider(*, org_id: int, service_label: str) -> EditionPublisher:
         if provider_raises:
@@ -164,6 +185,9 @@ def _make_service(
         ),
         publisher_provider=provider,
         purger_provider=purger_provider,
+        purge_coalescer=(
+            coalescer if coalescer is not None else CdnPurgeCoalescer()
+        ),
         logger=logger,
     )
 
@@ -571,6 +595,50 @@ async def test_publish_logs_successful_purge(
     )
     assert entries[0]["edition_slug"] == edition.slug
     assert entries[0]["build_id"] == build.id
+
+
+@pytest.mark.asyncio
+async def test_publish_coalesced_purge_skips_the_purger(
+    db_session: AsyncSession,
+) -> None:
+    """An absorbed purge contacts no CDN yet still publishes the edition."""
+    coalescer = _AbsorbingCoalescer()
+    mock_purger = MockCdnCachePurger()
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-coalesce-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        with capture_logs() as logs:
+            service = _make_service(
+                db_session,
+                publisher=MockEditionPublisher(),
+                purger=mock_purger,
+                coalescer=coalescer,
+            )
+            await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+        await db_session.commit()
+
+    hostname = f"{_PROJECT_SLUG}.purge-coalesce-org.example.com"
+    assert coalescer.hostnames == [hostname]
+    assert mock_purger.purge_calls == []
+    entries = [e for e in logs if e["event"] == "Coalesced CDN cache purge"]
+    assert len(entries) == 1
+    assert entries[0]["hostname"] == hostname
+
+    async with db_session.begin():
+        refreshed = await _fetch_edition(
+            db_session, edition.id, edition.project_id, edition.slug
+        )
+        assert refreshed.publish_status == PublishStatus.published
 
 
 @pytest.mark.asyncio

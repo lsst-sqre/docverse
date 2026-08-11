@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
+from .services.cdn_purge_coalescer import CdnPurgeCoalescer
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.dashboard.enqueue import DashboardBuildEnqueuer
@@ -127,8 +128,17 @@ class Factory:
         github_webhook_secret: SecretStr | None = None,
         github_app_name: str = "lsst-sqre/docverse",
         github_app_validated: bool = True,
+        purge_coalescer: CdnPurgeCoalescer | None = None,
         default_queue_name: str,
     ) -> None:
+        # A Factory is per-job / per-request, so an instance created here
+        # coalesces nothing beyond the single publish this Factory drives
+        # — i.e. the pre-coalescing behaviour. Production wiring injects
+        # the process-lifetime instance held by
+        # ``WorkerFactoryBuilder``; the local fallback keeps directly
+        # constructed factories (tests, one-off scripts) working without
+        # sharing coalescing state between them.
+        self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
@@ -151,6 +161,11 @@ class Factory:
     def discovery(self) -> DiscoveryClient | None:
         """Repertoire discovery client, or ``None`` when not configured."""
         return self._discovery
+
+    @property
+    def purge_coalescer(self) -> CdnPurgeCoalescer:
+        """CDN purge coalescer backing this factory's publishing service."""
+        return self._purge_coalescer
 
     def create_queue_backend(self) -> QueueBackend:
         """Create a :class:`QueueBackend` for enqueuing jobs."""
@@ -547,6 +562,7 @@ class Factory:
             ),
             publisher_provider=self.create_edition_publisher_for_org,
             purger_provider=self.create_cdn_cache_purger_for_org,
+            purge_coalescer=self._purge_coalescer,
             logger=self._logger,
         )
 

@@ -18,6 +18,7 @@ from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.published_url import compute_project_hostname
+from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.storage.cdncachepurger import CdnCachePurger
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -71,6 +72,7 @@ class EditionPublishingService:
         history_store: EditionBuildHistoryStore,
         publisher_provider: EditionPublisherProvider,
         purger_provider: CdnCachePurgerProvider,
+        purge_coalescer: CdnPurgeCoalescer,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
@@ -78,6 +80,7 @@ class EditionPublishingService:
         self._history_store = history_store
         self._publisher_provider = publisher_provider
         self._purger_provider = purger_provider
+        self._purge_coalescer = purge_coalescer
         self._logger = logger
 
     async def publish(
@@ -245,10 +248,29 @@ class EditionPublishingService:
     ) -> None:
         """Purge the project's hostname from the CDN edge cache.
 
+        The purge goes through the process-wide
+        `~docverse_server.services.cdn_purge_coalescer.CdnPurgeCoalescer`
+        rather than straight to the purger. Purging is hostname-scoped,
+        so every edition of a project emits a byte-identical call and a
+        publish burst (a release plus its semver aggregates, or a
+        keeper-sync backfill) is almost entirely redundant. The
+        coalescer folds the burst into a throttled sequence while
+        preserving the happens-after invariant: the purge that marks
+        this request served is guaranteed to have started after the
+        pointer write above. Resolving the purger — a database read for
+        the org's CDN credentials — happens inside the coalesced
+        callback so an absorbed request costs nothing.
+
+        Because the coalescer may wait out the remainder of the
+        hostname's throttle interval, this can add up to that interval
+        to the caller's publish. The caller runs inside an open
+        transaction, matching the purger's own retry backoff, which
+        already sleeps there.
+
         Best-effort: any failure resolving or invoking the purger is
         reported and swallowed, so a CDN outage degrades to a stale edge
-        copy instead of a failed publish. Every attempt is logged,
-        success or failure.
+        copy instead of a failed publish. Every outcome is logged —
+        purged, coalesced, or failed.
 
         Swallowed is not the same as dropped. A purge that Cloudflare
         keeps rejecting leaves the edition serving a stale copy at the
@@ -257,7 +279,9 @@ class EditionPublishingService:
         live only in worker logs — so the exception is captured to
         Sentry alongside the ERROR log, carrying whatever the purger
         knew (Cloudflare's ``errors[].code``, the status, the attempt
-        count) via its ``to_sentry`` override.
+        count) via its ``to_sentry`` override. A failed purge does not
+        mark the coalesced burst served either, so the next waiter
+        re-attempts instead of inheriting the failure.
         """
         hostname = compute_project_hostname(org, project_slug)
         logger = self._logger.bind(
@@ -268,12 +292,18 @@ class EditionPublishingService:
             cdn_service_label=service_label,
             hostname=hostname,
         )
-        try:
+
+        async def purge_hostname() -> None:
             purger = await self._purger_provider(
                 org_id=org.id, service_label=service_label
             )
             async with purger:
                 await purger.purge_hostname(hostname)
+
+        try:
+            purged = await self._purge_coalescer.purge(
+                hostname, purge_hostname
+            )
         except Exception as exc:
             # Explicit rather than relying on the SDK's logging
             # integration to turn the ERROR below into an event: the
@@ -285,7 +315,10 @@ class EditionPublishingService:
             sentry_sdk.capture_exception(exc)
             logger.exception("CDN cache purge failed")
         else:
-            logger.info("Purged CDN cache")
+            if purged:
+                logger.info("Purged CDN cache")
+            else:
+                logger.info("Coalesced CDN cache purge")
 
     async def _mark_published(
         self, *, edition_id: int, history_id: int
