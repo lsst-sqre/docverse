@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import TracebackType
 from typing import Self
 
@@ -11,7 +12,26 @@ from aiobotocore.client import AioBaseClient
 from aiobotocore.session import AioSession, ClientCreatorContext, get_session
 from botocore.config import Config
 
+from .._http_retry import (
+    RETRYABLE_STATUS_CODES,
+    RETRYABLE_TRANSPORT_ERRORS,
+    backoff_for_attempt,
+    backoff_for_response,
+)
+
 __all__ = ["S3ObjectStore"]
+
+#: Maximum attempts for a presigned upload, including the original
+#: request (``_MAX_ATTEMPTS - 1`` retries).
+_MAX_ATTEMPTS = 4
+
+#: Initial backoff in seconds; doubles each subsequent attempt.
+_BASE_BACKOFF_SECONDS = 0.5
+
+#: Lifetime of a presigned upload signature. Every attempt mints a fresh
+#: one, so this only has to outlive a single PUT rather than the whole
+#: retry sequence.
+_UPLOAD_URL_EXPIRES_SECONDS = 900
 
 
 class S3ObjectStore:
@@ -38,6 +58,17 @@ class S3ObjectStore:
         AWS region name (optional for non-AWS services).
     logger
         Bound logger for contextual logging.
+    http_client
+        Shared HTTP client. When set, ``upload_object`` PUTs to a
+        presigned URL over this client instead of going through
+        aiobotocore.
+    max_attempts
+        Attempts allowed for a presigned upload, including the first.
+        Clamped to at least 1 so a misconfigured budget degrades to
+        "upload once, no retries" rather than to a silent no-op.
+    base_backoff_seconds
+        Delay after a presigned upload's first failure; doubles each
+        subsequent attempt.
     """
 
     def __init__(
@@ -50,6 +81,8 @@ class S3ObjectStore:
         region: str = "",
         logger: structlog.stdlib.BoundLogger,
         http_client: httpx.AsyncClient | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+        base_backoff_seconds: float = _BASE_BACKOFF_SECONDS,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._bucket = bucket
@@ -58,6 +91,8 @@ class S3ObjectStore:
         self._region = region
         self._logger = logger
         self._http_client = http_client
+        self._max_attempts = max(1, max_attempts)
+        self._base_backoff_seconds = base_backoff_seconds
         self._session: AioSession = get_session()
         self._client_cm: ClientCreatorContext | None = None
         self._client: AioBaseClient | None = None
@@ -165,28 +200,17 @@ class S3ObjectStore:
     ) -> None:
         """Upload an object via presigned URL if http_client is available.
 
-        Falls back to direct put_object when no http_client is set.
+        Falls back to direct put_object when no http_client is set. The
+        fallback needs no retry logic of its own: aiobotocore inherits
+        botocore's standard retry mode.
         """
         if self._http_client is not None:
-            client = self._get_client()
-            url: str = await client.generate_presigned_url(
-                "put_object",
-                Params={"Bucket": self._bucket, "Key": key},
-                ExpiresIn=900,
+            await self._upload_via_presigned_url(
+                http_client=self._http_client,
+                key=key,
+                data=data,
+                content_type=content_type,
             )
-            response = await self._http_client.put(
-                url,
-                content=data,
-                headers={"Content-Type": content_type},
-            )
-            if response.is_error:
-                self._logger.error(
-                    "Presigned upload failed",
-                    status_code=response.status_code,
-                    response_body=response.text,
-                    key=key,
-                )
-            response.raise_for_status()
         else:
             client = self._get_client()
             await client.put_object(
@@ -195,3 +219,110 @@ class S3ObjectStore:
                 Body=data,
                 ContentType=content_type,
             )
+
+    async def _upload_via_presigned_url(
+        self,
+        *,
+        http_client: httpx.AsyncClient,
+        key: str,
+        data: bytes,
+        content_type: str,
+    ) -> None:
+        """PUT an object to a presigned URL, retrying transient failures.
+
+        Cloudflare R2 answers a bulk copy with occasional ``500``s and
+        dropped connections, and this path — not the aiobotocore
+        fallback — is the one production takes, so the retry lives here
+        rather than in every caller. Retrying is safe because a PUT of
+        the same key with the same bytes is idempotent.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            If the destination returns a non-retryable error status, or
+            keeps returning a retryable one until the attempt budget is
+            exhausted.
+        httpx.TransportError
+            If the transport keeps failing until the attempt budget is
+            exhausted, or fails in a way a retry cannot fix.
+        """
+        for attempt in range(1, self._max_attempts + 1):
+            # Sign afresh on every attempt. The signature is only valid
+            # for _UPLOAD_URL_EXPIRES_SECONDS, and a retry sequence that
+            # honours a long Retry-After can outlive that window; signing
+            # is a local HMAC, so re-minting costs nothing but rules out
+            # ever replaying an expired URL.
+            url = await self._generate_upload_url(key)
+            try:
+                response = await http_client.put(
+                    url,
+                    content=data,
+                    headers={"Content-Type": content_type},
+                )
+            except RETRYABLE_TRANSPORT_ERRORS as exc:
+                if attempt >= self._max_attempts:
+                    self._logger.exception(
+                        "Presigned upload failed",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                        key=key,
+                        attempts=attempt,
+                        retryable=True,
+                    )
+                    raise
+                delay = backoff_for_attempt(
+                    attempt, base_backoff_seconds=self._base_backoff_seconds
+                )
+                self._logger.warning(
+                    "Retrying presigned upload after transport error",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    key=key,
+                    attempt=attempt,
+                    max_attempts=self._max_attempts,
+                    retry_delay=delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if not response.is_error:
+                return
+
+            retryable = response.status_code in RETRYABLE_STATUS_CODES
+            if retryable and attempt < self._max_attempts:
+                delay = backoff_for_response(
+                    response,
+                    attempt,
+                    base_backoff_seconds=self._base_backoff_seconds,
+                    logger=self._logger,
+                )
+                self._logger.warning(
+                    "Retrying presigned upload",
+                    status_code=response.status_code,
+                    key=key,
+                    attempt=attempt,
+                    max_attempts=self._max_attempts,
+                    retry_delay=delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            self._logger.error(
+                "Presigned upload failed",
+                status_code=response.status_code,
+                response_body=response.text,
+                key=key,
+                attempts=attempt,
+                retryable=retryable,
+            )
+            response.raise_for_status()
+
+    async def _generate_upload_url(self, key: str) -> str:
+        """Mint a short-lived presigned PUT URL for ``key``."""
+        client = self._get_client()
+        url: str = await client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self._bucket, "Key": key},
+            ExpiresIn=_UPLOAD_URL_EXPIRES_SECONDS,
+        )
+        return url

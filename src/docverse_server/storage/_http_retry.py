@@ -1,18 +1,22 @@
 """Shared retry policy for outbound third-party HTTP calls.
 
-Docverse talks to two rate-limited third-party APIs from the storage
-layer: LTD Keeper (`docverse_server.storage.ltd.LtdClient`) and the
+Docverse makes flaky third-party HTTP calls from the storage layer in
+three places: LTD Keeper (`docverse_server.storage.ltd.LtdClient`), the
 Cloudflare zone purge API
-(`docverse_server.storage.cdncachepurger.CloudflareCachePurger`). Both
-need the same three decisions — which statuses are worth another
-attempt, how long to wait between attempts, and whether to trust a
-server-supplied ``Retry-After`` — so the policy lives here once instead
-of being mirrored (and then drifting) at each call site.
+(`docverse_server.storage.cdncachepurger.CloudflareCachePurger`), and
+presigned object uploads
+(`docverse_server.storage.objectstore.S3ObjectStore`). All three need
+the same decisions — which statuses are worth another attempt, which
+transport failures are worth another attempt, how long to wait between
+attempts, and whether to trust a server-supplied ``Retry-After`` — so
+the policy lives here once instead of being mirrored (and then
+drifting) at each call site.
 
 The helpers are deliberately stateless functions rather than a mixin or
 decorator: each caller owns its own request/response loop (LTD raises
-typed errors and treats 404 specially; the purger is best-effort), and
-only the waiting policy is genuinely shared.
+typed errors and treats 404 specially; the purger is best-effort; the
+object store re-signs its URL between attempts), and only the waiting
+policy is genuinely shared.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import structlog
 
 __all__ = [
     "RETRYABLE_STATUS_CODES",
+    "RETRYABLE_TRANSPORT_ERRORS",
     "backoff_for_attempt",
     "backoff_for_response",
 ]
@@ -30,6 +35,24 @@ __all__ = [
 #: family. Every other 4xx is a client-side mistake (bad token, wrong
 #: zone, malformed body) that a retry cannot fix.
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+#: Transport failures worth retrying, as a tuple suitable for ``except``.
+#: These are the cases where no response came back at all but the
+#: request may still succeed later: the connection could not be
+#: established, the peer went away mid-response, or the exchange timed
+#: out. ``httpx.TimeoutException`` is the parent of ``ReadTimeout`` and
+#: its connect/write/pool siblings, so naming it covers every timeout
+#: flavour without listing four subclasses.
+#:
+#: Deliberately narrower than ``httpx.TransportError``: that also
+#: catches ``LocalProtocolError`` and ``UnsupportedProtocol``, which are
+#: bugs on our side of the wire and must fail loudly on the first
+#: attempt rather than burn a retry budget.
+RETRYABLE_TRANSPORT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
 
 
 def backoff_for_attempt(attempt: int, *, base_backoff_seconds: float) -> float:
