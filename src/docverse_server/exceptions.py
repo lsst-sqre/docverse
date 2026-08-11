@@ -18,6 +18,7 @@ __all__ = [
     "InvalidJobStateError",
     "JobNotFoundError",
     "KeeperSyncInvariantError",
+    "KeeperSyncSystemicFailureError",
     "MissingConfigurationError",
     "NotFoundError",
     "PermissionDeniedError",
@@ -317,3 +318,72 @@ class KeeperSyncInvariantError(DocverseSlackException):
     (``state_id``, ``org_id``) are internal row ids that must not be
     surfaced as Sentry tags. Mirrors :class:`InvalidSlugError`.
     """
+
+
+class KeeperSyncSystemicFailureError(DocverseSlackException):
+    """Too many consecutive edition failures — the outage is systemic.
+
+    ``KeeperSyncService.sync_project`` gives each edition its own
+    failure boundary so one permanently-unreadable LTD build costs one
+    edition rather than the whole project. That isolation is wrong for
+    a *systemic* fault: a mid-run LTD outage or a database failure
+    would otherwise mark every remaining edition failed one by one, let
+    the loop finish, and roll the run up green — a 3-of-80 partial
+    import presenting as a completed run. A run of consecutive failures
+    is the signal that the fault is not per-edition, so the sync aborts
+    and this exception fails the project's queue job instead.
+
+    Raised with ``from`` the last edition's exception, so the triggering
+    error stays on the ``__cause__`` chain for both Sentry and the
+    ``queue_jobs.errors`` traceback.
+
+    No ``to_sentry`` override: the free-form ``message`` names the LTD
+    product slug and the consecutive-failure count, and the chained
+    cause carries the underlying fault. Mirrors
+    :class:`KeeperSyncInvariantError`.
+    """
+
+    def __init__(
+        self,
+        *,
+        ltd_slug: str | None = None,
+        consecutive_failures: int | None = None,
+        failed_ltd_edition_slugs: list[str] | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.ltd_slug = ltd_slug
+        self.consecutive_failures = consecutive_failures
+        self.failed_ltd_edition_slugs = failed_ltd_edition_slugs
+        super().__init__(
+            message
+            if message is not None
+            else self._format_message(
+                ltd_slug=ltd_slug,
+                consecutive_failures=consecutive_failures,
+                failed_ltd_edition_slugs=failed_ltd_edition_slugs,
+            )
+        )
+
+    @staticmethod
+    def _format_message(
+        *,
+        ltd_slug: str | None,
+        consecutive_failures: int | None,
+        failed_ltd_edition_slugs: list[str] | None,
+    ) -> str:
+        product = f" for LTD product {ltd_slug}" if ltd_slug else ""
+        count = (
+            f"{consecutive_failures} consecutive"
+            if consecutive_failures is not None
+            else "Too many consecutive"
+        )
+        detail = (
+            f" (editions: {', '.join(failed_ltd_edition_slugs)})"
+            if failed_ltd_edition_slugs
+            else ""
+        )
+        return (
+            f"Aborting keeper sync{product}: {count} edition failures"
+            f"{detail} indicate a systemic outage rather than"
+            " per-edition faults"
+        )

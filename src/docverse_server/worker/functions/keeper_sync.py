@@ -20,7 +20,9 @@ This module owns the ``docverse:sync-queue`` callable surface:
   catches editions whose build was already imported but never made it
   through the publish path. Per-edition failures the service isolated
   are recorded on the job's ``progress`` and leave its status
-  ``completed``; only a whole-project failure fails the job.
+  ``completed_with_errors``; a whole-project failure — including the
+  service's systemic-outage abort after too many consecutive edition
+  failures — fails the job.
 
 * ``keeper_sync_tier_main`` / ``_tier_discovery`` / ``_tier_other`` —
   cron-driven steady-state reconcilers that enqueue ``keeper_sync_
@@ -400,21 +402,31 @@ async def keeper_sync_project(
        (e.g. they were imported before this enqueue logic landed). The
        freshly-synced branch is no longer needed here — it's handled
        by the per-edition callback.
-    4. On success, mark the queue job ``completed``; on a caught
-       exception, mark it ``failed`` with structured error details and
-       re-raise so arq records the job as failed. Both branches call
-       :func:`maybe_finalise_run` so a terminal child cannot leave the
-       parent run stuck in ``in_progress``.
+    4. On success, mark the queue job ``completed`` (or
+       ``completed_with_errors`` when the service isolated any
+       per-edition failure); on a caught exception, mark it ``failed``
+       with structured error details and re-raise so arq records the job
+       as failed. Both branches call :func:`maybe_finalise_run` so a
+       terminal child cannot leave the parent run stuck in
+       ``in_progress``.
 
     :meth:`~KeeperSyncService.sync_project` gives each edition its own
     failure boundary, so an unreadable LTD build no longer reaches the
     outer ``except`` — it lands on
     :attr:`ProjectSyncResult.edition_failures` instead. Those runs still
-    end ``completed`` (see :func:`_edition_failure_progress` for why),
-    with the skipped LTD editions recorded on the ``queue_jobs`` row's
-    ``progress`` and repeated in a ``warning`` log line. Only a failure
-    of the project as a whole — the LTD product fetch, the org lookup,
-    the copier's destination store — still fails the job.
+    reach the end of the edition list rather than aborting, but they
+    finish ``completed_with_errors``, with the skipped LTD editions
+    recorded on the ``queue_jobs`` row's ``progress`` (see
+    :func:`_edition_failure_progress`) and repeated in a ``warning`` log
+    line; the parent run rolls up ``partial_failure``. A failure of the
+    project as a whole — the LTD product fetch, the org lookup, the
+    copier's destination store — still fails the job outright, as does
+    the service's systemic-outage abort
+    (:data:`~docverse_server.services.keeper_sync.service.MAX_CONSECUTIVE_EDITION_FAILURES`
+    consecutive edition failures raise
+    :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+    out of ``sync_project``, so a mid-run LTD or database outage fails
+    the job rather than quietly reporting a 3-of-80 import as done).
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -529,7 +541,7 @@ async def keeper_sync_project(
         _log_project_completion(
             logger=logger, edition_failures=edition_failures
         )
-        return "completed"
+        return "completed_with_errors" if edition_failures else "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
@@ -547,19 +559,34 @@ async def _finalise_project_job(
     """Close out a ``keeper_sync_project`` job that reached its end.
 
     Records any per-edition failures the service isolated on the job's
-    ``progress`` and marks the job ``completed`` in the *same*
-    transaction that rolls the parent run, so the job record and its
-    terminal status can never disagree. Returns whatever
+    ``progress`` and marks the job terminal in the *same* transaction
+    that rolls the parent run, so the job record and its terminal
+    status can never disagree. Returns whatever
     :func:`maybe_finalise_run` returned (always ``None`` for a
     tier-cron job, which carries no ``run_id``) for the caller to
     publish after the transaction commits.
+
+    A job with isolated per-edition failures completes
+    ``completed_with_errors`` rather than plain ``completed`` — the same
+    ``complete(has_errors=...)`` signal the ``git_ref_audit`` worker
+    uses for its own per-project isolation. Reaching the end of the
+    edition loop is not the same as importing the project, and a
+    partial import must not be indistinguishable from a clean one at
+    the status level. The status carries up to the run for free:
+    ``KeeperSyncRunStore.aggregate_activity`` buckets
+    ``completed_with_errors`` into ``failed_count``, so
+    :func:`maybe_finalise_run` rolls the parent run to the existing
+    ``partial_failure`` status once every child is terminal. No new run
+    status is needed.
     """
     async with session.begin():
         if edition_failures:
             await queue_job_store.update_progress(
                 queue_job_id, _edition_failure_progress(edition_failures)
             )
-        await queue_job_store.complete(queue_job_id)
+        await queue_job_store.complete(
+            queue_job_id, has_errors=bool(edition_failures)
+        )
         if run_id is None:
             return None
         return await maybe_finalise_run(run_store=run_store, run_id=run_id)
@@ -589,10 +616,11 @@ def _edition_failure_progress(
 ) -> dict[str, Any]:
     """Build the ``progress`` payload for a partially-synced project.
 
-    The job itself still finishes ``completed``: a permanently
-    unreadable LTD build (an old upload with no public-read ACL) must
-    not paint its project's sync red on every subsequent poll. These
-    per-edition entries are the partial-success signal instead, so an
+    The job finishes ``completed_with_errors`` rather than ``failed``:
+    a permanently unreadable LTD build (an old upload with no
+    public-read ACL) must not abort the project's import on every
+    subsequent poll, but it must not read as a clean sync either. These
+    per-edition entries carry the detail behind that status, so an
     operator reading ``GET /jobs/<id>`` can see exactly which LTD
     editions were skipped and why.
     """

@@ -42,8 +42,11 @@ from docverse_server.domain.lifecycle import (
     LifecycleRuleSet,
     RefDeletedRule,
 )
+from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.services.keeper_sync.copier import BuildContentCopier
 from docverse_server.services.keeper_sync.service import (
+    MAX_CONSECUTIVE_EDITION_FAILURES,
+    EditionSyncOutcome,
     KeeperSyncContext,
     KeeperSyncService,
     _now,
@@ -67,7 +70,11 @@ from docverse_server.storage.keeper_sync import (
     ResourceType,
     TombstoneReason,
 )
-from docverse_server.storage.ltd import LtdClient, LtdSourceProtocol
+from docverse_server.storage.ltd import (
+    LtdClient,
+    LtdEdition,
+    LtdSourceProtocol,
+)
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
@@ -1740,6 +1747,156 @@ _THREE_EDITION_SOURCE_OBJECTS = {
     "pipelines/builds/43/index.html": b"<html>middle</html>",
     "pipelines/builds/44/index.html": b"<html>last</html>",
 }
+
+
+def _seed_n_branch_editions(
+    mock_discovery: respx.Router, *, count: int
+) -> None:
+    """Stub a ``pipelines`` product with *count* ``git_refs`` editions.
+
+    Editions ``1..count`` each track their own branch and carry their
+    own build. Used by the systemic-abort tests, which need more
+    editions than the consecutive-failure threshold so the loop has
+    somewhere to abort *before*.
+    """
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/{i}" for i in range(1, count + 1)
+                ]
+            },
+        )
+    )
+    for i in range(1, count + 1):
+        build_id = 200 + i
+        payload = _load("edition_branch_git_refs.json")
+        payload["self_url"] = f"{LTD_BASE}/editions/{i}"
+        payload["slug"] = f"u-jsick-feat-{i}"
+        payload["title"] = f"u/jsick/feat-{i}"
+        payload["tracked_refs"] = [f"u/jsick/feat-{i}"]
+        payload["build_url"] = f"{LTD_BASE}/builds/{build_id}"
+        mock_discovery.get(f"{LTD_BASE}/editions/{i}").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        build_payload = _load("build.json")
+        build_payload["self_url"] = f"{LTD_BASE}/builds/{build_id}"
+        build_payload["slug"] = str(build_id)
+        build_payload["bucket_root_dir"] = f"pipelines/builds/{build_id}"
+        mock_discovery.get(f"{LTD_BASE}/builds/{build_id}").mock(
+            return_value=httpx.Response(200, json=build_payload)
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_project_aborts_after_consecutive_edition_failures(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A systemic outage aborts the loop instead of failing every edition.
+
+    Per-edition isolation is right for a single unreadable LTD build and
+    wrong for an LTD outage or a dead database: without an abort, every
+    remaining edition is marked failed one by one, the loop finishes,
+    and the project job (and its parent run) roll up green on a
+    3-of-80 import. ``MAX_CONSECUTIVE_EDITION_FAILURES`` in a row is
+    the systemic signal, and the raise is what fails the queue job.
+    """
+    total = MAX_CONSECUTIVE_EDITION_FAILURES + 3
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-abort")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    attempted: list[int] = []
+
+    async def _always_raises(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> None:
+        attempted.append(ltd_edition.ltd_id)
+        msg = "LTD is down"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(service, "sync_edition", _always_raises)
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The loop stopped at the threshold rather than walking every
+    # remaining edition and reporting them all as isolated failures.
+    assert len(attempted) == MAX_CONSECUTIVE_EDITION_FAILURES
+    assert attempted == list(range(1, MAX_CONSECUTIVE_EDITION_FAILURES + 1))
+    # The triggering error stays on the cause chain for Sentry and for
+    # the ``queue_jobs.errors`` traceback the worker records.
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert exc_info.value.ltd_slug == "pipelines"
+    assert (
+        exc_info.value.consecutive_failures == MAX_CONSECUTIVE_EDITION_FAILURES
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_project_success_resets_consecutive_failure_counter(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One success between failure runs keeps per-edition isolation alive.
+
+    Scattered failures — the permanently-unreadable-build case the
+    per-edition boundary exists for — must not accumulate into a false
+    systemic abort. Fail up to one short of the threshold, succeed once,
+    then fail that many again: the counter resets on the success, so the
+    project completes with every failure isolated.
+    """
+    run = MAX_CONSECUTIVE_EDITION_FAILURES - 1
+    total = run * 2 + 1
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-reset")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    async def _fails_except_middle(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> EditionSyncOutcome:
+        ltd_id = ltd_edition.ltd_id
+        if ltd_id != run + 1:
+            msg = "LTD is flaky"
+            raise RuntimeError(msg)
+        async with db_session.begin():
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+        assert project is not None
+        return EditionSyncOutcome(
+            docverse_edition_id=None,
+            docverse_slug=f"u-jsick-feat-{ltd_id}",
+            docverse_project_id=project.id,
+            docverse_project_slug=project.slug,
+            build_outcome=None,
+        )
+
+    monkeypatch.setattr(service, "sync_edition", _fails_except_middle)
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # No abort: every edition was walked and the failures stayed
+    # isolated on the result.
+    assert len(result.edition_outcomes) == 1
+    assert len(result.edition_failures) == total - 1
 
 
 @pytest.mark.asyncio
@@ -3776,3 +3933,102 @@ async def test_proactive_ref_set_fetched_once_per_sync_project(
     # GitHub refs endpoints each hit exactly once.
     assert heads_route.call_count == 1
     assert tags_route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_isolates_aggregate_backfill_failure(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising aggregate backfill must not discard the edition sync.
+
+    The backfill runs *after* ``sync_build`` has committed the build row
+    and pointed the edition at it. Letting its exception escape would
+    hand the whole edition to ``sync_project``'s per-edition boundary:
+    no ``EditionSyncOutcome``, so ``on_edition_synced`` never enqueues
+    the publish and the tail-end self-heal (which iterates only
+    ``edition_outcomes``) cannot recover it — an edition whose content
+    imported completely would be reported failed and never published.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-isolate")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    # Fail *inside* the backfill's own ``session.begin()`` block rather
+    # than stubbing the whole method, so the real semver guards still
+    # run: ``__main`` is not a release and never reaches this, and only
+    # the ``15.2.1`` release edition's backfill blows up — the shape of
+    # the transient DB error this boundary exists to absorb.
+    async def _raising_ensure_aggregate(**kwargs: object) -> None:
+        msg = "aggregate backfill blew up"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        service, "_ensure_aggregate_edition", _raising_ensure_aggregate
+    )
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    published: list[str] = []
+
+    async def on_edition_synced(outcome: object) -> None:
+        published.append(outcome.docverse_slug)  # type: ignore[attr-defined]
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        on_edition_synced=on_edition_synced,
+    )
+
+    # The edition sync is *not* converted into a failure.
+    assert result.edition_failures == ()
+    outcomes = {o.docverse_slug: o for o in result.edition_outcomes}
+    assert set(outcomes) == {"__main", "15.2.1"}
+    release_outcome = outcomes["15.2.1"]
+    assert release_outcome.build_outcome is not None
+    assert release_outcome.build_outcome.docverse_build_id is not None
+    # No aggregates moved, because the backfill never got that far.
+    assert release_outcome.aggregate_outcomes == ()
+
+    # The publish enqueue still fires for the successfully-synced edition.
+    assert published == ["__main", "15.2.1"]
+
+    # The failure is still visible to an operator via Sentry.
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+
+    # The edition really did import: it points at its copied build.
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+    assert release is not None
+    assert release.current_build_id is not None

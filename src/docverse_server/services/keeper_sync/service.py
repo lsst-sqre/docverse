@@ -59,7 +59,11 @@ from docverse_server.domain.slug import (
     parse_slug_rewrite_rules,
 )
 from docverse_server.domain.version import SemverVersion
-from docverse_server.exceptions import KeeperSyncInvariantError, NotFoundError
+from docverse_server.exceptions import (
+    KeeperSyncInvariantError,
+    KeeperSyncSystemicFailureError,
+    NotFoundError,
+)
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -108,6 +112,7 @@ from .mappers import (
 
 __all__ = [
     "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",
+    "MAX_CONSECUTIVE_EDITION_FAILURES",
     "AggregateEditionOutcome",
     "BuildSyncOutcome",
     "CopyCallable",
@@ -126,6 +131,26 @@ __all__ = [
 #: older is assumed to be from a worker that crashed between the
 #: placeholder commit and the finalize commit.
 DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
+
+#: Number of *consecutive* per-edition failures that ``sync_project``
+#: treats as a systemic outage rather than a run of independent
+#: per-edition faults.
+#:
+#: The per-edition failure boundary exists for the isolated case — LTD's
+#: oldest uploads carry no public-read object ACL, so one permanently
+#: unreadable build must not strand the releases behind it. That same
+#: isolation is actively harmful when the fault is shared: a mid-run LTD
+#: outage or a database failure marks every remaining edition failed one
+#: by one, the loop finishes, and the run rolls up ``completed`` on what
+#: was really a 3-of-80 import.
+#:
+#: Five is chosen to sit comfortably above the observed clustering of
+#: genuinely-unreadable builds (LTD's un-ACL'd uploads are scattered
+#: through a product's history, not contiguous runs) while still
+#: aborting fast enough that an outage costs a handful of attempts
+#: rather than a whole product's edition list. A single success resets
+#: the counter, so scattered failures never accumulate into an abort.
+MAX_CONSECUTIVE_EDITION_FAILURES = 5
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
 #: callable the service consumes. Tests inject a fake; the production
@@ -339,10 +364,24 @@ class KeeperSyncService:
         on. One unreadable LTD build therefore costs one edition rather
         than every edition behind it in the list — LTD's oldest uploads
         carry no public-read ACL, so a single permanently-``AccessDenied``
-        build used to strand the whole project's release history. The
-        run still reports as completed; ``edition_failures`` is the
-        partial-success signal (bounded retry of transient copy errors
-        is deliberately out of scope here).
+        build used to strand the whole project's release history.
+        ``edition_failures`` is the partial-success signal (bounded retry
+        of transient copy errors is deliberately out of scope here); the
+        worker records it on the job's ``progress`` and finishes the job
+        ``completed_with_errors``.
+
+        That isolation is bounded by
+        :data:`MAX_CONSECUTIVE_EDITION_FAILURES`. A run of that many
+        *consecutive* failures is read as a systemic fault — a mid-run
+        LTD outage, a dead database — rather than a run of independent
+        per-edition ones, and raises
+        :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+        (chained from the last edition's exception) instead of walking
+        the remaining editions. Without the abort, a systemic fault
+        would mark every remaining edition failed one at a time and
+        still let the run roll up green over a 3-of-80 import. Any
+        single success resets the counter, so scattered isolated
+        failures keep their per-edition boundary.
 
         ``on_edition_synced`` runs once per :meth:`sync_edition` return,
         before the next iteration begins. Callbacks fire after each
@@ -405,6 +444,7 @@ class KeeperSyncService:
         )
         outcomes: list[EditionSyncOutcome] = []
         failures: list[EditionSyncFailure] = []
+        consecutive_failures = 0
         for ltd_edition in ltd_editions:
             if ltd_edition.ltd_id in skip_ltd_ids:
                 continue
@@ -434,7 +474,28 @@ class KeeperSyncService:
                         error_message=str(exc),
                     )
                 )
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_EDITION_FAILURES:
+                    recent = [
+                        failure.ltd_edition_slug
+                        for failure in failures[-consecutive_failures:]
+                    ]
+                    self._logger.exception(
+                        "Aborting project sync: consecutive edition failures"
+                        " indicate a systemic outage",
+                        consecutive_failures=consecutive_failures,
+                        failed_ltd_edition_slugs=recent,
+                        project_id=project.id,
+                        project=project.slug,
+                        ltd_slug=ltd_slug,
+                    )
+                    raise KeeperSyncSystemicFailureError(
+                        ltd_slug=ltd_slug,
+                        consecutive_failures=consecutive_failures,
+                        failed_ltd_edition_slugs=recent,
+                    ) from exc
                 continue
+            consecutive_failures = 0
             outcomes.append(outcome)
             if on_edition_synced is not None:
                 try:
@@ -810,13 +871,43 @@ class KeeperSyncService:
                 ltd_build=ltd_build_for_mapping,
             )
             if build_outcome.docverse_build_id is not None:
-                aggregate_outcomes = await self._backfill_semver_aggregates(
-                    project_id=project.id,
-                    git_ref=tracking_params.get("git_ref"),
-                    derived_kind=kind_derivation.kind,
-                    build_id=build_outcome.docverse_build_id,
-                    autocreation=autocreation or DEFAULT_EDITION_AUTOCREATION,
-                )
+                # The backfill runs after ``sync_build`` has committed the
+                # build row and repointed the edition, so the edition's
+                # import is already durable by the time we get here.
+                # Letting a backfill error escape would hand the whole
+                # edition to ``sync_project``'s per-edition boundary:
+                # no outcome is emitted, so ``on_edition_synced`` never
+                # enqueues the publish and the tail-end self-heal (which
+                # iterates only ``edition_outcomes``) cannot recover it —
+                # a fully-imported edition would be reported failed and
+                # its CDN pointer never published this run. Swallow it
+                # here instead, exactly as the ``on_edition_synced``
+                # callback's failures are swallowed in ``sync_project``:
+                # the aggregates are a derived nicety, and the next poll
+                # re-runs the backfill for this build anyway.
+                try:
+                    aggregate_outcomes = (
+                        await self._backfill_semver_aggregates(
+                            project_id=project.id,
+                            git_ref=tracking_params.get("git_ref"),
+                            derived_kind=kind_derivation.kind,
+                            build_id=build_outcome.docverse_build_id,
+                            autocreation=(
+                                autocreation or DEFAULT_EDITION_AUTOCREATION
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
+                    self._logger.exception(
+                        "Semver aggregate backfill failed; edition sync"
+                        " still succeeded",
+                        ltd_edition_id=ltd_edition.ltd_id,
+                        ltd_edition_slug=ltd_edition.slug,
+                        docverse_slug=edition.slug,
+                        project_id=project.id,
+                        project=project.slug,
+                    )
 
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,

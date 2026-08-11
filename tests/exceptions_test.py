@@ -28,6 +28,7 @@ from docverse_server.exceptions import (
     InvalidJobStateError,
     JobNotFoundError,
     KeeperSyncInvariantError,
+    KeeperSyncSystemicFailureError,
 )
 from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
 
@@ -69,6 +70,14 @@ def _make_keeper_sync_invariant() -> KeeperSyncInvariantError:
     return KeeperSyncInvariantError("state_id=42 has no tombstone")
 
 
+def _make_keeper_sync_systemic_failure() -> KeeperSyncSystemicFailureError:
+    return KeeperSyncSystemicFailureError(
+        ltd_slug="pipelines",
+        consecutive_failures=5,
+        failed_ltd_edition_slugs=["15.0.0", "15.0.1", "15.0.2"],
+    )
+
+
 def _make_cloudflare_cache_purge() -> CloudflareCachePurgeError:
     return CloudflareCachePurgeError(
         hostname="myproject.example.org",
@@ -86,6 +95,10 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("JobNotFoundError", _make_job_not_found),
     ("InvalidSlugError", _make_invalid_slug),
     ("KeeperSyncInvariantError", _make_keeper_sync_invariant),
+    (
+        "KeeperSyncSystemicFailureError",
+        _make_keeper_sync_systemic_failure,
+    ),
     ("CloudflareCachePurgeError", _make_cloudflare_cache_purge),
 ]
 

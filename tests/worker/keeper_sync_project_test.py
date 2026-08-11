@@ -348,6 +348,9 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
+            # Zero edition failures stays plain ``completed`` — the
+            # ``completed_with_errors`` status is reserved for a genuine
+            # partial import, so a clean run is never ambiguous.
             assert qj.status == JobStatus.completed
 
             publish_qj = await queue_job_store.get_by_backend_job_id(
@@ -948,12 +951,13 @@ async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
     started copying and invokes the factory's copier closure, which
     calls ``create_objectstore_for_org``. We make that raise *after* the
     factory has entered the autobegun transaction region. The service's
-    per-edition boundary absorbs it, so the job finishes ``completed``
-    with the failure recorded — but only if the session is still clean
-    enough to open the completion transaction. A leaked transaction
-    reproduces the original bug (``InvalidRequestError: A transaction is
-    already begun on this Session``), now surfacing at completion time
-    instead of in the worker's except branch.
+    per-edition boundary absorbs it, so the job reaches its end and
+    finishes ``completed_with_errors`` with the failure recorded — but
+    only if the session is still clean enough to open the completion
+    transaction. A leaked transaction reproduces the original bug
+    (``InvalidRequestError: A transaction is already begun on this
+    Session``), now surfacing at completion time instead of in the
+    worker's except branch.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -999,14 +1003,14 @@ async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
         },
     )
     await ctx["http_client"].aclose()
-    assert result == "completed"
+    assert result == "completed_with_errors"
 
     async for session in db_session_dependency():
         async with session.begin():
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
-            assert qj.status == JobStatus.completed
+            assert qj.status == JobStatus.completed_with_errors
             assert qj.progress is not None
             assert qj.progress["edition_failure_count"] == 1
             recorded = qj.progress["edition_failures"][0]
@@ -1014,11 +1018,14 @@ async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
             assert "Service 'mock-store' not found" in message
 
             # The project's only edition failed, so the job is the run's
-            # only child and it completed: the run finalises clean.
+            # only child. ``aggregate_activity`` buckets
+            # ``completed_with_errors`` as a failure, so the run rolls up
+            # ``partial_failure`` — the errors reach the run status
+            # without inventing a new one.
             run_store = KeeperSyncRunStore(session=session, logger=_logger())
             run = await run_store.get(run_id)
             assert run is not None
-            assert run.status == KeeperSyncRunStatus.succeeded
+            assert run.status == KeeperSyncRunStatus.partial_failure
 
 
 @pytest.mark.asyncio
@@ -1441,13 +1448,15 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     callback enqueues a publish. Edition 2 (the branch edition, build
     43) raises mid-``sync_edition`` because its LTD build reports
     ``uploaded=False``. The service's per-edition boundary absorbs that
-    failure, so the job finishes ``completed`` (a permanently-broken
-    LTD build must not paint the project red forever) while the
-    ``queue_jobs`` row's ``progress`` records the partial run. Locks
-    two contracts at once: the editions that already succeeded end up
-    fully published rather than stranded on ``publish_status IS NULL``
-    (the issue #320 regression), and the failure is still visible on
-    the job record.
+    failure, so the job reaches its end rather than failing outright (a
+    permanently-broken LTD build must not abort the project's whole
+    import) — but it finishes ``completed_with_errors``, not plain
+    ``completed``, so a partial import is never indistinguishable from
+    a clean one. The ``queue_jobs`` row's ``progress`` carries the
+    per-edition detail. Locks two contracts at once: the editions that
+    already succeeded end up fully published rather than stranded on
+    ``publish_status IS NULL`` (the issue #320 regression), and the
+    failure is visible in both the status and the job record.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -1520,7 +1529,7 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
         },
     )
     await ctx["http_client"].aclose()
-    assert result == "completed"
+    assert result == "completed_with_errors"
 
     publish_jobs = get_jobs_by_name(
         mock_arq, "publish_edition", queue_name="docverse:queue"
@@ -1558,7 +1567,7 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
-            assert qj.status == JobStatus.completed
+            assert qj.status == JobStatus.completed_with_errors
             assert qj.progress is not None
             assert qj.progress["edition_failure_count"] == 1
             recorded = qj.progress["edition_failures"]
