@@ -19,6 +19,11 @@ from safir.slack.sentry import SentryEventInfo
 
 from docverse_server.exceptions import DocverseSlackException
 
+from .._http_retry import (
+    RETRYABLE_STATUS_CODES,
+    backoff_for_attempt,
+    backoff_for_response,
+)
 from .models import LtdBuild, LtdEdition, LtdProduct, LtdProductsListing
 
 __all__ = [
@@ -33,9 +38,6 @@ _MAX_ATTEMPTS = 4
 
 #: Initial backoff in seconds; doubles each subsequent attempt.
 _BASE_BACKOFF_SECONDS = 0.5
-
-#: Status codes that the client retries.
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 #: Cap on the response body bytes carried into Sentry events. LTD error
 #: bodies can be arbitrarily large (HTML error pages, full JSON payloads);
@@ -247,7 +249,7 @@ class LtdClient:
                     message=f"LTD resource {url} not found (404)",
                 )
 
-            if response.status_code in _RETRYABLE_STATUS_CODES:
+            if response.status_code in RETRYABLE_STATUS_CODES:
                 if attempt >= self._max_attempts:
                     raise LtdClientError(
                         url=url,
@@ -286,22 +288,17 @@ class LtdClient:
         ) from last_exc
 
     def _backoff_for_attempt(self, attempt: int) -> float:
-        multiplier: int = 2 ** (attempt - 1)
-        return self._base_backoff_seconds * multiplier
+        return backoff_for_attempt(
+            attempt, base_backoff_seconds=self._base_backoff_seconds
+        )
 
     def _backoff_for_response(
         self, response: httpx.Response, attempt: int
     ) -> float:
         """Honour ``Retry-After`` on 429, else fall back to exp backoff."""
-        retry_after = response.headers.get("Retry-After")
-        if retry_after is not None:
-            try:
-                value = float(retry_after)
-            except ValueError:
-                self._logger.warning(
-                    "Ignoring non-numeric Retry-After",
-                    retry_after=retry_after,
-                )
-            else:
-                return max(0.0, value)
-        return self._backoff_for_attempt(attempt)
+        return backoff_for_response(
+            response,
+            attempt,
+            base_backoff_seconds=self._base_backoff_seconds,
+            logger=self._logger,
+        )

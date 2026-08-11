@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 
 import pytest
+import sentry_sdk
 import structlog
+from safir.testing.sentry import (
+    TestTransport,
+    capture_events_fixture,
+    sentry_init_fixture,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -26,12 +32,14 @@ from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.dashboard_context import MAIN_SLUG
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.sentry import initialize_sentry
 from docverse_server.services.edition_publishing import (
     EditionPublishingService,
 )
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.cdncachepurger import (
     CdnCachePurger,
+    CloudflareCachePurgeError,
     MockCdnCachePurger,
 )
 from docverse_server.storage.edition_build_history_store import (
@@ -633,3 +641,76 @@ async def test_publish_purge_failure_does_not_propagate(
         assert refreshed.publish_status == PublishStatus.published
         refreshed_history = await _fetch_history(db_session, edition.id)
         assert refreshed_history.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_publish_purge_failure_captures_to_sentry(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exhausted purge stays best-effort but is reported to Sentry.
+
+    The publish contract is unchanged — a CDN outage still degrades to a
+    stale edge copy rather than a failed publish — but the swallowed
+    exception is no longer invisible: it reaches Sentry carrying
+    Cloudflare's own error code, so a stale-cache edition is
+    discoverable without grepping worker logs.
+    """
+    purge_error = CloudflareCachePurgeError(
+        hostname=f"{_PROJECT_SLUG}.purge-sentry-org.example.com",
+        zone_id="zone-123",
+        status_code=429,
+        error_codes=[1134],
+        error_messages=["Unable to purge, rate limit reached"],
+        attempts=4,
+    )
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=_FailingPurger(purge_error),
+    )
+
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    real_init = sentry_sdk.init
+
+    def _init_with_test_transport(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("transport", TestTransport())
+        return real_init(*args, **kwargs)
+
+    monkeypatch.setattr(sentry_sdk, "init", _init_with_test_transport)
+
+    with sentry_init_fixture():
+        # Publishing runs in the general worker pool (the
+        # ``publish_edition`` arq function), so that is the component
+        # an operator would filter on in Sentry.
+        initialize_sentry(component="worker")
+        captured = capture_events_fixture(monkeypatch)()
+
+        async with db_session.begin():
+            org_id, edition, build, history_entry = await _setup(
+                db_session,
+                org_slug="purge-sentry-org",
+                cdn_service_label="cdn-prod",
+                edition_kind=EditionKind.main,
+            )
+            await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+            await db_session.commit()
+
+        assert len(captured.errors) == 1
+        event = captured.errors[0]
+        assert event["tags"]["cloudflare_error_code"] == "1134"
+        assert event["tags"]["cdn_status_code"] == "429"
+        assert event["contexts"]["cloudflare_purge"]["attempts"] == 4
+
+    async with db_session.begin():
+        refreshed = await _fetch_edition(
+            db_session, edition.id, edition.project_id, edition.slug
+        )
+        assert refreshed.publish_status == PublishStatus.published

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import sentry_sdk
 import structlog
 
 from docverse.models.queue_enums import PublishStatus
@@ -152,11 +153,11 @@ class EditionPublishingService:
             # an edge colo can still read the previous pointer and
             # re-populate its cache with the old build under the long
             # profile, where it lives until the next publish purges it.
-            # That window is accepted for now: PRD #183 puts purge
-            # retries and scheduling machinery out of scope, and a
-            # delayed second purge would need a job-queue mechanism this
-            # story does not build. Revisit if the stale window is
-            # observed in practice.
+            # That window is still accepted: closing it needs a *delayed
+            # second* purge, i.e. the job-queue scheduling machinery PRD
+            # #183 put out of scope. Retrying a purge that Cloudflare
+            # rejected is a different problem and is handled inside
+            # `CloudflareCachePurger`.
             await self._purge_cdn_cache(
                 org=org,
                 service_label=org.cdn_service_label,
@@ -245,9 +246,18 @@ class EditionPublishingService:
         """Purge the project's hostname from the CDN edge cache.
 
         Best-effort: any failure resolving or invoking the purger is
-        logged at ERROR with the full publish context and swallowed, so
-        a CDN outage degrades to a stale edge copy instead of a failed
-        publish. Every attempt is logged, success or failure.
+        reported and swallowed, so a CDN outage degrades to a stale edge
+        copy instead of a failed publish. Every attempt is logged,
+        success or failure.
+
+        Swallowed is not the same as dropped. A purge that Cloudflare
+        keeps rejecting leaves the edition serving a stale copy at the
+        edge until some later publish happens to purge the same
+        hostname, which is exactly the kind of failure that must not
+        live only in worker logs — so the exception is captured to
+        Sentry alongside the ERROR log, carrying whatever the purger
+        knew (Cloudflare's ``errors[].code``, the status, the attempt
+        count) via its ``to_sentry`` override.
         """
         hostname = compute_project_hostname(org, project_slug)
         logger = self._logger.bind(
@@ -264,7 +274,15 @@ class EditionPublishingService:
             )
             async with purger:
                 await purger.purge_hostname(hostname)
-        except Exception:
+        except Exception as exc:
+            # Explicit rather than relying on the SDK's logging
+            # integration to turn the ERROR below into an event: the
+            # capture is the contract here, not a side effect of how
+            # logging happens to be wired. ``DedupeIntegration`` (a
+            # default ``sentry_sdk.init`` integration) drops the
+            # logging-integration capture of the same instance, so this
+            # reports once.
+            sentry_sdk.capture_exception(exc)
             logger.exception("CDN cache purge failed")
         else:
             logger.info("Purged CDN cache")

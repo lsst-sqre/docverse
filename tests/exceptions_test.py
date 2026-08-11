@@ -29,6 +29,7 @@ from docverse_server.exceptions import (
     JobNotFoundError,
     KeeperSyncInvariantError,
 )
+from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
 
 
 def _make_invalid_slug() -> InvalidSlugError:
@@ -68,12 +69,24 @@ def _make_keeper_sync_invariant() -> KeeperSyncInvariantError:
     return KeeperSyncInvariantError("state_id=42 has no tombstone")
 
 
+def _make_cloudflare_cache_purge() -> CloudflareCachePurgeError:
+    return CloudflareCachePurgeError(
+        hostname="myproject.example.org",
+        zone_id="zone-123",
+        status_code=429,
+        error_codes=[1134],
+        error_messages=["Unable to purge, rate limit reached"],
+        attempts=4,
+    )
+
+
 _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("InvalidJobStateError", _make_invalid_job_state),
     ("InvalidBuildStateError", _make_invalid_build_state),
     ("JobNotFoundError", _make_job_not_found),
     ("InvalidSlugError", _make_invalid_slug),
     ("KeeperSyncInvariantError", _make_keeper_sync_invariant),
+    ("CloudflareCachePurgeError", _make_cloudflare_cache_purge),
 ]
 
 
