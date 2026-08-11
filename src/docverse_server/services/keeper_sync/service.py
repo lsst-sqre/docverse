@@ -1068,8 +1068,9 @@ class KeeperSyncService:
         """Look up or create an edition; refresh its tracking and kind.
 
         ``kind_derivation`` seeds a newly created edition's kind
-        outright. On an existing edition — whether matched by slug or
-        adopted by ``git_ref`` — it is applied through
+        outright. On an existing edition — whether matched by slug,
+        adopted by ``git_ref``, or handed back by a ``create_internal``
+        that lost its ``ON CONFLICT`` race — it is applied through
         :meth:`_refresh_kind`, which only ever promotes.
         """
         edition = await self._edition_store.get_by_slug(
@@ -1124,16 +1125,26 @@ class KeeperSyncService:
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
             )
-        else:
-            await self._refresh_tracking(
-                edition=edition,
-                tracking_mode=tracking_mode,
-                tracking_params=tracking_params,
-            )
-            edition = await self._refresh_kind(
-                edition=edition, kind_derivation=kind_derivation
-            )
-        return edition
+        # Applied on both paths. ``create_internal`` is race-tolerant: a
+        # concurrent writer (e.g. the native ``track_build`` path handling
+        # an upload for the same ref) that inserted this
+        # ``(project, lower(slug))`` between our SELECT and INSERT wins the
+        # ``ON CONFLICT DO NOTHING``, and we get *its* row back — an
+        # existing edition exactly like a ``get_by_slug`` hit, whose
+        # tracking columns and kind still need realigning with LTD. The
+        # store returns the winner verbatim with no "did I insert?" signal,
+        # so both refreshes run unconditionally; on a genuinely fresh row
+        # they are no-ops, since it already carries these tracking params
+        # and ``_refresh_kind`` is promote-only (its ``(kind, kind)`` pair
+        # is never a promotion).
+        await self._refresh_tracking(
+            edition=edition,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+        )
+        return await self._refresh_kind(
+            edition=edition, kind_derivation=kind_derivation
+        )
 
     async def _refresh_tracking(
         self,

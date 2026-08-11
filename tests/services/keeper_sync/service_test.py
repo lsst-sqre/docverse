@@ -36,6 +36,7 @@ from docverse.models import (
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.edition import Edition
 from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
@@ -2833,6 +2834,164 @@ async def test_resync_kind_refresh_covers_adopted_editions(
     assert edition.kind == expected_kind
     # Adoption, not a second row under the keeper-derived slug.
     assert keeper_slugged is None
+
+
+@pytest.mark.asyncio
+async def test_resync_realigns_edition_when_create_loses_slug_race(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost ``create_internal`` race still gets tracking + kind applied.
+
+    ``_ensure_edition`` reads the slug, misses, and inserts — but the
+    insert is ``ON CONFLICT DO NOTHING`` on
+    ``uq_editions_project_lower_slug``, so a concurrent writer (the
+    native ``track_build`` path handling an upload for the same ref)
+    that landed the row in the SELECT/INSERT window makes
+    ``create_internal`` return *that* row instead. It is an existing
+    edition exactly like a ``get_by_slug`` hit, so it must get the same
+    tracking realignment and promote-only kind refresh — PRD #498
+    promises the kind recompute on *every* sync, and returning the
+    concurrent winner verbatim would leave it stale until some later
+    sync happened to take the slug-hit path.
+
+    The race window is simulated by making the store's first
+    ``get_by_slug`` for this slug miss while the row is really there;
+    ``create_internal``'s own re-fetch then returns the winner.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-lost-race")
+
+    # The concurrent winner: same slug, but a stale ref and the draft
+    # kind LTD's version ref disagrees with.
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="15.2.1",
+        kind=EditionKind.draft,
+        git_ref="u/jsick/stale",
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    original_get_by_slug = EditionStore.get_by_slug
+    missed = {"fired": False}
+
+    async def _miss_once(
+        self: EditionStore, *, project_id: int, slug: str
+    ) -> Edition | None:
+        """Miss the first lookup of ``15.2.1`` — the pre-insert SELECT."""
+        if slug == "15.2.1" and not missed["fired"]:
+            missed["fired"] = True
+            return None
+        return await original_get_by_slug(
+            self, project_id=project_id, slug=slug
+        )
+
+    monkeypatch.setattr(EditionStore, "get_by_slug", _miss_once)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert missed["fired"] is True
+    # The sync reports the concurrently-inserted row, not a second one.
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_edition_id == edition_id
+
+    monkeypatch.undo()
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.kind == EditionKind.release
+    assert edition.tracking_mode == TrackingMode.git_ref
+    assert edition.tracking_params == {"git_ref": "15.2.1"}
+
+
+@pytest.mark.asyncio
+async def test_sync_fresh_edition_create_needs_no_kind_rewrite(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely fresh insert lands its params without a kind write.
+
+    The lost-race fix applies the tracking/kind refresh after *every*
+    ``create_internal``, which is only safe because both are no-ops on a
+    row that was just inserted with exactly those params: the
+    promote-only refresh sees ``(release, release)``, which is not a
+    promotion, so ``update_kind`` is never issued.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-fresh-create")
+    await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    original_update_kind = EditionStore.update_kind
+    kind_writes: list[EditionKind] = []
+
+    async def _record_update_kind(
+        self: EditionStore, *, edition_id: int, kind: EditionKind
+    ) -> None:
+        kind_writes.append(kind)
+        await original_update_kind(self, edition_id=edition_id, kind=kind)
+
+    monkeypatch.setattr(EditionStore, "update_kind", _record_update_kind)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert kind_writes == []
+
+    monkeypatch.undo()
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+    assert edition is not None
+    assert edition.kind == EditionKind.release
+    assert edition.tracking_mode == TrackingMode.git_ref
+    assert edition.tracking_params == {"git_ref": "15.2.1"}
 
 
 # ---------------------------------------------------------------------------
