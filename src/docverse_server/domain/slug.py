@@ -43,6 +43,7 @@ __all__ = [
     "derive_edition_kind_from_ref",
     "derive_edition_slug",
     "parse_slug_rewrite_rules",
+    "resolve_slug_rewrite_rules",
     "validate_slug",
 ]
 
@@ -317,6 +318,45 @@ def parse_slug_rewrite_rules(
     if raw is None:
         return []
     return _rule_list_adapter.validate_python(raw)
+
+
+def resolve_slug_rewrite_rules(
+    *,
+    project: list[dict[str, Any]] | None,
+    org: list[dict[str, Any]] | None,
+) -> list[AnySlugRewriteRule]:
+    """Resolve a project's effective slug-rewrite rules.
+
+    Implements the SQR-112 inheritance rule: a project's rule list,
+    **when set**, entirely replaces the org's — there is no merging.
+    Resolution keys on ``None`` (unset), not on falsiness, so an
+    explicitly empty ``[]`` is a deliberate opt-out of the org's rules
+    rather than a fallback trigger. A project that PATCHes
+    ``slug_rewrite_rules`` to ``[]`` therefore escapes an org-level
+    ignore rule or kind override and is governed only by the built-in
+    rule chain.
+
+    Parameters
+    ----------
+    project
+        The project's own raw rule list, or ``None`` when unset.
+    org
+        The parent organization's raw rule list, or ``None`` when unset.
+
+    Returns
+    -------
+    list
+        Typed rule objects: the project's rules when the project sets
+        any list at all (including an empty one), else the org's, else
+        empty.
+
+    Raises
+    ------
+    pydantic.ValidationError
+        If any rule dict is invalid.
+    """
+    raw = project if project is not None else org
+    return parse_slug_rewrite_rules(raw)
 
 
 def validate_slug(slug: str) -> str:

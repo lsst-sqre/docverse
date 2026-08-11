@@ -22,7 +22,7 @@ from docverse_server.domain.slug import (
     InvalidSlugError,
     SlugDerivationResult,
     derive_edition_slug,
-    parse_slug_rewrite_rules,
+    resolve_slug_rewrite_rules,
 )
 from docverse_server.domain.version import (
     LsstDocVersion,
@@ -118,9 +118,13 @@ class EditionTrackingService:
             )
             raise RuntimeError(msg)
 
-        # 3. Resolve effective rewrite rules
-        raw_rules = project.slug_rewrite_rules or org.slug_rewrite_rules
-        rules = parse_slug_rewrite_rules(raw_rules)
+        # 3. Resolve effective rewrite rules. Project-over-org, keyed on
+        # None (unset) rather than falsiness, so an explicit `[]` opts
+        # the project out of the org's rules instead of inheriting them.
+        rules = resolve_slug_rewrite_rules(
+            project=project.slug_rewrite_rules,
+            org=org.slug_rewrite_rules,
+        )
 
         # 4. Derive slug
         try:

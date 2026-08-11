@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -22,6 +24,7 @@ from docverse_server.domain.slug import (
     derive_edition_kind_from_ref,
     derive_edition_slug,
     parse_slug_rewrite_rules,
+    resolve_slug_rewrite_rules,
     validate_slug,
 )
 
@@ -114,6 +117,40 @@ class TestParseSlugRewriteRules:
         assert isinstance(rule, PrefixStripRule)
         assert rule.edition_kind == EditionKind.draft
         assert rule.slash_replacement == "-"
+
+
+# ---- resolve_slug_rewrite_rules ----
+
+_ORG_RULES: list[dict[str, Any]] = [{"type": "ignore", "glob": "main"}]
+_PROJECT_RULES: list[dict[str, Any]] = [{"type": "ignore", "glob": "tags/*"}]
+
+
+class TestResolveSlugRewriteRules:
+    """Project-over-org resolution distinguishes unset from empty."""
+
+    def test_project_unset_falls_back_to_org(self) -> None:
+        rules = resolve_slug_rewrite_rules(project=None, org=_ORG_RULES)
+        assert len(rules) == 1
+        assert isinstance(rules[0], IgnoreRule)
+        assert rules[0].glob == "main"
+
+    def test_project_empty_does_not_inherit_org(self) -> None:
+        """An explicit ``[]`` opts the project out of the org's rules."""
+        assert resolve_slug_rewrite_rules(project=[], org=_ORG_RULES) == []
+
+    def test_project_rules_replace_org_rules(self) -> None:
+        rules = resolve_slug_rewrite_rules(
+            project=_PROJECT_RULES, org=_ORG_RULES
+        )
+        assert len(rules) == 1
+        assert isinstance(rules[0], IgnoreRule)
+        assert rules[0].glob == "tags/*"
+
+    def test_both_unset_is_empty(self) -> None:
+        assert resolve_slug_rewrite_rules(project=None, org=None) == []
+
+    def test_org_empty_with_project_unset_is_empty(self) -> None:
+        assert resolve_slug_rewrite_rules(project=None, org=[]) == []
 
 
 # ---- validate_slug ----

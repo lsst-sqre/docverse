@@ -2848,6 +2848,7 @@ async def _seed_project(
     *,
     org_id: int,
     edition_autocreation: dict[str, object] | None = None,
+    slug_rewrite_rules: list[dict[str, object]] | None = None,
 ) -> int:
     """Create the ``pipelines`` project before sync ever walks it.
 
@@ -2866,13 +2867,77 @@ async def _seed_project(
                 source_url="https://example.com/lsst/pipelines",
             ),
         )
+        # ``slug_rewrite_rules`` goes on with a direct UPDATE (it is
+        # PATCH-only, not on ``ProjectCreate``); an explicit ``[]`` is a
+        # meaningful value here, so the guard tests for ``None``.
+        project_values: dict[str, object] = {}
         if edition_autocreation is not None:
+            project_values["edition_autocreation"] = edition_autocreation
+        if slug_rewrite_rules is not None:
+            project_values["slug_rewrite_rules"] = slug_rewrite_rules
+        if project_values:
             await session.execute(
                 update(SqlProject)
                 .where(SqlProject.id == project.id)
-                .values(edition_autocreation=edition_autocreation)
+                .values(**project_values)
             )
     return project.id
+
+
+@pytest.mark.asyncio
+async def test_sync_kind_empty_project_rules_opt_out_of_org(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An explicit empty project rule list opts out of the org's rules.
+
+    The mirror of the native edition-tracking path: ``[]`` is a
+    deliberate override, not "unset", so the org's ``semver`` kind
+    override must not classify this project's editions and the built-in
+    heuristic makes ``15.2.1`` a release.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-kind-optout",
+            slug_rewrite_rules=[{"type": "semver", "edition_kind": "draft"}],
+        )
+    await _seed_project(db_session, org_id=org_id, slug_rewrite_rules=[])
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="15.2.1"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.release
 
 
 def _seed_ltd_two_releases(

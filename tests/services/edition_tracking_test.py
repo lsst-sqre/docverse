@@ -531,6 +531,43 @@ async def test_track_build_project_rules_override_org(
 
 
 @pytest.mark.asyncio
+async def test_track_build_empty_project_rules_opt_out_of_org(
+    db_session: AsyncSession,
+) -> None:
+    """An explicit empty project rule list opts out of the org's rules.
+
+    ``[]`` is a deliberate override, not "unset": the org's ignore rule
+    must not suppress the ref, and the built-in fallback derives the
+    slug instead.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="optout-org",
+            org_slug_rewrite_rules=[
+                {"type": "ignore", "glob": "tags/*"},
+            ],
+        )
+        # Explicitly clear the rules at the project level.
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(slug_rewrite_rules=[])
+        )
+        await db_session.flush()
+
+        build = await _create_build(
+            db_session, project.id, git_ref="tags/v1.0"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert result.suppressed is False
+    assert result.derived_slug == "tags-v1.0"
+
+
+@pytest.mark.asyncio
 async def test_track_build_default_fallback_no_rules(
     db_session: AsyncSession,
 ) -> None:

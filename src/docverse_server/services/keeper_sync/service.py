@@ -56,7 +56,7 @@ from docverse_server.domain.semver_aggregate import (
 )
 from docverse_server.domain.slug import (
     AnySlugRewriteRule,
-    parse_slug_rewrite_rules,
+    resolve_slug_rewrite_rules,
 )
 from docverse_server.domain.version import SemverVersion
 from docverse_server.exceptions import (
@@ -1510,10 +1510,13 @@ def _resolve_rewrite_rules(
 
     Mirrors :class:`~docverse_server.services.edition_tracking.EditionTrackingService`:
     a project's rule list, when set, entirely replaces the org's — there
-    is no merging (SQR-112 inheritance rule).
+    is no merging (SQR-112 inheritance rule). "Set" means not ``None``,
+    so an explicit ``[]`` opts the project out of the org's rules.
     """  # noqa: E501
-    raw_rules = project.slug_rewrite_rules or org.slug_rewrite_rules
-    return parse_slug_rewrite_rules(raw_rules)
+    return resolve_slug_rewrite_rules(
+        project=project.slug_rewrite_rules,
+        org=org.slug_rewrite_rules,
+    )
 
 
 def _transient_edition_from_ltd(
