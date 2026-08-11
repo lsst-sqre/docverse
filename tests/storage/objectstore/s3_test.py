@@ -97,6 +97,87 @@ async def test_upload_object_retries_read_timeout_then_succeeds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upload_object_retries_write_error_then_succeeds() -> None:
+    """A connection reset while sending the body is retried.
+
+    A TCP reset mid-PUT arrives as ``WriteError``, not ``ConnectError``,
+    so this is the failure mode the upload retry mainly exists for.
+    """
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise httpx.WriteError("broken pipe")
+        return httpx.Response(200)
+
+    store, client = _make_store(handler)
+    async with client, store as s:
+        await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert attempts == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_upload_object_retries_read_error_then_succeeds() -> None:
+    """A reset while reading the response is retried, not swallowed."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise httpx.ReadError("connection reset by peer")
+        return httpx.Response(200)
+
+    store, client = _make_store(handler)
+    async with client, store as s:
+        await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert attempts == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_upload_object_raises_on_redirect_response() -> None:
+    """A 3xx is a failed upload, not a quiet success.
+
+    R2 and S3 answer a wrong-region or wrong-endpoint PUT with a 301
+    ``PermanentRedirect``, and a proxy in front of them can answer with
+    a 307. Redirects are not followed on this path, so the bytes were
+    never stored — treating the response as "not an error" would report
+    a build as copied while the object is missing.
+    """
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        return httpx.Response(
+            301,
+            headers={"Location": "https://elsewhere.example.com/"},
+            text="PermanentRedirect",
+        )
+
+    store, client = _make_store(handler)
+    async with client, store as s:
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await s.upload_object(
+                key="build/index.html",
+                data=b"<html></html>",
+                content_type="text/html",
+            )
+
+    assert attempts == [1]
+    assert excinfo.value.response.status_code == 301
+
+
+@pytest.mark.asyncio
 async def test_upload_object_does_not_retry_403() -> None:
     """An expired or malformed signature fails without burning attempts."""
     attempts: list[int] = []

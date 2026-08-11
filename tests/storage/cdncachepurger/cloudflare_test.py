@@ -139,6 +139,105 @@ async def test_purge_hostname_exhausts_retries_on_persistent_429() -> None:
 
 
 @pytest.mark.asyncio
+async def test_purge_hostname_raises_on_redirect_response() -> None:
+    """A 3xx means the purge never ran, so it must not report success.
+
+    Redirects are not followed on this client, so a proxy or an API
+    gateway answering with a 302 leaves the edge still serving the stale
+    copy — the one outcome the purger exists to prevent.
+    """
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        return httpx.Response(
+            302, headers={"Location": "https://login.example.com/"}
+        )
+
+    with capture_logs() as logs:
+        purger, client = _make_purger(httpx.MockTransport(handler))
+        async with client, purger as p:
+            with pytest.raises(CloudflareCachePurgeError) as excinfo:
+                await p.purge_hostname("myproject.example.org")
+
+    assert attempts == [1]
+    assert excinfo.value.status_code == 302
+    assert not [
+        entry
+        for entry in logs
+        if entry["event"] == "Purged Cloudflare cache for hostname"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_purge_hostname_retries_connect_error_then_succeeds() -> None:
+    """A transient transport failure is retried, not given up on."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"success": True})
+
+    purger, client = _make_purger(httpx.MockTransport(handler))
+    async with client, purger as p:
+        await p.purge_hostname("myproject.example.org")
+
+    assert attempts == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_purge_hostname_reports_exhausted_transport_failures() -> None:
+    """A never-clearing transport failure reports like a failed status.
+
+    The caller catches `CloudflareCachePurgeError` to report a stale
+    edge to Sentry, so a transport failure has to arrive as that type
+    rather than as a bare ``httpx`` error.
+    """
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with capture_logs() as logs:
+        purger, client = _make_purger(
+            httpx.MockTransport(handler), max_attempts=3
+        )
+        async with client, purger as p:
+            with pytest.raises(CloudflareCachePurgeError) as excinfo:
+                await p.purge_hostname("myproject.example.org")
+
+    assert attempts == [1, 2, 3]
+    assert excinfo.value.status_code is None
+    assert excinfo.value.attempts == 3
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+
+    errors = [entry for entry in logs if entry["log_level"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["hostname"] == "myproject.example.org"
+    assert errors[0]["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_purge_hostname_does_not_retry_local_protocol_error() -> None:
+    """A bug on our side of the wire fails without burning the budget."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.LocalProtocolError("malformed request")
+
+    purger, client = _make_purger(httpx.MockTransport(handler))
+    async with client, purger as p:
+        with pytest.raises(httpx.LocalProtocolError):
+            await p.purge_hostname("myproject.example.org")
+
+    assert attempts == [1]
+
+
+@pytest.mark.asyncio
 async def test_purge_hostname_raises_on_4xx() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"errors": ["forbidden"]})

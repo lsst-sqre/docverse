@@ -12,7 +12,12 @@ from safir.slack.sentry import SentryEventInfo
 
 from docverse_server.exceptions import DocverseSlackException
 
-from .._http_retry import RETRYABLE_STATUS_CODES, backoff_for_response
+from .._http_retry import (
+    RETRYABLE_STATUS_CODES,
+    RETRYABLE_TRANSPORT_ERRORS,
+    backoff_for_attempt,
+    backoff_for_response,
+)
 
 __all__ = ["CloudflareCachePurgeError", "CloudflareCachePurger"]
 
@@ -159,8 +164,8 @@ class CloudflareCachePurger:
     the one purge mechanism available on every Cloudflare plan tier
     (purge by prefix and by cache tag are Enterprise-only).
 
-    Retries ``429`` and the transient 5xx family with bounded
-    exponential backoff (see
+    Retries ``429``, the transient 5xx family, and transient transport
+    failures with bounded exponential backoff (see
     `docverse_server.storage._http_retry`), because publishing a single
     release can fan out into several purges and Cloudflare's purge
     endpoint rate-limits well below that burst.
@@ -201,9 +206,11 @@ class CloudflareCachePurger:
         """Purge every cached response for a hostname in the zone.
 
         A ``429`` (Cloudflare error ``1134``, "Unable to purge, rate
-        limit reached") or a transient 5xx is retried with exponential
-        backoff, honouring ``Retry-After`` when Cloudflare sends one.
-        Any other error status fails on the first attempt — a retry
+        limit reached"), a transient 5xx, or a transient transport
+        failure is retried with exponential backoff, honouring
+        ``Retry-After`` when Cloudflare sends one (up to
+        `~docverse_server.storage._http_retry.MAX_BACKOFF_SECONDS`).
+        Any other non-2xx status fails on the first attempt — a retry
         cannot fix a bad token or an unknown zone.
 
         Parameters
@@ -215,22 +222,75 @@ class CloudflareCachePurger:
         Raises
         ------
         CloudflareCachePurgeError
-            If Cloudflare returns a non-retryable error status, or keeps
+            If Cloudflare returns a non-retryable non-2xx status, keeps
             returning a retryable one until the attempt budget is
-            exhausted. The failure is logged at ``ERROR`` with full
-            context first; the caller decides whether to swallow it.
+            exhausted, or keeps failing at the transport level until the
+            budget is exhausted. Transport failures are reported as this
+            type too, rather than as a bare ``httpx`` error, so the
+            caller's best-effort handling sees one exception type for
+            "the edge may still be stale". The failure is logged at
+            ``ERROR`` with full context first; the caller decides
+            whether to swallow it.
         """
         url = (
             "https://api.cloudflare.com/client/v4"
             f"/zones/{self._zone_id}/purge_cache"
         )
         for attempt in range(1, self._max_attempts + 1):
-            response = await self._http_client.post(
-                url,
-                json={"hosts": [hostname]},
-                headers={"Authorization": f"Bearer {self._api_token}"},
-            )
-            if not response.is_error:
+            try:
+                response = await self._http_client.post(
+                    url,
+                    json={"hosts": [hostname]},
+                    headers={"Authorization": f"Bearer {self._api_token}"},
+                )
+            except RETRYABLE_TRANSPORT_ERRORS as exc:
+                # No response came back at all. That is as transient as a
+                # 429 and just as recoverable, so it shares the status
+                # path's attempt budget instead of aborting the loop on
+                # the first dropped connection.
+                if attempt < self._max_attempts:
+                    delay = backoff_for_attempt(
+                        attempt,
+                        base_backoff_seconds=self._base_backoff_seconds,
+                    )
+                    self._logger.warning(
+                        "Retrying Cloudflare cache purge after transport"
+                        " error",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                        zone_id=self._zone_id,
+                        hostname=hostname,
+                        attempt=attempt,
+                        max_attempts=self._max_attempts,
+                        retry_delay=delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                self._logger.exception(
+                    "Cloudflare cache purge failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    zone_id=self._zone_id,
+                    hostname=hostname,
+                    attempts=attempt,
+                    retryable=True,
+                )
+                raise CloudflareCachePurgeError(
+                    hostname=hostname,
+                    zone_id=self._zone_id,
+                    attempts=attempt,
+                    message=(
+                        f"Cloudflare cache purge for {hostname} failed "
+                        f"after {attempt} attempts: {exc}"
+                    ),
+                ) from exc
+
+            # Only a 2xx means Cloudflare accepted the purge. A 3xx is
+            # not followed on this client, so treating "not an error" as
+            # success would log a purge that never ran while the edge
+            # keeps serving the stale copy.
+            if response.is_success:
                 self._logger.info(
                     "Purged Cloudflare cache for hostname",
                     zone_id=self._zone_id,

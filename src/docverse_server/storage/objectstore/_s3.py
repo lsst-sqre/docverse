@@ -239,9 +239,10 @@ class S3ObjectStore:
         Raises
         ------
         httpx.HTTPStatusError
-            If the destination returns a non-retryable error status, or
-            keeps returning a retryable one until the attempt budget is
-            exhausted.
+            If the destination returns any non-2xx status that is not
+            worth retrying (including a 3xx redirect, which this client
+            does not follow), or keeps returning a retryable one until
+            the attempt budget is exhausted.
         httpx.TransportError
             If the transport keeps failing until the attempt budget is
             exhausted, or fails in a way a retry cannot fix.
@@ -285,7 +286,12 @@ class S3ObjectStore:
                 await asyncio.sleep(delay)
                 continue
 
-            if not response.is_error:
+            # Only a 2xx means the bytes landed. Anything else — a 3xx
+            # region/endpoint redirect from S3 or R2 (this client does
+            # not follow redirects, so the body went nowhere) as much as
+            # a 4xx or 5xx — has to fail loudly rather than report a
+            # build as copied when the object was never stored.
+            if response.is_success:
                 return
 
             retryable = response.status_code in RETRYABLE_STATUS_CODES
