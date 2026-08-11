@@ -18,6 +18,7 @@ import httpx
 import pytest
 import pytest_asyncio
 import respx
+import sentry_sdk
 import structlog
 from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
@@ -796,7 +797,13 @@ async def test_sync_build_refuses_half_uploaded_build(
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """LTD build with ``uploaded=False`` must raise rather than sync."""
+    """LTD build with ``uploaded=False`` must not be synced.
+
+    ``sync_build`` raises; ``sync_project``'s per-edition boundary
+    turns that into a reported failure rather than a copied build, so
+    the assertion is on the reported failure plus an untouched
+    destination store.
+    """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
 
@@ -807,8 +814,12 @@ async def test_sync_build_refuses_half_uploaded_build(
     object_store = MockObjectStore()
     service = _build_service(db_session, http_client, object_store, {})
 
-    with pytest.raises(RuntimeError, match="uploaded=False"):
-        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert len(result.edition_failures) == 1
+    assert result.edition_failures[0].error_type == "RuntimeError"
+    assert "uploaded=False" in result.edition_failures[0].error_message
 
     # Nothing was copied to the destination.
     assert not object_store.objects
@@ -1659,6 +1670,186 @@ async def test_sync_project_continues_when_callback_raises(
     outcome_slugs = [o.docverse_slug for o in result.edition_outcomes]
     assert "__main" in outcome_slugs
     assert "u-jsick-feature" in outcome_slugs
+
+
+def _seed_three_editions(
+    mock_discovery: respx.Router, *, middle_uploaded: bool = True
+) -> None:
+    """Stub a pipelines product with three ``git_refs`` editions.
+
+    Editions 1 / 2 / 3 map to LTD builds 42 / 43 / 44. ``middle_uploaded
+    =False`` makes LTD report edition 2's build as half-uploaded, which
+    is what makes ``sync_build`` raise for that edition and no other.
+    """
+    main_edition = _load("edition_main_git_refs.json")
+    middle_edition = _load("edition_branch_git_refs.json")
+    last_edition = _load("edition_branch_git_refs.json")
+    last_edition["self_url"] = f"{LTD_BASE}/editions/3"
+    last_edition["build_url"] = f"{LTD_BASE}/builds/44"
+    last_edition["slug"] = "u-jsick-other"
+    last_edition["title"] = "u/jsick/other"
+    last_edition["tracked_refs"] = ["u/jsick/other"]
+
+    middle_build = _load("build.json")
+    middle_build["self_url"] = f"{LTD_BASE}/builds/43"
+    middle_build["slug"] = "43"
+    middle_build["bucket_root_dir"] = "pipelines/builds/43"
+    middle_build["uploaded"] = middle_uploaded
+    last_build = _load("build.json")
+    last_build["self_url"] = f"{LTD_BASE}/builds/44"
+    last_build["slug"] = "44"
+    last_build["bucket_root_dir"] = "pipelines/builds/44"
+
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                    f"{LTD_BASE}/editions/3",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=main_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=middle_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/3").mock(
+        return_value=httpx.Response(200, json=last_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=middle_build)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/44").mock(
+        return_value=httpx.Response(200, json=last_build)
+    )
+
+
+_THREE_EDITION_SOURCE_OBJECTS = {
+    "pipelines/builds/42/index.html": b"<html>main</html>",
+    "pipelines/builds/43/index.html": b"<html>middle</html>",
+    "pipelines/builds/44/index.html": b"<html>last</html>",
+}
+
+
+@pytest.mark.asyncio
+async def test_sync_project_isolates_a_failing_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """One raising edition costs one edition, not the rest of the project.
+
+    Three LTD editions where the middle one's build raises: the outer
+    two still sync end-to-end and the result reports exactly one
+    failure carrying the LTD edition's slug and id. Without the
+    per-edition boundary the exception would abandon edition 3
+    entirely — the roundtable-dev documenteer case, where LTD build 33
+    is permanently unreadable and stalls 76 readable releases behind
+    it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-isolate")
+
+    _seed_three_editions(mock_discovery, middle_uploaded=False)
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome_slugs = [o.docverse_slug for o in result.edition_outcomes]
+    assert outcome_slugs == ["__main", "u-jsick-other"]
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "u-jsick-feature"
+    assert failure.ltd_edition_id == 2
+    assert failure.error_type == "RuntimeError"
+    assert "uploaded=False" in failure.error_message
+
+    # The edition *after* the failure really was imported, not just
+    # reported: its build content landed in the destination store.
+    stored = {obj.data for obj in object_store.objects.values()}
+    assert b"<html>main</html>" in stored
+    assert b"<html>last</html>" in stored
+
+
+@pytest.mark.asyncio
+async def test_sync_project_captures_edition_failure_to_sentry(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each isolated per-edition failure is reported to Sentry.
+
+    Swallowing the exception must not swallow the alert: the boundary
+    reports every failure through ``sentry_sdk.capture_exception`` so
+    an operator still sees the LTD build that could not be read.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-isolate-sentry")
+
+    _seed_three_editions(mock_discovery, middle_uploaded=False)
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_failures) == 1
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_sync_project_reports_no_failures_when_all_editions_succeed(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The all-green project is unchanged: every outcome, no failures."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-isolate-green")
+
+    _seed_three_editions(mock_discovery)
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-feature",
+        "u-jsick-other",
+    ]
+    assert result.edition_failures == ()
 
 
 @pytest.mark.asyncio

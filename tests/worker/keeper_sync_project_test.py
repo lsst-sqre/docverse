@@ -936,20 +936,24 @@ async def test_keeper_sync_project_failure_captures_to_sentry(
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_objectstore_failure_marks_queue_job_failed(
+async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Objectstore resolution raising → queue job ``failed``, no leaked txn.
+    """Objectstore resolution raising mid-copy leaks no open transaction.
 
     Drives the failure deeper than the LTD-404 path: the service has
-    started copying and invokes the factory's copier closure, which calls
-    ``create_objectstore_for_org``. We make that raise, exercising the
-    worker's except branch after the factory has entered the autobegun
-    transaction region. Without the fix this reproduces
-    ``InvalidRequestError: A transaction is already begun on this Session``.
+    started copying and invokes the factory's copier closure, which
+    calls ``create_objectstore_for_org``. We make that raise *after* the
+    factory has entered the autobegun transaction region. The service's
+    per-edition boundary absorbs it, so the job finishes ``completed``
+    with the failure recorded — but only if the session is still clean
+    enough to open the completion transaction. A leaked transaction
+    reproduces the original bug (``InvalidRequestError: A transaction is
+    already begun on this Session``), now surfacing at completion time
+    instead of in the worker's except branch.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -983,33 +987,38 @@ async def test_keeper_sync_project_objectstore_failure_marks_queue_job_failed(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    with pytest.raises(RuntimeError, match="Service 'mock-store' not found"):
-        await keeper_sync_project(
-            ctx,
-            {
-                "org_id": org_id,
-                "org_slug": org_slug,
-                "run_id": run_id,
-                "queue_job_id": queue_job_id,
-                "ltd_slug": "pipelines",
-                "ltd_base_url": LTD_BASE,
-            },
-        )
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
     await ctx["http_client"].aclose()
+    assert result == "completed"
 
     async for session in db_session_dependency():
         async with session.begin():
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
-            assert qj.status == JobStatus.failed
-            assert qj.errors is not None
-            assert "Service 'mock-store' not found" in qj.errors["message"]
+            assert qj.status == JobStatus.completed
+            assert qj.progress is not None
+            assert qj.progress["edition_failure_count"] == 1
+            recorded = qj.progress["edition_failures"][0]
+            message = recorded["error_message"]
+            assert "Service 'mock-store' not found" in message
 
+            # The project's only edition failed, so the job is the run's
+            # only child and it completed: the run finalises clean.
             run_store = KeeperSyncRunStore(session=session, logger=_logger())
             run = await run_store.get(run_id)
             assert run is not None
-            assert run.status == KeeperSyncRunStatus.partial_failure
+            assert run.status == KeeperSyncRunStatus.succeeded
 
 
 @pytest.mark.asyncio
@@ -1426,17 +1435,19 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Partial-failure mid-sync: editions 1..M-1 publish; M..N untouched.
+    """Partial-failure mid-sync: editions that succeeded still publish.
 
     Edition 1 (``__main``, build 42) syncs cleanly and the per-edition
     callback enqueues a publish. Edition 2 (the branch edition, build
     43) raises mid-``sync_edition`` because its LTD build reports
-    ``uploaded=False`` — the exception propagates out of sync_project
-    and the worker marks the queue_jobs row failed. Locks the new
-    contract: a partial mid-sync failure leaves the editions that
-    already succeeded fully published, instead of stranding all of
-    them on ``publish_status IS NULL`` until the next reconciliation
-    tick (the issue #320 regression).
+    ``uploaded=False``. The service's per-edition boundary absorbs that
+    failure, so the job finishes ``completed`` (a permanently-broken
+    LTD build must not paint the project red forever) while the
+    ``queue_jobs`` row's ``progress`` records the partial run. Locks
+    two contracts at once: the editions that already succeeded end up
+    fully published rather than stranded on ``publish_status IS NULL``
+    (the issue #320 regression), and the failure is still visible on
+    the job record.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -1497,26 +1508,26 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    with pytest.raises(RuntimeError, match="uploaded=False"):
-        await keeper_sync_project(
-            ctx,
-            {
-                "org_id": org_id,
-                "org_slug": org_slug,
-                "run_id": run_id,
-                "queue_job_id": queue_job_id,
-                "ltd_slug": "pipelines",
-                "ltd_base_url": LTD_BASE,
-            },
-        )
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
     await ctx["http_client"].aclose()
+    assert result == "completed"
 
     publish_jobs = get_jobs_by_name(
         mock_arq, "publish_edition", queue_name="docverse:queue"
     )
     # Exactly M-1 = 1 publish_edition arq job: the per-edition
-    # callback fired for the first edition before sync_project raised
-    # on the second.
+    # callback fired for the first edition; the second edition's
+    # failure was isolated and skipped.
     assert len(publish_jobs) == 1
     assert publish_jobs[0].kwargs["payload"]["edition_slug"] == "__main"
 
@@ -1547,7 +1558,14 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
-            assert qj.status == JobStatus.failed
+            assert qj.status == JobStatus.completed
+            assert qj.progress is not None
+            assert qj.progress["edition_failure_count"] == 1
+            recorded = qj.progress["edition_failures"]
+            assert len(recorded) == 1
+            assert recorded[0]["ltd_edition_slug"] == "u-jsick-feature"
+            assert recorded[0]["error_type"] == "RuntimeError"
+            assert "uploaded=False" in recorded[0]["error_message"]
 
             publish_qj = await queue_job_store.get_by_backend_job_id(
                 publish_jobs[0].id
@@ -1556,6 +1574,14 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
             assert publish_qj.kind == JobKind.publish_edition
             assert publish_qj.keeper_sync_run_id == run_id
             assert publish_qj.edition_id == main_edition.id
+
+            # The isolated per-edition failure does not paint the run
+            # red: the publish child is still pending, so the run stays
+            # in_progress rather than finalising to partial_failure.
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.in_progress
 
 
 @pytest.mark.asyncio

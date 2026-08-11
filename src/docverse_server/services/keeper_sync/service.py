@@ -111,6 +111,7 @@ __all__ = [
     "AggregateEditionOutcome",
     "BuildSyncOutcome",
     "CopyCallable",
+    "EditionSyncFailure",
     "EditionSyncOutcome",
     "KeeperSyncContext",
     "KeeperSyncService",
@@ -230,6 +231,25 @@ class EditionSyncOutcome:
 
 
 @dataclass(frozen=True)
+class EditionSyncFailure:
+    """One LTD edition whose :meth:`sync_edition` call raised.
+
+    Carries the LTD-side identity rather than the Docverse-side one:
+    a failure can fire before the edition has a Docverse row at all
+    (an ``AccessDenied`` on the LTD build's objects leaves the edition
+    created but the build missing), so the LTD slug/id is the only
+    identifier guaranteed to exist. ``error_message`` is ``str(exc)``,
+    kept short enough to live in a ``queue_jobs.progress`` JSONB blob;
+    the full traceback goes to Sentry and the structured log.
+    """
+
+    ltd_edition_id: int
+    ltd_edition_slug: str
+    error_type: str
+    error_message: str
+
+
+@dataclass(frozen=True)
 class ProjectSyncResult:
     """What ``sync_project`` did with one LTD product.
 
@@ -239,11 +259,16 @@ class ProjectSyncResult:
     defensive shape; the only production path that writes a project
     tombstone is the manual-delete chokepoint, which always carries a
     Docverse project id.
+
+    ``edition_failures`` is empty on a clean sync; a non-empty tuple
+    means the run was *partial* — those LTD editions raised and were
+    skipped, every other edition still synced.
     """
 
     docverse_project_id: int | None
     docverse_project_slug: str
     edition_outcomes: list[EditionSyncOutcome]
+    edition_failures: tuple[EditionSyncFailure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -307,6 +332,18 @@ class KeeperSyncService:
     ) -> ProjectSyncResult:
         """Sync one LTD product (and all its editions) into Docverse.
 
+        Each edition has its own failure boundary: an exception out of
+        :meth:`sync_edition` is captured to Sentry, logged with the LTD
+        edition's slug/id, recorded on the returned
+        :attr:`ProjectSyncResult.edition_failures`, and the loop moves
+        on. One unreadable LTD build therefore costs one edition rather
+        than every edition behind it in the list — LTD's oldest uploads
+        carry no public-read ACL, so a single permanently-``AccessDenied``
+        build used to strand the whole project's release history. The
+        run still reports as completed; ``edition_failures`` is the
+        partial-success signal (bounded retry of transient copy errors
+        is deliberately out of scope here).
+
         ``on_edition_synced`` runs once per :meth:`sync_edition` return,
         before the next iteration begins. Callbacks fire after each
         edition's ``session.begin()`` blocks have committed, so they
@@ -367,17 +404,37 @@ class KeeperSyncService:
             rewrite_rules=rewrite_rules,
         )
         outcomes: list[EditionSyncOutcome] = []
+        failures: list[EditionSyncFailure] = []
         for ltd_edition in ltd_editions:
             if ltd_edition.ltd_id in skip_ltd_ids:
                 continue
-            outcome = await self.sync_edition(
-                org_id=org.id,
-                org_slug=org.slug,
-                project=project,
-                ltd_edition=ltd_edition,
-                rewrite_rules=rewrite_rules,
-                autocreation=autocreation,
-            )
+            try:
+                outcome = await self.sync_edition(
+                    org_id=org.id,
+                    org_slug=org.slug,
+                    project=project,
+                    ltd_edition=ltd_edition,
+                    rewrite_rules=rewrite_rules,
+                    autocreation=autocreation,
+                )
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
+                self._logger.exception(
+                    "Edition sync failed; skipping edition and continuing",
+                    ltd_edition_id=ltd_edition.ltd_id,
+                    ltd_edition_slug=ltd_edition.slug,
+                    project_id=project.id,
+                    project=project.slug,
+                )
+                failures.append(
+                    EditionSyncFailure(
+                        ltd_edition_id=ltd_edition.ltd_id,
+                        ltd_edition_slug=ltd_edition.slug,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                )
+                continue
             outcomes.append(outcome)
             if on_edition_synced is not None:
                 try:
@@ -392,6 +449,7 @@ class KeeperSyncService:
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             edition_outcomes=outcomes,
+            edition_failures=tuple(failures),
         )
 
     async def _proactive_lifecycle_pass(

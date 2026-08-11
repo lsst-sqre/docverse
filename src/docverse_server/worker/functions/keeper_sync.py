@@ -18,7 +18,9 @@ This module owns the ``docverse:sync-queue`` callable surface:
   ``on_edition_synced`` callback so a partial-failure mid-sync still
   publishes everything that succeeded; a tail-end self-heal pass
   catches editions whose build was already imported but never made it
-  through the publish path.
+  through the publish path. Per-edition failures the service isolated
+  are recorded on the job's ``progress`` and leave its status
+  ``completed``; only a whole-project failure fails the job.
 
 * ``keeper_sync_tier_main`` / ``_tier_discovery`` / ``_tier_other`` —
   cron-driven steady-state reconcilers that enqueue ``keeper_sync_
@@ -29,7 +31,7 @@ This module owns the ``docverse:sync-queue`` callable surface:
 from __future__ import annotations
 
 import traceback
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
@@ -63,6 +65,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_refresh_other_edition,
 )
 from docverse_server.services.keeper_sync.service import (
+    EditionSyncFailure,
     EditionSyncOutcome,
     ProjectSyncResult,
 )
@@ -118,6 +121,14 @@ _MAIN_EDITION_URL_KEY = "main_edition_url"
 #: so log lines and future reverse lookups have the id without needing
 #: to re-parse the URL.
 _MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
+
+#: Cap on the number of per-edition failure detail entries written into
+#: a ``keeper_sync_project`` job's ``progress`` JSONB (and into the
+#: accompanying log line). ``edition_failure_count`` is always exact;
+#: only the detail list is truncated, so a project whose entire release
+#: history is unreadable — LTD's oldest uploads carry no public-read
+#: object ACL — cannot write an unbounded blob into the job record.
+_MAX_RECORDED_EDITION_FAILURES = 20
 
 
 async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
@@ -394,6 +405,16 @@ async def keeper_sync_project(
        re-raise so arq records the job as failed. Both branches call
        :func:`maybe_finalise_run` so a terminal child cannot leave the
        parent run stuck in ``in_progress``.
+
+    :meth:`~KeeperSyncService.sync_project` gives each edition its own
+    failure boundary, so an unreadable LTD build no longer reaches the
+    outer ``except`` — it lands on
+    :attr:`ProjectSyncResult.edition_failures` instead. Those runs still
+    end ``completed`` (see :func:`_edition_failure_progress` for why),
+    with the skipped LTD editions recorded on the ``queue_jobs`` row's
+    ``progress`` and repeated in a ``warning`` log line. Only a failure
+    of the project as a whole — the LTD product fetch, the org lookup,
+    the copier's destination store — still fails the job.
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -489,13 +510,15 @@ async def keeper_sync_project(
             )
             raise
 
-        completion = None
-        async with session.begin():
-            await queue_job_store.complete(queue_job_id)
-            if run_id is not None:
-                completion = await maybe_finalise_run(
-                    run_store=run_store, run_id=run_id
-                )
+        edition_failures = sync_result.edition_failures
+        completion = await _finalise_project_job(
+            session=session,
+            queue_job_store=queue_job_store,
+            run_store=run_store,
+            queue_job_id=queue_job_id,
+            run_id=run_id,
+            edition_failures=edition_failures,
+        )
         await publish_run_completed(
             events=ctx.get("events"),
             session=session,
@@ -503,11 +526,92 @@ async def keeper_sync_project(
             completion=completion,
             logger=logger,
         )
-        logger.info("Keeper-sync project completed")
+        _log_project_completion(
+            logger=logger, edition_failures=edition_failures
+        )
         return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _finalise_project_job(
+    *,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    run_store: KeeperSyncRunStore,
+    queue_job_id: int,
+    run_id: int | None,
+    edition_failures: Sequence[EditionSyncFailure],
+) -> KeeperSyncRunWithActivity | None:
+    """Close out a ``keeper_sync_project`` job that reached its end.
+
+    Records any per-edition failures the service isolated on the job's
+    ``progress`` and marks the job ``completed`` in the *same*
+    transaction that rolls the parent run, so the job record and its
+    terminal status can never disagree. Returns whatever
+    :func:`maybe_finalise_run` returned (always ``None`` for a
+    tier-cron job, which carries no ``run_id``) for the caller to
+    publish after the transaction commits.
+    """
+    async with session.begin():
+        if edition_failures:
+            await queue_job_store.update_progress(
+                queue_job_id, _edition_failure_progress(edition_failures)
+            )
+        await queue_job_store.complete(queue_job_id)
+        if run_id is None:
+            return None
+        return await maybe_finalise_run(run_store=run_store, run_id=run_id)
+
+
+def _log_project_completion(
+    *,
+    logger: structlog.stdlib.BoundLogger,
+    edition_failures: Sequence[EditionSyncFailure],
+) -> None:
+    """Emit the project sync's terminal log line, partial or clean."""
+    if not edition_failures:
+        logger.info("Keeper-sync project completed")
+        return
+    logger.warning(
+        "Keeper-sync project completed with edition failures",
+        edition_failure_count=len(edition_failures),
+        failed_ltd_edition_slugs=[
+            failure.ltd_edition_slug
+            for failure in edition_failures[:_MAX_RECORDED_EDITION_FAILURES]
+        ],
+    )
+
+
+def _edition_failure_progress(
+    failures: Sequence[EditionSyncFailure],
+) -> dict[str, Any]:
+    """Build the ``progress`` payload for a partially-synced project.
+
+    The job itself still finishes ``completed``: a permanently
+    unreadable LTD build (an old upload with no public-read ACL) must
+    not paint its project's sync red on every subsequent poll. These
+    per-edition entries are the partial-success signal instead, so an
+    operator reading ``GET /jobs/<id>`` can see exactly which LTD
+    editions were skipped and why.
+    """
+    return {
+        "message": (
+            f"Project synced with {len(failures)} edition failure(s);"
+            " the remaining editions synced normally"
+        ),
+        "edition_failure_count": len(failures),
+        "edition_failures": [
+            {
+                "ltd_edition_id": failure.ltd_edition_id,
+                "ltd_edition_slug": failure.ltd_edition_slug,
+                "error_type": failure.error_type,
+                "error_message": failure.error_message,
+            }
+            for failure in failures[:_MAX_RECORDED_EDITION_FAILURES]
+        ],
+    }
 
 
 def _build_on_edition_synced(
