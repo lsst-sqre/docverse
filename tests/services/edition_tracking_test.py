@@ -1465,16 +1465,44 @@ async def test_semver_aggregates_default_when_unconfigured(
 
 
 @pytest.mark.asyncio
-async def test_semver_aggregates_suppressed_by_kind_rule(
+async def test_semver_aggregates_survive_slug_only_user_rule(
     db_session: AsyncSession,
 ) -> None:
-    """A rule declaring semver tags non-releases suppresses aggregates.
+    """A slug-shaping user rule does not disable aggregate creation.
 
-    Parity with keeper-sync's ``_backfill_semver_aggregates``, which
-    gates on the same rule-derived kind: an operator who re-points the
-    ``semver`` rule at ``draft`` has declared these refs are not
-    releases here, and that decision must suppress the ``1`` / ``1.0``
-    aggregates on the native upload path too.
+    An org whose ``prefix_strip`` rule exists only to drop the ``v``
+    from ``v16.0.0`` leaves the derived kind at that rule's default
+    (``draft``) — user rules run ahead of the built-in ``SemverRule``,
+    so the built-in never gets to classify the ref. Gating the
+    aggregates on the ref's own semver grammar instead of on the
+    derived kind keeps ``16`` / ``16.0`` coming.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-shadow-org",
+            org_slug_rewrite_rules=[{"type": "prefix_strip", "prefix": "v"}],
+        )
+        build = await _create_build(db_session, project.id, git_ref="v16.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"16.0.0", "16", "16.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_survive_draft_semver_rule(
+    db_session: AsyncSession,
+) -> None:
+    """A ``semver`` rule re-pointed at ``draft`` no longer suppresses.
+
+    The aggregate gate cannot tell a deliberate "these tags are not
+    releases" rule from one that shadows the built-in by accident, so
+    it stops guessing from the derived kind: the release edition is a
+    ``draft`` as the rule asks, and ``1`` / ``1.0`` are still created.
+    ``edition_autocreation.semver_aggregates`` is the knob for orgs
+    that really want no aggregates.
     """
     service = _make_service(db_session)
     async with db_session.begin():
@@ -1489,16 +1517,42 @@ async def test_semver_aggregates_suppressed_by_kind_rule(
         result = await service.track_build(build)
         await db_session.commit()
 
-    assert {o.slug for o in result.outcomes} == {"1.0.0"}
+    assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}
     async with db_session.begin():
         edition_store = EditionStore(session=db_session, logger=_logger())
-        assert (
-            await edition_store.get_by_slug(project_id=project.id, slug="1")
-        ) is None
-        assert (
-            await edition_store.get_by_slug(project_id=project.id, slug="1.0")
-        ) is None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0"
+        )
+        assert release is not None
+        assert release.kind == EditionKind.draft
         await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_skipped_for_shadowed_prerelease(
+    db_session: AsyncSession,
+) -> None:
+    """A prerelease gets no aggregates even under a slug-shaping rule.
+
+    The grammar gate keeps the prerelease exclusion the built-in
+    ``SemverRule`` has: ``v1.0.0-rc.1`` is not a stable release, so no
+    ``1`` / ``1.0`` rows appear even though the ``prefix_strip`` rule
+    matched the ref.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-shadow-pre-org",
+            org_slug_rewrite_rules=[{"type": "prefix_strip", "prefix": "v"}],
+        )
+        build = await _create_build(
+            db_session, project.id, git_ref="v1.0.0-rc.1"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0-rc.1"}
 
 
 @pytest.mark.asyncio

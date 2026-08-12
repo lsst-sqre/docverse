@@ -24,6 +24,7 @@ __all__ = [
     "LsstDocVersion",
     "SemverVersion",
     "accepts_version_advance",
+    "parse_stable_semver",
     "parse_version_for_mode",
 ]
 
@@ -100,6 +101,38 @@ class SemverVersion:
 
     def __hash__(self) -> int:
         return hash((self.major, self.minor, self.patch, self.prerelease))
+
+
+def parse_stable_semver(git_ref: str | None) -> SemverVersion | None:
+    """Parse *git_ref* as a stable (non-prerelease) semver version.
+
+    This is the built-in semver *grammar* — the classification
+    :class:`~docverse_server.domain.slug.SemverRule` applies and the one
+    both aggregate-creation paths gate on. Keeping it here, rather than
+    re-deriving it from the rule chain's final ``edition_kind``, is what
+    stops a user-configured rule that merely reshapes the slug (say a
+    ``prefix_strip`` stripping the ``v`` from ``v1.2.3``, which matches
+    first and leaves the kind at its ``draft`` default) from silently
+    disabling the ``N`` / ``N.M`` aggregates.
+
+    Parameters
+    ----------
+    git_ref
+        The git ref to classify; ``None`` for callers whose tracking
+        params carry no ref.
+
+    Returns
+    -------
+    SemverVersion or None
+        The parsed version when *git_ref* is a stable semver release,
+        else ``None`` (unparseable refs and prereleases alike).
+    """
+    if git_ref is None:
+        return None
+    version = SemverVersion.parse(git_ref)
+    if version is None or version.prerelease is not None:
+        return None
+    return version
 
 
 # ---------------------------------------------------------------------------

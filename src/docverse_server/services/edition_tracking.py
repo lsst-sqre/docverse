@@ -7,11 +7,7 @@ from typing import Literal
 
 import structlog
 
-from docverse.models import (
-    EditionAutocreationConfig,
-    EditionKind,
-    TrackingMode,
-)
+from docverse.models import EditionAutocreationConfig, TrackingMode
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
@@ -31,8 +27,8 @@ from docverse_server.domain.slug import (
 )
 from docverse_server.domain.version import (
     LsstDocVersion,
-    SemverVersion,
     accepts_version_advance,
+    parse_stable_semver,
     parse_version_for_mode,
 )
 from docverse_server.services.lock_service import LockKey, LockService
@@ -194,7 +190,6 @@ class EditionTrackingService:
         ) = await self._auto_create_version_editions(
             project_id=project.id,
             build=build,
-            derived_kind=derivation.edition_kind,
             autocreation=autocreation,
         )
         created_ids |= version_created_ids
@@ -539,24 +534,29 @@ class EditionTrackingService:
         *,
         project_id: int,
         build: Build,
-        derived_kind: EditionKind,
         autocreation: EditionAutocreationConfig,
     ) -> tuple[list[Edition], set[int]]:
         """Auto-create ``semver_major`` / ``semver_minor`` editions.
 
-        Only triggers for stable semver tags (no prerelease) the rule
-        chain classified as releases, and only when the resolved
-        ``autocreation`` config enables ``semver_aggregates``.  Uses
-        ``create_internal`` because single-digit slugs like ``"2"``
-        don't pass ``EditionCreate``'s slug pattern.
+        Only triggers for stable semver tags (no prerelease), and only
+        when the resolved ``autocreation`` config enables
+        ``semver_aggregates``.  Uses ``create_internal`` because
+        single-digit slugs like ``"2"`` don't pass ``EditionCreate``'s
+        slug pattern.
 
-        ``derived_kind`` is the kind ``track_build``'s slug derivation
-        assigned this ref, and it gates the aggregates exactly as it
-        does in keeper-sync's ``_backfill_semver_aggregates``: a
-        ``semver`` rule an operator re-pointed at ``draft`` means "these
-        refs are not releases here", and that decision must suppress the
-        aggregates on both paths or a migrated project would stop
-        matching a natively built one.
+        The gate is the ref's own semver grammar
+        (:func:`~docverse_server.domain.version.parse_stable_semver`),
+        not the kind ``track_build``'s slug derivation landed on —
+        keeper-sync's ``_backfill_semver_aggregates`` gates on the same
+        classification so the two paths stay in step. Reading the
+        derived kind instead would let any user rule that merely
+        reshapes the slug switch the aggregates off by accident: user
+        rules run ahead of the built-in ``SemverRule``, so an org whose
+        ``prefix_strip`` rule exists only to drop the ``v`` from
+        ``v16.0.0`` leaves the kind at that rule's ``draft`` default and
+        would silently never see a ``16`` / ``16.0`` row. Operators who
+        genuinely want no aggregates say so with
+        ``edition_autocreation.semver_aggregates = false``.
 
         The autocreation gate is autocreation-only, matching the
         config's name: an aggregate edition that already exists —
@@ -569,10 +569,8 @@ class EditionTrackingService:
         """
         if not autocreation.semver_aggregates:
             return [], set()
-        if derived_kind != EditionKind.release:
-            return [], set()
 
-        sv = SemverVersion.parse(build.git_ref)
+        sv = parse_stable_semver(build.git_ref)
         if sv is None:
             return [], set()
 

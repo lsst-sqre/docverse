@@ -30,7 +30,6 @@ from docverse.models import (
     BuildCreate,
     BuildStatus,
     EditionAutocreationConfig,
-    EditionKind,
     ProjectCreate,
     ProjectGitHubBindingCreate,
     TrackingMode,
@@ -62,6 +61,7 @@ from docverse_server.domain.slug import (
 from docverse_server.domain.version import (
     SemverVersion,
     accepts_version_advance,
+    parse_stable_semver,
 )
 from docverse_server.exceptions import (
     KeeperSyncInvariantError,
@@ -985,7 +985,6 @@ class KeeperSyncService:
                         await self._backfill_semver_aggregates(
                             project_id=project.id,
                             git_ref=tracking_params.get("git_ref"),
-                            derived_kind=kind_derivation.kind,
                             build_id=build_outcome.docverse_build_id,
                             autocreation=(
                                 autocreation or DEFAULT_EDITION_AUTOCREATION
@@ -1028,7 +1027,6 @@ class KeeperSyncService:
         *,
         project_id: int,
         git_ref: str | None,
-        derived_kind: EditionKind,
         build_id: int,
         autocreation: EditionAutocreationConfig,
     ) -> tuple[AggregateEditionOutcome, ...]:
@@ -1042,20 +1040,25 @@ class KeeperSyncService:
         :func:`~docverse_server.domain.semver_aggregate.semver_aggregate_specs`
         so they cannot drift.
 
-        The gate is the *derived* kind, not the persisted one: a
-        ``semver`` rule an operator re-pointed at ``draft`` means "these
-        refs are not releases here", and that decision must suppress the
-        aggregates too. Reading the persisted kind instead would couple
-        the aggregates to unrelated manual PATCHes of a single edition.
+        The gate is the ref's own semver grammar
+        (:func:`~docverse_server.domain.version.parse_stable_semver`) —
+        neither the persisted kind nor the rule-derived one. The
+        persisted kind would couple the aggregates to unrelated manual
+        PATCHes of a single edition; the derived kind would let any
+        user rule that merely reshapes a slug shadow the built-in
+        ``SemverRule`` and silently switch the backfill off, since user
+        rules match first. The native path gates on the same
+        classification, so a migrated project keeps rendering the same
+        dashboard groups as a natively built one, and
+        ``edition_autocreation.semver_aggregates`` stays the explicit
+        opt-out on both.
 
         Returns one outcome per aggregate this call actually moved, for
         the worker to publish; see :class:`AggregateEditionOutcome`.
         """
         if not autocreation.semver_aggregates:
             return ()
-        if derived_kind != EditionKind.release or git_ref is None:
-            return ()
-        version = SemverVersion.parse(git_ref)
+        version = parse_stable_semver(git_ref)
         if version is None:
             return ()
         specs = semver_aggregate_specs(version)

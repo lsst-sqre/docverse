@@ -12,6 +12,7 @@ from docverse_server.domain.version import (
     LsstDocVersion,
     SemverVersion,
     accepts_version_advance,
+    parse_stable_semver,
     parse_version_for_mode,
 )
 
@@ -76,6 +77,38 @@ class TestSemverVersion:
     def test_ge(self) -> None:
         assert SemverVersion(2, 0, 0) >= SemverVersion(1, 0, 0)
         assert SemverVersion(1, 0, 0) >= SemverVersion(1, 0, 0)
+
+
+class TestParseStableSemver:
+    """The stable-release grammar both aggregate paths gate on."""
+
+    @pytest.mark.parametrize(
+        ("ref", "expected"),
+        [
+            ("1.2.3", SemverVersion(1, 2, 3)),
+            ("v16.0.0", SemverVersion(16, 0, 0)),
+            ("0.0.1", SemverVersion(0, 0, 1)),
+        ],
+    )
+    def test_stable(self, ref: str, expected: SemverVersion) -> None:
+        assert parse_stable_semver(ref) == expected
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "1.0.0-rc.1",
+            "v2.1.0-alpha",
+            "main",
+            "v12_0",
+            "w_2026_10",
+        ],
+    )
+    def test_not_a_stable_release(self, ref: str) -> None:
+        assert parse_stable_semver(ref) is None
+
+    def test_none_ref(self) -> None:
+        """Callers whose tracking params carry no ref get ``None``."""
+        assert parse_stable_semver(None) is None
 
 
 # ── EupsMajorVersion ──────────────────────────────────────────────────────

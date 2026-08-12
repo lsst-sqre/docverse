@@ -3520,22 +3520,25 @@ async def test_sync_aggregates_suppressed_by_org_config(
 
 
 @pytest.mark.asyncio
-async def test_sync_aggregates_suppressed_by_kind_rule(
+async def test_sync_aggregates_survive_slug_only_user_rule(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """A rule declaring semver tags non-releases suppresses aggregates.
+    """A slug-shaping user rule does not disable the backfill.
 
-    The gate is the *derived* kind, so an operator who re-points the
-    ``semver`` rule at ``draft`` gets no ``15`` / ``15.2`` rows. The
-    native upload path gates on the same derivation.
+    The gate is the ref's semver grammar, not the derived kind, so an
+    org whose ``prefix_strip`` rule shadows the built-in ``SemverRule``
+    (leaving the imported edition a ``draft``) still gets its ``15`` /
+    ``15.2`` rows — the same call the native upload path makes for the
+    same ref. ``edition_autocreation.semver_aggregates`` remains the
+    way to turn the backfill off.
     """
     async with db_session.begin():
         org_id = await _seed_org(
             db_session,
             slug="ks-agg-kind-rule",
-            slug_rewrite_rules=[{"type": "semver", "edition_kind": "draft"}],
+            slug_rewrite_rules=[{"type": "prefix_strip", "prefix": "v"}],
         )
 
     project_id = await _seed_project(db_session, org_id=org_id)
@@ -3543,7 +3546,7 @@ async def test_sync_aggregates_suppressed_by_kind_rule(
     _seed_ltd_one_edition(
         mock_discovery,
         edition_payload=_version_edition_payload(
-            slug="15.2.1", git_ref="15.2.1"
+            slug="15.2.1", git_ref="v15.2.1"
         ),
     )
 
@@ -3562,7 +3565,11 @@ async def test_sync_aggregates_suppressed_by_kind_rule(
     )
     async with db_session.begin():
         editions = await edition_store.list_all_by_project(project_id)
-    assert {e.slug for e in editions} == {"15.2.1"}
+    by_slug = {e.slug: e for e in editions}
+    assert set(by_slug) == {"15.2.1", "15", "15.2"}
+    assert by_slug["15.2.1"].kind == EditionKind.draft
+    assert by_slug["15"].kind == EditionKind.major
+    assert by_slug["15.2"].kind == EditionKind.minor
 
 
 @pytest.mark.asyncio

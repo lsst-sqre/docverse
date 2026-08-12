@@ -19,7 +19,7 @@ from docverse_server.domain.version import (
     EupsMajorVersion,
     EupsWeeklyVersion,
     LsstDocVersion,
-    SemverVersion,
+    parse_stable_semver,
 )
 from docverse_server.exceptions import DocverseSlackException
 
@@ -165,8 +165,7 @@ class SemverRule(VersionRule):
     type: Literal["semver"] = "semver"
 
     def matches(self, git_ref: str) -> bool:
-        version = SemverVersion.parse(git_ref)
-        return version is not None and version.prerelease is None
+        return parse_stable_semver(git_ref) is not None
 
 
 class LsstDocRule(VersionRule):
