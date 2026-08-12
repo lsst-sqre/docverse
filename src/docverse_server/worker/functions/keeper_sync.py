@@ -184,9 +184,15 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
        commit and ``arq_queue.enqueue``.
 
     Thresholds: the silent paths use
-    ``config.keeper_sync_reaper_threshold_seconds`` (default 6 h,
-    env-overridable so test/staging environments can drive it down to
-    seconds for fast verification). The orphan path uses
+    ``config.keeper_sync_reaper_threshold_seconds``, which defaults to
+    ``config.keeper_sync_job_timeout_seconds`` plus
+    :data:`~docverse_server.config.KEEPER_SYNC_REAPER_MARGIN_SECONDS`
+    (5400 s at stock settings) and is env-overridable so test/staging
+    environments can drive it down to seconds for fast verification.
+    Deriving it keeps the wait just past the point where arq — running
+    these functions with ``max_tries=1`` — has definitely cancelled the
+    job, instead of parking the project behind its active-job mutex for
+    hours after the row is known dead. The orphan path uses
     :data:`_ORPHAN_IDLE_WINDOW` (5 min) so the staleness check matches
     the existing discovery-side orphan sweep.
 

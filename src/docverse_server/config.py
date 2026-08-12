@@ -15,7 +15,27 @@ from safir.pydantic import EnvRedisDsn
 
 from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
 
-__all__ = ["Configuration", "config"]
+__all__ = [
+    "KEEPER_SYNC_REAPER_MARGIN_SECONDS",
+    "Configuration",
+    "config",
+]
+
+
+KEEPER_SYNC_REAPER_MARGIN_SECONDS = 1800
+"""Grace period added to the keeper-sync job timeout to get the reaper
+threshold, in seconds.
+
+The keeper-sync arq functions run with ``max_tries=1``, so arq has
+already cancelled any job that reaches
+``keeper_sync_job_timeout_seconds``; a child ``queue_jobs`` row still
+``in_progress`` past that point is definitively dead and every extra
+minute of waiting keeps the project parked behind the partial unique
+index that the tier cron treats as an active job. The margin only
+needs to cover the finalisation window plus scheduling slop, and is
+sized at one full ``keeper_sync_reaper`` cron gap
+(``cron(minute={0, 30})``, so 30 min).
+"""
 
 
 def _parse_comma_separated(v: Any) -> Any:
@@ -23,6 +43,19 @@ def _parse_comma_separated(v: Any) -> Any:
     if isinstance(v, str):
         return [item.strip() for item in v.split(",") if item.strip()]
     return v
+
+
+def _default_keeper_sync_reaper_threshold(data: dict[str, Any]) -> int:
+    """Derive the keeper-sync reaper threshold from the job timeout.
+
+    Pydantic passes the already-validated fields declared before
+    ``keeper_sync_reaper_threshold_seconds``, which includes
+    ``keeper_sync_job_timeout_seconds``. Runs only when the env var is
+    unset, so an explicit
+    ``DOCVERSE_KEEPER_SYNC_REAPER_THRESHOLD_SECONDS`` still wins.
+    """
+    timeout = data.get("keeper_sync_job_timeout_seconds", 3600)
+    return int(timeout) + KEEPER_SYNC_REAPER_MARGIN_SECONDS
 
 
 class Configuration(BaseSettings):
@@ -197,18 +230,31 @@ class Configuration(BaseSettings):
             "Wraps the keeper-sync arq functions on"
             " ``KeeperSyncWorkerSettings``: arq cancels a job that runs"
             " past this. Lower this in test/staging to surface"
-            " stuck-worker behaviour quickly."
+            " stuck-worker behaviour quickly — the default"
+            " ``keeper_sync_reaper_threshold_seconds`` is derived from"
+            " this value, so it follows the timeout down."
         ),
     )
 
     keeper_sync_reaper_threshold_seconds: int = Field(
-        21600,
+        default_factory=_default_keeper_sync_reaper_threshold,
         title="Keeper-sync stuck-run reaper threshold, in seconds",
         description=(
             "Cron-driven backstop for arq losing a job (e.g. an"
             " OOM-killed worker pod). ``keeper_sync_reaper`` fails any"
             " keeper-sync child ``queue_jobs`` row that has been"
-            " ``in_progress`` longer than this without ``date_completed``."
+            " ``in_progress`` longer than this without"
+            " ``date_completed``. Unlike the other reaper thresholds"
+            " this one has no literal default: it derives to"
+            " ``keeper_sync_job_timeout_seconds`` +"
+            " ``KEEPER_SYNC_REAPER_MARGIN_SECONDS`` (5400 s at the"
+            " stock 3600 s timeout). Because the keeper-sync functions"
+            " run with ``max_tries=1``, arq has already cancelled any"
+            " job that hit its timeout, so a row still ``in_progress``"
+            " past that point is dead and the old flat 6 h wait only"
+            " kept the project parked behind the partial unique index"
+            " the tier cron reads as an active job. Setting the env var"
+            " overrides the derivation outright."
         ),
     )
 
