@@ -30,11 +30,23 @@ __all__ = [
     "EditionKindSource",
     "derive_edition_kind",
     "derive_edition_slug",
+    "derive_edition_source_prefix",
     "map_edition_tracking",
 ]
 
 LTD_MAIN_SLUG = "main"
 """LTD slug that corresponds to Docverse's auto-created ``__main`` edition."""
+
+DOCVERSE_MAIN_SLUG = "__main"
+"""Docverse slug for a project's auto-created default edition."""
+
+#: Path segment LTD writes build uploads under, between the product slug
+#: and the build slug: ``<product>/builds/<build-slug>/``.
+_LTD_BUILDS_SEGMENT = "builds"
+
+#: Path segment LTD publishes edition copies under:
+#: ``<product>/v/<edition-slug>/``.
+_LTD_EDITIONS_SEGMENT = "v"
 
 
 class EditionKindSource(StrEnum):
@@ -174,8 +186,44 @@ def derive_edition_slug(ltd_slug: str) -> str:
     relaxed edition-slug regex from #286.
     """
     if ltd_slug == LTD_MAIN_SLUG:
-        return "__main"
+        return DOCVERSE_MAIN_SLUG
     return ltd_slug
+
+
+def derive_edition_source_prefix(
+    *, bucket_root_dir: str, ltd_edition_slug: str
+) -> str | None:
+    """Derive the LTD *edition* prefix that mirrors a build's content.
+
+    LTD's publish step copies a build's objects from
+    ``<product>/builds/<build-slug>/`` to
+    ``<product>/v/<edition-slug>/`` and it is the latter copy Fastly
+    serves. On LTD's earliest uploads only that published copy carries a
+    public-read ACL, so it is the only prefix an anonymous reader can
+    recover the content from (#516).
+
+    The product root is read back off ``bucket_root_dir`` rather than
+    taken from ``LtdProduct.slug`` so the two prefixes are guaranteed to
+    be siblings in the bucket even if a product's layout ever diverges
+    from its slug.
+
+    Returns
+    -------
+    str | None
+        The ``<product>/v/<edition-slug>/`` prefix, or ``None`` when the
+        edition has no such prefix: LTD serves the default edition from
+        the product root, not ``v/main/``, and a ``bucket_root_dir``
+        that is not ``<product>/builds/<build-slug>`` does not locate a
+        product root at all.
+    """
+    if derive_edition_slug(ltd_edition_slug) == DOCVERSE_MAIN_SLUG:
+        return None
+    segments = bucket_root_dir.strip("/").split("/")
+    if len(segments) < 3 or segments[-2] != _LTD_BUILDS_SEGMENT:
+        return None
+    product_root = "/".join(segments[:-2])
+    edition_segment = ltd_edition_slug.strip("/")
+    return f"{product_root}/{_LTD_EDITIONS_SEGMENT}/{edition_segment}/"
 
 
 _VERSION_MODE_TABLE: dict[LtdEditionMode, TrackingMode] = {

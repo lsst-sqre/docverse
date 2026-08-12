@@ -11,7 +11,11 @@ from .models import (
     LtdProductsListing,
 )
 from .products_client import LtdProductsClient
-from .s3_source import LtdS3Source, LtdSourceProtocol
+from .s3_source import (
+    LtdS3Source,
+    LtdSourceAccessDeniedError,
+    LtdSourceProtocol,
+)
 
 __all__ = [
     "LtdBuild",
@@ -24,5 +28,6 @@ __all__ = [
     "LtdProductsClient",
     "LtdProductsListing",
     "LtdS3Source",
+    "LtdSourceAccessDeniedError",
     "LtdSourceProtocol",
 ]

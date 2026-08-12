@@ -32,10 +32,17 @@ import structlog
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
 
-__all__ = ["BuildContentCopier", "CopyResult"]
+__all__ = ["EMPTY_MANIFEST_HASH", "BuildContentCopier", "CopyResult"]
 
 #: Default number of worker tasks used for parallel object copies.
 _DEFAULT_MAX_CONCURRENT = 8
+
+#: Manifest hash of a prefix with no keys under it. Public because a
+#: caller cannot otherwise tell "hashed an empty prefix" apart from
+#: "hashed real content" by looking at the returned hash, and keeper-sync
+#: has to make exactly that distinction when deciding whether its
+#: edition-prefix fallback actually recovered anything (#516).
+EMPTY_MANIFEST_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -79,7 +86,7 @@ class BuildContentCopier:
             await self._source.list_keys(prefix=normalized_source_prefix)
         )
         if not keys:
-            return _empty_manifest_hash()
+            return EMPTY_MANIFEST_HASH
         _reject_escaping_keys(keys, normalized_source_prefix, verb="hash")
 
         manifest_entries: list[tuple[str, str]] = []
@@ -128,7 +135,7 @@ class BuildContentCopier:
             return CopyResult(
                 object_count=0,
                 total_size_bytes=0,
-                content_hash=_empty_manifest_hash(),
+                content_hash=EMPTY_MANIFEST_HASH,
             )
 
         _reject_escaping_keys(keys, normalized_source_prefix, verb="copy")
@@ -311,7 +318,3 @@ def _hash_manifest_pairs(entries: list[tuple[str, str]]) -> str:
     for relative, digest in entries:
         hasher.update(f"{relative}\t{digest}\n".encode())
     return f"sha256:{hasher.hexdigest()}"
-
-
-def _empty_manifest_hash() -> str:
-    return f"sha256:{hashlib.sha256(b'').hexdigest()}"

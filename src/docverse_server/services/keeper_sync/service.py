@@ -101,15 +101,17 @@ from docverse_server.storage.ltd import (
     LtdEdition,
     LtdEditionMode,
     LtdProduct,
+    LtdSourceAccessDeniedError,
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
-from .copier import CopyResult
+from .copier import EMPTY_MANIFEST_HASH, CopyResult
 from .mappers import (
     EditionKindDerivation,
     derive_edition_kind,
     derive_edition_slug,
+    derive_edition_source_prefix,
     map_edition_tracking,
 )
 
@@ -174,12 +176,18 @@ DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
 #: ``edition_failure_count`` and ``aggregate_activity`` rolls the parent
 #: run up ``partial_failure``.
 #:
-#: Discriminating permanent faults by error type (an ``AccessDenied``
-#: not counting toward a *systemic* signal at all) would allow a much
-#: tighter threshold, but the copier surfaces the denial as a raw
-#: botocore ``ClientError`` with no Docverse-side type to match on. The
-#: edition-prefix fallback in #516 removes those denials outright, and
-#: is the change that would let this threshold come back down.
+#: The edition-prefix fallback (#516) now recovers that whole
+#: contiguous block from ``<product>/v/<edition-slug>/``, so those
+#: denials should stop reaching this counter at all — a denial only
+#: survives to become an edition failure when the published copy is
+#: missing or denied too. The threshold is deliberately *not* lowered on
+#: the strength of that reasoning alone: a roundtable-dev resync has to
+#: confirm the 19 documenteer failures actually drop to zero first, and
+#: the asymmetry above still says to err high. Lowering it is separate
+#: work, and #516's
+#: :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` is
+#: the Docverse-side type that would also let a denial be discounted
+#: from the *systemic* signal by error type rather than by count.
 MAX_CONSECUTIVE_EDITION_FAILURES = 75
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
@@ -235,6 +243,44 @@ class BuildSyncOutcome:
     content_hash: str | None
     object_count: int | None
     total_size_bytes: int | None
+
+
+@dataclass(frozen=True)
+class _ResolvedBuildSource:
+    """The LTD bucket prefix one build sync actually reads, plus its hash.
+
+    Both the manifest hash and the copy must read the *same* prefix or
+    the ``content_hash`` recorded on the build would not describe the
+    bytes that were uploaded. Bundling the two together makes that
+    impossible to get wrong: the prefix is resolved once, and the hash
+    that comes back is the hash *of that prefix*.
+    """
+
+    prefix: str
+    """The resolved LTD prefix, always terminated by ``/``."""
+
+    manifest_hash: str
+    """Manifest hash of :attr:`prefix`'s contents."""
+
+    from_edition_prefix: bool
+    """``True`` when the build prefix denied and ``v/`` recovered it."""
+
+    @property
+    def annotations(self) -> dict[str, Any]:
+        """Provenance to record on the build's ``keeper_sync_state`` row.
+
+        A build recovered from the edition prefix carries a
+        ``bucket_root_dir`` whose bytes came from somewhere else, so
+        "where did this content come from" has to be answerable after
+        the fact — from the database, not just from a log line that has
+        since rotated away.
+        """
+        return {
+            "ltd_source_prefix": self.prefix,
+            "ltd_source_prefix_origin": (
+                "edition" if self.from_edition_prefix else "build"
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -1274,6 +1320,11 @@ class KeeperSyncService:
         the build (e.g. ``sync_edition`` does so for ``manual`` editions
         to derive the tracking pair). Skipping the refetch saves a round
         trip to LTD.
+
+        The bucket prefix the content is read from is resolved once, by
+        :meth:`_resolve_build_source`, and that one prefix feeds both the
+        manifest hash and the copy — see that method for the
+        ``AccessDenied`` recovery it performs.
         """
         if ltd_edition.build_url is None:
             msg = "sync_build requires an edition with build_url set"
@@ -1323,9 +1374,10 @@ class KeeperSyncService:
                 total_size_bytes=None,
             )
 
-        manifest_hash = await self._manifest_callable(
-            _ensure_trailing_slash(ltd_build.bucket_root_dir)
+        source = await self._resolve_build_source(
+            ltd_build=ltd_build, ltd_edition=ltd_edition, project=project
         )
+        manifest_hash = source.manifest_hash
         async with self._session.begin():
             existing_build = (
                 await self._build_store.get_completed_by_content_hash(
@@ -1354,6 +1406,7 @@ class KeeperSyncService:
                     date_last_synced=_now(),
                     date_rebuilt_seen=ltd_edition.date_rebuilt,
                     content_hash=manifest_hash,
+                    annotations=source.annotations,
                 )
         if existing_build is not None:
             self._logger.info(
@@ -1389,8 +1442,7 @@ class KeeperSyncService:
             )
 
         copy_result = await self._copy_callable(
-            _ensure_trailing_slash(ltd_build.bucket_root_dir),
-            new_build.storage_prefix,
+            source.prefix, new_build.storage_prefix
         )
 
         async with self._session.begin():
@@ -1410,6 +1462,7 @@ class KeeperSyncService:
                 date_last_synced=_now(),
                 date_rebuilt_seen=ltd_edition.date_rebuilt,
                 content_hash=copy_result.content_hash,
+                annotations=source.annotations,
             )
 
         self._logger.info(
@@ -1418,6 +1471,10 @@ class KeeperSyncService:
             docverse_build_public_id=serialize_base32_id(new_build.public_id),
             edition_slug=edition.slug,
             content_hash=copy_result.content_hash,
+            ltd_source_prefix=source.prefix,
+            ltd_source_prefix_origin=source.annotations[
+                "ltd_source_prefix_origin"
+            ],
         )
         return BuildSyncOutcome(
             docverse_build_id=new_build.id,
@@ -1426,6 +1483,99 @@ class KeeperSyncService:
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+        )
+
+    async def _resolve_build_source(
+        self,
+        *,
+        ltd_build: LtdBuild,
+        ltd_edition: LtdEdition,
+        project: Project,
+    ) -> _ResolvedBuildSource:
+        """Pick the LTD prefix this build's content is readable from.
+
+        ``LtdBuild.bucket_root_dir`` — ``<product>/builds/<build-slug>/``
+        — is the primary source and stays the source everywhere it
+        works, so already-synced projects re-hash to exactly the same
+        value and nothing is re-copied.
+
+        LTD's earliest uploads, though, wrote those build objects with no
+        public-read ACL, and :class:`~docverse_server.storage.ltd.LtdS3Source`
+        is deliberately anonymous, so every ``GetObject`` under the
+        prefix answers ``AccessDenied`` (#516). LTD's publish step also
+        copied the same bytes to the edition prefix,
+        ``<product>/v/<edition-slug>/``, and *that* copy is public —
+        it is what Fastly serves. Measured on documenteer 2026-08-12:
+        1,863 objects across the 19 denied editions, 100% readable from
+        the edition prefix, object counts matching the build prefixes
+        exactly.
+
+        So a denial — and *only* a denial — falls back to the edition
+        prefix. An empty or missing build prefix hashes to the empty
+        manifest as before rather than silently importing whatever the
+        edition prefix holds, and the default edition has no ``v/``
+        sibling to fall back to at all (LTD serves it from the product
+        root), which :func:`derive_edition_source_prefix` enforces.
+
+        A fallback that finds nothing — denied again, or an edition
+        prefix with no keys under it — re-raises the denial, leaving the
+        edition to ``sync_project``'s per-edition failure boundary
+        exactly as before this recovery path existed.
+        """
+        build_prefix = _ensure_trailing_slash(ltd_build.bucket_root_dir)
+        try:
+            manifest_hash = await self._manifest_callable(build_prefix)
+        except LtdSourceAccessDeniedError:
+            edition_prefix = derive_edition_source_prefix(
+                bucket_root_dir=ltd_build.bucket_root_dir,
+                ltd_edition_slug=ltd_edition.slug,
+            )
+            if edition_prefix is None:
+                raise
+            self._logger.info(
+                "LTD build prefix is unreadable; retrying from the"
+                " edition prefix",
+                ltd_build_id=ltd_build.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                ltd_build_prefix=build_prefix,
+                ltd_edition_prefix=edition_prefix,
+                project=project.slug,
+            )
+            manifest_hash = await self._manifest_callable(edition_prefix)
+            if manifest_hash == EMPTY_MANIFEST_HASH:
+                # Nothing was published under the edition prefix either.
+                # Importing the empty manifest would finalize a
+                # zero-object build and leave the edition serving 404s
+                # while the sync reported success, so the denial stands
+                # and the edition stays retryable.
+                self._logger.warning(
+                    "LTD edition prefix is empty; cannot recover the"
+                    " unreadable build",
+                    ltd_build_id=ltd_build.ltd_id,
+                    ltd_edition_slug=ltd_edition.slug,
+                    ltd_build_prefix=build_prefix,
+                    ltd_edition_prefix=edition_prefix,
+                    project=project.slug,
+                )
+                raise
+            self._logger.info(
+                "Recovered LTD build content from the edition prefix",
+                ltd_build_id=ltd_build.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                ltd_build_prefix=build_prefix,
+                ltd_edition_prefix=edition_prefix,
+                content_hash=manifest_hash,
+                project=project.slug,
+            )
+            return _ResolvedBuildSource(
+                prefix=edition_prefix,
+                manifest_hash=manifest_hash,
+                from_edition_prefix=True,
+            )
+        return _ResolvedBuildSource(
+            prefix=build_prefix,
+            manifest_hash=manifest_hash,
+            from_edition_prefix=False,
         )
 
     async def _reclaim_orphan_placeholders(

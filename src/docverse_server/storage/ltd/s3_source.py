@@ -16,14 +16,86 @@ from aiobotocore.client import AioBaseClient
 from aiobotocore.session import AioSession, ClientCreatorContext, get_session
 from botocore import UNSIGNED
 from botocore.config import Config
+from botocore.exceptions import ClientError
+
+from docverse_server.exceptions import DocverseSlackException
 
 __all__ = [
     "LtdS3Source",
+    "LtdSourceAccessDeniedError",
     "LtdSourceProtocol",
 ]
 
 #: Default region for the legacy ``lsst-the-docs`` bucket.
 _DEFAULT_REGION = "us-east-1"
+
+#: S3 error codes that mean "the anonymous principal may not read this",
+#: as opposed to "this key does not exist". LTD's earliest uploads carry
+#: no public-read object ACL, so every ``GetObject`` under those build
+#: prefixes answers with one of these.
+_DENIAL_ERROR_CODES = frozenset(
+    {"AccessDenied", "AccessDeniedException", "AllAccessDisabled", "403"}
+)
+
+
+class LtdSourceAccessDeniedError(DocverseSlackException):
+    """The anonymous LTD S3 principal may not read a bucket key.
+
+    LTD's oldest uploads were written without a public-read object ACL,
+    so :class:`LtdS3Source` — which is deliberately ``UNSIGNED`` and has
+    no AWS credentials to fall back on — is denied every object under
+    those build prefixes. keeper-sync recovers by re-reading the
+    edition's published copy (``<product>/v/<edition-slug>/``, which
+    *is* public), and it keys that recovery off this exception type: the
+    denial has to be distinguishable from an empty prefix or a missing
+    key, and botocore's raw ``ClientError`` carries that distinction
+    only inside a response dict.
+
+    No ``to_sentry`` override: the rendered message already names the
+    bucket, key, and S3 operation, which is the whole triage story.
+    Mirrors :class:`~docverse_server.domain.slug.InvalidSlugError`.
+    """
+
+    def __init__(
+        self,
+        *,
+        bucket: str | None = None,
+        key: str | None = None,
+        operation: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.bucket = bucket
+        self.key = key
+        self.operation = operation
+        super().__init__(
+            message
+            if message is not None
+            else self._format_message(
+                bucket=bucket, key=key, operation=operation
+            )
+        )
+
+    @staticmethod
+    def _format_message(
+        *, bucket: str | None, key: str | None, operation: str | None
+    ) -> str:
+        target = f"s3://{bucket}/{key}" if bucket and key else (key or bucket)
+        located = f" for {target}" if target else ""
+        called = f" {operation}" if operation else ""
+        return (
+            f"Anonymous LTD S3 access denied{called}{located};"
+            " the object carries no public-read ACL"
+        )
+
+
+def _is_access_denied(exc: ClientError) -> bool:
+    """Report whether ``exc`` is a denial rather than another S3 fault."""
+    response = exc.response if isinstance(exc.response, dict) else {}
+    error = response.get("Error") or {}
+    if str(error.get("Code", "")) in _DENIAL_ERROR_CODES:
+        return True
+    metadata = response.get("ResponseMetadata") or {}
+    return metadata.get("HTTPStatusCode") == 403
 
 
 @runtime_checkable
@@ -103,8 +175,22 @@ class LtdS3Source:
         return self._client
 
     async def list_keys(self, *, prefix: str) -> list[str]:
-        """List every object key under ``prefix`` (paginated)."""
-        return [key async for key in self._iter_keys(prefix)]
+        """List every object key under ``prefix`` (paginated).
+
+        Raises
+        ------
+        LtdSourceAccessDeniedError
+            If the anonymous principal may not list ``prefix``.
+        """
+        try:
+            return [key async for key in self._iter_keys(prefix)]
+        except ClientError as exc:
+            denial = _denial_for(
+                exc, bucket=self._bucket, key=prefix, operation="ListObjectsV2"
+            )
+            if denial is None:
+                raise
+            raise denial from exc
 
     async def _iter_keys(self, prefix: str) -> AsyncIterator[str]:
         client = self._get_client()
@@ -116,9 +202,40 @@ class LtdS3Source:
                 yield obj["Key"]
 
     async def download_object(self, *, key: str) -> bytes:
-        """Download an object body as bytes."""
+        """Download an object body as bytes.
+
+        Raises
+        ------
+        LtdSourceAccessDeniedError
+            If the anonymous principal may not read ``key``.
+        """
         client = self._get_client()
-        response = await client.get_object(Bucket=self._bucket, Key=key)
+        try:
+            response = await client.get_object(Bucket=self._bucket, Key=key)
+        except ClientError as exc:
+            denial = _denial_for(
+                exc, bucket=self._bucket, key=key, operation="GetObject"
+            )
+            if denial is None:
+                raise
+            raise denial from exc
         async with response["Body"] as stream:
             data: bytes = await stream.read()
         return data
+
+
+def _denial_for(
+    exc: ClientError, *, bucket: str, key: str, operation: str
+) -> LtdSourceAccessDeniedError | None:
+    """Return the denial exception for ``exc``, or ``None`` if it is not one.
+
+    Only denials are translated: a ``NoSuchKey`` or a throttling error
+    has to keep its botocore identity so the keeper-sync fallback does
+    not mistake "this prefix is empty" or "S3 is unhappy right now" for
+    "this content is unreadable and lives at the edition prefix".
+    """
+    if not _is_access_denied(exc):
+        return None
+    return LtdSourceAccessDeniedError(
+        bucket=bucket, key=key, operation=operation
+    )

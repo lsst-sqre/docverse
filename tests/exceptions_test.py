@@ -31,6 +31,7 @@ from docverse_server.exceptions import (
     KeeperSyncSystemicFailureError,
 )
 from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
+from docverse_server.storage.ltd import LtdSourceAccessDeniedError
 
 
 def _make_invalid_slug() -> InvalidSlugError:
@@ -89,6 +90,14 @@ def _make_cloudflare_cache_purge() -> CloudflareCachePurgeError:
     )
 
 
+def _make_ltd_source_access_denied() -> LtdSourceAccessDeniedError:
+    return LtdSourceAccessDeniedError(
+        bucket="lsst-the-docs",
+        key="documenteer/builds/33/index.html",
+        operation="GetObject",
+    )
+
+
 _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("InvalidJobStateError", _make_invalid_job_state),
     ("InvalidBuildStateError", _make_invalid_build_state),
@@ -100,6 +109,7 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
         _make_keeper_sync_systemic_failure,
     ),
     ("CloudflareCachePurgeError", _make_cloudflare_cache_purge),
+    ("LtdSourceAccessDeniedError", _make_ltd_source_access_denied),
 ]
 
 

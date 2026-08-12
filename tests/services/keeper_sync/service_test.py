@@ -74,6 +74,7 @@ from docverse_server.storage.keeper_sync import (
 from docverse_server.storage.ltd import (
     LtdClient,
     LtdEdition,
+    LtdSourceAccessDeniedError,
     LtdSourceProtocol,
 )
 from docverse_server.storage.objectstore import MockObjectStore
@@ -93,15 +94,34 @@ def _load(name: str) -> dict[str, object]:
 
 
 class _FakeLtdSource(LtdSourceProtocol):
-    """In-memory LTD source for service-level integration tests."""
+    """In-memory LTD source for service-level integration tests.
 
-    def __init__(self, objects: dict[str, bytes]) -> None:
+    ``denied_prefixes`` reproduces LTD's oldest uploads: the keys are
+    listable but every ``GetObject`` under the prefix answers
+    ``AccessDenied`` (#516). ``listed_prefixes`` records every prefix the
+    service asked about so a test can pin that a readable build prefix
+    never causes the edition-prefix fallback to be consulted.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, bytes],
+        *,
+        denied_prefixes: frozenset[str] = frozenset(),
+    ) -> None:
         self._objects = objects
+        self._denied_prefixes = denied_prefixes
+        self.listed_prefixes: list[str] = []
 
     async def list_keys(self, *, prefix: str) -> list[str]:
+        self.listed_prefixes.append(prefix)
         return [k for k in self._objects if k.startswith(prefix)]
 
     async def download_object(self, *, key: str) -> bytes:
+        if any(key.startswith(prefix) for prefix in self._denied_prefixes):
+            raise LtdSourceAccessDeniedError(
+                bucket="lsst-the-docs", key=key, operation="GetObject"
+            )
         return self._objects[key]
 
 
@@ -151,6 +171,7 @@ def _build_service(
     binding_resolver: ProjectGitHubBindingResolver | None = None,
     ref_set_fetcher: GitHubRefSetFetcher | None = None,
     tombstone_service: KeeperSyncTombstoneService | None = None,
+    source: _FakeLtdSource | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -158,6 +179,10 @@ def _build_service(
     ``tombstone_service`` wire the proactive-lifecycle path; tests
     that don't care about that path leave them unset and get the
     pre-PRD-#332 behavior (proactive pass is a no-op).
+
+    ``source`` overrides the LTD source built from ``source_objects``,
+    for tests that need to configure denied prefixes or inspect which
+    prefixes the sync consulted.
     """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -177,7 +202,8 @@ def _build_service(
         logger=logger,
         base_backoff_seconds=0.0,
     )
-    source = _FakeLtdSource(source_objects)
+    if source is None:
+        source = _FakeLtdSource(source_objects)
     copier = BuildContentCopier(
         source=source, destination=object_store, logger=logger
     )
@@ -4443,3 +4469,329 @@ async def test_sync_edition_isolates_aggregate_backfill_failure(
         )
     assert release is not None
     assert release.current_build_id is not None
+
+
+async def _manifest_hash_of(source: _FakeLtdSource, *, prefix: str) -> str:
+    """Hash ``prefix`` through a throwaway copier, uploading nothing."""
+    copier = BuildContentCopier(
+        source=source,
+        destination=MockObjectStore(),
+        logger=structlog.get_logger("test"),
+    )
+    return await copier.compute_manifest_hash(source_prefix=prefix)
+
+
+@pytest.mark.asyncio
+async def test_denied_build_prefix_recovers_from_edition_prefix(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An ``AccessDenied`` build prefix syncs from ``<product>/v/<slug>/``.
+
+    LTD's earliest build uploads carry no public-read object ACL, but the
+    publish step's copy under the edition prefix does — that copy is what
+    Fastly serves (#516). The recovered build must carry the *edition*
+    prefix's manifest hash, because those are the bytes that were
+    uploaded, and the state row must record where they came from.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-denied-recover")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        # The un-ACL'd build upload: listable, never readable.
+        "pipelines/builds/43/index.html": b"<html>denied</html>",
+        # LTD's published copy of the same build, which is public.
+        "pipelines/v/0.3.0/index.html": b"<html>release</html>",
+        "pipelines/v/0.3.0/assets/app.js": b"console.log(1)",
+    }
+    source = _FakeLtdSource(
+        source_objects, denied_prefixes=frozenset({"pipelines/builds/43/"})
+    )
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.edition_failures == ()
+
+    edition_prefix_hash = await _manifest_hash_of(
+        source, prefix="pipelines/v/0.3.0/"
+    )
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        assert release.current_build_id is not None
+        build = await build_store.get_by_id(release.current_build_id)
+        assert build is not None
+        assert build.status == BuildStatus.completed
+        # Hash and copy read the same prefix: the stored hash is the
+        # edition prefix's manifest, not the denied build prefix's.
+        assert build.content_hash == edition_prefix_hash
+        assert build.object_count == 2
+
+        # Provenance: the bytes did not come from ``bucket_root_dir``.
+        state = await state_store.get(
+            org_id=org_id, resource_type=ResourceType.build, ltd_id=43
+        )
+        assert state is not None
+        assert state.annotations is not None
+        assert state.annotations["ltd_source_prefix"] == "pipelines/v/0.3.0/"
+        assert state.annotations["ltd_source_prefix_origin"] == "edition"
+
+    # The uploaded bytes are the edition prefix's, so the manifest hash
+    # really does describe what landed in the destination.
+    uploaded = {
+        key: value
+        for key, value in object_store.objects.items()
+        if key.startswith(build.storage_prefix)
+    }
+    assert len(uploaded) == 2
+    index_key = next(k for k in uploaded if k.endswith("/index.html"))
+    assert uploaded[index_key].data == b"<html>release</html>"
+
+
+@pytest.mark.asyncio
+async def test_readable_build_prefix_never_consults_edition_prefix(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A readable build prefix is the only prefix a sync touches.
+
+    The fallback is a recovery path, not a new default: projects whose
+    build prefixes read fine must produce the same hash from the same
+    prefix as before #516, with no extra bucket traffic.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-readable-build")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+        # Present but irrelevant: nothing should read the published copy.
+        "pipelines/v/0.3.0/index.html": b"<html>stale</html>",
+    }
+    source = _FakeLtdSource(source_objects)
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.edition_failures == ()
+
+    assert "pipelines/builds/43/" in source.listed_prefixes
+    assert not [
+        p for p in source.listed_prefixes if p.startswith("pipelines/v/")
+    ]
+
+    build_prefix_hash = await _manifest_hash_of(
+        source, prefix="pipelines/builds/43/"
+    )
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        assert release.current_build_id is not None
+        build = await build_store.get_by_id(release.current_build_id)
+        assert build is not None
+        assert build.content_hash == build_prefix_hash
+
+        state = await state_store.get(
+            org_id=org_id, resource_type=ResourceType.build, ltd_id=43
+        )
+        assert state is not None
+        assert state.annotations is not None
+        assert state.annotations["ltd_source_prefix"] == "pipelines/builds/43/"
+        assert state.annotations["ltd_source_prefix_origin"] == "build"
+
+
+@pytest.mark.asyncio
+async def test_empty_build_prefix_does_not_trigger_edition_fallback(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An empty build prefix is not a denial, so no fallback fires.
+
+    The recovery path is scoped to ``AccessDenied`` specifically: a
+    missing or empty build prefix keeps today's behavior (an empty
+    manifest), rather than silently importing whatever the edition
+    prefix happens to hold.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-empty-build")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        # Nothing at all under pipelines/builds/43/.
+        "pipelines/v/0.3.0/index.html": b"<html>published</html>",
+    }
+    source = _FakeLtdSource(source_objects)
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.edition_failures == ()
+    assert not [
+        p for p in source.listed_prefixes if p.startswith("pipelines/v/")
+    ]
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        assert release.current_build_id is not None
+        build = await build_store.get_by_id(release.current_build_id)
+        assert build is not None
+        assert build.object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_main_edition_denial_does_not_try_the_edition_prefix(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """LTD serves the default edition from the product root, not ``v/``.
+
+    So a denied ``main`` build has no published sibling to recover from
+    and must keep failing its edition rather than importing some other
+    prefix's content.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-main-denied")
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>denied</html>",
+        "pipelines/v/main/index.html": b"<html>not the main edition</html>",
+    }
+    source = _FakeLtdSource(
+        source_objects, denied_prefixes=frozenset({"pipelines/builds/42/"})
+    )
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "main"
+    assert failure.error_type == "LtdSourceAccessDeniedError"
+    assert not [
+        p for p in source.listed_prefixes if p.startswith("pipelines/v/")
+    ]
+    assert object_store.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_denied_build_prefix_with_empty_edition_prefix_still_fails(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An empty edition prefix is not a recovery; the denial stands.
+
+    Importing a zero-object build would turn a loud, retryable
+    ``AccessDenied`` into an edition that looks synced and serves 404s,
+    so the fallback only counts when it actually finds content.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-empty-fallback")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>denied</html>",
+        # Nothing was ever published under pipelines/v/0.3.0/.
+    }
+    source = _FakeLtdSource(
+        source_objects, denied_prefixes=frozenset({"pipelines/builds/43/"})
+    )
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "0.3.0"
+    assert failure.error_type == "LtdSourceAccessDeniedError"
+    # The fallback was attempted, and found nothing.
+    assert "pipelines/v/0.3.0/" in source.listed_prefixes
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+    assert release is not None
+    assert release.current_build_id is None

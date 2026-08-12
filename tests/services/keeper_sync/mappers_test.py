@@ -19,6 +19,7 @@ from docverse_server.services.keeper_sync.mappers import (
     EditionKindSource,
     derive_edition_kind,
     derive_edition_slug,
+    derive_edition_source_prefix,
     map_edition_tracking,
 )
 from docverse_server.storage.ltd import LtdBuild, LtdEdition
@@ -331,3 +332,54 @@ def test_map_edition_tracking_table(
     edition = _edition(mode=ltd_mode, tracked_refs=tracked_refs)
     build = _build(git_refs=build_git_refs) if build_git_refs else None
     assert map_edition_tracking(edition, build=build) == expected
+
+
+class TestDeriveEditionSourcePrefix:
+    """``derive_edition_source_prefix`` mirrors LTD's publish layout."""
+
+    def test_versioned_edition_gets_its_published_prefix(self) -> None:
+        """LTD publishes an edition's copy at ``<product>/v/<slug>/``."""
+        prefix = derive_edition_source_prefix(
+            bucket_root_dir="documenteer/builds/33",
+            ltd_edition_slug="0.3.0",
+        )
+        assert prefix == "documenteer/v/0.3.0/"
+
+    def test_trailing_slash_on_the_build_prefix_is_tolerated(self) -> None:
+        prefix = derive_edition_source_prefix(
+            bucket_root_dir="documenteer/builds/33/",
+            ltd_edition_slug="0.3.0",
+        )
+        assert prefix == "documenteer/v/0.3.0/"
+
+    @pytest.mark.parametrize("ltd_slug", ["main", "__main"])
+    def test_default_edition_has_no_versioned_prefix(
+        self, ltd_slug: str
+    ) -> None:
+        """LTD serves the default edition from the product root.
+
+        Both spellings of the default edition's slug are refused, so the
+        guard holds whichever one the v1 API reports.
+        """
+        assert (
+            derive_edition_source_prefix(
+                bucket_root_dir="documenteer/builds/33",
+                ltd_edition_slug=ltd_slug,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "bucket_root_dir",
+        ["documenteer", "documenteer/33", "documenteer/v/0.3.0", ""],
+    )
+    def test_unrecognized_build_layout_yields_no_prefix(
+        self, bucket_root_dir: str
+    ) -> None:
+        """Only ``<product>/builds/<slug>`` locates a product root."""
+        assert (
+            derive_edition_source_prefix(
+                bucket_root_dir=bucket_root_dir, ltd_edition_slug="0.3.0"
+            )
+            is None
+        )
