@@ -64,6 +64,7 @@ from docverse_server.metrics import build_event_manager
 from docverse_server.sentry import initialize_sentry
 from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.services.lock_service import LockClass, LockKey
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -82,6 +83,7 @@ from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
+from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
 
 LTD_BASE = "https://keeper.lsst.codes"
@@ -1314,6 +1316,106 @@ async def test_keeper_sync_project_publishes_backfilled_aggregates(
                 )
                 assert aggregate is not None
                 assert aggregate.publish_status == PublishStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_locks_every_edition_pointer_write(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every pointer this worker moves is written under its own lock.
+
+    The factory has to hand ``KeeperSyncService`` a real ``LockService``,
+    because a project mid-migration publishes natively — through
+    ``build_processing`` and ``publish_edition``, both of which take
+    ``EDITION_UPDATE`` on the same key — while keeper-sync still polls.
+
+    Also pins the *shape* of the holds, which is what keeps keeper-sync
+    out of a deadlock with those workers: keeper-sync takes only
+    ``EDITION_UPDATE`` (never ``BUILD_PROCESSING``, so there is no
+    ordering to invert against the native path's outer-to-inner
+    nesting), and it releases each hold before taking the next, so no
+    two editions are ever held at once.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+    events = install_recording_lock_service(monkeypatch)
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    project_id = 0
+    edition_ids: dict[str, int] = {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            project_id = project.id
+            edition_store = EditionStore(session=session, logger=_logger())
+            for slug in ("15.2.1", "15", "15.2"):
+                edition = await edition_store.get_by_slug(
+                    project_id=project_id, slug=slug
+                )
+                assert edition is not None
+                edition_ids[slug] = edition.id
+
+    def _key(slug: str) -> LockKey:
+        return LockKey.for_edition_update(
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[slug],
+        )
+
+    # Only EDITION_UPDATE: keeper-sync never nests under BUILD_PROCESSING.
+    assert {e.lock_key.lock_class for e in events} == {
+        LockClass.EDITION_UPDATE
+    }
+    enters = [e.lock_key for e in events if e.event == "enter"]
+    # The imported release and both backfilled aggregates were each
+    # repointed under their own key.
+    assert set(enters) >= {_key("15.2.1"), _key("15"), _key("15.2")}
+    # Aggregates in ``semver_aggregate_specs`` order: major, then minor.
+    assert enters.index(_key("15")) < enters.index(_key("15.2"))
+    # Strictly serial: each hold is released before the next is taken.
+    assert [e.event for e in events] == ["enter", "exit"] * len(enters)
 
 
 @pytest.mark.asyncio

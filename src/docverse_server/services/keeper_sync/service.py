@@ -17,7 +17,8 @@ are filled in by issue #289.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -77,6 +78,7 @@ from docverse_server.services.lifecycle.evaluator import (
     filter_rule_set,
     resolve_rule_set,
 )
+from docverse_server.services.lock_service import LockKey, LockService
 from docverse_server.services.project import (
     DEFAULT_EDITION_SLUG,
     ProjectService,
@@ -461,6 +463,7 @@ class KeeperSyncService:
         tombstone_service: KeeperSyncTombstoneService | None = None,
         binding_resolver: ProjectGitHubBindingResolver | None = None,
         ref_set_fetcher: GitHubRefSetFetcher | None = None,
+        lock_service: LockService | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -477,6 +480,46 @@ class KeeperSyncService:
         self._tombstone_service = tombstone_service
         self._binding_resolver = binding_resolver
         self._ref_set_fetcher = ref_set_fetcher
+        self._lock_service = lock_service
+
+    @asynccontextmanager
+    async def _edition_update_lock(
+        self, *, org_id: int, project_id: int, edition_id: int
+    ) -> AsyncGenerator[None]:
+        """Hold the ``EDITION_UPDATE`` lock for one edition, if wired.
+
+        The same key the native path takes in
+        ``EditionTrackingService._set_current_build_locked`` and in the
+        ``publish_edition`` worker, so a project mid-migration —
+        publishing natively while keeper-sync still polls — cannot
+        interleave two pointer writes on one edition.
+
+        Acquisition follows the DM-54693 convention established by
+        ``build_processing`` and ``publish_edition``: resolve the key
+        with a read in its own committed transaction, then acquire with
+        **no** transaction open. Waiting on ``pg_advisory_lock`` while
+        holding row locks would let a native writer that already holds
+        the advisory lock block on those rows — a cycle Postgres'
+        deadlock detector cannot see, because advisory-lock waits are
+        not in its graph.
+
+        Keeper-sync never takes ``BUILD_PROCESSING``, and never nests
+        one ``EDITION_UPDATE`` hold inside another (aggregates are
+        locked one at a time, in :func:`semver_aggregate_specs` order),
+        so there is no ordering to invert against the native path's
+        ``BUILD_PROCESSING`` → ``EDITION_UPDATE`` nesting.
+
+        ``lock_service`` is ``None`` on direct unit-test constructions,
+        which run unwrapped exactly as ``EditionTrackingService`` does.
+        """
+        if self._lock_service is None:
+            yield
+            return
+        lock_key = LockKey.for_edition_update(
+            org_id=org_id, project_id=project_id, edition_id=edition_id
+        )
+        async with self._lock_service.acquire(lock_key):
+            yield
 
     async def sync_project(
         self,
@@ -1149,14 +1192,22 @@ class KeeperSyncService:
 
         ``state_key`` identifies the edition's ``keeper_sync_state`` row,
         onto which this method stamps
-        :data:`_AGGREGATES_BACKFILLED_BUILD_ID_KEY` — inside its own
-        transaction, so the marker and the rows it describes commit
-        together and a raising backfill retries on the next poll. Callers
-        compare that marker to the build id before calling at all, which
-        is what makes a steady-state poll free; refs with no aggregates
-        to reconcile return before the transaction opens and are
-        therefore left unmarked, since re-deciding that costs nothing
-        but a parse.
+        :data:`_AGGREGATES_BACKFILLED_BUILD_ID_KEY` once every spec has
+        been reconciled, so a raising backfill leaves the marker unwritten
+        and retries on the next poll. Callers compare that marker to the
+        build id before calling at all, which is what makes a steady-state
+        poll free; refs with no aggregates to reconcile return before any
+        transaction opens and are therefore left unmarked, since
+        re-deciding that costs nothing but a parse.
+
+        Each spec is reconciled in its own transaction rather than one
+        transaction spanning the loop, because
+        :meth:`_ensure_aggregate_edition` has to take that aggregate's
+        advisory lock with no transaction open — see
+        :meth:`_edition_update_lock`. The marker is what makes that safe:
+        the per-aggregate writes are individually idempotent, so a crash
+        part-way through simply replays the whole (short) spec list next
+        poll.
 
         Returns one outcome per aggregate this call actually moved, for
         the worker to publish; see :class:`AggregateEditionOutcome`.
@@ -1167,35 +1218,39 @@ class KeeperSyncService:
         specs = semver_aggregate_specs(version)
         if not specs:
             return ()
-        outcomes: list[AggregateEditionOutcome] = []
         async with self._session.begin():
             build = await self._build_store.get_by_id(build_id)
-            if build is not None:
-                for spec in specs:
-                    outcome = await self._ensure_aggregate_edition(
-                        project_id=project_id,
-                        spec=spec,
-                        build=build,
-                        version=version,
-                        allow_create=autocreation.semver_aggregates,
-                    )
-                    if outcome is not None:
-                        outcomes.append(outcome)
-                await self._state_store.upsert(
-                    org_id=state_key.org_id,
-                    resource_type=ResourceType.edition,
-                    ltd_id=state_key.ltd_id,
-                    ltd_slug=state_key.ltd_slug,
-                    annotations={
-                        **state_key.annotations,
-                        _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
-                    },
-                )
+        if build is None:
+            return ()
+        outcomes: list[AggregateEditionOutcome] = []
+        for spec in specs:
+            outcome = await self._ensure_aggregate_edition(
+                org_id=state_key.org_id,
+                project_id=project_id,
+                spec=spec,
+                build=build,
+                version=version,
+                allow_create=autocreation.semver_aggregates,
+            )
+            if outcome is not None:
+                outcomes.append(outcome)
+        async with self._session.begin():
+            await self._state_store.upsert(
+                org_id=state_key.org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=state_key.ltd_id,
+                ltd_slug=state_key.ltd_slug,
+                annotations={
+                    **state_key.annotations,
+                    _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
+                },
+            )
         return tuple(outcomes)
 
     async def _ensure_aggregate_edition(
         self,
         *,
+        org_id: int,
         project_id: int,
         spec: SemverAggregateSpec,
         build: Build,
@@ -1210,72 +1265,103 @@ class KeeperSyncService:
         free to advance — see :meth:`_backfill_semver_aggregates` for
         why the knob is creation-only.
 
+        Runs as locate-or-create, then decide-and-write under this
+        edition's ``EDITION_UPDATE`` lock. The split matters: the
+        version guard is a read-check-write, and a project mid-migration
+        has a second writer — the native ``build_processing`` path,
+        which takes the same lock around its own pointer update. Without
+        the lock keeper-sync could read ``15``'s ``current_build_git_ref``,
+        watch the native path publish a newer release onto it, and then
+        write its older build over the top, dropping ``/v/15`` back a
+        release until the next one shipped. So the guard re-reads the
+        row inside the lock: the locate step's ``Edition`` is a snapshot
+        from before the wait, and acting on it would be the same
+        unguarded read-check-write the lock is here to close.
+
         Returns ``None`` — leaving the row untouched — when the slug is
         occupied by an edition that is not this aggregate (an operator's
         own ``15``, or a natively created one on a different tracking
         mode), when the version guard rejects an older release, or when
         the pointer is already where it should be.
         """
-        edition = await self._edition_store.get_by_slug(
-            project_id=project_id, slug=spec.slug
-        )
-        if edition is None:
-            if not allow_create:
-                self._logger.debug(
-                    "Semver aggregate not created: autocreation disabled",
+        async with self._session.begin():
+            edition = await self._edition_store.get_by_slug(
+                project_id=project_id, slug=spec.slug
+            )
+            if edition is None:
+                if not allow_create:
+                    self._logger.debug(
+                        "Semver aggregate not created: autocreation disabled",
+                        project_id=project_id,
+                        edition_slug=spec.slug,
+                        build_id=build.id,
+                    )
+                    return None
+                edition = await self._edition_store.create_internal(
                     project_id=project_id,
-                    edition_slug=spec.slug,
-                    build_id=build.id,
+                    slug=spec.slug,
+                    title=spec.title,
+                    kind=spec.kind,
+                    tracking_mode=spec.tracking_mode,
+                    tracking_params=spec.tracking_params,
                 )
-                return None
-            edition = await self._edition_store.create_internal(
-                project_id=project_id,
-                slug=spec.slug,
-                title=spec.title,
-                kind=spec.kind,
-                tracking_mode=spec.tracking_mode,
-                tracking_params=spec.tracking_params,
-            )
-            self._logger.info(
-                "Auto-created semver aggregate edition for synced release",
-                project_id=project_id,
-                edition_id=edition.id,
-                edition_slug=edition.slug,
-                edition_kind=spec.kind.value,
-                tracking_mode=spec.tracking_mode.value,
-            )
-        # Also catches ``create_internal`` losing its ON CONFLICT race to
-        # a concurrent writer that inserted a differently-tracked row.
-        if edition.tracking_mode != spec.tracking_mode:
-            self._logger.info(
-                "Semver aggregate slug held by a non-aggregate edition;"
-                " leaving it untouched",
-                project_id=project_id,
-                edition_id=edition.id,
-                edition_slug=edition.slug,
-                edition_kind=edition.kind.value,
-                tracking_mode=edition.tracking_mode.value,
-            )
-            return None
-        if not _aggregate_accepts(edition, version):
-            return None
+                self._logger.info(
+                    "Auto-created semver aggregate edition for synced release",
+                    project_id=project_id,
+                    edition_id=edition.id,
+                    edition_slug=edition.slug,
+                    edition_kind=spec.kind.value,
+                    tracking_mode=spec.tracking_mode.value,
+                )
+        # Steady state on an unchanged project: the pointer is already
+        # where this build wants it, so decline before paying for a lock.
+        # Only ever declines, so a stale read here costs a poll at worst
+        # — the authoritative check runs under the lock below.
         if edition.current_build_id == build.id:
             return None
-        updated = await self._edition_store.set_current_build(
-            edition_id=edition.id, build_id=build.id, skip_date_guard=True
-        )
-        if updated is None:
-            return None
+        async with self._edition_update_lock(
+            org_id=org_id, project_id=project_id, edition_id=edition.id
+        ):
+            async with self._session.begin():
+                current = await self._edition_store.get_by_id(edition.id)
+                if current is None:
+                    # Soft-deleted between the locate and the lock.
+                    return None
+                # Also catches ``create_internal`` losing its ON CONFLICT
+                # race to a concurrent writer that inserted a
+                # differently-tracked row.
+                if current.tracking_mode != spec.tracking_mode:
+                    self._logger.info(
+                        "Semver aggregate slug held by a non-aggregate"
+                        " edition; leaving it untouched",
+                        project_id=project_id,
+                        edition_id=current.id,
+                        edition_slug=current.slug,
+                        edition_kind=current.kind.value,
+                        tracking_mode=current.tracking_mode.value,
+                    )
+                    return None
+                if not _aggregate_accepts(current, version):
+                    return None
+                if current.current_build_id == build.id:
+                    return None
+                updated = await self._edition_store.set_current_build(
+                    edition_id=current.id,
+                    build_id=build.id,
+                    skip_date_guard=True,
+                )
+                if updated is None:
+                    return None
         self._logger.info(
             "Pointed semver aggregate at synced release build",
             project_id=project_id,
-            edition_id=edition.id,
-            edition_slug=edition.slug,
+            edition_id=updated.id,
+            edition_slug=updated.slug,
             build_id=build.id,
         )
         return AggregateEditionOutcome(
-            docverse_edition_id=edition.id,
-            docverse_slug=edition.slug,
+            docverse_edition_id=updated.id,
+            docverse_slug=updated.slug,
             docverse_build_id=build.id,
             docverse_build_public_id=serialize_base32_id(build.public_id),
         )
@@ -1501,7 +1587,15 @@ class KeeperSyncService:
             ltd_build=ltd_build, ltd_edition=ltd_edition, project=project
         )
         manifest_hash = source.manifest_hash
-        async with self._session.begin():
+        # Both remaining transactions may repoint this edition, so both
+        # run under its EDITION_UPDATE lock — see the audit note on
+        # :meth:`_finalize_synced_build`.
+        async with (
+            self._edition_update_lock(
+                org_id=org_id, project_id=project.id, edition_id=edition.id
+            ),
+            self._session.begin(),
+        ):
             existing_build = (
                 await self._build_store.get_completed_by_content_hash(
                     project_id=project.id, content_hash=manifest_hash
@@ -1568,7 +1662,12 @@ class KeeperSyncService:
             source.prefix, new_build.storage_prefix
         )
 
-        async with self._session.begin():
+        async with (
+            self._edition_update_lock(
+                org_id=org_id, project_id=project.id, edition_id=edition.id
+            ),
+            self._session.begin(),
+        ):
             await self._finalize_synced_build(
                 build=new_build,
                 edition=edition,
@@ -1787,6 +1886,19 @@ class KeeperSyncService:
         Runs inside a single ``session.begin()`` so a crash between the
         build-side update and the edition-side update cannot leave the
         edition pointing at a build that does not exist or vice versa.
+
+        The caller holds this edition's ``EDITION_UPDATE`` lock across
+        that transaction. Unlike the aggregate path, there is no
+        read-check-write here to make atomic — the pointer move is
+        unconditional (``skip_date_guard=True``), so the lock changes no
+        ordering: whichever writer goes second still wins, and correcting
+        *that* would need a version guard on the concrete edition, which
+        is a separate question from this one. What the lock does buy is
+        mutual exclusion with ``publish_edition``, which holds the same
+        key while it reads the edition's build and pushes the CDN
+        pointer: without it a keeper-sync repoint could land mid-publish
+        and leave the CDN serving one build while the row records
+        another as published.
         """
         await self._build_store.update_content_hash(
             build_id=build.id,

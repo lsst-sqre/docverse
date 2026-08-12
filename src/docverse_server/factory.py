@@ -955,7 +955,14 @@ class Factory:
         service_label: str,
         ltd_base_url: str = "https://keeper.lsst.codes",
     ) -> KeeperSyncService:
-        """Create a :class:`KeeperSyncService` for one org's sync run."""
+        """Create a :class:`KeeperSyncService` for one org's sync run.
+
+        Always wires a :class:`LockService`, so the sync worker takes the
+        EDITION_UPDATE advisory lock around the aggregate pointer
+        updates it shares with the native ``build_processing`` path.
+        Direct unit-test constructions of the service may omit it and
+        run unwrapped, exactly as ``EditionTrackingService`` does.
+        """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
         async def copy_callable(
@@ -1011,6 +1018,7 @@ class Factory:
             tombstone_service=tombstone_service,
             binding_resolver=binding_resolver,
             ref_set_fetcher=ref_set_fetcher,
+            lock_service=self.create_lock_service(),
         )
 
 

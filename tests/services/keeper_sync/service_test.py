@@ -10,7 +10,8 @@ state-store rows and copied object bytes.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import pytest_asyncio
 import respx
 import sentry_sdk
 import structlog
+from safir.dependencies.db_session import db_session_dependency
 from safir.github import GitHubAppClientFactory
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +58,7 @@ from docverse_server.services.keeper_sync.service import (
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
+from docverse_server.services.lock_service import LockKey, LockService
 from docverse_server.services.project import ProjectService
 from docverse_server.services.project_github_binding import (
     ProjectGitHubBindingResolver,
@@ -173,6 +176,7 @@ def _build_service(
     ref_set_fetcher: GitHubRefSetFetcher | None = None,
     tombstone_service: KeeperSyncTombstoneService | None = None,
     source: _FakeLtdSource | None = None,
+    lock_service: LockService | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -235,6 +239,7 @@ def _build_service(
         tombstone_service=tombstone_service,
         binding_resolver=binding_resolver,
         ref_set_fetcher=ref_set_fetcher,
+        lock_service=lock_service,
     )
 
 
@@ -3944,6 +3949,179 @@ async def test_short_circuited_sync_heals_aggregates_exactly_once(
     assert calls == []
 
 
+# ---------------------------------------------------------------------------
+# Aggregate repointing under the EDITION_UPDATE advisory lock (#524). A
+# project mid-migration publishes natively while keeper-sync still polls, so
+# the aggregate's version-guard read and its pointer write have to be atomic
+# against ``build_processing`` / ``publish_edition``, which take the same
+# lock.
+# ---------------------------------------------------------------------------
+
+
+class _CompetingWriterLockService(LockService):
+    """Lock service that lands a competing commit at acquire time.
+
+    Stands in for the native ``build_processing`` path having won the
+    race for an aggregate's ``EDITION_UPDATE`` lock: by the time
+    keeper-sync gets inside the lock, the aggregate already points at a
+    newer release. ``acquire`` deliberately does *not* delegate to the
+    real :class:`LockService` — the double exists to control what is
+    committed while the lock is notionally held, not to exercise
+    Postgres advisory locks (``tests/services/locks_integration_test.py``
+    covers those).
+    """
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+        on_acquire: Callable[[LockKey], Awaitable[None]],
+    ) -> None:
+        super().__init__(session=session, logger=logger)
+        self._on_acquire = on_acquire
+        self.acquired: list[LockKey] = []
+
+    @asynccontextmanager
+    async def acquire(self, lock_key: LockKey) -> AsyncGenerator[None]:
+        self.acquired.append(lock_key)
+        await self._on_acquire(lock_key)
+        yield
+
+
+async def _seed_native_release_build(
+    session: AsyncSession, *, project_id: int, git_ref: str
+) -> int:
+    """Create a completed build on *git_ref*, as a native upload would."""
+    logger = structlog.get_logger("test")
+    build_store = BuildStore(session=session, logger=logger)
+    async with session.begin():
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="pipelines",
+            data=BuildCreate(
+                git_ref=git_ref,
+                content_hash="sha256:" + "b" * 64,
+            ),
+            uploader="native",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+    return build.id
+
+
+@pytest.mark.asyncio
+async def test_sync_aggregate_rereads_pointer_under_edition_lock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A native repoint landing before the lock is granted is not undone.
+
+    Reproduces the mid-migration regression: keeper-sync reads ``15``,
+    the native path publishes ``15.9.9`` onto it, and keeper-sync then
+    writes its older ``15.0.0`` build over the top — dropping ``/v/15``
+    back a release until the next one ships. The guard read has to
+    happen *inside* the ``EDITION_UPDATE`` lock, and has to see the
+    other writer's committed row rather than the copy this session
+    already loaded.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-lock")
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+    native_build_id = await _seed_native_release_build(
+        db_session, project_id=project_id, git_ref="15.9.9"
+    )
+
+    repointed: list[int] = []
+
+    async def _repoint_major_aggregate(lock_key: LockKey) -> None:
+        """Commit the native pointer move, once, from another session.
+
+        Fires on the first acquisition that finds ``15`` on disk — the
+        lock keeper-sync takes to decide that aggregate's pointer — and
+        then disarms, so a later acquisition cannot paper over a
+        keeper-sync write that should never have happened.
+        """
+        if repointed:
+            return
+        async for other in db_session_dependency():
+            store = EditionStore(
+                session=other, logger=structlog.get_logger("test")
+            )
+            async with other.begin():
+                major = await store.get_by_slug(
+                    project_id=project_id, slug="15"
+                )
+                if major is None:
+                    continue
+                await store.set_current_build(
+                    edition_id=major.id,
+                    build_id=native_build_id,
+                    skip_date_guard=True,
+                )
+                repointed.append(major.id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.0.0", git_ref="15.0.0"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    lock_service = _CompetingWriterLockService(
+        db_session, structlog.get_logger("test"), _repoint_major_aggregate
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        lock_service=lock_service,
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        release = await edition_store.get_by_slug(
+            project_id=project_id, slug="15.0.0"
+        )
+        major = await edition_store.get_by_slug(
+            project_id=project_id, slug="15"
+        )
+        minor = await edition_store.get_by_slug(
+            project_id=project_id, slug="15.0"
+        )
+    assert release is not None
+    assert release.current_build_id is not None
+    assert major is not None
+    assert repointed == [major.id]
+    # The native ``15.9.9`` pointer survives: the version guard ran on
+    # the row as it stood inside the lock, not on the pre-lock read.
+    assert major.current_build_id == native_build_id
+    # The minor aggregate has no competing writer, so it still advances.
+    assert minor is not None
+    assert minor.current_build_id == release.current_build_id
+    # The lock keyed on the aggregate really was taken.
+    assert (
+        LockKey.for_edition_update(
+            org_id=org_id, project_id=project_id, edition_id=major.id
+        )
+        in lock_service.acquired
+    )
+
+
 @pytest.mark.asyncio
 async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
     db_session: AsyncSession,
@@ -4701,11 +4879,11 @@ async def test_sync_edition_isolates_aggregate_backfill_failure(
         db_session, http_client, object_store, source_objects
     )
 
-    # Fail *inside* the backfill's own ``session.begin()`` block rather
-    # than stubbing the whole method, so the real semver guards still
-    # run: ``__main`` is not a release and never reaches this, and only
-    # the ``15.2.1`` release edition's backfill blows up — the shape of
-    # the transient DB error this boundary exists to absorb.
+    # Fail per-aggregate rather than stubbing the whole backfill, so the
+    # real semver guards still run: ``__main`` is not a release and never
+    # reaches this, and only the ``15.2.1`` release edition's backfill
+    # blows up — the shape of the transient DB error this boundary
+    # exists to absorb.
     async def _raising_ensure_aggregate(**kwargs: object) -> None:
         msg = "aggregate backfill blew up"
         raise RuntimeError(msg)
