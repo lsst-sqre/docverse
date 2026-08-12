@@ -1888,6 +1888,7 @@ async def test_sync_project_success_resets_consecutive_failure_counter(
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             build_outcome=None,
+            short_circuited=False,
         )
 
     monkeypatch.setattr(service, "sync_edition", _fails_except_middle)
@@ -1898,6 +1899,140 @@ async def test_sync_project_success_resets_consecutive_failure_counter(
     # isolated on the result.
     assert len(result.edition_outcomes) == 1
     assert len(result.edition_failures) == total - 1
+
+
+@pytest.mark.asyncio
+async def test_sync_project_short_circuit_does_not_reset_failure_counter(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tombstone short-circuit must not clear the systemic counter.
+
+    The mirror image of the reset test above: the middle edition returns
+    a short-circuited outcome instead of a genuine one. A short-circuit
+    never contacts LTD — it is a pure ``keeper_sync_state`` read, which
+    succeeds *especially* when LTD is down — so it carries no evidence
+    that the outage ended and must leave ``consecutive_failures``
+    exactly where it was. On documenteer, whose oldest history
+    interleaves ``lifecycle_preemptive`` tombstones with its releases,
+    resetting on short-circuits produced the alternating fail/reset
+    pattern that defeated the breaker outright.
+    """
+    run = MAX_CONSECUTIVE_EDITION_FAILURES - 1
+    total = MAX_CONSECUTIVE_EDITION_FAILURES + 3
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-tombstone")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    attempted: list[int] = []
+
+    async def _fails_around_a_short_circuit(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> EditionSyncOutcome:
+        ltd_id = ltd_edition.ltd_id
+        attempted.append(ltd_id)
+        if ltd_id != run + 1:
+            msg = "LTD is down"
+            raise RuntimeError(msg)
+        async with db_session.begin():
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+        assert project is not None
+        return EditionSyncOutcome(
+            docverse_edition_id=None,
+            docverse_slug=f"u-jsick-feat-{ltd_id}",
+            docverse_project_id=project.id,
+            docverse_project_slug=project.slug,
+            build_outcome=None,
+            short_circuited=True,
+        )
+
+    monkeypatch.setattr(service, "sync_edition", _fails_around_a_short_circuit)
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The short-circuited edition was walked — it is not in
+    # ``skip_ltd_ids`` — but left the counter alone, so the failure
+    # right after it is the Nth in a row and aborts. Editions past it
+    # were never attempted.
+    assert attempted == list(range(1, MAX_CONSECUTIVE_EDITION_FAILURES + 2))
+    assert (
+        exc_info.value.consecutive_failures == MAX_CONSECUTIVE_EDITION_FAILURES
+    )
+    # The reported run spans the short-circuit: the slug list holds only
+    # the genuinely-failed editions, and the short-circuited one is
+    # absent without having broken the run.
+    assert exc_info.value.failed_ltd_edition_slugs == [
+        *(f"u-jsick-feat-{i}" for i in range(1, run + 1)),
+        f"u-jsick-feat-{run + 2}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_project_proactive_skip_is_counter_neutral(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proactively-skipped edition neither increments nor resets.
+
+    Editions the proactive lifecycle pass tombstoned never reach
+    ``sync_edition`` at all: the loop ``continue``s past them. Pin that
+    they stay invisible to the breaker in both directions — the skip is
+    not a success (it must not reset a failure run) and not a failure
+    (it must not push the counter toward the threshold on its own).
+    """
+    run = MAX_CONSECUTIVE_EDITION_FAILURES - 1
+    total = MAX_CONSECUTIVE_EDITION_FAILURES + 3
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-skip")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    # Stub the pass rather than wiring the proactive deps: this test is
+    # about the loop's counter accounting for a skipped id, not about
+    # which editions the lifecycle evaluator picks.
+    async def _skip_middle(**kwargs: object) -> set[int]:
+        return {run + 1}
+
+    monkeypatch.setattr(service, "_proactive_lifecycle_pass", _skip_middle)
+
+    attempted: list[int] = []
+
+    async def _always_raises(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> None:
+        attempted.append(ltd_edition.ltd_id)
+        msg = "LTD is down"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(service, "sync_edition", _always_raises)
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The skipped edition was never attempted, and the failures either
+    # side of it still add up to one systemic run.
+    assert run + 1 not in attempted
+    assert attempted == [*range(1, run + 1), run + 2]
+    assert (
+        exc_info.value.consecutive_failures == MAX_CONSECUTIVE_EDITION_FAILURES
+    )
+    assert (
+        len(exc_info.value.failed_ltd_edition_slugs)
+        == MAX_CONSECUTIVE_EDITION_FAILURES
+    )
 
 
 @pytest.mark.asyncio
@@ -2038,6 +2173,9 @@ async def test_sync_edition_short_circuits_when_tombstoned(
     # First sync imports the edition + build normally.
     first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
     assert first.edition_outcomes
+    # A genuine sync is not short-circuited — the flag is the signal
+    # ``sync_project`` uses to decide whether the edition did any work.
+    assert first.edition_outcomes[0].short_circuited is False
     keys_after_first = set(object_store.objects.keys())
     assert keys_after_first
 
@@ -2107,6 +2245,9 @@ async def test_sync_edition_short_circuits_when_tombstoned(
     outcome = result.edition_outcomes[0]
     assert outcome.docverse_slug == "__main"
     assert outcome.build_outcome is None
+    # Flagged short-circuited so ``sync_project`` keeps it out of its
+    # consecutive-failure accounting: nothing here proves LTD is up.
+    assert outcome.short_circuited is True
 
     # No new bytes landed in the destination object store, and the
     # build endpoint was never fetched — short-circuit fired before

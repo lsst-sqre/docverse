@@ -147,13 +147,40 @@ DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
 #: by one, the loop finishes, and the run rolls up ``completed`` on what
 #: was really a 3-of-80 import.
 #:
-#: Five is chosen to sit comfortably above the observed clustering of
-#: genuinely-unreadable builds (LTD's un-ACL'd uploads are scattered
-#: through a product's history, not contiguous runs) while still
-#: aborting fast enough that an outage costs a handful of attempts
-#: rather than a whole product's edition list. A single success resets
-#: the counter, so scattered failures never accumulate into an abort.
-MAX_CONSECUTIVE_EDITION_FAILURES = 5
+#: The threshold is derived from the largest *contiguous* run of
+#: permanent per-edition faults LTD actually produces. Measured on
+#: roundtable-dev 2026-08-12: documenteer's build slugs 1-204 deny
+#: anonymous ``GetObject`` and 205+ read, 60 of its editions point at
+#: builds inside that block, and LTD lists editions oldest-first — so
+#: those 60 arrive back-to-back. (Only 19 failed the 2026-08-12 run
+#: because the other 41 were ``lifecycle_preemptive`` tombstones that
+#: short-circuited; after the PRD's manual tombstone purge and resync
+#: all 60 reach ``sync_edition``.) The un-ACL'd uploads are therefore
+#: strictly contiguous, not "scattered through a product's history" as
+#: this constant was originally justified — a premise that went
+#: unchallenged only because a tombstone short-circuit used to reset the
+#: counter, which kept the guard from ever firing.
+#:
+#: Seventy-five sits above that 60-edition block with headroom for a
+#: slightly deeper one on another product, and still aborts inside the
+#: first ~27% of documenteer's 279 editions, so a genuine outage costs
+#: 75 attempts rather than a whole product's edition list. The bias
+#: toward a high threshold follows the asymmetry of the two errors: a
+#: false abort is permanent and total — documenteer would stop at
+#: edition 60-something of 279 on every poll, forever, and none of the
+#: readable editions behind the denial block would ever import —
+#: whereas a missed abort is loud and recoverable, since the run
+#: finishes ``completed_with_errors`` with an exact
+#: ``edition_failure_count`` and ``aggregate_activity`` rolls the parent
+#: run up ``partial_failure``.
+#:
+#: Discriminating permanent faults by error type (an ``AccessDenied``
+#: not counting toward a *systemic* signal at all) would allow a much
+#: tighter threshold, but the copier surfaces the denial as a raw
+#: botocore ``ClientError`` with no Docverse-side type to match on. The
+#: edition-prefix fallback in #516 removes those denials outright, and
+#: is the change that would let this threshold come back down.
+MAX_CONSECUTIVE_EDITION_FAILURES = 75
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
 #: callable the service consumes. Tests inject a fake; the production
@@ -248,6 +275,21 @@ class EditionSyncOutcome:
     docverse_project_id: int
     docverse_project_slug: str
     build_outcome: BuildSyncOutcome | None
+    short_circuited: bool
+    """``True`` when the call returned without contacting LTD at all.
+
+    Set only by the tombstone short-circuit, which returns before
+    ``_ensure_edition`` on the strength of a single ``keeper_sync_state``
+    read. ``sync_project`` reads this to keep such a return out of its
+    consecutive-failure accounting: a database read succeeds *especially*
+    when LTD is down, so treating it as evidence of a healthy edition
+    reset the systemic-failure counter mid-outage.
+
+    Deliberately explicit rather than inferred from ``build_outcome is
+    None``, which is also true of a legitimately build-less edition that
+    really was synced.
+    """
+
     aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
     """Semver aggregates this edition's release build created or moved.
 
@@ -382,9 +424,15 @@ class KeeperSyncService:
         (chained from the last edition's exception) instead of walking
         the remaining editions. Without the abort, a systemic fault
         would mark every remaining edition failed one at a time and
-        still let the run roll up green over a 3-of-80 import. Any
-        single success resets the counter, so scattered isolated
-        failures keep their per-edition boundary.
+        still let the run roll up green over a 3-of-80 import.
+
+        Only an edition that *did work* resets the counter, so scattered
+        isolated failures keep their per-edition boundary while editions
+        the loop passed over stay invisible to the breaker: an edition in
+        ``skip_ltd_ids`` never reaches :meth:`sync_edition`, and one whose
+        ``keeper_sync_state`` row is tombstoned returns a
+        ``short_circuited`` outcome from a lone database read. Neither
+        contacts LTD, so neither is evidence that an outage has ended.
 
         ``on_edition_synced`` runs once per :meth:`sync_edition` return,
         before the next iteration begins. Callbacks fire after each
@@ -498,7 +546,17 @@ class KeeperSyncService:
                         failed_ltd_edition_slugs=recent,
                     ) from exc
                 continue
-            consecutive_failures = 0
+            # Only an edition that actually did work counts as evidence
+            # that the fault was per-edition rather than systemic. A
+            # tombstone short-circuit returns on a single
+            # ``keeper_sync_state`` read without touching LTD — it
+            # succeeds *especially* during an outage — so it leaves the
+            # counter alone, exactly as the ``skip_ltd_ids`` ``continue``
+            # above does. Resetting here let any project with tombstones
+            # scattered through its edition list defeat the breaker with
+            # an alternating fail/skip pattern.
+            if not outcome.short_circuited:
+                consecutive_failures = 0
             outcomes.append(outcome)
             if on_edition_synced is not None:
                 try:
@@ -803,6 +861,7 @@ class KeeperSyncService:
                 docverse_project_id=project.id,
                 docverse_project_slug=project.slug,
                 build_outcome=None,
+                short_circuited=True,
             )
 
         # ``manual`` editions need the published build's git_refs to
@@ -927,6 +986,7 @@ class KeeperSyncService:
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             build_outcome=build_outcome,
+            short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
         )
 
