@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import traceback
 
 import pytest
 import structlog
+from botocore.exceptions import ClientError
 
 from docverse_server.services.keeper_sync.copier import BuildContentCopier
-from docverse_server.storage.ltd import LtdSourceProtocol
+from docverse_server.storage.ltd import (
+    LtdSourceAccessDeniedError,
+    LtdSourceProtocol,
+)
 from docverse_server.storage.objectstore import MockObjectStore
 
 
@@ -416,3 +421,110 @@ async def test_concurrency_observed_peak_does_not_exceed_limit() -> None:
     ).copy_build(source_prefix="src/1/", dest_prefix="dst/")
 
     assert peak <= 4
+
+
+class _ChainedDenialSource(LtdSourceProtocol):
+    """Source whose downloads raise a botocore-chained Docverse denial.
+
+    Mirrors ``LtdS3Source.download_object``, which raises
+    ``LtdSourceAccessDeniedError`` ``from`` the underlying botocore
+    ``ClientError`` — the chain that carries the S3 error code and HTTP
+    status into Sentry and ``queue_jobs.errors``.
+    """
+
+    def __init__(self) -> None:
+        self.client_error = ClientError(
+            {
+                "Error": {"Code": "AccessDenied", "Message": "boom"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            },
+            "GetObject",
+        )
+
+    async def list_keys(self, *, prefix: str) -> list[str]:
+        return [f"{prefix}index.html"]
+
+    async def download_object(self, *, key: str) -> bytes:
+        try:
+            raise self.client_error
+        except ClientError as exc:
+            raise LtdSourceAccessDeniedError(
+                bucket="lsst-the-docs", key=key, operation="GetObject"
+            ) from exc
+
+
+@pytest.mark.asyncio
+async def test_leaf_error_keeps_its_cause_through_the_pool() -> None:
+    """The re-raised leaf keeps the ``__cause__`` its raiser gave it.
+
+    ``raise leaf from None`` clobbers the leaf's own chain, so Sentry and
+    ``queue_jobs.errors`` saw only the Docverse wrapper with no S3 error
+    code or HTTP status underneath it.
+    """
+    source = _ChainedDenialSource()
+    copier = BuildContentCopier(
+        source=source, destination=MockObjectStore(), logger=_logger()
+    )
+
+    with pytest.raises(LtdSourceAccessDeniedError) as excinfo:
+        await copier.copy_build(source_prefix="src/1/", dest_prefix="dst/")
+
+    assert excinfo.value.__cause__ is source.client_error
+
+
+@pytest.mark.asyncio
+async def test_leaf_error_renders_its_cause_not_the_group() -> None:
+    """The rendered chain shows the S3 fault, not the TaskGroup wrapper.
+
+    This is the shape Sentry and ``queue_jobs.errors`` store: the
+    botocore cause has to survive, and the pool's ``ExceptionGroup``
+    must not be tacked on as noise.
+    """
+    copier = BuildContentCopier(
+        source=_ChainedDenialSource(),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    )
+
+    with pytest.raises(LtdSourceAccessDeniedError) as excinfo:
+        await copier.copy_build(source_prefix="src/1/", dest_prefix="dst/")
+
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "ClientError" in rendered
+    assert "AccessDenied" in rendered
+    assert "direct cause" in rendered
+    assert "unhandled errors in a TaskGroup" not in rendered
+    assert "During handling of the above exception" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_uncaused_leaf_error_does_not_render_the_group() -> None:
+    """A leaf with no cause of its own still sheds the group context.
+
+    Without an explicit ``__suppress_context__``, a bare ``raise leaf``
+    inside the ``except BaseExceptionGroup`` block would install the
+    group as ``__context__`` and render it under "During handling of the
+    above exception" — the noise the old ``from None`` suppressed.
+    """
+
+    class _FailingSource(LtdSourceProtocol):
+        async def list_keys(self, *, prefix: str) -> list[str]:
+            return [f"{prefix}index.html"]
+
+        async def download_object(self, *, key: str) -> bytes:
+            msg = f"Simulated download failure for {key}"
+            raise RuntimeError(msg)
+
+    copier = BuildContentCopier(
+        source=_FailingSource(),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await copier.copy_build(source_prefix="src/1/", dest_prefix="dst/")
+
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "Simulated download failure" in rendered
+    assert "unhandled errors in a TaskGroup" not in rendered
+    assert "During handling of the above exception" not in rendered

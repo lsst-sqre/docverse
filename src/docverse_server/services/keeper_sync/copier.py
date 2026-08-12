@@ -205,6 +205,9 @@ class BuildContentCopier:
         the fix: ``gather`` left every sibling running after it raised,
         so a project whose oldest builds fail on every pass accumulated
         one orphaned fan-out per failed build.
+
+        The re-raise keeps the leaf exactly as its raiser built it,
+        chain included — see the comment on the ``except`` clause.
         """
         # One shared iterator, drained cooperatively. ``next()`` never
         # awaits, so no two workers can observe the same key even though
@@ -223,7 +226,18 @@ class BuildContentCopier:
                 for _ in range(worker_count):
                     task_group.create_task(_worker())
         except BaseExceptionGroup as exc_group:
-            raise _first_real_error(exc_group) from None
+            leaf = _first_real_error(exc_group)
+            # Re-raising the leaf ``from`` its *own* ``__cause__`` (which
+            # is often ``None``) suppresses the group as ``__context__``
+            # — the only thing worth hiding here — while leaving any
+            # chain the raiser built deliberately intact. Plain ``from
+            # None`` would suppress the context *and* blank the leaf's
+            # cause: ``LtdSourceAccessDeniedError`` is raised ``from``
+            # the botocore ``ClientError`` carrying the S3 error code and
+            # HTTP status, and httpx upload errors chain the same way, so
+            # blanking it leaves Sentry and ``queue_jobs.errors`` holding
+            # a bare Docverse wrapper with no underlying fault to triage.
+            raise leaf from leaf.__cause__
 
 
 class _ConcurrencyTracker:
