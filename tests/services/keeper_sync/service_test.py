@@ -178,6 +178,7 @@ def _build_service(
     tombstone_service: KeeperSyncTombstoneService | None = None,
     source: _FakeLtdSource | None = None,
     lock_service: LockService | None = None,
+    after_manifest_hash: Callable[[str], None] | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -189,6 +190,12 @@ def _build_service(
     ``source`` overrides the LTD source built from ``source_objects``,
     for tests that need to configure denied prefixes or inspect which
     prefixes the sync consulted.
+
+    ``after_manifest_hash`` fires with the resolved prefix immediately
+    after a successful manifest hash, i.e. inside the exact window
+    ``sync_build`` leaves between deciding on a hash and copying the
+    bytes. It is the seam the mid-resolution-republish tests use to
+    mutate the LTD source at that instant.
     """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -220,7 +227,12 @@ def _build_service(
         )
 
     async def manifest_callable(source_prefix: str) -> str:
-        return await copier.compute_manifest_hash(source_prefix=source_prefix)
+        manifest_hash = await copier.compute_manifest_hash(
+            source_prefix=source_prefix
+        )
+        if after_manifest_hash is not None:
+            after_manifest_hash(source_prefix)
+        return manifest_hash
 
     context = KeeperSyncContext(
         org_store=org_store,
@@ -5412,3 +5424,201 @@ async def test_denied_build_prefix_with_empty_edition_prefix_still_fails(
         )
     assert release is not None
     assert release.current_build_id is None
+
+
+_REPUBLISHED_EDITION_PREFIX = "pipelines/v/0.3.0/"
+
+
+def _seed_republish_race(
+    mock_discovery: respx.Router,
+) -> tuple[dict[str, bytes], _FakeLtdSource, Callable[[str], None]]:
+    """Set up a denied build whose ``v/`` prefix republishes mid-sync.
+
+    Returns the mutable source objects, the LTD source over them, and
+    the ``after_manifest_hash`` hook that overwrites the edition prefix
+    once — reproducing an LTD republish that lands between the hash
+    keeper-sync resolved on and the copy that reads the bytes.
+    """
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+    )
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        # The un-ACL'd build upload that forces the ``v/`` fallback.
+        "pipelines/builds/43/index.html": b"<html>denied</html>",
+        f"{_REPUBLISHED_EDITION_PREFIX}index.html": b"<html>release v1</html>",
+    }
+    source = _FakeLtdSource(
+        source_objects, denied_prefixes=frozenset({"pipelines/builds/43/"})
+    )
+    republished = False
+
+    def republish(prefix: str) -> None:
+        nonlocal republished
+        if prefix != _REPUBLISHED_EDITION_PREFIX or republished:
+            return
+        republished = True
+        source_objects[f"{_REPUBLISHED_EDITION_PREFIX}index.html"] = (
+            b"<html>release v2</html>"
+        )
+
+    return source_objects, source, republish
+
+
+@pytest.mark.asyncio
+async def test_republish_between_hash_and_copy_clears_the_rebuilt_marker(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A mutated source prefix must not leave a converged-looking state.
+
+    ``<product>/v/<slug>/`` is a live prefix LTD rewrites on every
+    republish, so the hash keeper-sync resolves on and the bytes it
+    later copies can come from two different publishes. When they do,
+    the recorded hash must describe the *copied* bytes and the build's
+    ``date_rebuilt_seen`` marker must not be written — writing it would
+    claim LTD's current rebuild had been imported when what landed is a
+    prefix state that no longer exists.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-republish-race")
+
+    source_objects, source, republish = _seed_republish_race(mock_discovery)
+    resolved_hash = await _manifest_hash_of(
+        source, prefix=_REPUBLISHED_EDITION_PREFIX
+    )
+
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        source=source,
+        after_manifest_hash=republish,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.edition_failures == ()
+
+    copied_hash = await _manifest_hash_of(
+        source, prefix=_REPUBLISHED_EDITION_PREFIX
+    )
+    assert copied_hash != resolved_hash
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        assert release.current_build_id is not None
+        build = await build_store.get_by_id(release.current_build_id)
+        assert build is not None
+        # The bytes that landed are the republished ones, and that is
+        # the hash both the build row and the state row carry.
+        assert build.content_hash == copied_hash
+
+        state = await state_store.get(
+            org_id=org_id, resource_type=ResourceType.build, ltd_id=43
+        )
+        assert state is not None
+        assert state.content_hash == copied_hash
+        # No marker: the next poll re-resolves instead of concluding
+        # LTD's current rebuild is already imported.
+        assert state.date_rebuilt_seen is None
+        assert state.annotations is not None
+        assert state.annotations["ltd_source_manifest_hash"] == resolved_hash
+
+
+@pytest.mark.asyncio
+async def test_republished_prefix_reconverges_on_the_next_sync(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The retracted marker is what makes the following poll finish.
+
+    Convergence, not just detection: once the prefix settles, the next
+    sync re-resolves the edition (rather than short-circuiting on the
+    marker), finds the hash it now reads already carried by the build
+    the mutated run imported, and dedupes onto it — recording the
+    rebuild marker without copying a single object again.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-republish-converge")
+
+    source_objects, source, republish = _seed_republish_race(mock_discovery)
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        source=source,
+        after_manifest_hash=republish,
+    )
+    assert (
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    ).edition_failures == ()
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+    build_id_after_first = release.current_build_id
+    assert build_id_after_first is not None
+    objects_after_first = set(object_store.objects)
+    prefixes_after_first = len(source.listed_prefixes)
+
+    # Second poll, with the prefix now settled on the republished bytes.
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.edition_failures == ()
+
+    # It re-read the edition prefix instead of short-circuiting.
+    assert (
+        _REPUBLISHED_EDITION_PREFIX
+        in source.listed_prefixes[prefixes_after_first:]
+    )
+    # ...and dedupe carried it: no object was copied a second time.
+    assert set(object_store.objects) == objects_after_first
+
+    async with db_session.begin():
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        assert release.current_build_id == build_id_after_first
+
+        state = await state_store.get(
+            org_id=org_id, resource_type=ResourceType.build, ltd_id=43
+        )
+        assert state is not None
+        # The marker is back: this LTD rebuild really is imported now.
+        assert state.date_rebuilt_seen is not None
+        # And the forensic annotation is gone with the mutation it
+        # described — annotations replace wholesale on a clean resolve.
+        assert state.annotations is not None
+        assert "ltd_source_manifest_hash" not in state.annotations

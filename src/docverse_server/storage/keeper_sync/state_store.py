@@ -159,6 +159,21 @@ def _key_clauses(
     ]
 
 
+def _apply_present_columns(
+    row: SqlKeeperSyncState, values: dict[str, Any]
+) -> None:
+    """Overwrite only the columns whose new value is not ``None``.
+
+    ``upsert``'s partial-update contract: an omitted argument arrives as
+    ``None`` and means "leave the stored value alone", so ``None`` can
+    never be written through this path. Retracting a value needs an
+    explicit flag — see ``clear_date_rebuilt_seen``.
+    """
+    for column, value in values.items():
+        if value is not None:
+            setattr(row, column, value)
+
+
 class KeeperSyncStateStore:
     """Direct database operations for ``keeper_sync_state`` rows."""
 
@@ -450,6 +465,7 @@ class KeeperSyncStateStore:
         docverse_id: int | None = None,
         date_last_synced: datetime | None = None,
         date_rebuilt_seen: datetime | None = None,
+        clear_date_rebuilt_seen: bool = False,
         last_seen_etag: str | None = None,
         content_hash: str | None = None,
         annotations: dict[str, Any] | None = None,
@@ -461,12 +477,28 @@ class KeeperSyncStateStore:
         update, only non-``None`` fields overwrite the existing row;
         ``None`` arguments preserve whatever value is already stored.
 
+        ``clear_date_rebuilt_seen`` is the one escape from that rule:
+        it forces the column to ``NULL`` rather than preserving it, so a
+        caller can retract a rebuild marker it is no longer entitled to
+        claim. Keeper-sync uses it when the bytes it copied turn out not
+        to match the hash it resolved on — leaving the stale marker in
+        place would let the next poll short-circuit on a resolution that
+        never held. Passing it alongside a non-``None``
+        ``date_rebuilt_seen`` asks for both at once and raises
+        ``ValueError``.
+
         A newly inserted row is minted a time-ordered Base32 ``public_id``
         via :func:`insert_with_time_ordered_public_id`, which re-mints on
         the (rare) same-millisecond collision. Every state row carries a
         public id, not just tombstoned ones — a tombstone is simply a
         state row with ``date_tombstoned`` set.
         """
+        if clear_date_rebuilt_seen and date_rebuilt_seen is not None:
+            msg = (
+                "upsert cannot both set and clear date_rebuilt_seen; pass"
+                " clear_date_rebuilt_seen only with date_rebuilt_seen=None"
+            )
+            raise ValueError(msg)
         clauses = _key_clauses(
             org_id=org_id,
             resource_type=resource_type,
@@ -501,18 +533,21 @@ class KeeperSyncStateStore:
             return KeeperSyncState.model_validate(row)
         else:
             row.ltd_slug = ltd_slug
-            if docverse_id is not None:
-                row.docverse_id = docverse_id
-            if date_last_synced is not None:
-                row.date_last_synced = date_last_synced
-            if date_rebuilt_seen is not None:
-                row.date_rebuilt_seen = date_rebuilt_seen
-            if last_seen_etag is not None:
-                row.last_seen_etag = last_seen_etag
-            if content_hash is not None:
-                row.content_hash = content_hash
-            if annotations is not None:
-                row.annotations = annotations
+            _apply_present_columns(
+                row,
+                {
+                    "docverse_id": docverse_id,
+                    "date_last_synced": date_last_synced,
+                    "date_rebuilt_seen": date_rebuilt_seen,
+                    "last_seen_etag": last_seen_etag,
+                    "content_hash": content_hash,
+                    "annotations": annotations,
+                },
+            )
+            # Guarded above as mutually exclusive with a supplied
+            # ``date_rebuilt_seen``, so this can run last unconditionally.
+            if clear_date_rebuilt_seen:
+                row.date_rebuilt_seen = None
         await self._session.flush()
         await self._session.refresh(row)
         return KeeperSyncState.model_validate(row)

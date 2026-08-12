@@ -74,6 +74,71 @@ async def test_upsert_inserts_row_first_time(
 
 
 @pytest.mark.asyncio
+async def test_upsert_clears_date_rebuilt_seen_on_request(
+    db_session: AsyncSession,
+) -> None:
+    """``clear_date_rebuilt_seen`` retracts a marker ``None`` would keep.
+
+    Every other column treats ``None`` as "leave it alone", so a caller
+    that discovers its recorded rebuild marker was never earned has no
+    way to take it back without this flag.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-state-clear")
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.build,
+            ltd_id=42,
+            ltd_slug="42",
+            date_rebuilt_seen=datetime(2026, 4, 30, 18, 30, tzinfo=UTC),
+        )
+    async with db_session.begin():
+        preserved = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.build,
+            ltd_id=42,
+            ltd_slug="42",
+            docverse_id=7,
+        )
+    assert preserved.date_rebuilt_seen is not None
+    async with db_session.begin():
+        cleared = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.build,
+            ltd_id=42,
+            ltd_slug="42",
+            clear_date_rebuilt_seen=True,
+        )
+    assert cleared.date_rebuilt_seen is None
+    # Nothing else was disturbed.
+    assert cleared.docverse_id == 7
+
+
+@pytest.mark.asyncio
+async def test_upsert_rejects_setting_and_clearing_date_rebuilt_seen(
+    db_session: AsyncSession,
+) -> None:
+    """Asking to both write and retract the marker is a caller bug."""
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-state-clear-conflict")
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    with pytest.raises(ValueError, match="both set and clear"):
+        async with db_session.begin():
+            await store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.build,
+                ltd_id=42,
+                ltd_slug="42",
+                date_rebuilt_seen=datetime(2026, 4, 30, tzinfo=UTC),
+                clear_date_rebuilt_seen=True,
+            )
+
+
+@pytest.mark.asyncio
 async def test_upsert_mints_unique_public_id(
     db_session: AsyncSession,
 ) -> None:

@@ -264,6 +264,40 @@ class _ResolvedBuildSource:
     bytes that were uploaded. Bundling the two together makes that
     impossible to get wrong: the prefix is resolved once, and the hash
     that comes back is the hash *of that prefix*.
+
+    The same prefix is not the same *instant*, though. ``sync_build``
+    was written against ``<product>/builds/<slug>/``, which LTD writes
+    once and never rewrites, so "hash now, copy later" was safe by
+    construction. The ``v/`` fallback (#516) reads
+    ``<product>/v/<edition-slug>/``, a live prefix LTD overwrites on
+    every republish of that edition, and the hash and the copy are two
+    separate passes over the bucket. A republish landing between them
+    leaves :attr:`manifest_hash` describing bytes that are already gone.
+
+    That opens two windows, handled differently:
+
+    * **Copy path** — no existing build carries :attr:`manifest_hash`,
+      so the bytes are imported. ``sync_build`` compares the copier's
+      hash against :attr:`manifest_hash` afterwards and treats a
+      difference as the mutation it is: the *copied* hash is what the
+      build and state rows record, and the build's ``date_rebuilt_seen``
+      marker is cleared so the next poll re-resolves instead of
+      short-circuiting on a resolution that never held. The re-resolve
+      then dedupes onto this very build if the prefix has settled on
+      what we copied, so a settled prefix converges without another
+      copy.
+    * **Dedupe-repoint path** — an existing build already carries
+      :attr:`manifest_hash`, so nothing is copied and there is no
+      second read to compare against. Detecting the mutation would mean
+      hashing the prefix again, a second full download of exactly the
+      content the dedupe exists to avoid transferring, so this window is
+      **accepted rather than mitigated**. The blast radius is bounded:
+      the edition is repointed at a real, complete Docverse build whose
+      content is what LTD served moments earlier, never at a phantom or
+      a half-import. Convergence comes from LTD, which advances the
+      edition's ``date_rebuilt`` on every republish — the poll after the
+      republish therefore sees a marker that no longer matches and
+      re-syncs the edition onto the new content.
     """
 
     prefix: str
@@ -1726,6 +1760,41 @@ class KeeperSyncService:
             source.prefix, new_build.storage_prefix
         )
 
+        # The hash the dedupe/convergence decision above was made on and
+        # the bytes just copied are two reads of the same prefix at two
+        # different times. For a build prefix that is a distinction
+        # without a difference (LTD never rewrites one), but the ``v/``
+        # fallback reads a prefix LTD overwrites on every republish, so
+        # the two can disagree — see :class:`_ResolvedBuildSource`. The
+        # check is unconditional because a build-prefix disagreement
+        # would be a copier bug worth the same alarm, and because
+        # comparing two strings we already hold is free.
+        source_mutated = copy_result.content_hash != source.manifest_hash
+        annotations = source.annotations
+        if source_mutated:
+            # The hash that is no longer true of anything is still the
+            # hash the resolution branched on, so keep it on the row:
+            # a log line naming it will have rotated away long before
+            # anyone asks why this build exists.
+            annotations = {
+                **annotations,
+                "ltd_source_manifest_hash": source.manifest_hash,
+            }
+            self._logger.warning(
+                "LTD source prefix changed between hash and copy; importing"
+                " the copied bytes and forcing a re-sync",
+                ltd_build_id=ltd_build.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                edition_slug=edition.slug,
+                project=project.slug,
+                ltd_source_prefix=source.prefix,
+                ltd_source_prefix_origin=annotations[
+                    "ltd_source_prefix_origin"
+                ],
+                resolved_manifest_hash=source.manifest_hash,
+                content_hash=copy_result.content_hash,
+            )
+
         async with (
             self._edition_update_lock(
                 org_id=org_id, project_id=project.id, edition_id=edition.id
@@ -1746,9 +1815,18 @@ class KeeperSyncService:
                 ltd_slug=ltd_build.slug,
                 docverse_id=new_build.id,
                 date_last_synced=_now(),
-                date_rebuilt_seen=ltd_edition.date_rebuilt,
+                # Recording LTD's ``date_rebuilt`` claims "this LTD
+                # rebuild is imported". After a mutation we imported a
+                # prefix state that no longer exists, so the marker is
+                # retracted (not merely left alone — a stale row could
+                # already carry a matching one) and the next poll
+                # re-resolves the edition rather than short-circuiting.
+                date_rebuilt_seen=(
+                    None if source_mutated else ltd_edition.date_rebuilt
+                ),
+                clear_date_rebuilt_seen=source_mutated,
                 content_hash=copy_result.content_hash,
-                annotations=source.annotations,
+                annotations=annotations,
             )
 
         self._logger.info(
