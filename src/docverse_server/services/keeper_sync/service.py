@@ -44,6 +44,7 @@ from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
     resolve_edition_autocreation,
 )
+from docverse_server.domain.edition_kind import is_kind_promotion
 from docverse_server.domain.lifecycle import (
     DraftInactivityRule,
     RefDeletedRule,
@@ -208,20 +209,6 @@ _PLACEHOLDER_CONTENT_HASH = f"sha256:{'0' * 64}"
 
 #: Username recorded as the build's uploader for synced builds.
 _SYNC_UPLOADER = "keeper-sync"
-
-#: ``(current kind, derived kind)`` pairs the per-sync kind refresh is
-#: allowed to write. Promote-only by construction (PRD #498): editions
-#: imported before keeper-sync derived kinds properly are all ``draft``,
-#: so promoting them to ``release`` is the whole healing story. Encoding
-#: the policy as an allow-list of transitions — rather than "derived !=
-#: current" — is what makes every other case safe without a special
-#: case: demotions never appear here, ``main`` / ``major`` / ``minor`` /
-#: ``alternate`` are never a source kind, and a ``release`` an operator
-#: set by hand through the editions PATCH API is never a source kind
-#: either, so manual decisions survive every subsequent sync.
-_KIND_PROMOTIONS: frozenset[tuple[EditionKind, EditionKind]] = frozenset(
-    {(EditionKind.draft, EditionKind.release)}
-)
 
 
 @dataclass(frozen=True)
@@ -1274,17 +1261,16 @@ class KeeperSyncService:
     ) -> Edition:
         """Apply a freshly derived kind to an existing edition.
 
-        Promote-only: the ``(current, derived)`` pair must be listed in
-        :data:`_KIND_PROMOTIONS`, so the only write this can make is
-        ``draft`` -> ``release``. Everything else is a no-op that
-        returns ``edition`` unchanged — see :data:`_KIND_PROMOTIONS` for
-        why that single rule covers demotions, aggregate kinds, and
-        manually PATCHed kinds alike.
+        Promote-only per the shared
+        :func:`~docverse_server.domain.edition_kind.is_kind_promotion`
+        policy — the same gate the native ``track_build`` path applies —
+        so the only write this can make is ``draft`` -> ``release``.
+        Everything else is a no-op that returns ``edition`` unchanged.
 
         Returns the edition with the promoted kind applied so the caller
         reports the row's post-sync state rather than the stale read.
         """
-        if (edition.kind, kind_derivation.kind) not in _KIND_PROMOTIONS:
+        if not is_kind_promotion(edition.kind, kind_derivation.kind):
             return edition
         await self._edition_store.update_kind(
             edition_id=edition.id, kind=kind_derivation.kind

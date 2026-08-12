@@ -17,6 +17,7 @@ from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
+from docverse_server.domain.edition_kind import is_kind_promotion
 from docverse_server.domain.edition_tracking import (
     EditionTrackingOutcome,
     EditionTrackingResult,
@@ -201,7 +202,12 @@ class EditionTrackingService:
             if not any(e.id == ve.id for e in editions):
                 editions.append(ve)
 
-        # 8. Update each edition
+        # 8. Heal kinds derived before the built-in version rules landed
+        editions = await self._refresh_kinds(
+            editions, derivation=derivation, project_id=project.id
+        )
+
+        # 9. Update each edition
         outcomes = await self._update_editions(
             editions,
             build,
@@ -215,6 +221,59 @@ class EditionTrackingService:
             suppressed=False,
             outcomes=outcomes,
         )
+
+    async def _refresh_kinds(
+        self,
+        editions: list[Edition],
+        *,
+        derivation: SlugDerivationResult,
+        project_id: int,
+    ) -> list[Edition]:
+        """Re-apply the derived kind to already-existing editions.
+
+        ``find_matching_editions`` only ever moves an edition's build
+        pointer, so an edition created before the built-in version rules
+        existed keeps whatever kind it was stamped with — a
+        version-slugged edition stays ``draft`` forever, holding the
+        short CDN cache profile and staying eligible for
+        ``draft_inactivity`` soft-deletion, while the byte-identical
+        edition on a keeper-sync-migrated project is promoted to
+        ``release`` on every sync. Re-deriving here closes that gap.
+
+        The write is gated by the shared
+        :func:`~docverse_server.domain.edition_kind.is_kind_promotion`
+        policy — the same one keeper-sync's ``_refresh_kind`` applies —
+        so the gate alone makes the sweep safe across the whole matched
+        set: the ``__main`` edition (``main``), the ``N`` / ``N.M``
+        aggregates (``major`` / ``minor``), an ``alternate``, a
+        hand-PATCHed ``release``, and every row just auto-created with
+        this very derivation are all no-ops, because none of them is a
+        ``(draft, release)`` pair.
+
+        Returns the list with promoted rows replaced by their post-write
+        state, so downstream steps see the kind that is in the database.
+        """
+        refreshed: list[Edition] = []
+        for edition in editions:
+            if not is_kind_promotion(edition.kind, derivation.edition_kind):
+                refreshed.append(edition)
+                continue
+            await self._deps.edition_store.update_kind(
+                edition_id=edition.id, kind=derivation.edition_kind
+            )
+            self._deps.logger.info(
+                "Promoted edition kind",
+                edition_slug=edition.slug,
+                edition_id=edition.id,
+                project_id=project_id,
+                previous_kind=edition.kind.value,
+                edition_kind=derivation.edition_kind.value,
+                matched_rule_type=derivation.matched_rule_type,
+            )
+            refreshed.append(
+                edition.model_copy(update={"kind": derivation.edition_kind})
+            )
+        return refreshed
 
     async def _update_editions(
         self,
