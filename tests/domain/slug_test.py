@@ -676,14 +676,53 @@ class TestDeriveEditionKindFromRef:
         assert derivation.edition_kind == EditionKind.draft
         assert derivation.matched_rule_type == "semver"
 
-    def test_ignore_rule_reports_draft_rather_than_suppressing(self) -> None:
-        """Ignore rules gate auto-creation, not classification."""
+    def test_ignore_match_falls_through_to_builtin_version_rules(
+        self,
+    ) -> None:
+        """Ignore rules gate auto-creation, not classification.
+
+        An org that ignores ``v*`` to gate native per-tag edition
+        auto-creation must not thereby have keeper-sync classify its
+        imported release tags as drafts.
+        """
         rules: list[AnySlugRewriteRule] = [
             IgnoreRule(type="ignore", glob="v*")
         ]
-        derivation = derive_edition_kind_from_ref("v1.2.3", rules)
+        derivation = derive_edition_kind_from_ref("v15.2.1", rules)
+        assert derivation.edition_kind == EditionKind.release
+        assert derivation.matched_rule_type == "semver"
+
+    def test_ignore_match_on_non_version_ref_still_drafts(self) -> None:
+        """Falling through an ignore match lands on the draft fallback."""
+        rules: list[AnySlugRewriteRule] = [
+            IgnoreRule(type="ignore", glob="dependabot/**")
+        ]
+        derivation = derive_edition_kind_from_ref(
+            "dependabot/pip/pydantic-2", rules
+        )
         assert derivation.edition_kind == EditionKind.draft
         assert derivation.matched_rule_type is None
+
+    def test_ignore_match_falls_through_to_later_user_rules(self) -> None:
+        """The chain resumes at the next rule, not at the built-ins."""
+        rules: list[AnySlugRewriteRule] = [
+            IgnoreRule(type="ignore", glob="v*"),
+            SemverRule(type="semver", edition_kind=EditionKind.draft),
+        ]
+        derivation = derive_edition_kind_from_ref("v15.2.1", rules)
+        assert derivation.edition_kind == EditionKind.draft
+        assert derivation.matched_rule_type == "semver"
+
+    def test_ignore_rule_still_suppresses_on_the_slug_path(self) -> None:
+        """Only classification ignores ignore rules; creation still obeys."""
+        rules: list[AnySlugRewriteRule] = [
+            IgnoreRule(type="ignore", glob="v*")
+        ]
+        assert derive_edition_slug("v15.2.1", rules) is None
+        assert (
+            derive_edition_kind_from_ref("v15.2.1", rules).edition_kind
+            == EditionKind.release
+        )
 
     def test_unslugifiable_ref_still_classifies(self) -> None:
         """No ``validate_slug`` call, so odd refs classify instead of raise."""

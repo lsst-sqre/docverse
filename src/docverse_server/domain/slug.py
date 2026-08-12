@@ -419,17 +419,26 @@ def _match_rewrite_rule(
 
 
 def _run_rule_chain(
-    git_ref: str, rules: Sequence[AnySlugRewriteRule]
+    git_ref: str,
+    rules: Sequence[AnySlugRewriteRule],
+    *,
+    honor_ignore_rules: bool = True,
 ) -> _ChainOutcome:
     """Walk *rules* then the built-ins; the first match wins.
 
     Shared by `derive_edition_slug` and `derive_edition_kind_from_ref`
     so both agree on precedence: org/project-configured rules first,
     then `BUILTIN_SLUG_REWRITE_RULES`, then "nothing matched".
+
+    *honor_ignore_rules* selects what an `IgnoreRule` match means.
+    Slug derivation leaves it on and suppresses auto-creation.
+    Kind-only derivation passes ``False``, which skips ignore rules
+    outright so the chain continues into the remaining rules and the
+    built-in version heuristics rather than short-circuiting.
     """
     for rule in chain(rules, BUILTIN_SLUG_REWRITE_RULES):
         if isinstance(rule, IgnoreRule):
-            if fnmatch.fnmatchcase(git_ref, rule.glob):
+            if honor_ignore_rules and fnmatch.fnmatchcase(git_ref, rule.glob):
                 return _ChainOutcome(suppressed=True)
             continue
         match = _match_rewrite_rule(rule, git_ref)
@@ -454,9 +463,13 @@ def derive_edition_kind_from_ref(
     of `derive_edition_slug` so ref shapes that would not survive
     `validate_slug` still get classified rather than raising.
 
-    An ignore rule reports ``draft`` rather than suppressing: ignore
-    rules gate *auto-creation*, and a caller asking only for a kind has
-    already decided the edition exists.
+    Ignore rules are skipped entirely rather than suppressing or
+    forcing ``draft``: they gate *auto-creation*, and a caller asking
+    only for a kind has already decided the edition exists. A match
+    therefore falls through to the rest of the chain, so an org that
+    ignores ``v*`` to gate per-tag auto-creation still has its imported
+    ``v15.2.1`` edition classified ``release`` by the built-in semver
+    rule. Refs that match nothing else still land on the draft fallback.
 
     Parameters
     ----------
@@ -470,9 +483,7 @@ def derive_edition_kind_from_ref(
     RefKindDerivation
         The derived kind and the ``type`` of the rule that produced it.
     """
-    outcome = _run_rule_chain(git_ref, rules)
-    if outcome.suppressed:
-        return RefKindDerivation(edition_kind=EditionKind.draft)
+    outcome = _run_rule_chain(git_ref, rules, honor_ignore_rules=False)
     return RefKindDerivation(
         edition_kind=outcome.edition_kind,
         matched_rule_type=outcome.matched_rule_type,

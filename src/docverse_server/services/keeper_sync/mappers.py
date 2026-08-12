@@ -114,7 +114,9 @@ def derive_edition_kind(
        consulting the ref at all.
     3. Everything else (``git_refs``, ``manual``) runs the full
        slug-rewrite rule chain — org/project rules then the built-in
-       version heuristics — against the tracked ref.
+       version heuristics — against the tracked ref. Ignore rules do
+       not participate: they gate auto-creation on the native path,
+       and these editions already exist in LTD.
 
     Parameters
     ----------

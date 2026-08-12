@@ -146,6 +146,41 @@ class TestDeriveEditionKind:
         assert derivation.kind == EditionKind.draft
         assert derivation.source == EditionKindSource.rule
 
+    def test_ignore_rule_does_not_draft_a_version_ref(self) -> None:
+        """An ignore rule gating auto-creation must not demote imports.
+
+        Orgs use ``{"type": "ignore", "glob": "v*"}`` to stop the native
+        path auto-creating a per-tag edition. Keeper-sync's editions
+        already exist, so the ignore match must fall through to the
+        built-in semver rule rather than classifying them ``draft`` and
+        feeding them back to the preemptive lifecycle pass.
+        """
+        rules = parse_slug_rewrite_rules([{"type": "ignore", "glob": "v*"}])
+        edition = _edition(
+            slug="v15.2.1", mode="git_refs", tracked_refs=["v15.2.1"]
+        )
+        derivation = derive_edition_kind(
+            edition, git_ref="v15.2.1", rules=rules
+        )
+        assert derivation.kind == EditionKind.release
+        assert derivation.source == EditionKindSource.rule
+        assert derivation.detail == "semver"
+
+    def test_ignore_rule_leaves_non_version_refs_drafts(self) -> None:
+        rules = parse_slug_rewrite_rules(
+            [{"type": "ignore", "glob": "tickets/*"}]
+        )
+        edition = _edition(
+            slug="DM-54112",
+            mode="git_refs",
+            tracked_refs=["tickets/DM-54112"],
+        )
+        derivation = derive_edition_kind(
+            edition, git_ref="tickets/DM-54112", rules=rules
+        )
+        assert derivation.kind == EditionKind.draft
+        assert derivation.source == EditionKindSource.fallback
+
     def test_unknown_mode_degrades_to_the_rule_chain(self) -> None:
         """Schema drift must not crash kind derivation.
 
