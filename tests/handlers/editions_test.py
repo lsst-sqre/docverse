@@ -17,6 +17,7 @@ from docverse.models.builds import BuildAnnotations
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.edition import Edition
 from docverse_server.factory import Factory
 from docverse_server.metrics import LifecycleAction, MetricsEditionKind
 from docverse_server.storage.build_store import BuildStore
@@ -584,6 +585,99 @@ async def test_create_edition_with_uppercase_ticket_slug(
     )
     assert fetched.status_code == 200
     assert fetched.json()["slug"] == "DM-54112"
+
+
+@pytest.mark.asyncio
+async def test_patch_kind_pins_the_edition_against_re_derivation(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``kind`` in the PATCH body records the operator's decision.
+
+    End-to-end proof that the handler's ``exclude_unset`` round-trip
+    through ``EditionService.update`` preserves the signal all the way
+    to ``kind_manually_set``, which is what stops keeper-sync and the
+    native upload path from re-deriving over the operator (PRD #498).
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "1.0.0",
+            "title": "1.0.0",
+            "kind": "release",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "1.0.0"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/1.0.0",
+        json={"kind": "draft"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["kind"] == "draft"
+
+    edition = await _fetch_edition(db_session, slug="1.0.0")
+    assert edition.kind_manually_set is True
+
+
+@pytest.mark.asyncio
+async def test_patch_without_kind_leaves_the_edition_unpinned(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A title-only PATCH is not a kind decision and must not pin.
+
+    Pinning on any PATCH would freeze the kind of every edition an
+    operator ever renamed, quietly opting them out of the healing the
+    PRD's whole promote-only story depends on.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "2.0.0",
+            "title": "Original",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "2.0.0"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/2.0.0",
+        json={"title": "Renamed"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+
+    edition = await _fetch_edition(db_session, slug="2.0.0")
+    assert edition.kind_manually_set is False
+
+
+async def _fetch_edition(db_session: AsyncSession, *, slug: str) -> Edition:
+    """Read one ``ed-proj`` edition straight from the database.
+
+    ``kind_manually_set`` is deliberately server-internal — it is set as
+    a side effect of PATCHing ``kind`` and never appears in a response
+    body — so these assertions go to the row rather than the API.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        proj_store = ProjectStore(session=db_session, logger=logger)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        org = await org_store.get_by_slug("ed-org")
+        assert org is not None
+        project = await proj_store.get_by_slug(org_id=org.id, slug="ed-proj")
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug=slug
+        )
+    assert edition is not None
+    return edition
 
 
 @pytest.mark.asyncio

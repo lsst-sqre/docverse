@@ -14,6 +14,7 @@ from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
+    EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
@@ -1539,6 +1540,54 @@ async def test_track_build_promotes_pre_existing_draft_edition(
         assert healed is not None
         assert healed.kind == EditionKind.release
         assert healed.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_respects_manual_demotion_to_draft(
+    db_session: AsyncSession,
+) -> None:
+    """A hand-PATCHed demotion is not undone by the next upload.
+
+    The native heal shares keeper-sync's promote-only gate, so it shares
+    the blind spot the gate alone leaves: an edition demoted from
+    ``release`` to ``draft`` sits on the one permitted transition. Its
+    ``kind_manually_set`` flag — stamped here by the real editions-API
+    write path, ``EditionStore.update`` — is what holds the operator's
+    decision through every subsequent build.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="manual-draft-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        pinned = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="1.0.0",
+                title="1.0.0",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            ),
+        )
+        demoted = await edition_store.update(
+            project_id=project.id,
+            slug="1.0.0",
+            data=EditionUpdate(kind=EditionKind.draft),
+        )
+        assert demoted is not None
+        assert demoted.kind == EditionKind.draft
+
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        held = await edition_store.get_by_id(pinned.id)
+        assert held is not None
+        assert held.kind == EditionKind.draft
+        assert held.current_build_id == build.id
         await db_session.commit()
 
 

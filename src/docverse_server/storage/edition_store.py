@@ -68,6 +68,7 @@ class EditionStore:
             SqlEdition.title,
             SqlEdition.project_id,
             SqlEdition.kind,
+            SqlEdition.kind_manually_set,
             SqlEdition.tracking_mode,
             SqlEdition.tracking_params,
             SqlEdition.alternate_name,
@@ -317,6 +318,16 @@ class EditionStore:
         """Update an edition by project_id and slug.
 
         Slug matching is case-insensitive (see :meth:`get_by_slug`).
+
+        This is the editions PATCH API's only write path, so it is also
+        where the manual-override flag is stamped: a payload that carries
+        ``kind`` is an operator declaring that edition's kind, and
+        ``kind_manually_set`` records the declaration so the automated
+        re-derivation paths stop rewriting the row (PRD #498). The flag
+        is set on the *presence* of ``kind`` in the payload rather than
+        on a value change, so re-asserting the kind an edition already
+        has still pins it — that is exactly how an operator undoes an
+        automatic promotion they disagree with.
         """
         result = await self._session.execute(
             select(SqlEdition).where(
@@ -331,6 +342,8 @@ class EditionStore:
         updates = data.model_dump(mode="json", exclude_unset=True)
         for key, value in updates.items():
             setattr(row, key, value)
+        if updates.get("kind") is not None:
+            row.kind_manually_set = True
         await self._session.flush()
         await self._session.refresh(row)
         # Re-query to get current_build_public_id via join

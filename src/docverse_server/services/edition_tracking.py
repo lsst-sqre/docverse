@@ -245,17 +245,23 @@ class EditionTrackingService:
         policy — the same one keeper-sync's ``_refresh_kind`` applies —
         so the gate alone makes the sweep safe across the whole matched
         set: the ``__main`` edition (``main``), the ``N`` / ``N.M``
-        aggregates (``major`` / ``minor``), an ``alternate``, a
-        hand-PATCHed ``release``, and every row just auto-created with
-        this very derivation are all no-ops, because none of them is a
-        ``(draft, release)`` pair.
+        aggregates (``major`` / ``minor``), an ``alternate``, and every
+        row just auto-created with this very derivation are all no-ops,
+        because none of them is a ``(draft, release)`` pair. Any edition
+        whose kind an operator PATCHed by hand — including one demoted
+        from ``release`` to ``draft``, which *is* such a pair — is held
+        back by its ``kind_manually_set`` flag instead.
 
         Returns the list with promoted rows replaced by their post-write
         state, so downstream steps see the kind that is in the database.
         """
         refreshed: list[Edition] = []
         for edition in editions:
-            if not is_kind_promotion(edition.kind, derivation.edition_kind):
+            if not is_kind_promotion(
+                edition.kind,
+                derivation.edition_kind,
+                kind_manually_set=edition.kind_manually_set,
+            ):
                 refreshed.append(edition)
                 continue
             await self._deps.edition_store.update_kind(

@@ -1264,13 +1264,18 @@ class KeeperSyncService:
         Promote-only per the shared
         :func:`~docverse_server.domain.edition_kind.is_kind_promotion`
         policy — the same gate the native ``track_build`` path applies —
-        so the only write this can make is ``draft`` -> ``release``.
+        so the only write this can make is ``draft`` -> ``release``, and
+        only on an edition whose kind no operator has pinned by hand.
         Everything else is a no-op that returns ``edition`` unchanged.
 
         Returns the edition with the promoted kind applied so the caller
         reports the row's post-sync state rather than the stale read.
         """
-        if not is_kind_promotion(edition.kind, kind_derivation.kind):
+        if not is_kind_promotion(
+            edition.kind,
+            kind_derivation.kind,
+            kind_manually_set=edition.kind_manually_set,
+        ):
             return edition
         await self._edition_store.update_kind(
             edition_id=edition.id, kind=kind_derivation.kind

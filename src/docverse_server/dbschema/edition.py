@@ -44,6 +44,10 @@ class SqlEdition(Base):
         nullable=False,
     )
 
+    kind_manually_set: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     tracking_mode: Mapped[TrackingMode] = mapped_column(
         Enum(TrackingMode, native_enum=False, length=32),
         nullable=False,

@@ -29,6 +29,7 @@ from docverse.models import (
     BuildStatus,
     EditionCreate,
     EditionKind,
+    EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
@@ -2933,6 +2934,69 @@ async def test_resync_kind_refresh_is_promote_only(
         edition = await edition_store.get_by_id(edition_id)
     assert edition is not None
     assert edition.kind == existing_kind
+
+
+@pytest.mark.asyncio
+async def test_resync_respects_manual_demotion_to_draft(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An operator's ``release`` -> ``draft`` PATCH survives every poll.
+
+    The one case the promote-only allow-list cannot protect on its own:
+    a demoted edition sits on ``(draft, release)``, exactly the pair the
+    policy permits, so before ``kind_manually_set`` the very next tier
+    poll silently promoted it back within minutes. The PATCH here goes
+    through ``EditionStore.update``, the real editions-API write path,
+    so the flag is stamped the way production stamps it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-manual-demote")
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="15.2.1",
+        kind=EditionKind.release,
+        git_ref="15.2.1",
+    )
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        seeded = await edition_store.get_by_id(edition_id)
+        assert seeded is not None
+        demoted = await edition_store.update(
+            project_id=seeded.project_id,
+            slug="15.2.1",
+            data=EditionUpdate(kind=EditionKind.draft),
+        )
+    assert demoted is not None
+    assert demoted.kind == EditionKind.draft
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>demoted</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.kind == EditionKind.draft
 
 
 @pytest.mark.asyncio

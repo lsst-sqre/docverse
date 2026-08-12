@@ -30,6 +30,16 @@ class Edition(BaseModel):
 
     kind: EditionKind = Field(description="Kind of edition.")
 
+    kind_manually_set: bool = Field(
+        default=False,
+        description=(
+            "Whether an operator set ``kind`` by hand through the editions"
+            " PATCH API. Pins the kind: the automated re-derivation paths"
+            " (keeper-sync's per-sync refresh and the native build-upload"
+            " heal) skip this edition entirely."
+        ),
+    )
+
     tracking_mode: TrackingMode = Field(
         description="How this edition tracks builds for automatic updates."
     )

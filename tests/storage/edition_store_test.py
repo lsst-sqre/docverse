@@ -281,6 +281,40 @@ async def test_update_edition(
 
 
 @pytest.mark.asyncio
+async def test_update_kind_marks_manual_override(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A PATCH carrying ``kind`` pins the edition's kind for good.
+
+    ``update`` is the editions PATCH API's only write path, so it is
+    where the operator's "I decided this kind" signal is recorded.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        created = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="pinned-ed",
+                title="Pinned",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            ),
+        )
+        assert created.kind_manually_set is False
+        updated = await edition_store.update(
+            project_id=project_id,
+            slug="pinned-ed",
+            data=EditionUpdate(kind=EditionKind.draft),
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.kind == EditionKind.draft
+    assert updated.kind_manually_set is True
+
+
+@pytest.mark.asyncio
 async def test_update_tracking(
     db_session: AsyncSession,
     edition_store: EditionStore,
