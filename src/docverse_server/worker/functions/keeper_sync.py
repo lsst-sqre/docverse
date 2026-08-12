@@ -88,6 +88,7 @@ from docverse_server.services.publish_enqueue import (
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
@@ -856,27 +857,34 @@ async def _self_heal_unpublished_editions(
 
     Iterates ``sync_result.edition_outcomes`` looking for editions whose
     sync short-circuited (``build_outcome.short_circuited`` is ``True``)
-    *and* whose Docverse-side ``publish_status`` is still ``NULL``. The
-    freshly-synced branch is now handled by
+    and whose current build has no publish on record, as
+    :func:`_resolve_unpublished_build_target` decides. The freshly-synced
+    branch is now handled by
     :func:`_enqueue_publish_for_synced_edition` as an
     ``on_edition_synced`` callback — running that path here too would
     double-publish.
 
-    A short-circuit + ``publish_status IS NULL`` edition can arise when:
+    A short-circuited edition can be missing its build's publish when:
 
     * The build pre-dates this enqueue logic landing (i.e. it was
       synced before the per-edition publish path existed).
     * A prior publish enqueue was lost (Phase B failure between the
       ``QueueJob`` insert and the arq enqueue).
+    * A convergence repoint moved the edition onto a build the
+      short-circuit path never publishes: ``sync_build`` re-points the
+      edition at the older completed build carrying the same content
+      hash and returns ``short_circuited=True``, which
+      :func:`_enqueue_publish_for_synced_edition` skips by design. This
+      leg is the only path that can publish that pair.
 
-    Editions whose ``publish_status`` is already ``pending`` /
-    ``published`` / ``failed`` are left alone — a stuck pending publish
-    is the in-flight publisher's problem to resolve, not ours, and a
-    successful or failed prior publish does not need re-running on
-    every reconciliation tick. The tail-end position keeps this pass
-    cheap on the steady-state common case (almost every edition either
-    short-circuited and is already published, or was freshly synced and
-    just got published by the per-edition callback).
+    Pairs whose publish is already ``pending`` / ``published`` /
+    ``failed`` are left alone — a stuck pending publish is the in-flight
+    publisher's problem to resolve, not ours, and a successful or failed
+    prior publish does not need re-running on every reconciliation tick.
+    The tail-end position keeps this pass cheap on the steady-state
+    common case (almost every edition either short-circuited and is
+    already published, or was freshly synced and just got published by
+    the per-edition callback).
     """
     project_id = sync_result.docverse_project_id
     if project_id is None:
@@ -901,6 +909,7 @@ async def _self_heal_unpublished_editions(
         target = await _resolve_self_heal_target(
             session=session,
             edition_store=edition_store,
+            history_store=history_store,
             project_id=project_id,
             edition_slug=outcome.docverse_slug,
         )
@@ -979,7 +988,7 @@ async def _self_heal_unpublished_aggregates(
     Healing therefore reads persistent state rather than this run's
     in-memory outcomes: every aggregate-shaped edition on the project is
     a candidate, and
-    :func:`_resolve_aggregate_self_heal_target` decides which ones are
+    :func:`_resolve_unpublished_build_target` decides which ones are
     genuinely unpublished. That covers all three loss modes, including
     the ones whose outcome never existed.
     """
@@ -996,7 +1005,7 @@ async def _self_heal_unpublished_aggregates(
     ]
 
     for aggregate in aggregates:
-        target = await _resolve_aggregate_self_heal_target(
+        target = await _resolve_unpublished_build_target(
             session=session,
             history_store=history_store,
             edition=aggregate,
@@ -1028,33 +1037,47 @@ async def _self_heal_unpublished_aggregates(
         )
 
 
-async def _resolve_aggregate_self_heal_target(
+async def _resolve_unpublished_build_target(
     *,
     session: AsyncSession,
     history_store: EditionBuildHistoryStore,
     edition: Edition,
 ) -> tuple[int, str] | None:
-    """Return ``(build_id, build_public_id)`` if the aggregate needs one.
+    """Return ``(build_id, build_public_id)`` if the pair needs a publish.
 
-    "Unpublished" is decided per ``(edition, current_build)`` pair via
-    the ``edition_build_history`` row, not via the edition's own
-    ``publish_status`` the way :func:`_resolve_self_heal_target` does.
-    The edition-level column is a single slot that survives a repoint:
-    an aggregate published for ``15.2.0`` and then advanced to ``15.2.1``
-    with a lost enqueue still reads ``published``, so the LTD leg's rule
-    would call it healthy and leave the new build unpublished forever.
-    The history row is per pair and is written by
+    The single "is this edition's current build unpublished?" rule, shared
+    by both legs of :func:`_self_heal_unpublished_editions`.
+
+    "Unpublished" is decided per ``(edition, current_build)`` pair via the
+    ``edition_build_history`` row rather than the edition's own
+    ``publish_status``. The edition-level column is a single slot that
+    survives a repoint — ``set_current_build`` never clears it — so an
+    edition published for ``15.2.0`` and then advanced to ``15.2.1`` with
+    a lost enqueue still reads ``published``. Reading that column would
+    call the pair healthy and leave the new build unpublished forever,
+    which is load-bearing for convergence repoints: a short-circuited
+    build sync skips ``_enqueue_publish_for_synced_edition`` by design,
+    so self-heal is the only path that can publish it.
+
+    The history row is per pair and, on both keeper-sync paths, is
+    written only by
     :func:`~docverse_server.services.publish_enqueue.enqueue_publish_for_edition`
-    itself — nothing on the keeper-sync aggregate path records one
-    otherwise, since ``_ensure_aggregate_edition`` only calls
-    ``set_current_build``. So "no history row, or one whose
-    ``publish_status`` is still ``NULL``" is exactly "a publish for this
-    build was never enqueued".
+    itself: keeper-sync skips ``EditionTrackingService`` entirely, and
+    the two places it advances a pointer — ``_finalize_synced_build`` and
+    ``_ensure_aggregate_edition`` — only call ``set_current_build``. So
+    "no history row, or one whose ``publish_status`` is still ``NULL``"
+    is exactly "a publish for this build was never enqueued". That covers
+    pre-enqueue-era rows too: their builds were imported before the
+    publish path existed, so no history row was ever recorded.
 
-    That also supplies the dedup the LTD leg gets from its own column: a
-    publish already in flight leaves the pair ``pending``, and a prior
-    ``published`` / ``failed`` publish is not something to re-run on
-    every reconciliation tick — all three are left alone.
+    The same signal supplies the dedup: a publish already in flight
+    leaves the pair ``pending``, and a prior ``published`` / ``failed``
+    publish is not something to re-run on every reconciliation tick —
+    all three are left alone. An edition that does re-enqueue does so at
+    most once, because the enqueue itself records the pair ``pending``.
+
+    The read happens inside its own transaction so it does not interfere
+    with ``enqueue_publish_for_edition``'s phased commits.
     """
     if edition.current_build_id is None:
         return None
@@ -1074,18 +1097,17 @@ async def _resolve_aggregate_self_heal_target(
 async def _resolve_self_heal_target(
     *,
     session: AsyncSession,
-    edition_store: Any,
+    edition_store: EditionStore,
+    history_store: EditionBuildHistoryStore,
     project_id: int,
     edition_slug: str,
 ) -> tuple[int, str] | None:
     """Return ``(build_id, build_public_id)`` if the edition needs catch-up.
 
-    Returns ``None`` when the edition has no ``current_build_id``, when
-    its ``publish_status`` is already set (so a publish has run, is in
-    flight, or previously failed), or when the joined build public_id
-    is missing for any reason. The read happens inside its own
-    transaction so it does not interfere with
-    ``enqueue_publish_for_edition``'s phased commits.
+    The LTD leg reaches its edition by slug — ``edition_outcomes`` carries
+    the Docverse slug, not the row — then defers to
+    :func:`_resolve_unpublished_build_target` for the decision itself, so
+    both legs of the self-heal pass share one rule.
     """
     async with session.begin():
         edition = await edition_store.get_by_slug(
@@ -1093,14 +1115,8 @@ async def _resolve_self_heal_target(
         )
     if edition is None:
         return None
-    if edition.publish_status is not None:
-        return None
-    if edition.current_build_id is None:
-        return None
-    if edition.current_build_public_id is None:
-        return None
-    return edition.current_build_id, serialize_base32_id(
-        edition.current_build_public_id
+    return await _resolve_unpublished_build_target(
+        session=session, history_store=history_store, edition=edition
     )
 
 

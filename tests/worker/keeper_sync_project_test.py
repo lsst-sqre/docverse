@@ -604,9 +604,10 @@ async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     Simulates the staging shape from the first sync runs that landed
     before the publish-enqueue path existed: an edition has its
     ``current_build_id`` set, the build is ``completed``, and a
-    ``keeper_sync_state`` row matches LTD's ``date_rebuilt`` — but
-    ``publish_status`` is ``NULL`` because no publish was ever enqueued
-    against this build. On the next sync run the build sync still
+    ``keeper_sync_state`` row matches LTD's ``date_rebuilt`` — but no
+    publish was ever enqueued against this build, so neither the
+    edition's ``publish_status`` nor an ``edition_build_history`` row for
+    the pair exists. On the next sync run the build sync still
     short-circuits (no LTD-side change), but the worker must observe
     the unpublished edition and enqueue a catch-up
     ``publish_edition`` job so KV + dashboard come into sync.
@@ -651,25 +652,9 @@ async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     )
     assert len(publish_after_first) == 1
 
-    # Reset the edition's publish_status to NULL to mimic data that
-    # landed before the publish-enqueue path existed.
-    async for session in db_session_dependency():
-        async with session.begin():
-            project_store = ProjectStore(session=session, logger=_logger())
-            project = await project_store.get_by_slug(
-                org_id=org_id, slug="pipelines"
-            )
-            assert project is not None
-            edition_store = EditionStore(session=session, logger=_logger())
-            main_edition = await edition_store.get_by_slug(
-                project_id=project.id, slug="__main"
-            )
-            assert main_edition is not None
-            await session.execute(
-                update(SqlEdition)
-                .where(SqlEdition.id == main_edition.id)
-                .values(publish_status=None)
-            )
+    # Erase every trace of the publish to mimic data that landed before
+    # the publish-enqueue path existed.
+    await _clear_publish_traces(org_id=org_id, edition_slug="__main")
 
     async with db_session.begin():
         second_qj = await _seed_project_queue_job(
@@ -1603,12 +1588,12 @@ async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Re-run with N short-circuits + N null publish_status → N self-heals.
+    """Re-run with N short-circuits + N unpublished builds → N self-heals.
 
     Locks the tail-end self-heal pass: when every edition's build
-    short-circuits but every edition is sitting on
-    ``publish_status IS NULL`` (e.g. their builds pre-date the publish
-    enqueue path), the second pass enqueues N publishes via
+    short-circuits but no edition's current build has a publish on
+    record (e.g. their builds pre-date the publish enqueue path), the
+    second pass enqueues N publishes via
     :func:`_self_heal_unpublished_editions` since the per-edition
     callback skips short-circuited builds.
     """
@@ -1652,20 +1637,10 @@ async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
     )
     assert len(publish_after_first) == 2
 
-    # Null out publish_status on both editions so a re-run that
+    # Erase the publish traces on both editions so a re-run that
     # short-circuits has work to do at the tail end.
-    async for session in db_session_dependency():
-        async with session.begin():
-            project_store = ProjectStore(session=session, logger=_logger())
-            project = await project_store.get_by_slug(
-                org_id=org_id, slug="pipelines"
-            )
-            assert project is not None
-            await session.execute(
-                update(SqlEdition)
-                .where(SqlEdition.project_id == project.id)
-                .values(publish_status=None)
-            )
+    for slug in ("__main", "u-jsick-feature"):
+        await _clear_publish_traces(org_id=org_id, edition_slug=slug)
 
     async with db_session.begin():
         second_qj = await _seed_project_queue_job(
@@ -1907,6 +1882,336 @@ async def test_keeper_sync_project_self_heal_skips_published_aggregates(
     assert sorted(
         job.kwargs["payload"]["edition_slug"] for job in publish_after_first
     ) == ["15", "15.2", "15.2.1", "__main"]
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_second) == len(publish_after_first)
+
+
+def _repoint_ltd_main_edition(mock_discovery: respx.Router) -> None:
+    """Advance LTD's ``main`` edition onto a second, newer build.
+
+    Replaces the ``/editions/1`` and ``/builds/43`` routes seeded by
+    :func:`_seed_ltd` so a follow-up sync sees a fresh ``date_rebuilt``
+    pointing at LTD build ``43``. ``respx`` replaces routes with an
+    identical pattern, so the later ``.mock()`` wins.
+    """
+    edition = _load("edition_main_git_refs.json")
+    edition["build_url"] = f"{LTD_BASE}/builds/43"
+    edition["date_rebuilt"] = "2026-05-02T18:30:00.000000+00:00"
+    build = _load("build.json")
+    build["self_url"] = f"{LTD_BASE}/builds/43"
+    build["slug"] = "43"
+    build["bucket_root_dir"] = "pipelines/builds/43"
+    build["date_created"] = "2026-05-02T18:25:00.000000+00:00"
+    build["published_url"] = "https://pipelines.lsst.io/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build)
+    )
+
+
+async def _lose_repoint_publish_enqueue(
+    *, org_id: int, edition_slug: str, surviving_status: PublishStatus
+) -> tuple[int, int, int]:
+    """Erase the publish traces for an edition's *current* build only.
+
+    The LTD-leg counterpart to :func:`_clear_publish_traces`: rather than
+    the pre-enqueue-era shape (no publish ever ran for this edition), this
+    models the repoint shape. The edition was published against an
+    earlier build — so its edition-level ``publish_status`` is still set,
+    a single slot ``set_current_build`` never clears — and then advanced
+    onto a new build whose publish enqueue was lost, leaving the new
+    ``(edition, build)`` pair with no ``edition_build_history`` row and no
+    ``publish_edition`` queue job. The earlier build's history row is left
+    intact, exactly as a real repoint leaves it.
+
+    Returns ``(project_id, edition_id, current_build_id)``.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug=edition_slug
+            )
+            assert edition is not None
+            assert edition.current_build_id is not None
+            build_id = edition.current_build_id
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(publish_status=surviving_status.value)
+            )
+            await session.execute(
+                delete(SqlEditionBuildHistory).where(
+                    SqlEditionBuildHistory.edition_id == edition.id,
+                    SqlEditionBuildHistory.build_id == build_id,
+                )
+            )
+            await session.execute(
+                delete(SqlQueueJob).where(
+                    SqlQueueJob.edition_id == edition.id,
+                    SqlQueueJob.build_id == build_id,
+                    SqlQueueJob.kind == JobKind.publish_edition.value,
+                )
+            )
+            return project.id, edition.id, build_id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heals_repointed_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repointed LTD edition whose publish enqueue was lost is healed.
+
+    The edition-level ``publish_status`` is a single slot that survives a
+    repoint — ``set_current_build`` never clears it — so an edition that
+    published for build ``42`` and then advanced onto build ``43`` with a
+    lost enqueue still reads ``published``. Deciding "unpublished" from
+    that column leaves the new build unpublished forever, because the
+    LTD leg is the only path that can publish a short-circuited build.
+    The self-heal must therefore decide per ``(edition, current_build)``
+    pair via the ``edition_build_history`` row.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # LTD rebuilds ``main`` onto a second build with different content,
+    # so the second pass imports a new Docverse build and repoints.
+    _repoint_ltd_main_edition(mock_discovery)
+    source_objects["pipelines/builds/43/index.html"] = b"<html>v2</html>"
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # Rewind the repoint to the lost-enqueue shape: the edition still
+    # reads ``published`` from build 42's publish, but the new pair has
+    # no history row and no queue job.
+    (
+        project_id,
+        edition_id,
+        repointed_build_id,
+    ) = await _lose_repoint_publish_enqueue(
+        org_id=org_id,
+        edition_slug="__main",
+        surviving_status=PublishStatus.published,
+    )
+    publish_before = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    async with db_session.begin():
+        third_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-3",
+        )
+    payload["queue_job_id"] = third_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    healed = publish_after[len(publish_before) :]
+    assert [job.kwargs["payload"]["edition_slug"] for job in healed] == [
+        "__main"
+    ]
+    assert healed[0].kwargs["payload"]["build_id"] == repointed_build_id
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project_id, slug="__main"
+            )
+            assert edition is not None
+            assert edition.id == edition_id
+            assert edition.publish_status == PublishStatus.pending
+
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            )
+            history = await history_store.get_by_edition_and_build(
+                edition_id=edition_id, build_id=repointed_build_id
+            )
+            assert history is not None
+            assert history.publish_status == PublishStatus.pending
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            healed_qj = await queue_job_store.get_by_backend_job_id(
+                healed[0].id
+            )
+            assert healed_qj is not None
+            assert healed_qj.kind == JobKind.publish_edition
+            assert healed_qj.keeper_sync_run_id == run_id
+
+
+async def _settle_publish(
+    *, org_id: int, edition_slug: str, status: PublishStatus
+) -> None:
+    """Drive one edition's current-build publish to a terminal status.
+
+    Stands in for the ``publish_edition`` worker's write-back: it sets
+    both the edition-level ``publish_status`` and the
+    ``edition_build_history`` row for the edition's current build, which
+    is the shape a steady-state re-sync finds.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug=edition_slug
+            )
+            assert edition is not None
+            assert edition.current_build_id is not None
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(publish_status=status.value)
+            )
+            await session.execute(
+                update(SqlEditionBuildHistory)
+                .where(
+                    SqlEditionBuildHistory.edition_id == edition.id,
+                    SqlEditionBuildHistory.build_id
+                    == edition.current_build_id,
+                )
+                .values(publish_status=status.value)
+            )
+            return
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.parametrize(
+    "settled_status", [PublishStatus.published, PublishStatus.failed]
+)
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heal_skips_settled_editions(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    settled_status: PublishStatus,
+) -> None:
+    """A terminal publish for the current pair is not re-enqueued.
+
+    The per-pair rule has to carry the dedup the edition-level column
+    used to supply: once the ``(edition, current_build)`` pair carries a
+    ``published`` or ``failed`` publish, a steady-state re-sync must
+    leave it alone rather than burn a KV write on every reconciliation
+    tick. (``pending`` — a publish still in flight — is covered by
+    ``test_keeper_sync_project_short_circuit_skips_publish_enqueue``.)
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_first) == 1
+
+    await _settle_publish(
+        org_id=org_id, edition_slug="__main", status=settled_status
+    )
 
     async with db_session.begin():
         second_qj = await _seed_project_queue_job(
