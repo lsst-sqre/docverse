@@ -106,9 +106,12 @@ class CdnPurgeCoalescer:
         purge
             Zero-argument coroutine function performing the purge. It is
             invoked at most once per call and not at all when the
-            request is coalesced, so resolving the purger (a database
-            read for the org's CDN credentials) belongs inside it rather
-            than at the call site.
+            request is coalesced. It must not touch the database:
+            callers wait here — for the lock, and then for the throttle
+            interval — with no transaction open precisely so those waits
+            hold no connection, so anything the purge needs from the
+            database (the org's CDN credentials) must already be
+            resolved and captured by the closure.
 
         Returns
         -------

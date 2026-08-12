@@ -126,9 +126,10 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     queue_job_id=queue_job_id,
                 )
 
+            publishing_service = factory.create_edition_publishing_service()
             try:
                 async with session.begin():
-                    await factory.create_edition_publishing_service().publish(
+                    pending_purge = await publishing_service.publish(
                         org_id=payload["org_id"],
                         project_slug=payload["project_slug"],
                         edition=resources.edition,
@@ -159,6 +160,20 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     logger=logger,
                 )
                 return "failed"
+
+            # Purge the CDN edge cache only now that the publish
+            # transaction has committed, and deliberately outside every
+            # ``session.begin()`` block. The purge queues on the
+            # process-wide per-hostname coalescer and can then sit in
+            # the purger's rate-limit backoff for tens of seconds; under
+            # a same-hostname publish burst (a keeper-sync backfill)
+            # every waiter would otherwise pin an idle-in-transaction
+            # connection for minutes and exhaust the engine pool,
+            # failing unrelated worker jobs. The purge is best-effort
+            # and cannot undo the committed publish.
+            if pending_purge is not None:
+                await publishing_service.purge_cdn_cache(pending_purge)
+
             completion = None
             async with session.begin():
                 await queue_job_store.complete(queue_job_id)

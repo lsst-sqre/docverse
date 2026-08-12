@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from types import TracebackType
 from typing import Any, Self
@@ -117,8 +118,101 @@ class _FailingPublisher:
         raise self._exc
 
 
+@dataclass(slots=True)
+class _PurgeObservation:
+    """Database state observed at the moment the CDN purge ran."""
+
+    in_transaction: bool
+    """Whether the worker's session had an open transaction."""
+
+    publish_status: PublishStatus | None
+    """The edition's ``publish_status`` as visible to another session."""
+
+
+class _ProbingCdnCachePurger:
+    """A ``CdnCachePurger`` that snapshots database state when it purges.
+
+    The publish burst that motivates deferring the purge (a keeper-sync
+    backfill) only exhausts the engine pool when each waiter holds a
+    connection while the coalescer serializes and the purger backs off,
+    so the load-bearing assertion is that the worker's session is *not*
+    in a transaction by the time the purger is reached.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: AsyncSession,
+        edition_id: int,
+        observations: list[_PurgeObservation],
+    ) -> None:
+        self._session = session
+        self._edition_id = edition_id
+        self._observations = observations
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def purge_hostname(self, hostname: str) -> None:
+        _ = hostname
+        in_transaction = self._session.in_transaction()
+        publish_status: PublishStatus | None = None
+        # A second session sees only committed rows, so reading the
+        # edition here proves the publish transaction already landed.
+        async for probe_session in db_session_dependency():
+            async with probe_session.begin():
+                store = EditionStore(session=probe_session, logger=_logger())
+                edition = await store.get_by_id(self._edition_id)
+                publish_status = (
+                    edition.publish_status if edition is not None else None
+                )
+        self._observations.append(
+            _PurgeObservation(
+                in_transaction=in_transaction,
+                publish_status=publish_status,
+            )
+        )
+
+
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
+
+
+def _mock_create_cdn_cache_purger(
+    *,
+    edition_id: int,
+    observations: list[_PurgeObservation],
+) -> Any:
+    """Return a patched ``create_cdn_cache_purger_for_org``."""
+
+    async def _create(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> Any:
+        _ = (org_id, service_label)
+        # Mimic the real helper's database access: resolving an org's
+        # CDN credentials reads the database, so resolving the purger
+        # outside an explicit ``session.begin()`` block would autobegin
+        # a transaction and break the worker's next one — the same
+        # failure production would see.
+        await self._session.execute(select(1))
+        return _ProbingCdnCachePurger(
+            session=self._session,
+            edition_id=edition_id,
+            observations=observations,
+        )
+
+    return _create
 
 
 def _mock_create_edition_publisher(
@@ -957,3 +1051,101 @@ async def test_publish_edition_acquires_edition_update_lock(
     assert publish_timestamps, "expected publisher.publish to be called"
     eu_enter_ts = eu_enters[0].timestamp
     assert all(ts > eu_enter_ts for ts in publish_timestamps)
+
+
+async def _run_publish_with_purge_probe(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    org_slug: str,
+    backend_job_id: str,
+) -> list[_PurgeObservation]:
+    """Run one ``publish_edition`` job against a probing CDN purger."""
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug=org_slug,
+            cdn_service_label="cdn-prod",
+            backend_job_id=backend_job_id,
+        )
+
+    observations: list[_PurgeObservation] = []
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(MockEditionPublisher()),
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_cdn_cache_purger_for_org",
+        _mock_create_cdn_cache_purger(
+            edition_id=edition.id, observations=observations
+        ),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id=backend_job_id,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert observations, "expected the purger to be reached"
+    return observations
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_purges_with_no_open_transaction(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CDN purge is awaited with no database transaction open.
+
+    The purge queues behind the process-wide per-hostname coalescer and
+    can then sit in the purger's own retry backoff for tens of seconds.
+    Holding an idle-in-transaction connection across that wait is what
+    exhausts the async engine pool during a same-hostname publish burst.
+    """
+    observations = await _run_publish_with_purge_probe(
+        db_session,
+        monkeypatch,
+        org_slug="pub-purge-txn-org",
+        backend_job_id="test-publish-arq-purge-txn",
+    )
+
+    assert [o.in_transaction for o in observations] == [False]
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_commits_publish_state_before_purging(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The edition reaches ``published`` before the purge is attempted."""
+    observations = await _run_publish_with_purge_probe(
+        db_session,
+        monkeypatch,
+        org_slug="pub-purge-commit-org",
+        backend_job_id="test-publish-arq-purge-commit",
+    )
+
+    assert [o.publish_status for o in observations] == [
+        PublishStatus.published
+    ]
