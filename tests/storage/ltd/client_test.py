@@ -177,6 +177,34 @@ async def test_non_retryable_error_status_raises(
     assert route.call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_redirect_status_raises_client_error(
+    http_client: httpx.AsyncClient, mock_discovery: respx.Router
+) -> None:
+    """A 3xx is a failed call, not a body to parse.
+
+    Nothing in this codebase constructs an ``httpx.AsyncClient`` that
+    follows redirects, so an SSO gateway or a moved-endpoint 302 in
+    front of LTD hands back a login page instead of the product JSON.
+    Treating "not an error status" as success sent that page into
+    ``response.json()``, raising ``json.JSONDecodeError`` from outside
+    the ``LtdClientError`` taxonomy every caller catches.
+    """
+    route = mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(
+            302,
+            headers={"Location": "https://login.example.com/"},
+            text="<html>login</html>",
+        )
+    )
+    with pytest.raises(LtdClientError) as excinfo:
+        await _make_client(http_client).get_product("pipelines")
+    assert route.call_count == 1
+    exc = excinfo.value
+    assert exc.status_code == 302
+    assert exc.body == "<html>login</html>"
+
+
 def test_ltd_client_error_is_docverse_slack_exception() -> None:
     """``LtdClientError`` migrates onto the shared ``DocverseSlackException``.
 

@@ -58,7 +58,16 @@ class CloudflareKvEditionPublisher:
         object_key_prefix: str,
         cache_profile: CacheProfile,
     ) -> None:
-        """Write the edition pointer to the configured KV namespace."""
+        """Write the edition pointer to the configured KV namespace.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            If Cloudflare answers with any non-2xx status, including a
+            3xx redirect (this client does not follow redirects, so the
+            pointer was not written). The failure is logged at ``ERROR``
+            with the status code and response body first.
+        """
         url = (
             "https://api.cloudflare.com/client/v4"
             f"/accounts/{self._account_id}"
@@ -79,7 +88,11 @@ class CloudflareKvEditionPublisher:
             },
             headers={"Authorization": f"Bearer {self._api_token}"},
         )
-        if response.is_error:
+        # Only a 2xx means Cloudflare stored the pointer. A 3xx is not
+        # followed on this client, so gating the diagnostic on
+        # ``is_error`` (4xx/5xx only) let a redirect raise below with no
+        # status or body for the triager to read.
+        if not response.is_success:
             self._logger.error(
                 "Cloudflare KV publish failed",
                 status_code=response.status_code,
@@ -101,6 +114,15 @@ class CloudflareKvEditionPublisher:
         operation is idempotent — soft-deleting an edition whose pointer
         was never published, or running cleanup twice, must not surface
         as a failure to the caller.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            If Cloudflare answers with any other non-2xx status,
+            including a 3xx redirect (this client does not follow
+            redirects, so the pointer is still in place). The failure is
+            logged at ``ERROR`` with the status code and response body
+            first.
         """
         url = (
             "https://api.cloudflare.com/client/v4"
@@ -119,7 +141,10 @@ class CloudflareKvEditionPublisher:
                 edition_slug=edition_slug,
             )
             return
-        if response.is_error:
+        # The 404 above is the one non-2xx that means success. Every
+        # other non-2xx — including an unfollowed 3xx — left the pointer
+        # in place, so it is logged with its context before raising.
+        if not response.is_success:
             self._logger.error(
                 "Cloudflare KV unpublish failed",
                 status_code=response.status_code,

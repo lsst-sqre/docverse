@@ -7,6 +7,7 @@ import json
 import httpx
 import pytest
 import structlog
+from structlog.testing import capture_logs
 
 from docverse_server.storage.editionpublisher import (
     CloudflareKvEditionPublisher,
@@ -125,6 +126,46 @@ async def test_publish_raises_on_5xx() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publish_reports_redirect_response() -> None:
+    """A 3xx publish failure reaches the log with its response context.
+
+    The pointer write is not followed on this client, so a 302 from a
+    proxy or a moved Cloudflare endpoint means the KV entry was never
+    written. Gating the diagnostic on ``is_error`` (4xx/5xx only) left
+    that failure with a bare ``HTTPStatusError`` and no status or body
+    to triage from.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"Location": "https://login.example.com/"},
+            text="<html>login</html>",
+        )
+
+    with capture_logs() as logs:
+        publisher, client = _make_publisher(httpx.MockTransport(handler))
+        async with client, publisher as pub:
+            with pytest.raises(httpx.HTTPStatusError):
+                await pub.publish(
+                    project_slug="p",
+                    edition_slug="e",
+                    build_public_id="B",
+                    object_key_prefix="p/__builds/B/",
+                    cache_profile="long",
+                )
+
+    errors = [
+        entry
+        for entry in logs
+        if entry["event"] == "Cloudflare KV publish failed"
+    ]
+    assert len(errors) == 1
+    assert errors[0]["status_code"] == 302
+    assert errors[0]["response_body"] == "<html>login</html>"
+
+
+@pytest.mark.asyncio
 async def test_unpublish_issues_delete_to_kv_endpoint() -> None:
     seen: dict[str, httpx.Request] = {}
 
@@ -164,6 +205,38 @@ async def test_unpublish_treats_404_as_success() -> None:
         # Should not raise.
         await pub.unpublish(project_slug="p", edition_slug="e")
     assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unpublish_reports_redirect_response() -> None:
+    """A 3xx unpublish failure reaches the log with its response context.
+
+    Only the 404 above is a successful no-op; a redirect means the
+    delete never reached the namespace, so it has to be as loud as a
+    5xx rather than an unexplained ``HTTPStatusError``.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            307,
+            headers={"Location": "https://login.example.com/"},
+            text="<html>login</html>",
+        )
+
+    with capture_logs() as logs:
+        publisher, client = _make_publisher(httpx.MockTransport(handler))
+        async with client, publisher as pub:
+            with pytest.raises(httpx.HTTPStatusError):
+                await pub.unpublish(project_slug="p", edition_slug="e")
+
+    errors = [
+        entry
+        for entry in logs
+        if entry["event"] == "Cloudflare KV unpublish failed"
+    ]
+    assert len(errors) == 1
+    assert errors[0]["status_code"] == 307
+    assert errors[0]["response_body"] == "<html>login</html>"
 
 
 @pytest.mark.asyncio

@@ -222,8 +222,10 @@ class LtdClient:
         LtdNotFoundError
             On HTTP 404. Not retried.
         LtdClientError
-            On any other non-2xx after the retry budget is exhausted, or
-            on a network error after the retry budget is exhausted.
+            On any other non-2xx — including a 3xx redirect, which this
+            client does not follow — either immediately if the status is
+            not retryable or after the retry budget is exhausted, and on
+            a network error after the retry budget is exhausted.
         """
         last_exc: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
@@ -266,7 +268,12 @@ class LtdClient:
                 )
                 continue
 
-            if response.is_error:
+            # Only a 2xx carries a JSON body worth parsing. A 3xx is not
+            # followed on this client, so treating "not an error" as
+            # success fed a redirect's HTML into ``response.json()`` and
+            # raised ``JSONDecodeError`` from outside the
+            # ``LtdClientError`` taxonomy every caller handles.
+            if not response.is_success:
                 raise LtdClientError(
                     url=url,
                     method="GET",
