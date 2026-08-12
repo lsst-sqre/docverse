@@ -56,6 +56,22 @@ def test_keeper_sync_worker_settings_uses_dedicated_queue() -> None:
     assert KeeperSyncWorkerSettings.queue_name != WorkerSettings.queue_name
 
 
+def test_keeper_sync_worker_settings_sets_max_jobs_from_config() -> None:
+    """The sync pool declares its job concurrency instead of inheriting it.
+
+    The sync worker's peak resident size is ``max_jobs`` x
+    ``keeper_sync_copy_concurrency`` object bodies, so leaving
+    ``max_jobs`` to arq's implicit default left half of the memory
+    bound outside any operator's reach (#517).
+    """
+    assert KeeperSyncWorkerSettings.max_jobs == _config.keeper_sync_max_jobs
+
+
+def test_default_worker_settings_sets_max_jobs_from_config() -> None:
+    """The default pool declares its job concurrency explicitly too."""
+    assert WorkerSettings.max_jobs == _config.arq_max_jobs
+
+
 def test_keeper_sync_worker_settings_registers_keeper_sync_functions() -> None:
     """Both keeper_sync functions are registered on the dedicated queue.
 

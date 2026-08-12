@@ -17,6 +17,15 @@ destination protocol. With the pool bound in place peak resident bytes
 are ``max_concurrent`` times the largest object under the prefix, which
 for LTD's HTML/CSS/JS/image payloads is a small constant — not the term
 that OOM-killed the sync worker.
+
+That is the bound for *one* copier. Each concurrent
+``keeper_sync_project`` arq job drives its own, so the sync worker
+process holds up to ``keeper_sync_max_jobs`` times ``max_concurrent``
+object bodies at once — the number its memory limit is sized against.
+Both factors come from configuration
+(``Config.keeper_sync_max_jobs`` and
+``Config.keeper_sync_copy_concurrency``), so raising either one
+requires raising that limit with it.
 """
 
 from __future__ import annotations
@@ -32,10 +41,27 @@ import structlog
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
 
-__all__ = ["EMPTY_MANIFEST_HASH", "BuildContentCopier", "CopyResult"]
+__all__ = [
+    "DEFAULT_COPY_CONCURRENCY",
+    "EMPTY_MANIFEST_HASH",
+    "BuildContentCopier",
+    "CopyResult",
+]
 
-#: Default number of worker tasks used for parallel object copies.
-_DEFAULT_MAX_CONCURRENT = 8
+DEFAULT_COPY_CONCURRENCY = 8
+"""Default number of worker tasks used for parallel object copies.
+
+The copier's own fallback, used when it is constructed directly (unit
+tests, one-off scripts). Production construction goes through
+:meth:`docverse_server.factory.Factory.create_build_content_copier_for_org`,
+which threads ``Config.keeper_sync_copy_concurrency`` — defaulted to
+this same value — so the operator knob and the fallback cannot drift.
+
+Public rather than module-private because the factory shares it as its
+own default: a second literal in ``factory.py`` was exactly the
+duplication that made the sync worker's real memory bound impossible
+to reason about (#517).
+"""
 
 #: Manifest hash of a prefix with no keys under it. Public because a
 #: caller cannot otherwise tell "hashed an empty prefix" apart from
@@ -64,12 +90,23 @@ class BuildContentCopier:
         source: LtdSourceProtocol,
         destination: ObjectStore,
         logger: structlog.stdlib.BoundLogger,
-        max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+        max_concurrent: int = DEFAULT_COPY_CONCURRENCY,
     ) -> None:
         self._source = source
         self._destination = destination
         self._logger = logger
         self._max_concurrent = max_concurrent
+
+    @property
+    def max_concurrent(self) -> int:
+        """Upper bound on this copier's simultaneous object transfers.
+
+        Also the count of object bodies this copier can hold in memory
+        at once, so it is the per-copier half of the sync worker's
+        resident-size budget (the other half being the pool's
+        ``max_jobs``).
+        """
+        return self._max_concurrent
 
     async def compute_manifest_hash(self, *, source_prefix: str) -> str:
         """Compute the manifest hash for ``source_prefix`` without copying.

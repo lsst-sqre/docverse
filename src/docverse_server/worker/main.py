@@ -155,6 +155,7 @@ class WorkerFactoryBuilder:
         github_webhook_secret: SecretStr | None,
         purge_coalescer: CdnPurgeCoalescer | None = None,
         default_queue_name: str,
+        keeper_sync_copy_concurrency: int,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -170,6 +171,10 @@ class WorkerFactoryBuilder:
         self._github_webhook_secret = github_webhook_secret
         self._github_app_validated = True
         self._default_queue_name = default_queue_name
+        # Required rather than defaulted: the worker is the only process
+        # that copies build content, so a silent fallback here is
+        # precisely the invisible memory bound #517 removes.
+        self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
 
     @property
     def github_app_enabled(self) -> bool:
@@ -215,6 +220,7 @@ class WorkerFactoryBuilder:
             github_app_validated=self._github_app_validated,
             purge_coalescer=self._purge_coalescer,
             default_queue_name=self._default_queue_name,
+            keeper_sync_copy_concurrency=self._keeper_sync_copy_concurrency,
         )
 
 
@@ -302,6 +308,7 @@ async def _startup(
             min_interval=config.cdn_purge_min_interval_seconds
         ),
         default_queue_name=config.arq_queue_name,
+        keeper_sync_copy_concurrency=config.keeper_sync_copy_concurrency,
     )
     await validate_github_app(
         state=factory_builder,
@@ -374,8 +381,15 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    """arq WorkerSettings for the default Docverse queue."""
+    """arq WorkerSettings for the default Docverse queue.
 
+    ``max_jobs`` is declared rather than left to arq's implicit
+    default so the pool's concurrency is visible to operators and
+    movable from the environment. The value is arq's own default, so
+    this changes controllability, not behaviour.
+    """
+
+    max_jobs = config.arq_max_jobs
     functions = [
         instrument_arq_task(build_processing),
         instrument_arq_task(dashboard_build),
@@ -419,8 +433,18 @@ class KeeperSyncWorkerSettings:
     The cron-driven :func:`keeper_sync_reaper` is the second backstop
     — it covers the case where arq itself loses a job (e.g. an
     OOM-killed worker pod) and no timeout ever fires.
+
+    ``max_jobs`` is declared here rather than left to arq's implicit
+    default because it is half of this pool's memory bound: each
+    concurrent ``keeper_sync_project`` job runs its own
+    ``BuildContentCopier`` pool, so peak resident size scales with
+    ``keeper_sync_max_jobs`` x ``keeper_sync_copy_concurrency`` x the
+    largest object under a build prefix. Both factors are now
+    env-driven, so the pod's memory limit and the concurrency that
+    limit is sized against can move together.
     """
 
+    max_jobs = config.keeper_sync_max_jobs
     functions = [
         func(
             instrument_arq_task(keeper_sync_run_discovery),
@@ -530,8 +554,14 @@ class MaintenanceWorkerSettings:
     (rather than cron-driven) function on the pool and is registered
     plainly — no ``func`` timeout wrapper — exactly as it was on the
     default pool.
+
+    ``max_jobs`` is declared rather than left to arq's implicit
+    default so the pool's concurrency is visible to operators and
+    movable from the environment. The value is arq's own default, so
+    this changes controllability, not behaviour.
     """
 
+    max_jobs = config.maintenance_max_jobs
     functions = [
         func(
             instrument_arq_task(lifecycle_eval_dispatcher),

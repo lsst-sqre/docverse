@@ -202,6 +202,24 @@ class Configuration(BaseSettings):
         title="Name of the arq queue",
     )
 
+    arq_max_jobs: int = Field(
+        10,
+        ge=1,
+        title="Concurrent jobs per default-queue worker process",
+        description=(
+            "Bound on how many ``docverse:queue`` jobs"
+            " (``build_processing``, ``publish_edition``,"
+            " ``dashboard_build``, ``dashboard_sync``, ``ping``) one"
+            " worker process runs at once, set as ``max_jobs`` on"
+            " ``WorkerSettings``. The default matches arq's own, which"
+            " this pool previously inherited implicitly; it is declared"
+            " here so the concurrency is visible to operators and"
+            " movable without a code change. Raising it multiplies"
+            " every per-job resource (DB sessions, buffered payloads)"
+            " and so needs a matching memory-limit raise."
+        ),
+    )
+
     cdn_purge_min_interval_seconds: float = Field(
         DEFAULT_PURGE_MIN_INTERVAL_SECONDS,
         ge=0.0,
@@ -236,6 +254,46 @@ class Configuration(BaseSettings):
         ),
     )
 
+    keeper_sync_max_jobs: int = Field(
+        10,
+        ge=1,
+        title="Concurrent jobs per keeper-sync worker process",
+        description=(
+            "Bound on how many ``docverse:sync-queue`` jobs one worker"
+            " process runs at once, set as ``max_jobs`` on"
+            " ``KeeperSyncWorkerSettings``. The default matches arq's"
+            " own, which this pool previously inherited implicitly."
+            " **Memory:** each concurrent ``keeper_sync_project`` job"
+            " drives its own ``BuildContentCopier`` pool, so the sync"
+            " worker's peak resident size scales with this value x"
+            " ``keeper_sync_copy_concurrency`` x the largest object"
+            " under a build prefix — 80 buffered object bodies at the"
+            " stock 10 x 8. That product is what the sync worker's"
+            " memory limit is sized against; raising either knob"
+            " requires raising the limit with it."
+        ),
+    )
+
+    keeper_sync_copy_concurrency: int = Field(
+        8,
+        ge=1,
+        title="Simultaneous object transfers per keeper-sync copier",
+        description=(
+            "Upper bound on the worker-task pool that"
+            " ``BuildContentCopier`` runs one LTD build prefix through."
+            " Object bodies are buffered whole (the destination"
+            " ``upload_object`` takes ``bytes``), so this is also the"
+            " number of bodies one copier holds in memory at once."
+            " **Memory:** the sync worker's peak resident size scales"
+            " with ``keeper_sync_max_jobs`` x this value x the largest"
+            " object under a build prefix — each concurrent"
+            " ``keeper_sync_project`` job runs its own copier pool."
+            " At the stock 10 x 8 that is 80 buffered bodies, which is"
+            " what the sync worker's memory limit is sized against;"
+            " raising either knob requires raising that limit with it."
+        ),
+    )
+
     keeper_sync_reaper_threshold_seconds: int = Field(
         default_factory=_default_keeper_sync_reaper_threshold,
         title="Keeper-sync stuck-run reaper threshold, in seconds",
@@ -255,6 +313,21 @@ class Configuration(BaseSettings):
             " kept the project parked behind the partial unique index"
             " the tier cron reads as an active job. Setting the env var"
             " overrides the derivation outright."
+        ),
+    )
+
+    maintenance_max_jobs: int = Field(
+        10,
+        ge=1,
+        title="Concurrent jobs per maintenance worker process",
+        description=(
+            "Bound on how many ``docverse:maintenance-queue`` jobs"
+            " (``lifecycle_eval``, ``git_ref_audit``,"
+            " ``inventory_census``, the reaper backstops, and"
+            " ``project_github_resolve``) one worker process runs at"
+            " once, set as ``max_jobs`` on"
+            " ``MaintenanceWorkerSettings``. The default matches arq's"
+            " own, which this pool previously inherited implicitly."
         ),
     )
 

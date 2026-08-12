@@ -13,6 +13,13 @@ carrying an independent literal: the keeper-sync functions run with
 its timeout and a row still ``in_progress`` past that point is
 definitively dead. The derivation keeps the pair in lockstep when an
 operator drives the job timeout down.
+
+Also covers the two memory-shaping knobs that together set the sync
+worker's worst-case resident size — ``keeper_sync_max_jobs`` and
+``keeper_sync_copy_concurrency`` — plus the sibling ``max_jobs``
+settings for the other two arq pools. Their defaults are pinned
+because the Phalanx memory limits are sized against exactly that
+product.
 """
 
 from __future__ import annotations
@@ -22,6 +29,9 @@ import pytest
 from docverse_server.config import (
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
     Configuration,
+)
+from docverse_server.services.keeper_sync.copier import (
+    DEFAULT_COPY_CONCURRENCY,
 )
 
 #: Cadence gap of the ``keeper_sync_reaper`` cron
@@ -96,6 +106,68 @@ def test_keeper_sync_reaper_margin_clears_one_cron_gap() -> None:
     assert config.keeper_sync_reaper_threshold_seconds > (
         config.keeper_sync_job_timeout_seconds + _REAPER_CRON_GAP_SECONDS - 1
     )
+
+
+def test_keeper_sync_copy_concurrency_default() -> None:
+    """The copier fan-out bound defaults to the copier's own fallback.
+
+    ``BuildContentCopier`` keeps ``DEFAULT_COPY_CONCURRENCY`` for
+    direct construction (tests build it without a factory), so the
+    config default must track it rather than carry an independent
+    literal that can silently drift.
+    """
+    config = Configuration()
+    assert config.keeper_sync_copy_concurrency == DEFAULT_COPY_CONCURRENCY
+    assert config.keeper_sync_copy_concurrency == 8
+
+
+def test_keeper_sync_copy_concurrency_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fan-out bound is env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_COPY_CONCURRENCY", "3")
+    config = Configuration()
+    assert config.keeper_sync_copy_concurrency == 3
+
+
+def test_pool_max_jobs_defaults_preserve_arq_behaviour() -> None:
+    """All three pools default to arq's own 10-job concurrency.
+
+    The settings exist to make the bound visible and controllable, not
+    to change it — the sync worker's memory limit is sized against the
+    stock ``max_jobs`` x ``keeper_sync_copy_concurrency`` product.
+    """
+    config = Configuration()
+    assert config.arq_max_jobs == 10
+    assert config.keeper_sync_max_jobs == 10
+    assert config.maintenance_max_jobs == 10
+
+
+def test_pool_max_jobs_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each pool's concurrency is independently env-overridable."""
+    monkeypatch.setenv("DOCVERSE_ARQ_MAX_JOBS", "20")
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_MAX_JOBS", "4")
+    monkeypatch.setenv("DOCVERSE_MAINTENANCE_MAX_JOBS", "2")
+    config = Configuration()
+    assert config.arq_max_jobs == 20
+    assert config.keeper_sync_max_jobs == 4
+    assert config.maintenance_max_jobs == 2
+
+
+def test_sync_worker_buffered_body_budget_is_the_documented_product() -> None:
+    """The two sync knobs multiply out to the sized-against 80 bodies.
+
+    ``keeper_sync_project`` jobs each run their own copier pool, so the
+    worker's peak buffered-body count — the term the Phalanx memory
+    limit is sized against — is the product of the two. Pinning it here
+    means a future default bump has to move this number deliberately.
+    """
+    config = Configuration()
+    assert (
+        config.keeper_sync_max_jobs * config.keeper_sync_copy_concurrency
+    ) == 80
 
 
 def test_other_reaper_thresholds_unchanged() -> None:

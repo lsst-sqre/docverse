@@ -41,6 +41,7 @@ def _make_builder(
     github_app_id: int | None = None,
     github_app_private_key: SecretStr | None = None,
     github_webhook_secret: SecretStr | None = None,
+    keeper_sync_copy_concurrency: int | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
@@ -53,7 +54,32 @@ def _make_builder(
         github_app_private_key=github_app_private_key,
         github_webhook_secret=github_webhook_secret,
         default_queue_name=_config.arq_queue_name,
+        keeper_sync_copy_concurrency=(
+            keeper_sync_copy_concurrency
+            if keeper_sync_copy_concurrency is not None
+            else _config.keeper_sync_copy_concurrency
+        ),
     )
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_copy_concurrency_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """The worker's copier fan-out bound is process-config driven.
+
+    ``keeper_sync_project`` is the only job kind that copies build
+    content, so the sync worker's peak resident size is this bound
+    times the pool's ``max_jobs``. The builder must carry the operator
+    knob onto every per-job factory rather than letting the factory
+    fall back to the copier's own default (#517).
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client, keeper_sync_copy_concurrency=3
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.keeper_sync_copy_concurrency == 3
 
 
 @pytest.mark.asyncio
