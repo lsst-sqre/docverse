@@ -104,6 +104,52 @@ def test_backoff_for_response_honours_short_retry_after() -> None:
     assert delay == 3.0
 
 
+def test_backoff_for_attempt_honours_caller_max_backoff() -> None:
+    """A caller may raise the ceiling above the shared default."""
+    delay = backoff_for_attempt(
+        6, base_backoff_seconds=1.0, max_backoff_seconds=300.0
+    )
+
+    assert delay == 32.0
+
+
+def test_backoff_for_response_honours_caller_max_backoff() -> None:
+    """A caller with a generous ceiling rides out a long rate-limit window.
+
+    ``LtdClient`` sleeps its backoff while holding no database
+    transaction and no coalescer lock, so an LTD ``Retry-After: 60``
+    must be obeyed rather than clamped to the shared 10 s default —
+    otherwise the whole retry budget burns inside the same rate-limit
+    window and every project in a tier tick fails its sync.
+    """
+    response = httpx.Response(429, headers={"Retry-After": "60"})
+
+    delay = backoff_for_response(
+        response,
+        1,
+        base_backoff_seconds=0.5,
+        logger=structlog.get_logger("test"),
+        max_backoff_seconds=300.0,
+    )
+
+    assert delay == 60.0
+
+
+def test_backoff_for_response_caps_at_caller_max_backoff() -> None:
+    """An override raises the ceiling; it never removes it."""
+    response = httpx.Response(429, headers={"Retry-After": "9999"})
+
+    delay = backoff_for_response(
+        response,
+        1,
+        base_backoff_seconds=0.5,
+        logger=structlog.get_logger("test"),
+        max_backoff_seconds=300.0,
+    )
+
+    assert delay == 300.0
+
+
 def test_backoff_for_response_clamps_negative_retry_after() -> None:
     """A nonsense negative ``Retry-After`` never becomes a negative sleep."""
     response = httpx.Response(503, headers={"Retry-After": "-5"})

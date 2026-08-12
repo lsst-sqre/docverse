@@ -32,19 +32,28 @@ __all__ = [
     "backoff_for_response",
 ]
 
-#: Upper bound, in seconds, on any single wait between attempts —
-#: including one a server asks for via ``Retry-After``.
+#: Default upper bound, in seconds, on any single wait between attempts
+#: — including one a server asks for via ``Retry-After``.
 #:
-#: Callers sleep this delay *in line*, and the line they block is
-#: expensive: a publish job holds an open database transaction for the
-#: length of the purge, and the CDN purge coalescer holds a per-hostname
-#: lock across it, so every other publish for that hostname queues
-#: behind the sleep. Cloudflare answering a rate-limited purge with
-#: ``Retry-After: 300`` would therefore pin a database connection and
-#: serialize a whole publish burst for five minutes. We would rather
-#: give up after a bounded wait and let the caller's best-effort
-#: handling (or the next publish) deal with it, so a server's request
-#: is treated as an upper hint and clamped to this ceiling.
+#: The default is tuned for the callers that sleep this delay *in line*
+#: on an expensive line: a publish job holds an open database
+#: transaction for the length of the purge, and the CDN purge coalescer
+#: holds a per-hostname lock across it, so every other publish for that
+#: hostname queues behind the sleep. Cloudflare answering a
+#: rate-limited purge with ``Retry-After: 300`` would therefore pin a
+#: database connection and serialize a whole publish burst for five
+#: minutes. We would rather give up after a bounded wait and let the
+#: caller's best-effort handling (or the next publish) deal with it, so
+#: a server's request is treated as an upper hint and clamped to this
+#: ceiling.
+#:
+#: A caller that blocks nothing expensive while it waits may raise the
+#: ceiling with the ``max_backoff_seconds`` argument both helpers
+#: accept — see `LtdClient
+#: <docverse_server.storage.ltd.LtdClient>`, whose read-only GETs hold
+#: neither a transaction nor a lock and so can afford to ride out a
+#: full LTD rate-limit window instead of failing inside it. The
+#: argument raises the ceiling; it never removes one.
 MAX_BACKOFF_SECONDS = 10.0
 
 #: Status codes worth retrying: rate limiting plus the transient 5xx
@@ -80,7 +89,12 @@ RETRYABLE_TRANSPORT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
 )
 
 
-def backoff_for_attempt(attempt: int, *, base_backoff_seconds: float) -> float:
+def backoff_for_attempt(
+    attempt: int,
+    *,
+    base_backoff_seconds: float,
+    max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+) -> float:
     """Compute the exponential backoff delay for a 1-based attempt.
 
     Parameters
@@ -89,15 +103,19 @@ def backoff_for_attempt(attempt: int, *, base_backoff_seconds: float) -> float:
         The attempt that just failed, counting from 1.
     base_backoff_seconds
         Delay after the first failure; doubles each subsequent attempt.
+    max_backoff_seconds
+        Ceiling on the returned delay. Defaults to `MAX_BACKOFF_SECONDS`;
+        a caller that blocks nothing expensive while it sleeps may pass
+        a larger value.
 
     Returns
     -------
     float
         Seconds to wait before the next attempt, never longer than
-        `MAX_BACKOFF_SECONDS`.
+        ``max_backoff_seconds``.
     """
     multiplier: int = 2 ** (attempt - 1)
-    return min(MAX_BACKOFF_SECONDS, base_backoff_seconds * multiplier)
+    return min(max_backoff_seconds, base_backoff_seconds * multiplier)
 
 
 def backoff_for_response(
@@ -106,13 +124,16 @@ def backoff_for_response(
     *,
     base_backoff_seconds: float,
     logger: structlog.stdlib.BoundLogger,
+    max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
 ) -> float:
     """Honour a numeric ``Retry-After``, else fall back to exp backoff.
 
     The header is treated as a hint, not an instruction: the value is
-    clamped to ``[0, MAX_BACKOFF_SECONDS]`` because the caller sleeps it
-    while holding a database transaction and the purge coalescer's lock
-    (see `MAX_BACKOFF_SECONDS`).
+    clamped to ``[0, max_backoff_seconds]``. The default ceiling is
+    tight because the callers it was written for sleep while holding a
+    database transaction and the purge coalescer's lock; a caller
+    holding neither raises it (see `MAX_BACKOFF_SECONDS`) so a long
+    rate-limit window can be waited out rather than failed inside.
 
     ``Retry-After`` may also be an HTTP-date, which neither API sends in
     practice; a non-numeric value is logged at ``WARNING`` and the
@@ -132,12 +153,16 @@ def backoff_for_response(
         Delay after the first failure; doubles each subsequent attempt.
     logger
         Logger used to warn about an uninterpretable ``Retry-After``.
+    max_backoff_seconds
+        Ceiling on the returned delay, applied to a server-supplied
+        ``Retry-After`` as much as to the computed fallback. Defaults to
+        `MAX_BACKOFF_SECONDS`.
 
     Returns
     -------
     float
         Seconds to wait before the next attempt, never negative and
-        never longer than `MAX_BACKOFF_SECONDS`.
+        never longer than ``max_backoff_seconds``.
     """
     retry_after = response.headers.get("Retry-After")
     if retry_after is not None:
@@ -149,13 +174,15 @@ def backoff_for_response(
                 retry_after=retry_after,
             )
         else:
-            if value > MAX_BACKOFF_SECONDS:
+            if value > max_backoff_seconds:
                 logger.warning(
                     "Capping long Retry-After",
                     retry_after=value,
-                    capped_to=MAX_BACKOFF_SECONDS,
+                    capped_to=max_backoff_seconds,
                 )
-            return min(MAX_BACKOFF_SECONDS, max(0.0, value))
+            return min(max_backoff_seconds, max(0.0, value))
     return backoff_for_attempt(
-        attempt, base_backoff_seconds=base_backoff_seconds
+        attempt,
+        base_backoff_seconds=base_backoff_seconds,
+        max_backoff_seconds=max_backoff_seconds,
     )

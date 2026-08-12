@@ -18,6 +18,7 @@ import pytest
 import structlog
 from structlog.testing import capture_logs
 
+from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
 from docverse_server.storage.objectstore import S3ObjectStore
 
 
@@ -272,6 +273,36 @@ async def test_upload_object_honours_numeric_retry_after(
         )
 
     assert delays == [5.0]
+
+
+@pytest.mark.asyncio
+async def test_upload_object_caps_long_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The store keeps the tight shared ceiling on ``Retry-After``.
+
+    Uploads run inside a build-copy job whose progress the rest of the
+    publish waits on, so a five-minute obedient sleep is worse than
+    another attempt — only ``LtdClient`` raises its ceiling.
+    """
+    delays = _record_sleeps(monkeypatch)
+    responses = [
+        httpx.Response(503, headers={"Retry-After": "300"}),
+        httpx.Response(200),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    store, client = _make_store(handler)
+    async with client, store as s:
+        await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert delays == [MAX_BACKOFF_SECONDS]
 
 
 @pytest.mark.asyncio

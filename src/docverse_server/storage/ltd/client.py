@@ -3,7 +3,9 @@
 A thin async wrapper over the worker's shared
 :class:`httpx.AsyncClient` that translates the API's resource URLs into
 typed Pydantic models, retries 429/5xx with bounded exponential
-backoff, and surfaces 404 as :class:`LtdNotFoundError` so callers can
+backoff (obeying a rate-limit ``Retry-After`` up to
+:data:`_MAX_BACKOFF_SECONDS`, well past the tighter shared default),
+and surfaces 404 as :class:`LtdNotFoundError` so callers can
 distinguish "LTD doesn't have this any more" (soft-deletion path) from
 "LTD is having a bad day" (transient retry path).
 """
@@ -38,6 +40,24 @@ _MAX_ATTEMPTS = 4
 
 #: Initial backoff in seconds; doubles each subsequent attempt.
 _BASE_BACKOFF_SECONDS = 0.5
+
+#: Ceiling on any single wait between attempts, overriding the tighter
+#: shared default in `docverse_server.storage._http_retry`.
+#:
+#: This client's calls are read-only GETs issued from sync jobs: they
+#: hold no database transaction and no CDN purge coalescer lock, so a
+#: long sleep blocks only the job doing it. That is what the shared
+#: 10-second default protects against, and honouring it here was a
+#: liability instead — LTD answers a rate-limited GET with the seconds
+#: left in its window, so a ``Retry-After: 60`` clamped to 10 burned
+#: the entire attempt budget inside the same window and failed the sync
+#: job for every project in a tier tick, turning a self-healing
+#: throttle into a fleet-wide outage. Five minutes is long enough to
+#: outlast any window LTD actually asks for while still bounding a
+#: pathological header value; the keeper-sync job's own arq ``timeout``
+#: (``Config.keeper_sync_job_timeout_seconds``, an hour by default)
+#: remains the outer bound on a job that keeps being throttled.
+_MAX_BACKOFF_SECONDS = 300.0
 
 #: Cap on the response body bytes carried into Sentry events. LTD error
 #: bodies can be arbitrarily large (HTML error pages, full JSON payloads);
@@ -150,12 +170,14 @@ class LtdClient:
         logger: structlog.stdlib.BoundLogger,
         max_attempts: int = _MAX_ATTEMPTS,
         base_backoff_seconds: float = _BASE_BACKOFF_SECONDS,
+        max_backoff_seconds: float = _MAX_BACKOFF_SECONDS,
     ) -> None:
         self._http_client = http_client
         self._base_url = base_url.rstrip("/")
         self._logger = logger
         self._max_attempts = max_attempts
         self._base_backoff_seconds = base_backoff_seconds
+        self._max_backoff_seconds = max_backoff_seconds
 
     async def list_products(self) -> LtdProductsListing:
         """Fetch ``GET /products/`` — the flat listing of product URLs."""
@@ -296,16 +318,25 @@ class LtdClient:
 
     def _backoff_for_attempt(self, attempt: int) -> float:
         return backoff_for_attempt(
-            attempt, base_backoff_seconds=self._base_backoff_seconds
+            attempt,
+            base_backoff_seconds=self._base_backoff_seconds,
+            max_backoff_seconds=self._max_backoff_seconds,
         )
 
     def _backoff_for_response(
         self, response: httpx.Response, attempt: int
     ) -> float:
-        """Honour ``Retry-After`` on 429, else fall back to exp backoff."""
+        """Honour ``Retry-After`` on 429, else fall back to exp backoff.
+
+        Waits are bounded by this client's own generous ceiling rather
+        than the shared default, so an LTD rate-limit window gets
+        ridden out instead of being failed inside (see
+        :data:`_MAX_BACKOFF_SECONDS`).
+        """
         return backoff_for_response(
             response,
             attempt,
             base_backoff_seconds=self._base_backoff_seconds,
             logger=self._logger,
+            max_backoff_seconds=self._max_backoff_seconds,
         )

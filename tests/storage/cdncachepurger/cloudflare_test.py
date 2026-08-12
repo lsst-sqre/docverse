@@ -10,6 +10,7 @@ import pytest
 import structlog
 from structlog.testing import capture_logs
 
+from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
 from docverse_server.storage.cdncachepurger import (
     CloudflareCachePurgeError,
     CloudflareCachePurger,
@@ -267,6 +268,33 @@ async def test_purge_hostname_honours_numeric_retry_after(
         await p.purge_hostname("myproject.example.org")
 
     assert delays == [7.0]
+
+
+@pytest.mark.asyncio
+async def test_purge_hostname_caps_long_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The purger keeps the tight shared ceiling on ``Retry-After``.
+
+    ``LtdClient`` raises its own ceiling because its GETs block nothing;
+    the purger must not follow, because it sleeps inside an open
+    database transaction while every other publish for the hostname
+    queues behind the coalescer lock it holds.
+    """
+    delays = _record_sleeps(monkeypatch)
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "300"}),
+        httpx.Response(200, json={"success": True}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    purger, client = _make_purger(httpx.MockTransport(handler))
+    async with client, purger as p:
+        await p.purge_hostname("myproject.example.org")
+
+    assert delays == [MAX_BACKOFF_SECONDS]
 
 
 @pytest.mark.asyncio
