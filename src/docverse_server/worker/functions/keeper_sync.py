@@ -803,9 +803,11 @@ async def _enqueue_publish_for_aggregates(
     steady state enqueues nothing.
 
     This is a one-shot enqueue and the only outcome-driven one an
-    aggregate ever gets: on the next sync ``_ensure_aggregate_edition``
-    returns ``None`` because the pointer is already where it should be,
-    so no outcome is emitted and nothing here fires again. Whatever this
+    aggregate ever gets: the next sync skips the backfill outright
+    (its ``aggregates_backfilled_build_id`` state marker already names
+    this build) and would emit no outcome even if it ran, because the
+    pointer is where it should be — nothing here fires again. Whatever
+    this
     call loses — ``sync_project`` swallows this callback's exceptions,
     and a worker can die between the backfill's commit and this enqueue
     — is recovered from persistent state by
@@ -987,9 +989,11 @@ async def _self_heal_unpublished_aggregates(
     with its KV pointer never written — a URL that serves 404 (or stale
     content) indefinitely, because no later pass recovers it: the LTD
     leg of :func:`_self_heal_unpublished_editions` iterates only
-    ``edition_outcomes``, and on re-sync ``_ensure_aggregate_edition``
-    returns ``None`` once ``current_build_id`` already equals the build,
-    so no outcome is emitted and nothing re-enqueues.
+    ``edition_outcomes``, and a re-sync of an unchanged edition skips
+    the backfill on its ``aggregates_backfilled_build_id`` marker (and
+    ``_ensure_aggregate_edition`` would return ``None`` anyway once
+    ``current_build_id`` already equals the build), so no outcome is
+    emitted and nothing re-enqueues.
 
     Healing therefore reads persistent state rather than this run's
     in-memory outcomes: every aggregate-shaped edition on the project is

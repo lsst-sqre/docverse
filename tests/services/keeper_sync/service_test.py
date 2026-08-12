@@ -3520,6 +3520,70 @@ async def test_sync_aggregates_suppressed_by_org_config(
 
 
 @pytest.mark.asyncio
+async def test_sync_advances_existing_aggregate_when_autocreation_off(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """``semver_aggregates=false`` stops creation, never advancement.
+
+    Native parity: ``find_matching_editions`` carries no autocreation
+    gate, so a natively built project's existing ``15`` keeps moving with
+    every release after the knob is turned off — only the implicit
+    creation of new ``N`` / ``N.M`` rows stops. A migrated project's
+    ``/v/15`` pointer must not freeze where an identically configured
+    native one moves.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-advance-off")
+
+    project_id = await _seed_project(
+        db_session,
+        org_id=org_id,
+        edition_autocreation={"semver_aggregates": False},
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    # The ``15`` aggregate predates the opt-out (auto-created while the
+    # knob was still on, or made by hand); ``15.2`` deliberately does not
+    # exist, so the same sync exercises both halves of the gate.
+    async with db_session.begin():
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="15",
+            title="Latest 15.x",
+            kind=EditionKind.major,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 15},
+        )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    by_slug = {e.slug: e for e in editions}
+    assert set(by_slug) == {"15.2.1", "15"}
+    assert by_slug["15.2.1"].current_build_id is not None
+    assert by_slug["15"].current_build_id == by_slug["15.2.1"].current_build_id
+
+
+@pytest.mark.asyncio
 async def test_sync_aggregates_survive_slug_only_user_rule(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -3720,6 +3784,164 @@ async def test_sync_aggregate_never_moves_backwards(
     assert newest is not None
     assert major is not None
     assert major.current_build_id == newest.current_build_id
+
+
+def _record_backfill_calls(
+    service: KeeperSyncService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    """Replace the aggregate backfill with a recorder of its build ids.
+
+    Asserting the returned list is empty pins that a poll did no
+    aggregate work *at all* — not one transaction and not one per-spec
+    ``get_by_slug`` — which is the property a migrated project with ~80
+    release editions needs on every 5-minute tick.
+    """
+    calls: list[int] = []
+
+    async def _recording_backfill(**kwargs: object) -> tuple[object, ...]:
+        calls.append(int(kwargs["build_id"]))  # type: ignore[call-overload]
+        return ()
+
+    monkeypatch.setattr(
+        service, "_backfill_semver_aggregates", _recording_backfill
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_resync_skips_aggregate_backfill_when_nothing_changed(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short-circuited re-sync of a healed edition does no backfill.
+
+    ``sync_build`` hands back the previously-synced build id even when it
+    short-circuits, so keying the backfill off "we have a build id" made
+    every tick re-open a transaction and re-SELECT both aggregate slugs
+    per release edition, only to conclude nothing moved.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-steady")
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {"15.2.1", "15", "15.2"}
+
+    # Second poll: LTD state is unchanged, so nothing needs backfilling.
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    calls = _record_backfill_calls(service, monkeypatch)
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = result.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.build_outcome.docverse_build_id is not None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_short_circuited_sync_heals_aggregates_exactly_once(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Editions imported before the backfill existed still heal.
+
+    The one-time heal lands on a *short-circuited* sync — the content was
+    imported by an older Docverse, so ``date_rebuilt`` never changes
+    again — which is why the skip cannot simply key off
+    ``short_circuited``. The first sync here stands in for that older
+    Docverse by stubbing the backfill out entirely; the second must
+    create the aggregates anyway, and the third must not go looking.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-heal")
+
+    project_id = await _seed_project(db_session, org_id=org_id)
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+
+    legacy = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    _record_backfill_calls(legacy, monkeypatch)
+    await legacy.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {"15.2.1"}
+
+    # Today's code, first poll after deploy: the build short-circuits but
+    # the aggregates are still missing, so the heal runs.
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = result.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    by_slug = {e.slug: e for e in editions}
+    assert set(by_slug) == {"15.2.1", "15", "15.2"}
+    release_build_id = by_slug["15.2.1"].current_build_id
+    assert release_build_id is not None
+    assert by_slug["15"].current_build_id == release_build_id
+    assert by_slug["15.2"].current_build_id == release_build_id
+    # The healed aggregates are reported, so the worker publishes them.
+    assert {o.docverse_slug for o in outcome.aggregate_outcomes} == {
+        "15",
+        "15.2",
+    }
+
+    # Third poll: the heal is recorded, so it does not run again.
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    calls = _record_backfill_calls(service, monkeypatch)
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert calls == []
 
 
 @pytest.mark.asyncio

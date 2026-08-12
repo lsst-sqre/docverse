@@ -93,6 +93,13 @@ class KeeperSyncState(BaseModel):
         ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
         mode / refs preserved for reversibility (used by the ``manual``
         mapper path).
+
+        ``aggregates_backfilled_build_id`` — the Docverse build id whose
+        semver aggregates
+        :meth:`~docverse_server.services.keeper_sync.service.KeeperSyncService._backfill_semver_aggregates`
+        has already reconciled. Its absence (or a mismatch against the
+        build the edition points at now) is what makes the backfill run;
+        a match makes a steady-state poll skip it entirely.
     """
 
     model_config = ConfigDict(from_attributes=True)

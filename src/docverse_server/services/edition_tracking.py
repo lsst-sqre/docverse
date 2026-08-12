@@ -563,7 +563,9 @@ class EditionTrackingService:
         auto-created before the knob was turned off, or created by hand
         — is still matched and advanced by ``find_matching_editions`` in
         ``track_build``. Only the implicit creation of new ``N`` /
-        ``N.M`` rows stops.
+        ``N.M`` rows stops. Keeper-sync's backfill applies the knob the
+        same way, so a migrated project's ``/v/15`` does not freeze
+        where an identically configured native project's keeps moving.
 
         Returns a tuple of (matched editions, IDs of newly created ones).
         """

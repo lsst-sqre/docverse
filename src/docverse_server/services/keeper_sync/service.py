@@ -92,6 +92,7 @@ from docverse_server.storage.github import (
     RepositoryRefFetchError,
 )
 from docverse_server.storage.keeper_sync import (
+    KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
@@ -210,6 +211,26 @@ _PLACEHOLDER_CONTENT_HASH = f"sha256:{'0' * 64}"
 #: Username recorded as the build's uploader for synced builds.
 _SYNC_UPLOADER = "keeper-sync"
 
+#: ``keeper_sync_state.annotations`` key on an *edition* row: the
+#: Docverse build id whose semver aggregates
+#: :meth:`KeeperSyncService._backfill_semver_aggregates` has already
+#: reconciled. Written inside that method's own transaction, so it is
+#: committed with the aggregate rows it describes and a raising backfill
+#: leaves no marker behind to retry against.
+#:
+#: The marker is what makes the backfill free in steady state.
+#: ``sync_build`` hands back the previously-synced build id even when it
+#: short-circuits, so "we have a build id" is true on every 5-minute
+#: poll of an unchanged project — a migrated project with ~80 release
+#: editions paid ~80 transactions and ~240 SELECTs per tick to conclude
+#: nothing had moved. Comparing the marker to the build the edition
+#: actually points at now skips all of it, while still running the
+#: one-time heal for editions imported before the backfill existed:
+#: those have no marker, and their heal necessarily lands on a
+#: short-circuited sync (their content was imported long ago), which is
+#: why the skip cannot key off ``short_circuited`` instead.
+_AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
+
 
 @dataclass(frozen=True)
 class BuildSyncOutcome:
@@ -268,6 +289,39 @@ class _ResolvedBuildSource:
                 "edition" if self.from_edition_prefix else "build"
             ),
         }
+
+
+@dataclass(frozen=True)
+class _EditionStateKey:
+    """One edition's ``keeper_sync_state`` row, as an updatable handle.
+
+    Bundles the row's idempotency key with the annotations
+    ``sync_edition`` most recently wrote to it, so a later write in the
+    same sync can add a key without dropping the others — the store's
+    ``annotations`` argument replaces the column wholesale.
+    """
+
+    org_id: int
+    ltd_id: int
+    ltd_slug: str
+    annotations: dict[str, Any]
+
+
+def _aggregates_backfilled_build_id(
+    state: KeeperSyncState | None,
+) -> int | None:
+    """Read the recorded aggregate-convergence build id off a state row.
+
+    Returns ``None`` for a row that has never been backfilled — an
+    edition imported before the backfill existed, which is exactly the
+    population the one-time heal has to reach — and for an annotation
+    that is not an ``int``, so a hand-edited row degrades into "run the
+    backfill again" rather than a type error mid-sync.
+    """
+    if state is None or not state.annotations:
+        return None
+    value = state.annotations.get(_AGGREGATES_BACKFILLED_BUILD_ID_KEY)
+    return value if isinstance(value, int) else None
 
 
 @dataclass(frozen=True)
@@ -931,6 +985,19 @@ class KeeperSyncService:
             project_id=project.id,
         )
 
+        # ``annotations`` replaces wholesale on upsert, so the aggregate
+        # convergence marker has to be carried forward here or every
+        # sync would erase it and re-run the backfill it records.
+        annotations: dict[str, Any] = {
+            "ltd_mode": ltd_edition.mode,
+            "ltd_tracked_refs": ltd_edition.tracked_refs,
+        }
+        backfilled_build_id = _aggregates_backfilled_build_id(edition_state)
+        if backfilled_build_id is not None:
+            annotations[_AGGREGATES_BACKFILLED_BUILD_ID_KEY] = (
+                backfilled_build_id
+            )
+
         async with self._session.begin():
             edition = await self._ensure_edition(
                 project_id=project.id,
@@ -948,10 +1015,7 @@ class KeeperSyncService:
                 docverse_id=edition.id,
                 date_last_synced=_now(),
                 date_rebuilt_seen=ltd_edition.date_rebuilt,
-                annotations={
-                    "ltd_mode": ltd_edition.mode,
-                    "ltd_tracked_refs": ltd_edition.tracked_refs,
-                },
+                annotations=annotations,
             )
 
         build_outcome: BuildSyncOutcome | None = None
@@ -965,7 +1029,20 @@ class KeeperSyncService:
                 ltd_edition=ltd_edition,
                 ltd_build=ltd_build_for_mapping,
             )
-            if build_outcome.docverse_build_id is not None:
+            if (
+                build_outcome.docverse_build_id is not None
+                # Steady state: the aggregates were already reconciled
+                # against this very build, so there is nothing to look
+                # at. See ``_AGGREGATES_BACKFILLED_BUILD_ID_KEY`` — this
+                # is the check that keeps an unchanged 80-release
+                # project from paying 80 transactions per poll, and it
+                # compares build ids rather than reading
+                # ``short_circuited`` so both the one-time heal and
+                # ``sync_build``'s converged-on-an-existing-build path
+                # (short-circuited, yet a *different* build id) still
+                # run.
+                and backfilled_build_id != build_outcome.docverse_build_id
+            ):
                 # The backfill runs after ``sync_build`` has committed the
                 # build row and repointed the edition, so the edition's
                 # import is already durable by the time we get here.
@@ -988,6 +1065,12 @@ class KeeperSyncService:
                             build_id=build_outcome.docverse_build_id,
                             autocreation=(
                                 autocreation or DEFAULT_EDITION_AUTOCREATION
+                            ),
+                            state_key=_EditionStateKey(
+                                org_id=org_id,
+                                ltd_id=ltd_edition.ltd_id,
+                                ltd_slug=ltd_edition.slug,
+                                annotations=annotations,
                             ),
                         )
                     )
@@ -1029,6 +1112,7 @@ class KeeperSyncService:
         git_ref: str | None,
         build_id: int,
         autocreation: EditionAutocreationConfig,
+        state_key: _EditionStateKey,
     ) -> tuple[AggregateEditionOutcome, ...]:
         """Create/point the ``N`` / ``N.M`` aggregates for a release.
 
@@ -1053,11 +1137,30 @@ class KeeperSyncService:
         ``edition_autocreation.semver_aggregates`` stays the explicit
         opt-out on both.
 
+        ``autocreation`` is an *autocreation* gate, matching the config's
+        name and the native path exactly: it decides only whether a
+        missing ``N`` / ``N.M`` row may be created. An aggregate that
+        already exists is advanced regardless, because the native
+        counterpart of this method — ``find_matching_editions`` in
+        ``track_build`` — has no knob or kind gate at all and keeps
+        moving those rows. Suppressing advancement here would freeze a
+        migrated project's ``/v/15`` where an identically configured
+        native project's still moves.
+
+        ``state_key`` identifies the edition's ``keeper_sync_state`` row,
+        onto which this method stamps
+        :data:`_AGGREGATES_BACKFILLED_BUILD_ID_KEY` — inside its own
+        transaction, so the marker and the rows it describes commit
+        together and a raising backfill retries on the next poll. Callers
+        compare that marker to the build id before calling at all, which
+        is what makes a steady-state poll free; refs with no aggregates
+        to reconcile return before the transaction opens and are
+        therefore left unmarked, since re-deciding that costs nothing
+        but a parse.
+
         Returns one outcome per aggregate this call actually moved, for
         the worker to publish; see :class:`AggregateEditionOutcome`.
         """
-        if not autocreation.semver_aggregates:
-            return ()
         version = parse_stable_semver(git_ref)
         if version is None:
             return ()
@@ -1074,9 +1177,20 @@ class KeeperSyncService:
                         spec=spec,
                         build=build,
                         version=version,
+                        allow_create=autocreation.semver_aggregates,
                     )
                     if outcome is not None:
                         outcomes.append(outcome)
+                await self._state_store.upsert(
+                    org_id=state_key.org_id,
+                    resource_type=ResourceType.edition,
+                    ltd_id=state_key.ltd_id,
+                    ltd_slug=state_key.ltd_slug,
+                    annotations={
+                        **state_key.annotations,
+                        _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
+                    },
+                )
         return tuple(outcomes)
 
     async def _ensure_aggregate_edition(
@@ -1086,8 +1200,15 @@ class KeeperSyncService:
         spec: SemverAggregateSpec,
         build: Build,
         version: SemverVersion,
+        allow_create: bool,
     ) -> AggregateEditionOutcome | None:
         """Ensure one aggregate exists and points at *build*.
+
+        ``allow_create`` carries
+        ``edition_autocreation.semver_aggregates``: ``False`` skips a
+        missing row rather than creating it, but leaves an existing one
+        free to advance — see :meth:`_backfill_semver_aggregates` for
+        why the knob is creation-only.
 
         Returns ``None`` — leaving the row untouched — when the slug is
         occupied by an edition that is not this aggregate (an operator's
@@ -1099,6 +1220,14 @@ class KeeperSyncService:
             project_id=project_id, slug=spec.slug
         )
         if edition is None:
+            if not allow_create:
+                self._logger.debug(
+                    "Semver aggregate not created: autocreation disabled",
+                    project_id=project_id,
+                    edition_slug=spec.slug,
+                    build_id=build.id,
+                )
+                return None
             edition = await self._edition_store.create_internal(
                 project_id=project_id,
                 slug=spec.slug,

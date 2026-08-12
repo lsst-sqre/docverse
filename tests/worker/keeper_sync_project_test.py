@@ -1740,11 +1740,11 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
     ``on_edition_synced`` callback, and ``sync_project`` deliberately
     swallows callback failures — so a failed enqueue (or a worker death
     between the backfill's commit and the enqueue) leaves the aggregate
-    pointing at the release build with no KV pointer ever written. On
-    re-sync ``_ensure_aggregate_edition`` returns ``None`` (the pointer
-    is already where it should be), so nothing re-enqueues it via the
-    outcome path; the tail-end self-heal pass must recover it from
-    persistent state instead.
+    pointing at the release build with no KV pointer ever written. A
+    re-sync of the unchanged edition skips the backfill entirely (its
+    ``aggregates_backfilled_build_id`` marker already names this build),
+    so nothing re-enqueues it via the outcome path; the tail-end
+    self-heal pass must recover it from persistent state instead.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
