@@ -59,6 +59,7 @@ from docverse_server.domain.base32id import (
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
+from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
 from docverse_server.sentry import initialize_sentry
@@ -941,13 +942,15 @@ async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
     started copying and invokes the factory's copier closure, which
     calls ``create_objectstore_for_org``. We make that raise *after* the
     factory has entered the autobegun transaction region. The service's
-    per-edition boundary absorbs it, so the job reaches its end and
-    finishes ``completed_with_errors`` with the failure recorded — but
-    only if the session is still clean enough to open the completion
-    transaction. A leaked transaction reproduces the original bug
-    (``InvalidRequestError: A transaction is already begun on this
-    Session``), now surfacing at completion time instead of in the
-    worker's except branch.
+    per-edition boundary absorbs it and the loop reaches its end — but
+    this product has exactly one edition, so *every* attempted edition
+    failed and the end-of-run check turns that into a
+    ``KeeperSyncSystemicFailureError``: a run that imported nothing is
+    an outage, not a partial success, on a project of any size. Marking
+    the job ``failed`` still needs a session clean enough to open the
+    worker's except-branch transaction; a leaked transaction reproduces
+    the original bug (``InvalidRequestError: A transaction is already
+    begun on this Session``).
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -981,35 +984,36 @@ async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    result = await keeper_sync_project(
-        ctx,
-        {
-            "org_id": org_id,
-            "org_slug": org_slug,
-            "run_id": run_id,
-            "queue_job_id": queue_job_id,
-            "ltd_slug": "pipelines",
-            "ltd_base_url": LTD_BASE,
-        },
-    )
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
     await ctx["http_client"].aclose()
-    assert result == "completed_with_errors"
 
     async for session in db_session_dependency():
         async with session.begin():
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
-            assert qj.status == JobStatus.completed_with_errors
-            assert qj.progress is not None
-            assert qj.progress["edition_failure_count"] == 1
-            recorded = qj.progress["edition_failures"][0]
-            message = recorded["error_message"]
-            assert "Service 'mock-store' not found" in message
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "KeeperSyncSystemicFailureError"
+            # The edition's own error is chained onto the systemic
+            # abort, so the underlying fault stays triageable from the
+            # recorded traceback.
+            assert "Service 'mock-store' not found" in qj.errors["traceback"]
 
             # The project's only edition failed, so the job is the run's
-            # only child. ``aggregate_activity`` buckets
-            # ``completed_with_errors`` as a failure, so the run rolls up
+            # only child. ``aggregate_activity`` buckets the failed job
+            # into ``failed_count``, so the run rolls up
             # ``partial_failure`` — the errors reach the run status
             # without inventing a new one.
             run_store = KeeperSyncRunStore(session=session, logger=_logger())

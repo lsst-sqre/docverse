@@ -388,6 +388,33 @@ class EditionSyncOutcome:
     build.
     """
 
+    @property
+    def contacted_ltd(self) -> bool:
+        """``True`` when this edition's sync actually reached LTD.
+
+        The systemic-failure accounting in :meth:`sync_project` keys off
+        this rather than "did the call return without raising". Only work
+        that went out to LTD — resolving the build, hashing its bucket
+        prefix, copying its objects — is evidence that an outage has
+        ended; anything the service could have done with LTD and the
+        object store both dark is not.
+
+        Two returns are therefore *neutral* for the breaker rather than
+        successful. A tombstone short-circuit returns off a single
+        ``keeper_sync_state`` read (:attr:`short_circuited`). A build-less
+        LTD edition — one whose ``build_url`` is ``None`` — writes its
+        edition and state rows and stops, so ``sync_build`` never runs
+        and :attr:`build_outcome` stays ``None``. Both succeed
+        *especially* during an outage, and treating either as evidence of
+        health let a product that interleaves them through its edition
+        list defeat the breaker with an alternating fail/reset pattern.
+
+        A short-circuited ``build_outcome`` still counts: ``sync_build``
+        short-circuits only *after* resolving the LTD build, which is a
+        live LTD round trip.
+        """
+        return not self.short_circuited and self.build_outcome is not None
+
 
 @dataclass(frozen=True)
 class EditionSyncFailure:
@@ -556,13 +583,28 @@ class KeeperSyncService:
         would mark every remaining edition failed one at a time and
         still let the run roll up green over a 3-of-80 import.
 
-        Only an edition that *did work* resets the counter, so scattered
-        isolated failures keep their per-edition boundary while editions
-        the loop passed over stay invisible to the breaker: an edition in
-        ``skip_ltd_ids`` never reaches :meth:`sync_edition`, and one whose
+        Only an edition that *reached LTD* resets the counter (see
+        :attr:`EditionSyncOutcome.contacted_ltd`), so scattered isolated
+        failures keep their per-edition boundary while editions the loop
+        did no LTD work for stay invisible to the breaker: an edition in
+        ``skip_ltd_ids`` never reaches :meth:`sync_edition`, one whose
         ``keeper_sync_state`` row is tombstoned returns a
-        ``short_circuited`` outcome from a lone database read. Neither
-        contacts LTD, so neither is evidence that an outage has ended.
+        ``short_circuited`` outcome from a lone database read, and a
+        build-less LTD edition writes its rows without ever resolving a
+        build. None of them contacts LTD, so none is evidence that an
+        outage has ended.
+
+        The breaker alone cannot catch a whole-infrastructure outage on a
+        *small* project: a migrated product typically carries ~20
+        editions, so expired object-store credentials or a dead database
+        would fail every one of them and still finish under the
+        threshold, rolling up ``completed_with_errors`` /
+        ``partial_failure`` with nothing imported. A run that ends with
+        failures and *no* LTD-contacting outcome therefore raises the
+        same :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+        from the end of the loop, whatever the edition count. Editions
+        that succeeded before the failure started keep the run on the
+        partial-success path, so the mixed case is unaffected.
 
         ``on_edition_synced`` runs once per :meth:`sync_edition` return,
         before the next iteration begins. Callbacks fire after each
@@ -626,6 +668,8 @@ class KeeperSyncService:
         outcomes: list[EditionSyncOutcome] = []
         failures: list[EditionSyncFailure] = []
         consecutive_failures = 0
+        ltd_successes = 0
+        last_failure: Exception | None = None
         for ltd_edition in ltd_editions:
             if ltd_edition.ltd_id in skip_ltd_ids:
                 continue
@@ -639,6 +683,7 @@ class KeeperSyncService:
                     autocreation=autocreation,
                 )
             except Exception as exc:
+                last_failure = exc
                 sentry_sdk.capture_exception(exc)
                 self._logger.exception(
                     "Edition sync failed; skipping edition and continuing",
@@ -676,17 +721,15 @@ class KeeperSyncService:
                         failed_ltd_edition_slugs=recent,
                     ) from exc
                 continue
-            # Only an edition that actually did work counts as evidence
-            # that the fault was per-edition rather than systemic. A
-            # tombstone short-circuit returns on a single
-            # ``keeper_sync_state`` read without touching LTD — it
-            # succeeds *especially* during an outage — so it leaves the
-            # counter alone, exactly as the ``skip_ltd_ids`` ``continue``
-            # above does. Resetting here let any project with tombstones
-            # scattered through its edition list defeat the breaker with
-            # an alternating fail/skip pattern.
-            if not outcome.short_circuited:
+            # Only an edition that actually reached LTD counts as
+            # evidence that the fault was per-edition rather than
+            # systemic — see ``EditionSyncOutcome.contacted_ltd`` for why
+            # tombstone short-circuits and build-less editions are
+            # neutral here, exactly as the ``skip_ltd_ids`` ``continue``
+            # above is.
+            if outcome.contacted_ltd:
                 consecutive_failures = 0
+                ltd_successes += 1
             outcomes.append(outcome)
             if on_edition_synced is not None:
                 try:
@@ -697,6 +740,27 @@ class KeeperSyncService:
                         "on_edition_synced callback raised; continuing",
                         docverse_slug=outcome.docverse_slug,
                     )
+        if failures and ltd_successes == 0:
+            failed_slugs = [failure.ltd_edition_slug for failure in failures]
+            self._logger.error(
+                "Failing project sync: every attempted edition failed",
+                edition_failure_count=len(failures),
+                failed_ltd_edition_slugs=failed_slugs,
+                project_id=project.id,
+                project=project.slug,
+                ltd_slug=ltd_slug,
+            )
+            raise KeeperSyncSystemicFailureError(
+                ltd_slug=ltd_slug,
+                consecutive_failures=len(failures),
+                failed_ltd_edition_slugs=failed_slugs,
+                message=(
+                    f"Aborting keeper sync for LTD product {ltd_slug}: all"
+                    f" {len(failures)} attempted editions failed (editions:"
+                    f" {', '.join(failed_slugs)}), so nothing was imported"
+                    " — a systemic outage rather than per-edition faults"
+                ),
+            ) from last_failure
         return ProjectSyncResult(
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,

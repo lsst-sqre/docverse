@@ -449,12 +449,14 @@ async def keeper_sync_project(
     line; the parent run rolls up ``partial_failure``. A failure of the
     project as a whole — the LTD product fetch, the org lookup, the
     copier's destination store — still fails the job outright, as does
-    the service's systemic-outage abort
-    (:data:`~docverse_server.services.keeper_sync.service.MAX_CONSECUTIVE_EDITION_FAILURES`
-    consecutive edition failures raise
+    either of the service's systemic-outage signals, which raise
     :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
-    out of ``sync_project``, so a mid-run LTD or database outage fails
-    the job rather than quietly reporting a 3-of-80 import as done).
+    out of ``sync_project``:
+    :data:`~docverse_server.services.keeper_sync.service.MAX_CONSECUTIVE_EDITION_FAILURES`
+    consecutive edition failures (a mid-run LTD or database outage fails
+    the job rather than quietly reporting a 3-of-80 import as done), and
+    a run that ends with failures and nothing imported at all (the same
+    outage on a project too small to reach that threshold).
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]

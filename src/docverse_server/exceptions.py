@@ -321,7 +321,7 @@ class KeeperSyncInvariantError(DocverseSlackException):
 
 
 class KeeperSyncSystemicFailureError(DocverseSlackException):
-    """Too many consecutive edition failures — the outage is systemic.
+    """The keeper-sync edition failures are systemic, not per-edition.
 
     ``KeeperSyncService.sync_project`` gives each edition its own
     failure boundary so one permanently-unreadable LTD build costs one
@@ -329,13 +329,26 @@ class KeeperSyncSystemicFailureError(DocverseSlackException):
     a *systemic* fault: a mid-run LTD outage or a database failure
     would otherwise mark every remaining edition failed one by one, let
     the loop finish, and roll the run up green — a 3-of-80 partial
-    import presenting as a completed run. A run of consecutive failures
-    is the signal that the fault is not per-edition, so the sync aborts
-    and this exception fails the project's queue job instead.
+    import presenting as a completed run. Two signals say the fault is
+    not per-edition, and both raise this exception to fail the project's
+    queue job instead:
+
+    * ``MAX_CONSECUTIVE_EDITION_FAILURES`` failures in a row, which
+      aborts the loop mid-list rather than walking the remainder.
+    * A run that reached the end of the edition list with failures and
+      no edition imported at all. The consecutive-failure threshold is
+      larger than a typical migrated project's edition count, so without
+      this check a total outage on a 20-edition product would finish
+      under the threshold and report a zero-import run as a partial
+      success.
 
     Raised with ``from`` the last edition's exception, so the triggering
     error stays on the ``__cause__`` chain for both Sentry and the
-    ``queue_jobs.errors`` traceback.
+    ``queue_jobs.errors`` traceback. The end-of-run variant passes its
+    own ``message`` — nothing was imported, rather than the loop being
+    cut short — while still reporting ``consecutive_failures``: with no
+    imported edition to reset the counter, every failure in such a run
+    was consecutive.
 
     No ``to_sentry`` override: the free-form ``message`` names the LTD
     product slug and the consecutive-failure count, and the chained

@@ -50,6 +50,7 @@ from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.services.keeper_sync.copier import BuildContentCopier
 from docverse_server.services.keeper_sync.service import (
     MAX_CONSECUTIVE_EDITION_FAILURES,
+    BuildSyncOutcome,
     EditionSyncOutcome,
     KeeperSyncContext,
     KeeperSyncService,
@@ -839,10 +840,12 @@ async def test_sync_build_refuses_half_uploaded_build(
 ) -> None:
     """LTD build with ``uploaded=False`` must not be synced.
 
-    ``sync_build`` raises; ``sync_project``'s per-edition boundary
-    turns that into a reported failure rather than a copied build, so
-    the assertion is on the reported failure plus an untouched
-    destination store.
+    ``sync_build`` raises and ``sync_project``'s per-edition boundary
+    catches it rather than copying a half-uploaded build. This product
+    has a single edition, so that failure is also the whole run: nothing
+    was imported, which the end-of-run check reads as systemic and
+    raises. The half-uploaded build's own error stays on the cause
+    chain, and the destination store is untouched either way.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
@@ -854,12 +857,13 @@ async def test_sync_build_refuses_half_uploaded_build(
     object_store = MockObjectStore()
     service = _build_service(db_session, http_client, object_store, {})
 
-    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
 
-    assert result.edition_outcomes == []
-    assert len(result.edition_failures) == 1
-    assert result.edition_failures[0].error_type == "RuntimeError"
-    assert "uploaded=False" in result.edition_failures[0].error_message
+    assert exc_info.value.failed_ltd_edition_slugs == ["main"]
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, RuntimeError)
+    assert "uploaded=False" in str(cause)
 
     # Nothing was copied to the destination.
     assert not object_store.objects
@@ -1889,6 +1893,10 @@ async def test_sync_project_success_resets_consecutive_failure_counter(
     systemic abort. Fail up to one short of the threshold, succeed once,
     then fail that many again: the counter resets on the success, so the
     project completes with every failure isolated.
+
+    The success in the middle carries a build outcome, because that is
+    what "success" means to the breaker: the edition reached LTD. It is
+    also what keeps the run off the end-of-loop total-failure abort.
     """
     run = MAX_CONSECUTIVE_EDITION_FAILURES - 1
     total = run * 2 + 1
@@ -1919,7 +1927,14 @@ async def test_sync_project_success_resets_consecutive_failure_counter(
             docverse_slug=f"u-jsick-feat-{ltd_id}",
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
-            build_outcome=None,
+            build_outcome=BuildSyncOutcome(
+                docverse_build_id=1,
+                docverse_build_public_id="BUILD1",
+                short_circuited=False,
+                content_hash=None,
+                object_count=None,
+                total_size_bytes=None,
+            ),
             short_circuited=False,
         )
 
@@ -2065,6 +2080,136 @@ async def test_sync_project_proactive_skip_is_counter_neutral(
         len(exc_info.value.failed_ltd_edition_slugs)
         == MAX_CONSECUTIVE_EDITION_FAILURES
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_project_buildless_edition_is_counter_neutral(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An LTD edition with no build must not clear the systemic counter.
+
+    A build-less edition does database-only work: it never resolves an
+    LTD build, never reads the LTD bucket, and returns a genuine
+    (non-short-circuited) outcome. Like a tombstone short-circuit, it
+    succeeds *especially* during an outage, so it carries no evidence
+    that LTD or the object store recovered. Counting it as a success
+    let any product whose edition list interleaves a build-less edition
+    at least once per ``MAX_CONSECUTIVE_EDITION_FAILURES`` positions
+    defeat the breaker outright — the same masking the tombstone
+    exemption exists to prevent.
+    """
+    run = MAX_CONSECUTIVE_EDITION_FAILURES - 1
+    total = MAX_CONSECUTIVE_EDITION_FAILURES + 3
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-buildless")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    attempted: list[int] = []
+
+    async def _fails_around_a_buildless_edition(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> EditionSyncOutcome:
+        ltd_id = ltd_edition.ltd_id
+        attempted.append(ltd_id)
+        if ltd_id != run + 1:
+            msg = "LTD is down"
+            raise RuntimeError(msg)
+        async with db_session.begin():
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+        assert project is not None
+        # A real sync of a build-less LTD edition: the edition row and
+        # its state row were written, but ``sync_build`` never ran, so
+        # there is no build outcome and nothing touched LTD.
+        return EditionSyncOutcome(
+            docverse_edition_id=1,
+            docverse_slug=f"u-jsick-feat-{ltd_id}",
+            docverse_project_id=project.id,
+            docverse_project_slug=project.slug,
+            build_outcome=None,
+            short_circuited=False,
+        )
+
+    monkeypatch.setattr(
+        service, "sync_edition", _fails_around_a_buildless_edition
+    )
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # The build-less edition was walked but left the counter alone, so
+    # the failure right after it is the Nth in a row and aborts.
+    assert attempted == list(range(1, MAX_CONSECUTIVE_EDITION_FAILURES + 2))
+    assert (
+        exc_info.value.consecutive_failures == MAX_CONSECUTIVE_EDITION_FAILURES
+    )
+    # The build-less edition is absent from the reported run without
+    # having broken it.
+    assert exc_info.value.failed_ltd_edition_slugs == [
+        *(f"u-jsick-feat-{i}" for i in range(1, run + 1)),
+        f"u-jsick-feat-{run + 2}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_project_fails_when_every_attempted_edition_fails(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A total outage fails the run even below the breaker threshold.
+
+    Per-edition isolation means the consecutive-failure breaker is the
+    only path back to a failed job, and a typical migrated project has
+    ~20 editions — far fewer than ``MAX_CONSECUTIVE_EDITION_FAILURES``.
+    Expired object-store credentials or a dead database would therefore
+    fail every edition and still roll the project up
+    ``completed_with_errors`` / ``partial_failure`` with zero editions
+    imported. A run where every attempted edition failed is systemic by
+    construction, whatever the edition count.
+    """
+    total = 3
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-total")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    attempted: list[int] = []
+
+    async def _always_raises(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> None:
+        attempted.append(ltd_edition.ltd_id)
+        msg = "The object store credentials expired"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(service, "sync_edition", _always_raises)
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # Nothing short-circuited the loop: every edition was attempted, and
+    # the abort fires at the end of the run rather than mid-list.
+    assert attempted == list(range(1, total + 1))
+    # The last edition's exception stays on the cause chain for Sentry
+    # and the ``queue_jobs.errors`` traceback.
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert exc_info.value.ltd_slug == "pipelines"
+    assert exc_info.value.consecutive_failures == total
+    assert exc_info.value.failed_ltd_edition_slugs == [
+        f"u-jsick-feat-{i}" for i in range(1, total + 1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -5180,7 +5325,9 @@ async def test_main_edition_denial_does_not_try_the_edition_prefix(
 
     So a denied ``main`` build has no published sibling to recover from
     and must keep failing its edition rather than importing some other
-    prefix's content.
+    prefix's content. ``main`` is this product's only edition, so the
+    failed run imported nothing and the end-of-run systemic check turns
+    it into a failed job — with the denial itself on the cause chain.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-main-denied")
@@ -5199,12 +5346,11 @@ async def test_main_edition_denial_does_not_try_the_edition_prefix(
         db_session, http_client, object_store, source_objects, source=source
     )
 
-    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
 
-    assert len(result.edition_failures) == 1
-    failure = result.edition_failures[0]
-    assert failure.ltd_edition_slug == "main"
-    assert failure.error_type == "LtdSourceAccessDeniedError"
+    assert exc_info.value.failed_ltd_edition_slugs == ["main"]
+    assert isinstance(exc_info.value.__cause__, LtdSourceAccessDeniedError)
     assert not [
         p for p in source.listed_prefixes if p.startswith("pipelines/v/")
     ]
