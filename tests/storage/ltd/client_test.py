@@ -217,6 +217,51 @@ async def test_5xx_exhausts_retries_then_raises(
 
 
 @pytest.mark.asyncio
+async def test_transport_failure_exhausts_retries_then_raises() -> None:
+    """A dropped connection is retried before it becomes a client error."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http_client:
+        with pytest.raises(LtdClientError) as excinfo:
+            await _make_client(http_client).get_product("pipelines")
+
+    assert attempts == [1, 2, 3, 4]
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+
+
+@pytest.mark.asyncio
+async def test_unsupported_protocol_fails_on_the_first_attempt() -> None:
+    """A misconfigured ``ltd_base_url`` must not burn the retry budget.
+
+    ``UnsupportedProtocol`` is what a base URL with a typo'd (or
+    missing) scheme raises, and every attempt would fail identically.
+    Catching the whole ``httpx.HTTPError`` tree spent four attempts and
+    four backoff sleeps proving that to itself before reporting the
+    operator's mistake.
+    """
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.UnsupportedProtocol("unknown scheme")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http_client:
+        with pytest.raises(LtdClientError) as excinfo:
+            await _make_client(http_client).get_product("pipelines")
+
+    assert attempts == [1]
+    assert isinstance(excinfo.value.__cause__, httpx.UnsupportedProtocol)
+
+
+@pytest.mark.asyncio
 async def test_schema_drift_extra_fields_does_not_break(
     http_client: httpx.AsyncClient, mock_discovery: respx.Router
 ) -> None:

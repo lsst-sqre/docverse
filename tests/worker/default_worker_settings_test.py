@@ -14,9 +14,9 @@ from typing import Any
 from arq.worker import Function
 
 from docverse_server.config import Configuration
-from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
-from docverse_server.storage.cdncachepurger._cloudflare import (
-    _MAX_ATTEMPTS as _PURGE_MAX_ATTEMPTS,
+from docverse_server.storage._http_retry import (
+    DEFAULT_MAX_ATTEMPTS,
+    MAX_BACKOFF_SECONDS,
 )
 from docverse_server.worker.functions import publish_edition
 from docverse_server.worker.main import WorkerSettings
@@ -57,18 +57,18 @@ def test_publish_edition_declares_an_explicit_timeout() -> None:
     )
 
 
-def test_publish_edition_timeout_clears_the_purge_backoff() -> None:
-    """The budget covers the coalescer wait plus a full purge backoff.
+def test_publish_edition_timeout_clears_the_retry_backoffs() -> None:
+    """The budget covers the coalescer wait plus both Cloudflare backoffs.
 
-    Worst case for one publish is the coalescer's throttle interval
-    followed by four purge attempts spaced by the clamped ``Retry-After``
+    Worst case for one publish is a full KV pointer-write backoff, then
+    the coalescer's throttle interval, then a full zone-purge backoff —
+    each a run of attempts spaced by the clamped ``Retry-After``
     ceiling. Anything at or below that would cancel healthy publishes
     that are merely riding out a Cloudflare 429.
     """
-    worst_case_purge = _config.cdn_purge_min_interval_seconds + (
-        (_PURGE_MAX_ATTEMPTS - 1) * MAX_BACKOFF_SECONDS
-    )
-    assert _config.publish_edition_job_timeout_seconds > worst_case_purge
+    one_backoff_run = (DEFAULT_MAX_ATTEMPTS - 1) * MAX_BACKOFF_SECONDS
+    worst_case = _config.cdn_purge_min_interval_seconds + 2 * one_backoff_run
+    assert _config.publish_edition_job_timeout_seconds > worst_case
 
 
 def test_publish_edition_timeout_sits_below_its_reaper_threshold() -> None:

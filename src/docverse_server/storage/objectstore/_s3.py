@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from types import TracebackType
 from typing import Self
 
@@ -13,20 +12,13 @@ from aiobotocore.session import AioSession, ClientCreatorContext, get_session
 from botocore.config import Config
 
 from .._http_retry import (
-    RETRYABLE_STATUS_CODES,
+    DEFAULT_BASE_BACKOFF_SECONDS,
+    DEFAULT_MAX_ATTEMPTS,
     RETRYABLE_TRANSPORT_ERRORS,
-    backoff_for_attempt,
-    backoff_for_response,
+    retry_request,
 )
 
 __all__ = ["S3ObjectStore"]
-
-#: Maximum attempts for a presigned upload, including the original
-#: request (``_MAX_ATTEMPTS - 1`` retries).
-_MAX_ATTEMPTS = 4
-
-#: Initial backoff in seconds; doubles each subsequent attempt.
-_BASE_BACKOFF_SECONDS = 0.5
 
 #: Lifetime of a presigned upload signature. Every attempt mints a fresh
 #: one, so this only has to outlive a single PUT rather than the whole
@@ -81,8 +73,8 @@ class S3ObjectStore:
         region: str = "",
         logger: structlog.stdlib.BoundLogger,
         http_client: httpx.AsyncClient | None = None,
-        max_attempts: int = _MAX_ATTEMPTS,
-        base_backoff_seconds: float = _BASE_BACKOFF_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._bucket = bucket
@@ -91,6 +83,9 @@ class S3ObjectStore:
         self._region = region
         self._logger = logger
         self._http_client = http_client
+        # Clamped here as well as inside ``retry_request`` so the stored
+        # value is the one actually spent, and the exhausted-transport
+        # log below can report it without re-deriving the policy.
         self._max_attempts = max(1, max_attempts)
         self._base_backoff_seconds = base_backoff_seconds
         self._session: AioSession = get_session()
@@ -247,81 +242,55 @@ class S3ObjectStore:
             If the transport keeps failing until the attempt budget is
             exhausted, or fails in a way a retry cannot fix.
         """
-        for attempt in range(1, self._max_attempts + 1):
+        logger = self._logger.bind(key=key)
+
+        async def send() -> httpx.Response:
             # Sign afresh on every attempt. The signature is only valid
             # for _UPLOAD_URL_EXPIRES_SECONDS, and a retry sequence that
             # honours a long Retry-After can outlive that window; signing
             # is a local HMAC, so re-minting costs nothing but rules out
             # ever replaying an expired URL.
             url = await self._generate_upload_url(key)
-            try:
-                response = await http_client.put(
-                    url,
-                    content=data,
-                    headers={"Content-Type": content_type},
-                )
-            except RETRYABLE_TRANSPORT_ERRORS as exc:
-                if attempt >= self._max_attempts:
-                    self._logger.exception(
-                        "Presigned upload failed",
-                        error=str(exc),
-                        error_type=type(exc).__name__,
-                        key=key,
-                        attempts=attempt,
-                        retryable=True,
-                    )
-                    raise
-                delay = backoff_for_attempt(
-                    attempt, base_backoff_seconds=self._base_backoff_seconds
-                )
-                self._logger.warning(
-                    "Retrying presigned upload after transport error",
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                    key=key,
-                    attempt=attempt,
-                    max_attempts=self._max_attempts,
-                    retry_delay=delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # Only a 2xx means the bytes landed. Anything else — a 3xx
-            # region/endpoint redirect from S3 or R2 (this client does
-            # not follow redirects, so the body went nowhere) as much as
-            # a 4xx or 5xx — has to fail loudly rather than report a
-            # build as copied when the object was never stored.
-            if response.is_success:
-                return
-
-            retryable = response.status_code in RETRYABLE_STATUS_CODES
-            if retryable and attempt < self._max_attempts:
-                delay = backoff_for_response(
-                    response,
-                    attempt,
-                    base_backoff_seconds=self._base_backoff_seconds,
-                    logger=self._logger,
-                )
-                self._logger.warning(
-                    "Retrying presigned upload",
-                    status_code=response.status_code,
-                    key=key,
-                    attempt=attempt,
-                    max_attempts=self._max_attempts,
-                    retry_delay=delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            self._logger.error(
-                "Presigned upload failed",
-                status_code=response.status_code,
-                response_body=response.text,
-                key=key,
-                attempts=attempt,
-                retryable=retryable,
+            return await http_client.put(
+                url,
+                content=data,
+                headers={"Content-Type": content_type},
             )
-            response.raise_for_status()
+
+        try:
+            outcome = await retry_request(
+                send,
+                operation="presigned upload",
+                logger=logger,
+                max_attempts=self._max_attempts,
+                base_backoff_seconds=self._base_backoff_seconds,
+            )
+        except RETRYABLE_TRANSPORT_ERRORS as exc:
+            logger.exception(
+                "Presigned upload failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                attempts=self._max_attempts,
+                retryable=True,
+            )
+            raise
+
+        # Only a 2xx means the bytes landed. Anything else — a 3xx
+        # region/endpoint redirect from S3 or R2 (this client does not
+        # follow redirects, so the body went nowhere) as much as a 4xx or
+        # 5xx — has to fail loudly rather than report a build as copied
+        # when the object was never stored.
+        if outcome.response.is_success:
+            return
+
+        logger.error(
+            "Presigned upload failed",
+            status_code=outcome.response.status_code,
+            response_body=outcome.response.text,
+            attempts=outcome.attempts,
+            retryable=outcome.retryable,
+        )
+        outcome.response.raise_for_status()
 
     async def _generate_upload_url(self, key: str) -> str:
         """Mint a short-lived presigned PUT URL for ``key``."""

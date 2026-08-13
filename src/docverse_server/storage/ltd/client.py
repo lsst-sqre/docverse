@@ -12,7 +12,6 @@ distinguish "LTD doesn't have this any more" (soft-deletion path) from
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, override
 
 import httpx
@@ -22,9 +21,9 @@ from safir.slack.sentry import SentryEventInfo
 from docverse_server.exceptions import DocverseSlackException
 
 from .._http_retry import (
-    RETRYABLE_STATUS_CODES,
-    backoff_for_attempt,
-    backoff_for_response,
+    DEFAULT_BASE_BACKOFF_SECONDS,
+    DEFAULT_MAX_ATTEMPTS,
+    retry_request,
 )
 from .models import LtdBuild, LtdEdition, LtdProduct, LtdProductsListing
 
@@ -33,13 +32,6 @@ __all__ = [
     "LtdClientError",
     "LtdNotFoundError",
 ]
-
-#: Maximum retry attempts for transient (429/5xx) responses, including
-#: the original request (``_MAX_ATTEMPTS - 1`` retries).
-_MAX_ATTEMPTS = 4
-
-#: Initial backoff in seconds; doubles each subsequent attempt.
-_BASE_BACKOFF_SECONDS = 0.5
 
 #: Ceiling on any single wait between attempts, overriding the tighter
 #: shared default in `docverse_server.storage._http_retry`.
@@ -168,8 +160,8 @@ class LtdClient:
         http_client: httpx.AsyncClient,
         base_url: str,
         logger: structlog.stdlib.BoundLogger,
-        max_attempts: int = _MAX_ATTEMPTS,
-        base_backoff_seconds: float = _BASE_BACKOFF_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: float = _MAX_BACKOFF_SECONDS,
     ) -> None:
         self._http_client = http_client
@@ -239,6 +231,11 @@ class LtdClient:
     async def _get_json(self, url: str) -> dict[str, Any]:
         """Issue a GET with retries and return the parsed JSON body.
 
+        Waits between attempts are bounded by this client's own generous
+        ceiling rather than the shared default, so an LTD rate-limit
+        window gets ridden out instead of being failed inside (see
+        :data:`_MAX_BACKOFF_SECONDS`).
+
         Raises
         ------
         LtdNotFoundError
@@ -247,96 +244,66 @@ class LtdClient:
             On any other non-2xx — including a 3xx redirect, which this
             client does not follow — either immediately if the status is
             not retryable or after the retry budget is exhausted, and on
-            a network error after the retry budget is exhausted.
+            a transport failure. A transport failure a retry could fix
+            is reported only once the budget is exhausted; one it could
+            not (a malformed request, or a ``ltd_base_url`` whose scheme
+            Docverse cannot speak) is reported from the first attempt,
+            because every further attempt would fail identically.
         """
-        last_exc: Exception | None = None
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                response = await self._http_client.get(url)
-            except httpx.HTTPError as exc:
-                last_exc = exc
-                if attempt >= self._max_attempts:
-                    raise LtdClientError(
-                        url=url,
-                        method="GET",
-                        message=f"LTD GET {url} failed: {exc}",
-                    ) from exc
-                await asyncio.sleep(self._backoff_for_attempt(attempt))
-                continue
+        try:
+            outcome = await retry_request(
+                lambda: self._http_client.get(url),
+                operation="LTD GET",
+                logger=self._logger.bind(ltd_url=url),
+                max_attempts=self._max_attempts,
+                base_backoff_seconds=self._base_backoff_seconds,
+                max_backoff_seconds=self._max_backoff_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise LtdClientError(
+                url=url,
+                method="GET",
+                message=f"LTD GET {url} failed: {exc}",
+            ) from exc
 
-            if response.status_code == httpx.codes.NOT_FOUND:
-                raise LtdNotFoundError(
-                    url=url,
-                    method="GET",
-                    status_code=response.status_code,
-                    body=response.text,
-                    message=f"LTD resource {url} not found (404)",
-                )
+        response = outcome.response
+        if response.status_code == httpx.codes.NOT_FOUND:
+            raise LtdNotFoundError(
+                url=url,
+                method="GET",
+                status_code=response.status_code,
+                body=response.text,
+                message=f"LTD resource {url} not found (404)",
+            )
 
-            if response.status_code in RETRYABLE_STATUS_CODES:
-                if attempt >= self._max_attempts:
-                    raise LtdClientError(
-                        url=url,
-                        method="GET",
-                        status_code=response.status_code,
-                        body=response.text,
-                        message=(
-                            f"LTD GET {url} returned {response.status_code} "
-                            f"after {attempt} attempts"
-                        ),
-                    )
-                await asyncio.sleep(
-                    self._backoff_for_response(response, attempt)
-                )
-                continue
+        if outcome.retryable:
+            raise LtdClientError(
+                url=url,
+                method="GET",
+                status_code=response.status_code,
+                body=response.text,
+                message=(
+                    f"LTD GET {url} returned {response.status_code} "
+                    f"after {outcome.attempts} attempts"
+                ),
+            )
 
-            # Only a 2xx carries a JSON body worth parsing. A 3xx is not
-            # followed on this client, so treating "not an error" as
-            # success fed a redirect's HTML into ``response.json()`` and
-            # raised ``JSONDecodeError`` from outside the
-            # ``LtdClientError`` taxonomy every caller handles.
-            if not response.is_success:
-                raise LtdClientError(
-                    url=url,
-                    method="GET",
-                    status_code=response.status_code,
-                    body=response.text,
-                    message=(
-                        f"LTD GET {url} returned non-retryable status "
-                        f"{response.status_code}"
-                    ),
-                )
+        # Only a 2xx carries a JSON body worth parsing. A 3xx is not
+        # followed on this client, so treating "not an error" as success
+        # fed a redirect's HTML into ``response.json()`` and raised
+        # ``JSONDecodeError`` from outside the ``LtdClientError``
+        # taxonomy every caller handles.
+        if not response.is_success:
+            raise LtdClientError(
+                url=url,
+                method="GET",
+                status_code=response.status_code,
+                body=response.text,
+                message=(
+                    f"LTD GET {url} returned non-retryable status "
+                    f"{response.status_code}"
+                ),
+            )
 
-            payload: dict[str, Any] = response.json()
-            return payload
-
-        raise LtdClientError(
-            url=url,
-            method="GET",
-            message=f"LTD GET {url} exhausted retries",
-        ) from last_exc
-
-    def _backoff_for_attempt(self, attempt: int) -> float:
-        return backoff_for_attempt(
-            attempt,
-            base_backoff_seconds=self._base_backoff_seconds,
-            max_backoff_seconds=self._max_backoff_seconds,
-        )
-
-    def _backoff_for_response(
-        self, response: httpx.Response, attempt: int
-    ) -> float:
-        """Honour ``Retry-After`` on 429, else fall back to exp backoff.
-
-        Waits are bounded by this client's own generous ceiling rather
-        than the shared default, so an LTD rate-limit window gets
-        ridden out instead of being failed inside (see
-        :data:`_MAX_BACKOFF_SECONDS`).
-        """
-        return backoff_for_response(
-            response,
-            attempt,
-            base_backoff_seconds=self._base_backoff_seconds,
-            logger=self._logger,
-            max_backoff_seconds=self._max_backoff_seconds,
-        )
+        payload: dict[str, Any] = response.json()
+        return payload

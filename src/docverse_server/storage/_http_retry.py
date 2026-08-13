@@ -1,36 +1,62 @@
 """Shared retry policy for outbound third-party HTTP calls.
 
 Docverse makes flaky third-party HTTP calls from the storage layer in
-three places: LTD Keeper (`docverse_server.storage.ltd.LtdClient`), the
+four places: LTD Keeper (`docverse_server.storage.ltd.LtdClient`), the
 Cloudflare zone purge API
-(`docverse_server.storage.cdncachepurger.CloudflareCachePurger`), and
-presigned object uploads
-(`docverse_server.storage.objectstore.S3ObjectStore`). All three need
+(`docverse_server.storage.cdncachepurger.CloudflareCachePurger`), the
+Cloudflare Workers KV pointer write
+(`docverse_server.storage.editionpublisher.CloudflareKvEditionPublisher`),
+and presigned object uploads
+(`docverse_server.storage.objectstore.S3ObjectStore`). All four need
 the same decisions — which statuses are worth another attempt, which
 transport failures are worth another attempt, how long to wait between
 attempts, and whether to trust a server-supplied ``Retry-After`` — so
 the policy lives here once instead of being mirrored (and then
 drifting) at each call site.
 
-The helpers are deliberately stateless functions rather than a mixin or
-decorator: each caller owns its own request/response loop (LTD raises
-typed errors and treats 404 specially; the purger is best-effort; the
-object store re-signs its URL between attempts), and only the waiting
-policy is genuinely shared.
+`retry_request` owns the whole attempt loop, and the callers own only
+what is genuinely theirs: how to issue one attempt (the object store
+re-signs its presigned URL each time) and how to render a terminal
+failure (LTD raises typed errors and treats 404 specially; the purger
+translates into a Slack-routed exception; the object store and the KV
+publisher call ``raise_for_status``). The waiting helpers stay exported
+because the loop is built from them and they are worth testing on their
+own.
 """
 
 from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
 import structlog
 
 __all__ = [
+    "DEFAULT_BASE_BACKOFF_SECONDS",
+    "DEFAULT_MAX_ATTEMPTS",
     "MAX_BACKOFF_SECONDS",
     "RETRYABLE_STATUS_CODES",
     "RETRYABLE_TRANSPORT_ERRORS",
+    "RetryOutcome",
     "backoff_for_attempt",
     "backoff_for_response",
+    "retry_request",
 ]
+
+#: Default attempts allowed for one logical request, *including* the
+#: original (so ``DEFAULT_MAX_ATTEMPTS - 1`` retries). Shared by every
+#: storage client: they all talk to rate-limited third-party APIs whose
+#: throttles clear on the order of seconds, and there is no evidence any
+#: one of them wants a different budget. A caller that does can pass
+#: ``max_attempts``.
+DEFAULT_MAX_ATTEMPTS = 4
+
+#: Default delay after a first failure, in seconds; doubles each
+#: subsequent attempt up to the applicable ceiling.
+DEFAULT_BASE_BACKOFF_SECONDS = 0.5
 
 #: Default upper bound, in seconds, on any single wait between attempts
 #: — including one a server asks for via ``Retry-After``.
@@ -186,3 +212,160 @@ def backoff_for_response(
         base_backoff_seconds=base_backoff_seconds,
         max_backoff_seconds=max_backoff_seconds,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class RetryOutcome:
+    """The response `retry_request` settled on, and what it cost.
+
+    Carries the attempt count alongside the response because every
+    caller's terminal log line reports it, and by then the loop that
+    counted the attempts is gone.
+    """
+
+    response: httpx.Response
+    """The last response received, successful or not."""
+
+    attempts: int
+    """Attempts spent reaching it, counting the original request."""
+
+    @property
+    def retryable(self) -> bool:
+        """Whether the budget, not the status, ended the attempts.
+
+        ``True`` only for a terminal response whose status *was* worth
+        retrying — i.e. the attempt budget ran out mid-throttle rather
+        than the server saying something a retry could never fix. That
+        distinction is what tells an operator "raise the budget" apart
+        from "fix the credential".
+        """
+        return self.response.status_code in RETRYABLE_STATUS_CODES
+
+
+async def retry_request(
+    send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    operation: str,
+    logger: structlog.stdlib.BoundLogger,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS,
+    max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+    retry_log_context: (
+        Callable[[httpx.Response], Mapping[str, Any]] | None
+    ) = None,
+) -> RetryOutcome:
+    """Issue a request, retrying transient failures with backoff.
+
+    The loop every storage client used to keep its own copy of: retry
+    `RETRYABLE_STATUS_CODES` and `RETRYABLE_TRANSPORT_ERRORS`, wait
+    `backoff_for_response` / `backoff_for_attempt` in between, and stop
+    at the attempt budget.
+
+    What it deliberately does *not* do is decide what a failure means.
+    A terminal response — a 403, an unfollowed 3xx, or a 503 that
+    outlasted the budget — comes back as a `RetryOutcome` for the caller
+    to translate into ``raise_for_status``, a typed purge error, or an
+    ``LtdClientError``. A transport failure that outlasts the budget is
+    re-raised as itself so the caller's own exception keeps the real
+    ``httpx`` error as its ``__cause__``.
+
+    Parameters
+    ----------
+    send
+        Issues one attempt and returns its response. Called afresh per
+        attempt, so a caller whose request cannot simply be replayed
+        (`~docverse_server.storage.objectstore.S3ObjectStore` re-signs
+        its presigned URL) rebuilds it here.
+    operation
+        Human-readable name of what is being retried, used to build the
+        retry log events (``"Retrying {operation}"``). Phrase it as a
+        lowercase-or-proper-noun noun phrase, e.g. ``"presigned
+        upload"`` or ``"Cloudflare cache purge"``.
+    logger
+        Logger for the retry warnings. Bind the caller's identifying
+        context (object key, hostname, edition slug) onto it first —
+        this function adds only the attempt and delay fields.
+    max_attempts
+        Attempts allowed including the original. Clamped to at least 1
+        so a misconfigured budget degrades to "try once, no retries"
+        rather than to a silent no-op that never issues the request.
+    base_backoff_seconds
+        Delay after the first failure; doubles each subsequent attempt.
+    max_backoff_seconds
+        Ceiling on any single wait, including one a server asks for via
+        ``Retry-After``. See `MAX_BACKOFF_SECONDS` for why the default
+        is tight and who may raise it.
+    retry_log_context
+        Optional hook returning extra structured fields for the retry
+        warning, derived from the response that triggered it. A retry
+        that eventually succeeds never reaches a caller's terminal error
+        log, so this warning is the only record of it — and for
+        Cloudflare that record is only actionable with the API's own
+        ``errors[].code`` in it (``1134`` is "publishing too fast",
+        an auth code is "the token expired").
+
+    Returns
+    -------
+    RetryOutcome
+        The terminal response and the attempts it took. A success, a
+        status not worth retrying, or a retryable status that outlasted
+        the budget all arrive this way.
+
+    Raises
+    ------
+    httpx.TransportError
+        If the transport fails in a way no retry can fix (a bug or
+        misconfiguration on our side, see `RETRYABLE_TRANSPORT_ERRORS`),
+        which happens on the first attempt, or if a retryable transport
+        failure outlasts the attempt budget.
+    """
+    budget = max(1, max_attempts)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            response = await send()
+        except RETRYABLE_TRANSPORT_ERRORS as exc:
+            # No response came back at all. That is as transient as a
+            # 429 and just as recoverable, so it shares the status
+            # path's attempt budget instead of aborting on the first
+            # dropped connection.
+            if attempt >= budget:
+                raise
+            delay = backoff_for_attempt(
+                attempt,
+                base_backoff_seconds=base_backoff_seconds,
+                max_backoff_seconds=max_backoff_seconds,
+            )
+            logger.warning(
+                f"Retrying {operation} after transport error",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                attempt=attempt,
+                max_attempts=budget,
+                retry_delay=delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        retryable = response.status_code in RETRYABLE_STATUS_CODES
+        if not (retryable and attempt < budget):
+            return RetryOutcome(response=response, attempts=attempt)
+
+        delay = backoff_for_response(
+            response,
+            attempt,
+            base_backoff_seconds=base_backoff_seconds,
+            logger=logger,
+            max_backoff_seconds=max_backoff_seconds,
+        )
+        extra = retry_log_context(response) if retry_log_context else {}
+        logger.warning(
+            f"Retrying {operation}",
+            status_code=response.status_code,
+            attempt=attempt,
+            max_attempts=budget,
+            retry_delay=delay,
+            **extra,
+        )
+        await asyncio.sleep(delay)
