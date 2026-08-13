@@ -139,3 +139,20 @@ def test_edition_autocreation_rejects_unknown_keys() -> None:
         EditionAutocreationConfig.model_validate(
             {"semver_aggregates": False, "eups_aggregates": True}
         )
+
+
+def test_edition_autocreation_is_frozen() -> None:
+    """Resolved configs are shared instances, so mutation must be refused."""
+    config = EditionAutocreationConfig()
+    with pytest.raises(ValidationError) as exc_info:
+        config.semver_aggregates = False
+    assert exc_info.value.errors()[0]["type"] == "frozen_instance"
+    assert config.semver_aggregates is True
+
+
+def test_edition_autocreation_copies_with_updates() -> None:
+    """Freezing must not block deriving a variant from a shared config."""
+    config = EditionAutocreationConfig()
+    derived = config.model_copy(update={"semver_aggregates": False})
+    assert derived.semver_aggregates is False
+    assert config.semver_aggregates is True

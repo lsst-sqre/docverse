@@ -134,9 +134,14 @@ class EditionAutocreationConfig(BaseModel):
     Set on an organization and/or a project; the project value wins
     whole-object when both are present, and ``null`` at both levels
     means "use the defaults" (every knob below at its default).
+
+    Instances are frozen: the server hands out one shared default config
+    to every project that configures none, so a consumer mutating what it
+    resolved would rewrite the defaults process-wide. Derive a variant
+    with ``model_copy(update=...)`` instead.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     semver_aggregates: bool = Field(
         default=True,
