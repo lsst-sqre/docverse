@@ -99,7 +99,29 @@ class KeeperSyncState(BaseModel):
         :meth:`~docverse_server.services.keeper_sync.service.KeeperSyncService._backfill_semver_aggregates`
         has already reconciled. Its absence (or a mismatch against the
         build the edition points at now) is what makes the backfill run;
-        a match makes a steady-state poll skip it entirely.
+        a match makes a steady-state poll skip it entirely. Only a pass
+        that actually reconciled something writes it, so a project with
+        ``edition_autocreation.semver_aggregates`` off stays unmarked and
+        heals the moment the knob comes back on.
+    Build-resource rows
+        ``ltd_source_prefix`` / ``ltd_source_prefix_origin`` — the LTD
+        bucket prefix the content was read from, and whether it was the
+        build's own prefix (``build``) or the edition's ``v/`` prefix
+        recovered after an ``AccessDenied`` (``edition``).
+
+        ``ltd_source_manifest_hash`` — present only when that prefix
+        mutated between the hash keeper-sync resolved on and the bytes
+        it copied: the hash the resolution branched on, kept for
+        forensics because the row's ``content_hash`` describes the
+        copied bytes instead.
+
+        ``date_rebuilt_seen_retracted`` — ``True`` while that mutation's
+        retraction of ``date_rebuilt_seen`` is outstanding. The cleared
+        column cannot carry the signal by itself: an LTD edition with a
+        null ``date_rebuilt`` compares equal to it, and
+        ``sync_build``'s short-circuit would read a retraction as a
+        match. Both keys clear on the next clean resolve, since
+        ``annotations`` replaces wholesale.
     """
 
     model_config = ConfigDict(from_attributes=True)

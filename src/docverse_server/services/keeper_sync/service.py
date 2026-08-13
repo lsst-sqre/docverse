@@ -232,7 +232,30 @@ _SYNC_UPLOADER = "keeper-sync"
 #: those have no marker, and their heal necessarily lands on a
 #: short-circuited sync (their content was imported long ago), which is
 #: why the skip cannot key off ``short_circuited`` instead.
+#:
+#: Only a pass that actually reconciled something writes it — see
+#: :meth:`KeeperSyncService._backfill_semver_aggregates`. A pass held
+#: back by ``edition_autocreation.semver_aggregates`` leaves the row
+#: unmarked so re-enabling the knob heals on the very next poll.
 _AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
+
+#: ``keeper_sync_state.annotations`` key on a *build* row: ``True`` while
+#: the row's ``date_rebuilt_seen`` stands retracted, i.e. ``sync_build``
+#: imported a ``v/`` prefix that mutated between the hash it resolved on
+#: and the bytes it copied, and cleared the marker so the next poll
+#: re-resolves rather than short-circuiting.
+#:
+#: The flag exists because ``date_rebuilt_seen`` alone cannot say it.
+#: ``LtdEdition.date_rebuilt`` is nullable, and null is the norm for
+#: LTD's oldest editions — the very population whose un-ACL'd build
+#: prefixes force the mutable ``v/`` fallback. For those, a retracted
+#: ``NULL`` marker compares equal to LTD's ``NULL`` timestamp, so the
+#: short-circuit read "already converged" and the retraction it was
+#: handed never took effect. This flag is what separates "no marker,
+#: re-resolve" from "the marker matches"; it is written in the same
+#: upsert that clears the column, and disappears on the next clean
+#: resolve because ``annotations`` replaces wholesale.
+_DATE_REBUILT_RETRACTED_KEY = "date_rebuilt_seen_retracted"
 
 
 @dataclass(frozen=True)
@@ -282,7 +305,9 @@ class _ResolvedBuildSource:
       hash against :attr:`manifest_hash` afterwards and treats a
       difference as the mutation it is: the *copied* hash is what the
       build and state rows record, and the build's ``date_rebuilt_seen``
-      marker is cleared so the next poll re-resolves instead of
+      marker is retracted — cleared *and* flagged, see
+      :data:`_DATE_REBUILT_RETRACTED_KEY` — so the next poll
+      re-resolves instead of
       short-circuiting on a resolution that never held. The re-resolve
       then dedupes onto this very build if the prefix has settled on
       what we copied, so a settled prefix converges without another
@@ -393,6 +418,22 @@ def _aggregates_backfilled_build_id(
         return None
     value = state.annotations.get(_AGGREGATES_BACKFILLED_BUILD_ID_KEY)
     return value if isinstance(value, int) else None
+
+
+def _date_rebuilt_marker_retracted(state: KeeperSyncState) -> bool:
+    """Report whether *state*'s rebuild marker stands retracted.
+
+    A truthy :data:`_DATE_REBUILT_RETRACTED_KEY` annotation means the
+    row's ``date_rebuilt_seen`` was cleared on purpose and the build's
+    content came from an LTD prefix state that no longer exists, so the
+    edition owes one full re-resolve no matter what the column now holds
+    — including the ``NULL`` that would otherwise compare equal to an
+    LTD edition reporting no ``date_rebuilt`` at all.
+    """
+    return bool(
+        state.annotations
+        and state.annotations.get(_DATE_REBUILT_RETRACTED_KEY)
+    )
 
 
 @dataclass(frozen=True)
@@ -1341,6 +1382,16 @@ class KeeperSyncService:
         transaction opens and are therefore left unmarked, since
         re-deciding that costs nothing but a parse.
 
+        The marker is a claim that this build's ``N`` / ``N.M`` rows are
+        as they should be, so a pass that reconciled *nothing* — creation
+        disabled and no existing aggregate moved — must not write one. It
+        would otherwise pin the caller's skip to this build id for good,
+        and an operator turning ``semver_aggregates`` back on would see no
+        aggregates until LTD happened to publish a new build for the
+        edition. Leaving it unwritten costs such a project one cheap
+        re-decision (a parse plus a ``get_by_slug`` per spec) per poll,
+        which is the price of the knob staying live.
+
         Each spec is reconciled in its own transaction rather than one
         transaction spanning the loop, because
         :meth:`_ensure_aggregate_edition` has to take that aggregate's
@@ -1375,17 +1426,18 @@ class KeeperSyncService:
             )
             if outcome is not None:
                 outcomes.append(outcome)
-        async with self._session.begin():
-            await self._state_store.upsert(
-                org_id=state_key.org_id,
-                resource_type=ResourceType.edition,
-                ltd_id=state_key.ltd_id,
-                ltd_slug=state_key.ltd_slug,
-                annotations={
-                    **state_key.annotations,
-                    _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
-                },
-            )
+        if autocreation.semver_aggregates or outcomes:
+            async with self._session.begin():
+                await self._state_store.upsert(
+                    org_id=state_key.org_id,
+                    resource_type=ResourceType.edition,
+                    ltd_id=state_key.ltd_id,
+                    ltd_slug=state_key.ltd_slug,
+                    annotations={
+                        **state_key.annotations,
+                        _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
+                    },
+                )
         return tuple(outcomes)
 
     async def _ensure_aggregate_edition(
@@ -1684,7 +1736,8 @@ class KeeperSyncService:
         """Sync the LTD edition's current build into Docverse.
 
         Short-circuits when ``keeper_sync_state`` already records a
-        Docverse build whose ``date_rebuilt_seen`` matches LTD's.
+        Docverse build whose ``date_rebuilt_seen`` matches LTD's and
+        has not been retracted (:data:`_DATE_REBUILT_RETRACTED_KEY`).
 
         ``ltd_build`` may be passed in by callers that already fetched
         the build (e.g. ``sync_edition`` does so for ``manual`` editions
@@ -1721,6 +1774,10 @@ class KeeperSyncService:
         if existing_state is not None and (
             existing_state.date_rebuilt_seen == ltd_edition.date_rebuilt
             and existing_state.docverse_id is not None
+            # A retracted marker is not a matching one, however the two
+            # columns happen to compare — see
+            # :data:`_DATE_REBUILT_RETRACTED_KEY`.
+            and not _date_rebuilt_marker_retracted(existing_state)
         ):
             async with self._session.begin():
                 await self._state_store.upsert(
@@ -1842,6 +1899,11 @@ class KeeperSyncService:
             annotations = {
                 **annotations,
                 "ltd_source_manifest_hash": source.manifest_hash,
+                # Retracting the marker below is only half the signal:
+                # an LTD edition with no ``date_rebuilt`` would make the
+                # cleared column compare equal to LTD's ``NULL`` and
+                # short-circuit anyway. This says the clear happened.
+                _DATE_REBUILT_RETRACTED_KEY: True,
             }
             self._logger.warning(
                 "LTD source prefix changed between hash and copy; importing"
@@ -1884,6 +1946,10 @@ class KeeperSyncService:
                 # retracted (not merely left alone — a stale row could
                 # already carry a matching one) and the next poll
                 # re-resolves the edition rather than short-circuiting.
+                # The retraction is carried by the annotation written
+                # above as well as by this clear, because clearing to
+                # ``NULL`` says nothing on an edition LTD reports with a
+                # null ``date_rebuilt``.
                 date_rebuilt_seen=(
                     None if source_mutated else ltd_edition.date_rebuilt
                 ),

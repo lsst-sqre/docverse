@@ -3908,6 +3908,82 @@ async def test_sync_advances_existing_aggregate_when_autocreation_off(
 
 
 @pytest.mark.asyncio
+async def test_enabling_aggregates_backfills_on_the_next_sync(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Re-enabling the knob heals the aggregates it had suppressed.
+
+    A poll that ran with ``semver_aggregates=false`` reconciled nothing,
+    so it must leave no convergence marker behind — the marker claims
+    this build's ``N`` / ``N.M`` rows are already as they should be, and
+    with creation disabled they are exactly not. Stamping it anyway
+    pinned the skip in ``sync_edition`` to the same build id forever, so
+    turning the knob back on only took effect if LTD happened to publish
+    a new build for the edition.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-reenable")
+
+    project_id = await _seed_project(
+        db_session,
+        org_id=org_id,
+        edition_autocreation={"semver_aggregates": False},
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    assert {e.slug for e in editions} == {"15.2.1"}
+
+    # The operator PATCHes the knob back on. LTD publishes nothing new,
+    # so the next poll's ``sync_build`` short-circuits — the marker is
+    # the only thing standing between the release and its aggregates.
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project_id)
+            .values(edition_autocreation={"semver_aggregates": True})
+        )
+
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = result.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    async with db_session.begin():
+        editions = await edition_store.list_all_by_project(project_id)
+    by_slug = {e.slug: e for e in editions}
+    assert set(by_slug) == {"15.2.1", "15", "15.2"}
+    release_build_id = by_slug["15.2.1"].current_build_id
+    assert release_build_id is not None
+    assert by_slug["15"].current_build_id == release_build_id
+    assert by_slug["15.2"].current_build_id == release_build_id
+
+
+@pytest.mark.asyncio
 async def test_sync_aggregates_survive_slug_only_user_rule(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -5593,6 +5669,8 @@ _REPUBLISHED_EDITION_PREFIX = "pipelines/v/0.3.0/"
 
 def _seed_republish_race(
     mock_discovery: respx.Router,
+    *,
+    no_date_rebuilt: bool = False,
 ) -> tuple[dict[str, bytes], _FakeLtdSource, Callable[[str], None]]:
     """Set up a denied build whose ``v/`` prefix republishes mid-sync.
 
@@ -5600,10 +5678,16 @@ def _seed_republish_race(
     the ``after_manifest_hash`` hook that overwrites the edition prefix
     once — reproducing an LTD republish that lands between the hash
     keeper-sync resolved on and the copy that reads the bytes.
+
+    ``no_date_rebuilt`` nulls the LTD edition's rebuild timestamp,
+    reproducing LTD's oldest editions — the same population whose
+    un-ACL'd build uploads force the ``v/`` fallback in the first place.
     """
+    draft_payload = _version_edition_payload(slug="0.3.0", git_ref="0.3.0")
+    if no_date_rebuilt:
+        draft_payload["date_rebuilt"] = None
     _seed_two_editions_main_and_draft(
-        mock_discovery,
-        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+        mock_discovery, draft_payload=draft_payload
     )
     source_objects = {
         "pipelines/builds/42/index.html": b"<html>main</html>",
@@ -5697,9 +5781,12 @@ async def test_republish_between_hash_and_copy_clears_the_rebuilt_marker(
         assert state is not None
         assert state.content_hash == copied_hash
         # No marker: the next poll re-resolves instead of concluding
-        # LTD's current rebuild is already imported.
+        # LTD's current rebuild is already imported. The retraction is
+        # recorded explicitly rather than left to the cleared column,
+        # which an edition with no ``date_rebuilt`` cannot express.
         assert state.date_rebuilt_seen is None
         assert state.annotations is not None
+        assert state.annotations["date_rebuilt_seen_retracted"] is True
         assert state.annotations["ltd_source_manifest_hash"] == resolved_hash
 
 
@@ -5783,4 +5870,100 @@ async def test_republished_prefix_reconverges_on_the_next_sync(
         # And the forensic annotation is gone with the mutation it
         # described — annotations replace wholesale on a clean resolve.
         assert state.annotations is not None
+        assert "ltd_source_manifest_hash" not in state.annotations
+
+
+@pytest.mark.asyncio
+async def test_republished_prefix_without_a_rebuilt_date_reconverges(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A retracted marker outranks LTD reporting no rebuild timestamp.
+
+    ``LtdEdition.date_rebuilt`` is nullable, and the editions that
+    report it null are the oldest uploads — precisely the ones whose
+    un-ACL'd build prefixes send keeper-sync down the mutable ``v/``
+    fallback. Comparing the retracted marker to LTD's timestamp on
+    equality alone made ``None == None`` read as "already converged", so
+    the poll after a mid-import republish short-circuited and the
+    edition kept serving a prefix state that no longer exists. The
+    retraction has to be distinguishable from a marker that matches.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-republish-nodate")
+
+    source_objects, source, republish = _seed_republish_race(
+        mock_discovery, no_date_rebuilt=True
+    )
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        source=source,
+        after_manifest_hash=republish,
+    )
+    assert (
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    ).edition_failures == ()
+
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        state = await state_store.get(
+            org_id=org_id, resource_type=ResourceType.build, ltd_id=43
+        )
+        assert state is not None
+    build_id_after_first = release.current_build_id
+    assert build_id_after_first is not None
+    # Both the retracted marker and LTD's timestamp are null, so the
+    # short-circuit cannot tell them apart on value alone.
+    assert state.date_rebuilt_seen is None
+    objects_after_first = set(object_store.objects)
+    prefixes_after_first = len(source.listed_prefixes)
+
+    # Second poll, with the prefix now settled on the republished bytes.
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.edition_failures == ()
+
+    # It re-read the edition prefix rather than short-circuiting on the
+    # retracted marker...
+    assert (
+        _REPUBLISHED_EDITION_PREFIX
+        in source.listed_prefixes[prefixes_after_first:]
+    )
+    # ...and dedupe carried it onto the build the mutated run imported.
+    assert set(object_store.objects) == objects_after_first
+
+    async with db_session.begin():
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="0.3.0"
+        )
+        assert release is not None
+        assert release.current_build_id == build_id_after_first
+
+        state = await state_store.get(
+            org_id=org_id, resource_type=ResourceType.build, ltd_id=43
+        )
+        assert state is not None
+        assert state.annotations is not None
+        # The retraction is spent: LTD still reports no rebuild
+        # timestamp, but this resolution held, so the next poll is free
+        # to short-circuit again.
+        assert "date_rebuilt_seen_retracted" not in state.annotations
         assert "ltd_source_manifest_hash" not in state.annotations
