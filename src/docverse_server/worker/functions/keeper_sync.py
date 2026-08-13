@@ -53,6 +53,7 @@ from docverse.models import (
 from docverse_server.config import config
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
 from docverse_server.factory import Factory
@@ -863,7 +864,10 @@ async def _self_heal_unpublished_editions(
     :func:`_self_heal_unpublished_aggregates`, covers the semver
     aggregates, which are not LTD resources and therefore never appear
     in ``edition_outcomes`` at all; it heals from persistent state
-    instead.
+    instead, and runs only on the runs
+    :func:`_run_may_have_moved_aggregates` admits — reading that state
+    means a full-project scan, which must not be on the steady-state
+    poll's bill.
 
     Iterates ``sync_result.edition_outcomes`` looking for editions whose
     sync short-circuited (``build_outcome.short_circuited`` is ``True``)
@@ -949,16 +953,65 @@ async def _self_heal_unpublished_editions(
             phase="self_heal",
         )
 
-    await _self_heal_unpublished_aggregates(
-        factory=factory,
-        session=session,
-        queue_job_store=queue_job_store,
-        org_id=org_id,
-        run_id=run_id,
-        project_id=project_id,
-        project_slug=project_slug,
-        logger=logger,
-    )
+    if _run_may_have_moved_aggregates(sync_result):
+        await _self_heal_unpublished_aggregates(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            logger=logger,
+        )
+
+
+def _run_may_have_moved_aggregates(sync_result: ProjectSyncResult) -> bool:
+    """Report whether this run could have moved a semver aggregate.
+
+    The gate on :func:`_self_heal_unpublished_aggregates`, whose scan is
+    the one part of a ``keeper_sync_project`` job that costs the same on
+    a run that changed nothing as on a run that imported the whole
+    project. A migrated project with 80 releases carries ~30 ``N`` /
+    ``N.M`` rows, and the reconciliation tiers re-poll every project
+    every few minutes forever — so an ungated pass is a permanent
+    per-project tax paid for a result that is, in the steady state,
+    always "nothing to do".
+
+    Two signals open the gate, matching exactly the ways an aggregate's
+    build pointer can end up unpublished in the first place:
+
+    * **An aggregate outcome.** ``_backfill_semver_aggregates`` created
+      or advanced a row this run, so the one publish enqueue it gets
+      (from :func:`_enqueue_publish_for_aggregates`) is in flight — and
+      may have been swallowed, which is the loss mode the self-heal
+      exists for. The pass runs in the same job, so the recovery lands
+      on the run that opened the hole.
+    * **A build outcome that did not short-circuit.** An edition
+      imported a fresh build, which is the only way the backfill can
+      have run at all this poll — including the paths that lose their
+      outcome, where ``_backfill_semver_aggregates`` raised (or the
+      worker died) after committing an aggregate but before reporting
+      it. Those emit no ``aggregate_outcomes`` by construction, so the
+      build-level signal is what covers them.
+
+    A run with neither signal imported no build and reconciled no
+    aggregate, so anything it would find was already in place when the
+    previous run ended — healed there, or left for the next run that
+    moves something on the project, which for a project still receiving
+    LTD builds is its next rebuild. The window this trades away is a
+    project whose editions have *all* frozen and which lost an enqueue on
+    the last run that touched them: its aggregate stays unpublished until
+    something moves again. Scanning every project on every poll forever
+    is too much to pay to close it.
+    """
+    for outcome in sync_result.edition_outcomes:
+        if outcome.aggregate_outcomes:
+            return True
+        build_outcome = outcome.build_outcome
+        if build_outcome is not None and not build_outcome.short_circuited:
+            return True
+    return False
 
 
 async def _self_heal_unpublished_aggregates(
@@ -999,28 +1052,49 @@ async def _self_heal_unpublished_aggregates(
 
     Healing therefore reads persistent state rather than this run's
     in-memory outcomes: every aggregate-shaped edition on the project is
-    a candidate, and
-    :func:`_resolve_unpublished_build_target` decides which ones are
-    genuinely unpublished. That covers all three loss modes, including
-    the ones whose outcome never existed.
+    a candidate, and :func:`_unpublished_build_target` decides which ones
+    are genuinely unpublished. That covers all three loss modes,
+    including the ones whose outcome never existed.
+
+    *Which runs* look at that state is a separate question, answered by
+    :func:`_run_may_have_moved_aggregates` — the caller's gate keeps this
+    scan off the steady-state poll entirely.
+
+    The scan itself is two queries in one transaction: the project's
+    editions, then every candidate's ``edition_build_history`` row in a
+    single batched lookup. The per-aggregate alternative
+    (:func:`_resolve_unpublished_build_target`, still used by the LTD
+    leg, which reaches its editions one at a time anyway) would open a
+    transaction per row, and a migrated project carries one aggregate
+    per release series.
     """
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
 
+    aggregates: list[tuple[Edition, int]] = []
     async with session.begin():
-        editions = await edition_store.list_all_by_project(project_id)
-    aggregates = [
-        edition
-        for edition in editions
-        if edition.tracking_mode in _AGGREGATE_TRACKING_MODES
-    ]
+        for edition in await edition_store.list_all_by_project(project_id):
+            if edition.tracking_mode not in _AGGREGATE_TRACKING_MODES:
+                continue
+            current_build_id = edition.current_build_id
+            if current_build_id is None:
+                continue
+            aggregates.append((edition, current_build_id))
+        histories = await history_store.list_by_edition_build_pairs(
+            [(edition.id, build_id) for edition, build_id in aggregates]
+        )
 
-    for aggregate in aggregates:
-        target = await _resolve_unpublished_build_target(
-            session=session,
-            history_store=history_store,
+    history_by_pair: dict[tuple[int, int], EditionBuildHistory] = {}
+    for history in histories:
+        history_by_pair.setdefault(
+            (history.edition_id, history.build_id), history
+        )
+
+    for aggregate, current_build_id in aggregates:
+        target = _unpublished_build_target(
             edition=aggregate,
+            history=history_by_pair.get((aggregate.id, current_build_id)),
         )
         if target is None:
             continue
@@ -1049,16 +1123,20 @@ async def _self_heal_unpublished_aggregates(
         )
 
 
-async def _resolve_unpublished_build_target(
+def _unpublished_build_target(
     *,
-    session: AsyncSession,
-    history_store: EditionBuildHistoryStore,
     edition: Edition,
+    history: EditionBuildHistory | None,
 ) -> tuple[int, str] | None:
     """Return ``(build_id, build_public_id)`` if the pair needs a publish.
 
-    The single "is this edition's current build unpublished?" rule, shared
-    by both legs of :func:`_self_heal_unpublished_editions`.
+    The single "is this edition's current build unpublished?" rule,
+    shared by both legs of :func:`_self_heal_unpublished_editions`. It
+    takes *history* — the ``edition_build_history`` row for the
+    ``(edition, current_build)`` pair, or ``None`` when there is none —
+    rather than loading it, so the aggregate leg can supply rows from
+    one batched query while the LTD leg loads them one at a time via
+    :func:`_resolve_unpublished_build_target`.
 
     "Unpublished" is decided per ``(edition, current_build)`` pair via the
     ``edition_build_history`` row rather than the edition's own
@@ -1087,23 +1165,40 @@ async def _resolve_unpublished_build_target(
     publish is not something to re-run on every reconciliation tick —
     all three are left alone. An edition that does re-enqueue does so at
     most once, because the enqueue itself records the pair ``pending``.
+    """
+    if edition.current_build_id is None:
+        return None
+    if edition.current_build_public_id is None:
+        return None
+    if history is not None and history.publish_status is not None:
+        return None
+    return edition.current_build_id, serialize_base32_id(
+        edition.current_build_public_id
+    )
+
+
+async def _resolve_unpublished_build_target(
+    *,
+    session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    edition: Edition,
+) -> tuple[int, str] | None:
+    """Load one pair's history row and apply :func:`_unpublished_build_target`.
+
+    The LTD leg's accessor. It reaches its editions one at a time — the
+    slug-keyed lookup in :func:`_resolve_self_heal_target` — so there is
+    no pair set to batch, unlike the aggregate leg.
 
     The read happens inside its own transaction so it does not interfere
     with ``enqueue_publish_for_edition``'s phased commits.
     """
     if edition.current_build_id is None:
         return None
-    if edition.current_build_public_id is None:
-        return None
     async with session.begin():
         history = await history_store.get_by_edition_and_build(
             edition_id=edition.id, build_id=edition.current_build_id
         )
-    if history is not None and history.publish_status is not None:
-        return None
-    return edition.current_build_id, serialize_base32_id(
-        edition.current_build_public_id
-    )
+    return _unpublished_build_target(edition=edition, history=history)
 
 
 async def _resolve_self_heal_target(

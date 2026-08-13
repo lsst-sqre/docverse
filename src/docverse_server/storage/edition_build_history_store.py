@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select, update
+from sqlalchemy import select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models.queue_enums import PublishStatus
@@ -127,6 +129,52 @@ class EditionBuildHistoryStore:
         stmt = (
             select(SqlEditionBuildHistory)
             .where(SqlEditionBuildHistory.edition_id.in_(edition_ids))
+            .order_by(
+                SqlEditionBuildHistory.edition_id,
+                SqlEditionBuildHistory.position.asc(),
+            )
+        )
+        result = await self._session.execute(stmt)
+        return [
+            EditionBuildHistory.model_validate(r) for r in result.scalars()
+        ]
+
+    async def list_by_edition_build_pairs(
+        self, pairs: Sequence[tuple[int, int]]
+    ) -> list[EditionBuildHistory]:
+        """Load history rows for specific ``(edition_id, build_id)`` pairs.
+
+        The batched form of :meth:`get_by_edition_and_build`: one
+        round-trip answers "has a publish ever been enqueued for this
+        edition's *current* build?" for a whole set of editions at once.
+        Used by keeper-sync's aggregate self-heal, which asks that
+        question of every ``N`` / ``N.M`` row on a project and would
+        otherwise open a transaction per aggregate. Passing an empty
+        ``pairs`` returns ``[]`` without hitting the database.
+
+        Matching is on the pair, not on the two columns independently —
+        an ``edition_id IN (...) AND build_id IN (...)`` filter would
+        return the cross product, reporting a history row for a pair
+        that was never recorded.
+
+        Rows come back ordered by ``(edition_id, position)``, so a
+        caller grouping by pair and keeping the first row it sees gets
+        the edition's most recent pointer at that build. Duplicate pairs
+        need an edition to have been pointed back at a build it had
+        already left, which the aggregates this serves never do (they
+        only advance), but the order makes the pick deterministic
+        regardless.
+        """
+        if not pairs:
+            return []
+        stmt = (
+            select(SqlEditionBuildHistory)
+            .where(
+                tuple_(
+                    SqlEditionBuildHistory.edition_id,
+                    SqlEditionBuildHistory.build_id,
+                ).in_(pairs)
+            )
             .order_by(
                 SqlEditionBuildHistory.edition_id,
                 SqlEditionBuildHistory.position.asc(),

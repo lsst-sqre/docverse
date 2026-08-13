@@ -12,6 +12,7 @@ failing paths — without depending on real S3 or R2.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -58,6 +59,8 @@ from docverse_server.domain.base32id import (
     generate_base32_id,
     validate_base32_id,
 )
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.queue import JobStatus
 from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.factory import Factory
@@ -1955,6 +1958,16 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
     ``aggregates_backfilled_build_id`` marker already names this build),
     so nothing re-enqueues it via the outcome path; the tail-end
     self-heal pass must recover it from persistent state instead.
+
+    The recovery run has to carry a signal that an aggregate could have
+    moved, or the pass is gated off (see
+    ``_run_may_have_moved_aggregates``) — here LTD rebuilds ``main`` onto
+    a new build, which is both the cheapest such signal and the shape a
+    real project hits, since the tiers keep polling a project whose
+    ``main`` moves long after its releases have frozen. The rebuilt
+    edition is deliberately *not* the release one: a fresh release build
+    would re-run the backfill and re-enqueue the aggregates through the
+    outcome path, which is the path this test is proving unnecessary.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -1995,6 +2008,9 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
     project_id, aggregate_id = await _clear_publish_traces(
         org_id=org_id, edition_slug="15.2"
     )
+    # ``main`` rebuilds, so the recovery run is not an idle poll.
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    source_objects["pipelines/builds/44/index.html"] = b"<html>main v2</html>"
     publish_before = get_jobs_by_name(
         mock_arq, "publish_edition", queue_name="docverse:queue"
     )
@@ -2015,7 +2031,11 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
     )
     healed = publish_after[len(publish_before) :]
     healed_slugs = [job.kwargs["payload"]["edition_slug"] for job in healed]
-    assert healed_slugs == ["15.2"]
+    # ``__main`` is the rebuilt edition's own publish, enqueued by the
+    # per-edition callback; ``15.2`` is the aggregate the tail-end pass
+    # recovered.
+    assert healed_slugs == ["__main", "15.2"]
+    aggregate_job = healed[1]
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -2029,7 +2049,7 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
 
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             healed_qj = await queue_job_store.get_by_backend_job_id(
-                healed[0].id
+                aggregate_job.id
             )
             assert healed_qj is not None
             assert healed_qj.kind == JobKind.publish_edition
@@ -2110,27 +2130,340 @@ async def test_keeper_sync_project_self_heal_skips_published_aggregates(
     assert len(publish_after_second) == len(publish_after_first)
 
 
-def _repoint_ltd_main_edition(mock_discovery: respx.Router) -> None:
+async def _project_id_for(*, org_id: int) -> int:
+    """Return the Docverse id of the org's synced ``pipelines`` project."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            return project.id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+def _spy_aggregate_scan(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every project-wide edition scan the worker performs.
+
+    ``EditionStore.list_all_by_project`` has exactly one caller on the
+    ``keeper_sync_project`` path — the aggregate self-heal pass — so the
+    returned list is a direct measure of how often that pass ran.
+    """
+    project_scans: list[int] = []
+    original_scan = EditionStore.list_all_by_project
+
+    async def _scan(self: EditionStore, project_id: int) -> list[Edition]:
+        project_scans.append(project_id)
+        return await original_scan(self, project_id)
+
+    monkeypatch.setattr(EditionStore, "list_all_by_project", _scan)
+    return project_scans
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_skips_aggregate_self_heal_when_idle(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A steady-state re-sync does not scan the project for aggregates.
+
+    Nothing in a run where every edition short-circuited and no
+    aggregate outcome was emitted can have moved an aggregate, so the
+    self-heal pass must not pay a full-project edition scan (plus a
+    history lookup per aggregate) on every five-minute poll, forever,
+    for every synced project.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # Spy only over the second, steady-state run.
+    project_scans = _spy_aggregate_scan(monkeypatch)
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    assert project_scans == []
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_scans_aggregates_after_a_build_moved(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that imported a fresh build still scans for aggregates.
+
+    The mirror of
+    ``test_keeper_sync_project_skips_aggregate_self_heal_when_idle``:
+    identical setup, except LTD rebuilds ``main`` before the second
+    sync. A non-short-circuited build is the signal that the backfill
+    could have run — including the paths where it committed an aggregate
+    and then lost its outcome — so the pass must not be gated off.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    project_id = await _project_id_for(org_id=org_id)
+
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    source_objects["pipelines/builds/44/index.html"] = b"<html>main v2</html>"
+
+    # Spy only over the second run.
+    project_scans = _spy_aggregate_scan(monkeypatch)
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    assert project_scans == [project_id]
+
+
+async def _current_build_pairs(
+    *, project_id: int, slugs: Sequence[str]
+) -> list[tuple[int, int]]:
+    """Return each named edition's ``(edition_id, current_build_id)``."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            pairs: list[tuple[int, int]] = []
+            for slug in slugs:
+                edition = await edition_store.get_by_slug(
+                    project_id=project_id, slug=slug
+                )
+                assert edition is not None
+                assert edition.current_build_id is not None
+                pairs.append((edition.id, edition.current_build_id))
+            return pairs
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+def _spy_history_lookups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[list[tuple[int, int]]], list[tuple[int, int]]]:
+    """Record batched and per-pair ``edition_build_history`` lookups.
+
+    Returns ``(batched, single)``: the pair list handed to every
+    ``list_by_edition_build_pairs`` call, and the pair every
+    ``get_by_edition_and_build`` call asked about.
+    """
+    batched: list[list[tuple[int, int]]] = []
+    single: list[tuple[int, int]] = []
+    original_batched = EditionBuildHistoryStore.list_by_edition_build_pairs
+    original_single = EditionBuildHistoryStore.get_by_edition_and_build
+
+    async def _batched(
+        self: EditionBuildHistoryStore, pairs: Sequence[tuple[int, int]]
+    ) -> list[EditionBuildHistory]:
+        batched.append(list(pairs))
+        return await original_batched(self, pairs)
+
+    async def _single(
+        self: EditionBuildHistoryStore, *, edition_id: int, build_id: int
+    ) -> EditionBuildHistory | None:
+        single.append((edition_id, build_id))
+        return await original_single(
+            self, edition_id=edition_id, build_id=build_id
+        )
+
+    monkeypatch.setattr(
+        EditionBuildHistoryStore, "list_by_edition_build_pairs", _batched
+    )
+    monkeypatch.setattr(
+        EditionBuildHistoryStore, "get_by_edition_and_build", _single
+    )
+    return batched, single
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_batches_aggregate_history_lookups(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregate pass reads every history row in one query.
+
+    A migrated project carries an ``N`` / ``N.M`` row per release
+    series, and resolving each one's publish state through
+    ``get_by_edition_and_build`` cost a BEGIN/SELECT/COMMIT apiece. One
+    ``IN`` query over the whole pair set replaces them.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    project_id = await _project_id_for(org_id=org_id)
+    aggregate_pairs = await _current_build_pairs(
+        project_id=project_id, slugs=("15", "15.2")
+    )
+
+    # Rebuild ``main`` so the second run opens the aggregate gate.
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    source_objects["pipelines/builds/44/index.html"] = b"<html>main v2</html>"
+
+    batched, single = _spy_history_lookups(monkeypatch)
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    assert len(batched) == 1
+    assert sorted(batched[0]) == sorted(aggregate_pairs)
+    # No aggregate fell back to the per-pair lookup (the LTD leg still
+    # uses it for its own short-circuited editions).
+    assert not set(aggregate_pairs) & set(single)
+
+
+def _repoint_ltd_main_edition(
+    mock_discovery: respx.Router, *, build_slug: str = "43"
+) -> None:
     """Advance LTD's ``main`` edition onto a second, newer build.
 
-    Replaces the ``/editions/1`` and ``/builds/43`` routes seeded by
-    :func:`_seed_ltd` so a follow-up sync sees a fresh ``date_rebuilt``
-    pointing at LTD build ``43``. ``respx`` replaces routes with an
-    identical pattern, so the later ``.mock()`` wins.
+    Replaces the ``/editions/1`` and ``/builds/<build_slug>`` routes
+    seeded by :func:`_seed_ltd` so a follow-up sync sees a fresh
+    ``date_rebuilt`` pointing at that LTD build. ``respx`` replaces
+    routes with an identical pattern, so the later ``.mock()`` wins.
+
+    ``build_slug`` defaults to the next build after :func:`_seed_ltd`'s
+    single ``42``; fixtures that already use ``43`` for a second edition
+    (:func:`_seed_release_edition_ltd`) pass a free slug instead.
     """
     edition = _load("edition_main_git_refs.json")
-    edition["build_url"] = f"{LTD_BASE}/builds/43"
+    edition["build_url"] = f"{LTD_BASE}/builds/{build_slug}"
     edition["date_rebuilt"] = "2026-05-02T18:30:00.000000+00:00"
     build = _load("build.json")
-    build["self_url"] = f"{LTD_BASE}/builds/43"
-    build["slug"] = "43"
-    build["bucket_root_dir"] = "pipelines/builds/43"
+    build["self_url"] = f"{LTD_BASE}/builds/{build_slug}"
+    build["slug"] = build_slug
+    build["bucket_root_dir"] = f"pipelines/builds/{build_slug}"
     build["date_created"] = "2026-05-02T18:25:00.000000+00:00"
-    build["published_url"] = "https://pipelines.lsst.io/builds/43"
+    build["published_url"] = f"https://pipelines.lsst.io/builds/{build_slug}"
     mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
         return_value=httpx.Response(200, json=edition)
     )
-    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+    mock_discovery.get(f"{LTD_BASE}/builds/{build_slug}").mock(
         return_value=httpx.Response(200, json=build)
     )
 
