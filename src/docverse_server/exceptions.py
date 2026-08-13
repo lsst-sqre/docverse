@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, override
 
 from fastapi import status
@@ -10,6 +11,7 @@ from safir.slack.blockkit import SlackException
 from safir.slack.sentry import SentryEventInfo
 
 __all__ = [
+    "MAX_REPORTED_EDITION_SLUGS",
     "BadRequestError",
     "ConflictError",
     "DocverseSlackException",
@@ -22,7 +24,41 @@ __all__ = [
     "MissingConfigurationError",
     "NotFoundError",
     "PermissionDeniedError",
+    "format_ltd_edition_slugs",
 ]
+
+#: Cap on the number of LTD edition slugs named in a
+#: :class:`KeeperSyncSystemicFailureError` message.
+#:
+#: An exception message is not a bounded field: ``str(exc)`` is copied
+#: verbatim into the failing job's ``queue_jobs.errors['message']``
+#: JSONB and becomes the Sentry issue title. keeper-sync's systemic
+#: raises carry one slug per failed edition, and the populations are
+#: large — up to ``MAX_CONSECUTIVE_EDITION_FAILURES`` (75) at the
+#: consecutive-failure site and the whole edition list (279 on
+#: documenteer) at the end-of-run site — so the unbounded join wrote
+#: multi-KB blobs into the job record and gave each run a title unique
+#: enough to defeat Sentry grouping.
+#:
+#: Matches the worker's ``_MAX_RECORDED_EDITION_FAILURES``, which bounds
+#: the same population on the *partial-success* side (the job's
+#: ``progress`` payload and its terminal log line), so an operator sees
+#: the same depth of detail whichever way a run ended. Counts stay exact
+#: everywhere; only the slug lists are truncated.
+MAX_REPORTED_EDITION_SLUGS = 20
+
+
+def format_ltd_edition_slugs(slugs: Sequence[str]) -> str:
+    """Render LTD edition slugs as a bounded, comma-joined list.
+
+    Names at most :data:`MAX_REPORTED_EDITION_SLUGS` slugs and appends a
+    ``(+N more)`` suffix for the remainder, so the caller's message stays
+    a fixed size whatever the failure count while still admitting how
+    much was elided. An empty sequence renders as the empty string.
+    """
+    head = ", ".join(slugs[:MAX_REPORTED_EDITION_SLUGS])
+    elided = len(slugs) - MAX_REPORTED_EDITION_SLUGS
+    return f"{head} (+{elided} more)" if elided > 0 else head
 
 
 class DocverseSlackException(SlackException):
@@ -335,12 +371,17 @@ class KeeperSyncSystemicFailureError(DocverseSlackException):
 
     * ``MAX_CONSECUTIVE_EDITION_FAILURES`` failures in a row, which
       aborts the loop mid-list rather than walking the remainder.
-    * A run that reached the end of the edition list with failures and
-      no edition imported at all. The consecutive-failure threshold is
-      larger than a typical migrated project's edition count, so without
-      this check a total outage on a 20-edition product would finish
-      under the threshold and report a zero-import run as a partial
-      success.
+    * A run that reached the end of the edition list with no edition
+      imported at all and at least one failure that *could* have been
+      caused by an outage. The consecutive-failure threshold is larger
+      than a typical migrated project's edition count, so without this
+      check a total outage on a 20-edition product would finish under
+      the threshold and report a zero-import run as a partial success.
+      Failures of a permanently-failing type are excluded from that
+      signal — see
+      :data:`~docverse_server.services.keeper_sync.service._PERMANENT_EDITION_FAILURE_TYPES`
+      — so a project whose only fault is a permanently unreadable
+      edition keeps the partial-success path it was built for.
 
     Raised with ``from`` the last edition's exception, so the triggering
     error stays on the ``__cause__`` chain for both Sentry and the
@@ -349,6 +390,14 @@ class KeeperSyncSystemicFailureError(DocverseSlackException):
     cut short — while still reporting ``consecutive_failures``: with no
     imported edition to reset the counter, every failure in such a run
     was consecutive.
+
+    ``failed_ltd_edition_slugs`` keeps every failed slug for
+    programmatic callers, but the *message* names at most
+    :data:`MAX_REPORTED_EDITION_SLUGS` of them — see that constant for
+    why an exception message has to be treated as a bounded field here.
+    Callers that pass their own ``message`` are responsible for the same
+    cap and should build the list with
+    :func:`format_ltd_edition_slugs`.
 
     No ``to_sentry`` override: the free-form ``message`` names the LTD
     product slug and the consecutive-failure count, and the chained
@@ -390,11 +439,12 @@ class KeeperSyncSystemicFailureError(DocverseSlackException):
             if consecutive_failures is not None
             else "Too many consecutive"
         )
-        detail = (
-            f" (editions: {', '.join(failed_ltd_edition_slugs)})"
+        editions = (
+            format_ltd_edition_slugs(failed_ltd_edition_slugs)
             if failed_ltd_edition_slugs
             else ""
         )
+        detail = f" (editions: {editions})" if editions else ""
         return (
             f"Aborting keeper sync{product}: {count} edition failures"
             f"{detail} indicate a systemic outage rather than"

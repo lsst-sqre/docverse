@@ -66,9 +66,11 @@ from docverse_server.domain.version import (
     parse_stable_semver,
 )
 from docverse_server.exceptions import (
+    MAX_REPORTED_EDITION_SLUGS,
     KeeperSyncInvariantError,
     KeeperSyncSystemicFailureError,
     NotFoundError,
+    format_ltd_edition_slugs,
 )
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -189,11 +191,50 @@ DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
 #: the strength of that reasoning alone: a roundtable-dev resync has to
 #: confirm the 19 documenteer failures actually drop to zero first, and
 #: the asymmetry above still says to err high. Lowering it is separate
-#: work, and #516's
-#: :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` is
-#: the Docverse-side type that would also let a denial be discounted
-#: from the *systemic* signal by error type rather than by count.
+#: work.
+#:
+#: The end-of-run half of the systemic signal *does* now discount
+#: denials by error type rather than by count — see
+#: :data:`_PERMANENT_EDITION_FAILURE_TYPES`, which deliberately leaves
+#: this counter alone so an outage beginning inside a denial block still
+#: aborts within the threshold.
 MAX_CONSECUTIVE_EDITION_FAILURES = 75
+
+#: Per-edition failure types that are *permanent* by construction, and
+#: so carry no evidence of a systemic fault.
+#:
+#: ``sync_project``'s end-of-run check reads "failures, and nothing
+#: imported" as an outage. That inference only holds for failures whose
+#: cause could be shared: a project can legitimately import nothing
+#: because its only non-tombstoned edition is permanently broken, and
+#: the ``completed_with_errors`` / ``edition_failures`` partial-success
+#: path is built for exactly that. On roundtable-dev, a migrated product
+#: with 19 ``lifecycle_preemptive`` tombstones and one edition denied at
+#: both ``builds/<slug>/`` and ``v/<slug>/`` failed its job on every
+#: 5-minute tier tick, forever, because tombstone short-circuits are
+#: neutral for ``contacted_ltd`` and left ``ltd_successes == 0``.
+#:
+#: :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` is
+#: the only member today, and is permanent by construction rather than
+#: by observation: LTD's oldest uploads carry no public-read object ACL,
+#: :class:`~docverse_server.storage.ltd.LtdS3Source` is deliberately
+#: anonymous with no credentials to fall back on, and LTD Keeper is
+#: read-only source material — so nothing about a replay can change the
+#: answer. Every other per-edition fault in this path arrives as a bare
+#: ``RuntimeError`` or a transport error and cannot be distinguished by
+#: type, which is why the tuple is not larger: membership has to be
+#: earned by that "cannot be transient" argument, not by a hunch that a
+#: given failure looks per-edition.
+#:
+#: Deliberately *not* applied to the consecutive-failure breaker. That
+#: guard's threshold is already sized above the largest contiguous run
+#: of denials LTD produces (see
+#: :data:`MAX_CONSECUTIVE_EDITION_FAILURES`), and exempting denials from
+#: the count as well would let a genuine outage that begins inside a
+#: denial block walk further than the threshold allows.
+_PERMANENT_EDITION_FAILURE_TYPES: tuple[type[BaseException], ...] = (
+    LtdSourceAccessDeniedError,
+)
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
 #: callable the service consumes. Tests inject a fake; the production
@@ -716,6 +757,18 @@ class KeeperSyncService:
         that succeeded before the failure started keep the run on the
         partial-success path, so the mixed case is unaffected.
 
+        That end-of-run signal is read by failure *type*, not by count:
+        a failure in :data:`_PERMANENT_EDITION_FAILURE_TYPES` cannot be
+        the outage the check is looking for, so a run whose only
+        failures are permanent stays on the partial-success path however
+        little it imported. Otherwise the shape the per-edition boundary
+        exists for — a product whose surviving edition is permanently
+        denied, everything else tombstoned — failed its job on every
+        tier tick forever. The abort chains from the last failure that
+        *was* a candidate, so the triggering fault on the ``__cause__``
+        chain is the systemic evidence rather than an incidental denial
+        beside it.
+
         ``on_edition_synced`` runs once per :meth:`sync_edition` return,
         before the next iteration begins. Callbacks fire after each
         edition's ``session.begin()`` blocks have committed, so they
@@ -779,7 +832,13 @@ class KeeperSyncService:
         failures: list[EditionSyncFailure] = []
         consecutive_failures = 0
         ltd_successes = 0
-        last_failure: Exception | None = None
+        # Failures whose type leaves an outage possible — see
+        # ``_PERMANENT_EDITION_FAILURE_TYPES`` for why a permanent fault
+        # is excluded from the end-of-run systemic signal, and why the
+        # last of *these*, not the last failure outright, is what the
+        # abort chains from.
+        systemic_candidates = 0
+        last_systemic_candidate: Exception | None = None
         for ltd_edition in ltd_editions:
             if ltd_edition.ltd_id in skip_ltd_ids:
                 continue
@@ -793,7 +852,9 @@ class KeeperSyncService:
                     autocreation=autocreation,
                 )
             except Exception as exc:
-                last_failure = exc
+                if not isinstance(exc, _PERMANENT_EDITION_FAILURE_TYPES):
+                    systemic_candidates += 1
+                    last_systemic_candidate = exc
                 sentry_sdk.capture_exception(exc)
                 self._logger.exception(
                     "Edition sync failed; skipping edition and continuing",
@@ -820,7 +881,9 @@ class KeeperSyncService:
                         "Aborting project sync: consecutive edition failures"
                         " indicate a systemic outage",
                         consecutive_failures=consecutive_failures,
-                        failed_ltd_edition_slugs=recent,
+                        failed_ltd_edition_slugs=recent[
+                            :MAX_REPORTED_EDITION_SLUGS
+                        ],
                         project_id=project.id,
                         project=project.slug,
                         ltd_slug=ltd_slug,
@@ -850,33 +913,83 @@ class KeeperSyncService:
                         "on_edition_synced callback raised; continuing",
                         docverse_slug=outcome.docverse_slug,
                     )
-        if failures and ltd_successes == 0:
-            failed_slugs = [failure.ltd_edition_slug for failure in failures]
-            self._logger.error(
-                "Failing project sync: every attempted edition failed",
-                edition_failure_count=len(failures),
-                failed_ltd_edition_slugs=failed_slugs,
-                project_id=project.id,
-                project=project.slug,
-                ltd_slug=ltd_slug,
-            )
-            raise KeeperSyncSystemicFailureError(
-                ltd_slug=ltd_slug,
-                consecutive_failures=len(failures),
-                failed_ltd_edition_slugs=failed_slugs,
-                message=(
-                    f"Aborting keeper sync for LTD product {ltd_slug}: all"
-                    f" {len(failures)} attempted editions failed (editions:"
-                    f" {', '.join(failed_slugs)}), so nothing was imported"
-                    " — a systemic outage rather than per-edition faults"
-                ),
-            ) from last_failure
+        self._guard_zero_import_run(
+            project=project,
+            ltd_slug=ltd_slug,
+            failures=failures,
+            ltd_successes=ltd_successes,
+            systemic_candidates=systemic_candidates,
+            last_systemic_candidate=last_systemic_candidate,
+        )
         return ProjectSyncResult(
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             edition_outcomes=outcomes,
             edition_failures=tuple(failures),
         )
+
+    def _guard_zero_import_run(
+        self,
+        *,
+        project: Project,
+        ltd_slug: str,
+        failures: Sequence[EditionSyncFailure],
+        ltd_successes: int,
+        systemic_candidates: int,
+        last_systemic_candidate: Exception | None,
+    ) -> None:
+        """Fail a run that imported nothing, unless every fault is permanent.
+
+        The end-of-loop half of the systemic signal (the mid-list half
+        is the consecutive-failure breaker): a project that finished its
+        edition list with failures and no LTD-contacting outcome
+        imported nothing, which the consecutive breaker cannot catch on
+        a project smaller than its threshold.
+
+        ``systemic_candidates`` counts only failures whose type leaves an
+        outage possible — see :data:`_PERMANENT_EDITION_FAILURE_TYPES`.
+        Zero of them means the run is *degraded*, not systemic: replaying
+        it would fail exactly the same way, so raising here would hand
+        the tier cron a job it re-fails every five minutes forever
+        instead of the ``completed_with_errors`` / ``edition_failures``
+        partial-success path built for a permanently unreadable edition.
+        """
+        if not failures or ltd_successes > 0:
+            return
+        failed_slugs = [failure.ltd_edition_slug for failure in failures]
+        reported_slugs = failed_slugs[:MAX_REPORTED_EDITION_SLUGS]
+        if systemic_candidates == 0:
+            self._logger.warning(
+                "Project sync imported nothing; every failure is a"
+                " permanent per-edition fault",
+                edition_failure_count=len(failures),
+                failed_ltd_edition_slugs=reported_slugs,
+                project_id=project.id,
+                project=project.slug,
+                ltd_slug=ltd_slug,
+            )
+            return
+        self._logger.error(
+            "Failing project sync: every attempted edition failed",
+            edition_failure_count=len(failures),
+            systemic_candidate_count=systemic_candidates,
+            failed_ltd_edition_slugs=reported_slugs,
+            project_id=project.id,
+            project=project.slug,
+            ltd_slug=ltd_slug,
+        )
+        raise KeeperSyncSystemicFailureError(
+            ltd_slug=ltd_slug,
+            consecutive_failures=len(failures),
+            failed_ltd_edition_slugs=failed_slugs,
+            message=(
+                f"Aborting keeper sync for LTD product {ltd_slug}: all"
+                f" {len(failures)} attempted editions failed (editions:"
+                f" {format_ltd_edition_slugs(failed_slugs)}), so nothing"
+                " was imported — a systemic outage rather than"
+                " per-edition faults"
+            ),
+        ) from last_systemic_candidate
 
     async def _proactive_lifecycle_pass(
         self,

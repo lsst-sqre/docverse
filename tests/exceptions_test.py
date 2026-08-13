@@ -23,6 +23,7 @@ from safir.slack.blockkit import SlackException, SlackMessage
 
 from docverse_server.domain.slug import InvalidSlugError
 from docverse_server.exceptions import (
+    MAX_REPORTED_EDITION_SLUGS,
     DocverseSlackException,
     InvalidBuildStateError,
     InvalidJobStateError,
@@ -509,3 +510,31 @@ def test_job_not_found_explicit_message_wins() -> None:
         message="Queue job 42 not found",
     )
     assert str(exc) == "Queue job 42 not found"
+
+
+def test_keeper_sync_systemic_failure_message_caps_the_slug_list() -> None:
+    """The rendered message names at most ``MAX_REPORTED_EDITION_SLUGS``.
+
+    ``str(exc)`` is copied verbatim into ``queue_jobs.errors['message']``
+    and becomes the Sentry issue title, so an all-failed documenteer run
+    (279 editions) would otherwise write a multi-KB blob into a JSONB
+    column and give every such run a title unique enough to defeat
+    grouping. The exact count stays on the exception's attributes.
+    """
+    slugs = [f"u-jsick-feat-{i}" for i in range(1, 76)]
+
+    exc = KeeperSyncSystemicFailureError(
+        ltd_slug="documenteer",
+        consecutive_failures=len(slugs),
+        failed_ltd_edition_slugs=slugs,
+    )
+
+    rendered = str(exc)
+    named = [slug for slug in slugs if slug in rendered]
+    assert named == slugs[:MAX_REPORTED_EDITION_SLUGS]
+    assert f"+{len(slugs) - MAX_REPORTED_EDITION_SLUGS} more" in rendered
+    # The truncation is what bounds the payload, not a coincidence of
+    # this slug vocabulary.
+    assert len(rendered) < 1000
+    # Callers still see every failed slug programmatically.
+    assert exc.failed_ltd_edition_slugs == slugs

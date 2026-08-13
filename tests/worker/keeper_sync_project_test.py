@@ -76,7 +76,10 @@ from docverse_server.storage.keeper_sync import (
     ResourceType,
 )
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse_server.storage.ltd import LtdNotFoundError
+from docverse_server.storage.ltd import (
+    LtdNotFoundError,
+    LtdSourceAccessDeniedError,
+)
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
@@ -100,10 +103,22 @@ def _load(name: str) -> dict[str, Any]:
 
 
 class _FakeLtdSource:
-    """In-memory ``LtdSourceProtocol`` backing for worker integration tests."""
+    """In-memory ``LtdSourceProtocol`` backing for worker integration tests.
 
-    def __init__(self, objects: dict[str, bytes]) -> None:
+    ``denied_prefixes`` reproduces LTD's oldest uploads: the keys under
+    the prefix are listable but every ``GetObject`` answers
+    ``AccessDenied``, because those objects were written without a
+    public-read ACL and this source is anonymous.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, bytes],
+        *,
+        denied_prefixes: frozenset[str] = frozenset(),
+    ) -> None:
         self._objects = objects
+        self._denied_prefixes = denied_prefixes
 
     async def __aenter__(self) -> Self:
         return self
@@ -120,6 +135,10 @@ class _FakeLtdSource:
         return [k for k in self._objects if k.startswith(prefix)]
 
     async def download_object(self, *, key: str) -> bytes:
+        if any(key.startswith(prefix) for prefix in self._denied_prefixes):
+            raise LtdSourceAccessDeniedError(
+                bucket="lsst-the-docs", key=key, operation="GetObject"
+            )
         return self._objects[key]
 
 
@@ -128,6 +147,7 @@ def _patch_factory_io(
     *,
     object_store: MockObjectStore,
     source_objects: dict[str, bytes],
+    denied_prefixes: frozenset[str] = frozenset(),
 ) -> None:
     """Route the factory's S3/objectstore wiring through in-memory doubles."""
 
@@ -139,7 +159,7 @@ def _patch_factory_io(
     def _create_ltd_s3_source(
         self: Factory, *, bucket: str = "lsst-the-docs"
     ) -> _FakeLtdSource:
-        return _FakeLtdSource(source_objects)
+        return _FakeLtdSource(source_objects, denied_prefixes=denied_prefixes)
 
     monkeypatch.setattr(
         Factory, "create_objectstore_for_org", _create_objectstore_for_org
@@ -1685,6 +1705,90 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
             run = await run_store.get(run_id)
             assert run is not None
             assert run.status == KeeperSyncRunStatus.in_progress
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_permanent_denial_completes_with_errors(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-import run of permanent faults completes rather than fails.
+
+    The roundtable-dev shape behind this fix: every other edition is a
+    ``lifecycle_preemptive`` tombstone (neutral for ``contacted_ltd``)
+    and the one edition that reaches LTD is denied at both
+    ``builds/<slug>/`` and ``v/<slug>/``. Nothing is imported, so the
+    end-of-run systemic check used to fail the job — and the 5-minute
+    tier cron then replayed an identically-failing job forever while
+    Sentry fired each time.
+
+    A denial is permanent by construction, so the run belongs on the
+    partial-success path: the job finishes ``completed_with_errors``
+    with the edition named in ``progress``, and the parent run rolls up
+    off that rather than off a raised exception.
+
+    This product's only edition is ``main``, which LTD serves from the
+    product root — there is no ``v/`` sibling to recover from — so the
+    denial survives the edition-prefix fallback.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects={
+            "pipelines/builds/42/index.html": b"<html>denied</html>"
+        },
+        denied_prefixes=frozenset({"pipelines/builds/42/"}),
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed_with_errors"
+
+    # Nothing was imported, so nothing was published either.
+    assert not get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert object_store.objects == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.completed_with_errors
+            assert qj.errors is None
+            assert qj.progress is not None
+            assert qj.progress["edition_failure_count"] == 1
+            recorded = qj.progress["edition_failures"]
+            assert recorded[0]["ltd_edition_slug"] == "main"
+            assert recorded[0]["error_type"] == "LtdSourceAccessDeniedError"
 
 
 @pytest.mark.asyncio

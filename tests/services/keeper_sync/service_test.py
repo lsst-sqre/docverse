@@ -47,7 +47,10 @@ from docverse_server.domain.lifecycle import (
     LifecycleRuleSet,
     RefDeletedRule,
 )
-from docverse_server.exceptions import KeeperSyncSystemicFailureError
+from docverse_server.exceptions import (
+    MAX_REPORTED_EDITION_SLUGS,
+    KeeperSyncSystemicFailureError,
+)
 from docverse_server.services.keeper_sync.copier import BuildContentCopier
 from docverse_server.services.keeper_sync.service import (
     MAX_CONSECUTIVE_EDITION_FAILURES,
@@ -1893,6 +1896,14 @@ async def test_sync_project_aborts_after_consecutive_edition_failures(
     assert (
         exc_info.value.consecutive_failures == MAX_CONSECUTIVE_EDITION_FAILURES
     )
+    # The message is bounded even though the run recorded 75 slugs: it
+    # is copied into ``queue_jobs.errors`` and the Sentry issue title.
+    rendered = str(exc_info.value)
+    assert (
+        f"+{MAX_CONSECUTIVE_EDITION_FAILURES - MAX_REPORTED_EDITION_SLUGS}"
+        " more" in rendered
+    )
+    assert len(rendered) < 1000
 
 
 @pytest.mark.asyncio
@@ -2226,6 +2237,164 @@ async def test_sync_project_fails_when_every_attempted_edition_fails(
     assert exc_info.value.failed_ltd_edition_slugs == [
         f"u-jsick-feat-{i}" for i in range(1, total + 1)
     ]
+
+
+@pytest.mark.asyncio
+async def test_sync_project_permanent_denials_alone_are_not_systemic(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanently-denied edition must not fail the whole project.
+
+    The roundtable-dev shape this guard broke on: a migrated product
+    whose history is mostly ``lifecycle_preemptive`` tombstones plus one
+    edition whose LTD build is ``AccessDenied`` at both
+    ``builds/<slug>/`` and ``v/<slug>/``. Tombstone short-circuits are
+    neutral for ``contacted_ltd``, so the run reaches the end with
+    ``ltd_successes == 0`` and one failure — and the end-of-run check
+    read that as an outage, failing the job, firing Sentry, and handing
+    the 5-minute tier cron a job it replays identically forever.
+
+    A denial is permanent by construction (the object carries no
+    public-read ACL and the anonymous principal has no credentials to
+    acquire one), so it is exactly what the ``completed_with_errors`` /
+    ``edition_failures`` partial-success path exists for.
+    """
+    tombstoned = 19
+    total = tombstoned + 1
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-permanent-only")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    async def _tombstones_then_a_denial(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> EditionSyncOutcome:
+        ltd_id = ltd_edition.ltd_id
+        if ltd_id > tombstoned:
+            raise LtdSourceAccessDeniedError(
+                bucket="lsst-the-docs",
+                key=f"pipelines/builds/{200 + ltd_id}/index.html",
+                operation="GetObject",
+            )
+        async with db_session.begin():
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+        assert project is not None
+        return EditionSyncOutcome(
+            docverse_edition_id=None,
+            docverse_slug=f"u-jsick-feat-{ltd_id}",
+            docverse_project_id=project.id,
+            docverse_project_slug=project.slug,
+            build_outcome=None,
+            short_circuited=True,
+        )
+
+    monkeypatch.setattr(service, "sync_edition", _tombstones_then_a_denial)
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == f"u-jsick-feat-{total}"
+    assert failure.error_type == "LtdSourceAccessDeniedError"
+
+
+@pytest.mark.asyncio
+async def test_sync_project_transport_failure_amid_denials_still_aborts(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discounting permanent faults must not disarm the systemic check.
+
+    Same zero-import run as the test above, but one of the failures is a
+    transport error rather than a denial. A transport error *can* be an
+    outage, so the run is still systemic and still fails the job — and
+    the transport error, not the incidental denial next to it, is what
+    lands on the cause chain for triage.
+    """
+    denied = 2
+    total = denied + 1
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-mixed-systemic")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    async def _denials_then_a_transport_error(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> None:
+        if ltd_edition.ltd_id > denied:
+            raise httpx.ConnectError("LTD is unreachable")
+        raise LtdSourceAccessDeniedError(
+            bucket="lsst-the-docs",
+            key=f"pipelines/builds/{200 + ltd_edition.ltd_id}/index.html",
+            operation="GetObject",
+        )
+
+    monkeypatch.setattr(
+        service, "sync_edition", _denials_then_a_transport_error
+    )
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+    # The count is of everything that failed, not just the systemic
+    # evidence — nothing was imported either way.
+    assert exc_info.value.consecutive_failures == total
+
+
+@pytest.mark.asyncio
+async def test_sync_project_systemic_message_caps_the_slug_list(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The end-of-run raise names a bounded number of edition slugs.
+
+    ``str(exc)`` lands verbatim in ``queue_jobs.errors['message']`` and
+    in the Sentry issue title, so an all-failed documenteer run (279
+    editions) must not write the whole slug list into either. The
+    exception's attributes still carry every slug.
+    """
+    total = MAX_REPORTED_EDITION_SLUGS + 5
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-systemic-message")
+
+    _seed_n_branch_editions(mock_discovery, count=total)
+    service = _build_service(db_session, http_client, MockObjectStore(), {})
+
+    async def _always_raises(
+        *, ltd_edition: LtdEdition, **kwargs: object
+    ) -> None:
+        msg = "The object store credentials expired"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(service, "sync_edition", _always_raises)
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    rendered = str(exc_info.value)
+    assert f"u-jsick-feat-{MAX_REPORTED_EDITION_SLUGS}" in rendered
+    assert f"u-jsick-feat-{MAX_REPORTED_EDITION_SLUGS + 1}" not in rendered
+    assert "+5 more" in rendered
+    assert len(rendered) < 1000
+    # The exact count is preserved even though the list is not.
+    assert f"all {total} attempted editions failed" in rendered
+    assert len(exc_info.value.failed_ltd_edition_slugs) == total
 
 
 @pytest.mark.asyncio
@@ -5576,8 +5745,9 @@ async def test_main_edition_denial_does_not_try_the_edition_prefix(
     So a denied ``main`` build has no published sibling to recover from
     and must keep failing its edition rather than importing some other
     prefix's content. ``main`` is this product's only edition, so the
-    failed run imported nothing and the end-of-run systemic check turns
-    it into a failed job — with the denial itself on the cause chain.
+    run imports nothing — but a denial is a permanent per-edition fault,
+    not an outage, so it stays on the partial-success path instead of
+    failing the job the tier cron would then replay identically forever.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-main-denied")
@@ -5596,11 +5766,12 @@ async def test_main_edition_denial_does_not_try_the_edition_prefix(
         db_session, http_client, object_store, source_objects, source=source
     )
 
-    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
-        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
 
-    assert exc_info.value.failed_ltd_edition_slugs == ["main"]
-    assert isinstance(exc_info.value.__cause__, LtdSourceAccessDeniedError)
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "main"
+    assert failure.error_type == "LtdSourceAccessDeniedError"
     assert not [
         p for p in source.listed_prefixes if p.startswith("pipelines/v/")
     ]
