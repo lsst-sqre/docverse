@@ -12,7 +12,7 @@ from __future__ import annotations
 from .copier import DEFAULT_COPY_CONCURRENCY, BuildContentCopier, CopyResult
 from .mappers import (
     EditionKindDerivation,
-    EditionKindSource,
+    KindDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
@@ -33,10 +33,10 @@ __all__ = [
     "CopyCallable",
     "CopyResult",
     "EditionKindDerivation",
-    "EditionKindSource",
     "EditionSyncOutcome",
     "KeeperSyncContext",
     "KeeperSyncService",
+    "KindDerivationSource",
     "ProjectSyncResult",
     "derive_edition_kind",
     "derive_edition_slug",

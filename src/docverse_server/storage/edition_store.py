@@ -18,6 +18,7 @@ from sqlalchemy.sql import func
 from docverse.models import (
     EditionCreate,
     EditionKind,
+    EditionKindSource,
     EditionUpdate,
     TrackingMode,
 )
@@ -68,7 +69,7 @@ class EditionStore:
             SqlEdition.title,
             SqlEdition.project_id,
             SqlEdition.kind,
-            SqlEdition.kind_manually_set,
+            SqlEdition.kind_source,
             SqlEdition.tracking_mode,
             SqlEdition.tracking_params,
             SqlEdition.alternate_name,
@@ -94,12 +95,21 @@ class EditionStore:
         return edition
 
     async def create(self, *, project_id: int, data: EditionCreate) -> Edition:
-        """Insert a new edition row."""
+        """Insert a new edition row from an operator's POST.
+
+        ``EditionCreate.kind`` is required, so every row inserted here
+        carries a kind an operator chose by hand: it is stamped
+        ``declared`` in the same statement, and the automated derivation
+        paths leave it alone. Without the stamp, an operator who POSTed
+        ``release`` for a branch-tracking edition would watch the next
+        build silently demote it.
+        """
         row = SqlEdition(
             slug=data.slug,
             title=data.title,
             project_id=project_id,
             kind=data.kind,
+            kind_source=EditionKindSource.declared,
             tracking_mode=data.tracking_mode,
             tracking_params=data.tracking_params,
             lifecycle_exempt=data.lifecycle_exempt,
@@ -125,7 +135,11 @@ class EditionStore:
 
         Used for system-created editions like ``__main`` where the slug
         does not conform to the user-facing pattern constraints in
-        ``EditionCreate``.
+        ``EditionCreate``. Every caller is a derivation — project
+        creation's default edition, the native tracking path's
+        auto-creation, the semver aggregates, keeper-sync's import — so
+        the row is stamped ``derived`` and stays the system's to
+        reconverge as rules change.
 
         Race-tolerant: a concurrent transaction that already inserted
         the same ``(project_id, lower(slug))`` makes this insert a
@@ -144,6 +158,7 @@ class EditionStore:
                 title=title,
                 project_id=project_id,
                 kind=kind,
+                kind_source=EditionKindSource.derived,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
                 alternate_name=alternate_name,
@@ -320,14 +335,19 @@ class EditionStore:
         Slug matching is case-insensitive (see :meth:`get_by_slug`).
 
         This is the editions PATCH API's only write path, so it is also
-        where the manual-override flag is stamped: a payload that carries
-        ``kind`` is an operator declaring that edition's kind, and
-        ``kind_manually_set`` records the declaration so the automated
-        re-derivation paths stop rewriting the row (PRD #498). The flag
-        is set on the *presence* of ``kind`` in the payload rather than
-        on a value change, so re-asserting the kind an edition already
-        has still pins it — that is exactly how an operator undoes an
-        automatic promotion they disagree with.
+        where ``kind_source`` moves to ``declared`` (PRD #498). The
+        trigger is a *change* of value, not the presence of ``kind`` in
+        the payload: a read-modify-write client echoes back the kind it
+        just GET-ed on every unrelated edit, and pinning on presence
+        would opt those editions out of healing invisibly and
+        irreversibly. Re-asserting the current kind is therefore a no-op
+        — the way to undo an automatic promotion is to fix the rules and
+        let the derivation converge, or to say so explicitly with
+        ``kind_source``.
+
+        An explicit ``kind_source`` in the payload always wins over the
+        value-change stamp, so "correct this kind and hand it back to
+        the system" is a single PATCH.
         """
         result = await self._session.execute(
             select(SqlEdition).where(
@@ -340,10 +360,16 @@ class EditionStore:
         if row is None:
             return None
         updates = data.model_dump(mode="json", exclude_unset=True)
+        previous_kind = row.kind
         for key, value in updates.items():
             setattr(row, key, value)
-        if updates.get("kind") is not None:
-            row.kind_manually_set = True
+        new_kind = updates.get("kind")
+        if (
+            new_kind is not None
+            and new_kind != previous_kind.value
+            and updates.get("kind_source") is None
+        ):
+            row.kind_source = EditionKindSource.declared
         await self._session.flush()
         await self._session.refresh(row)
         # Re-query to get current_build_public_id via join
@@ -435,14 +461,19 @@ class EditionStore:
         await self._session.flush()
 
     async def update_kind(self, *, edition_id: int, kind: EditionKind) -> None:
-        """Set the ``kind`` column on an edition row.
+        """Converge an edition's ``kind`` on a fresh derivation.
 
-        Deliberately narrower than :meth:`update`: keeper-sync's
-        promote-only kind refresh must rewrite ``kind`` and nothing
-        else, and it holds an edition id rather than a ``(project_id,
-        slug)`` pair (an adopted edition's slug is not the keeper-derived
-        one). The promote-only policy lives in the caller — this method
-        writes whatever kind it is given.
+        Deliberately narrower than :meth:`update`: the heal paths must
+        rewrite ``kind`` and nothing else, and they hold an edition id
+        rather than a ``(project_id, slug)`` pair (an adopted edition's
+        slug is not the keeper-derived one).
+
+        ``kind_source`` is re-asserted as ``derived`` in the same
+        statement. It is normally already ``derived`` — the callers gate
+        on exactly that — but writing it keeps the invariant "whoever
+        writes ``kind`` writes its provenance" true of every path, so no
+        future caller can leave a row claiming a declaration the value
+        no longer reflects.
         """
         result = await self._session.execute(
             select(SqlEdition).where(SqlEdition.id == edition_id)
@@ -452,6 +483,7 @@ class EditionStore:
             msg = f"Edition id={edition_id} not found"
             raise RuntimeError(msg)
         row.kind = kind
+        row.kind_source = EditionKindSource.derived
         await self._session.flush()
 
     async def set_publish_status(

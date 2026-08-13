@@ -501,6 +501,10 @@ def derive_edition_slug(
     the caller-supplied *rules*, then `BUILTIN_SLUG_REWRITE_RULES`, then
     a draft fallback that only replaces slashes with hyphens.
 
+    Passing *alternate_name* overrides the chain's kind with
+    `EditionKind.alternate`: the rules shape an alternate's slug, but a
+    deployment variant is never a release however its ref is tagged.
+
     Parameters
     ----------
     git_ref
@@ -535,6 +539,16 @@ def derive_edition_slug(
     # Compound slug for alternates
     if alternate_name is not None:
         slug = f"{alternate_name}{ALTERNATE_SEPARATOR}{base_slug}"
+        # An alternate is a deployment variant, not a version line, so
+        # the rule chain only shapes its *slug*: whatever kind matched
+        # the underlying ref describes the ref, not this edition. Left
+        # inherited, a version-tagged alternate would derive ``release``
+        # — a long CDN cache profile, the Releases bucket on the
+        # dashboard, and permanent lifecycle exemption for a preview
+        # deployment. ``alternate`` is the kind the dashboard already
+        # buckets on, so deriving it here is also what finally writes it:
+        # nothing else in the server ever assigns it.
+        edition_kind = EditionKind.alternate
         tracking_mode = TrackingMode.alternate_git_ref
         tracking_params = {
             "git_ref": git_ref,

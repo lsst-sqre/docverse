@@ -368,6 +368,7 @@ def edition_from_domain(
         slug=domain.slug,
         title=domain.title,
         kind=domain.kind,
+        kind_source=domain.kind_source,
         tracking_mode=domain.tracking_mode,
         tracking_params=domain.tracking_params,
         lifecycle_exempt=domain.lifecycle_exempt,

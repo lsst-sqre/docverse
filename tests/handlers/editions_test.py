@@ -12,7 +12,7 @@ from safir.metrics import MockEventPublisher
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.models import BuildCreate
+from docverse.models import BuildCreate, EditionKindSource
 from docverse.models.builds import BuildAnnotations
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dependencies.context import context_dependency
@@ -588,16 +588,40 @@ async def test_create_edition_with_uppercase_ticket_slug(
 
 
 @pytest.mark.asyncio
-async def test_patch_kind_pins_the_edition_against_re_derivation(
+async def test_posted_edition_reports_a_declared_kind(
     client: AsyncClient,
-    db_session: AsyncSession,
 ) -> None:
-    """A ``kind`` in the PATCH body records the operator's decision.
+    """``kind_source`` is visible on every edition response.
 
-    End-to-end proof that the handler's ``exclude_unset`` round-trip
-    through ``EditionService.update`` preserves the signal all the way
-    to ``kind_manually_set``, which is what stops keeper-sync and the
-    native upload path from re-deriving over the operator (PRD #498).
+    A POSTed edition's kind is the operator's, so the very first
+    response already reads ``declared`` — the signal that tells a client
+    this row is exempt from automated re-derivation.
+    """
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "1.0.0",
+            "title": "1.0.0",
+            "kind": "release",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "1.0.0"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    assert response.json()["kind_source"] == "declared"
+
+
+@pytest.mark.asyncio
+async def test_patch_can_hand_the_kind_back_to_the_system(
+    client: AsyncClient,
+) -> None:
+    """PATCHing ``kind_source`` to ``derived`` unpins a declared kind.
+
+    Without a way back, an operator who once corrected a kind opted that
+    edition out of every future derivation permanently — including the
+    rule changes the whole heal exists to propagate.
     """
     await _setup(client)
     await client.post(
@@ -613,6 +637,44 @@ async def test_patch_kind_pins_the_edition_against_re_derivation(
     )
     response = await client.patch(
         "/docverse/orgs/ed-org/projects/ed-proj/editions/1.0.0",
+        json={"kind_source": "derived"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["kind_source"] == "derived"
+
+
+@pytest.mark.asyncio
+async def test_patch_changing_kind_declares_the_edition(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``kind`` change in the PATCH body records the decision.
+
+    End-to-end proof that the handler's ``exclude_unset`` round-trip
+    through ``EditionService.update`` preserves the signal all the way
+    to ``kind_source``, which is what stops keeper-sync and the native
+    upload path from re-deriving over the operator (PRD #498).
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "1.0.0",
+            "title": "1.0.0",
+            "kind": "release",
+            "tracking_mode": "git_ref",
+            "tracking_params": {"git_ref": "1.0.0"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/1.0.0",
+        json={"kind_source": "derived"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/1.0.0",
         json={"kind": "draft"},
         headers={"X-Auth-Request-User": "testuser"},
     )
@@ -620,19 +682,20 @@ async def test_patch_kind_pins_the_edition_against_re_derivation(
     assert response.json()["kind"] == "draft"
 
     edition = await _fetch_edition(db_session, slug="1.0.0")
-    assert edition.kind_manually_set is True
+    assert edition.kind_source == EditionKindSource.declared
 
 
 @pytest.mark.asyncio
-async def test_patch_without_kind_leaves_the_edition_unpinned(
+async def test_get_then_patch_round_trip_does_not_declare(
     client: AsyncClient,
     db_session: AsyncSession,
 ) -> None:
-    """A title-only PATCH is not a kind decision and must not pin.
+    """Echoing the kind a GET just returned must not pin the edition.
 
-    Pinning on any PATCH would freeze the kind of every edition an
-    operator ever renamed, quietly opting them out of the healing the
-    PRD's whole promote-only story depends on.
+    A read-modify-write client sends back every field it read, so
+    pinning on the presence of ``kind`` would opt every edition such a
+    client ever renamed out of healing — invisibly, since nothing in the
+    payload asked for it.
     """
     await _setup(client)
     await client.post(
@@ -646,24 +709,30 @@ async def test_patch_without_kind_leaves_the_edition_unpinned(
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
+    await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/2.0.0",
+        json={"kind_source": "derived"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    fetched = await client.get(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/2.0.0",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert fetched.status_code == 200
     response = await client.patch(
         "/docverse/orgs/ed-org/projects/ed-proj/editions/2.0.0",
-        json={"title": "Renamed"},
+        json={"title": "Renamed", "kind": fetched.json()["kind"]},
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 200
+    assert response.json()["kind_source"] == "derived"
 
     edition = await _fetch_edition(db_session, slug="2.0.0")
-    assert edition.kind_manually_set is False
+    assert edition.kind_source == EditionKindSource.derived
 
 
 async def _fetch_edition(db_session: AsyncSession, *, slug: str) -> Edition:
-    """Read one ``ed-proj`` edition straight from the database.
-
-    ``kind_manually_set`` is deliberately server-internal — it is set as
-    a side effect of PATCHing ``kind`` and never appears in a response
-    body — so these assertions go to the row rather than the API.
-    """
+    """Read one ``ed-proj`` edition straight from the database."""
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
         proj_store = ProjectStore(session=db_session, logger=logger)

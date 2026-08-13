@@ -433,7 +433,7 @@ class TestAlternateSlug:
         )
         assert result is not None
         assert result.slug == f"usdf-dev{ALTERNATE_SEPARATOR}DM-12345"
-        assert result.edition_kind == EditionKind.draft
+        assert result.edition_kind == EditionKind.alternate
         assert result.tracking_mode == TrackingMode.alternate_git_ref
         assert result.tracking_params == {
             "git_ref": "tickets/DM-12345",
@@ -524,7 +524,7 @@ def test_rubin_alternate() -> None:
     )
     assert result is not None
     assert result.slug == "usdf-dev--DM-12345"
-    assert result.edition_kind == EditionKind.draft
+    assert result.edition_kind == EditionKind.alternate
     assert result.tracking_mode == TrackingMode.alternate_git_ref
     assert result.tracking_params == {
         "git_ref": "tickets/DM-12345",
@@ -606,11 +606,15 @@ def test_builtin_release_keeps_git_ref_tracking() -> None:
 
 
 def test_builtin_applies_to_alternate_editions() -> None:
-    """Alternate builds still get a compound slug and alternate tracking."""
+    """Alternate builds still get a compound slug and alternate tracking.
+
+    The rule chain shapes the *slug* for an alternate, but never its
+    kind: an alternate is an alternate whatever grammar its ref matched.
+    """
     result = derive_edition_slug("1.2.3", [], alternate_name="usdf-dev")
     assert result is not None
     assert result.slug == f"usdf-dev{ALTERNATE_SEPARATOR}1.2.3"
-    assert result.edition_kind == EditionKind.release
+    assert result.edition_kind == EditionKind.alternate
     assert result.tracking_mode == TrackingMode.alternate_git_ref
 
 

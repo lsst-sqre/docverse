@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
-from docverse.models import EditionKind, TrackingMode
+from docverse.models import EditionKind, EditionKindSource, TrackingMode
 
 from .base import Base
 
@@ -44,8 +44,11 @@ class SqlEdition(Base):
         nullable=False,
     )
 
-    kind_manually_set: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
+    kind_source: Mapped[EditionKindSource] = mapped_column(
+        Enum(EditionKindSource, native_enum=False, length=32),
+        nullable=False,
+        default=EditionKindSource.derived,
+        server_default=text("'derived'"),
     )
 
     tracking_mode: Mapped[TrackingMode] = mapped_column(

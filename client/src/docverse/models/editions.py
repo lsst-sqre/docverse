@@ -24,6 +24,7 @@ __all__ = [
     "EditionBuildHistoryEntry",
     "EditionCreate",
     "EditionKind",
+    "EditionKindSource",
     "EditionRollback",
     "EditionUpdate",
     "TrackingMode",
@@ -52,6 +53,24 @@ class EditionKind(StrEnum):
     major = "major"
     minor = "minor"
     alternate = "alternate"
+
+
+class EditionKindSource(StrEnum):
+    """Who owns an edition's ``kind``.
+
+    - ``derived`` — Docverse owns it. Every sync and every tracked build
+      recomputes the kind from the edition's ref and the project's
+      slug-rewrite rules, and writes the result, so the row converges on
+      the current rules in both directions.
+    - ``declared`` — an operator owns it. The kind was set through the
+      editions API and no automated derivation rewrites it.
+
+    PATCH ``kind_source`` back to ``derived`` to hand a declared kind
+    back to the system; the next sync or tracked build re-derives it.
+    """
+
+    derived = "derived"
+    declared = "declared"
 
 
 class TrackingMode(StrEnum):
@@ -246,6 +265,15 @@ class Edition(BaseModel):
 
     kind: EditionKind = Field(description="Kind of edition.")
 
+    kind_source: EditionKindSource = Field(
+        default=EditionKindSource.derived,
+        description=(
+            "Who owns ``kind``. Read-only here — change it by PATCHing"
+            " ``kind`` (which declares it) or ``kind_source`` itself"
+            " (which hands it back to the system)."
+        ),
+    )
+
     tracking_mode: TrackingMode = Field(
         description="How this edition tracks builds for automatic updates."
     )
@@ -333,7 +361,24 @@ class EditionUpdate(BaseModel):
     )
 
     kind: EditionKind | None = Field(
-        default=None, description="Kind of edition."
+        default=None,
+        description=(
+            "Kind of edition. Sending a kind that differs from the"
+            " current one declares it, pinning the edition against"
+            " automated re-derivation; echoing the kind an edition"
+            " already has is a no-op."
+        ),
+    )
+
+    kind_source: EditionKindSource | None = Field(
+        default=None,
+        description=(
+            "Who owns ``kind`` from now on. Send ``derived`` to hand a"
+            " declared kind back to Docverse: the next sync or tracked"
+            " build re-derives it from the edition's ref and the"
+            " project's slug-rewrite rules. Send ``declared`` to pin the"
+            " current kind without changing its value."
+        ),
     )
 
     tracking_mode: TrackingMode | None = Field(

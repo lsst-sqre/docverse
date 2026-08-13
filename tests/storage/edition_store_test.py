@@ -18,6 +18,7 @@ from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
+    EditionKindSource,
     EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
@@ -281,28 +282,68 @@ async def test_update_edition(
 
 
 @pytest.mark.asyncio
-async def test_update_kind_marks_manual_override(
+async def test_create_declares_the_operators_kind(
     db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
-    """A PATCH carrying ``kind`` pins the edition's kind for good.
+    """A POSTed edition's ``kind`` is the operator's, not the system's.
 
-    ``update`` is the editions PATCH API's only write path, so it is
-    where the operator's "I decided this kind" signal is recorded.
+    ``create`` is the editions POST API's only write path, so a kind
+    that arrives here was chosen by hand and must survive the next
+    build's derivation.
     """
     async with db_session.begin():
         project_id = await _create_project(db_session)
         created = await edition_store.create(
             project_id=project_id,
             data=EditionCreate(
-                slug="pinned-ed",
-                title="Pinned",
+                slug="posted-ed",
+                title="Posted",
                 kind=EditionKind.release,
                 tracking_mode=TrackingMode.git_ref,
-                tracking_params={"git_ref": "1.0.0"},
+                tracking_params={"git_ref": "u/jsick/feature"},
             ),
         )
-        assert created.kind_manually_set is False
+        await db_session.commit()
+    assert created.kind_source == EditionKindSource.declared
+
+
+@pytest.mark.asyncio
+async def test_create_internal_derives_the_kind(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """System-created editions hand their kind to the derivation."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        created = await edition_store.create_internal(
+            project_id=project_id,
+            slug="internal-ed",
+            title="Internal",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        await db_session.commit()
+    assert created.kind_source == EditionKindSource.derived
+
+
+@pytest.mark.asyncio
+async def test_update_declares_a_changed_kind(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A PATCH that *changes* ``kind`` pins the edition's kind for good."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="pinned-ed",
+            title="Pinned",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
         updated = await edition_store.update(
             project_id=project_id,
             slug="pinned-ed",
@@ -311,7 +352,103 @@ async def test_update_kind_marks_manual_override(
         await db_session.commit()
     assert updated is not None
     assert updated.kind == EditionKind.draft
-    assert updated.kind_manually_set is True
+    assert updated.kind_source == EditionKindSource.declared
+
+
+@pytest.mark.asyncio
+async def test_update_echoing_the_current_kind_does_not_declare(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A read-modify-write client must not silently opt out of healing.
+
+    Every GET-then-PATCH round-trip carries the kind it just read.
+    Pinning on the mere *presence* of ``kind`` would freeze the kind of
+    every edition such a client ever touched — invisibly, since nothing
+    in the payload said "pin me".
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="echo-ed",
+            title="Echo",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        updated = await edition_store.update(
+            project_id=project_id,
+            slug="echo-ed",
+            data=EditionUpdate(title="Echoed", kind=EditionKind.draft),
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.title == "Echoed"
+    assert updated.kind_source == EditionKindSource.derived
+
+
+@pytest.mark.asyncio
+async def test_update_can_hand_a_declared_kind_back(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """PATCHing ``kind_source`` to ``derived`` is the unpin path."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="unpin-ed",
+                title="Unpin",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            ),
+        )
+        updated = await edition_store.update(
+            project_id=project_id,
+            slug="unpin-ed",
+            data=EditionUpdate(kind_source=EditionKindSource.derived),
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.kind_source == EditionKindSource.derived
+
+
+@pytest.mark.asyncio
+async def test_update_kind_source_wins_over_the_change_stamp(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """An explicit ``kind_source`` is the operator's last word.
+
+    Correcting a kind *and* handing it straight back to the system is a
+    single coherent PATCH, so the explicit field must not be overwritten
+    by the value-change stamp.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="both-ed",
+            title="Both",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        updated = await edition_store.update(
+            project_id=project_id,
+            slug="both-ed",
+            data=EditionUpdate(
+                kind=EditionKind.release,
+                kind_source=EditionKindSource.derived,
+            ),
+        )
+        await db_session.commit()
+    assert updated is not None
+    assert updated.kind == EditionKind.release
+    assert updated.kind_source == EditionKindSource.derived
 
 
 @pytest.mark.asyncio
@@ -366,7 +503,12 @@ async def test_update_kind(
     db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
-    """``update_kind`` rewrites only the ``kind`` column."""
+    """``update_kind`` rewrites ``kind`` and its provenance, nothing else.
+
+    The heal paths are the only callers, so the write re-asserts
+    ``derived``: an edition the system just converged is still the
+    system's to converge again.
+    """
     async with db_session.begin():
         project_id = await _create_project(db_session)
         edition = await edition_store.create(
@@ -390,6 +532,7 @@ async def test_update_kind(
         )
     assert refetched is not None
     assert refetched.kind == EditionKind.release
+    assert refetched.kind_source == EditionKindSource.derived
     assert refetched.tracking_mode == TrackingMode.git_ref
     assert refetched.tracking_params == {"git_ref": "1.0.0"}
 

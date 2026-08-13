@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal
 
 import structlog
 
-from docverse.models import EditionAutocreationConfig, TrackingMode
+from docverse.models import (
+    EditionAutocreationConfig,
+    EditionKind,
+    EditionKindSource,
+    TrackingMode,
+)
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
-from docverse_server.domain.edition_kind import is_kind_promotion
 from docverse_server.domain.edition_tracking import (
     EditionTrackingOutcome,
     EditionTrackingResult,
@@ -38,6 +44,33 @@ from docverse_server.storage.edition_build_history_store import (
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+
+
+def _derivation_governs(
+    edition: Edition, derivation: SlugDerivationResult
+) -> bool:
+    """Report whether *derivation* describes *edition*'s kind.
+
+    ``find_matching_editions`` returns everything a build advances, not
+    just the edition the ref derivation names: a build on ``1.0.0``
+    also matches the ``1`` / ``1.0`` aggregates, and a build on ``main``
+    matches the project's ``__main`` edition. Those rows carry
+    *structural* kinds that no ref derivation computes, so applying the
+    ref's kind to them would demote ``__main`` to ``draft`` (which
+    ``ck_editions_main_slug_kind`` rejects outright) and flatten the
+    aggregates into ordinary releases.
+
+    The derivation therefore governs exactly the editions it could have
+    created: those tracking the mode it emits — ``git_ref``, or
+    ``alternate_git_ref`` when the build carries an alternate scope —
+    and never the default edition, whose ``main`` kind is a property of
+    the project rather than of any ref.
+    """
+    return (
+        edition.kind is not EditionKind.main
+        and edition.tracking_mode == derivation.tracking_mode
+    )
+
 
 # Tracking modes that use version comparison instead of date-based guards.
 _VERSION_MODES = frozenset(
@@ -197,9 +230,12 @@ class EditionTrackingService:
             if not any(e.id == ve.id for e in editions):
                 editions.append(ve)
 
-        # 8. Heal kinds derived before the built-in version rules landed
+        # 8. Converge kinds on the current derivation
         editions = await self._refresh_kinds(
-            editions, derivation=derivation, project_id=project.id
+            editions,
+            derivation=derivation,
+            org_id=org.id,
+            project_id=project.id,
         )
 
         # 9. Update each edition
@@ -222,9 +258,10 @@ class EditionTrackingService:
         editions: list[Edition],
         *,
         derivation: SlugDerivationResult,
+        org_id: int,
         project_id: int,
     ) -> list[Edition]:
-        """Re-apply the derived kind to already-existing editions.
+        """Converge matched editions on the current derivation.
 
         ``find_matching_editions`` only ever moves an edition's build
         pointer, so an edition created before the built-in version rules
@@ -232,49 +269,63 @@ class EditionTrackingService:
         version-slugged edition stays ``draft`` forever, holding the
         short CDN cache profile and staying eligible for
         ``draft_inactivity`` soft-deletion, while the byte-identical
-        edition on a keeper-sync-migrated project is promoted to
-        ``release`` on every sync. Re-deriving here closes that gap.
+        edition on a keeper-sync-migrated project is corrected on every
+        sync. Re-deriving here closes that gap.
 
-        The write is gated by the shared
-        :func:`~docverse_server.domain.edition_kind.is_kind_promotion`
-        policy — the same one keeper-sync's ``_refresh_kind`` applies —
-        so the gate alone makes the sweep safe across the whole matched
-        set: the ``__main`` edition (``main``), the ``N`` / ``N.M``
-        aggregates (``major`` / ``minor``), an ``alternate``, and every
-        row just auto-created with this very derivation are all no-ops,
-        because none of them is a ``(draft, release)`` pair. Any edition
-        whose kind an operator PATCHed by hand — including one demoted
-        from ``release`` to ``draft``, which *is* such a pair — is held
-        back by its ``kind_manually_set`` flag instead.
+        The sweep converges rather than promotes: a ``derived`` row is
+        rewritten to whatever the rules say *today*, demotions included,
+        so an org that adds ``{"type": "semver", "edition_kind":
+        "draft"}`` sees its earlier promotions unwound instead of
+        stranded. Convergence — not a re-asserting PATCH — is the
+        supported way to undo an automatic kind.
 
-        Returns the list with promoted rows replaced by their post-write
-        state, so downstream steps see the kind that is in the database.
+        Returns the list with converged rows replaced by their
+        post-write state, so downstream steps see the kind that is in
+        the database.
         """
         refreshed: list[Edition] = []
         for edition in editions:
-            if not is_kind_promotion(
-                edition.kind,
-                derivation.edition_kind,
-                kind_manually_set=edition.kind_manually_set,
-            ):
-                refreshed.append(edition)
-                continue
+            converged = await self._converge_kind(
+                edition,
+                derivation=derivation,
+                org_id=org_id,
+                project_id=project_id,
+            )
+            refreshed.append(converged)
+        return refreshed
+
+    async def _converge_kind(
+        self,
+        edition: Edition,
+        *,
+        derivation: SlugDerivationResult,
+        org_id: int,
+        project_id: int,
+    ) -> Edition:
+        """Write *derivation*'s kind to *edition* when it governs it."""
+        if not _derivation_governs(edition, derivation):
+            return edition
+        if edition.kind_source is EditionKindSource.declared:
+            return edition
+        if edition.kind is derivation.edition_kind:
+            return edition
+        async with self._edition_update_lock(
+            org_id=org_id, project_id=project_id, edition_id=edition.id
+        ):
             await self._deps.edition_store.update_kind(
                 edition_id=edition.id, kind=derivation.edition_kind
             )
-            self._deps.logger.info(
-                "Promoted edition kind",
-                edition_slug=edition.slug,
-                edition_id=edition.id,
-                project_id=project_id,
-                previous_kind=edition.kind.value,
-                edition_kind=derivation.edition_kind.value,
-                matched_rule_type=derivation.matched_rule_type,
-            )
-            refreshed.append(
-                edition.model_copy(update={"kind": derivation.edition_kind})
-            )
-        return refreshed
+        self._deps.logger.info(
+            "Converged edition kind",
+            edition_slug=edition.slug,
+            edition_id=edition.id,
+            project_id=project_id,
+            previous_kind=edition.kind.value,
+            edition_kind=derivation.edition_kind.value,
+            kind_trigger="build_upload",
+            matched_rule_type=derivation.matched_rule_type,
+        )
+        return edition.model_copy(update={"kind": derivation.edition_kind})
 
     async def _update_editions(
         self,
@@ -382,6 +433,31 @@ class EditionTrackingService:
             action=action,
         )
 
+    @asynccontextmanager
+    async def _edition_update_lock(
+        self, *, org_id: int, project_id: int, edition_id: int
+    ) -> AsyncGenerator[None]:
+        """Hold the ``EDITION_UPDATE`` lock for one edition, if wired.
+
+        When ``self._deps.lock_service`` is configured (worker call
+        paths), everything inside the block serializes against
+        concurrent ``publish_edition`` jobs, keeper-sync's writes, and
+        admin-triggered edition changes for the same edition. With no
+        lock service (unit-test call paths), the body runs unwrapped —
+        non-worker callers are explicitly out of scope per the design
+        (SQR-112).
+        """
+        if self._deps.lock_service is None:
+            yield
+            return
+        lock_key = LockKey.for_edition_update(
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_id,
+        )
+        async with self._deps.lock_service.acquire(lock_key):
+            yield
+
     async def _set_current_build_locked(
         self,
         *,
@@ -391,27 +467,10 @@ class EditionTrackingService:
         build_id: int,
         skip_date_guard: bool,
     ) -> Edition | None:
-        """Update the edition pointer under an EDITION_UPDATE lock.
-
-        When ``self._deps.lock_service`` is configured (worker call paths),
-        the call serializes against concurrent ``publish_edition`` jobs
-        and admin-triggered edition pointer changes for the same
-        edition. With no lock service (unit-test call paths), the
-        update runs unwrapped — non-worker callers are explicitly
-        out of scope per the design (SQR-112).
-        """
-        if self._deps.lock_service is None:
-            return await self._deps.edition_store.set_current_build(
-                edition_id=edition_id,
-                build_id=build_id,
-                skip_date_guard=skip_date_guard,
-            )
-        lock_key = LockKey.for_edition_update(
-            org_id=org_id,
-            project_id=project_id,
-            edition_id=edition_id,
-        )
-        async with self._deps.lock_service.acquire(lock_key):
+        """Update the edition pointer under an EDITION_UPDATE lock."""
+        async with self._edition_update_lock(
+            org_id=org_id, project_id=project_id, edition_id=edition_id
+        ):
             return await self._deps.edition_store.set_current_build(
                 edition_id=edition_id,
                 build_id=build_id,

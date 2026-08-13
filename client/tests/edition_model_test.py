@@ -12,6 +12,8 @@ from docverse.models import (
     EditionAutocreationConfig,
     EditionCreate,
     EditionKind,
+    EditionKindSource,
+    EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
@@ -35,6 +37,20 @@ def _base_edition(**overrides: object) -> Edition:
     }
     base.update(overrides)
     return Edition.model_validate(base)
+
+
+def test_edition_kind_source_defaults_to_derived() -> None:
+    """An edition whose kind nobody declared is the system's to re-derive."""
+    edition = _base_edition()
+    assert edition.kind_source == EditionKindSource.derived
+
+
+def test_edition_update_can_hand_the_kind_back_to_the_system() -> None:
+    """PATCHing ``kind_source`` to ``derived`` is the documented unpin."""
+    update = EditionUpdate(kind_source=EditionKindSource.derived)
+    assert update.model_dump(exclude_unset=True) == {
+        "kind_source": EditionKindSource.derived
+    }
 
 
 def test_edition_publish_status_default_is_none() -> None:

@@ -31,6 +31,7 @@ from docverse.models import (
     BuildStatus,
     EditionCreate,
     EditionKind,
+    EditionKindSource,
     EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
@@ -86,6 +87,7 @@ from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
+from tests.support.lock_service_spy import RecordingLockService
 
 FIXTURES_DIR = (
     Path(__file__).parent.parent.parent / "storage" / "ltd" / "fixtures"
@@ -958,17 +960,18 @@ async def test_sync_edition_imports_lsst_doc_branch_edition(
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """A non-main ``lsst_doc`` edition imports as a Docverse release.
+    """A branch-tracking ``lsst_doc`` edition imports as a draft.
 
-    The LTD tracking mode alone decides the kind: this fixture's ref is
-    an ordinary ``u/jsick/feature`` branch, which the ref heuristic
-    would classify as a draft.
+    The LTD mode narrows but does not decide: this fixture tracks an
+    ordinary ``u/jsick/feature`` branch. Trusting the mode alone gave it
+    a ``release`` kind — the long CDN cache profile, the Releases bucket
+    on the dashboard, and permanent exemption from lifecycle reaping —
+    with no path back, since nothing ever demoted it.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
 
-    branch_edition = _load("edition_branch_git_refs.json")
-    branch_edition["mode"] = "lsst_doc"
+    branch_edition = _load("edition_branch_lsst_doc.json")
     branch_build = _load("build.json")
     branch_build["self_url"] = f"{LTD_BASE}/builds/43"
     branch_build["bucket_root_dir"] = "pipelines/builds/43"
@@ -1013,7 +1016,8 @@ async def test_sync_edition_imports_lsst_doc_branch_edition(
             project_id=project.id, slug="u-jsick-feature"
         )
         assert edition is not None
-        assert edition.kind == EditionKind.release
+        assert edition.kind == EditionKind.draft
+        assert edition.kind_source == EditionKindSource.derived
         assert edition.tracking_mode == TrackingMode.lsst_doc
         assert edition.tracking_params == {}
 
@@ -2826,16 +2830,27 @@ async def test_sync_imports_ticket_branch_edition_as_draft(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("ltd_mode", "expected_kind", "expected_tracking_mode"),
+    ("ltd_mode", "git_ref", "expected_kind", "expected_tracking_mode"),
     [
-        ("lsst_doc", EditionKind.release, TrackingMode.lsst_doc),
+        ("lsst_doc", "v1.2", EditionKind.release, TrackingMode.lsst_doc),
+        (
+            "lsst_doc",
+            "tickets/DM-1",
+            EditionKind.draft,
+            TrackingMode.lsst_doc,
+        ),
         (
             "eups_daily_release",
+            "d_2026_08_10",
             EditionKind.draft,
             TrackingMode.eups_daily_release,
         ),
     ],
-    ids=["lsst-doc-release", "eups-daily-draft"],
+    ids=[
+        "lsst-doc-version-release",
+        "lsst-doc-branch-draft",
+        "eups-daily-draft",
+    ],
 )
 async def test_sync_imports_version_mode_editions_by_mode(
     *,
@@ -2843,25 +2858,28 @@ async def test_sync_imports_version_mode_editions_by_mode(
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
     ltd_mode: str,
+    git_ref: str,
     expected_kind: EditionKind,
     expected_tracking_mode: TrackingMode,
 ) -> None:
-    """LTD version tracking modes decide the kind on their own.
+    """The LTD mode narrows the grammar; the tracked ref confirms it.
 
-    The tracked ref is deliberately ticket-shaped so a mode-derived
-    kind cannot be confused with a ref-heuristic one: ``lsst_doc``
-    still imports as a release, ``eups_daily_release`` still as a
-    draft.
+    Docverse's tracking mode still comes straight from LTD's, but the
+    *kind* does not: a ``lsst_doc`` edition on ``v1.2`` is a release and
+    the same mode on a ticket branch is a draft. ``eups_daily_release``
+    is the one mode that decides alone, and it decides ``draft`` so
+    dailies keep ageing out.
     """
     async with db_session.begin():
         org_id = await _seed_org(
-            db_session, slug=f"ks-mode-{ltd_mode.replace('_', '-')}"
+            db_session,
+            slug=f"ks-mode-{ltd_mode.replace('_', '-')}-{expected_kind.value}",
         )
 
     _seed_two_editions_main_and_draft(
         mock_discovery,
         draft_payload=_version_edition_payload(
-            slug="current", git_ref="tickets/DM-1", mode=ltd_mode
+            slug="current", git_ref=git_ref, mode=ltd_mode
         ),
     )
 
@@ -2949,8 +2967,11 @@ async def _seed_project_with_edition(
 
     Stands in for a project keeper-sync has already walked at least
     once: the edition row exists with whatever kind that earlier sync
-    (or an operator's PATCH) left behind. Returns the edition id so the
-    caller can assert on the same row regardless of slug.
+    left behind. ``create_internal`` is the seeding path precisely
+    because it is the one keeper-sync itself uses, so the row lands with
+    ``kind_source == derived`` — the system's to reconverge. Returns the
+    edition id so the caller can assert on the same row regardless of
+    slug.
     """
     logger = structlog.get_logger("test")
     project_store = ProjectStore(session=session, logger=logger)
@@ -2964,15 +2985,13 @@ async def _seed_project_with_edition(
                 source_url="https://example.com/lsst/pipelines",
             ),
         )
-        edition = await edition_store.create(
+        edition = await edition_store.create_internal(
             project_id=project.id,
-            data=EditionCreate(
-                slug=edition_slug,
-                title=edition_slug,
-                kind=kind,
-                tracking_mode=TrackingMode.git_ref,
-                tracking_params={"git_ref": git_ref},
-            ),
+            slug=edition_slug,
+            title=edition_slug,
+            kind=kind,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": git_ref},
         )
     return edition.id
 
@@ -3027,22 +3046,72 @@ async def test_resync_promotes_draft_edition_to_release(
 
 
 @pytest.mark.asyncio
+async def test_resync_heals_a_wrongly_imported_release_back_to_draft(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A ``release`` the old mode table produced heals back to ``draft``.
+
+    Before the ref confirmation, every ``lsst_doc`` / ``eups_*`` edition
+    imported as ``release`` whatever it tracked, so branch-tracking rows
+    landed with a long CDN cache profile and permanent lifecycle
+    exemption. Those rows are ``derived``, so the next poll converges
+    them downhill rather than stranding them.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-heal-down")
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="u-jsick-feature",
+        kind=EditionKind.release,
+        git_ref="u/jsick/feature",
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="u-jsick-feature", git_ref="u/jsick/feature"
+        ),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>healed</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.kind == EditionKind.draft
+    assert edition.kind_source == EditionKindSource.derived
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("existing_kind", "edition_slug", "git_ref"),
     [
-        (EditionKind.release, "u-jsick-feature", "u/jsick/feature"),
         (EditionKind.major, "15", "15.2.1"),
         (EditionKind.minor, "15.2", "15.2.1"),
         (EditionKind.alternate, "15.2.1", "15.2.1"),
     ],
     ids=[
-        "never-demote-release",
         "major-untouched",
         "minor-untouched",
         "alternate-untouched",
     ],
 )
-async def test_resync_kind_refresh_is_promote_only(
+async def test_resync_kind_refresh_leaves_foreign_derivations_alone(
     *,
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -3051,13 +3120,13 @@ async def test_resync_kind_refresh_is_promote_only(
     edition_slug: str,
     git_ref: str,
 ) -> None:
-    """Only ``draft`` -> ``release`` is applied; every other kind holds.
+    """Aggregate and alternate kinds belong to another derivation.
 
-    ``never-demote-release`` derives ``draft`` from a ticket branch
-    against an edition already marked ``release`` — the exact shape of a
-    manual PATCH that must survive. The aggregate and alternate cases
-    derive ``release`` from a version ref but must not disturb a kind
-    Docverse itself assigned.
+    ``derive_edition_kind`` only ever answers ``main`` / ``release`` /
+    ``draft``; ``major`` / ``minor`` come from the semver aggregate
+    specs and ``alternate`` from the alternate branch of
+    ``derive_edition_slug``. These cases derive ``release`` from a
+    version ref, and must leave the rollup or variant exactly as it is.
     """
     async with db_session.begin():
         org_id = await _seed_org(
@@ -3099,6 +3168,99 @@ async def test_resync_kind_refresh_is_promote_only(
 
 
 @pytest.mark.asyncio
+async def test_resync_kind_convergence_is_locked_and_logged(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kind write holds ``EDITION_UPDATE`` and leaves an audit line.
+
+    ``publish_edition`` reads ``edition.kind`` to pick the CDN cache
+    profile, so a job that loaded the edition before an unlocked
+    promotion committed would write the KV pointer with the stale
+    ``short`` profile and skip the hostname purge — leaving the edge
+    serving ``max-age=60`` for a release.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-heal-lock")
+
+    edition_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="15.2.1",
+        kind=EditionKind.draft,
+        git_ref="15.2.1",
+    )
+
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+
+    trace: list[str] = []
+    lock_service = RecordingLockService(
+        session=db_session,
+        logger=structlog.get_logger("test"),
+        events=[],
+        trace=trace,
+    )
+    original_update_kind = EditionStore.update_kind
+
+    async def _traced_update_kind(
+        self: EditionStore, *, edition_id: int, kind: EditionKind
+    ) -> None:
+        trace.append(f"update_kind:{edition_id}")
+        await original_update_kind(self, edition_id=edition_id, kind=kind)
+
+    monkeypatch.setattr(EditionStore, "update_kind", _traced_update_kind)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        lock_service=lock_service,
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    monkeypatch.undo()
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.kind == EditionKind.release
+
+    lock_key = LockKey.for_edition_update(
+        org_id=org_id, project_id=edition.project_id, edition_id=edition_id
+    )
+    write = trace.index(f"update_kind:{edition_id}")
+    assert any(
+        entry == f"enter:{lock_key.lock_id}" for entry in trace[:write]
+    ), "kind write ran with no EDITION_UPDATE lock held"
+    assert any(
+        entry == f"exit:{lock_key.lock_id}" for entry in trace[write + 1 :]
+    ), "EDITION_UPDATE lock released before the kind write"
+
+    events = [e for e in logs if e["event"] == "Converged edition kind"]
+    assert len(events) == 1
+    assert events[0]["edition_id"] == edition_id
+    assert events[0]["previous_kind"] == "draft"
+    assert events[0]["edition_kind"] == "release"
+    assert events[0]["kind_trigger"] == "keeper_sync"
+
+
+@pytest.mark.asyncio
 async def test_resync_respects_manual_demotion_to_draft(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -3106,12 +3268,12 @@ async def test_resync_respects_manual_demotion_to_draft(
 ) -> None:
     """An operator's ``release`` -> ``draft`` PATCH survives every poll.
 
-    The one case the promote-only allow-list cannot protect on its own:
-    a demoted edition sits on ``(draft, release)``, exactly the pair the
-    policy permits, so before ``kind_manually_set`` the very next tier
-    poll silently promoted it back within minutes. The PATCH here goes
-    through ``EditionStore.update``, the real editions-API write path,
-    so the flag is stamped the way production stamps it.
+    Convergence alone would undo the operator within minutes: the ref is
+    still a version tag, so the derivation still says ``release``. The
+    PATCH here goes through ``EditionStore.update``, the real
+    editions-API write path, so ``kind_source`` is stamped ``declared``
+    the way production stamps it — and a declared row is never
+    converged.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-manual-demote")

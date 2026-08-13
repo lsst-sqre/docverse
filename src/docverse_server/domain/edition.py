@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from docverse.models import EditionKind, TrackingMode
+from docverse.models import EditionKind, EditionKindSource, TrackingMode
 from docverse.models.queue_enums import PublishStatus
 
 from .base32id import Base32Id
@@ -30,13 +30,14 @@ class Edition(BaseModel):
 
     kind: EditionKind = Field(description="Kind of edition.")
 
-    kind_manually_set: bool = Field(
-        default=False,
+    kind_source: EditionKindSource = Field(
+        default=EditionKindSource.derived,
         description=(
-            "Whether an operator set ``kind`` by hand through the editions"
-            " PATCH API. Pins the kind: the automated re-derivation paths"
-            " (keeper-sync's per-sync refresh and the native build-upload"
-            " heal) skip this edition entirely."
+            "Who owns ``kind``. ``derived`` hands it to the automated"
+            " derivation paths (keeper-sync's per-sync refresh and the"
+            " native build-upload heal), which converge the row on the"
+            " current rules in both directions; ``declared`` records an"
+            " operator's decision and is never rewritten."
         ),
     )
 

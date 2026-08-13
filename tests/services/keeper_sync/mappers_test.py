@@ -7,7 +7,9 @@ rules") so a future change has to update both the rule and the test.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,13 +18,22 @@ from pydantic import HttpUrl
 from docverse.models import EditionKind, TrackingMode
 from docverse_server.domain.slug import parse_slug_rewrite_rules
 from docverse_server.services.keeper_sync.mappers import (
-    EditionKindSource,
+    KindDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
     map_edition_tracking,
 )
 from docverse_server.storage.ltd import LtdBuild, LtdEdition
+
+_LTD_FIXTURES_DIR = Path(__file__).parents[2] / "storage" / "ltd" / "fixtures"
+
+
+def _load_ltd_edition(name: str) -> LtdEdition:
+    """Validate a captured ``keeper.lsst.codes`` edition payload."""
+    return LtdEdition.model_validate(
+        json.loads((_LTD_FIXTURES_DIR / name).read_text())
+    )
 
 
 def _edition(
@@ -66,14 +77,14 @@ class TestDeriveEditionKind:
         )
         derivation = derive_edition_kind(edition, git_ref="15.2.1")
         assert derivation.kind == EditionKind.release
-        assert derivation.source == EditionKindSource.rule
+        assert derivation.source == KindDerivationSource.rule
         assert derivation.detail == "semver"
 
     def test_main_edition_is_main(self) -> None:
         edition = _edition(slug="main", tracked_refs=["main"])
         derivation = derive_edition_kind(edition, git_ref="main")
         assert derivation.kind == EditionKind.main
-        assert derivation.source == EditionKindSource.ltd_main
+        assert derivation.source == KindDerivationSource.ltd_main
 
     def test_git_refs_ticket_branch_is_a_draft(self) -> None:
         edition = _edition(
@@ -83,40 +94,84 @@ class TestDeriveEditionKind:
         )
         derivation = derive_edition_kind(edition, git_ref="tickets/DM-54112")
         assert derivation.kind == EditionKind.draft
-        assert derivation.source == EditionKindSource.fallback
+        assert derivation.source == KindDerivationSource.fallback
         assert derivation.detail is None
 
     @pytest.mark.parametrize(
-        ("ltd_mode", "expected"),
-        [
-            ("lsst_doc", EditionKind.release),
-            ("eups_major_release", EditionKind.release),
-            ("eups_weekly_release", EditionKind.release),
-            ("eups_daily_release", EditionKind.draft),
-        ],
+        "ltd_mode",
+        ["lsst_doc", "eups_major_release", "eups_weekly_release"],
     )
-    def test_version_modes_map_directly(
-        self, ltd_mode: str, expected: EditionKind
+    def test_version_modes_are_confirmed_by_the_ref(
+        self, ltd_mode: str
     ) -> None:
-        """Version modes decide the kind without consulting the ref.
+        """A version mode narrows; the ref has to confirm the release.
 
-        The tracked ref here is deliberately ticket-shaped: a mode match
-        must win before the ref heuristic ever runs.
+        LTD's version modes only describe which grammar an edition
+        *prefers* — ``lsst_doc`` explicitly publishes ``main`` builds
+        until a version tag exists — so the mode alone cannot certify a
+        release. A ticket-shaped ref under any of them stays ``draft``.
         """
         edition = _edition(
-            slug="v1.0", mode=ltd_mode, tracked_refs=["tickets/DM-1"]
+            slug="u-jsick-feature",
+            mode=ltd_mode,
+            tracked_refs=["tickets/DM-1"],
         )
         derivation = derive_edition_kind(edition, git_ref="tickets/DM-1")
-        assert derivation.kind == expected
-        assert derivation.source == EditionKindSource.ltd_mode
-        assert derivation.detail == ltd_mode
+        assert derivation.kind == EditionKind.draft
+        assert derivation.source == KindDerivationSource.fallback
+
+    @pytest.mark.parametrize(
+        ("ltd_mode", "slug", "expected_rule"),
+        [
+            ("lsst_doc", "v1.2", "lsst_doc"),
+            ("eups_major_release", "v27_0", "eups_major"),
+            ("eups_weekly_release", "w_2026_10", "eups_weekly"),
+        ],
+    )
+    def test_version_modes_confirmed_by_the_slug(
+        self, ltd_mode: str, slug: str, expected_rule: str
+    ) -> None:
+        """LTD sends ``tracked_refs: null`` for its version modes.
+
+        With no ref to inspect, the LTD slug — which for these editions
+        *is* the version string — is what the heuristics confirm.
+        """
+        edition = _edition(slug=slug, mode=ltd_mode, tracked_refs=None)
+        derivation = derive_edition_kind(edition)
+        assert derivation.kind == EditionKind.release
+        assert derivation.source == KindDerivationSource.rule
+        assert derivation.detail == expected_rule
+
+    def test_eups_daily_release_is_always_a_draft(self) -> None:
+        """Dailies stay drafts so they keep ageing out under lifecycle."""
+        edition = _edition(
+            slug="d_2026_08_10",
+            mode="eups_daily_release",
+            tracked_refs=None,
+        )
+        derivation = derive_edition_kind(edition)
+        assert derivation.kind == EditionKind.draft
+        assert derivation.source == KindDerivationSource.ltd_mode
+        assert derivation.detail == "eups_daily_release"
+
+    def test_branch_tracking_lsst_doc_fixture_is_a_draft(self) -> None:
+        """The captured mis-moded LTD edition imports as a draft.
+
+        ``edition_branch_lsst_doc.json`` is an LTD ``lsst_doc`` edition
+        pointed at ``u/jsick/feature``. Before the ref confirmation it
+        imported as ``release``: a long CDN cache profile and permanent
+        lifecycle exemption for a ticket branch.
+        """
+        edition = _load_ltd_edition("edition_branch_lsst_doc.json")
+        derivation = derive_edition_kind(edition)
+        assert derivation.kind == EditionKind.draft
 
     def test_manual_uses_the_supplied_build_ref(self) -> None:
         """``manual`` editions classify on the ref their tracking pins."""
         edition = _edition(slug="current", mode="manual", tracked_refs=None)
         derivation = derive_edition_kind(edition, git_ref="v22_0")
         assert derivation.kind == EditionKind.release
-        assert derivation.source == EditionKindSource.rule
+        assert derivation.source == KindDerivationSource.rule
         assert derivation.detail == "eups_major"
 
     def test_falls_back_to_tracked_ref_when_git_ref_omitted(self) -> None:
@@ -144,7 +199,7 @@ class TestDeriveEditionKind:
             edition, git_ref="15.2.1", rules=rules
         )
         assert derivation.kind == EditionKind.draft
-        assert derivation.source == EditionKindSource.rule
+        assert derivation.source == KindDerivationSource.rule
 
     def test_ignore_rule_does_not_draft_a_version_ref(self) -> None:
         """An ignore rule gating auto-creation must not demote imports.
@@ -163,7 +218,7 @@ class TestDeriveEditionKind:
             edition, git_ref="v15.2.1", rules=rules
         )
         assert derivation.kind == EditionKind.release
-        assert derivation.source == EditionKindSource.rule
+        assert derivation.source == KindDerivationSource.rule
         assert derivation.detail == "semver"
 
     def test_ignore_rule_leaves_non_version_refs_drafts(self) -> None:
@@ -179,7 +234,7 @@ class TestDeriveEditionKind:
             edition, git_ref="tickets/DM-54112", rules=rules
         )
         assert derivation.kind == EditionKind.draft
-        assert derivation.source == EditionKindSource.fallback
+        assert derivation.source == KindDerivationSource.fallback
 
     def test_unknown_mode_degrades_to_the_rule_chain(self) -> None:
         """Schema drift must not crash kind derivation.
@@ -193,7 +248,7 @@ class TestDeriveEditionKind:
         )
         derivation = derive_edition_kind(edition, git_ref="1.2.3")
         assert derivation.kind == EditionKind.release
-        assert derivation.source == EditionKindSource.rule
+        assert derivation.source == KindDerivationSource.rule
 
 
 @pytest.mark.parametrize(

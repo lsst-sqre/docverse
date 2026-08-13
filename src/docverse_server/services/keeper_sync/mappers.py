@@ -27,7 +27,7 @@ from docverse_server.storage.ltd import LtdBuild, LtdEdition, LtdEditionMode
 __all__ = [
     "LTD_MAIN_SLUG",
     "EditionKindDerivation",
-    "EditionKindSource",
+    "KindDerivationSource",
     "derive_edition_kind",
     "derive_edition_slug",
     "derive_edition_source_prefix",
@@ -49,12 +49,15 @@ _LTD_BUILDS_SEGMENT = "builds"
 _LTD_EDITIONS_SEGMENT = "v"
 
 
-class EditionKindSource(StrEnum):
-    """Where a derived Docverse edition kind came from.
+class KindDerivationSource(StrEnum):
+    """Which arm of the derivation produced a Docverse edition kind.
 
     Carried on :class:`EditionKindDerivation` purely for observability:
     operators triaging a mis-kinded import need to know whether LTD's
-    tracking mode or a slug-rewrite rule decided the kind.
+    tracking mode or a slug-rewrite rule decided the kind. Distinct from
+    the persisted ``kind_source`` column
+    (:class:`docverse.models.EditionKindSource`), which records *who
+    owns* an edition's kind rather than how the system computed one.
     """
 
     ltd_main = "ltd_main"
@@ -77,22 +80,28 @@ class EditionKindDerivation:
     kind: EditionKind
     """The Docverse edition kind to import the LTD edition as."""
 
-    source: EditionKindSource
+    source: KindDerivationSource
     """Which derivation arm produced :attr:`kind`."""
 
     detail: str | None = None
     """LTD mode for ``ltd_mode``, matched rule ``type`` for ``rule``."""
 
 
-#: LTD version tracking modes that imply a Docverse kind on their own,
-#: with no ref inspection. LTD only ever points these editions at
-#: releases of the matching grammar, so the mode *is* the classification.
-#: ``eups_daily_release`` is deliberately ``draft`` — dailies should keep
-#: aging out under the ``draft_inactivity`` lifecycle rule.
+#: LTD version tracking modes that decide a Docverse kind on their own,
+#: with no ref inspection. Only ``eups_daily_release`` qualifies, and
+#: only because it is a *floor*: whatever ref a daily edition points at,
+#: it must stay ``draft`` so it keeps ageing out under the
+#: ``draft_inactivity`` lifecycle rule.
+#:
+#: The other version modes (``lsst_doc``, ``eups_major_release``,
+#: ``eups_weekly_release``) deliberately do **not** appear here. They
+#: narrow which grammar an edition prefers, but they do not certify that
+#: the edition is currently on a release — LTD's own ``lsst_doc`` mode
+#: publishes ``main`` builds until a version tag exists, so a
+#: branch-tracking edition under any of them would have imported as
+#: ``release`` and become permanently exempt from lifecycle reaping.
+#: They fall through to the ref/slug confirmation below instead.
 _MODE_KIND_TABLE: dict[LtdEditionMode, EditionKind] = {
-    LtdEditionMode.lsst_doc: EditionKind.release,
-    LtdEditionMode.eups_major_release: EditionKind.release,
-    LtdEditionMode.eups_weekly_release: EditionKind.release,
     LtdEditionMode.eups_daily_release: EditionKind.draft,
 }
 
@@ -105,18 +114,21 @@ def derive_edition_kind(
 ) -> EditionKindDerivation:
     """Pick the Docverse :class:`EditionKind` for an LTD edition.
 
-    Mode-first, then rule-driven:
+    Structure-first, then rule-driven:
 
     1. LTD's ``main`` edition maps onto Docverse's auto-created
        ``__main`` edition (``EditionKind.main``).
-    2. An LTD version tracking mode (``lsst_doc``, ``eups_*``) maps
-       straight onto a kind via ``_MODE_KIND_TABLE``, without
-       consulting the ref at all.
-    3. Everything else (``git_refs``, ``manual``) runs the full
-       slug-rewrite rule chain — org/project rules then the built-in
-       version heuristics — against the tracked ref. Ignore rules do
-       not participate: they gate auto-creation on the native path,
-       and these editions already exist in LTD.
+    2. ``eups_daily_release`` pins ``draft`` outright — see
+       ``_MODE_KIND_TABLE``.
+    3. Everything else runs the full slug-rewrite rule chain —
+       org/project rules then the built-in version heuristics — against
+       the tracked ref. Ignore rules do not participate: they gate
+       auto-creation on the native path, and these editions already
+       exist in LTD.
+
+    The version modes take arm 3 with the rest: the mode narrows, but
+    the ref (or, when LTD sends none, the version-shaped LTD slug) is
+    what confirms a release.
 
     Parameters
     ----------
@@ -127,6 +139,9 @@ def derive_edition_kind(
         :func:`map_edition_tracking`. Falls back to the edition's first
         ``tracked_refs`` entry and finally to the LTD slug, so an
         edition with no ref at all still gets classified on its slug.
+        LTD reports ``tracked_refs: null`` for every non-``git_refs``
+        mode, so version-mode editions land on that slug fallback — and
+        their slug is the version string (``v27_0``, ``w_2026_10``).
     rules
         Ordered org/project-configured slug rewrite rules. The built-in
         version rules are always appended by the domain layer.
@@ -138,7 +153,7 @@ def derive_edition_kind(
     """
     if ltd_edition.slug == LTD_MAIN_SLUG:
         return EditionKindDerivation(
-            kind=EditionKind.main, source=EditionKindSource.ltd_main
+            kind=EditionKind.main, source=KindDerivationSource.ltd_main
         )
 
     ltd_mode = _parse_mode(ltd_edition.mode)
@@ -147,7 +162,7 @@ def derive_edition_kind(
         if mode_kind is not None:
             return EditionKindDerivation(
                 kind=mode_kind,
-                source=EditionKindSource.ltd_mode,
+                source=KindDerivationSource.ltd_mode,
                 detail=ltd_mode.value,
             )
 
@@ -156,11 +171,11 @@ def derive_edition_kind(
     derivation = derive_edition_kind_from_ref(ref, rules)
     if derivation.matched_rule_type is None:
         return EditionKindDerivation(
-            kind=derivation.edition_kind, source=EditionKindSource.fallback
+            kind=derivation.edition_kind, source=KindDerivationSource.fallback
         )
     return EditionKindDerivation(
         kind=derivation.edition_kind,
-        source=EditionKindSource.rule,
+        source=KindDerivationSource.rule,
         detail=derivation.matched_rule_type,
     )
 

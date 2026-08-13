@@ -31,6 +31,8 @@ from docverse.models import (
     BuildCreate,
     BuildStatus,
     EditionAutocreationConfig,
+    EditionKind,
+    EditionKindSource,
     ProjectCreate,
     ProjectGitHubBindingCreate,
     TrackingMode,
@@ -44,7 +46,6 @@ from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
     resolve_edition_autocreation,
 )
-from docverse_server.domain.edition_kind import is_kind_promotion
 from docverse_server.domain.lifecycle import (
     DraftInactivityRule,
     RefDeletedRule,
@@ -341,6 +342,40 @@ class _EditionStateKey:
     ltd_id: int
     ltd_slug: str
     annotations: dict[str, Any]
+
+
+#: Kinds a *different* derivation owns, which the per-LTD-edition
+#: derivation must therefore never overwrite. ``derive_edition_kind``
+#: only ever answers ``main``/``release``/``draft``; the semver aggregate
+#: specs own ``major`` / ``minor`` and ``derive_edition_slug``'s
+#: alternate branch owns ``alternate``. An LTD edition slugged like an
+#: aggregate (``15``) can land on such a row through ``get_by_slug``, and
+#: converging it would flatten the rollup — or, for ``main``, attempt a
+#: write ``ck_editions_main_slug_kind`` rejects outright.
+_FOREIGN_DERIVED_KINDS = frozenset(
+    {
+        EditionKind.main,
+        EditionKind.major,
+        EditionKind.minor,
+        EditionKind.alternate,
+    }
+)
+
+
+def _kind_needs_convergence(edition: Edition, derived: EditionKind) -> bool:
+    """Report whether the heal should rewrite *edition*'s ``kind``.
+
+    ``declared`` rows carry an operator's decision and are never
+    rewritten; a ``derived`` row is rewritten whenever this derivation
+    disagrees with it, in either direction — unless the row's current
+    kind belongs to another derivation entirely
+    (:data:`_FOREIGN_DERIVED_KINDS`).
+    """
+    return (
+        edition.kind_source is EditionKindSource.derived
+        and edition.kind not in _FOREIGN_DERIVED_KINDS
+        and edition.kind is not derived
+    )
 
 
 def _aggregates_backfilled_build_id(
@@ -1158,6 +1193,14 @@ class KeeperSyncService:
                 date_rebuilt_seen=ltd_edition.date_rebuilt,
                 annotations=annotations,
             )
+        # Outside the transaction above: the kind convergence write takes
+        # the edition's advisory lock, and this service acquires those
+        # with no transaction open (see ``_edition_update_lock``).
+        edition = await self._refresh_kind(
+            org_id=org_id,
+            edition=edition,
+            kind_derivation=kind_derivation,
+        )
 
         build_outcome: BuildSyncOutcome | None = None
         aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
@@ -1474,13 +1517,16 @@ class KeeperSyncService:
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
     ) -> Edition:
-        """Look up or create an edition; refresh its tracking and kind.
+        """Look up or create an edition and realign its tracking columns.
 
         ``kind_derivation`` seeds a newly created edition's kind
-        outright. On an existing edition — whether matched by slug,
-        adopted by ``git_ref``, or handed back by a ``create_internal``
-        that lost its ``ON CONFLICT`` race — it is applied through
-        :meth:`_refresh_kind`, which only ever promotes.
+        outright. Existing rows — matched by slug, adopted by
+        ``git_ref``, or handed back by a ``create_internal`` that lost
+        its ``ON CONFLICT`` race — keep whatever kind they carry here;
+        the caller converges them through :meth:`_refresh_kind` once
+        this transaction has closed, because that write has to take the
+        edition's advisory lock and acquiring one while holding row
+        locks is the deadlock shape ``_edition_update_lock`` documents.
         """
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
@@ -1523,9 +1569,7 @@ class KeeperSyncService:
                         keeper_slug=docverse_slug,
                         edition_id=adopted.id,
                     )
-                    return await self._refresh_kind(
-                        edition=adopted, kind_derivation=kind_derivation
-                    )
+                    return adopted
             edition = await self._edition_store.create_internal(
                 project_id=project_id,
                 slug=docverse_slug,
@@ -1540,20 +1584,18 @@ class KeeperSyncService:
         # ``(project, lower(slug))`` between our SELECT and INSERT wins the
         # ``ON CONFLICT DO NOTHING``, and we get *its* row back — an
         # existing edition exactly like a ``get_by_slug`` hit, whose
-        # tracking columns and kind still need realigning with LTD. The
-        # store returns the winner verbatim with no "did I insert?" signal,
-        # so both refreshes run unconditionally; on a genuinely fresh row
-        # they are no-ops, since it already carries these tracking params
-        # and ``_refresh_kind`` is promote-only (its ``(kind, kind)`` pair
-        # is never a promotion).
+        # tracking columns still need realigning with LTD. The store
+        # returns the winner verbatim with no "did I insert?" signal, so
+        # the refresh runs unconditionally; on a genuinely fresh row it
+        # is a no-op, since that row already carries these params. The
+        # caller's ``_refresh_kind`` covers the winner's kind the same
+        # way, and is likewise a no-op on a fresh row.
         await self._refresh_tracking(
             edition=edition,
             tracking_mode=tracking_mode,
             tracking_params=tracking_params,
         )
-        return await self._refresh_kind(
-            edition=edition, kind_derivation=kind_derivation
-        )
+        return edition
 
     async def _refresh_tracking(
         self,
@@ -1572,38 +1614,59 @@ class KeeperSyncService:
     async def _refresh_kind(
         self,
         *,
+        org_id: int,
         edition: Edition,
         kind_derivation: EditionKindDerivation,
     ) -> Edition:
-        """Apply a freshly derived kind to an existing edition.
+        """Converge an existing edition's kind on a fresh derivation.
 
-        Promote-only per the shared
-        :func:`~docverse_server.domain.edition_kind.is_kind_promotion`
-        policy — the same gate the native ``track_build`` path applies —
-        so the only write this can make is ``draft`` -> ``release``, and
-        only on an edition whose kind no operator has pinned by hand.
-        Everything else is a no-op that returns ``edition`` unchanged.
+        The gate is provenance, not a transition allow-list: a row whose
+        ``kind_source`` is ``derived`` belongs to Docverse and is
+        rewritten to whatever LTD's mode and the rule chain say *now* —
+        demotions included, so a ``release`` that a wrong mode mapping
+        once produced heals back to ``draft`` on the next poll. A
+        ``declared`` row is an operator's decision and is never touched.
 
-        Returns the edition with the promoted kind applied so the caller
-        reports the row's post-sync state rather than the stale read.
+        The write runs under the edition's ``EDITION_UPDATE`` lock and
+        re-reads the row inside it, matching the aggregate path: a
+        ``publish_edition`` job that loaded the edition before an
+        unlocked kind change committed would pick the stale CDN cache
+        profile and skip the hostname purge, leaving the edge serving
+        ``max-age=60`` for a release.
+
+        Returns the edition with the converged kind applied so the
+        caller reports the row's post-sync state rather than the stale
+        read.
         """
-        if not is_kind_promotion(
-            edition.kind,
-            kind_derivation.kind,
-            kind_manually_set=edition.kind_manually_set,
-        ):
+        if not _kind_needs_convergence(edition, kind_derivation.kind):
             return edition
-        await self._edition_store.update_kind(
-            edition_id=edition.id, kind=kind_derivation.kind
-        )
+        async with (
+            self._edition_update_lock(
+                org_id=org_id,
+                project_id=edition.project_id,
+                edition_id=edition.id,
+            ),
+            self._session.begin(),
+        ):
+            current = await self._edition_store.get_by_id(edition.id)
+            if current is None:
+                # Soft-deleted between the pre-check and the lock.
+                return edition
+            if not _kind_needs_convergence(current, kind_derivation.kind):
+                return current
+            await self._edition_store.update_kind(
+                edition_id=current.id, kind=kind_derivation.kind
+            )
+            previous_kind = current.kind
         self._logger.info(
-            "Promoted keeper-sync edition kind",
+            "Converged edition kind",
             project_id=edition.project_id,
             edition_id=edition.id,
             edition_slug=edition.slug,
-            previous_kind=edition.kind.value,
+            previous_kind=previous_kind.value,
             edition_kind=kind_derivation.kind.value,
-            kind_source=kind_derivation.source.value,
+            kind_trigger="keeper_sync",
+            kind_derivation_source=kind_derivation.source.value,
             kind_detail=kind_derivation.detail,
         )
         return edition.model_copy(update={"kind": kind_derivation.kind})

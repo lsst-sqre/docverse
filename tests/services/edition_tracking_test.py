@@ -14,6 +14,7 @@ from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
+    EditionKindSource,
     EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
@@ -29,6 +30,11 @@ from docverse_server.services.edition_tracking import (
     EditionTrackingDeps,
     EditionTrackingService,
 )
+from docverse_server.services.lock_service import (
+    LockClass,
+    LockKey,
+    LockService,
+)
 from docverse_server.services.project import DEFAULT_EDITION_SLUG
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
@@ -37,6 +43,7 @@ from docverse_server.storage.edition_build_history_store import (
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.lock_service_spy import RecordingLockService
 
 _HASH = "sha256:" + "a" * 64
 
@@ -47,6 +54,8 @@ def _logger() -> structlog.stdlib.BoundLogger:
 
 def _make_service(
     db_session: AsyncSession,
+    *,
+    lock_service: LockService | None = None,
 ) -> EditionTrackingService:
     logger = _logger()
     deps = EditionTrackingDeps(
@@ -57,6 +66,7 @@ def _make_service(
         project_store=ProjectStore(session=db_session, logger=logger),
         org_store=OrganizationStore(session=db_session, logger=logger),
         logger=logger,
+        lock_service=lock_service,
     )
     return EditionTrackingService(deps)
 
@@ -1563,23 +1573,21 @@ async def test_track_build_promotes_pre_existing_draft_edition(
 
     Version-slugged editions created before the built-in version rules
     landed were all stamped ``draft``. The next tracked build for their
-    ref re-derives the kind and applies the shared promote-only gate,
-    so the native path heals exactly as keeper-sync's ``_refresh_kind``
-    does for migrated projects.
+    ref re-derives the kind and converges the row, so the native path
+    heals exactly as keeper-sync's ``_refresh_kind`` does for migrated
+    projects.
     """
     service = _make_service(db_session)
     async with db_session.begin():
         _org, project = await _setup(db_session, org_slug="heal-org")
         edition_store = EditionStore(session=db_session, logger=_logger())
-        stale = await edition_store.create(
+        stale = await edition_store.create_internal(
             project_id=project.id,
-            data=EditionCreate(
-                slug="1.0.0",
-                title="1.0.0",
-                kind=EditionKind.draft,
-                tracking_mode=TrackingMode.git_ref,
-                tracking_params={"git_ref": "1.0.0"},
-            ),
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
         )
         build = await _create_build(db_session, project.id, git_ref="1.0.0")
 
@@ -1593,36 +1601,121 @@ async def test_track_build_promotes_pre_existing_draft_edition(
         healed = await edition_store.get_by_id(stale.id)
         assert healed is not None
         assert healed.kind == EditionKind.release
+        assert healed.kind_source == EditionKindSource.derived
         assert healed.current_build_id == build.id
         await db_session.commit()
 
 
 @pytest.mark.asyncio
-async def test_track_build_respects_manual_demotion_to_draft(
+async def test_track_build_demotes_when_the_rules_change(
+    db_session: AsyncSession,
+) -> None:
+    """Convergence runs downhill too, which is how promotions are undone.
+
+    An org that decides its version tags are not releases says so with a
+    ``semver`` rule. The rows the built-in heuristic already promoted are
+    still Docverse's (``kind_source == derived``), so the next tracked
+    build writes the new derivation rather than leaving a permanently
+    mis-kinded release behind.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="demote-org",
+            org_slug_rewrite_rules=[
+                {"type": "semver", "edition_kind": "draft"}
+            ],
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        promoted = await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        converged = await edition_store.get_by_id(promoted.id)
+        assert converged is not None
+        assert converged.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_does_not_promote_an_existing_draft_alternate(
+    db_session: AsyncSession,
+) -> None:
+    """An alternate on a version tag heals to ``alternate``, not ``release``.
+
+    Nothing in the server ever wrote ``EditionKind.alternate``, so every
+    system-created alternate sits at ``draft``. Inheriting the rule
+    chain's kind would have made the heal retroactively promote each one
+    to ``release`` the first time a version-tagged build landed on it —
+    a long CDN cache profile, the wrong dashboard bucket, and permanent
+    exemption from lifecycle reaping for a preview deployment.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alt-heal-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug="usdf-dev--1.2.3",
+            title="usdf-dev--1.2.3",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.alternate_git_ref,
+            tracking_params={
+                "git_ref": "1.2.3",
+                "alternate_name": "usdf-dev",
+            },
+            alternate_name="usdf-dev",
+        )
+        build = await _create_build(
+            db_session,
+            project.id,
+            git_ref="1.2.3",
+            alternate_name="usdf-dev",
+        )
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        healed = await edition_store.get_by_id(stale.id)
+        assert healed is not None
+        assert healed.kind == EditionKind.alternate
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_respects_a_declared_demotion_to_draft(
     db_session: AsyncSession,
 ) -> None:
     """A hand-PATCHed demotion is not undone by the next upload.
 
-    The native heal shares keeper-sync's promote-only gate, so it shares
-    the blind spot the gate alone leaves: an edition demoted from
-    ``release`` to ``draft`` sits on the one permitted transition. Its
-    ``kind_manually_set`` flag — stamped here by the real editions-API
-    write path, ``EditionStore.update`` — is what holds the operator's
-    decision through every subsequent build.
+    The PATCH here goes through ``EditionStore.update``, the real
+    editions-API write path, so ``kind_source`` is stamped ``declared``
+    the way production stamps it — and convergence never touches a
+    declared row.
     """
     service = _make_service(db_session)
     async with db_session.begin():
         _org, project = await _setup(db_session, org_slug="manual-draft-org")
         edition_store = EditionStore(session=db_session, logger=_logger())
-        pinned = await edition_store.create(
+        pinned = await edition_store.create_internal(
             project_id=project.id,
-            data=EditionCreate(
-                slug="1.0.0",
-                title="1.0.0",
-                kind=EditionKind.release,
-                tracking_mode=TrackingMode.git_ref,
-                tracking_params={"git_ref": "1.0.0"},
-            ),
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
         )
         demoted = await edition_store.update(
             project_id=project.id,
@@ -1641,6 +1734,7 @@ async def test_track_build_respects_manual_demotion_to_draft(
         held = await edition_store.get_by_id(pinned.id)
         assert held is not None
         assert held.kind == EditionKind.draft
+        assert held.kind_source == EditionKindSource.declared
         assert held.current_build_id == build.id
         await db_session.commit()
 
@@ -1651,24 +1745,22 @@ async def test_track_build_leaves_correct_kind_untouched(
 ) -> None:
     """An edition already carrying the derived kind is not rewritten.
 
-    ``(release, release)`` is not a promotion, so the healing sweep
-    issues no ``kind`` write at all — the common steady-state path for
-    every already-correct edition.
+    The steady-state path for every already-correct edition: the derived
+    kind equals the stored kind, so no ``kind`` write is issued and no
+    convergence event is logged.
     """
     service = _make_service(db_session)
     with structlog.testing.capture_logs() as logs:
         async with db_session.begin():
             _org, project = await _setup(db_session, org_slug="noop-kind-org")
             edition_store = EditionStore(session=db_session, logger=_logger())
-            existing = await edition_store.create(
+            await edition_store.create_internal(
                 project_id=project.id,
-                data=EditionCreate(
-                    slug="1.0.0",
-                    title="1.0.0",
-                    kind=EditionKind.release,
-                    tracking_mode=TrackingMode.git_ref,
-                    tracking_params={"git_ref": "1.0.0"},
-                ),
+                slug="1.0.0",
+                title="1.0.0",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
             )
             build = await _create_build(
                 db_session, project.id, git_ref="1.0.0"
@@ -1676,25 +1768,117 @@ async def test_track_build_leaves_correct_kind_untouched(
             await service.track_build(build)
             await db_session.commit()
 
-    assert not [e for e in logs if e["event"] == "Promoted edition kind"]
-
-    async with db_session.begin():
-        edition_store = EditionStore(session=db_session, logger=_logger())
-        unchanged = await edition_store.get_by_id(existing.id)
-        assert unchanged is not None
-        assert unchanged.kind == EditionKind.release
-        await db_session.commit()
+    assert not [e for e in logs if e["event"] == "Converged edition kind"]
 
 
 @pytest.mark.asyncio
-async def test_track_build_never_demotes_or_touches_other_kinds(
+async def test_track_build_logs_every_kind_change(
     db_session: AsyncSession,
 ) -> None:
-    """Only ``draft`` is a promotion source; nothing else is rewritten.
+    """Each converged row leaves an audit trail of old kind -> new kind."""
+    service = _make_service(db_session)
+    with structlog.testing.capture_logs() as logs:
+        async with db_session.begin():
+            _org, project = await _setup(db_session, org_slug="heal-log-org")
+            edition_store = EditionStore(session=db_session, logger=_logger())
+            stale = await edition_store.create_internal(
+                project_id=project.id,
+                slug="1.0.0",
+                title="1.0.0",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            )
+            build = await _create_build(
+                db_session, project.id, git_ref="1.0.0"
+            )
+            await service.track_build(build)
+            await db_session.commit()
+
+    events = [e for e in logs if e["event"] == "Converged edition kind"]
+    assert len(events) == 1
+    assert events[0]["edition_id"] == stale.id
+    assert events[0]["previous_kind"] == "draft"
+    assert events[0]["edition_kind"] == "release"
+    assert events[0]["kind_trigger"] == "build_upload"
+
+
+@pytest.mark.asyncio
+async def test_track_build_holds_the_edition_lock_for_the_kind_write(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kind convergence write serializes against ``publish_edition``.
+
+    ``publish_edition`` reads ``edition.kind`` to pick the CDN cache
+    profile. A job that loaded the edition before an unlocked promotion
+    committed would write the KV pointer with the stale ``short``
+    profile and skip the hostname purge, leaving the edge serving
+    ``max-age=60`` for a release. The write therefore takes the same
+    ``EDITION_UPDATE`` key the pointer write does, and the trace below
+    pins that the write happens *between* the acquire and the release.
+    """
+    trace: list[str] = []
+    lock_service = RecordingLockService(
+        session=db_session, logger=_logger(), events=[], trace=trace
+    )
+    service = _make_service(db_session, lock_service=lock_service)
+
+    original_update_kind = EditionStore.update_kind
+
+    async def _traced_update_kind(
+        self: EditionStore, *, edition_id: int, kind: EditionKind
+    ) -> None:
+        trace.append(f"update_kind:{edition_id}")
+        await original_update_kind(self, edition_id=edition_id, kind=kind)
+
+    monkeypatch.setattr(EditionStore, "update_kind", _traced_update_kind)
+
+    async with db_session.begin():
+        org, project = await _setup(db_session, org_slug="heal-lock-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    expected_key = LockKey.for_edition_update(
+        org_id=org.id, project_id=project.id, edition_id=stale.id
+    )
+    assert expected_key.lock_class == LockClass.EDITION_UPDATE
+    write = trace.index(f"update_kind:{stale.id}")
+    held = [
+        i
+        for i, entry in enumerate(trace)
+        if entry == f"enter:{expected_key.lock_id}" and i < write
+    ]
+    released = [
+        i
+        for i, entry in enumerate(trace)
+        if entry == f"exit:{expected_key.lock_id}" and i > write
+    ]
+    assert held, "kind write ran with no EDITION_UPDATE lock held"
+    assert released, "EDITION_UPDATE lock released before the kind write"
+
+
+@pytest.mark.asyncio
+async def test_track_build_never_demotes_declared_or_structural_kinds(
+    db_session: AsyncSession,
+) -> None:
+    """Declared and structural kinds both survive a ``draft`` derivation.
 
     A build on a non-version ref derives ``draft``, yet neither the
-    hand-PATCHed ``release`` edition tracking that ref nor the project's
-    ``__main`` edition may be demoted to it.
+    operator-declared ``release`` edition tracking that ref nor the
+    project's ``__main`` edition may be demoted to it — the first
+    because it is ``declared``, the second because no ref derivation
+    governs the default edition's kind at all.
     """
     service = _make_service(db_session)
     async with db_session.begin():
@@ -1742,11 +1926,11 @@ async def test_track_build_leaves_aggregate_kinds_untouched(
 ) -> None:
     """Matched ``major`` / ``minor`` aggregates keep their kinds.
 
-    The healing sweep runs over every matched edition, and a stable
+    The convergence sweep runs over every matched edition, and a stable
     semver build matches its ``N`` / ``N.M`` rollups alongside the
-    concrete release. Those carry aggregate kinds, which are never a
-    promotion source, so the ``release`` derivation must not overwrite
-    them.
+    concrete release. Those rollups track ``semver_major`` /
+    ``semver_minor``, not the ``git_ref`` mode this derivation emits, so
+    the ``release`` derivation does not govern them.
     """
     service = _make_service(db_session)
     async with db_session.begin():
