@@ -161,19 +161,14 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 )
                 return "failed"
 
-            # Purge the CDN edge cache only now that the publish
-            # transaction has committed, and deliberately outside every
-            # ``session.begin()`` block. The purge queues on the
-            # process-wide per-hostname coalescer and can then sit in
-            # the purger's rate-limit backoff for tens of seconds; under
-            # a same-hostname publish burst (a keeper-sync backfill)
-            # every waiter would otherwise pin an idle-in-transaction
-            # connection for minutes and exhaust the engine pool,
-            # failing unrelated worker jobs. The purge is best-effort
-            # and cannot undo the committed publish.
-            if pending_purge is not None:
-                await publishing_service.purge_cdn_cache(pending_purge)
-
+            # Record the terminal success *before* the purge. The purge
+            # is the one step long enough to be cancelled by the arq
+            # per-job timeout, and ``CancelledError`` is a
+            # ``BaseException`` that escapes ``purge_cdn_cache``'s
+            # best-effort ``except Exception``. Completing first means a
+            # cancellation there costs only the (best-effort) purge
+            # instead of stranding a committed publish ``in_progress``
+            # until ``publish_edition_reaper`` fails it hours later.
             completion = None
             async with session.begin():
                 await queue_job_store.complete(queue_job_id)
@@ -212,7 +207,23 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 org_id=payload["org_id"],
                 project_id=resources.edition.project_id,
             )
-            return "completed"
+
+        # EDITION_UPDATE released. Purge the CDN edge cache only now:
+        # after the publish transaction committed, outside every
+        # ``session.begin()`` block, *and* outside the advisory lock.
+        # The purge queues on the process-wide per-hostname coalescer
+        # and can then sit in the purger's rate-limit backoff for tens
+        # of seconds. ``LockService.acquire`` pins a dedicated
+        # ``engine.connect()`` for its whole block, so purging inside it
+        # would hold a pool connection the purge does not touch — and,
+        # because keeper-sync takes the same ``for_edition_update`` key
+        # in ``sync_build`` and ``_ensure_aggregate_edition``, would
+        # also park the sync worker's next import of this edition behind
+        # a Cloudflare 429. The purge is best-effort and cannot undo the
+        # committed publish.
+        if pending_purge is not None:
+            await publishing_service.purge_cdn_cache(pending_purge)
+        return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)

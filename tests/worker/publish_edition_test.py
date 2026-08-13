@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -128,6 +129,12 @@ class _PurgeObservation:
     publish_status: PublishStatus | None
     """The edition's ``publish_status`` as visible to another session."""
 
+    job_status: JobStatus | None
+    """The publish ``queue_jobs`` status as visible to another session."""
+
+    timestamp: float
+    """``time.monotonic()`` when the purge was reached."""
+
 
 class _ProbingCdnCachePurger:
     """A ``CdnCachePurger`` that snapshots database state when it purges.
@@ -144,10 +151,12 @@ class _ProbingCdnCachePurger:
         *,
         session: AsyncSession,
         edition_id: int,
+        queue_job_id: int,
         observations: list[_PurgeObservation],
     ) -> None:
         self._session = session
         self._edition_id = edition_id
+        self._queue_job_id = queue_job_id
         self._observations = observations
 
     async def __aenter__(self) -> Self:
@@ -165,6 +174,7 @@ class _ProbingCdnCachePurger:
         _ = hostname
         in_transaction = self._session.in_transaction()
         publish_status: PublishStatus | None = None
+        job_status: JobStatus | None = None
         # A second session sees only committed rows, so reading the
         # edition here proves the publish transaction already landed.
         async for probe_session in db_session_dependency():
@@ -174,10 +184,15 @@ class _ProbingCdnCachePurger:
                 publish_status = (
                     edition.publish_status if edition is not None else None
                 )
+                jobs = QueueJobStore(session=probe_session, logger=_logger())
+                job = await jobs.get(self._queue_job_id)
+                job_status = job.status if job is not None else None
         self._observations.append(
             _PurgeObservation(
                 in_transaction=in_transaction,
                 publish_status=publish_status,
+                job_status=job_status,
+                timestamp=time.monotonic(),
             )
         )
 
@@ -189,6 +204,7 @@ def _logger() -> structlog.stdlib.BoundLogger:
 def _mock_create_cdn_cache_purger(
     *,
     edition_id: int,
+    queue_job_id: int,
     observations: list[_PurgeObservation],
 ) -> Any:
     """Return a patched ``create_cdn_cache_purger_for_org``."""
@@ -209,6 +225,7 @@ def _mock_create_cdn_cache_purger(
         return _ProbingCdnCachePurger(
             session=self._session,
             edition_id=edition_id,
+            queue_job_id=queue_job_id,
             observations=observations,
         )
 
@@ -1086,7 +1103,9 @@ async def _run_publish_with_purge_probe(
         Factory,
         "create_cdn_cache_purger_for_org",
         _mock_create_cdn_cache_purger(
-            edition_id=edition.id, observations=observations
+            edition_id=edition.id,
+            queue_job_id=queue_job.id,
+            observations=observations,
         ),
     )
 
@@ -1149,3 +1168,165 @@ async def test_publish_edition_commits_publish_state_before_purging(
     assert [o.publish_status for o in observations] == [
         PublishStatus.published
     ]
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_purges_after_releasing_edition_lock(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The EDITION_UPDATE advisory lock is released before the purge runs.
+
+    ``LockService.acquire`` pins a dedicated ``engine.connect()`` for the
+    whole block, and keeper-sync takes the *same* key in ``sync_build``
+    and ``_ensure_aggregate_edition``. A publish parked in the purger's
+    rate-limit backoff (up to four attempts x a 10 s clamped
+    ``Retry-After``) therefore used to block the sync worker's next
+    import of that edition while holding a pool connection it does not
+    need — the purge touches no database at all.
+    """
+    events = install_recording_lock_service(monkeypatch)
+
+    observations = await _run_publish_with_purge_probe(
+        db_session,
+        monkeypatch,
+        org_slug="pub-purge-lock-org",
+        backend_job_id="test-publish-arq-purge-lock",
+    )
+
+    edition_lock_exits = [
+        e
+        for e in events
+        if e.event == "exit"
+        and e.lock_key.lock_class == LockClass.EDITION_UPDATE
+    ]
+    assert len(edition_lock_exits) == 1
+    assert observations[0].timestamp > edition_lock_exits[0].timestamp
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_completes_queue_job_before_purging(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The queue job is already terminal when the purge is attempted.
+
+    The purge is the one step that can sleep for tens of seconds, so it
+    is also the step arq's per-job timeout is most likely to cancel.
+    Committing the completion first means the cancellation can only cost
+    the (best-effort) purge, never strand a committed publish as
+    ``in_progress`` until the reaper fails it hours later.
+    """
+    observations = await _run_publish_with_purge_probe(
+        db_session,
+        monkeypatch,
+        org_slug="pub-purge-job-org",
+        backend_job_id="test-publish-arq-purge-job",
+    )
+
+    assert [o.job_status for o in observations] == [JobStatus.completed]
+
+
+class _CancellingCdnCachePurger:
+    """A ``CdnCachePurger`` whose purge is cancelled mid-flight.
+
+    Stands in for arq's per-job timeout firing while the purger sleeps
+    out a Cloudflare 429 backoff. ``CancelledError`` is a
+    ``BaseException``, so it escapes ``purge_cdn_cache``'s best-effort
+    ``except Exception``.
+    """
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def purge_hostname(self, hostname: str) -> None:
+        _ = hostname
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_survives_cancellation_during_purge(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A publish cancelled during its purge still reports terminal state.
+
+    Regression for the ``publish_edition`` timeout budget: a job that
+    committed its publish and was then cancelled inside the purge must
+    leave the ``queue_jobs`` row terminal, not ``in_progress`` for the
+    reaper to fail up to four hours later.
+    """
+    logger = _logger()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-purge-cancel-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-purge-cancel",
+        )
+
+    async def _create_purger(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> Any:
+        _ = (self, org_id, service_label)
+        return _CancellingCdnCachePurger()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(MockEditionPublisher()),
+    )
+    monkeypatch.setattr(
+        Factory, "create_cdn_cache_purger_for_org", _create_purger
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-purge-cancel",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.date_completed is not None
+
+            ed_store = EditionStore(session=session, logger=logger)
+            refreshed_ed = await ed_store.get_by_id(edition.id)
+            assert refreshed_ed is not None
+            assert refreshed_ed.publish_status == PublishStatus.published

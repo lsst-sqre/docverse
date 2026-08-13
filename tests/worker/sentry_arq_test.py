@@ -244,8 +244,13 @@ async def test_startup_maintenance_uses_worker_maintenance_component(
     captured: dict[str, Any] = {}
 
     async def fake_startup(
-        ctx: dict[str, Any], *, component: str, queue_name: str
+        ctx: dict[str, Any],
+        *,
+        component: str,
+        queue_name: str,
+        max_jobs: int,
     ) -> None:
+        _ = max_jobs
         captured["component"] = component
         captured["queue_name"] = queue_name
 

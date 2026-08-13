@@ -241,6 +241,30 @@ class Configuration(BaseSettings):
         ),
     )
 
+    publish_edition_job_timeout_seconds: int = Field(
+        1800,
+        title="Publish_edition per-job timeout, in seconds",
+        description=(
+            "Wraps ``publish_edition`` on ``WorkerSettings``: arq"
+            " cancels a job that runs past this. The job is the default"
+            " pool's one deliberate sleeper — it waits on the"
+            " ``EDITION_UPDATE`` advisory lock (which keeper-sync's"
+            " ``sync_build`` also takes), then on the per-hostname CDN"
+            " purge coalescer's throttle interval, then on the purger's"
+            " own rate-limit backoff (up to three waits clamped to"
+            " ``MAX_BACKOFF_SECONDS`` when Cloudflare answers 429)."
+            " arq's implicit 300 s default was not derived from any of"
+            " those, so the 30-minute default clears them with room for"
+            " a contended lock while still sitting far below"
+            " ``publish_edition_reaper_threshold_seconds`` — the"
+            " cron backstop must never fire on a job arq is still"
+            " running. Cancellation is safe by construction: the job"
+            " commits its ``queue_jobs`` completion *before* the purge,"
+            " so a timeout during the purge costs only the best-effort"
+            " purge, never the record of a committed publish."
+        ),
+    )
+
     keeper_sync_job_timeout_seconds: int = Field(
         3600,
         title="Keeper-sync per-job timeout, in seconds",

@@ -170,6 +170,27 @@ def test_sync_worker_buffered_body_budget_is_the_documented_product() -> None:
     ) == 80
 
 
+def test_publish_edition_job_timeout_default() -> None:
+    """The publish budget is 30 min — well above arq's 300 s default.
+
+    ``publish_edition`` waits on the ``EDITION_UPDATE`` advisory lock,
+    then on the per-hostname purge coalescer, then on the purger's
+    rate-limit backoff, so arq's implicit default was far too tight to
+    be a meaningful ceiling on any of them.
+    """
+    config = Configuration()
+    assert config.publish_edition_job_timeout_seconds == 1800
+
+
+def test_publish_edition_job_timeout_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The publish budget is env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_PUBLISH_EDITION_JOB_TIMEOUT_SECONDS", "45")
+    config = Configuration()
+    assert config.publish_edition_job_timeout_seconds == 45
+
+
 def test_other_reaper_thresholds_unchanged() -> None:
     """Only keeper-sync derives; the other five reapers keep literals."""
     config = Configuration()
