@@ -1087,6 +1087,76 @@ class QueueJobStore:
             ),
         )
 
+    async def fail_abandoned_lifecycle_eval_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail ``lifecycle_eval`` rows that reached arq and were then lost.
+
+        Abandoned-sweep sibling of
+        :meth:`fail_orphaned_lifecycle_eval_jobs`, scoped identically
+        (``kind='lifecycle_eval'``) but for rows that *did* reach arq.
+        The orphan sweep only sees rows whose ``backend_job_id`` is still
+        ``NULL``, so a row whose arq job later vanished stays ``queued``
+        forever — and because
+        ``idx_queue_jobs_lifecycle_eval_active_uq`` counts a ``queued``
+        row as active work, every subsequent dispatcher tick for that org
+        is blocked. Reaping the row releases the mutex so the next tick
+        enqueues fresh work.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`_fail_abandoned_candidates` for the shared
+        core and its backend-unreachable behaviour. Reaped rows keep
+        their ``lifecycle_eval_run_id``, so the reaper feeds them into
+        the same ``maybe_finalise_lifecycle_run`` pass as the silent and
+        orphan sweeps.
+        """
+        return await self._fail_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.lifecycle_eval.value,
+            idle_after=idle_after,
+            queue_backend=queue_backend,
+            message=(
+                "Abandoned lifecycle_eval: queue_jobs row still queued past "
+                "the lifecycle_reaper threshold and arq has no record of its "
+                "backend_job_id (reaped by the abandoned sweep)"
+            ),
+        )
+
+    async def fail_abandoned_git_ref_audit_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail ``git_ref_audit`` rows that reached arq and were then lost.
+
+        Abandoned-sweep sibling of
+        :meth:`fail_orphaned_git_ref_audit_jobs`, scoped identically
+        (``kind='git_ref_audit'``) but for rows that *did* reach arq.
+        Same wedge as the lifecycle_eval variant one mutex over:
+        ``idx_queue_jobs_git_ref_audit_active_uq`` treats the stranded
+        ``queued`` row as an in-flight audit, so the next day's discovery
+        tick skips that org indefinitely.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`_fail_abandoned_candidates` for the shared
+        core and its backend-unreachable behaviour. Reaped rows keep
+        their ``git_ref_audit_run_id`` so the reaper can roll the parent
+        run up in the same tick.
+        """
+        return await self._fail_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.git_ref_audit.value,
+            idle_after=idle_after,
+            queue_backend=queue_backend,
+            message=(
+                "Abandoned git_ref_audit: queue_jobs row still queued past "
+                "the lifecycle_reaper threshold and arq has no record of its "
+                "backend_job_id (reaped by the abandoned sweep)"
+            ),
+        )
+
     async def _fail_abandoned_candidates(
         self,
         *scope: ColumnExpressionArgument[bool],

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,6 +33,7 @@ from docverse_server.exceptions import InvalidJobStateError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import (
     _ACTIVE_JOB_UNIQUE_INDEXES,
     QueueJobStore,
@@ -1354,32 +1355,34 @@ async def test_fail_orphaned_run_children_scoped_to_run(
 
 
 # ---------------------------------------------------------------------
-# lifecycle_eval reaper helpers
+# lifecycle reaper helpers
 # ---------------------------------------------------------------------
 
 
-async def _seed_lifecycle_eval_row(
+async def _seed_lifecycle_family_row(
     db_session: AsyncSession,
     *,
+    kind: JobKind,
     org_id: int,
     status: JobStatus,
     backend_job_id: str | None,
     date_started: datetime | None = None,
     date_created_offset: timedelta | None = None,
 ) -> int:
-    """Insert one ``kind='lifecycle_eval'`` row with explicit timestamps.
+    """Insert one ``lifecycle_reaper``-owned row with explicit timestamps.
 
-    The store's ``create`` does not expose ``lifecycle_eval_run_id`` (the
-    dispatcher sibling task adds that), and ``status`` defaults to
-    ``queued``. The reaper-helper tests drive every field that the
-    sweep predicates consult, so direct ``SqlQueueJob`` construction is
-    cleaner than threading two-step setup through ``create`` +
-    ``start``.
+    ``kind`` selects the family — ``lifecycle_eval`` or
+    ``git_ref_audit``, the two the reaper sweeps. The store's ``create``
+    does not expose ``lifecycle_eval_run_id`` (the dispatcher sibling
+    task adds that), and ``status`` defaults to ``queued``. The
+    reaper-helper tests drive every field that the sweep predicates
+    consult, so direct ``SqlQueueJob`` construction is cleaner than
+    threading two-step setup through ``create`` + ``start``.
     """
     row = SqlQueueJob(
         public_id=validate_base32_id(generate_base32_id()),
         backend_job_id=backend_job_id,
-        kind=JobKind.lifecycle_eval.value,
+        kind=kind.value,
         status=status.value,
         org_id=org_id,
         date_started=date_started,
@@ -1400,8 +1403,9 @@ async def test_fail_silent_lifecycle_eval_jobs_reaps_old_in_progress(
     """An ``in_progress`` lifecycle_eval row past the threshold is failed."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-reap-1")
-        stuck_id = await _seed_lifecycle_eval_row(
+        stuck_id = await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.in_progress,
             backend_job_id="arq-lce-stuck",
@@ -1428,8 +1432,9 @@ async def test_fail_silent_lifecycle_eval_jobs_skips_recent(
     """An ``in_progress`` row within the idle window is left alone."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-reap-2")
-        await _seed_lifecycle_eval_row(
+        await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.in_progress,
             backend_job_id="arq-lce-fresh",
@@ -1479,8 +1484,9 @@ async def test_fail_orphaned_lifecycle_eval_jobs_reaps_old_orphan(
     """A ``queued`` lifecycle_eval row with no ``backend_job_id`` is failed."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-orphan-1")
-        orphan_id = await _seed_lifecycle_eval_row(
+        orphan_id = await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.queued,
             backend_job_id=None,
@@ -1507,8 +1513,9 @@ async def test_fail_orphaned_lifecycle_eval_jobs_skips_rows_with_backend_id(
     """A queued row that already has a backend_job_id is not an orphan."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-orphan-2")
-        await _seed_lifecycle_eval_row(
+        await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.queued,
             backend_job_id="arq-lce-enqueued",
@@ -1531,8 +1538,9 @@ async def test_fail_orphaned_lifecycle_eval_jobs_skips_started_rows(
     """An ``in_progress`` row is not an orphan; silent sweep owns it."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-orphan-3")
-        await _seed_lifecycle_eval_row(
+        await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.in_progress,
             backend_job_id=None,
@@ -2731,6 +2739,358 @@ async def test_fail_abandoned_run_children_without_run_id_sweeps_all_runs(
         await db_session.commit()
 
     assert {job.keeper_sync_run_id for job in failed} == {run_a_id, run_b_id}
+
+
+# ---------------------------------------------------------------------
+# lifecycle_eval / git_ref_audit abandoned sweeps (PRD #538, task #541)
+# ---------------------------------------------------------------------
+#
+# The two families ``lifecycle_reaper`` owns are structurally identical
+# — each is scoped by ``kind`` alone and each guards a per-org active
+# mutex (``idx_queue_jobs_lifecycle_eval_active_uq`` /
+# ``idx_queue_jobs_git_ref_audit_active_uq``) that a wedged ``queued``
+# row holds forever — so the predicate tests are parametrized over a
+# two-row spec table rather than written twice.
+
+
+_LifecycleSweep = Callable[
+    [QueueJobStore, timedelta, QueueBackend], Awaitable[list[QueueJob]]
+]
+
+
+async def _sweep_abandoned_lifecycle_eval(
+    store: QueueJobStore,
+    idle_after: timedelta,
+    queue_backend: QueueBackend,
+) -> list[QueueJob]:
+    return await store.fail_abandoned_lifecycle_eval_jobs(
+        idle_after=idle_after, queue_backend=queue_backend
+    )
+
+
+async def _sweep_abandoned_git_ref_audit(
+    store: QueueJobStore,
+    idle_after: timedelta,
+    queue_backend: QueueBackend,
+) -> list[QueueJob]:
+    return await store.fail_abandoned_git_ref_audit_jobs(
+        idle_after=idle_after, queue_backend=queue_backend
+    )
+
+
+@dataclass(frozen=True)
+class LifecycleAbandonedSpec:
+    """One row per family the ``lifecycle_reaper`` abandoned sweeps own."""
+
+    kind: JobKind
+    other_kind: JobKind
+    slug_prefix: str
+    sweep: _LifecycleSweep
+
+    @property
+    def label(self) -> str:
+        return self.kind.value
+
+
+LIFECYCLE_ABANDONED_SPECS = [
+    LifecycleAbandonedSpec(
+        kind=JobKind.lifecycle_eval,
+        other_kind=JobKind.git_ref_audit,
+        slug_prefix="lce-ab",
+        sweep=_sweep_abandoned_lifecycle_eval,
+    ),
+    LifecycleAbandonedSpec(
+        kind=JobKind.git_ref_audit,
+        other_kind=JobKind.lifecycle_eval,
+        slug_prefix="gra-ab",
+        sweep=_sweep_abandoned_git_ref_audit,
+    ),
+]
+
+
+_lifecycle_abandoned_param = pytest.mark.parametrize(
+    "spec",
+    LIFECYCLE_ABANDONED_SPECS,
+    ids=lambda s: s.label,
+)
+
+
+#: Stands in for ``config.lifecycle_reaper_threshold_seconds`` (6 h in
+#: production), which both families use as their abandoned-sweep age
+#: gate.
+_LIFECYCLE_THRESHOLD = timedelta(hours=6)
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_reaped_when_arq_lost(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """A ``queued`` row past the threshold that arq lost is failed."""
+    backend_job_id = f"arq-{spec.slug_prefix}-lost"
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-1")
+        abandoned_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert len(failed) == 1
+    assert failed[0].id == abandoned_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_spared_when_arq_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """A job arq still knows about survives regardless of age.
+
+    Both families run on pools that can back up (the lifecycle
+    dispatcher fans out one job per org), so age alone would cancel
+    healthy work. The backend check is what separates "lost" from
+    "waiting its turn".
+    """
+    backend_job_id = f"arq-{spec.slug_prefix}-alive"
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-2")
+        healthy_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=timedelta(days=30),
+        )
+
+        backend = _StubQueueBackend(known_ids={backend_job_id})
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_inside_threshold_untouched(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Threshold boundary: a row younger than the gate is not a candidate.
+
+    A just-dispatched row legitimately has no settled arq record yet, so
+    it must not even be queried against the backend.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-3")
+        await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-fresh",
+            date_created_offset=_LIFECYCLE_THRESHOLD - timedelta(minutes=1),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_scoped_to_its_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Kind scoping: the sibling family's rows belong to its own sweep.
+
+    ``lifecycle_reaper`` runs both sweeps in one transaction, so a
+    predicate that leaked across kinds would double-count reaped rows
+    and misattribute them in the log context.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-4")
+        await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.other_kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-sibling",
+            date_created_offset=timedelta(hours=7),
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-runless",
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_leaves_silent_and_orphan_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Sweep non-interference within the family.
+
+    An ``in_progress`` row belongs to the silent sweep and a ``queued``
+    row with no ``backend_job_id`` to the orphan sweep; claiming either
+    here would make the three loss modes indistinguishable in a
+    postmortem.
+    """
+    async with db_session.begin():
+        org_a_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-5a"
+        )
+        org_b_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-5b"
+        )
+        silent_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_a_id,
+            status=JobStatus.in_progress,
+            backend_job_id=f"arq-{spec.slug_prefix}-silent",
+            date_started=datetime.now(tz=UTC) - timedelta(hours=7),
+            date_created_offset=timedelta(hours=7),
+        )
+        orphan_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_b_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+    async with db_session.begin():
+        silent = await store.get(silent_id)
+        orphan = await store.get(orphan_id)
+        assert silent is not None
+        assert silent.status == JobStatus.in_progress
+        assert orphan is not None
+        assert orphan.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_aborts_when_backend_unreachable(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """An unreachable backend leaves every candidate alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-6")
+        candidate_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-unreachable",
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend(error=ConnectionError("redis is down"))
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert failed == []
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_frees_per_org_mutex(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Reaping releases the family's per-org active-job mutex.
+
+    Both mutexes count a ``queued`` row as live work, so until the sweep
+    fails the wedged row the next dispatcher / discovery tick cannot
+    enqueue for that org at all.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-7")
+        wedged_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-wedged",
+            date_created_offset=timedelta(hours=7),
+        )
+
+        blocked = await store.create_unless_active(
+            kind=spec.kind, org_id=org_id
+        )
+        assert blocked is None
+
+        failed = await spec.sweep(
+            store, _LIFECYCLE_THRESHOLD, _StubQueueBackend()
+        )
+        assert len(failed) == 1
+
+        fresh = await store.create_unless_active(kind=spec.kind, org_id=org_id)
+        await db_session.commit()
+
+    assert fresh is not None
+    assert fresh.id != wedged_id
+    assert fresh.status == JobStatus.queued
 
 
 @pytest.mark.asyncio

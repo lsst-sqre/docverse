@@ -6,7 +6,11 @@ PRDs (SQR-112 §"Reaper" plus PRD #346 §"git_ref_audit worker
 function"), one wedged per-org child must not block subsequent
 dispatcher ticks for that org indefinitely in either subsystem. The
 reaper sweeps stuck ``queue_jobs`` rows for both kinds in a single
-transaction and triggers the matching finaliser
+transaction — three passes per kind covering the three ways a row
+goes stuck: silent (``in_progress`` but the worker died), orphan
+(``queued`` and never reached arq), and abandoned (``queued``,
+reached arq, and arq then lost the job — PRD #538) — and triggers
+the matching finaliser
 (:func:`maybe_finalise_lifecycle_run` or
 :func:`maybe_finalise_git_ref_audit_run`) for each distinct parent
 run so an operator never sees either run stuck in ``in_progress``
@@ -59,7 +63,7 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
     ``idx_queue_jobs_lifecycle_eval_active_uq`` then blocks all
     subsequent dispatcher ticks for that org.
 
-    Sweeps two populations in one transaction:
+    Sweeps three populations per kind in one transaction:
 
     1. Silent rows
        (:meth:`QueueJobStore.fail_silent_lifecycle_eval_jobs`) —
@@ -71,8 +75,25 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
        ``status='queued'`` with ``backend_job_id IS NULL`` past
        :data:`_ORPHAN_IDLE_WINDOW` (5 min, matching the keeper-sync
        orphan window).
+    3. Abandoned rows
+       (:meth:`QueueJobStore.fail_abandoned_lifecycle_eval_jobs`) — the
+       third loss mode PRD #538 identified: the row *did* reach arq and
+       arq then lost the job, so neither the silent pass
+       (``in_progress`` only) nor the orphan pass (``backend_job_id IS
+       NULL`` only) can see it, while the per-org mutex keeps counting
+       it as live work.
 
-    After both sweeps run, :func:`maybe_finalise_lifecycle_run` is
+    The abandoned passes ask the queue backend whether arq still knows
+    each candidate before failing it, so a job merely backed up behind a
+    saturated maintenance pool is never cancelled. That is the reaper's
+    only dependency beyond the stores; when the backend is unreachable
+    those two passes abort for the tick (logging a warning and mutating
+    nothing) while the silent and orphan passes proceed. They reuse the
+    silent threshold rather than the short orphan window: a row that
+    reached arq deserves the same benefit of the doubt a running job
+    gets before being declared dead.
+
+    After all sweeps run, :func:`maybe_finalise_lifecycle_run` is
     invoked once per distinct ``lifecycle_eval_run_id`` seen across the
     reaped rows so the parent aggregate row rolls to its terminal
     status. Returns a one-line status string for arq's result log; the
@@ -87,6 +108,10 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
         queue_job_store = factory.create_queue_job_store()
         run_store = factory.create_lifecycle_eval_run_store()
         audit_run_store = factory.create_git_ref_audit_run_store()
+        # The abandoned sweeps ask arq whether it still knows each
+        # candidate job, so the reaper now needs a queue backend (PRD
+        # #538 §Summary, "Reaper dependency change").
+        queue_backend = factory.create_queue_backend()
 
         async with session.begin():
             le_silent = await queue_job_store.fail_silent_lifecycle_eval_jobs(
@@ -95,6 +120,11 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
             le_orphan = (
                 await queue_job_store.fail_orphaned_lifecycle_eval_jobs(
                     idle_after=_ORPHAN_IDLE_WINDOW
+                )
+            )
+            le_abandoned = (
+                await queue_job_store.fail_abandoned_lifecycle_eval_jobs(
+                    idle_after=threshold, queue_backend=queue_backend
                 )
             )
             audit_silent = (
@@ -107,8 +137,14 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
                     idle_after=_ORPHAN_IDLE_WINDOW
                 )
             )
+            audit_abandoned = (
+                await queue_job_store.fail_abandoned_git_ref_audit_jobs(
+                    idle_after=threshold, queue_backend=queue_backend
+                )
+            )
             le_run_ids = {
-                qj.lifecycle_eval_run_id for qj in (*le_silent, *le_orphan)
+                qj.lifecycle_eval_run_id
+                for qj in (*le_silent, *le_orphan, *le_abandoned)
             }
             for run_id in le_run_ids:
                 if run_id is None:
@@ -118,7 +154,7 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
                 )
             audit_run_ids = {
                 qj.git_ref_audit_run_id
-                for qj in (*audit_silent, *audit_orphan)
+                for qj in (*audit_silent, *audit_orphan, *audit_abandoned)
             }
             for run_id in audit_run_ids:
                 if run_id is None:
@@ -127,23 +163,43 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
                     run_store=audit_run_store, run_id=run_id
                 )
 
-        le_reaped = len(le_silent) + len(le_orphan)
-        audit_reaped = len(audit_silent) + len(audit_orphan)
-        total_reaped = le_reaped + audit_reaped
+        by_sweep = (
+            ("lifecycle_eval_silent", le_silent),
+            ("lifecycle_eval_orphan", le_orphan),
+            ("lifecycle_eval_abandoned", le_abandoned),
+            ("git_ref_audit_silent", audit_silent),
+            ("git_ref_audit_orphan", audit_orphan),
+            ("git_ref_audit_abandoned", audit_abandoned),
+        )
+        total_reaped = sum(len(jobs) for _, jobs in by_sweep)
         if total_reaped:
             logger.warning(
                 "Reaped stuck lifecycle queue jobs",
                 reaped_count=total_reaped,
                 lifecycle_eval_silent_count=len(le_silent),
                 lifecycle_eval_orphan_count=len(le_orphan),
+                lifecycle_eval_abandoned_count=len(le_abandoned),
                 git_ref_audit_silent_count=len(audit_silent),
                 git_ref_audit_orphan_count=len(audit_orphan),
+                git_ref_audit_abandoned_count=len(audit_abandoned),
                 lifecycle_eval_run_ids=sorted(
                     r for r in le_run_ids if r is not None
                 ),
                 git_ref_audit_run_ids=sorted(
                     r for r in audit_run_ids if r is not None
                 ),
+                # Per-row detail so a postmortem can tell which sweep
+                # claimed a row and cross-reference the arq job ID that
+                # went missing, without querying the database.
+                reaped_jobs=[
+                    {
+                        "public_id": qj.public_id,
+                        "sweep": sweep,
+                        "backend_job_id": qj.backend_job_id,
+                    }
+                    for sweep, jobs in by_sweep
+                    for qj in jobs
+                ],
             )
         else:
             logger.debug("No stuck lifecycle queue jobs to reap")
