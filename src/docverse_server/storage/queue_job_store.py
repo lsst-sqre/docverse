@@ -1006,6 +1006,87 @@ class QueueJobStore:
             ),
         )
 
+    async def fail_abandoned_tier_cron_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail run-less ``keeper_sync_project`` rows that arq lost.
+
+        Abandoned-sweep sibling of
+        :meth:`fail_orphaned_tier_cron_jobs`, scoped identically
+        (``kind='keeper_sync_project'``, ``keeper_sync_run_id IS NULL``)
+        but for rows that *did* reach arq. The orphan sweep can only see
+        rows whose ``backend_job_id`` is still ``NULL``, so a tier-cron
+        row whose arq job later vanished stays ``queued`` forever, and
+        :meth:`has_active_for_subject` — which the tier crons consult
+        before enqueuing — keeps reporting an in-flight sync and skips
+        that subject on every subsequent tick.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`_fail_abandoned_candidates` for the shared
+        core and its backend-unreachable behaviour. Run-attributed rows
+        belong to :meth:`fail_abandoned_run_children`.
+        """
+        return await self._fail_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+            SqlQueueJob.keeper_sync_run_id.is_(None),
+            idle_after=idle_after,
+            queue_backend=queue_backend,
+            message=(
+                "Abandoned tier-cron keeper_sync_project: queue_jobs row "
+                "still queued past the keeper_sync_reaper threshold and "
+                "arq has no record of its backend_job_id (reaped by the "
+                "abandoned sweep)"
+            ),
+        )
+
+    async def fail_abandoned_run_children(
+        self,
+        *,
+        run_id: int | None = None,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail keeper-sync child rows that arq lost.
+
+        Abandoned-sweep sibling of :meth:`fail_orphaned_run_children`,
+        scoped identically (``keeper_sync_run_id == run_id``) but for
+        rows that *did* reach arq. Such a child stays ``queued``
+        forever, so it counts toward the parent run's ``pending_count``
+        and blocks finalisation exactly the way an orphan does —
+        callers therefore feed the reaped rows into the same
+        ``maybe_finalise_run`` path.
+
+        ``run_id`` narrows the sweep to one run for the discovery-side
+        reconciliation shape; ``None`` (the cron reaper's mode) sweeps
+        every run-attributed row in one query, since the reaper has no
+        run in hand and would otherwise have to enumerate runs just to
+        find the ones that are wedged. Callers in that mode take the
+        affected run IDs from the returned rows.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`_fail_abandoned_candidates` for the shared
+        core and its backend-unreachable behaviour.
+        """
+        scope: ColumnExpressionArgument[bool] = (
+            SqlQueueJob.keeper_sync_run_id.is_not(None)
+            if run_id is None
+            else SqlQueueJob.keeper_sync_run_id == run_id
+        )
+        return await self._fail_abandoned_candidates(
+            scope,
+            idle_after=idle_after,
+            queue_backend=queue_backend,
+            message=(
+                "Abandoned keeper-sync child: queue_jobs row still queued "
+                "past the keeper_sync_reaper threshold and arq has no "
+                "record of its backend_job_id (reaped by the abandoned "
+                "sweep)"
+            ),
+        )
+
     async def _fail_abandoned_candidates(
         self,
         *scope: ColumnExpressionArgument[bool],

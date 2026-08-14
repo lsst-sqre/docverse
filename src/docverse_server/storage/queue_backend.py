@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from safir.arq import ArqQueue, JobMetadata, JobNotFound, JobResultUnavailable
@@ -115,6 +116,13 @@ class ArqQueueBackend:
     """Queue backend wrapping safir's ArqQueue.
 
     Works with both RedisArqQueue and MockArqQueue.
+
+    ``additional_queue_names`` lists the other queues Docverse runs
+    (the dedicated keeper-sync and maintenance pools) so job *lookups*
+    can find a job whichever pool it was enqueued onto; see
+    :meth:`get_job_metadata`. It does not affect enqueueing, which
+    always targets ``default_queue_name`` unless the caller overrides
+    it per call.
     """
 
     def __init__(
@@ -122,9 +130,21 @@ class ArqQueueBackend:
         arq_queue: ArqQueue,
         *,
         default_queue_name: str = "arq:queue",
+        additional_queue_names: Sequence[str] = (),
     ) -> None:
         self._arq_queue = arq_queue
         self._default_queue_name = default_queue_name
+        # ``None`` first so the default lookup keeps deferring to the
+        # wrapped queue's own default, exactly as before this fallback
+        # existed.
+        self._lookup_queue_names: tuple[str | None, ...] = (
+            None,
+            *(
+                name
+                for name in additional_queue_names
+                if name != default_queue_name
+            ),
+        )
 
     async def enqueue(
         self,
@@ -144,18 +164,34 @@ class ArqQueueBackend:
     async def get_job_metadata(
         self, backend_job_id: str
     ) -> dict[str, Any] | None:
-        """Get arq job metadata as a dict."""
-        try:
-            metadata = await self._arq_queue.get_job_metadata(backend_job_id)
-        except JobNotFound:
-            return None
-        return {
-            "id": metadata.id,
-            "name": metadata.name,
-            "status": metadata.status.value,
-            "enqueue_time": metadata.enqueue_time.isoformat(),
-            "queue_name": metadata.queue_name,
-        }
+        """Get arq job metadata as a dict, whichever pool queue holds it.
+
+        arq stores a job's *definition* under a queue-agnostic key but
+        resolves its *status* through the queue's sorted set, so a job
+        that is merely ``queued`` on a dedicated pool queue looks
+        missing when queried under the default queue name — safir turns
+        that into ``JobNotFound``. Since ``None`` here means "arq has no
+        record of this job", and the abandoned reaper sweep (PRD #538)
+        fails a ``queue_jobs`` row on exactly that answer, the lookup
+        walks every configured pool queue before concluding the job is
+        gone. Otherwise every healthy keeper-sync or maintenance job
+        would read as lost.
+        """
+        for queue_name in self._lookup_queue_names:
+            try:
+                metadata = await self._arq_queue.get_job_metadata(
+                    backend_job_id, queue_name
+                )
+            except JobNotFound:
+                continue
+            return {
+                "id": metadata.id,
+                "name": metadata.name,
+                "status": metadata.status.value,
+                "enqueue_time": metadata.enqueue_time.isoformat(),
+                "queue_name": metadata.queue_name,
+            }
+        return None
 
     async def get_job_result(self, backend_job_id: str) -> object | None:
         """Get the result of a completed arq job."""

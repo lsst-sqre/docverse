@@ -183,6 +183,24 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
        (:meth:`QueueJobStore.fail_orphaned_tier_cron_jobs`) — same
        outcome for queued rows whose worker crashed between the SQL
        commit and ``arq_queue.enqueue``.
+    4. Tier-cron abandoned rows
+       (:meth:`QueueJobStore.fail_abandoned_tier_cron_jobs`) — the
+       third loss mode PRD #538 identified: the row *did* reach arq and
+       arq then lost the job, so neither the silent pass
+       (``in_progress`` only) nor the orphan pass
+       (``backend_job_id IS NULL`` only) can see it.
+    5. Run-attributed abandoned children
+       (:meth:`QueueJobStore.fail_abandoned_run_children`) — the same
+       loss mode under a run, folded into the same ``run_ids``
+       finalisation pass as population 1 so an abandoned child stops
+       blocking its parent run exactly like an orphaned one does.
+
+    Populations 4 and 5 ask the queue backend whether arq still knows
+    each candidate before failing it, so a job merely backed up behind a
+    saturated pool is never cancelled. That is the reaper's only
+    dependency beyond the queue-job store; when the backend is
+    unreachable those two passes abort for the tick (logging a warning
+    and mutating nothing) while the first three proceed.
 
     Thresholds: the silent paths use
     ``config.keeper_sync_reaper_threshold_seconds``, which defaults to
@@ -195,7 +213,10 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     job, instead of parking the project behind its active-job mutex for
     hours after the row is known dead. The orphan path uses
     :data:`_ORPHAN_IDLE_WINDOW` (5 min) so the staleness check matches
-    the existing discovery-side orphan sweep.
+    the existing discovery-side orphan sweep. The abandoned paths reuse
+    the silent threshold rather than that short window: a row that
+    reached arq deserves the same benefit of the doubt a running job
+    gets before being declared dead.
 
     Wired as a cron job on ``KeeperSyncWorkerSettings.cron_jobs``
     (every 30 min). Returns a one-line status string for arq's result
@@ -209,6 +230,10 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
         queue_job_store = factory.create_queue_job_store()
         run_store = factory.create_keeper_sync_run_store()
         org_store = factory.create_org_store()
+        # The abandoned sweeps ask arq whether it still knows each
+        # candidate job, so the reaper now needs a queue backend (PRD
+        # #538 §Summary, "Reaper dependency change").
+        queue_backend = factory.create_queue_backend()
 
         completions: list[KeeperSyncRunWithActivity] = []
         async with session.begin():
@@ -221,7 +246,20 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             tier_orphans = await queue_job_store.fail_orphaned_tier_cron_jobs(
                 idle_after=_ORPHAN_IDLE_WINDOW
             )
-            run_ids = {qj.keeper_sync_run_id for qj in reaped}
+            tier_abandoned = (
+                await queue_job_store.fail_abandoned_tier_cron_jobs(
+                    idle_after=threshold, queue_backend=queue_backend
+                )
+            )
+            # No ``run_id``: the reaper has no run in hand, so it sweeps
+            # every run-attributed row at once and reads the runs that
+            # need finalising back off the reaped rows below.
+            run_abandoned = await queue_job_store.fail_abandoned_run_children(
+                idle_after=threshold, queue_backend=queue_backend
+            )
+            run_ids = {
+                qj.keeper_sync_run_id for qj in (*reaped, *run_abandoned)
+            }
             for run_id in run_ids:
                 if run_id is None:
                     continue
@@ -243,7 +281,14 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                 logger=logger,
             )
 
-        total_reaped = len(reaped) + len(tier_silent) + len(tier_orphans)
+        by_sweep = (
+            ("run_attributed_silent", reaped),
+            ("tier_cron_silent", tier_silent),
+            ("tier_cron_orphan", tier_orphans),
+            ("tier_cron_abandoned", tier_abandoned),
+            ("run_attributed_abandoned", run_abandoned),
+        )
+        total_reaped = sum(len(jobs) for _, jobs in by_sweep)
         if total_reaped:
             logger.warning(
                 "Reaped stuck keeper-sync queue jobs",
@@ -251,7 +296,21 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                 run_attributed_silent_count=len(reaped),
                 tier_cron_silent_count=len(tier_silent),
                 tier_cron_orphan_count=len(tier_orphans),
+                tier_cron_abandoned_count=len(tier_abandoned),
+                run_attributed_abandoned_count=len(run_abandoned),
                 run_ids=sorted(r for r in run_ids if r is not None),
+                # Per-row detail so a postmortem can tell which sweep
+                # claimed a row and cross-reference the arq job ID that
+                # went missing, without querying the database.
+                reaped_jobs=[
+                    {
+                        "public_id": qj.public_id,
+                        "sweep": sweep,
+                        "backend_job_id": qj.backend_job_id,
+                    }
+                    for sweep, jobs in by_sweep
+                    for qj in jobs
+                ],
             )
         else:
             logger.debug("No stuck keeper-sync queue jobs to reap")

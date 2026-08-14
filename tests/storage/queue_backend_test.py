@@ -3,8 +3,9 @@
 import pytest
 from safir.arq import MockArqQueue
 
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.storage.queue_backend import ArqQueueBackend
-from tests.support.arq_testing import get_jobs_by_name
+from tests.support.arq_testing import get_jobs_by_name, register_queue
 
 
 @pytest.fixture
@@ -76,6 +77,34 @@ async def test_get_job_metadata(queue_backend: ArqQueueBackend) -> None:
     assert metadata["id"] == job_id
     assert metadata["name"] == "test_task"
     assert metadata["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_get_job_metadata_finds_job_on_a_dedicated_pool_queue() -> None:
+    """Lookups are queue-name-agnostic across Docverse's pool queues.
+
+    arq resolves a job's *status* through its queue's sorted set, so a
+    job that is merely ``queued`` on a dedicated pool queue reads as
+    "not found" when looked up under the default queue name alone. The
+    abandoned sweep (PRD #538) treats "no record" as "arq lost this
+    job", so without consulting every pool queue it would reap healthy
+    keeper-sync and maintenance work.
+    """
+    mock_queue = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_queue, KEEPER_SYNC_QUEUE_NAME)
+    backend = ArqQueueBackend(
+        arq_queue=mock_queue,
+        default_queue_name="docverse:queue",
+        additional_queue_names=(KEEPER_SYNC_QUEUE_NAME,),
+    )
+
+    job_id = await backend.enqueue(
+        "keeper_sync_project", {"k": "v"}, queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    metadata = await backend.get_job_metadata(job_id)
+
+    assert metadata is not None
+    assert metadata["queue_name"] == KEEPER_SYNC_QUEUE_NAME
 
 
 @pytest.mark.asyncio

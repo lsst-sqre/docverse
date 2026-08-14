@@ -49,7 +49,10 @@ from .services.keeper_sync import (
 )
 from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.keeper_sync_project import KeeperSyncProjectService
-from .services.keeper_sync_run import KeeperSyncRunService
+from .services.keeper_sync_run import (
+    KEEPER_SYNC_QUEUE_NAME,
+    KeeperSyncRunService,
+)
 from .services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
@@ -92,6 +95,16 @@ from .storage.queue_backend import (
 )
 from .storage.queue_job_store import QueueJobStore
 from .storage.user_info_store import UserInfoStore
+from .worker.queues import MAINTENANCE_QUEUE_NAME
+
+DEDICATED_POOL_QUEUE_NAMES = (KEEPER_SYNC_QUEUE_NAME, MAINTENANCE_QUEUE_NAME)
+"""arq queues Docverse runs besides the configurable default one.
+
+Handed to every :class:`~docverse_server.storage.queue_backend.
+ArqQueueBackend` so a job lookup finds its job whichever pool enqueued
+it — see ``ArqQueueBackend.get_job_metadata`` for why a queue-scoped
+lookup is not enough.
+"""
 
 
 @dataclass(frozen=True)
@@ -187,6 +200,7 @@ class Factory:
         return ArqQueueBackend(
             arq_queue=self._arq_queue,
             default_queue_name=self._default_queue_name,
+            additional_queue_names=DEDICATED_POOL_QUEUE_NAMES,
         )
 
     def create_org_store(self) -> OrganizationStore:
