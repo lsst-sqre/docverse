@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select, update
+from sqlalchemy import ColumnExpressionArgument, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -24,6 +24,7 @@ from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
 )
 from docverse_server.storage.pagination import QueueJobDateCreatedCursor
+from docverse_server.storage.queue_backend import QueueBackend
 
 __all__ = ["QueueJobStore"]
 
@@ -958,6 +959,113 @@ class QueueJobStore:
                     "crashed between SQL commit and arq_queue.enqueue)"
                 ),
                 "type": "OrphanedQueueJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
+
+    async def fail_abandoned_jobs(
+        self,
+        kind: JobKind,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail rows of ``kind`` that reached arq and were then lost.
+
+        Third sweep of the reaper triad, closing the gap PRD #538
+        describes: :meth:`fail_silent_jobs` only looks at
+        ``in_progress`` rows and :meth:`fail_orphaned_jobs` only at
+        ``queued`` rows with ``backend_job_id IS NULL``, so a row that
+        *did* get an arq job ID and then had that job vanish (Redis
+        eviction, a queue flush, a lost `arq:queue` entry) is swept by
+        neither. Because the active-job partial unique indexes count a
+        ``queued`` row as holding the mutex, one such row wedges its
+        slot permanently — on roundtable-dev this silently froze the
+        documenteer version dashboard.
+
+        Age alone cannot separate "arq lost this job" from "arq is
+        backed up", so each candidate (``status='queued'``,
+        ``backend_job_id IS NOT NULL``, ``date_created`` older than
+        ``now - idle_after``) is verified against
+        :meth:`QueueBackend.get_job_metadata` first and failed only when
+        the backend has no record of it. Reaped rows carry
+        ``errors.type='AbandonedQueueJob'``, distinct from
+        ``SilentWorker`` and ``OrphanedQueueJob`` so postmortem queries
+        can separate the three loss modes.
+        """
+        return await self._fail_abandoned_candidates(
+            SqlQueueJob.kind == kind.value,
+            idle_after=idle_after,
+            queue_backend=queue_backend,
+            message=(
+                f"Abandoned {kind.value}: queue_jobs row still queued past "
+                f"the {kind.value}_reaper threshold and arq has no record "
+                "of its backend_job_id (reaped by the abandoned sweep)"
+            ),
+        )
+
+    async def _fail_abandoned_candidates(
+        self,
+        *scope: ColumnExpressionArgument[bool],
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+        message: str,
+    ) -> list[QueueJob]:
+        """Shared candidate-query + arq-verify + fail core.
+
+        ``scope`` narrows the base abandoned predicate
+        (``status='queued'``, ``backend_job_id IS NOT NULL``,
+        ``date_created < now - idle_after``) to one family — a ``kind``
+        equality for :meth:`fail_abandoned_jobs`, or the scoping the
+        per-family variants use.
+
+        Every candidate is verified *before* any row is mutated, so a
+        backend that becomes unreachable partway through the sweep
+        leaves no half-applied reap behind. On such a failure the sweep
+        aborts for this tick with a warning and returns an empty list:
+        the caller's sibling silent and orphan sweeps are unaffected and
+        the next tick retries (PRD #538 §Scope, backend-unreachable
+        bullet). Failing open this way is deliberate — reaping a row
+        whose arq job may well be alive would cancel healthy work.
+        """
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
+        stmt = select(SqlQueueJob).where(
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_not(None),
+            SqlQueueJob.date_created < cutoff,
+            *scope,
+        )
+        result = await self._session.execute(stmt)
+        rows = list(result.scalars().all())
+
+        abandoned: list[SqlQueueJob] = []
+        for row in rows:
+            backend_job_id = row.backend_job_id
+            if backend_job_id is None:  # pragma: no cover - SQL excludes
+                continue
+            try:
+                metadata = await queue_backend.get_job_metadata(backend_job_id)
+            except Exception as exc:
+                self._logger.warning(
+                    "Queue backend unreachable; skipping abandoned sweep",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    candidate_count=len(rows),
+                )
+                return []
+            if metadata is None:
+                abandoned.append(row)
+
+        failed: list[QueueJob] = []
+        for row in abandoned:
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": message,
+                "type": "AbandonedQueueJob",
             }
             failed.append(QueueJob.model_validate(row, from_attributes=True))
         if failed:

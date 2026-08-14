@@ -3,8 +3,11 @@
 A "run-less" reaper is the cron-driven backstop for a :class:`JobKind`
 that does not aggregate into a parent run row — currently
 ``dashboard_build``, ``publish_edition``, ``build_processing``, and
-``dashboard_sync``. Each sweeps stuck ``queue_jobs`` rows (silent
-in-progress + orphan queued) in one transaction and finalises nothing.
+``dashboard_sync``. Each sweeps stuck ``queue_jobs`` rows in one
+transaction and finalises nothing. Three passes cover the three ways a
+row goes stuck: silent (``in_progress`` but the worker died), orphan
+(``queued`` and never reached arq), and abandoned (``queued``, reached
+arq, and arq then lost the job — PRD #538).
 
 Per PRD #367 §"Reaper module shape", each kind still ships its own
 arq-registered function so cron staggering, logger name, log-event
@@ -41,14 +44,15 @@ async def sweep_runless_kind(
     kind: JobKind,
     threshold_attr: str,
 ) -> str:
-    """Sweep silent + orphan rows for one run-less ``kind``.
+    """Sweep silent + orphan + abandoned rows for one run-less ``kind``.
 
     Used by the per-kind reaper modules. Reads the configured threshold
     from ``config.<threshold_attr>`` at invocation time (so non-prod
     overrides via ``DOCVERSE_<KIND>_REAPER_THRESHOLD_SECONDS`` take
-    effect immediately), runs both sweeps in one transaction, and
-    emits ``logger.warning`` with counts and reaped public IDs when
-    anything was reaped, ``logger.debug`` otherwise.
+    effect immediately), runs all three sweeps in one transaction, and
+    emits ``logger.warning`` with counts, reaped public IDs, and
+    per-row sweep/``backend_job_id`` detail when anything was reaped,
+    ``logger.debug`` otherwise.
 
     The structlog ``event`` strings are f-string-built from
     ``kind.value`` so they match the per-kind literals the original
@@ -69,6 +73,11 @@ async def sweep_runless_kind(
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
         queue_job_store = factory.create_queue_job_store()
+        # The abandoned sweep asks arq whether it still knows each
+        # candidate job, so the reapers now need a queue backend — the
+        # only reaper dependency beyond the store (PRD #538 §Summary,
+        # "Reaper dependency change").
+        queue_backend = factory.create_queue_backend()
 
         async with session.begin():
             silent = await queue_job_store.fail_silent_jobs(
@@ -77,17 +86,42 @@ async def sweep_runless_kind(
             orphan = await queue_job_store.fail_orphaned_jobs(
                 kind, idle_after=ORPHAN_IDLE_WINDOW
             )
+            # Reuses the kind's silent threshold rather than the much
+            # shorter orphan window: an abandoned row *did* reach arq,
+            # so it deserves the same benefit of the doubt a running
+            # job gets before being declared dead.
+            abandoned = await queue_job_store.fail_abandoned_jobs(
+                kind, idle_after=threshold, queue_backend=queue_backend
+            )
 
-        reaped_count = len(silent) + len(orphan)
+        by_sweep = (
+            ("silent", silent),
+            ("orphan", orphan),
+            ("abandoned", abandoned),
+        )
+        reaped_count = len(silent) + len(orphan) + len(abandoned)
         if reaped_count:
             logger.warning(
                 warning_event,
                 reaped_count=reaped_count,
                 silent_count=len(silent),
                 orphan_count=len(orphan),
+                abandoned_count=len(abandoned),
                 reaped_public_ids=sorted(
-                    qj.public_id for qj in (*silent, *orphan)
+                    qj.public_id for jobs in by_sweep for qj in jobs[1]
                 ),
+                # Per-row detail so a postmortem can tell which sweep
+                # claimed a row and cross-reference the arq job ID that
+                # went missing, without querying the database.
+                reaped_jobs=[
+                    {
+                        "public_id": qj.public_id,
+                        "sweep": sweep,
+                        "backend_job_id": qj.backend_job_id,
+                    }
+                    for sweep, jobs in by_sweep
+                    for qj in jobs
+                ],
             )
         else:
             logger.debug(debug_event)

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 import structlog
@@ -1619,6 +1620,7 @@ async def _seed_runless_row(
     backend_job_id: str | None,
     date_started: datetime | None = None,
     date_created_offset: timedelta | None = None,
+    project_id: int | None = None,
 ) -> int:
     """Insert one row of ``kind`` with explicit timestamps for sweep tests."""
     row = SqlQueueJob(
@@ -1627,6 +1629,7 @@ async def _seed_runless_row(
         kind=kind.value,
         status=status.value,
         org_id=org_id,
+        project_id=project_id,
         date_started=date_started,
     )
     db_session.add(row)
@@ -1907,6 +1910,366 @@ async def test_fail_orphaned_jobs_skips_other_kinds(
         await db_session.commit()
 
     assert failed == []
+
+
+# ---------------------------------------------------------------------
+# Abandoned sweep storage tests (PRD #538)
+# ---------------------------------------------------------------------
+#
+# The abandoned sweep closes the gap between the silent sweep (which
+# requires ``in_progress``) and the orphan sweep (which requires
+# ``backend_job_id IS NULL``): a ``queued`` row that *did* reach arq
+# and was then lost by it. Because age alone cannot distinguish "lost"
+# from "backed up behind a long queue", every candidate is verified
+# against :meth:`QueueBackend.get_job_metadata` before being failed.
+
+
+class _StubQueueBackend:
+    """Minimal :class:`QueueBackend` double for the abandoned sweeps.
+
+    ``known_ids`` are the ``backend_job_id`` values arq still has a
+    record of; any other ID reads as lost. ``error``, when set, makes
+    :meth:`get_job_metadata` raise instead — modelling an unreachable
+    Redis so the sweep's abort path can be exercised.
+    """
+
+    def __init__(
+        self,
+        *,
+        known_ids: set[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.known_ids = known_ids if known_ids is not None else set()
+        self.error = error
+        self.queried: list[str] = []
+
+    async def enqueue(
+        self,
+        job_type: str,
+        payload: dict[str, Any],
+        *,
+        queue_name: str | None = None,
+    ) -> str:
+        raise NotImplementedError
+
+    async def get_job_metadata(
+        self, backend_job_id: str
+    ) -> dict[str, Any] | None:
+        self.queried.append(backend_job_id)
+        if self.error is not None:
+            raise self.error
+        if backend_job_id in self.known_ids:
+            return {"id": backend_job_id, "status": "queued"}
+        return None
+
+    async def get_job_result(self, backend_job_id: str) -> object | None:
+        return None
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_reaps_arq_lost_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """A ``queued`` row past the threshold that arq lost is failed."""
+    backend_job_id = f"arq-{spec.slug_prefix}-lost"
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-1"
+        )
+        abandoned_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=spec.silent_past_offset,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert len(failed) == 1
+    assert failed[0].id == abandoned_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_spares_row_arq_still_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """The healthy-job race: a backed-up but live job is never reaped.
+
+    A ``queued`` row can sit past the threshold simply because the
+    worker pool is saturated. Verifying against the backend before
+    failing is what separates that case from a genuinely lost job, so
+    an arq-known row survives *regardless* of age.
+    """
+    backend_job_id = f"arq-{spec.slug_prefix}-alive"
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-2"
+        )
+        healthy_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=timedelta(days=30),
+        )
+
+        backend = _StubQueueBackend(known_ids={backend_job_id})
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_skips_row_inside_threshold(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Threshold boundary: a fresh queued row is not even a candidate.
+
+    A row younger than ``idle_after`` must not be queried against the
+    backend at all — the dispatcher may still be mid-enqueue, and a
+    just-created job legitimately has no arq record yet.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-3"
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-fresh",
+            date_created_offset=spec.silent_idle_after - timedelta(minutes=1),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_leaves_silent_and_orphan_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Sweep non-interference: the other two sweeps keep their rows.
+
+    An ``in_progress`` row belongs to :meth:`fail_silent_jobs` and a
+    ``queued`` row with no ``backend_job_id`` to
+    :meth:`fail_orphaned_jobs`; the abandoned sweep must claim neither,
+    so the three sweeps stay attributable in postmortems.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-4"
+        )
+        silent_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=f"arq-{spec.slug_prefix}-silent",
+            date_started=datetime.now(tz=UTC) - spec.silent_past_offset,
+            date_created_offset=spec.silent_past_offset,
+        )
+        orphan_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=spec.silent_past_offset,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+    async with db_session.begin():
+        silent = await store.get(silent_id)
+        orphan = await store.get(orphan_id)
+        assert silent is not None
+        assert silent.status == JobStatus.in_progress
+        assert orphan is not None
+        assert orphan.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Cross-kind scoping for the abandoned sweep.
+
+    An arq-lost ``queued`` row of every other run-less kind plus
+    ``lifecycle_eval`` must be left to that kind's own reaper.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-5"
+        )
+        for idx, kind in enumerate(_other_runless_kinds(spec)):
+            await _seed_runless_row(
+                db_session,
+                kind=kind,
+                org_id=org_id,
+                status=JobStatus.queued,
+                backend_job_id=f"arq-other-lost-{idx}",
+                date_created_offset=spec.silent_past_offset,
+            )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_aborts_when_backend_unreachable(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An unreachable backend aborts the sweep instead of reaping blind.
+
+    ``get_job_metadata`` raising means the sweep cannot tell a lost job
+    from a live one, so it must fail open: no row is mutated and the
+    next tick retries once Redis is back.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-unreachable")
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-unreachable",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(error=ConnectionError("redis is down"))
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_frees_dashboard_build_mutex(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The wedge this PRD exists to clear: reaping frees the mutex.
+
+    ``idx_queue_jobs_dashboard_build_active_uq`` counts a ``queued`` row
+    as an active job, so an abandoned row blocks every later dashboard
+    build for that project. After the sweep,
+    :meth:`create_unless_active` must hand back a fresh row rather than
+    ``None``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-mutex")
+        wedged_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-wedged",
+            date_created_offset=timedelta(hours=1),
+            project_id=4242,
+        )
+
+        blocked = await store.create_unless_active(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=4242,
+        )
+        assert blocked is None
+
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=_StubQueueBackend(),
+        )
+        assert len(failed) == 1
+
+        fresh = await store.create_unless_active(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=4242,
+        )
+        await db_session.commit()
+
+    assert fresh is not None
+    assert fresh.id != wedged_id
+    assert fresh.status == JobStatus.queued
 
 
 @pytest.mark.asyncio
