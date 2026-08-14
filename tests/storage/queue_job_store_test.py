@@ -29,7 +29,7 @@ from docverse_server.domain.base32id import (
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
-from docverse_server.exceptions import InvalidJobStateError
+from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
@@ -140,6 +140,71 @@ async def test_start_job_wrong_status(
         with pytest.raises(InvalidJobStateError):
             await store.start(job.id)
         await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_start_if_queued_starts_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A ``queued`` row transitions just the way ``start`` transitions it."""
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        started = await store.start_if_queued(job.id)
+        await db_session.commit()
+    assert started is not None
+    assert started.id == job.id
+    assert started.status == JobStatus.in_progress
+    assert started.date_started is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.failed,
+        JobStatus.cancelled,
+        JobStatus.completed,
+        JobStatus.in_progress,
+    ],
+)
+@pytest.mark.asyncio
+async def test_start_if_queued_returns_none_for_non_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    status: JobStatus,
+) -> None:
+    """A row a reaper already moved off ``queued`` yields ``None``.
+
+    This is the late-delivery guard: arq handing the worker a job whose
+    row is no longer ``queued`` must not raise ``InvalidJobStateError``.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        row.status = status.value
+        await db_session.flush()
+
+        result = await store.start_if_queued(job.id)
+        await db_session.commit()
+
+    assert result is None
+    async with db_session.begin():
+        unchanged = await store.get(job.id)
+        assert unchanged is not None
+        assert unchanged.status == status
+        assert unchanged.date_started is None
+
+
+@pytest.mark.asyncio
+async def test_start_if_queued_raises_for_missing_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A missing row is a programming error, not a race — it still raises."""
+    async with db_session.begin():
+        with pytest.raises(JobNotFoundError):
+            await store.start_if_queued(-1)
 
 
 @pytest.mark.asyncio

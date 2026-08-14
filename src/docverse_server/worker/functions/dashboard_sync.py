@@ -64,7 +64,11 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             binding = await binding_store.get_by_id(binding_id)
         if binding is None:
             async with session.begin():
-                await queue_job_store.start(queue_job_id)
+                # Late-delivery guard (PRD #538): a reaper may have
+                # already failed this row, in which case the store logs
+                # the skip and there is nothing left to mark failed.
+                if await queue_job_store.start_if_queued(queue_job_id) is None:
+                    return "skipped"
                 await queue_job_store.fail(
                     queue_job_id,
                     errors={
@@ -91,7 +95,8 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             # begin/commit around each DB write so progress updates
             # are visible to observers outside the lock hold.
             async with session.begin():
-                await queue_job_store.start(queue_job_id)
+                if await queue_job_store.start_if_queued(queue_job_id) is None:
+                    return "skipped"
                 await queue_job_store.update_phase(
                     queue_job_id,
                     "fetching",

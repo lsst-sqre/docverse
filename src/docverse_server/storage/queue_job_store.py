@@ -242,6 +242,55 @@ class QueueJobStore:
                 job_public_id=serialize_base32_id(row.public_id),
                 job_function=row.kind,
             )
+        return await self._mark_started(row)
+
+    async def start_if_queued(self, job_id: int) -> QueueJob | None:
+        """Mark job as in_progress, or return ``None`` if it is not queued.
+
+        Late-delivery guard for the reaper triad (PRD #538). The
+        abandoned sweep asks arq whether it still knows a queued job
+        before failing its row, but a job re-appearing between that
+        check and the ``UPDATE`` — or any other residual reap/deliver
+        race — can still hand a worker a row that is no longer
+        ``queued``. Picking such a row up with :meth:`start` would raise
+        :exc:`~docverse_server.exceptions.InvalidJobStateError` into
+        Sentry for a race the reaper is meant to absorb, so worker
+        pickup paths call this instead and return without running the
+        job body when it yields ``None``.
+
+        On the ``queued`` path the transition is identical to
+        :meth:`start`; :meth:`start` keeps its raising semantics for
+        non-pickup callers, where an unexpected status *is* a bug.
+
+        Returns
+        -------
+        QueueJob or None
+            The started job when the row was ``queued``; ``None`` when
+            it exists in any other status — terminal because a reaper
+            failed it, or already ``in_progress`` because a duplicate
+            delivery beat this one. The skip is logged as a warning
+            carrying the job's public id, kind, and current status.
+
+        Raises
+        ------
+        JobNotFoundError
+            If no row with ``job_id`` exists. A missing row is not the
+            reap race this guards — it means the caller was handed an id
+            that never existed — so it still raises.
+        """
+        row = await self._get_row(job_id)
+        if row.status != JobStatus.queued.value:
+            self._logger.warning(
+                "Skipping late-delivered queue job",
+                queue_job_id=serialize_base32_id(row.public_id),
+                queue_job_kind=row.kind,
+                queue_job_status=row.status,
+            )
+            return None
+        return await self._mark_started(row)
+
+    async def _mark_started(self, row: SqlQueueJob) -> QueueJob:
+        """Apply the queued → in_progress transition to a loaded row."""
         row.status = JobStatus.in_progress.value
         row.date_started = func.now()
         await self._session.flush()

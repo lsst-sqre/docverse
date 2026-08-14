@@ -63,6 +63,17 @@ class _BuildProcessedOutcome:
     stale_skipped: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _QueueJobPickup:
+    """Outcome of resolving this arq job's ``queue_jobs`` row at pickup."""
+
+    queue_job_id: int | None
+    """Internal id of the row this worker started, if it started one."""
+
+    reaped: bool
+    """True when the row existed but a reaper had already failed it."""
+
+
 async def build_processing(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -116,6 +127,7 @@ async def build_processing(
             git_ref=build.git_ref,
         )
         async with lock_service.acquire(lock_key):
+            outcome: _BuildProcessedOutcome | None
             if await _guard_stale_build(
                 session=session,
                 ctx=ctx,
@@ -150,6 +162,11 @@ async def build_processing(
                     build_public_id=build_public_id,
                     logger=logger,
                 )
+
+        # A reaped queue job produces no outcome: the build body never
+        # ran, so there is nothing to report as processed.
+        if outcome is None:
+            return result
 
         # Publish after releasing the lock and after the terminal DB
         # transition has committed. Best-effort: production runs
@@ -250,17 +267,26 @@ async def _process_build_locked(
     build_id: int,
     build_public_id: str,
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[str, _BuildProcessedOutcome]:
+) -> tuple[str, _BuildProcessedOutcome | None]:
     """Unpack, upload, and finalize a non-stale build under the lock.
 
     Assumes the caller holds the BUILD_PROCESSING advisory lock and has
     already confirmed this build is the latest for ``(project, git_ref)``.
 
     Returns the arq status message paired with the terminal metrics for
-    the run so the caller can emit one ``build_processed`` event.
+    the run so the caller can emit one ``build_processed`` event. The
+    metrics are ``None`` when the late-delivery guard (PRD #538) skipped
+    the build because a reaper had already failed its queue job: nothing
+    ran, so there is no build outcome to report.
     """
-    # Phase 1: Load metadata and mark QueueJob as in_progress
+    # Phase 1: Mark QueueJob as in_progress and load metadata. The
+    # pickup guard runs first so a reaped row costs nothing beyond the
+    # lookup — no org read, no object store resolved.
     async with session.begin():
+        pickup = await _start_queue_job(ctx, queue_job_store)
+        if pickup.reaped:
+            return "skipped", None
+
         org = await org_store.get_by_id(org_id)
         if org is None:
             msg = f"Organization {org_id} not found"
@@ -275,7 +301,7 @@ async def _process_build_locked(
             org_id=org_id, service_label=service_label
         )
 
-        queue_job_id = await _start_queue_job(ctx, queue_job_store)
+        queue_job_id = pickup.queue_job_id
         if queue_job_id is not None:
             await queue_job_store.update_phase(
                 queue_job_id,
@@ -366,8 +392,12 @@ async def _mark_stale_skipped(
         latest_build_id=latest_build_id,
     )
     async with session.begin():
-        queue_job_id = await _start_queue_job(ctx, queue_job_store)
-        if queue_job_id is not None:
+        # A reaped row (``pickup.reaped``) is handled the same way as no
+        # row at all here: the build really is superseded either way, so
+        # only the queue-job bookkeeping is skipped.
+        pickup = await _start_queue_job(ctx, queue_job_store)
+        if pickup.queue_job_id is not None:
+            queue_job_id = pickup.queue_job_id
             await queue_job_store.update_phase(
                 queue_job_id,
                 "complete",
@@ -386,20 +416,24 @@ async def _mark_stale_skipped(
 async def _start_queue_job(
     ctx: dict[str, Any],
     queue_job_store: QueueJobStore,
-) -> int | None:
+) -> _QueueJobPickup:
     """Look up and start the QueueJob for this arq job.
 
-    Returns the queue job's internal ID, or ``None`` if no matching
-    QueueJob exists.
+    Distinguishes the two "no queue job to drive" cases the callers
+    treat differently: no row at all (``build_processing`` can still be
+    enqueued without one, so the build is processed anyway) versus a row
+    a reaper already failed, where the late-delivery guard from PRD #538
+    requires the job body to be skipped entirely.
     """
     arq_job_id: str | None = ctx.get("job_id")
     if arq_job_id is None:
-        return None
+        return _QueueJobPickup(queue_job_id=None, reaped=False)
     queue_job = await queue_job_store.get_by_backend_job_id(arq_job_id)
     if queue_job is None:
-        return None
-    await queue_job_store.start(queue_job.id)
-    return queue_job.id
+        return _QueueJobPickup(queue_job_id=None, reaped=False)
+    if await queue_job_store.start_if_queued(queue_job.id) is None:
+        return _QueueJobPickup(queue_job_id=None, reaped=True)
+    return _QueueJobPickup(queue_job_id=queue_job.id, reaped=False)
 
 
 async def _resolve_api_base_url(

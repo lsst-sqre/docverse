@@ -118,13 +118,15 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 resources = await _load_resources(
                     factory=factory, payload=payload
                 )
-                await _mark_publishing(
+                picked_up = await _mark_publishing(
                     queue_job_store=queue_job_store,
                     edition_store=edition_store,
                     history_store=history_store,
                     resources=resources,
                     queue_job_id=queue_job_id,
                 )
+            if not picked_up:
+                return "skipped"
 
             publishing_service = factory.create_edition_publishing_service()
             try:
@@ -284,9 +286,16 @@ async def _mark_publishing(
     history_store: EditionBuildHistoryStore,
     resources: _PublishResources,
     queue_job_id: int,
-) -> None:
-    """Transition the queue job, edition, and history to publishing."""
-    await queue_job_store.start(queue_job_id)
+) -> bool:
+    """Transition the queue job, edition, and history to publishing.
+
+    Returns ``False`` — having transitioned nothing — when the late-
+    delivery guard (PRD #538) finds the queue job's row already off
+    ``queued`` because a reaper failed it; the caller then returns
+    without publishing.
+    """
+    if await queue_job_store.start_if_queued(queue_job_id) is None:
+        return False
     await queue_job_store.update_phase(
         queue_job_id,
         "publishing",
@@ -299,6 +308,7 @@ async def _mark_publishing(
         history_id=resources.history_entry.id,
         status=PublishStatus.publishing,
     )
+    return True
 
 
 async def _mark_failed(

@@ -356,7 +356,11 @@ async def keeper_sync_run_discovery(
         run_store = factory.create_keeper_sync_run_store()
 
         async with session.begin():
-            await queue_job_store.start(queue_job_id)
+            # Late-delivery guard (PRD #538): a reaper may have already
+            # failed this row — and rolled the run up with it — so the
+            # discovery must not fan out a second time.
+            if await queue_job_store.start_if_queued(queue_job_id) is None:
+                return "skipped"
             await _reconcile_orphan_children(
                 queue_job_store=queue_job_store,
                 run_id=run_id,
@@ -541,7 +545,11 @@ async def keeper_sync_project(
         org_store = factory.create_org_store()
 
         async with session.begin():
-            await queue_job_store.start(queue_job_id)
+            # Late-delivery guard (PRD #538): a reaper may have already
+            # failed this row and, for a run child, rolled the parent run
+            # up on its behalf.
+            if await queue_job_store.start_if_queued(queue_job_id) is None:
+                return "skipped"
             org = await org_store.get_by_id(org_id)
 
         try:
