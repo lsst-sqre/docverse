@@ -24,6 +24,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse_server.domain.base32id import generate_resource_id
+from docverse_server.storage._integrity import (
+    is_unique_violation,
+    violated_constraint_name,
+)
 
 __all__ = ["insert_with_time_ordered_public_id"]
 
@@ -33,15 +37,6 @@ MAX_PUBLIC_ID_ATTEMPTS = 5
 Same-millisecond collisions across ~131k random values are astronomically
 unlikely to recur even once; five attempts is a generous safety margin whose
 exhaustion signals a real problem rather than an unlucky draw.
-"""
-
-_UNIQUE_VIOLATION_SQLSTATE = "23505"
-"""Postgres SQLSTATE for ``unique_violation``.
-
-Only a genuine unique-constraint violation is a re-mintable ``public_id``
-collision. Gating on this code stops a *different* integrity error that merely
-mentions ``public_id`` (e.g. a NOT NULL violation, SQLSTATE ``23502``) from
-being silently retried and masked as an "exhausted attempts" error.
 """
 
 
@@ -112,27 +107,9 @@ def _is_public_id_conflict(exc: IntegrityError) -> bool:
     from being silently retried and surfaced as an "exhausted attempts"
     :class:`RuntimeError` that masks the real bug.
     """
-    if not _is_unique_violation(exc):
+    if not is_unique_violation(exc):
         return False
-    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
-        name = getattr(candidate, "constraint_name", None)
-        if name is not None:
-            return "public_id" in name
+    name = violated_constraint_name(exc)
+    if name is not None:
+        return "public_id" in name
     return "public_id" in str(exc.orig)
-
-
-def _is_unique_violation(exc: IntegrityError) -> bool:
-    """Return True when ``exc`` wraps a Postgres ``unique_violation``.
-
-    Checks the SQLSTATE on the driver exception (asyncpg exposes it as
-    ``sqlstate``; other DBAPIs as ``pgcode``) against ``23505``. Walks both
-    ``exc.orig`` and its ``__cause__`` because the driver exception may be
-    wrapped.
-    """
-    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
-        sqlstate = getattr(candidate, "sqlstate", None) or getattr(
-            candidate, "pgcode", None
-        )
-        if sqlstate == _UNIQUE_VIOLATION_SQLSTATE:
-            return True
-    return False

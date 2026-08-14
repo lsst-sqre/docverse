@@ -9,7 +9,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
+from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -25,12 +27,15 @@ from docverse_server.domain.base32id import (
     generate_base32_id,
     validate_base32_id,
 )
-from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.exceptions import InvalidJobStateError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.queue_job_store import (
+    _ACTIVE_JOB_UNIQUE_INDEXES,
+    QueueJobStore,
+)
 
 
 @pytest.fixture
@@ -2195,3 +2200,178 @@ async def test_list_by_org_paginates(
         newest[2].id,
         newest[3].id,
     ]
+
+
+# ---------------------------------------------------------------------------
+# create_unless_active — race-tolerant insert against the active-job
+# partial unique indexes (issue #508)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_unless_active_returns_none_when_slot_taken(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The loser of the active-job race gets ``None``, not an exception."""
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session, slug="cua-taken")
+        first = await store.create_unless_active(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            subject_label="pipelines",
+        )
+        second = await store.create_unless_active(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            subject_label="pipelines",
+        )
+        await db_session.commit()
+
+    assert first is not None
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_create_unless_active_leaves_transaction_usable(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A lost race does not poison the caller's transaction.
+
+    The whole point of absorbing the violation inside a savepoint: the
+    tier-cron pass that loses the race on one slug must keep enqueuing
+    the remaining slugs, and must be able to commit what it did.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session, slug="cua-usable")
+        await store.create_unless_active(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            subject_label="pipelines",
+        )
+        lost = await store.create_unless_active(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            subject_label="pipelines",
+        )
+        # The transaction survived: a further read and a further write
+        # both succeed, and the whole unit commits.
+        assert lost is None
+        assert await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="pipelines",
+        )
+        next_slug = await store.create_unless_active(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            subject_label="afw",
+        )
+        await db_session.commit()
+
+    assert next_slug is not None
+    async with db_session.begin():
+        rows = (
+            (
+                await db_session.execute(
+                    select(SqlQueueJob).where(SqlQueueJob.org_id == org_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(row.subject_label or "" for row in rows) == [
+        "afw",
+        "pipelines",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_unless_active_propagates_other_integrity_errors(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A non-unique-violation IntegrityError is not swallowed.
+
+    ``edition_id`` is a real foreign key; pointing it at a missing row
+    raises SQLSTATE ``23503``, which the helper must let through rather
+    than reporting as "someone else holds the slot".
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session, slug="cua-fk")
+        with pytest.raises(IntegrityError):
+            await store.create_unless_active(
+                kind=JobKind.publish_edition,
+                org_id=org_id,
+                edition_id=987654321,
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_unless_active_dedups_concurrent_sessions(
+    db_session: AsyncSession,
+) -> None:
+    """Two genuinely concurrent inserts settle on exactly one row.
+
+    Each task runs on its own session/connection and both enter their
+    transaction before either inserts, so the winner is decided by the
+    ``idx_queue_jobs_keeper_sync_project_active_uq`` index rather than by
+    the application-side pre-check. The loser blocks on the winner's row
+    lock, then gets ``None`` once the winner commits — neither raises.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, _ = await _seed_org_project(db_session, slug="cua-concurrent")
+        await db_session.commit()
+
+    barrier = asyncio.Barrier(2)
+
+    async def enqueue() -> QueueJob | None:
+        async for session in db_session_dependency():
+            store = QueueJobStore(session=session, logger=logger)
+            async with session.begin():
+                await barrier.wait()
+                job = await store.create_unless_active(
+                    kind=JobKind.keeper_sync_project,
+                    org_id=org_id,
+                    subject_label="pipelines",
+                )
+                await session.commit()
+            return job
+        msg = "No database session available"
+        raise RuntimeError(msg)
+
+    results = await asyncio.gather(enqueue(), enqueue())
+
+    assert sum(job is not None for job in results) == 1
+    assert sum(job is None for job in results) == 1
+    async with db_session.begin():
+        rows = (
+            (
+                await db_session.execute(
+                    select(SqlQueueJob).where(SqlQueueJob.org_id == org_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+
+
+def test_active_job_unique_indexes_cover_every_mutex() -> None:
+    """The derived index set names every active-job mutex on the table.
+
+    ``_ACTIVE_JOB_UNIQUE_INDEXES`` is derived from the table metadata by
+    naming convention, so a mutex added later participates in
+    ``create_unless_active`` for free — but a rename that breaks the
+    convention would silently empty the set and turn the backstop back
+    into an unhandled ``IntegrityError``. Pin the current membership so
+    that regression fails here instead of in production.
+    """
+    assert {
+        "idx_queue_jobs_keeper_sync_project_active_uq",
+        "idx_queue_jobs_lifecycle_eval_active_uq",
+        "idx_queue_jobs_git_ref_audit_active_uq",
+        "idx_queue_jobs_dashboard_build_active_uq",
+    } == _ACTIVE_JOB_UNIQUE_INDEXES

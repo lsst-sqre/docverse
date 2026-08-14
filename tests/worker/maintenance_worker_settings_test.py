@@ -72,6 +72,11 @@ def test_maintenance_worker_settings_uses_dedicated_queue() -> None:
     )
 
 
+def test_maintenance_worker_settings_sets_max_jobs_from_config() -> None:
+    """The maintenance pool declares its job concurrency explicitly."""
+    assert MaintenanceWorkerSettings.max_jobs == _config.maintenance_max_jobs
+
+
 def test_maintenance_worker_settings_registers_functions() -> None:
     """Dispatcher and per-org worker are both registered, single-attempt.
 

@@ -295,3 +295,54 @@ async def test_enqueue_for_org_filters_skipped_projects(
     assert project.id == kept_project.id
     assert queue_job is not None
     assert queue_job.project_id == kept_project.id
+
+
+@pytest.mark.asyncio
+async def test_enqueue_for_project_absorbs_lost_race(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost race returns ``None`` instead of raising (Sentry DOCVERSE-C).
+
+    ``has_active_dashboard_build`` is stubbed to always miss, which is
+    what a real race looks like from the enqueuing worker: the
+    pre-check's ``SELECT`` sees nothing, but by the time the ``INSERT``
+    lands another cascade holds
+    ``idx_queue_jobs_dashboard_build_active_uq``. The publish cascade
+    wraps this call in a bare ``except Exception`` that reports to
+    Sentry, so a benign duplicate must not surface as an exception at
+    all.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_with_project(
+            db_session,
+            org_slug="race-org",
+            project_slug="race-proj",
+        )
+        await db_session.commit()
+
+    enqueuer = _make_enqueuer(db_session, arq_queue=arq_queue)
+    async with db_session.begin():
+        first = await enqueuer.enqueue_for_project(
+            org_id=org_id, project_id=project_id
+        )
+        await db_session.commit()
+    assert first is not None
+
+    async def always_miss(*args: object, **kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        QueueJobStore, "has_active_dashboard_build", always_miss
+    )
+
+    async with db_session.begin():
+        second = await enqueuer.enqueue_for_project(
+            org_id=org_id, project_id=project_id
+        )
+        await db_session.commit()
+
+    assert second is None
+    async with db_session.begin():
+        assert await _count_dashboard_rows(db_session) == 1

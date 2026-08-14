@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -606,3 +606,124 @@ async def test_discovery_skips_tombstoned_project_slugs(
             child_rows = (await session.execute(stmt)).scalars().all()
             assert len(child_rows) == 1
             assert child_rows[0].subject_label == "sqr-112"
+
+
+# ---------------------------------------------------------------------------
+# Lost active-job race in the discovery fan-out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discovery_lost_race_does_not_truncate_the_fanout(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the per-slug race skips that slug, not the rest of the run.
+
+    The ``has_active_for_subject`` pre-check is stubbed to always miss,
+    which is exactly what a genuine race looks like from the enqueuing
+    worker's point of view: the ``SELECT`` sees no active row, but by the
+    time the ``INSERT`` lands another worker (the 5-minute
+    ``keeper_sync_tier`` cron, typically) holds
+    ``idx_queue_jobs_keeper_sync_project_active_uq``. The lost race must
+    skip that one slug — not escape to
+    ``keeper_sync_run_discovery``'s outer ``except``, which would fail
+    the discovery job *and* the whole run while silently dropping every
+    remaining in-scope project.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001", "sqr-112"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # Another worker already holds the mutex for ``dmtn-001``.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        existing = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label="dmtn-001",
+            backend_job_id="arq-job-tier-cron",
+        )
+
+    async def always_miss(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(QueueJobStore, "has_active_for_subject", always_miss)
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001", "sqr-112"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # ``dmtn-001`` lost the race and was skipped; ``sqr-112`` — which
+    # comes after it in the per-slug loop — is still enqueued.
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert [j.kwargs["payload"]["ltd_slug"] for j in project_jobs] == [
+        "sqr-112"
+    ]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            # Exactly one active ``dmtn-001`` row — the other worker's —
+            # survives; the lost insert left no duplicate behind.
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                SqlQueueJob.subject_label == "dmtn-001",
+                SqlQueueJob.org_id == org_id,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            assert len(rows) == 1
+            assert rows[0].id == existing.id
+
+            # The skipped slug is not attributed to this run, so the run's
+            # child count matches what actually got enqueued and
+            # ``maybe_finalise_run`` can still reach a terminal status.
+            attributed = (
+                (
+                    await session.execute(
+                        select(SqlQueueJob).where(
+                            SqlQueueJob.keeper_sync_run_id == run_id,
+                            SqlQueueJob.kind
+                            == JobKind.keeper_sync_project.value,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(attributed) == 1
+            assert attributed[0].subject_label == "sqr-112"
+
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.in_progress
+
+            disc_store = QueueJobStore(session=session, logger=_logger())
+            disc = await disc_store.get(queue_job_id)
+            assert disc is not None
+            assert disc.status == JobStatus.completed
+            assert disc.progress is not None
+            assert disc.progress["enqueued_count"] == 1

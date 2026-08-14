@@ -96,6 +96,7 @@ class AdminOrganization(_OrganizationBase):
             root_path_prefix=domain.root_path_prefix,
             slug_rewrite_rules=domain.slug_rewrite_rules,
             lifecycle_rules=domain.lifecycle_rules,
+            edition_autocreation=domain.edition_autocreation,
             purgatory_retention=int(
                 domain.purgatory_retention.total_seconds()
             ),

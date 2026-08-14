@@ -8,6 +8,7 @@ from typing import Any
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -15,12 +16,55 @@ from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse_server.storage._integrity import (
+    is_unique_violation,
+    violated_constraint_name,
+)
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
 )
 from docverse_server.storage.pagination import QueueJobDateCreatedCursor
 
 __all__ = ["QueueJobStore"]
+
+ACTIVE_JOB_INDEX_SUFFIX = "_active_uq"
+"""Naming convention for the ``queue_jobs`` active-job mutex indexes.
+
+Every partial unique index on ``queue_jobs`` whose predicate is
+``status IN ('queued', 'in_progress')`` — the per-``(org, subject_label)``
+keeper-sync mutex, the per-org lifecycle-eval and git-ref-audit mutexes,
+and the per-``(org, project)`` dashboard-build mutex — is named with this
+suffix. :data:`_ACTIVE_JOB_UNIQUE_INDEXES` is derived from the table
+metadata rather than hand-listed so a mutex added later participates in
+:meth:`QueueJobStore.create_unless_active` automatically.
+"""
+
+_ACTIVE_JOB_UNIQUE_INDEXES = frozenset(
+    index.name
+    for index in SqlQueueJob.metadata.tables[SqlQueueJob.__tablename__].indexes
+    if index.unique
+    and index.name is not None
+    and index.name.endswith(ACTIVE_JOB_INDEX_SUFFIX)
+)
+"""Names of the ``queue_jobs`` partial unique indexes guarding active jobs."""
+
+
+def _is_active_job_conflict(exc: IntegrityError) -> bool:
+    """Return True when ``exc`` is an active-job mutex unique violation.
+
+    Two conditions must hold: the error is a Postgres ``unique_violation``
+    (so a foreign-key or NOT NULL violation is never absorbed), and the
+    offending constraint is one of the ``queue_jobs`` active-job partial
+    unique indexes (so a ``public_id`` collision — or any future
+    constraint on the table — still propagates).
+    """
+    if not is_unique_violation(exc):
+        return False
+    name = violated_constraint_name(exc)
+    if name is not None:
+        return name in _ACTIVE_JOB_UNIQUE_INDEXES
+    message = str(exc.orig)
+    return any(index in message for index in _ACTIVE_JOB_UNIQUE_INDEXES)
 
 
 class QueueJobStore:
@@ -76,6 +120,76 @@ class QueueJobStore:
         )
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
+
+    async def create_unless_active(
+        self,
+        *,
+        kind: JobKind,
+        org_id: int,
+        backend_job_id: str | None = None,
+        project_id: int | None = None,
+        build_id: int | None = None,
+        edition_id: int | None = None,
+        keeper_sync_run_id: int | None = None,
+        lifecycle_eval_run_id: int | None = None,
+        git_ref_audit_run_id: int | None = None,
+        subject_label: str | None = None,
+    ) -> QueueJob | None:
+        """Insert a QueueJob row, returning ``None`` if the mutex is held.
+
+        Race-tolerant sibling of :meth:`create` for the kinds guarded by
+        a ``queue_jobs`` active-job partial unique index. Callers pair a
+        cheap ``has_active_*`` pre-check (the fast path, which also keeps
+        the reapers' unwedging contract meaningful) with this insert (the
+        backstop): between the pre-check's ``SELECT`` and the ``INSERT``
+        another worker can win the slot, and the index — not the
+        pre-check — is what actually enforces the mutex. Rather than let
+        that lost race surface as an ``IntegrityError``, this returns
+        ``None``, the same "someone else already holds the slot" signal
+        the pre-check produces.
+
+        The insert already runs inside a SAVEPOINT (see
+        :func:`~docverse_server.storage._public_id.insert_with_time_ordered_public_id`),
+        so absorbing the violation leaves the handler-owned outer
+        transaction usable — the caller can keep working (enqueue the
+        next project in the tier pass, commit its other writes) instead
+        of unwinding.
+
+        Only an active-job mutex violation is absorbed. Any other
+        integrity error — a foreign-key violation, a NOT NULL violation,
+        an exhausted ``public_id`` re-mint — propagates untouched, so a
+        genuine bug still fails loudly.
+
+        Returns
+        -------
+        QueueJob | None
+            The inserted job, or ``None`` when an active job already
+            holds the mutex this row would have claimed.
+        """
+        try:
+            return await self.create(
+                kind=kind,
+                org_id=org_id,
+                backend_job_id=backend_job_id,
+                project_id=project_id,
+                build_id=build_id,
+                edition_id=edition_id,
+                keeper_sync_run_id=keeper_sync_run_id,
+                lifecycle_eval_run_id=lifecycle_eval_run_id,
+                git_ref_audit_run_id=git_ref_audit_run_id,
+                subject_label=subject_label,
+            )
+        except IntegrityError as exc:
+            if not _is_active_job_conflict(exc):
+                raise
+            self._logger.info(
+                "Lost the active-job race for a queue job",
+                kind=kind.value,
+                org_id=org_id,
+                project_id=project_id,
+                subject_label=subject_label,
+            )
+            return None
 
     async def get(self, job_id: int) -> QueueJob | None:
         """Fetch a QueueJob by internal id."""

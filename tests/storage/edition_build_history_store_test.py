@@ -257,6 +257,66 @@ async def test_get_by_edition_and_build_not_found(
 
 
 @pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_matches_exact_pairs(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """Only the requested ``(edition_id, build_id)`` pairs come back.
+
+    The batched lookup replaces one ``get_by_edition_and_build`` round
+    trip per edition, so it has to be pair-exact: an edition/build
+    cross-product would report a history row for a pair that never
+    existed, and the keeper-sync aggregate self-heal reads exactly that
+    signal as "a publish was already enqueued for this build".
+    """
+    async with db_session.begin():
+        ed1_id, project_id, build_ids = await _create_edition_and_builds(
+            db_session,
+            n_builds=2,
+            edition_slug="pairs-one",
+            org_slug="pairs-org",
+            project_slug="pairs-proj",
+        )
+        logger = structlog.get_logger("docverse")
+        edition_store = EditionStore(session=db_session, logger=logger)
+        ed2 = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="pairs-two",
+                title="Pairs Two",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "v1.0"},
+            ),
+        )
+        # Edition 1 pointed at build 0; edition 2 pointed at build 1.
+        # The crossed pairs — (ed1, build 1) and (ed2, build 0) — were
+        # never recorded.
+        await history_store.record(edition_id=ed1_id, build_id=build_ids[0])
+        await history_store.record(edition_id=ed2.id, build_id=build_ids[1])
+        rows = await history_store.list_by_edition_build_pairs(
+            [
+                (ed1_id, build_ids[0]),
+                (ed1_id, build_ids[1]),
+                (ed2.id, build_ids[0]),
+            ]
+        )
+        await db_session.commit()
+
+    assert [(row.edition_id, row.build_id) for row in rows] == [
+        (ed1_id, build_ids[0])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_empty(
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """An empty pair list returns ``[]`` without hitting the database."""
+    assert await history_store.list_by_edition_build_pairs([]) == []
+
+
+@pytest.mark.asyncio
 async def test_list_with_build_info_includes_status(
     db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,

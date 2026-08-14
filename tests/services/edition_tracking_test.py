@@ -14,6 +14,8 @@ from docverse.models import (
     BuildCreate,
     EditionCreate,
     EditionKind,
+    EditionKindSource,
+    EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
@@ -28,6 +30,12 @@ from docverse_server.services.edition_tracking import (
     EditionTrackingDeps,
     EditionTrackingService,
 )
+from docverse_server.services.lock_service import (
+    LockClass,
+    LockKey,
+    LockService,
+)
+from docverse_server.services.project import DEFAULT_EDITION_SLUG
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -35,6 +43,7 @@ from docverse_server.storage.edition_build_history_store import (
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.lock_service_spy import RecordingLockService
 
 _HASH = "sha256:" + "a" * 64
 
@@ -45,6 +54,8 @@ def _logger() -> structlog.stdlib.BoundLogger:
 
 def _make_service(
     db_session: AsyncSession,
+    *,
+    lock_service: LockService | None = None,
 ) -> EditionTrackingService:
     logger = _logger()
     deps = EditionTrackingDeps(
@@ -55,6 +66,7 @@ def _make_service(
         project_store=ProjectStore(session=db_session, logger=logger),
         org_store=OrganizationStore(session=db_session, logger=logger),
         logger=logger,
+        lock_service=lock_service,
     )
     return EditionTrackingService(deps)
 
@@ -64,6 +76,8 @@ async def _setup(
     *,
     org_slug: str = "track-org",
     org_slug_rewrite_rules: list[dict[str, Any]] | None = None,
+    org_edition_autocreation: dict[str, Any] | None = None,
+    project_edition_autocreation: dict[str, Any] | None = None,
 ) -> tuple[Organization, Project]:
     """Create an org and project, returning both."""
     logger = _logger()
@@ -78,11 +92,18 @@ async def _setup(
     )
     # Set slug_rewrite_rules directly on the SQL row because the
     # Pydantic model types the field as dict but the DB stores a list.
+    # ``edition_autocreation`` goes the same way because it is settable
+    # only through PATCH, not through the create models.
+    org_values: dict[str, Any] = {}
     if org_slug_rewrite_rules is not None:
+        org_values["slug_rewrite_rules"] = org_slug_rewrite_rules
+    if org_edition_autocreation is not None:
+        org_values["edition_autocreation"] = org_edition_autocreation
+    if org_values:
         await db_session.execute(
             update(SqlOrganization)
             .where(SqlOrganization.id == org.id)
-            .values(slug_rewrite_rules=org_slug_rewrite_rules)
+            .values(**org_values)
         )
         await db_session.flush()
     project = await proj_store.create(
@@ -93,6 +114,18 @@ async def _setup(
             source_url="https://example.com/example/repo",
         ),
     )
+    if project_edition_autocreation is not None:
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(edition_autocreation=project_edition_autocreation)
+        )
+        await db_session.flush()
+        reloaded = await proj_store.get_by_id(project.id)
+        if reloaded is None:
+            msg = f"Project id={project.id} vanished after update"
+            raise RuntimeError(msg)
+        project = reloaded
     return org, project
 
 
@@ -507,6 +540,43 @@ async def test_track_build_project_rules_override_org(
     assert result.suppressed is True
     assert result.derived_slug is None
     assert len(result.outcomes) == 0
+
+
+@pytest.mark.asyncio
+async def test_track_build_empty_project_rules_opt_out_of_org(
+    db_session: AsyncSession,
+) -> None:
+    """An explicit empty project rule list opts out of the org's rules.
+
+    ``[]`` is a deliberate override, not "unset": the org's ignore rule
+    must not suppress the ref, and the built-in fallback derives the
+    slug instead.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="optout-org",
+            org_slug_rewrite_rules=[
+                {"type": "ignore", "glob": "tags/*"},
+            ],
+        )
+        # Explicitly clear the rules at the project level.
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(slug_rewrite_rules=[])
+        )
+        await db_session.flush()
+
+        build = await _create_build(
+            db_session, project.id, git_ref="tags/v1.0"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert result.suppressed is False
+    assert result.derived_slug == "tags-v1.0"
 
 
 @pytest.mark.asyncio
@@ -1176,4 +1246,709 @@ async def test_track_build_unparseable_ref_no_match(
         )
         assert ed is not None
         assert ed.current_build_id == build_valid.id
+        await db_session.commit()
+
+
+# ── Built-in version rule tests ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_track_build_builtin_semver_release(
+    db_session: AsyncSession,
+) -> None:
+    """A stable semver ref auto-creates a release edition with no config."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="builtin-rel-org")
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert result.derived_slug == "1.0.0"
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.release
+        assert edition.tracking_mode == TrackingMode.git_ref
+        assert edition.tracking_params == {"git_ref": "1.0.0"}
+        assert edition.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_builtin_semver_prerelease_is_draft(
+    db_session: AsyncSession,
+) -> None:
+    """A semver prerelease falls through the built-ins to a draft."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="builtin-pre-org")
+        build = await _create_build(
+            db_session, project.id, git_ref="1.0.0-rc.1"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert result.derived_slug == "1.0.0-rc.1"
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0-rc.1"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_user_rule_beats_builtin(
+    db_session: AsyncSession,
+) -> None:
+    """A configured rule matching a version-like ref wins over built-ins."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="builtin-override-org",
+            org_slug_rewrite_rules=[
+                {
+                    "type": "regex",
+                    "pattern": r"^(?P<slug>\d+\.\d+\.\d+)$",
+                    "edition_kind": "draft",
+                }
+            ],
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0"
+        )
+        assert edition is not None
+        assert edition.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_logs_matched_rule_type(
+    db_session: AsyncSession,
+) -> None:
+    """The derivation log event names the rule type that matched."""
+    service = _make_service(db_session)
+    with structlog.testing.capture_logs() as logs:
+        async with db_session.begin():
+            _org, project = await _setup(
+                db_session, org_slug="builtin-log-org"
+            )
+            build = await _create_build(
+                db_session, project.id, git_ref="w_2026_10"
+            )
+            await service.track_build(build)
+            await db_session.commit()
+
+    derivations = [
+        entry for entry in logs if entry["event"] == "Derived edition slug"
+    ]
+    assert len(derivations) == 1
+    assert derivations[0]["matched_rule_type"] == "eups_weekly"
+    assert derivations[0]["edition_kind"] == EditionKind.release
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_disabled_on_project(
+    db_session: AsyncSession,
+) -> None:
+    """A project opting out gets the release edition but no aggregates."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="no-agg-proj-org",
+            project_edition_autocreation={"semver_aggregates": False},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0"}
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        assert (
+            await edition_store.get_by_slug(project_id=project.id, slug="1")
+        ) is None
+        assert (
+            await edition_store.get_by_slug(project_id=project.id, slug="1.0")
+        ) is None
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_disabled_still_updates_existing(
+    db_session: AsyncSession,
+) -> None:
+    """The knob gates autocreation only, not existing aggregates."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="keep-agg-org",
+            project_edition_autocreation={"semver_aggregates": False},
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="1",
+            title="Latest 1.x",
+            kind=EditionKind.major,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 1},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    outcomes_by_slug = {o.slug: o for o in result.outcomes}
+    assert outcomes_by_slug["1"].action == "updated"
+    assert "1.0" not in outcomes_by_slug
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_disabled_on_org(
+    db_session: AsyncSession,
+) -> None:
+    """An org-level opt-out applies when the project value is null."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="no-agg-org",
+            org_edition_autocreation={"semver_aggregates": False},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_project_overrides_org(
+    db_session: AsyncSession,
+) -> None:
+    """A project opting in beats an org that opted out."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-override-org",
+            org_edition_autocreation={"semver_aggregates": False},
+            project_edition_autocreation={"semver_aggregates": True},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_default_when_unconfigured(
+    db_session: AsyncSession,
+) -> None:
+    """All-null config leaves aggregate creation on, as before."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="agg-default-org")
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_survive_slug_only_user_rule(
+    db_session: AsyncSession,
+) -> None:
+    """A slug-shaping user rule does not disable aggregate creation.
+
+    An org whose ``prefix_strip`` rule exists only to drop the ``v``
+    from ``v16.0.0`` leaves the derived kind at that rule's default
+    (``draft``) — user rules run ahead of the built-in ``SemverRule``,
+    so the built-in never gets to classify the ref. Gating the
+    aggregates on the ref's own semver grammar instead of on the
+    derived kind keeps ``16`` / ``16.0`` coming.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-shadow-org",
+            org_slug_rewrite_rules=[{"type": "prefix_strip", "prefix": "v"}],
+        )
+        build = await _create_build(db_session, project.id, git_ref="v16.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"16.0.0", "16", "16.0"}
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_survive_draft_semver_rule(
+    db_session: AsyncSession,
+) -> None:
+    """A ``semver`` rule re-pointed at ``draft`` no longer suppresses.
+
+    The aggregate gate cannot tell a deliberate "these tags are not
+    releases" rule from one that shadows the built-in by accident, so
+    it stops guessing from the derived kind: the release edition is a
+    ``draft`` as the rule asks, and ``1`` / ``1.0`` are still created.
+    ``edition_autocreation.semver_aggregates`` is the knob for orgs
+    that really want no aggregates.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-kind-rule-org",
+            org_slug_rewrite_rules=[
+                {"type": "semver", "edition_kind": "draft"}
+            ],
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0", "1", "1.0"}
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        release = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0.0"
+        )
+        assert release is not None
+        assert release.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_semver_aggregates_skipped_for_shadowed_prerelease(
+    db_session: AsyncSession,
+) -> None:
+    """A prerelease gets no aggregates even under a slug-shaping rule.
+
+    The grammar gate keeps the prerelease exclusion the built-in
+    ``SemverRule`` has: ``v1.0.0-rc.1`` is not a stable release, so no
+    ``1`` / ``1.0`` rows appear even though the ``prefix_strip`` rule
+    matched the ref.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="agg-shadow-pre-org",
+            org_slug_rewrite_rules=[{"type": "prefix_strip", "prefix": "v"}],
+        )
+        build = await _create_build(
+            db_session, project.id, git_ref="v1.0.0-rc.1"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} == {"1.0.0-rc.1"}
+
+
+@pytest.mark.asyncio
+async def test_track_build_promotes_pre_existing_draft_edition(
+    db_session: AsyncSession,
+) -> None:
+    """A stale draft on a version ref heals to release on the next build.
+
+    Version-slugged editions created before the built-in version rules
+    landed were all stamped ``draft``. The next tracked build for their
+    ref re-derives the kind and converges the row, so the native path
+    heals exactly as keeper-sync's ``_refresh_kind`` does for migrated
+    projects.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="heal-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert {o.slug for o in result.outcomes} >= {"1.0.0"}
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        healed = await edition_store.get_by_id(stale.id)
+        assert healed is not None
+        assert healed.kind == EditionKind.release
+        assert healed.kind_source == EditionKindSource.derived
+        assert healed.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_demotes_when_the_rules_change(
+    db_session: AsyncSession,
+) -> None:
+    """Convergence runs downhill too, which is how promotions are undone.
+
+    An org that decides its version tags are not releases says so with a
+    ``semver`` rule. The rows the built-in heuristic already promoted are
+    still Docverse's (``kind_source == derived``), so the next tracked
+    build writes the new derivation rather than leaving a permanently
+    mis-kinded release behind.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session,
+            org_slug="demote-org",
+            org_slug_rewrite_rules=[
+                {"type": "semver", "edition_kind": "draft"}
+            ],
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        promoted = await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        converged = await edition_store.get_by_id(promoted.id)
+        assert converged is not None
+        assert converged.kind == EditionKind.draft
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_does_not_promote_an_existing_draft_alternate(
+    db_session: AsyncSession,
+) -> None:
+    """An alternate on a version tag heals to ``alternate``, not ``release``.
+
+    Nothing in the server ever wrote ``EditionKind.alternate``, so every
+    system-created alternate sits at ``draft``. Inheriting the rule
+    chain's kind would have made the heal retroactively promote each one
+    to ``release`` the first time a version-tagged build landed on it —
+    a long CDN cache profile, the wrong dashboard bucket, and permanent
+    exemption from lifecycle reaping for a preview deployment.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alt-heal-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug="usdf-dev--1.2.3",
+            title="usdf-dev--1.2.3",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.alternate_git_ref,
+            tracking_params={
+                "git_ref": "1.2.3",
+                "alternate_name": "usdf-dev",
+            },
+            alternate_name="usdf-dev",
+        )
+        build = await _create_build(
+            db_session,
+            project.id,
+            git_ref="1.2.3",
+            alternate_name="usdf-dev",
+        )
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        healed = await edition_store.get_by_id(stale.id)
+        assert healed is not None
+        assert healed.kind == EditionKind.alternate
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_respects_a_declared_demotion_to_draft(
+    db_session: AsyncSession,
+) -> None:
+    """A hand-PATCHed demotion is not undone by the next upload.
+
+    The PATCH here goes through ``EditionStore.update``, the real
+    editions-API write path, so ``kind_source`` is stamped ``declared``
+    the way production stamps it — and convergence never touches a
+    declared row.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="manual-draft-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        pinned = await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        demoted = await edition_store.update(
+            project_id=project.id,
+            slug="1.0.0",
+            data=EditionUpdate(kind=EditionKind.draft),
+        )
+        assert demoted is not None
+        assert demoted.kind == EditionKind.draft
+
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        held = await edition_store.get_by_id(pinned.id)
+        assert held is not None
+        assert held.kind == EditionKind.draft
+        assert held.kind_source == EditionKindSource.declared
+        assert held.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_leaves_correct_kind_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """An edition already carrying the derived kind is not rewritten.
+
+    The steady-state path for every already-correct edition: the derived
+    kind equals the stored kind, so no ``kind`` write is issued and no
+    convergence event is logged.
+    """
+    service = _make_service(db_session)
+    with structlog.testing.capture_logs() as logs:
+        async with db_session.begin():
+            _org, project = await _setup(db_session, org_slug="noop-kind-org")
+            edition_store = EditionStore(session=db_session, logger=_logger())
+            await edition_store.create_internal(
+                project_id=project.id,
+                slug="1.0.0",
+                title="1.0.0",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            )
+            build = await _create_build(
+                db_session, project.id, git_ref="1.0.0"
+            )
+            await service.track_build(build)
+            await db_session.commit()
+
+    assert not [e for e in logs if e["event"] == "Converged edition kind"]
+
+
+@pytest.mark.asyncio
+async def test_track_build_logs_every_kind_change(
+    db_session: AsyncSession,
+) -> None:
+    """Each converged row leaves an audit trail of old kind -> new kind."""
+    service = _make_service(db_session)
+    with structlog.testing.capture_logs() as logs:
+        async with db_session.begin():
+            _org, project = await _setup(db_session, org_slug="heal-log-org")
+            edition_store = EditionStore(session=db_session, logger=_logger())
+            stale = await edition_store.create_internal(
+                project_id=project.id,
+                slug="1.0.0",
+                title="1.0.0",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "1.0.0"},
+            )
+            build = await _create_build(
+                db_session, project.id, git_ref="1.0.0"
+            )
+            await service.track_build(build)
+            await db_session.commit()
+
+    events = [e for e in logs if e["event"] == "Converged edition kind"]
+    assert len(events) == 1
+    assert events[0]["edition_id"] == stale.id
+    assert events[0]["previous_kind"] == "draft"
+    assert events[0]["edition_kind"] == "release"
+    assert events[0]["kind_trigger"] == "build_upload"
+
+
+@pytest.mark.asyncio
+async def test_track_build_holds_the_edition_lock_for_the_kind_write(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kind convergence write serializes against ``publish_edition``.
+
+    ``publish_edition`` reads ``edition.kind`` to pick the CDN cache
+    profile. A job that loaded the edition before an unlocked promotion
+    committed would write the KV pointer with the stale ``short``
+    profile and skip the hostname purge, leaving the edge serving
+    ``max-age=60`` for a release. The write therefore takes the same
+    ``EDITION_UPDATE`` key the pointer write does, and the trace below
+    pins that the write happens *between* the acquire and the release.
+    """
+    trace: list[str] = []
+    lock_service = RecordingLockService(
+        session=db_session, logger=_logger(), events=[], trace=trace
+    )
+    service = _make_service(db_session, lock_service=lock_service)
+
+    original_update_kind = EditionStore.update_kind
+
+    async def _traced_update_kind(
+        self: EditionStore, *, edition_id: int, kind: EditionKind
+    ) -> None:
+        trace.append(f"update_kind:{edition_id}")
+        await original_update_kind(self, edition_id=edition_id, kind=kind)
+
+    monkeypatch.setattr(EditionStore, "update_kind", _traced_update_kind)
+
+    async with db_session.begin():
+        org, project = await _setup(db_session, org_slug="heal-lock-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0.0",
+            title="1.0.0",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "1.0.0"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    expected_key = LockKey.for_edition_update(
+        org_id=org.id, project_id=project.id, edition_id=stale.id
+    )
+    assert expected_key.lock_class == LockClass.EDITION_UPDATE
+    write = trace.index(f"update_kind:{stale.id}")
+    held = [
+        i
+        for i, entry in enumerate(trace)
+        if entry == f"enter:{expected_key.lock_id}" and i < write
+    ]
+    released = [
+        i
+        for i, entry in enumerate(trace)
+        if entry == f"exit:{expected_key.lock_id}" and i > write
+    ]
+    assert held, "kind write ran with no EDITION_UPDATE lock held"
+    assert released, "EDITION_UPDATE lock released before the kind write"
+
+
+@pytest.mark.asyncio
+async def test_track_build_never_demotes_declared_or_structural_kinds(
+    db_session: AsyncSession,
+) -> None:
+    """Declared and structural kinds both survive a ``draft`` derivation.
+
+    A build on a non-version ref derives ``draft``, yet neither the
+    operator-declared ``release`` edition tracking that ref nor the
+    project's ``__main`` edition may be demoted to it — the first
+    because it is ``declared``, the second because no ref derivation
+    governs the default edition's kind at all.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="no-demote-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        promoted_by_hand = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="stable",
+                title="Stable",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="main")
+
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        kept = await edition_store.get_by_id(promoted_by_hand.id)
+        assert kept is not None
+        assert kept.kind == EditionKind.release
+        main_edition = await edition_store.get_by_slug(
+            project_id=project.id, slug=DEFAULT_EDITION_SLUG
+        )
+        assert main_edition is not None
+        assert main_edition.kind == EditionKind.main
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_leaves_aggregate_kinds_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """Matched ``major`` / ``minor`` aggregates keep their kinds.
+
+    The convergence sweep runs over every matched edition, and a stable
+    semver build matches its ``N`` / ``N.M`` rollups alongside the
+    concrete release. Those rollups track ``semver_major`` /
+    ``semver_minor``, not the ``git_ref`` mode this derivation emits, so
+    the ``release`` derivation does not govern them.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="agg-kind-org")
+        build = await _create_build(db_session, project.id, git_ref="1.0.0")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        major = await edition_store.get_by_slug(
+            project_id=project.id, slug="1"
+        )
+        minor = await edition_store.get_by_slug(
+            project_id=project.id, slug="1.0"
+        )
+        assert major is not None
+        assert major.kind == EditionKind.major
+        assert minor is not None
+        assert minor.kind == EditionKind.minor
         await db_session.commit()

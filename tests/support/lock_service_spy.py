@@ -49,6 +49,11 @@ class RecordingLockService(LockService):
     recorded events live on the shared list passed at construction so
     multiple ``RecordingLockService`` instances created from the same
     factory share one event log.
+
+    ``trace`` is an optional second, plain-string log — ``enter:<id>`` /
+    ``exit:<id>`` — for tests that need to interleave lock events with
+    *other* instrumented calls (e.g. a patched store method) and assert
+    that a write happened while a particular lock was held.
     """
 
     def __init__(
@@ -56,9 +61,11 @@ class RecordingLockService(LockService):
         session: AsyncSession,
         logger: structlog.stdlib.BoundLogger,
         events: list[LockEvent],
+        trace: list[str] | None = None,
     ) -> None:
         super().__init__(session=session, logger=logger)
         self._events = events
+        self._trace = trace
 
     @asynccontextmanager
     async def acquire(self, lock_key: LockKey) -> AsyncGenerator[None]:
@@ -71,6 +78,8 @@ class RecordingLockService(LockService):
                     timestamp=time.monotonic(),
                 )
             )
+            if self._trace is not None:
+                self._trace.append(f"enter:{lock_key.lock_id}")
             try:
                 yield
             finally:
@@ -81,6 +90,8 @@ class RecordingLockService(LockService):
                         timestamp=time.monotonic(),
                     )
                 )
+                if self._trace is not None:
+                    self._trace.append(f"exit:{lock_key.lock_id}")
 
 
 def install_recording_lock_service(

@@ -73,6 +73,17 @@ class DashboardBuildEnqueuer:
         "at most one *queued* dashboard_build" semantics, not "at most
         one ever".
 
+        The ``has_active_dashboard_build`` pre-check is the fast path,
+        not the guarantee — a concurrent cascade can claim the slot
+        between its ``SELECT`` and this ``INSERT``. The insert therefore
+        goes through
+        :meth:`~docverse_server.storage.queue_job_store.QueueJobStore.create_unless_active`
+        so a lost race returns the same ``None`` as the pre-check skip.
+        Both module-level wrappers report every exception to Sentry, so
+        letting the ``IntegrityError`` escape would turn an expected
+        duplicate into an error report (Sentry ``DOCVERSE-C``) while
+        telling operators nothing actionable.
+
         Raises
         ------
         NotFoundError
@@ -97,11 +108,19 @@ class DashboardBuildEnqueuer:
             )
             return None
 
-        queue_job = await self._queue_job_store.create(
+        queue_job = await self._queue_job_store.create_unless_active(
             kind=JobKind.dashboard_build,
             org_id=org_id,
             project_id=project_id,
         )
+        if queue_job is None:
+            self._logger.info(
+                "Skipping dashboard_build enqueue: "
+                "lost the race for this project's active-job slot",
+                org_id=org_id,
+                project_id=project_id,
+            )
+            return None
         backend_job_id = await self._queue_backend.enqueue(
             "dashboard_build",
             {

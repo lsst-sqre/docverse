@@ -5,6 +5,7 @@ Launch with: ``arq docverse_server.worker.main.WorkerSettings``
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import timedelta
 from importlib.metadata import version
 from typing import Any
@@ -35,6 +36,7 @@ from docverse_server.sentry import (
     initialize_sentry,
     instrument_arq_task,
 )
+from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.services.credential_encryptor import CredentialEncryptor
 from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
@@ -102,6 +104,87 @@ def _cron_minutes_for_tier_interval(interval: timedelta) -> set[int]:
     return set(range(0, 60, minutes))
 
 
+DB_CONNECTIONS_PER_JOB = 2
+"""Peak database connections one concurrent worker job checks out.
+
+Every job runs on an ``AsyncSession``, which holds one pooled
+connection for the length of each ``session.begin()`` block. A job that
+also takes a Postgres advisory lock holds a **second**, dedicated
+connection for the whole
+:meth:`docverse_server.services.lock_service.LockService.acquire` block —
+that dedication is what keeps the lock from leaking onto a pooled
+connection a sibling session picks up (see the method's docstring).
+
+Three job kinds pair the two: ``publish_edition``, and keeper-sync's
+``sync_build`` and ``_ensure_aggregate_edition``. So a pool running
+``max_jobs`` of them concurrently needs twice ``max_jobs`` connections
+before any job blocks, and the arithmetic is per pool because each
+worker process owns its own engine.
+"""
+
+DB_POOL_HEADROOM = 5
+"""Spare connections above the per-job budget, used as ``max_overflow``.
+
+Cron-driven work runs *alongside* the ``max_jobs`` budget rather than
+inside it: the tier polls, the five reaper backstops, and the
+queue-stats gauge all open sessions of their own. This surge allowance
+keeps them off the critical path of the concurrent jobs, and gives a
+job whose session and lock connections briefly overlap a third slot to
+land in rather than blocking for ``pool_timeout``.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDbPoolSizing:
+    """Explicit SQLAlchemy engine pool sizing for one arq worker pool."""
+
+    pool_size: int
+    """Connections kept open for the pool's steady-state concurrency."""
+
+    max_overflow: int
+    """Additional connections allowed above :attr:`pool_size`."""
+
+
+def worker_db_pool_sizing(max_jobs: int) -> WorkerDbPoolSizing:
+    """Derive a worker's engine pool sizing from its job concurrency.
+
+    SQLAlchemy's defaults (``pool_size=5``, ``max_overflow=10``) are
+    sized for a request-per-connection web app, not for a pool of
+    ``max_jobs`` long-running jobs that each hold a lock connection and
+    a session connection at once. At the stock ``max_jobs = 10`` those
+    defaults leave five slots for ten session checkouts: the losers wait
+    out ``pool_timeout`` and then raise, and in keeper-sync each such
+    raise is laundered by ``sync_project``'s per-edition
+    ``except Exception`` into an edition failure that can trip the
+    systemic-abort or consecutive-failure breakers.
+
+    Every worker therefore states its sizing explicitly, derived from
+    the concurrency it declares: :data:`DB_CONNECTIONS_PER_JOB` slots
+    per concurrent job, plus :data:`DB_POOL_HEADROOM` for cron and
+    reaper work.
+    """
+    return WorkerDbPoolSizing(
+        pool_size=max_jobs * DB_CONNECTIONS_PER_JOB + DB_POOL_HEADROOM,
+        max_overflow=DB_POOL_HEADROOM,
+    )
+
+
+async def initialize_worker_db_pool(*, max_jobs: int) -> None:
+    """Initialize this worker process's session dependency and engine.
+
+    Split out of :func:`_startup` so the pool sizing a worker actually
+    ships with is reachable without standing up Redis, Alembic, and the
+    metrics event manager.
+    """
+    sizing = worker_db_pool_sizing(max_jobs)
+    await db_session_dependency.initialize(
+        config.database_url,
+        config.database_password,
+        pool_size=sizing.pool_size,
+        max_overflow=sizing.max_overflow,
+    )
+
+
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
 """Five-minute cadence for the ``arq_queue_stats`` gauge.
 
@@ -152,8 +235,15 @@ class WorkerFactoryBuilder:
         github_app_id: int | None,
         github_app_private_key: SecretStr | None,
         github_webhook_secret: SecretStr | None,
+        purge_coalescer: CdnPurgeCoalescer | None = None,
         default_queue_name: str,
+        keeper_sync_copy_concurrency: int,
     ) -> None:
+        # Process-lifetime, like ``http_client``: keeper-sync enqueues one
+        # ``publish_edition`` job per synced edition, so folding a publish
+        # burst's redundant per-project CDN purges needs state that spans
+        # jobs rather than living inside one.
+        self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
         self._encryptor = encryptor
         self._http_client = http_client
         self._arq_queue = arq_queue
@@ -163,6 +253,10 @@ class WorkerFactoryBuilder:
         self._github_webhook_secret = github_webhook_secret
         self._github_app_validated = True
         self._default_queue_name = default_queue_name
+        # Required rather than defaulted: the worker is the only process
+        # that copies build content, so a silent fallback here is
+        # precisely the invisible memory bound #517 removes.
+        self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
 
     @property
     def github_app_enabled(self) -> bool:
@@ -206,7 +300,9 @@ class WorkerFactoryBuilder:
             github_app_private_key=self._github_app_private_key,
             github_webhook_secret=self._github_webhook_secret,
             github_app_validated=self._github_app_validated,
+            purge_coalescer=self._purge_coalescer,
             default_queue_name=self._default_queue_name,
+            keeper_sync_copy_concurrency=self._keeper_sync_copy_concurrency,
         )
 
 
@@ -215,12 +311,15 @@ async def _startup(
     *,
     component: DocverseSentryComponent,
     queue_name: str,
+    max_jobs: int,
 ) -> None:
     """Initialize resources for the arq worker process.
 
     ``component`` distinguishes the three queues on Sentry: all worker
     settings share this body, so the per-startup wrappers below pick the
-    right tag.
+    right tag. ``max_jobs`` travels with it because the database pool is
+    sized per pool from the concurrency that pool declares — see
+    :func:`worker_db_pool_sizing`.
     """
     initialize_sentry(component=component)
     configure_logging(
@@ -247,10 +346,7 @@ async def _startup(
         queue_name=queue_name,
     )
 
-    await db_session_dependency.initialize(
-        config.database_url,
-        config.database_password,
-    )
+    await initialize_worker_db_pool(max_jobs=max_jobs)
 
     retired_key = (
         config.credential_encryption_key_retired.get_secret_value()
@@ -290,7 +386,11 @@ async def _startup(
         github_app_id=config.github_app_id,
         github_app_private_key=config.github_app_private_key,
         github_webhook_secret=config.github_webhook_secret,
+        purge_coalescer=CdnPurgeCoalescer(
+            min_interval=config.cdn_purge_min_interval_seconds
+        ),
         default_queue_name=config.arq_queue_name,
+        keeper_sync_copy_concurrency=config.keeper_sync_copy_concurrency,
     )
     await validate_github_app(
         state=factory_builder,
@@ -325,7 +425,12 @@ async def _startup(
 
 async def startup_default(ctx: dict[str, Any]) -> None:
     """on_startup for the default Docverse arq queue."""
-    await _startup(ctx, component="worker", queue_name=config.arq_queue_name)
+    await _startup(
+        ctx,
+        component="worker",
+        queue_name=config.arq_queue_name,
+        max_jobs=config.arq_max_jobs,
+    )
 
 
 async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
@@ -334,6 +439,7 @@ async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
         ctx,
         component="worker-keeper-sync",
         queue_name=KEEPER_SYNC_QUEUE_NAME,
+        max_jobs=config.keeper_sync_max_jobs,
     )
 
 
@@ -343,6 +449,7 @@ async def startup_maintenance(ctx: dict[str, Any]) -> None:
         ctx,
         component="worker-maintenance",
         queue_name=MAINTENANCE_QUEUE_NAME,
+        max_jobs=config.maintenance_max_jobs,
     )
 
 
@@ -363,14 +470,43 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    """arq WorkerSettings for the default Docverse queue."""
+    """arq WorkerSettings for the default Docverse queue.
 
+    ``max_jobs`` is declared rather than left to arq's implicit
+    default so the pool's concurrency is visible to operators and
+    movable from the environment. The value is arq's own default, so
+    this changes controllability, not behaviour. It is also this pool's
+    database-pool input: ``startup_default`` sizes the engine from it
+    via :func:`worker_db_pool_sizing`, budgeting
+    :data:`DB_CONNECTIONS_PER_JOB` connections per concurrent job —
+    ``publish_edition`` holds an ``EDITION_UPDATE`` lock connection
+    alongside its session — plus :data:`DB_POOL_HEADROOM` for the
+    queue-stats cron.
+    """
+
+    max_jobs = config.arq_max_jobs
     functions = [
         instrument_arq_task(build_processing),
         instrument_arq_task(dashboard_build),
         instrument_arq_task(dashboard_sync),
         instrument_arq_task(ping),
-        instrument_arq_task(publish_edition),
+        # ``publish_edition`` is the only default-pool job that
+        # deliberately waits — on the ``EDITION_UPDATE`` advisory lock,
+        # the per-hostname purge coalescer, and the purger's rate-limit
+        # backoff — so it carries an explicit, operator-movable budget
+        # instead of arq's implicit 300 s default (the sibling
+        # ``KeeperSyncWorkerSettings`` and ``MaintenanceWorkerSettings``
+        # do the same for their own long-running jobs). ``max_tries``
+        # is deliberately left unset: the job handles its own failures
+        # (``except Exception`` -> ``queue_job_store.fail()`` ->
+        # ``return "failed"``), so it never needed the single-attempt
+        # policy the other two pools use to surface failures promptly,
+        # and pinning one here would change retry behaviour that this
+        # timeout is not meant to touch.
+        func(
+            instrument_arq_task(publish_edition),
+            timeout=config.publish_edition_job_timeout_seconds,
+        ),
     ]
     # Generic arq-queue metrics (SQR-112): publish ``arq_job_run`` for
     # every job and an ``arq_queue_stats`` gauge for this pool's queue.
@@ -408,8 +544,29 @@ class KeeperSyncWorkerSettings:
     The cron-driven :func:`keeper_sync_reaper` is the second backstop
     — it covers the case where arq itself loses a job (e.g. an
     OOM-killed worker pod) and no timeout ever fires.
+
+    ``max_jobs`` is declared here rather than left to arq's implicit
+    default because it is half of this pool's memory bound: each
+    concurrent ``keeper_sync_project`` job runs its own
+    ``BuildContentCopier`` pool, so peak resident size scales with
+    ``keeper_sync_max_jobs`` x ``keeper_sync_copy_concurrency`` x the
+    largest object under a build prefix. Both factors are now
+    env-driven, so the pod's memory limit and the concurrency that
+    limit is sized against can move together.
+
+    ``max_jobs`` is equally this pool's *database*-pool input.
+    ``startup_keeper_sync`` sizes the engine from it via
+    :func:`worker_db_pool_sizing`: ``sync_build`` and
+    ``_ensure_aggregate_edition`` each hold an ``EDITION_UPDATE`` lock
+    connection *and* a session connection, so the pool budgets
+    :data:`DB_CONNECTIONS_PER_JOB` connections per concurrent job plus
+    :data:`DB_POOL_HEADROOM` for the tier crons, the reaper, and the
+    queue-stats gauge. SQLAlchemy's stock 5 + 10 left ten such jobs
+    fighting over five session slots, and every loser surfaced as a
+    ``sync_project`` edition failure feeding the systemic-abort breaker.
     """
 
+    max_jobs = config.keeper_sync_max_jobs
     functions = [
         func(
             instrument_arq_task(keeper_sync_run_discovery),
@@ -519,8 +676,20 @@ class MaintenanceWorkerSettings:
     (rather than cron-driven) function on the pool and is registered
     plainly — no ``func`` timeout wrapper — exactly as it was on the
     default pool.
+
+    ``max_jobs`` is declared rather than left to arq's implicit
+    default so the pool's concurrency is visible to operators and
+    movable from the environment. The value is arq's own default, so
+    this changes controllability, not behaviour. ``startup_maintenance``
+    also sizes this pool's database engine from it via
+    :func:`worker_db_pool_sizing`, on the same
+    :data:`DB_CONNECTIONS_PER_JOB` + :data:`DB_POOL_HEADROOM`
+    derivation the other two pools use — uniform sizing matters here
+    because this pool hosts the cross-subsystem reaper crons, which run
+    alongside the per-org jobs rather than inside their budget.
     """
 
+    max_jobs = config.maintenance_max_jobs
     functions = [
         func(
             instrument_arq_task(lifecycle_eval_dispatcher),

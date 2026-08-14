@@ -11,6 +11,8 @@ from docverse_server.domain.version import (
     EupsWeeklyVersion,
     LsstDocVersion,
     SemverVersion,
+    accepts_version_advance,
+    parse_stable_semver,
     parse_version_for_mode,
 )
 
@@ -75,6 +77,38 @@ class TestSemverVersion:
     def test_ge(self) -> None:
         assert SemverVersion(2, 0, 0) >= SemverVersion(1, 0, 0)
         assert SemverVersion(1, 0, 0) >= SemverVersion(1, 0, 0)
+
+
+class TestParseStableSemver:
+    """The stable-release grammar both aggregate paths gate on."""
+
+    @pytest.mark.parametrize(
+        ("ref", "expected"),
+        [
+            ("1.2.3", SemverVersion(1, 2, 3)),
+            ("v16.0.0", SemverVersion(16, 0, 0)),
+            ("0.0.1", SemverVersion(0, 0, 1)),
+        ],
+    )
+    def test_stable(self, ref: str, expected: SemverVersion) -> None:
+        assert parse_stable_semver(ref) == expected
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "1.0.0-rc.1",
+            "v2.1.0-alpha",
+            "main",
+            "v12_0",
+            "w_2026_10",
+        ],
+    )
+    def test_not_a_stable_release(self, ref: str) -> None:
+        assert parse_stable_semver(ref) is None
+
+    def test_none_ref(self) -> None:
+        """Callers whose tracking params carry no ref get ``None``."""
+        assert parse_stable_semver(None) is None
 
 
 # ── EupsMajorVersion ──────────────────────────────────────────────────────
@@ -256,4 +290,73 @@ class TestParseVersionForMode:
     def test_unparseable_returns_none(self) -> None:
         assert (
             parse_version_for_mode("main", TrackingMode.semver_release) is None
+        )
+
+
+# ── accepts_version_advance ────────────────────────────────────────────────
+
+
+class TestAcceptsVersionAdvance:
+    """The version guard shared by native tracking and keeper-sync."""
+
+    def test_no_current_build(self) -> None:
+        """An edition with no current build accepts any version."""
+        assert accepts_version_advance(
+            candidate=SemverVersion(1, 0, 0),
+            current_build_id=None,
+            current_build_git_ref=None,
+            mode=TrackingMode.semver_major,
+        )
+
+    def test_current_build_without_ref(self) -> None:
+        """A current build id with no ref is treated as no current build."""
+        assert accepts_version_advance(
+            candidate=SemverVersion(1, 0, 0),
+            current_build_id=7,
+            current_build_git_ref=None,
+            mode=TrackingMode.semver_major,
+        )
+
+    def test_unparseable_current_ref(self) -> None:
+        """A leftover non-version ref like ``main`` is always overtaken."""
+        assert accepts_version_advance(
+            candidate=SemverVersion(1, 0, 0),
+            current_build_id=7,
+            current_build_git_ref="main",
+            mode=TrackingMode.semver_major,
+        )
+
+    def test_greater_candidate(self) -> None:
+        assert accepts_version_advance(
+            candidate=SemverVersion(15, 3, 0),
+            current_build_id=7,
+            current_build_git_ref="15.2.1",
+            mode=TrackingMode.semver_major,
+        )
+
+    def test_equal_candidate(self) -> None:
+        """An equal version is accepted, so a re-sync can repoint."""
+        assert accepts_version_advance(
+            candidate=SemverVersion(15, 2, 1),
+            current_build_id=7,
+            current_build_git_ref="15.2.1",
+            mode=TrackingMode.semver_major,
+        )
+
+    def test_lesser_candidate(self) -> None:
+        """An out-of-order older release must not move the pointer."""
+        assert not accepts_version_advance(
+            candidate=SemverVersion(15, 2, 0),
+            current_build_id=7,
+            current_build_git_ref="15.2.1",
+            mode=TrackingMode.semver_major,
+        )
+
+    def test_uses_the_mode_grammar(self) -> None:
+        """The current ref is parsed with the edition's own grammar."""
+        assert not accepts_version_advance(
+            candidate=EupsWeeklyVersion(2024, 4),
+            current_build_id=7,
+            current_build_git_ref="w_2024_05",
+            mode=TrackingMode.eups_weekly_release,
         )

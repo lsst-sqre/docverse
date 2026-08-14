@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -18,6 +19,7 @@ from docverse_server.storage.ltd import (
     LtdClientError,
     LtdNotFoundError,
 )
+from docverse_server.storage.ltd.client import _MAX_BACKOFF_SECONDS
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 LTD_BASE = "https://keeper.lsst.codes"
@@ -41,6 +43,22 @@ def _make_client(http_client: httpx.AsyncClient) -> LtdClient:
         logger=structlog.get_logger("test"),
         base_backoff_seconds=0.0,
     )
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace ``asyncio.sleep`` with a recorder and return the log.
+
+    The delays the client asks for are the behaviour under test, so they
+    are asserted directly rather than waited out — a test that honestly
+    slept an LTD rate-limit window would take a minute.
+    """
+    delays: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    return delays
 
 
 @pytest.mark.asyncio
@@ -139,6 +157,53 @@ async def test_429_with_retry_after_then_success(
 
 
 @pytest.mark.asyncio
+async def test_429_rides_out_a_long_rate_limit_window(
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``Retry-After`` past the shared 10 s default is obeyed in full.
+
+    LTD answers a rate-limited GET with the seconds left in its window.
+    Clamping that to the shared default burned all four attempts inside
+    the same window and failed the sync job for every project in a tier
+    tick; these GETs hold no transaction and no lock, so sleeping the
+    full window is both safe and the only way the call ever succeeds.
+    """
+    delays = _record_sleeps(monkeypatch)
+    route = mock_discovery.get(f"{LTD_BASE}/products/pipelines")
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": "60"}),
+        httpx.Response(200, json=_load("product_pipelines.json")),
+    ]
+
+    product = await _make_client(http_client).get_product("pipelines")
+
+    assert product.slug == "pipelines"
+    assert delays == [60.0]
+
+
+@pytest.mark.asyncio
+async def test_429_retry_after_clamped_to_ltd_ceiling(
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generous LTD ceiling is still a ceiling, not a blank cheque."""
+    delays = _record_sleeps(monkeypatch)
+    route = mock_discovery.get(f"{LTD_BASE}/products/pipelines")
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": "86400"}),
+        httpx.Response(200, json=_load("product_pipelines.json")),
+    ]
+
+    product = await _make_client(http_client).get_product("pipelines")
+
+    assert product.slug == "pipelines"
+    assert delays == [_MAX_BACKOFF_SECONDS]
+
+
+@pytest.mark.asyncio
 async def test_5xx_exhausts_retries_then_raises(
     http_client: httpx.AsyncClient, mock_discovery: respx.Router
 ) -> None:
@@ -149,6 +214,51 @@ async def test_5xx_exhausts_retries_then_raises(
     with pytest.raises(LtdClientError, match="503"):
         await client.get_product("pipelines")
     assert route.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_exhausts_retries_then_raises() -> None:
+    """A dropped connection is retried before it becomes a client error."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http_client:
+        with pytest.raises(LtdClientError) as excinfo:
+            await _make_client(http_client).get_product("pipelines")
+
+    assert attempts == [1, 2, 3, 4]
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+
+
+@pytest.mark.asyncio
+async def test_unsupported_protocol_fails_on_the_first_attempt() -> None:
+    """A misconfigured ``ltd_base_url`` must not burn the retry budget.
+
+    ``UnsupportedProtocol`` is what a base URL with a typo'd (or
+    missing) scheme raises, and every attempt would fail identically.
+    Catching the whole ``httpx.HTTPError`` tree spent four attempts and
+    four backoff sleeps proving that to itself before reporting the
+    operator's mistake.
+    """
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.UnsupportedProtocol("unknown scheme")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http_client:
+        with pytest.raises(LtdClientError) as excinfo:
+            await _make_client(http_client).get_product("pipelines")
+
+    assert attempts == [1]
+    assert isinstance(excinfo.value.__cause__, httpx.UnsupportedProtocol)
 
 
 @pytest.mark.asyncio
@@ -175,6 +285,34 @@ async def test_non_retryable_error_status_raises(
     with pytest.raises(LtdClientError, match="401"):
         await _make_client(http_client).get_product("pipelines")
     assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_redirect_status_raises_client_error(
+    http_client: httpx.AsyncClient, mock_discovery: respx.Router
+) -> None:
+    """A 3xx is a failed call, not a body to parse.
+
+    Nothing in this codebase constructs an ``httpx.AsyncClient`` that
+    follows redirects, so an SSO gateway or a moved-endpoint 302 in
+    front of LTD hands back a login page instead of the product JSON.
+    Treating "not an error status" as success sent that page into
+    ``response.json()``, raising ``json.JSONDecodeError`` from outside
+    the ``LtdClientError`` taxonomy every caller catches.
+    """
+    route = mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(
+            302,
+            headers={"Location": "https://login.example.com/"},
+            text="<html>login</html>",
+        )
+    )
+    with pytest.raises(LtdClientError) as excinfo:
+        await _make_client(http_client).get_product("pipelines")
+    assert route.call_count == 1
+    exc = excinfo.value
+    assert exc.status_code == 302
+    assert exc.body == "<html>login</html>"
 
 
 def test_ltd_client_error_is_docverse_slack_exception() -> None:

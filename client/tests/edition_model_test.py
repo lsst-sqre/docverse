@@ -9,8 +9,11 @@ from pydantic import ValidationError
 
 from docverse.models import (
     Edition,
+    EditionAutocreationConfig,
     EditionCreate,
     EditionKind,
+    EditionKindSource,
+    EditionUpdate,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
@@ -34,6 +37,20 @@ def _base_edition(**overrides: object) -> Edition:
     }
     base.update(overrides)
     return Edition.model_validate(base)
+
+
+def test_edition_kind_source_defaults_to_derived() -> None:
+    """An edition whose kind nobody declared is the system's to re-derive."""
+    edition = _base_edition()
+    assert edition.kind_source == EditionKindSource.derived
+
+
+def test_edition_update_can_hand_the_kind_back_to_the_system() -> None:
+    """PATCHing ``kind_source`` to ``derived`` is the documented unpin."""
+    update = EditionUpdate(kind_source=EditionKindSource.derived)
+    assert update.model_dump(exclude_unset=True) == {
+        "kind_source": EditionKindSource.derived
+    }
 
 
 def test_edition_publish_status_default_is_none() -> None:
@@ -124,3 +141,34 @@ def test_relaxed_edition_slug_chars_stay_edition_only(slug: str) -> None:
             title="T",
             base_domain="lsst.io",
         )
+
+
+def test_edition_autocreation_defaults_semver_aggregates_true() -> None:
+    """An empty autocreation config still enables semver aggregates."""
+    config = EditionAutocreationConfig()
+    assert config.semver_aggregates is True
+
+
+def test_edition_autocreation_rejects_unknown_keys() -> None:
+    """An unrecognized knob is a validation error, not a silent no-op."""
+    with pytest.raises(ValidationError):
+        EditionAutocreationConfig.model_validate(
+            {"semver_aggregates": False, "eups_aggregates": True}
+        )
+
+
+def test_edition_autocreation_is_frozen() -> None:
+    """Resolved configs are shared instances, so mutation must be refused."""
+    config = EditionAutocreationConfig()
+    with pytest.raises(ValidationError) as exc_info:
+        config.semver_aggregates = False
+    assert exc_info.value.errors()[0]["type"] == "frozen_instance"
+    assert config.semver_aggregates is True
+
+
+def test_edition_autocreation_copies_with_updates() -> None:
+    """Freezing must not block deriving a variant from a shared config."""
+    config = EditionAutocreationConfig()
+    derived = config.model_copy(update={"semver_aggregates": False})
+    assert derived.semver_aggregates is False
+    assert config.semver_aggregates is True

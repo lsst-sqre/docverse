@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from docverse.models import EditionAutocreationConfig
 from docverse.models.projects import InstallationStatus, build_github_url
 
 from .lifecycle import LifecycleRuleSet
@@ -87,6 +88,15 @@ class Project(BaseModel):
     lifecycle_rules: LifecycleRuleSet | None = Field(
         default=None,
         description="Rules governing build lifecycle.",
+    )
+
+    edition_autocreation: EditionAutocreationConfig | None = Field(
+        default=None,
+        description=(
+            "Which editions are auto-created for this project. ``None``"
+            " defers to the organization's config, then to the built-in"
+            " defaults."
+        ),
     )
 
     date_created: datetime = Field(

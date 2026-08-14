@@ -69,6 +69,7 @@ def make_worker_ctx(
         github_app_private_key=github_app_private_key,
         github_webhook_secret=github_webhook_secret,
         default_queue_name=_config.arq_queue_name,
+        keeper_sync_copy_concurrency=_config.keeper_sync_copy_concurrency,
     )
     ctx: dict[str, Any] = {
         "factory_builder": builder,

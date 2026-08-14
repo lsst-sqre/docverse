@@ -12,6 +12,7 @@ failing paths — without depending on real S3 or R2.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -31,7 +32,7 @@ from safir.testing.sentry import (
     capture_events_fixture,
     sentry_init_fixture,
 )
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -48,6 +49,9 @@ from docverse.models import (
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
 from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.edition_build_history import (
+    SqlEditionBuildHistory,
+)
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -55,12 +59,16 @@ from docverse_server.domain.base32id import (
     generate_base32_id,
     validate_base32_id,
 )
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.queue import JobStatus
+from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
 from docverse_server.sentry import initialize_sentry
 from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.services.lock_service import LockClass, LockKey
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -71,7 +79,10 @@ from docverse_server.storage.keeper_sync import (
     ResourceType,
 )
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
-from docverse_server.storage.ltd import LtdNotFoundError
+from docverse_server.storage.ltd import (
+    LtdNotFoundError,
+    LtdSourceAccessDeniedError,
+)
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
@@ -79,6 +90,7 @@ from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
+from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
 
 LTD_BASE = "https://keeper.lsst.codes"
@@ -94,10 +106,22 @@ def _load(name: str) -> dict[str, Any]:
 
 
 class _FakeLtdSource:
-    """In-memory ``LtdSourceProtocol`` backing for worker integration tests."""
+    """In-memory ``LtdSourceProtocol`` backing for worker integration tests.
 
-    def __init__(self, objects: dict[str, bytes]) -> None:
+    ``denied_prefixes`` reproduces LTD's oldest uploads: the keys under
+    the prefix are listable but every ``GetObject`` answers
+    ``AccessDenied``, because those objects were written without a
+    public-read ACL and this source is anonymous.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, bytes],
+        *,
+        denied_prefixes: frozenset[str] = frozenset(),
+    ) -> None:
         self._objects = objects
+        self._denied_prefixes = denied_prefixes
 
     async def __aenter__(self) -> Self:
         return self
@@ -114,6 +138,10 @@ class _FakeLtdSource:
         return [k for k in self._objects if k.startswith(prefix)]
 
     async def download_object(self, *, key: str) -> bytes:
+        if any(key.startswith(prefix) for prefix in self._denied_prefixes):
+            raise LtdSourceAccessDeniedError(
+                bucket="lsst-the-docs", key=key, operation="GetObject"
+            )
         return self._objects[key]
 
 
@@ -122,6 +150,7 @@ def _patch_factory_io(
     *,
     object_store: MockObjectStore,
     source_objects: dict[str, bytes],
+    denied_prefixes: frozenset[str] = frozenset(),
 ) -> None:
     """Route the factory's S3/objectstore wiring through in-memory doubles."""
 
@@ -133,7 +162,7 @@ def _patch_factory_io(
     def _create_ltd_s3_source(
         self: Factory, *, bucket: str = "lsst-the-docs"
     ) -> _FakeLtdSource:
-        return _FakeLtdSource(source_objects)
+        return _FakeLtdSource(source_objects, denied_prefixes=denied_prefixes)
 
     monkeypatch.setattr(
         Factory, "create_objectstore_for_org", _create_objectstore_for_org
@@ -348,6 +377,9 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
+            # Zero edition failures stays plain ``completed`` — the
+            # ``completed_with_errors`` status is reserved for a genuine
+            # partial import, so a clean run is never ambiguous.
             assert qj.status == JobStatus.completed
 
             publish_qj = await queue_job_store.get_by_backend_job_id(
@@ -598,9 +630,10 @@ async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     Simulates the staging shape from the first sync runs that landed
     before the publish-enqueue path existed: an edition has its
     ``current_build_id`` set, the build is ``completed``, and a
-    ``keeper_sync_state`` row matches LTD's ``date_rebuilt`` — but
-    ``publish_status`` is ``NULL`` because no publish was ever enqueued
-    against this build. On the next sync run the build sync still
+    ``keeper_sync_state`` row matches LTD's ``date_rebuilt`` — but no
+    publish was ever enqueued against this build, so neither the
+    edition's ``publish_status`` nor an ``edition_build_history`` row for
+    the pair exists. On the next sync run the build sync still
     short-circuits (no LTD-side change), but the worker must observe
     the unpublished edition and enqueue a catch-up
     ``publish_edition`` job so KV + dashboard come into sync.
@@ -645,25 +678,9 @@ async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     )
     assert len(publish_after_first) == 1
 
-    # Reset the edition's publish_status to NULL to mimic data that
-    # landed before the publish-enqueue path existed.
-    async for session in db_session_dependency():
-        async with session.begin():
-            project_store = ProjectStore(session=session, logger=_logger())
-            project = await project_store.get_by_slug(
-                org_id=org_id, slug="pipelines"
-            )
-            assert project is not None
-            edition_store = EditionStore(session=session, logger=_logger())
-            main_edition = await edition_store.get_by_slug(
-                project_id=project.id, slug="__main"
-            )
-            assert main_edition is not None
-            await session.execute(
-                update(SqlEdition)
-                .where(SqlEdition.id == main_edition.id)
-                .values(publish_status=None)
-            )
+    # Erase every trace of the publish to mimic data that landed before
+    # the publish-enqueue path existed.
+    await _clear_publish_traces(org_id=org_id, edition_slug="__main")
 
     async with db_session.begin():
         second_qj = await _seed_project_queue_job(
@@ -936,20 +953,27 @@ async def test_keeper_sync_project_failure_captures_to_sentry(
 
 
 @pytest.mark.asyncio
-async def test_keeper_sync_project_objectstore_failure_marks_queue_job_failed(
+async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Objectstore resolution raising → queue job ``failed``, no leaked txn.
+    """Objectstore resolution raising mid-copy leaks no open transaction.
 
     Drives the failure deeper than the LTD-404 path: the service has
-    started copying and invokes the factory's copier closure, which calls
-    ``create_objectstore_for_org``. We make that raise, exercising the
-    worker's except branch after the factory has entered the autobegun
-    transaction region. Without the fix this reproduces
-    ``InvalidRequestError: A transaction is already begun on this Session``.
+    started copying and invokes the factory's copier closure, which
+    calls ``create_objectstore_for_org``. We make that raise *after* the
+    factory has entered the autobegun transaction region. The service's
+    per-edition boundary absorbs it and the loop reaches its end — but
+    this product has exactly one edition, so *every* attempted edition
+    failed and the end-of-run check turns that into a
+    ``KeeperSyncSystemicFailureError``: a run that imported nothing is
+    an outage, not a partial success, on a project of any size. Marking
+    the job ``failed`` still needs a session clean enough to open the
+    worker's except-branch transaction; a leaked transaction reproduces
+    the original bug (``InvalidRequestError: A transaction is already
+    begun on this Session``).
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -983,7 +1007,7 @@ async def test_keeper_sync_project_objectstore_failure_marks_queue_job_failed(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    with pytest.raises(RuntimeError, match="Service 'mock-store' not found"):
+    with pytest.raises(KeeperSyncSystemicFailureError):
         await keeper_sync_project(
             ctx,
             {
@@ -1004,8 +1028,17 @@ async def test_keeper_sync_project_objectstore_failure_marks_queue_job_failed(
             assert qj is not None
             assert qj.status == JobStatus.failed
             assert qj.errors is not None
-            assert "Service 'mock-store' not found" in qj.errors["message"]
+            assert qj.errors["type"] == "KeeperSyncSystemicFailureError"
+            # The edition's own error is chained onto the systemic
+            # abort, so the underlying fault stays triageable from the
+            # recorded traceback.
+            assert "Service 'mock-store' not found" in qj.errors["traceback"]
 
+            # The project's only edition failed, so the job is the run's
+            # only child. ``aggregate_activity`` buckets the failed job
+            # into ``failed_count``, so the run rolls up
+            # ``partial_failure`` — the errors reach the run status
+            # without inventing a new one.
             run_store = KeeperSyncRunStore(session=session, logger=_logger())
             run = await run_store.get(run_id)
             assert run is not None
@@ -1196,6 +1229,222 @@ async def test_keeper_sync_project_publishes_each_edition_per_iteration(
                 assert qj.keeper_sync_run_id == run_id
 
 
+def _seed_release_edition_ltd(mock_discovery: respx.Router) -> None:
+    """Stub LTD with the main edition + one ``15.2.1`` release edition."""
+    release_edition = _load("edition_branch_git_refs.json")
+    release_edition["slug"] = "15.2.1"
+    release_edition["title"] = "15.2.1"
+    release_edition["tracked_refs"] = ["15.2.1"]
+    release_build = _load("build.json")
+    release_build["self_url"] = f"{LTD_BASE}/builds/43"
+    release_build["bucket_root_dir"] = "pipelines/builds/43"
+    release_edition["build_url"] = f"{LTD_BASE}/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/2",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=release_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=release_build)
+    )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_publishes_backfilled_aggregates(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``15`` / ``15.2`` aggregates get published, not just created.
+
+    The dashboard lists any edition with a current build, so an
+    aggregate keeper-sync creates but never publishes would render as a
+    link to a 404.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    publish_slugs = sorted(
+        job.kwargs["payload"]["edition_slug"] for job in publish_jobs
+    )
+    assert publish_slugs == ["15", "15.2", "15.2.1", "__main"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            for slug in ("15", "15.2"):
+                aggregate = await edition_store.get_by_slug(
+                    project_id=project.id, slug=slug
+                )
+                assert aggregate is not None
+                assert aggregate.publish_status == PublishStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_locks_every_edition_pointer_write(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every pointer this worker moves is written under its own lock.
+
+    The factory has to hand ``KeeperSyncService`` a real ``LockService``,
+    because a project mid-migration publishes natively — through
+    ``build_processing`` and ``publish_edition``, both of which take
+    ``EDITION_UPDATE`` on the same key — while keeper-sync still polls.
+
+    Also pins the *shape* of the holds, which is what keeps keeper-sync
+    out of a deadlock with those workers: keeper-sync takes only
+    ``EDITION_UPDATE`` (never ``BUILD_PROCESSING``, so there is no
+    ordering to invert against the native path's outer-to-inner
+    nesting), and it releases each hold before taking the next, so no
+    two editions are ever held at once.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+    events = install_recording_lock_service(monkeypatch)
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    project_id = 0
+    edition_ids: dict[str, int] = {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            project_id = project.id
+            edition_store = EditionStore(session=session, logger=_logger())
+            for slug in ("15.2.1", "15", "15.2"):
+                edition = await edition_store.get_by_slug(
+                    project_id=project_id, slug=slug
+                )
+                assert edition is not None
+                edition_ids[slug] = edition.id
+
+    def _key(slug: str) -> LockKey:
+        return LockKey.for_edition_update(
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[slug],
+        )
+
+    # Only EDITION_UPDATE: keeper-sync never nests under BUILD_PROCESSING.
+    assert {e.lock_key.lock_class for e in events} == {
+        LockClass.EDITION_UPDATE
+    }
+    enters = [e.lock_key for e in events if e.event == "enter"]
+    # The imported release and both backfilled aggregates were each
+    # repointed under their own key.
+    assert set(enters) >= {_key("15.2.1"), _key("15"), _key("15.2")}
+    # Aggregates in ``semver_aggregate_specs`` order: major, then minor.
+    assert enters.index(_key("15")) < enters.index(_key("15.2"))
+    # Strictly serial: each hold is released before the next is taken.
+    assert [e.event for e in events] == ["enter", "exit"] * len(enters)
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_dedups_dashboard_build_cascade(
     app: None,
@@ -1310,17 +1559,21 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Partial-failure mid-sync: editions 1..M-1 publish; M..N untouched.
+    """Partial-failure mid-sync: editions that succeeded still publish.
 
     Edition 1 (``__main``, build 42) syncs cleanly and the per-edition
     callback enqueues a publish. Edition 2 (the branch edition, build
     43) raises mid-``sync_edition`` because its LTD build reports
-    ``uploaded=False`` — the exception propagates out of sync_project
-    and the worker marks the queue_jobs row failed. Locks the new
-    contract: a partial mid-sync failure leaves the editions that
-    already succeeded fully published, instead of stranding all of
-    them on ``publish_status IS NULL`` until the next reconciliation
-    tick (the issue #320 regression).
+    ``uploaded=False``. The service's per-edition boundary absorbs that
+    failure, so the job reaches its end rather than failing outright (a
+    permanently-broken LTD build must not abort the project's whole
+    import) — but it finishes ``completed_with_errors``, not plain
+    ``completed``, so a partial import is never indistinguishable from
+    a clean one. The ``queue_jobs`` row's ``progress`` carries the
+    per-edition detail. Locks two contracts at once: the editions that
+    already succeeded end up fully published rather than stranded on
+    ``publish_status IS NULL`` (the issue #320 regression), and the
+    failure is visible in both the status and the job record.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -1381,26 +1634,26 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    with pytest.raises(RuntimeError, match="uploaded=False"):
-        await keeper_sync_project(
-            ctx,
-            {
-                "org_id": org_id,
-                "org_slug": org_slug,
-                "run_id": run_id,
-                "queue_job_id": queue_job_id,
-                "ltd_slug": "pipelines",
-                "ltd_base_url": LTD_BASE,
-            },
-        )
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
     await ctx["http_client"].aclose()
+    assert result == "completed_with_errors"
 
     publish_jobs = get_jobs_by_name(
         mock_arq, "publish_edition", queue_name="docverse:queue"
     )
     # Exactly M-1 = 1 publish_edition arq job: the per-edition
-    # callback fired for the first edition before sync_project raised
-    # on the second.
+    # callback fired for the first edition; the second edition's
+    # failure was isolated and skipped.
     assert len(publish_jobs) == 1
     assert publish_jobs[0].kwargs["payload"]["edition_slug"] == "__main"
 
@@ -1431,7 +1684,14 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
             queue_job_store = QueueJobStore(session=session, logger=_logger())
             qj = await queue_job_store.get(queue_job_id)
             assert qj is not None
-            assert qj.status == JobStatus.failed
+            assert qj.status == JobStatus.completed_with_errors
+            assert qj.progress is not None
+            assert qj.progress["edition_failure_count"] == 1
+            recorded = qj.progress["edition_failures"]
+            assert len(recorded) == 1
+            assert recorded[0]["ltd_edition_slug"] == "u-jsick-feature"
+            assert recorded[0]["error_type"] == "RuntimeError"
+            assert "uploaded=False" in recorded[0]["error_message"]
 
             publish_qj = await queue_job_store.get_by_backend_job_id(
                 publish_jobs[0].id
@@ -1441,6 +1701,98 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
             assert publish_qj.keeper_sync_run_id == run_id
             assert publish_qj.edition_id == main_edition.id
 
+            # The isolated per-edition failure does not paint the run
+            # red: the publish child is still pending, so the run stays
+            # in_progress rather than finalising to partial_failure.
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.in_progress
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_permanent_denial_completes_with_errors(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-import run of permanent faults completes rather than fails.
+
+    The roundtable-dev shape behind this fix: every other edition is a
+    ``lifecycle_preemptive`` tombstone (neutral for ``contacted_ltd``)
+    and the one edition that reaches LTD is denied at both
+    ``builds/<slug>/`` and ``v/<slug>/``. Nothing is imported, so the
+    end-of-run systemic check used to fail the job — and the 5-minute
+    tier cron then replayed an identically-failing job forever while
+    Sentry fired each time.
+
+    A denial is permanent by construction, so the run belongs on the
+    partial-success path: the job finishes ``completed_with_errors``
+    with the edition named in ``progress``, and the parent run rolls up
+    off that rather than off a raised exception.
+
+    This product's only edition is ``main``, which LTD serves from the
+    product root — there is no ``v/`` sibling to recover from — so the
+    denial survives the edition-prefix fallback.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects={
+            "pipelines/builds/42/index.html": b"<html>denied</html>"
+        },
+        denied_prefixes=frozenset({"pipelines/builds/42/"}),
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_project(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+            "ltd_slug": "pipelines",
+            "ltd_base_url": LTD_BASE,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed_with_errors"
+
+    # Nothing was imported, so nothing was published either.
+    assert not get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert object_store.objects == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.completed_with_errors
+            assert qj.errors is None
+            assert qj.progress is not None
+            assert qj.progress["edition_failure_count"] == 1
+            recorded = qj.progress["edition_failures"]
+            assert recorded[0]["ltd_edition_slug"] == "main"
+            assert recorded[0]["error_type"] == "LtdSourceAccessDeniedError"
+
 
 @pytest.mark.asyncio
 async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
@@ -1449,12 +1801,12 @@ async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Re-run with N short-circuits + N null publish_status → N self-heals.
+    """Re-run with N short-circuits + N unpublished builds → N self-heals.
 
     Locks the tail-end self-heal pass: when every edition's build
-    short-circuits but every edition is sitting on
-    ``publish_status IS NULL`` (e.g. their builds pre-date the publish
-    enqueue path), the second pass enqueues N publishes via
+    short-circuits but no edition's current build has a publish on
+    record (e.g. their builds pre-date the publish enqueue path), the
+    second pass enqueues N publishes via
     :func:`_self_heal_unpublished_editions` since the per-edition
     callback skips short-circuited builds.
     """
@@ -1498,20 +1850,10 @@ async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
     )
     assert len(publish_after_first) == 2
 
-    # Null out publish_status on both editions so a re-run that
+    # Erase the publish traces on both editions so a re-run that
     # short-circuits has work to do at the tail end.
-    async for session in db_session_dependency():
-        async with session.begin():
-            project_store = ProjectStore(session=session, logger=_logger())
-            project = await project_store.get_by_slug(
-                org_id=org_id, slug="pipelines"
-            )
-            assert project is not None
-            await session.execute(
-                update(SqlEdition)
-                .where(SqlEdition.project_id == project.id)
-                .values(publish_status=None)
-            )
+    for slug in ("__main", "u-jsick-feature"):
+        await _clear_publish_traces(org_id=org_id, edition_slug=slug)
 
     async with db_session.begin():
         second_qj = await _seed_project_queue_job(
@@ -1551,3 +1893,881 @@ async def test_keeper_sync_project_self_heals_all_short_circuited_editions(
                 )
                 assert edition is not None
                 assert edition.publish_status == PublishStatus.pending
+
+
+async def _clear_publish_traces(
+    *, org_id: int, edition_slug: str
+) -> tuple[int, int]:
+    """Erase every trace that a publish was enqueued for one edition.
+
+    Simulates the lost-enqueue shapes described on
+    ``_self_heal_unpublished_aggregates``: the aggregate row still points
+    at the release build, but the edition's ``publish_status``, its
+    ``edition_build_history`` row for that build, and the
+    ``publish_edition`` queue job all never happened. Returns the
+    ``(project_id, edition_id)`` pair for follow-up assertions.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug=edition_slug
+            )
+            assert edition is not None
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(publish_status=None)
+            )
+            await session.execute(
+                delete(SqlEditionBuildHistory).where(
+                    SqlEditionBuildHistory.edition_id == edition.id
+                )
+            )
+            await session.execute(
+                delete(SqlQueueJob).where(
+                    SqlQueueJob.edition_id == edition.id,
+                    SqlQueueJob.kind == JobKind.publish_edition.value,
+                )
+            )
+            return project.id, edition.id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heals_unpublished_aggregate(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A semver aggregate whose publish enqueue was lost is re-enqueued.
+
+    The ``15`` / ``15.2`` aggregates are enqueued exactly once, from the
+    ``on_edition_synced`` callback, and ``sync_project`` deliberately
+    swallows callback failures — so a failed enqueue (or a worker death
+    between the backfill's commit and the enqueue) leaves the aggregate
+    pointing at the release build with no KV pointer ever written. A
+    re-sync of the unchanged edition skips the backfill entirely (its
+    ``aggregates_backfilled_build_id`` marker already names this build),
+    so nothing re-enqueues it via the outcome path; the tail-end
+    self-heal pass must recover it from persistent state instead.
+
+    The recovery run has to carry a signal that an aggregate could have
+    moved, or the pass is gated off (see
+    ``_run_may_have_moved_aggregates``) — here LTD rebuilds ``main`` onto
+    a new build, which is both the cheapest such signal and the shape a
+    real project hits, since the tiers keep polling a project whose
+    ``main`` moves long after its releases have frozen. The rebuilt
+    edition is deliberately *not* the release one: a fresh release build
+    would re-run the backfill and re-enqueue the aggregates through the
+    outcome path, which is the path this test is proving unnecessary.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # Rewind the ``15.2`` aggregate to the lost-enqueue shape.
+    project_id, aggregate_id = await _clear_publish_traces(
+        org_id=org_id, edition_slug="15.2"
+    )
+    # ``main`` rebuilds, so the recovery run is not an idle poll.
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    source_objects["pipelines/builds/44/index.html"] = b"<html>main v2</html>"
+    publish_before = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    healed = publish_after[len(publish_before) :]
+    healed_slugs = [job.kwargs["payload"]["edition_slug"] for job in healed]
+    # ``__main`` is the rebuilt edition's own publish, enqueued by the
+    # per-edition callback; ``15.2`` is the aggregate the tail-end pass
+    # recovered.
+    assert healed_slugs == ["__main", "15.2"]
+    aggregate_job = healed[1]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            aggregate = await edition_store.get_by_slug(
+                project_id=project_id, slug="15.2"
+            )
+            assert aggregate is not None
+            assert aggregate.id == aggregate_id
+            assert aggregate.publish_status == PublishStatus.pending
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            healed_qj = await queue_job_store.get_by_backend_job_id(
+                aggregate_job.id
+            )
+            assert healed_qj is not None
+            assert healed_qj.kind == JobKind.publish_edition
+            assert healed_qj.keeper_sync_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heal_skips_published_aggregates(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aggregates with a publish already in flight are not re-enqueued.
+
+    The first sync leaves ``15`` / ``15.2`` with a ``pending``
+    ``edition_build_history`` row for the build they point at. The
+    aggregate self-heal must read that as "the publish for this pair was
+    already enqueued" and leave the pair alone, so a steady-state
+    re-sync does not enqueue a duplicate ``publish_edition`` on every
+    reconciliation tick.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert sorted(
+        job.kwargs["payload"]["edition_slug"] for job in publish_after_first
+    ) == ["15", "15.2", "15.2.1", "__main"]
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_second) == len(publish_after_first)
+
+
+async def _project_id_for(*, org_id: int) -> int:
+    """Return the Docverse id of the org's synced ``pipelines`` project."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            return project.id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+def _spy_aggregate_scan(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every project-wide edition scan the worker performs.
+
+    ``EditionStore.list_all_by_project`` has exactly one caller on the
+    ``keeper_sync_project`` path — the aggregate self-heal pass — so the
+    returned list is a direct measure of how often that pass ran.
+    """
+    project_scans: list[int] = []
+    original_scan = EditionStore.list_all_by_project
+
+    async def _scan(self: EditionStore, project_id: int) -> list[Edition]:
+        project_scans.append(project_id)
+        return await original_scan(self, project_id)
+
+    monkeypatch.setattr(EditionStore, "list_all_by_project", _scan)
+    return project_scans
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_skips_aggregate_self_heal_when_idle(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A steady-state re-sync does not scan the project for aggregates.
+
+    Nothing in a run where every edition short-circuited and no
+    aggregate outcome was emitted can have moved an aggregate, so the
+    self-heal pass must not pay a full-project edition scan (plus a
+    history lookup per aggregate) on every five-minute poll, forever,
+    for every synced project.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # Spy only over the second, steady-state run.
+    project_scans = _spy_aggregate_scan(monkeypatch)
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    assert project_scans == []
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_scans_aggregates_after_a_build_moved(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that imported a fresh build still scans for aggregates.
+
+    The mirror of
+    ``test_keeper_sync_project_skips_aggregate_self_heal_when_idle``:
+    identical setup, except LTD rebuilds ``main`` before the second
+    sync. A non-short-circuited build is the signal that the backfill
+    could have run — including the paths where it committed an aggregate
+    and then lost its outcome — so the pass must not be gated off.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    project_id = await _project_id_for(org_id=org_id)
+
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    source_objects["pipelines/builds/44/index.html"] = b"<html>main v2</html>"
+
+    # Spy only over the second run.
+    project_scans = _spy_aggregate_scan(monkeypatch)
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    assert project_scans == [project_id]
+
+
+async def _current_build_pairs(
+    *, project_id: int, slugs: Sequence[str]
+) -> list[tuple[int, int]]:
+    """Return each named edition's ``(edition_id, current_build_id)``."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            pairs: list[tuple[int, int]] = []
+            for slug in slugs:
+                edition = await edition_store.get_by_slug(
+                    project_id=project_id, slug=slug
+                )
+                assert edition is not None
+                assert edition.current_build_id is not None
+                pairs.append((edition.id, edition.current_build_id))
+            return pairs
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+def _spy_history_lookups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[list[tuple[int, int]]], list[tuple[int, int]]]:
+    """Record batched and per-pair ``edition_build_history`` lookups.
+
+    Returns ``(batched, single)``: the pair list handed to every
+    ``list_by_edition_build_pairs`` call, and the pair every
+    ``get_by_edition_and_build`` call asked about.
+    """
+    batched: list[list[tuple[int, int]]] = []
+    single: list[tuple[int, int]] = []
+    original_batched = EditionBuildHistoryStore.list_by_edition_build_pairs
+    original_single = EditionBuildHistoryStore.get_by_edition_and_build
+
+    async def _batched(
+        self: EditionBuildHistoryStore, pairs: Sequence[tuple[int, int]]
+    ) -> list[EditionBuildHistory]:
+        batched.append(list(pairs))
+        return await original_batched(self, pairs)
+
+    async def _single(
+        self: EditionBuildHistoryStore, *, edition_id: int, build_id: int
+    ) -> EditionBuildHistory | None:
+        single.append((edition_id, build_id))
+        return await original_single(
+            self, edition_id=edition_id, build_id=build_id
+        )
+
+    monkeypatch.setattr(
+        EditionBuildHistoryStore, "list_by_edition_build_pairs", _batched
+    )
+    monkeypatch.setattr(
+        EditionBuildHistoryStore, "get_by_edition_and_build", _single
+    )
+    return batched, single
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_batches_aggregate_history_lookups(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregate pass reads every history row in one query.
+
+    A migrated project carries an ``N`` / ``N.M`` row per release
+    series, and resolving each one's publish state through
+    ``get_by_edition_and_build`` cost a BEGIN/SELECT/COMMIT apiece. One
+    ``IN`` query over the whole pair set replaces them.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_release_edition_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    project_id = await _project_id_for(org_id=org_id)
+    aggregate_pairs = await _current_build_pairs(
+        project_id=project_id, slugs=("15", "15.2")
+    )
+
+    # Rebuild ``main`` so the second run opens the aggregate gate.
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    source_objects["pipelines/builds/44/index.html"] = b"<html>main v2</html>"
+
+    batched, single = _spy_history_lookups(monkeypatch)
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    assert len(batched) == 1
+    assert sorted(batched[0]) == sorted(aggregate_pairs)
+    # No aggregate fell back to the per-pair lookup (the LTD leg still
+    # uses it for its own short-circuited editions).
+    assert not set(aggregate_pairs) & set(single)
+
+
+def _repoint_ltd_main_edition(
+    mock_discovery: respx.Router, *, build_slug: str = "43"
+) -> None:
+    """Advance LTD's ``main`` edition onto a second, newer build.
+
+    Replaces the ``/editions/1`` and ``/builds/<build_slug>`` routes
+    seeded by :func:`_seed_ltd` so a follow-up sync sees a fresh
+    ``date_rebuilt`` pointing at that LTD build. ``respx`` replaces
+    routes with an identical pattern, so the later ``.mock()`` wins.
+
+    ``build_slug`` defaults to the next build after :func:`_seed_ltd`'s
+    single ``42``; fixtures that already use ``43`` for a second edition
+    (:func:`_seed_release_edition_ltd`) pass a free slug instead.
+    """
+    edition = _load("edition_main_git_refs.json")
+    edition["build_url"] = f"{LTD_BASE}/builds/{build_slug}"
+    edition["date_rebuilt"] = "2026-05-02T18:30:00.000000+00:00"
+    build = _load("build.json")
+    build["self_url"] = f"{LTD_BASE}/builds/{build_slug}"
+    build["slug"] = build_slug
+    build["bucket_root_dir"] = f"pipelines/builds/{build_slug}"
+    build["date_created"] = "2026-05-02T18:25:00.000000+00:00"
+    build["published_url"] = f"https://pipelines.lsst.io/builds/{build_slug}"
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/{build_slug}").mock(
+        return_value=httpx.Response(200, json=build)
+    )
+
+
+async def _lose_repoint_publish_enqueue(
+    *, org_id: int, edition_slug: str, surviving_status: PublishStatus
+) -> tuple[int, int, int]:
+    """Erase the publish traces for an edition's *current* build only.
+
+    The LTD-leg counterpart to :func:`_clear_publish_traces`: rather than
+    the pre-enqueue-era shape (no publish ever ran for this edition), this
+    models the repoint shape. The edition was published against an
+    earlier build — so its edition-level ``publish_status`` is still set,
+    a single slot ``set_current_build`` never clears — and then advanced
+    onto a new build whose publish enqueue was lost, leaving the new
+    ``(edition, build)`` pair with no ``edition_build_history`` row and no
+    ``publish_edition`` queue job. The earlier build's history row is left
+    intact, exactly as a real repoint leaves it.
+
+    Returns ``(project_id, edition_id, current_build_id)``.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug=edition_slug
+            )
+            assert edition is not None
+            assert edition.current_build_id is not None
+            build_id = edition.current_build_id
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(publish_status=surviving_status.value)
+            )
+            await session.execute(
+                delete(SqlEditionBuildHistory).where(
+                    SqlEditionBuildHistory.edition_id == edition.id,
+                    SqlEditionBuildHistory.build_id == build_id,
+                )
+            )
+            await session.execute(
+                delete(SqlQueueJob).where(
+                    SqlQueueJob.edition_id == edition.id,
+                    SqlQueueJob.build_id == build_id,
+                    SqlQueueJob.kind == JobKind.publish_edition.value,
+                )
+            )
+            return project.id, edition.id, build_id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heals_repointed_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repointed LTD edition whose publish enqueue was lost is healed.
+
+    The edition-level ``publish_status`` is a single slot that survives a
+    repoint — ``set_current_build`` never clears it — so an edition that
+    published for build ``42`` and then advanced onto build ``43`` with a
+    lost enqueue still reads ``published``. Deciding "unpublished" from
+    that column leaves the new build unpublished forever, because the
+    LTD leg is the only path that can publish a short-circuited build.
+    The self-heal must therefore decide per ``(edition, current_build)``
+    pair via the ``edition_build_history`` row.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # LTD rebuilds ``main`` onto a second build with different content,
+    # so the second pass imports a new Docverse build and repoints.
+    _repoint_ltd_main_edition(mock_discovery)
+    source_objects["pipelines/builds/43/index.html"] = b"<html>v2</html>"
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+
+    # Rewind the repoint to the lost-enqueue shape: the edition still
+    # reads ``published`` from build 42's publish, but the new pair has
+    # no history row and no queue job.
+    (
+        project_id,
+        edition_id,
+        repointed_build_id,
+    ) = await _lose_repoint_publish_enqueue(
+        org_id=org_id,
+        edition_slug="__main",
+        surviving_status=PublishStatus.published,
+    )
+    publish_before = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    async with db_session.begin():
+        third_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-3",
+        )
+    payload["queue_job_id"] = third_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    healed = publish_after[len(publish_before) :]
+    assert [job.kwargs["payload"]["edition_slug"] for job in healed] == [
+        "__main"
+    ]
+    assert healed[0].kwargs["payload"]["build_id"] == repointed_build_id
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project_id, slug="__main"
+            )
+            assert edition is not None
+            assert edition.id == edition_id
+            assert edition.publish_status == PublishStatus.pending
+
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            )
+            history = await history_store.get_by_edition_and_build(
+                edition_id=edition_id, build_id=repointed_build_id
+            )
+            assert history is not None
+            assert history.publish_status == PublishStatus.pending
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            healed_qj = await queue_job_store.get_by_backend_job_id(
+                healed[0].id
+            )
+            assert healed_qj is not None
+            assert healed_qj.kind == JobKind.publish_edition
+            assert healed_qj.keeper_sync_run_id == run_id
+
+
+async def _settle_publish(
+    *, org_id: int, edition_slug: str, status: PublishStatus
+) -> None:
+    """Drive one edition's current-build publish to a terminal status.
+
+    Stands in for the ``publish_edition`` worker's write-back: it sets
+    both the edition-level ``publish_status`` and the
+    ``edition_build_history`` row for the edition's current build, which
+    is the shape a steady-state re-sync finds.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_store = ProjectStore(session=session, logger=_logger())
+            project = await project_store.get_by_slug(
+                org_id=org_id, slug="pipelines"
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug=edition_slug
+            )
+            assert edition is not None
+            assert edition.current_build_id is not None
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(publish_status=status.value)
+            )
+            await session.execute(
+                update(SqlEditionBuildHistory)
+                .where(
+                    SqlEditionBuildHistory.edition_id == edition.id,
+                    SqlEditionBuildHistory.build_id
+                    == edition.current_build_id,
+                )
+                .values(publish_status=status.value)
+            )
+            return
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.parametrize(
+    "settled_status", [PublishStatus.published, PublishStatus.failed]
+)
+@pytest.mark.asyncio
+async def test_keeper_sync_project_self_heal_skips_settled_editions(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    settled_status: PublishStatus,
+) -> None:
+    """A terminal publish for the current pair is not re-enqueued.
+
+    The per-pair rule has to carry the dedup the edition-level column
+    used to supply: once the ``(edition, current_build)`` pair carries a
+    ``published`` or ``failed`` publish, a steady-state re-sync must
+    leave it alone rather than burn a KV write on every reconciliation
+    tick. (``pending`` — a publish still in flight — is covered by
+    ``test_keeper_sync_project_short_circuit_skips_publish_enqueue``.)
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        first_qj = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _seed_ltd(mock_discovery)
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>v1</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects=source_objects,
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": first_qj,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    publish_after_first = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_first) == 1
+
+    await _settle_publish(
+        org_id=org_id, edition_slug="__main", status=settled_status
+    )
+
+    async with db_session.begin():
+        second_qj = await _seed_project_queue_job(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="test-arq-project-2",
+        )
+    payload["queue_job_id"] = second_qj
+    assert await keeper_sync_project(ctx, payload) == "completed"
+    await ctx["http_client"].aclose()
+
+    publish_after_second = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publish_after_second) == len(publish_after_first)

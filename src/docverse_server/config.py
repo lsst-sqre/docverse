@@ -13,7 +13,29 @@ from safir.logging import LogLevel, Profile
 from safir.metrics import MetricsConfiguration, metrics_configuration_factory
 from safir.pydantic import EnvRedisDsn
 
-__all__ = ["Configuration", "config"]
+from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
+
+__all__ = [
+    "KEEPER_SYNC_REAPER_MARGIN_SECONDS",
+    "Configuration",
+    "config",
+]
+
+
+KEEPER_SYNC_REAPER_MARGIN_SECONDS = 1800
+"""Grace period added to the keeper-sync job timeout to get the reaper
+threshold, in seconds.
+
+The keeper-sync arq functions run with ``max_tries=1``, so arq has
+already cancelled any job that reaches
+``keeper_sync_job_timeout_seconds``; a child ``queue_jobs`` row still
+``in_progress`` past that point is definitively dead and every extra
+minute of waiting keeps the project parked behind the partial unique
+index that the tier cron treats as an active job. The margin only
+needs to cover the finalisation window plus scheduling slop, and is
+sized at one full ``keeper_sync_reaper`` cron gap
+(``cron(minute={0, 30})``, so 30 min).
+"""
 
 
 def _parse_comma_separated(v: Any) -> Any:
@@ -21,6 +43,19 @@ def _parse_comma_separated(v: Any) -> Any:
     if isinstance(v, str):
         return [item.strip() for item in v.split(",") if item.strip()]
     return v
+
+
+def _default_keeper_sync_reaper_threshold(data: dict[str, Any]) -> int:
+    """Derive the keeper-sync reaper threshold from the job timeout.
+
+    Pydantic passes the already-validated fields declared before
+    ``keeper_sync_reaper_threshold_seconds``, which includes
+    ``keeper_sync_job_timeout_seconds``. Runs only when the env var is
+    unset, so an explicit
+    ``DOCVERSE_KEEPER_SYNC_REAPER_THRESHOLD_SECONDS`` still wins.
+    """
+    timeout = data.get("keeper_sync_job_timeout_seconds", 3600)
+    return int(timeout) + KEEPER_SYNC_REAPER_MARGIN_SECONDS
 
 
 class Configuration(BaseSettings):
@@ -167,6 +202,69 @@ class Configuration(BaseSettings):
         title="Name of the arq queue",
     )
 
+    arq_max_jobs: int = Field(
+        10,
+        ge=1,
+        title="Concurrent jobs per default-queue worker process",
+        description=(
+            "Bound on how many ``docverse:queue`` jobs"
+            " (``build_processing``, ``publish_edition``,"
+            " ``dashboard_build``, ``dashboard_sync``, ``ping``) one"
+            " worker process runs at once, set as ``max_jobs`` on"
+            " ``WorkerSettings``. The default matches arq's own, which"
+            " this pool previously inherited implicitly; it is declared"
+            " here so the concurrency is visible to operators and"
+            " movable without a code change. Raising it multiplies"
+            " every per-job resource (DB sessions, buffered payloads)"
+            " and so needs a matching memory-limit raise."
+        ),
+    )
+
+    cdn_purge_min_interval_seconds: float = Field(
+        DEFAULT_PURGE_MIN_INTERVAL_SECONDS,
+        ge=0.0,
+        title="Minimum spacing between CDN purges of one hostname",
+        description=(
+            "CDN cache purging is hostname-scoped (the only mechanism"
+            " available on every Cloudflare plan tier), so every edition"
+            " of a project emits a byte-identical purge and a publish"
+            " burst — a release plus its semver aggregates, or a bulk"
+            " keeper-sync backfill — is almost entirely redundant. Each"
+            " worker process folds those into at most one purge per"
+            " hostname per this interval; requests arriving during the"
+            " wait are absorbed by the pending purge, and a request"
+            " arriving after it fired always gets its own. Raise this to"
+            " cut purge volume further at the cost of up to this many"
+            " seconds of added publish latency for a project that was"
+            " just purged; set to 0 to disable coalescing entirely and"
+            " purge once per publish."
+        ),
+    )
+
+    publish_edition_job_timeout_seconds: int = Field(
+        1800,
+        title="Publish_edition per-job timeout, in seconds",
+        description=(
+            "Wraps ``publish_edition`` on ``WorkerSettings``: arq"
+            " cancels a job that runs past this. The job is the default"
+            " pool's one deliberate sleeper — it waits on the"
+            " ``EDITION_UPDATE`` advisory lock (which keeper-sync's"
+            " ``sync_build`` also takes), then on the per-hostname CDN"
+            " purge coalescer's throttle interval, then on the purger's"
+            " own rate-limit backoff (up to three waits clamped to"
+            " ``MAX_BACKOFF_SECONDS`` when Cloudflare answers 429)."
+            " arq's implicit 300 s default was not derived from any of"
+            " those, so the 30-minute default clears them with room for"
+            " a contended lock while still sitting far below"
+            " ``publish_edition_reaper_threshold_seconds`` — the"
+            " cron backstop must never fire on a job arq is still"
+            " running. Cancellation is safe by construction: the job"
+            " commits its ``queue_jobs`` completion *before* the purge,"
+            " so a timeout during the purge costs only the best-effort"
+            " purge, never the record of a committed publish."
+        ),
+    )
+
     keeper_sync_job_timeout_seconds: int = Field(
         3600,
         title="Keeper-sync per-job timeout, in seconds",
@@ -174,18 +272,86 @@ class Configuration(BaseSettings):
             "Wraps the keeper-sync arq functions on"
             " ``KeeperSyncWorkerSettings``: arq cancels a job that runs"
             " past this. Lower this in test/staging to surface"
-            " stuck-worker behaviour quickly."
+            " stuck-worker behaviour quickly — the default"
+            " ``keeper_sync_reaper_threshold_seconds`` is derived from"
+            " this value, so it follows the timeout down."
+        ),
+    )
+
+    keeper_sync_max_jobs: int = Field(
+        10,
+        ge=1,
+        title="Concurrent jobs per keeper-sync worker process",
+        description=(
+            "Bound on how many ``docverse:sync-queue`` jobs one worker"
+            " process runs at once, set as ``max_jobs`` on"
+            " ``KeeperSyncWorkerSettings``. The default matches arq's"
+            " own, which this pool previously inherited implicitly."
+            " **Memory:** each concurrent ``keeper_sync_project`` job"
+            " drives its own ``BuildContentCopier`` pool, so the sync"
+            " worker's peak resident size scales with this value x"
+            " ``keeper_sync_copy_concurrency`` x the largest object"
+            " under a build prefix — 80 buffered object bodies at the"
+            " stock 10 x 8. That product is what the sync worker's"
+            " memory limit is sized against; raising either knob"
+            " requires raising the limit with it."
+        ),
+    )
+
+    keeper_sync_copy_concurrency: int = Field(
+        8,
+        ge=1,
+        title="Simultaneous object transfers per keeper-sync copier",
+        description=(
+            "Upper bound on the worker-task pool that"
+            " ``BuildContentCopier`` runs one LTD build prefix through."
+            " Object bodies are buffered whole (the destination"
+            " ``upload_object`` takes ``bytes``), so this is also the"
+            " number of bodies one copier holds in memory at once."
+            " **Memory:** the sync worker's peak resident size scales"
+            " with ``keeper_sync_max_jobs`` x this value x the largest"
+            " object under a build prefix — each concurrent"
+            " ``keeper_sync_project`` job runs its own copier pool."
+            " At the stock 10 x 8 that is 80 buffered bodies, which is"
+            " what the sync worker's memory limit is sized against;"
+            " raising either knob requires raising that limit with it."
         ),
     )
 
     keeper_sync_reaper_threshold_seconds: int = Field(
-        21600,
+        default_factory=_default_keeper_sync_reaper_threshold,
         title="Keeper-sync stuck-run reaper threshold, in seconds",
         description=(
             "Cron-driven backstop for arq losing a job (e.g. an"
             " OOM-killed worker pod). ``keeper_sync_reaper`` fails any"
             " keeper-sync child ``queue_jobs`` row that has been"
-            " ``in_progress`` longer than this without ``date_completed``."
+            " ``in_progress`` longer than this without"
+            " ``date_completed``. Unlike the other reaper thresholds"
+            " this one has no literal default: it derives to"
+            " ``keeper_sync_job_timeout_seconds`` +"
+            " ``KEEPER_SYNC_REAPER_MARGIN_SECONDS`` (5400 s at the"
+            " stock 3600 s timeout). Because the keeper-sync functions"
+            " run with ``max_tries=1``, arq has already cancelled any"
+            " job that hit its timeout, so a row still ``in_progress``"
+            " past that point is dead and the old flat 6 h wait only"
+            " kept the project parked behind the partial unique index"
+            " the tier cron reads as an active job. Setting the env var"
+            " overrides the derivation outright."
+        ),
+    )
+
+    maintenance_max_jobs: int = Field(
+        10,
+        ge=1,
+        title="Concurrent jobs per maintenance worker process",
+        description=(
+            "Bound on how many ``docverse:maintenance-queue`` jobs"
+            " (``lifecycle_eval``, ``git_ref_audit``,"
+            " ``inventory_census``, the reaper backstops, and"
+            " ``project_github_resolve``) one worker process runs at"
+            " once, set as ``max_jobs`` on"
+            " ``MaintenanceWorkerSettings``. The default matches arq's"
+            " own, which this pool previously inherited implicitly."
         ),
     )
 

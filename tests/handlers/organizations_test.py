@@ -6,6 +6,7 @@ import pytest
 from httpx import AsyncClient
 
 from docverse.models import OrgRole
+from docverse_server.domain.slug import parse_slug_rewrite_rules
 from tests.conftest import seed_member, seed_org_with_admin
 
 
@@ -286,6 +287,87 @@ async def test_patch_organization_lifecycle_rules_missing_discriminator(
                 {"max_days_inactive": 30},
             ],
         },
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_version_slug_rules(
+    client: AsyncClient,
+) -> None:
+    """Version rule types round-trip through org PATCH and GET."""
+    await seed_org_with_admin(client, "patch-slugrules-org", "admin")
+    rules = [
+        {"type": "ignore", "glob": "dependabot/**"},
+        {"type": "semver", "edition_kind": "release"},
+        {"type": "lsst_doc", "edition_kind": "release"},
+        {"type": "eups_major", "edition_kind": "release"},
+        {"type": "eups_weekly", "edition_kind": "draft"},
+    ]
+    response = await client.patch(
+        "/docverse/orgs/patch-slugrules-org",
+        json={"slug_rewrite_rules": rules},
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 200
+    assert response.json()["slug_rewrite_rules"] == rules
+
+    get_response = await client.get(
+        "/docverse/orgs/patch-slugrules-org",
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert get_response.status_code == 200
+    stored = get_response.json()["slug_rewrite_rules"]
+    assert stored == rules
+    # The persisted payload parses back into typed rule objects.
+    parsed = parse_slug_rewrite_rules(stored)
+    assert [rule.type for rule in parsed] == [
+        "ignore",
+        "semver",
+        "lsst_doc",
+        "eups_major",
+        "eups_weekly",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_edition_autocreation(
+    client: AsyncClient,
+) -> None:
+    """``edition_autocreation`` round-trips through org PATCH and GET."""
+    await seed_org_with_admin(client, "patch-autocreate-org", "admin")
+
+    response = await client.patch(
+        "/docverse/orgs/patch-autocreate-org",
+        json={"edition_autocreation": {"semver_aggregates": False}},
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert response.status_code == 200
+    assert response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }
+
+    get_response = await client.get(
+        "/docverse/orgs/patch-autocreate-org",
+        headers={"X-Auth-Request-User": "admin"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }
+
+
+@pytest.mark.asyncio
+async def test_patch_organization_edition_autocreation_invalid_shape(
+    client: AsyncClient,
+) -> None:
+    """An unknown autocreation knob is rejected with a 422."""
+    await seed_org_with_admin(client, "bad-autocreate-org", "admin")
+
+    response = await client.patch(
+        "/docverse/orgs/bad-autocreate-org",
+        json={"edition_autocreation": {"semver_aggregate": False}},
         headers={"X-Auth-Request-User": "admin"},
     )
     assert response.status_code == 422

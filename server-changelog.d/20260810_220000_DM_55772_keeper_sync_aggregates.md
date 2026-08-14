@@ -1,0 +1,3 @@
+### New features
+
+- Keeper-sync now backfills semver aggregate editions. When a sync imports or re-syncs a stable-semver release edition (for example `15.2.1`), it creates or advances the matching `15` (`semver_major`) and `15.2` (`semver_minor`) aggregate editions and publishes them, so a migrated project renders the same dashboard groups as a natively built one. The backfill honors the same `edition_autocreation` setting as the native upload path (project value over organization value), never touches an edition that already holds an `N` or `N.M` slug on different tracking, skips prereleases and the non-semver release grammars (lsstdoc, EUPS), and applies a version guard so an out-of-order import cannot point an aggregate at an older release.

@@ -2,27 +2,39 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal
 
 import structlog
 
-from docverse.models import EditionKind, TrackingMode
+from docverse.models import (
+    EditionAutocreationConfig,
+    EditionKind,
+    EditionKindSource,
+    TrackingMode,
+)
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_autocreation import (
+    resolve_edition_autocreation,
+)
 from docverse_server.domain.edition_tracking import (
     EditionTrackingOutcome,
     EditionTrackingResult,
 )
+from docverse_server.domain.semver_aggregate import semver_aggregate_specs
 from docverse_server.domain.slug import (
     InvalidSlugError,
     SlugDerivationResult,
     derive_edition_slug,
-    parse_slug_rewrite_rules,
+    resolve_slug_rewrite_rules,
 )
 from docverse_server.domain.version import (
     LsstDocVersion,
-    SemverVersion,
+    accepts_version_advance,
+    parse_stable_semver,
     parse_version_for_mode,
 )
 from docverse_server.services.lock_service import LockKey, LockService
@@ -32,6 +44,33 @@ from docverse_server.storage.edition_build_history_store import (
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+
+
+def _derivation_governs(
+    edition: Edition, derivation: SlugDerivationResult
+) -> bool:
+    """Report whether *derivation* describes *edition*'s kind.
+
+    ``find_matching_editions`` returns everything a build advances, not
+    just the edition the ref derivation names: a build on ``1.0.0``
+    also matches the ``1`` / ``1.0`` aggregates, and a build on ``main``
+    matches the project's ``__main`` edition. Those rows carry
+    *structural* kinds that no ref derivation computes, so applying the
+    ref's kind to them would demote ``__main`` to ``draft`` (which
+    ``ck_editions_main_slug_kind`` rejects outright) and flatten the
+    aggregates into ordinary releases.
+
+    The derivation therefore governs exactly the editions it could have
+    created: those tracking the mode it emits — ``git_ref``, or
+    ``alternate_git_ref`` when the build carries an alternate scope —
+    and never the default edition, whose ``main`` kind is a property of
+    the project rather than of any ref.
+    """
+    return (
+        edition.kind is not EditionKind.main
+        and edition.tracking_mode == derivation.tracking_mode
+    )
+
 
 # Tracking modes that use version comparison instead of date-based guards.
 _VERSION_MODES = frozenset(
@@ -114,9 +153,13 @@ class EditionTrackingService:
             )
             raise RuntimeError(msg)
 
-        # 3. Resolve effective rewrite rules
-        raw_rules = project.slug_rewrite_rules or org.slug_rewrite_rules
-        rules = parse_slug_rewrite_rules(raw_rules)
+        # 3. Resolve effective rewrite rules. Project-over-org, keyed on
+        # None (unset) rather than falsiness, so an explicit `[]` opts
+        # the project out of the org's rules instead of inheriting them.
+        rules = resolve_slug_rewrite_rules(
+            project=project.slug_rewrite_rules,
+            org=org.slug_rewrite_rules,
+        )
 
         # 4. Derive slug
         try:
@@ -146,6 +189,7 @@ class EditionTrackingService:
             "Derived edition slug",
             slug=derivation.slug,
             edition_kind=derivation.edition_kind,
+            matched_rule_type=derivation.matched_rule_type,
             git_ref=build.git_ref,
             build_id=build.id,
             project_id=project.id,
@@ -169,18 +213,32 @@ class EditionTrackingService:
                 created_ids.add(new_edition.id)
 
         # 7. Auto-create semver_major / semver_minor editions
+        autocreation = resolve_edition_autocreation(
+            project=project.edition_autocreation,
+            org=org.edition_autocreation,
+        )
         (
             version_editions,
             version_created_ids,
         ) = await self._auto_create_version_editions(
-            project_id=project.id, build=build
+            project_id=project.id,
+            build=build,
+            autocreation=autocreation,
         )
         created_ids |= version_created_ids
         for ve in version_editions:
             if not any(e.id == ve.id for e in editions):
                 editions.append(ve)
 
-        # 8. Update each edition
+        # 8. Converge kinds on the current derivation
+        editions = await self._refresh_kinds(
+            editions,
+            derivation=derivation,
+            org_id=org.id,
+            project_id=project.id,
+        )
+
+        # 9. Update each edition
         outcomes = await self._update_editions(
             editions,
             build,
@@ -194,6 +252,80 @@ class EditionTrackingService:
             suppressed=False,
             outcomes=outcomes,
         )
+
+    async def _refresh_kinds(
+        self,
+        editions: list[Edition],
+        *,
+        derivation: SlugDerivationResult,
+        org_id: int,
+        project_id: int,
+    ) -> list[Edition]:
+        """Converge matched editions on the current derivation.
+
+        ``find_matching_editions`` only ever moves an edition's build
+        pointer, so an edition created before the built-in version rules
+        existed keeps whatever kind it was stamped with — a
+        version-slugged edition stays ``draft`` forever, holding the
+        short CDN cache profile and staying eligible for
+        ``draft_inactivity`` soft-deletion, while the byte-identical
+        edition on a keeper-sync-migrated project is corrected on every
+        sync. Re-deriving here closes that gap.
+
+        The sweep converges rather than promotes: a ``derived`` row is
+        rewritten to whatever the rules say *today*, demotions included,
+        so an org that adds ``{"type": "semver", "edition_kind":
+        "draft"}`` sees its earlier promotions unwound instead of
+        stranded. Convergence — not a re-asserting PATCH — is the
+        supported way to undo an automatic kind.
+
+        Returns the list with converged rows replaced by their
+        post-write state, so downstream steps see the kind that is in
+        the database.
+        """
+        refreshed: list[Edition] = []
+        for edition in editions:
+            converged = await self._converge_kind(
+                edition,
+                derivation=derivation,
+                org_id=org_id,
+                project_id=project_id,
+            )
+            refreshed.append(converged)
+        return refreshed
+
+    async def _converge_kind(
+        self,
+        edition: Edition,
+        *,
+        derivation: SlugDerivationResult,
+        org_id: int,
+        project_id: int,
+    ) -> Edition:
+        """Write *derivation*'s kind to *edition* when it governs it."""
+        if not _derivation_governs(edition, derivation):
+            return edition
+        if edition.kind_source is EditionKindSource.declared:
+            return edition
+        if edition.kind is derivation.edition_kind:
+            return edition
+        async with self._edition_update_lock(
+            org_id=org_id, project_id=project_id, edition_id=edition.id
+        ):
+            await self._deps.edition_store.update_kind(
+                edition_id=edition.id, kind=derivation.edition_kind
+            )
+        self._deps.logger.info(
+            "Converged edition kind",
+            edition_slug=edition.slug,
+            edition_id=edition.id,
+            project_id=project_id,
+            previous_kind=edition.kind.value,
+            edition_kind=derivation.edition_kind.value,
+            kind_trigger="build_upload",
+            matched_rule_type=derivation.matched_rule_type,
+        )
+        return edition.model_copy(update={"kind": derivation.edition_kind})
 
     async def _update_editions(
         self,
@@ -301,6 +433,31 @@ class EditionTrackingService:
             action=action,
         )
 
+    @asynccontextmanager
+    async def _edition_update_lock(
+        self, *, org_id: int, project_id: int, edition_id: int
+    ) -> AsyncGenerator[None]:
+        """Hold the ``EDITION_UPDATE`` lock for one edition, if wired.
+
+        When ``self._deps.lock_service`` is configured (worker call
+        paths), everything inside the block serializes against
+        concurrent ``publish_edition`` jobs, keeper-sync's writes, and
+        admin-triggered edition changes for the same edition. With no
+        lock service (unit-test call paths), the body runs unwrapped —
+        non-worker callers are explicitly out of scope per the design
+        (SQR-112).
+        """
+        if self._deps.lock_service is None:
+            yield
+            return
+        lock_key = LockKey.for_edition_update(
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_id,
+        )
+        async with self._deps.lock_service.acquire(lock_key):
+            yield
+
     async def _set_current_build_locked(
         self,
         *,
@@ -310,27 +467,10 @@ class EditionTrackingService:
         build_id: int,
         skip_date_guard: bool,
     ) -> Edition | None:
-        """Update the edition pointer under an EDITION_UPDATE lock.
-
-        When ``self._deps.lock_service`` is configured (worker call paths),
-        the call serializes against concurrent ``publish_edition`` jobs
-        and admin-triggered edition pointer changes for the same
-        edition. With no lock service (unit-test call paths), the
-        update runs unwrapped — non-worker callers are explicitly
-        out of scope per the design (SQR-112).
-        """
-        if self._deps.lock_service is None:
-            return await self._deps.edition_store.set_current_build(
-                edition_id=edition_id,
-                build_id=build_id,
-                skip_date_guard=skip_date_guard,
-            )
-        lock_key = LockKey.for_edition_update(
-            org_id=org_id,
-            project_id=project_id,
-            edition_id=edition_id,
-        )
-        async with self._deps.lock_service.acquire(lock_key):
+        """Update the edition pointer under an EDITION_UPDATE lock."""
+        async with self._edition_update_lock(
+            org_id=org_id, project_id=project_id, edition_id=edition_id
+        ):
             return await self._deps.edition_store.set_current_build(
                 edition_id=edition_id,
                 build_id=build_id,
@@ -348,9 +488,10 @@ class EditionTrackingService:
         always returns ``True`` — the date-based stale guard in
         ``set_current_build`` handles ordering.
 
-        For version-based modes, parses both the candidate and current
-        git refs and returns ``True`` only when the candidate is >=
-        the current version.
+        For version-based modes, parses the candidate ref and defers to
+        `accepts_version_advance` — the guard keeper-sync's aggregate
+        backfill shares, so migrated and natively built editions cannot
+        end up on different releases.
         """
         if edition.tracking_mode not in _VERSION_MODES:
             return True
@@ -365,21 +506,12 @@ class EditionTrackingService:
         if candidate is None:
             return False
 
-        # No current build → accept any parseable version
-        if (
-            edition.current_build_id is None
-            or edition.current_build_git_ref is None
-        ):
-            return True
-
-        current = parse_version_for_mode(
-            edition.current_build_git_ref, edition.tracking_mode
+        return accepts_version_advance(
+            candidate=candidate,
+            current_build_id=edition.current_build_id,
+            current_build_git_ref=edition.current_build_git_ref,
+            mode=edition.tracking_mode,
         )
-        if current is None:
-            # Current ref is unparseable (e.g. leftover "main") → accept
-            return True
-
-        return candidate >= current
 
     def _should_update_lsst_doc(self, edition: Edition, build: Build) -> bool:
         """Version guard for ``lsst_doc`` tracking mode.
@@ -461,71 +593,72 @@ class EditionTrackingService:
         *,
         project_id: int,
         build: Build,
+        autocreation: EditionAutocreationConfig,
     ) -> tuple[list[Edition], set[int]]:
         """Auto-create ``semver_major`` / ``semver_minor`` editions.
 
-        Only triggers for stable semver tags (no prerelease).  Uses
-        ``create_internal`` because single-digit slugs like ``"2"``
-        don't pass ``EditionCreate``'s slug pattern.
+        Only triggers for stable semver tags (no prerelease), and only
+        when the resolved ``autocreation`` config enables
+        ``semver_aggregates``.  Uses ``create_internal`` because
+        single-digit slugs like ``"2"`` don't pass ``EditionCreate``'s
+        slug pattern.
+
+        The gate is the ref's own semver grammar
+        (:func:`~docverse_server.domain.version.parse_stable_semver`),
+        not the kind ``track_build``'s slug derivation landed on —
+        keeper-sync's ``_backfill_semver_aggregates`` gates on the same
+        classification so the two paths stay in step. Reading the
+        derived kind instead would let any user rule that merely
+        reshapes the slug switch the aggregates off by accident: user
+        rules run ahead of the built-in ``SemverRule``, so an org whose
+        ``prefix_strip`` rule exists only to drop the ``v`` from
+        ``v16.0.0`` leaves the kind at that rule's ``draft`` default and
+        would silently never see a ``16`` / ``16.0`` row. Operators who
+        genuinely want no aggregates say so with
+        ``edition_autocreation.semver_aggregates = false``.
+
+        The autocreation gate is autocreation-only, matching the
+        config's name: an aggregate edition that already exists —
+        auto-created before the knob was turned off, or created by hand
+        — is still matched and advanced by ``find_matching_editions`` in
+        ``track_build``. Only the implicit creation of new ``N`` /
+        ``N.M`` rows stops. Keeper-sync's backfill applies the knob the
+        same way, so a migrated project's ``/v/15`` does not freeze
+        where an identically configured native project's keeps moving.
 
         Returns a tuple of (matched editions, IDs of newly created ones).
         """
-        sv = SemverVersion.parse(build.git_ref)
-        if sv is None or sv.prerelease is not None:
+        if not autocreation.semver_aggregates:
+            return [], set()
+
+        sv = parse_stable_semver(build.git_ref)
+        if sv is None:
             return [], set()
 
         matched: list[Edition] = []
         created_ids: set[int] = set()
-
-        # --- semver_major ---
-        major_slug = str(sv.major)
-        major_edition = await self._deps.edition_store.get_by_slug(
-            project_id=project_id, slug=major_slug
-        )
-        if major_edition is None:
-            major_edition = await self._deps.edition_store.create_internal(
-                project_id=project_id,
-                slug=major_slug,
-                title=f"Latest {sv.major}.x",
-                kind=EditionKind.major,
-                tracking_mode=TrackingMode.semver_major,
-                tracking_params={"major_version": sv.major},
+        for spec in semver_aggregate_specs(sv):
+            edition = await self._deps.edition_store.get_by_slug(
+                project_id=project_id, slug=spec.slug
             )
-            self._deps.logger.info(
-                "Auto-created semver_major edition",
-                slug=major_slug,
-                project_id=project_id,
-            )
-            matched.append(major_edition)
-            created_ids.add(major_edition.id)
-        elif major_edition.tracking_mode == TrackingMode.semver_major:
-            matched.append(major_edition)
-
-        # --- semver_minor ---
-        minor_slug = f"{sv.major}.{sv.minor}"
-        minor_edition = await self._deps.edition_store.get_by_slug(
-            project_id=project_id, slug=minor_slug
-        )
-        if minor_edition is None:
-            minor_edition = await self._deps.edition_store.create_internal(
-                project_id=project_id,
-                slug=minor_slug,
-                title=f"Latest {sv.major}.{sv.minor}.x",
-                kind=EditionKind.minor,
-                tracking_mode=TrackingMode.semver_minor,
-                tracking_params={
-                    "major_version": sv.major,
-                    "minor_version": sv.minor,
-                },
-            )
-            self._deps.logger.info(
-                "Auto-created semver_minor edition",
-                slug=minor_slug,
-                project_id=project_id,
-            )
-            matched.append(minor_edition)
-            created_ids.add(minor_edition.id)
-        elif minor_edition.tracking_mode == TrackingMode.semver_minor:
-            matched.append(minor_edition)
+            if edition is None:
+                edition = await self._deps.edition_store.create_internal(
+                    project_id=project_id,
+                    slug=spec.slug,
+                    title=spec.title,
+                    kind=spec.kind,
+                    tracking_mode=spec.tracking_mode,
+                    tracking_params=spec.tracking_params,
+                )
+                self._deps.logger.info(
+                    "Auto-created semver aggregate edition",
+                    slug=spec.slug,
+                    tracking_mode=spec.tracking_mode,
+                    project_id=project_id,
+                )
+                matched.append(edition)
+                created_ids.add(edition.id)
+            elif edition.tracking_mode == spec.tracking_mode:
+                matched.append(edition)
 
         return matched, created_ids

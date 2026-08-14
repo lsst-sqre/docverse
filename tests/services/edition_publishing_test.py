@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from types import TracebackType
-from typing import Self
+from typing import Any, Self, override
 
 import pytest
+import sentry_sdk
 import structlog
+from safir.testing.sentry import (
+    TestTransport,
+    capture_events_fixture,
+    sentry_init_fixture,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -26,12 +33,15 @@ from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.dashboard_context import MAIN_SLUG
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.sentry import initialize_sentry
+from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.services.edition_publishing import (
     EditionPublishingService,
 )
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.cdncachepurger import (
     CdnCachePurger,
+    CloudflareCachePurgeError,
     MockCdnCachePurger,
 )
 from docverse_server.storage.edition_build_history_store import (
@@ -116,6 +126,24 @@ class _FailingPurger:
         raise self._exc
 
 
+class _AbsorbingCoalescer(CdnPurgeCoalescer):
+    """A coalescer that absorbs every request into a concurrent purge."""
+
+    def __init__(self) -> None:
+        super().__init__(min_interval=0.0)
+        self.hostnames: list[str] = []
+
+    @override
+    async def purge(
+        self,
+        hostname: str,
+        purge: Callable[[], Awaitable[None]],
+    ) -> bool:
+        _ = purge
+        self.hostnames.append(hostname)
+        return False
+
+
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
@@ -126,6 +154,8 @@ def _make_service(
     publisher: EditionPublisher | None = None,
     provider_raises: bool = False,
     purger: CdnCachePurger | None = None,
+    purger_provider_error: Exception | None = None,
+    coalescer: CdnPurgeCoalescer | None = None,
 ) -> EditionPublishingService:
     async def provider(*, org_id: int, service_label: str) -> EditionPublisher:
         if provider_raises:
@@ -145,6 +175,8 @@ def _make_service(
         *, org_id: int, service_label: str
     ) -> CdnCachePurger:
         _ = (org_id, service_label)
+        if purger_provider_error is not None:
+            raise purger_provider_error
         return resolved_purger
 
     logger = _logger()
@@ -156,6 +188,9 @@ def _make_service(
         ),
         publisher_provider=provider,
         purger_provider=purger_provider,
+        purge_coalescer=(
+            coalescer if coalescer is not None else CdnPurgeCoalescer()
+        ),
         logger=logger,
     )
 
@@ -451,7 +486,7 @@ async def test_publish_long_profile_purges_project_hostname(
             cdn_service_label="cdn-prod",
             edition_kind=edition_kind,
         )
-        await service.publish(
+        pending = await service.publish(
             org_id=org_id,
             project_slug=_PROJECT_SLUG,
             edition=edition,
@@ -459,6 +494,12 @@ async def test_publish_long_profile_purges_project_hostname(
             history_entry=history_entry,
         )
         await db_session.commit()
+
+    # ``publish`` only *prepares* the purge; nothing reaches the CDN
+    # until the caller runs it, deliberately outside the transaction.
+    assert mock_purger.purge_calls == []
+    assert pending is not None
+    await service.purge_cdn_cache(pending)
 
     assert mock_purger.purge_calls == [
         f"{_PROJECT_SLUG}.{org_slug}.example.com"
@@ -478,7 +519,7 @@ async def test_publish_short_profile_does_not_purge(
     edition_kind: EditionKind,
     org_slug: str,
 ) -> None:
-    """Short-profile publishes make no purge call."""
+    """Short-profile publishes leave no purge for the caller to run."""
     mock_purger = MockCdnCachePurger()
     service = _make_service(
         db_session,
@@ -492,7 +533,7 @@ async def test_publish_short_profile_does_not_purge(
             cdn_service_label="cdn-prod",
             edition_kind=edition_kind,
         )
-        await service.publish(
+        pending = await service.publish(
             org_id=org_id,
             project_slug=_PROJECT_SLUG,
             edition=edition,
@@ -501,6 +542,7 @@ async def test_publish_short_profile_does_not_purge(
         )
         await db_session.commit()
 
+    assert pending is None
     assert mock_purger.purge_calls == []
 
 
@@ -517,7 +559,7 @@ async def test_publish_without_cdn_service_label_does_not_purge(
         org_id, edition, build, history_entry = await _setup(
             db_session, org_slug="nopurge-no-cdn-org"
         )
-        await service.publish(
+        pending = await service.publish(
             org_id=org_id,
             project_slug=_PROJECT_SLUG,
             edition=edition,
@@ -526,6 +568,7 @@ async def test_publish_without_cdn_service_label_does_not_purge(
         )
         await db_session.commit()
 
+    assert pending is None
     assert mock_purger.purge_calls == []
 
 
@@ -534,6 +577,11 @@ async def test_publish_logs_successful_purge(
     db_session: AsyncSession,
 ) -> None:
     """A successful purge emits a structured log with full context."""
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=MockCdnCachePurger(),
+    )
     async with db_session.begin():
         org_id, edition, build, history_entry = await _setup(
             db_session,
@@ -541,20 +589,18 @@ async def test_publish_logs_successful_purge(
             cdn_service_label="cdn-prod",
             edition_kind=EditionKind.main,
         )
-        with capture_logs() as logs:
-            service = _make_service(
-                db_session,
-                publisher=MockEditionPublisher(),
-                purger=MockCdnCachePurger(),
-            )
-            await service.publish(
-                org_id=org_id,
-                project_slug=_PROJECT_SLUG,
-                edition=edition,
-                build=build,
-                history_entry=history_entry,
-            )
+        pending = await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
         await db_session.commit()
+
+    assert pending is not None
+    with capture_logs() as logs:
+        await service.purge_cdn_cache(pending)
 
     entries = [e for e in logs if e["event"] == "Purged CDN cache"]
     assert len(entries) == 1
@@ -566,10 +612,62 @@ async def test_publish_logs_successful_purge(
 
 
 @pytest.mark.asyncio
+async def test_publish_coalesced_purge_skips_the_purger(
+    db_session: AsyncSession,
+) -> None:
+    """An absorbed purge contacts no CDN yet still publishes the edition."""
+    coalescer = _AbsorbingCoalescer()
+    mock_purger = MockCdnCachePurger()
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=mock_purger,
+        coalescer=coalescer,
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-coalesce-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        pending = await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
+        await db_session.commit()
+
+    assert pending is not None
+    with capture_logs() as logs:
+        await service.purge_cdn_cache(pending)
+
+    hostname = f"{_PROJECT_SLUG}.purge-coalesce-org.example.com"
+    assert coalescer.hostnames == [hostname]
+    assert mock_purger.purge_calls == []
+    entries = [e for e in logs if e["event"] == "Coalesced CDN cache purge"]
+    assert len(entries) == 1
+    assert entries[0]["hostname"] == hostname
+
+    async with db_session.begin():
+        refreshed = await _fetch_edition(
+            db_session, edition.id, edition.project_id, edition.slug
+        )
+        assert refreshed.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
 async def test_publish_logs_failed_purge(
     db_session: AsyncSession,
 ) -> None:
     """A failed purge emits a structured error log with full context."""
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=_FailingPurger(RuntimeError("purge exploded")),
+    )
     async with db_session.begin():
         org_id, edition, build, history_entry = await _setup(
             db_session,
@@ -577,20 +675,18 @@ async def test_publish_logs_failed_purge(
             cdn_service_label="cdn-prod",
             edition_kind=EditionKind.main,
         )
-        with capture_logs() as logs:
-            service = _make_service(
-                db_session,
-                publisher=MockEditionPublisher(),
-                purger=_FailingPurger(RuntimeError("purge exploded")),
-            )
-            await service.publish(
-                org_id=org_id,
-                project_slug=_PROJECT_SLUG,
-                edition=edition,
-                build=build,
-                history_entry=history_entry,
-            )
+        pending = await service.publish(
+            org_id=org_id,
+            project_slug=_PROJECT_SLUG,
+            edition=edition,
+            build=build,
+            history_entry=history_entry,
+        )
         await db_session.commit()
+
+    assert pending is not None
+    with capture_logs() as logs:
+        await service.purge_cdn_cache(pending)
 
     entries = [e for e in logs if e["event"] == "CDN cache purge failed"]
     assert len(entries) == 1
@@ -617,7 +713,7 @@ async def test_publish_purge_failure_does_not_propagate(
             cdn_service_label="cdn-prod",
             edition_kind=EditionKind.main,
         )
-        await service.publish(
+        pending = await service.publish(
             org_id=org_id,
             project_slug=_PROJECT_SLUG,
             edition=edition,
@@ -626,6 +722,9 @@ async def test_publish_purge_failure_does_not_propagate(
         )
         await db_session.commit()
 
+    assert pending is not None
+    await service.purge_cdn_cache(pending)
+
     async with db_session.begin():
         refreshed = await _fetch_edition(
             db_session, edition.id, edition.project_id, edition.slug
@@ -633,3 +732,125 @@ async def test_publish_purge_failure_does_not_propagate(
         assert refreshed.publish_status == PublishStatus.published
         refreshed_history = await _fetch_history(db_session, edition.id)
         assert refreshed_history.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_publish_purge_failure_captures_to_sentry(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exhausted purge stays best-effort but is reported to Sentry.
+
+    The publish contract is unchanged — a CDN outage still degrades to a
+    stale edge copy rather than a failed publish — but the swallowed
+    exception is no longer invisible: it reaches Sentry carrying
+    Cloudflare's own error code, so a stale-cache edition is
+    discoverable without grepping worker logs.
+    """
+    purge_error = CloudflareCachePurgeError(
+        hostname=f"{_PROJECT_SLUG}.purge-sentry-org.example.com",
+        zone_id="zone-123",
+        status_code=429,
+        error_codes=[1134],
+        error_messages=["Unable to purge, rate limit reached"],
+        attempts=4,
+    )
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger=_FailingPurger(purge_error),
+    )
+
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    real_init = sentry_sdk.init
+
+    def _init_with_test_transport(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("transport", TestTransport())
+        return real_init(*args, **kwargs)
+
+    monkeypatch.setattr(sentry_sdk, "init", _init_with_test_transport)
+
+    with sentry_init_fixture():
+        # Publishing runs in the general worker pool (the
+        # ``publish_edition`` arq function), so that is the component
+        # an operator would filter on in Sentry.
+        initialize_sentry(component="worker")
+        captured = capture_events_fixture(monkeypatch)()
+
+        async with db_session.begin():
+            org_id, edition, build, history_entry = await _setup(
+                db_session,
+                org_slug="purge-sentry-org",
+                cdn_service_label="cdn-prod",
+                edition_kind=EditionKind.main,
+            )
+            pending = await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+            await db_session.commit()
+
+        assert pending is not None
+        await service.purge_cdn_cache(pending)
+
+        assert len(captured.errors) == 1
+        event = captured.errors[0]
+        assert event["tags"]["cloudflare_error_code"] == "1134"
+        assert event["tags"]["cdn_status_code"] == "429"
+        assert event["contexts"]["cloudflare_purge"]["attempts"] == 4
+
+    async with db_session.begin():
+        refreshed = await _fetch_edition(
+            db_session, edition.id, edition.project_id, edition.slug
+        )
+        assert refreshed.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_publish_purger_resolution_failure_leaves_no_pending_purge(
+    db_session: AsyncSession,
+) -> None:
+    """An unresolvable purger is reported but does not fail the publish.
+
+    Resolving the purger reads the org's CDN credentials, so it has to
+    happen while the publish transaction is still open — that is what
+    lets the purge itself run on no connection at all. It is therefore
+    the one part of purging that can fail *during* a publish, and it
+    stays as best-effort as the purge it feeds.
+    """
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger_provider_error=RuntimeError("no such CDN service"),
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-resolve-fail-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        with capture_logs() as logs:
+            pending = await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+        await db_session.commit()
+
+    assert pending is None
+    entries = [e for e in logs if e["event"] == "CDN cache purge failed"]
+    assert len(entries) == 1
+    assert entries[0]["log_level"] == "error"
+
+    async with db_session.begin():
+        refreshed = await _fetch_edition(
+            db_session, edition.id, edition.project_id, edition.slug
+        )
+        assert refreshed.publish_status == PublishStatus.published

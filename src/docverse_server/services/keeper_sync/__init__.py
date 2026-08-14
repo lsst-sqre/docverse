@@ -9,8 +9,10 @@ See SQR-112 and the parent PRD (#275) for the full design.
 
 from __future__ import annotations
 
-from .copier import BuildContentCopier, CopyResult
+from .copier import DEFAULT_COPY_CONCURRENCY, BuildContentCopier, CopyResult
 from .mappers import (
+    EditionKindDerivation,
+    KindDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
     map_edition_tracking,
@@ -25,13 +27,16 @@ from .service import (
 )
 
 __all__ = [
+    "DEFAULT_COPY_CONCURRENCY",
     "BuildContentCopier",
     "BuildSyncOutcome",
     "CopyCallable",
     "CopyResult",
+    "EditionKindDerivation",
     "EditionSyncOutcome",
     "KeeperSyncContext",
     "KeeperSyncService",
+    "KindDerivationSource",
     "ProjectSyncResult",
     "derive_edition_kind",
     "derive_edition_slug",

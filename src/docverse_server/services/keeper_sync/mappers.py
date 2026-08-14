@@ -12,32 +12,185 @@ mode (PRD #275 "Out of scope") and is collapsed onto a pinned
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from docverse.models import EditionKind, TrackingMode
+from docverse_server.domain.slug import (
+    AnySlugRewriteRule,
+    derive_edition_kind_from_ref,
+)
 from docverse_server.storage.ltd import LtdBuild, LtdEdition, LtdEditionMode
 
 __all__ = [
     "LTD_MAIN_SLUG",
+    "EditionKindDerivation",
+    "KindDerivationSource",
     "derive_edition_kind",
     "derive_edition_slug",
+    "derive_edition_source_prefix",
     "map_edition_tracking",
 ]
 
 LTD_MAIN_SLUG = "main"
 """LTD slug that corresponds to Docverse's auto-created ``__main`` edition."""
 
+DOCVERSE_MAIN_SLUG = "__main"
+"""Docverse slug for a project's auto-created default edition."""
 
-def derive_edition_kind(ltd_slug: str) -> EditionKind:
-    """Pick the Docverse :class:`EditionKind` for an LTD edition slug.
+#: Path segment LTD writes build uploads under, between the product slug
+#: and the build slug: ``<product>/builds/<build-slug>/``.
+_LTD_BUILDS_SEGMENT = "builds"
 
-    LTD's ``main`` edition maps onto Docverse's auto-created ``__main``
-    edition (``EditionKind.main``). All other LTD editions are imported
-    as ``EditionKind.draft``; the LTD slug is preserved verbatim.
+#: Path segment LTD publishes edition copies under:
+#: ``<product>/v/<edition-slug>/``.
+_LTD_EDITIONS_SEGMENT = "v"
+
+
+class KindDerivationSource(StrEnum):
+    """Which arm of the derivation produced a Docverse edition kind.
+
+    Carried on :class:`EditionKindDerivation` purely for observability:
+    operators triaging a mis-kinded import need to know whether LTD's
+    tracking mode or a slug-rewrite rule decided the kind. Distinct from
+    the persisted ``kind_source`` column
+    (:class:`docverse.models.EditionKindSource`), which records *who
+    owns* an edition's kind rather than how the system computed one.
     """
-    if ltd_slug == LTD_MAIN_SLUG:
-        return EditionKind.main
-    return EditionKind.draft
+
+    ltd_main = "ltd_main"
+    """LTD's ``main`` edition, which always maps to ``EditionKind.main``."""
+
+    ltd_mode = "ltd_mode"
+    """An LTD version tracking mode mapped directly onto a kind."""
+
+    rule = "rule"
+    """A slug-rewrite rule (user-configured or built-in) matched the ref."""
+
+    fallback = "fallback"
+    """No mode mapping and no rule matched; the draft fallback applied."""
+
+
+@dataclass(frozen=True, slots=True)
+class EditionKindDerivation:
+    """A derived Docverse edition kind plus its provenance."""
+
+    kind: EditionKind
+    """The Docverse edition kind to import the LTD edition as."""
+
+    source: KindDerivationSource
+    """Which derivation arm produced :attr:`kind`."""
+
+    detail: str | None = None
+    """LTD mode for ``ltd_mode``, matched rule ``type`` for ``rule``."""
+
+
+#: LTD version tracking modes that decide a Docverse kind on their own,
+#: with no ref inspection. Only ``eups_daily_release`` qualifies, and
+#: only because it is a *floor*: whatever ref a daily edition points at,
+#: it must stay ``draft`` so it keeps ageing out under the
+#: ``draft_inactivity`` lifecycle rule.
+#:
+#: The other version modes (``lsst_doc``, ``eups_major_release``,
+#: ``eups_weekly_release``) deliberately do **not** appear here. They
+#: narrow which grammar an edition prefers, but they do not certify that
+#: the edition is currently on a release — LTD's own ``lsst_doc`` mode
+#: publishes ``main`` builds until a version tag exists, so a
+#: branch-tracking edition under any of them would have imported as
+#: ``release`` and become permanently exempt from lifecycle reaping.
+#: They fall through to the ref/slug confirmation below instead.
+_MODE_KIND_TABLE: dict[LtdEditionMode, EditionKind] = {
+    LtdEditionMode.eups_daily_release: EditionKind.draft,
+}
+
+
+def derive_edition_kind(
+    ltd_edition: LtdEdition,
+    *,
+    git_ref: str | None = None,
+    rules: Sequence[AnySlugRewriteRule] = (),
+) -> EditionKindDerivation:
+    """Pick the Docverse :class:`EditionKind` for an LTD edition.
+
+    Structure-first, then rule-driven:
+
+    1. LTD's ``main`` edition maps onto Docverse's auto-created
+       ``__main`` edition (``EditionKind.main``).
+    2. ``eups_daily_release`` pins ``draft`` outright — see
+       ``_MODE_KIND_TABLE``.
+    3. Everything else runs the full slug-rewrite rule chain —
+       org/project rules then the built-in version heuristics — against
+       the tracked ref. Ignore rules do not participate: they gate
+       auto-creation on the native path, and these editions already
+       exist in LTD.
+
+    The version modes take arm 3 with the rest: the mode narrows, but
+    the ref (or, when LTD sends none, the version-shaped LTD slug) is
+    what confirms a release.
+
+    Parameters
+    ----------
+    ltd_edition
+        The LTD edition being imported.
+    git_ref
+        The ref the Docverse tracking pair pins, as returned by
+        :func:`map_edition_tracking`. Falls back to the edition's first
+        ``tracked_refs`` entry and finally to the LTD slug, so an
+        edition with no ref at all still gets classified on its slug.
+        LTD reports ``tracked_refs: null`` for every non-``git_refs``
+        mode, so version-mode editions land on that slug fallback — and
+        their slug is the version string (``v27_0``, ``w_2026_10``).
+    rules
+        Ordered org/project-configured slug rewrite rules. The built-in
+        version rules are always appended by the domain layer.
+
+    Returns
+    -------
+    EditionKindDerivation
+        The derived kind and where it came from.
+    """
+    if ltd_edition.slug == LTD_MAIN_SLUG:
+        return EditionKindDerivation(
+            kind=EditionKind.main, source=KindDerivationSource.ltd_main
+        )
+
+    ltd_mode = _parse_mode(ltd_edition.mode)
+    if ltd_mode is not None:
+        mode_kind = _MODE_KIND_TABLE.get(ltd_mode)
+        if mode_kind is not None:
+            return EditionKindDerivation(
+                kind=mode_kind,
+                source=KindDerivationSource.ltd_mode,
+                detail=ltd_mode.value,
+            )
+
+    tracked = ltd_edition.tracked_refs[0] if ltd_edition.tracked_refs else None
+    ref = git_ref or tracked or ltd_edition.slug
+    derivation = derive_edition_kind_from_ref(ref, rules)
+    if derivation.matched_rule_type is None:
+        return EditionKindDerivation(
+            kind=derivation.edition_kind, source=KindDerivationSource.fallback
+        )
+    return EditionKindDerivation(
+        kind=derivation.edition_kind,
+        source=KindDerivationSource.rule,
+        detail=derivation.matched_rule_type,
+    )
+
+
+def _parse_mode(mode: str) -> LtdEditionMode | None:
+    """Parse LTD's ``mode`` string, tolerating schema drift.
+
+    Unknown modes return ``None`` so kind derivation degrades to the
+    rule chain. :func:`map_edition_tracking` — which every caller runs
+    first — raises on the same input, so this is a defensive branch.
+    """
+    try:
+        return LtdEditionMode(mode)
+    except ValueError:
+        return None
 
 
 def derive_edition_slug(ltd_slug: str) -> str:
@@ -50,8 +203,44 @@ def derive_edition_slug(ltd_slug: str) -> str:
     relaxed edition-slug regex from #286.
     """
     if ltd_slug == LTD_MAIN_SLUG:
-        return "__main"
+        return DOCVERSE_MAIN_SLUG
     return ltd_slug
+
+
+def derive_edition_source_prefix(
+    *, bucket_root_dir: str, ltd_edition_slug: str
+) -> str | None:
+    """Derive the LTD *edition* prefix that mirrors a build's content.
+
+    LTD's publish step copies a build's objects from
+    ``<product>/builds/<build-slug>/`` to
+    ``<product>/v/<edition-slug>/`` and it is the latter copy Fastly
+    serves. On LTD's earliest uploads only that published copy carries a
+    public-read ACL, so it is the only prefix an anonymous reader can
+    recover the content from (#516).
+
+    The product root is read back off ``bucket_root_dir`` rather than
+    taken from ``LtdProduct.slug`` so the two prefixes are guaranteed to
+    be siblings in the bucket even if a product's layout ever diverges
+    from its slug.
+
+    Returns
+    -------
+    str | None
+        The ``<product>/v/<edition-slug>/`` prefix, or ``None`` when the
+        edition has no such prefix: LTD serves the default edition from
+        the product root, not ``v/main/``, and a ``bucket_root_dir``
+        that is not ``<product>/builds/<build-slug>`` does not locate a
+        product root at all.
+    """
+    if derive_edition_slug(ltd_edition_slug) == DOCVERSE_MAIN_SLUG:
+        return None
+    segments = bucket_root_dir.strip("/").split("/")
+    if len(segments) < 3 or segments[-2] != _LTD_BUILDS_SEGMENT:
+        return None
+    product_root = "/".join(segments[:-2])
+    edition_segment = ltd_edition_slug.strip("/")
+    return f"{product_root}/{_LTD_EDITIONS_SEGMENT}/{edition_segment}/"
 
 
 _VERSION_MODE_TABLE: dict[LtdEditionMode, TrackingMode] = {

@@ -17,7 +17,8 @@ are filled in by issue #289.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -29,7 +30,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.models import (
     BuildCreate,
     BuildStatus,
+    EditionAutocreationConfig,
     EditionKind,
+    EditionKindSource,
     ProjectCreate,
     ProjectGitHubBindingCreate,
     TrackingMode,
@@ -39,13 +42,36 @@ from docverse.models.projects import parse_github_url
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_autocreation import (
+    DEFAULT_EDITION_AUTOCREATION,
+    resolve_edition_autocreation,
+)
 from docverse_server.domain.lifecycle import (
     DraftInactivityRule,
     RefDeletedRule,
 )
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
-from docverse_server.exceptions import KeeperSyncInvariantError, NotFoundError
+from docverse_server.domain.semver_aggregate import (
+    SemverAggregateSpec,
+    semver_aggregate_specs,
+)
+from docverse_server.domain.slug import (
+    AnySlugRewriteRule,
+    resolve_slug_rewrite_rules,
+)
+from docverse_server.domain.version import (
+    SemverVersion,
+    accepts_version_advance,
+    parse_stable_semver,
+)
+from docverse_server.exceptions import (
+    MAX_REPORTED_EDITION_SLUGS,
+    KeeperSyncInvariantError,
+    KeeperSyncSystemicFailureError,
+    NotFoundError,
+    format_ltd_edition_slugs,
+)
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -55,6 +81,7 @@ from docverse_server.services.lifecycle.evaluator import (
     filter_rule_set,
     resolve_rule_set,
 )
+from docverse_server.services.lock_service import LockKey, LockService
 from docverse_server.services.project import (
     DEFAULT_EDITION_SLUG,
     ProjectService,
@@ -70,6 +97,7 @@ from docverse_server.storage.github import (
     RepositoryRefFetchError,
 )
 from docverse_server.storage.keeper_sync import (
+    KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
@@ -80,21 +108,27 @@ from docverse_server.storage.ltd import (
     LtdEdition,
     LtdEditionMode,
     LtdProduct,
+    LtdSourceAccessDeniedError,
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
-from .copier import CopyResult
+from .copier import EMPTY_MANIFEST_HASH, CopyResult
 from .mappers import (
+    EditionKindDerivation,
     derive_edition_kind,
     derive_edition_slug,
+    derive_edition_source_prefix,
     map_edition_tracking,
 )
 
 __all__ = [
     "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",
+    "MAX_CONSECUTIVE_EDITION_FAILURES",
+    "AggregateEditionOutcome",
     "BuildSyncOutcome",
     "CopyCallable",
+    "EditionSyncFailure",
     "EditionSyncOutcome",
     "KeeperSyncContext",
     "KeeperSyncService",
@@ -109,6 +143,98 @@ __all__ = [
 #: older is assumed to be from a worker that crashed between the
 #: placeholder commit and the finalize commit.
 DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
+
+#: Number of *consecutive* per-edition failures that ``sync_project``
+#: treats as a systemic outage rather than a run of independent
+#: per-edition faults.
+#:
+#: The per-edition failure boundary exists for the isolated case — LTD's
+#: oldest uploads carry no public-read object ACL, so one permanently
+#: unreadable build must not strand the releases behind it. That same
+#: isolation is actively harmful when the fault is shared: a mid-run LTD
+#: outage or a database failure marks every remaining edition failed one
+#: by one, the loop finishes, and the run rolls up ``completed`` on what
+#: was really a 3-of-80 import.
+#:
+#: The threshold is derived from the largest *contiguous* run of
+#: permanent per-edition faults LTD actually produces. Measured on
+#: roundtable-dev 2026-08-12: documenteer's build slugs 1-204 deny
+#: anonymous ``GetObject`` and 205+ read, 60 of its editions point at
+#: builds inside that block, and LTD lists editions oldest-first — so
+#: those 60 arrive back-to-back. (Only 19 failed the 2026-08-12 run
+#: because the other 41 were ``lifecycle_preemptive`` tombstones that
+#: short-circuited; after the PRD's manual tombstone purge and resync
+#: all 60 reach ``sync_edition``.) The un-ACL'd uploads are therefore
+#: strictly contiguous, not "scattered through a product's history" as
+#: this constant was originally justified — a premise that went
+#: unchallenged only because a tombstone short-circuit used to reset the
+#: counter, which kept the guard from ever firing.
+#:
+#: Seventy-five sits above that 60-edition block with headroom for a
+#: slightly deeper one on another product, and still aborts inside the
+#: first ~27% of documenteer's 279 editions, so a genuine outage costs
+#: 75 attempts rather than a whole product's edition list. The bias
+#: toward a high threshold follows the asymmetry of the two errors: a
+#: false abort is permanent and total — documenteer would stop at
+#: edition 60-something of 279 on every poll, forever, and none of the
+#: readable editions behind the denial block would ever import —
+#: whereas a missed abort is loud and recoverable, since the run
+#: finishes ``completed_with_errors`` with an exact
+#: ``edition_failure_count`` and ``aggregate_activity`` rolls the parent
+#: run up ``partial_failure``.
+#:
+#: The edition-prefix fallback (#516) now recovers that whole
+#: contiguous block from ``<product>/v/<edition-slug>/``, so those
+#: denials should stop reaching this counter at all — a denial only
+#: survives to become an edition failure when the published copy is
+#: missing or denied too. The threshold is deliberately *not* lowered on
+#: the strength of that reasoning alone: a roundtable-dev resync has to
+#: confirm the 19 documenteer failures actually drop to zero first, and
+#: the asymmetry above still says to err high. Lowering it is separate
+#: work.
+#:
+#: The end-of-run half of the systemic signal *does* now discount
+#: denials by error type rather than by count — see
+#: :data:`_PERMANENT_EDITION_FAILURE_TYPES`, which deliberately leaves
+#: this counter alone so an outage beginning inside a denial block still
+#: aborts within the threshold.
+MAX_CONSECUTIVE_EDITION_FAILURES = 75
+
+#: Per-edition failure types that are *permanent* by construction, and
+#: so carry no evidence of a systemic fault.
+#:
+#: ``sync_project``'s end-of-run check reads "failures, and nothing
+#: imported" as an outage. That inference only holds for failures whose
+#: cause could be shared: a project can legitimately import nothing
+#: because its only non-tombstoned edition is permanently broken, and
+#: the ``completed_with_errors`` / ``edition_failures`` partial-success
+#: path is built for exactly that. On roundtable-dev, a migrated product
+#: with 19 ``lifecycle_preemptive`` tombstones and one edition denied at
+#: both ``builds/<slug>/`` and ``v/<slug>/`` failed its job on every
+#: 5-minute tier tick, forever, because tombstone short-circuits are
+#: neutral for ``contacted_ltd`` and left ``ltd_successes == 0``.
+#:
+#: :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` is
+#: the only member today, and is permanent by construction rather than
+#: by observation: LTD's oldest uploads carry no public-read object ACL,
+#: :class:`~docverse_server.storage.ltd.LtdS3Source` is deliberately
+#: anonymous with no credentials to fall back on, and LTD Keeper is
+#: read-only source material — so nothing about a replay can change the
+#: answer. Every other per-edition fault in this path arrives as a bare
+#: ``RuntimeError`` or a transport error and cannot be distinguished by
+#: type, which is why the tuple is not larger: membership has to be
+#: earned by that "cannot be transient" argument, not by a hunch that a
+#: given failure looks per-edition.
+#:
+#: Deliberately *not* applied to the consecutive-failure breaker. That
+#: guard's threshold is already sized above the largest contiguous run
+#: of denials LTD produces (see
+#: :data:`MAX_CONSECUTIVE_EDITION_FAILURES`), and exempting denials from
+#: the count as well would let a genuine outage that begins inside a
+#: denial block walk further than the threshold allows.
+_PERMANENT_EDITION_FAILURE_TYPES: tuple[type[BaseException], ...] = (
+    LtdSourceAccessDeniedError,
+)
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
 #: callable the service consumes. Tests inject a fake; the production
@@ -128,6 +254,49 @@ _PLACEHOLDER_CONTENT_HASH = f"sha256:{'0' * 64}"
 
 #: Username recorded as the build's uploader for synced builds.
 _SYNC_UPLOADER = "keeper-sync"
+
+#: ``keeper_sync_state.annotations`` key on an *edition* row: the
+#: Docverse build id whose semver aggregates
+#: :meth:`KeeperSyncService._backfill_semver_aggregates` has already
+#: reconciled. Written inside that method's own transaction, so it is
+#: committed with the aggregate rows it describes and a raising backfill
+#: leaves no marker behind to retry against.
+#:
+#: The marker is what makes the backfill free in steady state.
+#: ``sync_build`` hands back the previously-synced build id even when it
+#: short-circuits, so "we have a build id" is true on every 5-minute
+#: poll of an unchanged project — a migrated project with ~80 release
+#: editions paid ~80 transactions and ~240 SELECTs per tick to conclude
+#: nothing had moved. Comparing the marker to the build the edition
+#: actually points at now skips all of it, while still running the
+#: one-time heal for editions imported before the backfill existed:
+#: those have no marker, and their heal necessarily lands on a
+#: short-circuited sync (their content was imported long ago), which is
+#: why the skip cannot key off ``short_circuited`` instead.
+#:
+#: Only a pass that actually reconciled something writes it — see
+#: :meth:`KeeperSyncService._backfill_semver_aggregates`. A pass held
+#: back by ``edition_autocreation.semver_aggregates`` leaves the row
+#: unmarked so re-enabling the knob heals on the very next poll.
+_AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
+
+#: ``keeper_sync_state.annotations`` key on a *build* row: ``True`` while
+#: the row's ``date_rebuilt_seen`` stands retracted, i.e. ``sync_build``
+#: imported a ``v/`` prefix that mutated between the hash it resolved on
+#: and the bytes it copied, and cleared the marker so the next poll
+#: re-resolves rather than short-circuiting.
+#:
+#: The flag exists because ``date_rebuilt_seen`` alone cannot say it.
+#: ``LtdEdition.date_rebuilt`` is nullable, and null is the norm for
+#: LTD's oldest editions — the very population whose un-ACL'd build
+#: prefixes force the mutable ``v/`` fallback. For those, a retracted
+#: ``NULL`` marker compares equal to LTD's ``NULL`` timestamp, so the
+#: short-circuit read "already converged" and the retraction it was
+#: handed never took effect. This flag is what separates "no marker,
+#: re-resolve" from "the marker matches"; it is written in the same
+#: upsert that clears the column, and disappears on the next clean
+#: resolve because ``annotations`` replaces wholesale.
+_DATE_REBUILT_RETRACTED_KEY = "date_rebuilt_seen_retracted"
 
 
 @dataclass(frozen=True)
@@ -152,6 +321,180 @@ class BuildSyncOutcome:
 
 
 @dataclass(frozen=True)
+class _ResolvedBuildSource:
+    """The LTD bucket prefix one build sync actually reads, plus its hash.
+
+    Both the manifest hash and the copy must read the *same* prefix or
+    the ``content_hash`` recorded on the build would not describe the
+    bytes that were uploaded. Bundling the two together makes that
+    impossible to get wrong: the prefix is resolved once, and the hash
+    that comes back is the hash *of that prefix*.
+
+    The same prefix is not the same *instant*, though. ``sync_build``
+    was written against ``<product>/builds/<slug>/``, which LTD writes
+    once and never rewrites, so "hash now, copy later" was safe by
+    construction. The ``v/`` fallback (#516) reads
+    ``<product>/v/<edition-slug>/``, a live prefix LTD overwrites on
+    every republish of that edition, and the hash and the copy are two
+    separate passes over the bucket. A republish landing between them
+    leaves :attr:`manifest_hash` describing bytes that are already gone.
+
+    That opens two windows, handled differently:
+
+    * **Copy path** — no existing build carries :attr:`manifest_hash`,
+      so the bytes are imported. ``sync_build`` compares the copier's
+      hash against :attr:`manifest_hash` afterwards and treats a
+      difference as the mutation it is: the *copied* hash is what the
+      build and state rows record, and the build's ``date_rebuilt_seen``
+      marker is retracted — cleared *and* flagged, see
+      :data:`_DATE_REBUILT_RETRACTED_KEY` — so the next poll
+      re-resolves instead of
+      short-circuiting on a resolution that never held. The re-resolve
+      then dedupes onto this very build if the prefix has settled on
+      what we copied, so a settled prefix converges without another
+      copy.
+    * **Dedupe-repoint path** — an existing build already carries
+      :attr:`manifest_hash`, so nothing is copied and there is no
+      second read to compare against. Detecting the mutation would mean
+      hashing the prefix again, a second full download of exactly the
+      content the dedupe exists to avoid transferring, so this window is
+      **accepted rather than mitigated**. The blast radius is bounded:
+      the edition is repointed at a real, complete Docverse build whose
+      content is what LTD served moments earlier, never at a phantom or
+      a half-import. Convergence comes from LTD, which advances the
+      edition's ``date_rebuilt`` on every republish — the poll after the
+      republish therefore sees a marker that no longer matches and
+      re-syncs the edition onto the new content.
+    """
+
+    prefix: str
+    """The resolved LTD prefix, always terminated by ``/``."""
+
+    manifest_hash: str
+    """Manifest hash of :attr:`prefix`'s contents."""
+
+    from_edition_prefix: bool
+    """``True`` when the build prefix denied and ``v/`` recovered it."""
+
+    @property
+    def annotations(self) -> dict[str, Any]:
+        """Provenance to record on the build's ``keeper_sync_state`` row.
+
+        A build recovered from the edition prefix carries a
+        ``bucket_root_dir`` whose bytes came from somewhere else, so
+        "where did this content come from" has to be answerable after
+        the fact — from the database, not just from a log line that has
+        since rotated away.
+        """
+        return {
+            "ltd_source_prefix": self.prefix,
+            "ltd_source_prefix_origin": (
+                "edition" if self.from_edition_prefix else "build"
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class _EditionStateKey:
+    """One edition's ``keeper_sync_state`` row, as an updatable handle.
+
+    Bundles the row's idempotency key with the annotations
+    ``sync_edition`` most recently wrote to it, so a later write in the
+    same sync can add a key without dropping the others — the store's
+    ``annotations`` argument replaces the column wholesale.
+    """
+
+    org_id: int
+    ltd_id: int
+    ltd_slug: str
+    annotations: dict[str, Any]
+
+
+#: Kinds a *different* derivation owns, which the per-LTD-edition
+#: derivation must therefore never overwrite. ``derive_edition_kind``
+#: only ever answers ``main``/``release``/``draft``; the semver aggregate
+#: specs own ``major`` / ``minor`` and ``derive_edition_slug``'s
+#: alternate branch owns ``alternate``. An LTD edition slugged like an
+#: aggregate (``15``) can land on such a row through ``get_by_slug``, and
+#: converging it would flatten the rollup — or, for ``main``, attempt a
+#: write ``ck_editions_main_slug_kind`` rejects outright.
+_FOREIGN_DERIVED_KINDS = frozenset(
+    {
+        EditionKind.main,
+        EditionKind.major,
+        EditionKind.minor,
+        EditionKind.alternate,
+    }
+)
+
+
+def _kind_needs_convergence(edition: Edition, derived: EditionKind) -> bool:
+    """Report whether the heal should rewrite *edition*'s ``kind``.
+
+    ``declared`` rows carry an operator's decision and are never
+    rewritten; a ``derived`` row is rewritten whenever this derivation
+    disagrees with it, in either direction — unless the row's current
+    kind belongs to another derivation entirely
+    (:data:`_FOREIGN_DERIVED_KINDS`).
+    """
+    return (
+        edition.kind_source is EditionKindSource.derived
+        and edition.kind not in _FOREIGN_DERIVED_KINDS
+        and edition.kind is not derived
+    )
+
+
+def _aggregates_backfilled_build_id(
+    state: KeeperSyncState | None,
+) -> int | None:
+    """Read the recorded aggregate-convergence build id off a state row.
+
+    Returns ``None`` for a row that has never been backfilled — an
+    edition imported before the backfill existed, which is exactly the
+    population the one-time heal has to reach — and for an annotation
+    that is not an ``int``, so a hand-edited row degrades into "run the
+    backfill again" rather than a type error mid-sync.
+    """
+    if state is None or not state.annotations:
+        return None
+    value = state.annotations.get(_AGGREGATES_BACKFILLED_BUILD_ID_KEY)
+    return value if isinstance(value, int) else None
+
+
+def _date_rebuilt_marker_retracted(state: KeeperSyncState) -> bool:
+    """Report whether *state*'s rebuild marker stands retracted.
+
+    A truthy :data:`_DATE_REBUILT_RETRACTED_KEY` annotation means the
+    row's ``date_rebuilt_seen`` was cleared on purpose and the build's
+    content came from an LTD prefix state that no longer exists, so the
+    edition owes one full re-resolve no matter what the column now holds
+    — including the ``NULL`` that would otherwise compare equal to an
+    LTD edition reporting no ``date_rebuilt`` at all.
+    """
+    return bool(
+        state.annotations
+        and state.annotations.get(_DATE_REBUILT_RETRACTED_KEY)
+    )
+
+
+@dataclass(frozen=True)
+class AggregateEditionOutcome:
+    """One semver aggregate edition the backfill created or advanced.
+
+    Emitted only when the pass actually moved a row — a freshly created
+    ``N`` / ``N.M`` edition, or an existing aggregate whose pointer
+    advanced onto this build. The steady state (aggregate already on the
+    build, or held back by the version guard) emits nothing, so the
+    worker's publish fan-out stays a no-op on repeat polls.
+    """
+
+    docverse_edition_id: int
+    docverse_slug: str
+    docverse_build_id: int
+    docverse_build_public_id: str
+
+
+@dataclass(frozen=True)
 class EditionSyncOutcome:
     """What ``sync_edition`` did with one LTD edition.
 
@@ -172,6 +515,75 @@ class EditionSyncOutcome:
     docverse_project_id: int
     docverse_project_slug: str
     build_outcome: BuildSyncOutcome | None
+    short_circuited: bool
+    """``True`` when the call returned without contacting LTD at all.
+
+    Set only by the tombstone short-circuit, which returns before
+    ``_ensure_edition`` on the strength of a single ``keeper_sync_state``
+    read. ``sync_project`` reads this to keep such a return out of its
+    consecutive-failure accounting: a database read succeeds *especially*
+    when LTD is down, so treating it as evidence of a healthy edition
+    reset the systemic-failure counter mid-outage.
+
+    Deliberately explicit rather than inferred from ``build_outcome is
+    None``, which is also true of a legitimately build-less edition that
+    really was synced.
+    """
+
+    aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
+    """Semver aggregates this edition's release build created or moved.
+
+    Empty on every path that did not run the backfill (no build, a
+    tombstone short-circuit, a non-semver ref, aggregates switched off)
+    and in the steady state where the aggregates already point at the
+    build.
+    """
+
+    @property
+    def contacted_ltd(self) -> bool:
+        """``True`` when this edition's sync actually reached LTD.
+
+        The systemic-failure accounting in :meth:`sync_project` keys off
+        this rather than "did the call return without raising". Only work
+        that went out to LTD — resolving the build, hashing its bucket
+        prefix, copying its objects — is evidence that an outage has
+        ended; anything the service could have done with LTD and the
+        object store both dark is not.
+
+        Two returns are therefore *neutral* for the breaker rather than
+        successful. A tombstone short-circuit returns off a single
+        ``keeper_sync_state`` read (:attr:`short_circuited`). A build-less
+        LTD edition — one whose ``build_url`` is ``None`` — writes its
+        edition and state rows and stops, so ``sync_build`` never runs
+        and :attr:`build_outcome` stays ``None``. Both succeed
+        *especially* during an outage, and treating either as evidence of
+        health let a product that interleaves them through its edition
+        list defeat the breaker with an alternating fail/reset pattern.
+
+        A short-circuited ``build_outcome`` still counts: ``sync_build``
+        short-circuits only *after* resolving the LTD build, which is a
+        live LTD round trip.
+        """
+        return not self.short_circuited and self.build_outcome is not None
+
+
+@dataclass(frozen=True)
+class EditionSyncFailure:
+    """One LTD edition whose :meth:`sync_edition` call raised.
+
+    Carries the LTD-side identity rather than the Docverse-side one:
+    a failure can fire before the edition has a Docverse row at all
+    (an ``AccessDenied`` on the LTD build's objects leaves the edition
+    created but the build missing), so the LTD slug/id is the only
+    identifier guaranteed to exist. ``error_message`` is ``str(exc)``,
+    kept short enough to live in a ``queue_jobs.progress`` JSONB blob;
+    the full traceback goes to Sentry and the structured log.
+    """
+
+    ltd_edition_id: int
+    ltd_edition_slug: str
+    error_type: str
+    error_message: str
 
 
 @dataclass(frozen=True)
@@ -184,11 +596,16 @@ class ProjectSyncResult:
     defensive shape; the only production path that writes a project
     tombstone is the manual-delete chokepoint, which always carries a
     Docverse project id.
+
+    ``edition_failures`` is empty on a clean sync; a non-empty tuple
+    means the run was *partial* — those LTD editions raised and were
+    skipped, every other edition still synced.
     """
 
     docverse_project_id: int | None
     docverse_project_slug: str
     edition_outcomes: list[EditionSyncOutcome]
+    edition_failures: tuple[EditionSyncFailure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +641,7 @@ class KeeperSyncService:
         tombstone_service: KeeperSyncTombstoneService | None = None,
         binding_resolver: ProjectGitHubBindingResolver | None = None,
         ref_set_fetcher: GitHubRefSetFetcher | None = None,
+        lock_service: LockService | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -240,6 +658,46 @@ class KeeperSyncService:
         self._tombstone_service = tombstone_service
         self._binding_resolver = binding_resolver
         self._ref_set_fetcher = ref_set_fetcher
+        self._lock_service = lock_service
+
+    @asynccontextmanager
+    async def _edition_update_lock(
+        self, *, org_id: int, project_id: int, edition_id: int
+    ) -> AsyncGenerator[None]:
+        """Hold the ``EDITION_UPDATE`` lock for one edition, if wired.
+
+        The same key the native path takes in
+        ``EditionTrackingService._set_current_build_locked`` and in the
+        ``publish_edition`` worker, so a project mid-migration —
+        publishing natively while keeper-sync still polls — cannot
+        interleave two pointer writes on one edition.
+
+        Acquisition follows the DM-54693 convention established by
+        ``build_processing`` and ``publish_edition``: resolve the key
+        with a read in its own committed transaction, then acquire with
+        **no** transaction open. Waiting on ``pg_advisory_lock`` while
+        holding row locks would let a native writer that already holds
+        the advisory lock block on those rows — a cycle Postgres'
+        deadlock detector cannot see, because advisory-lock waits are
+        not in its graph.
+
+        Keeper-sync never takes ``BUILD_PROCESSING``, and never nests
+        one ``EDITION_UPDATE`` hold inside another (aggregates are
+        locked one at a time, in :func:`semver_aggregate_specs` order),
+        so there is no ordering to invert against the native path's
+        ``BUILD_PROCESSING`` → ``EDITION_UPDATE`` nesting.
+
+        ``lock_service`` is ``None`` on direct unit-test constructions,
+        which run unwrapped exactly as ``EditionTrackingService`` does.
+        """
+        if self._lock_service is None:
+            yield
+            return
+        lock_key = LockKey.for_edition_update(
+            org_id=org_id, project_id=project_id, edition_id=edition_id
+        )
+        async with self._lock_service.acquire(lock_key):
+            yield
 
     async def sync_project(
         self,
@@ -251,6 +709,65 @@ class KeeperSyncService:
         ) = None,
     ) -> ProjectSyncResult:
         """Sync one LTD product (and all its editions) into Docverse.
+
+        Each edition has its own failure boundary: an exception out of
+        :meth:`sync_edition` is captured to Sentry, logged with the LTD
+        edition's slug/id, recorded on the returned
+        :attr:`ProjectSyncResult.edition_failures`, and the loop moves
+        on. One unreadable LTD build therefore costs one edition rather
+        than every edition behind it in the list — LTD's oldest uploads
+        carry no public-read ACL, so a single permanently-``AccessDenied``
+        build used to strand the whole project's release history.
+        ``edition_failures`` is the partial-success signal (bounded retry
+        of transient copy errors is deliberately out of scope here); the
+        worker records it on the job's ``progress`` and finishes the job
+        ``completed_with_errors``.
+
+        That isolation is bounded by
+        :data:`MAX_CONSECUTIVE_EDITION_FAILURES`. A run of that many
+        *consecutive* failures is read as a systemic fault — a mid-run
+        LTD outage, a dead database — rather than a run of independent
+        per-edition ones, and raises
+        :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+        (chained from the last edition's exception) instead of walking
+        the remaining editions. Without the abort, a systemic fault
+        would mark every remaining edition failed one at a time and
+        still let the run roll up green over a 3-of-80 import.
+
+        Only an edition that *reached LTD* resets the counter (see
+        :attr:`EditionSyncOutcome.contacted_ltd`), so scattered isolated
+        failures keep their per-edition boundary while editions the loop
+        did no LTD work for stay invisible to the breaker: an edition in
+        ``skip_ltd_ids`` never reaches :meth:`sync_edition`, one whose
+        ``keeper_sync_state`` row is tombstoned returns a
+        ``short_circuited`` outcome from a lone database read, and a
+        build-less LTD edition writes its rows without ever resolving a
+        build. None of them contacts LTD, so none is evidence that an
+        outage has ended.
+
+        The breaker alone cannot catch a whole-infrastructure outage on a
+        *small* project: a migrated product typically carries ~20
+        editions, so expired object-store credentials or a dead database
+        would fail every one of them and still finish under the
+        threshold, rolling up ``completed_with_errors`` /
+        ``partial_failure`` with nothing imported. A run that ends with
+        failures and *no* LTD-contacting outcome therefore raises the
+        same :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+        from the end of the loop, whatever the edition count. Editions
+        that succeeded before the failure started keep the run on the
+        partial-success path, so the mixed case is unaffected.
+
+        That end-of-run signal is read by failure *type*, not by count:
+        a failure in :data:`_PERMANENT_EDITION_FAILURE_TYPES` cannot be
+        the outage the check is looking for, so a run whose only
+        failures are permanent stays on the partial-success path however
+        little it imported. Otherwise the shape the per-edition boundary
+        exists for — a product whose surviving edition is permanently
+        denied, everything else tombstoned — failed its job on every
+        tier tick forever. The abort chains from the last failure that
+        *was* a candidate, so the triggering fault on the ``__cause__``
+        chain is the systemic evidence rather than an incidental denial
+        beside it.
 
         ``on_edition_synced`` runs once per :meth:`sync_edition` return,
         before the next iteration begins. Callbacks fire after each
@@ -292,6 +809,16 @@ class KeeperSyncService:
             org, project = await self._ensure_project(
                 org_id=org_id, ltd_product=ltd_product
             )
+        # Resolved once per project and threaded through both kind
+        # derivation call sites (the proactive pass and sync_edition)
+        # so the rule set is parsed a single time per sync.
+        rewrite_rules = _resolve_rewrite_rules(org=org, project=project)
+        # Same story for the autocreation config: project-over-org, one
+        # resolution per sync, threaded into every sync_edition call.
+        autocreation = resolve_edition_autocreation(
+            project=project.edition_autocreation,
+            org=org.edition_autocreation,
+        )
         ltd_editions = await self._ltd_client.list_editions_for_product(
             ltd_slug
         )
@@ -299,17 +826,83 @@ class KeeperSyncService:
             org=org,
             project=project,
             ltd_editions=ltd_editions,
+            rewrite_rules=rewrite_rules,
         )
         outcomes: list[EditionSyncOutcome] = []
+        failures: list[EditionSyncFailure] = []
+        consecutive_failures = 0
+        ltd_successes = 0
+        # Failures whose type leaves an outage possible — see
+        # ``_PERMANENT_EDITION_FAILURE_TYPES`` for why a permanent fault
+        # is excluded from the end-of-run systemic signal, and why the
+        # last of *these*, not the last failure outright, is what the
+        # abort chains from.
+        systemic_candidates = 0
+        last_systemic_candidate: Exception | None = None
         for ltd_edition in ltd_editions:
             if ltd_edition.ltd_id in skip_ltd_ids:
                 continue
-            outcome = await self.sync_edition(
-                org_id=org.id,
-                org_slug=org.slug,
-                project=project,
-                ltd_edition=ltd_edition,
-            )
+            try:
+                outcome = await self.sync_edition(
+                    org_id=org.id,
+                    org_slug=org.slug,
+                    project=project,
+                    ltd_edition=ltd_edition,
+                    rewrite_rules=rewrite_rules,
+                    autocreation=autocreation,
+                )
+            except Exception as exc:
+                if not isinstance(exc, _PERMANENT_EDITION_FAILURE_TYPES):
+                    systemic_candidates += 1
+                    last_systemic_candidate = exc
+                sentry_sdk.capture_exception(exc)
+                self._logger.exception(
+                    "Edition sync failed; skipping edition and continuing",
+                    ltd_edition_id=ltd_edition.ltd_id,
+                    ltd_edition_slug=ltd_edition.slug,
+                    project_id=project.id,
+                    project=project.slug,
+                )
+                failures.append(
+                    EditionSyncFailure(
+                        ltd_edition_id=ltd_edition.ltd_id,
+                        ltd_edition_slug=ltd_edition.slug,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_EDITION_FAILURES:
+                    recent = [
+                        failure.ltd_edition_slug
+                        for failure in failures[-consecutive_failures:]
+                    ]
+                    self._logger.exception(
+                        "Aborting project sync: consecutive edition failures"
+                        " indicate a systemic outage",
+                        consecutive_failures=consecutive_failures,
+                        failed_ltd_edition_slugs=recent[
+                            :MAX_REPORTED_EDITION_SLUGS
+                        ],
+                        project_id=project.id,
+                        project=project.slug,
+                        ltd_slug=ltd_slug,
+                    )
+                    raise KeeperSyncSystemicFailureError(
+                        ltd_slug=ltd_slug,
+                        consecutive_failures=consecutive_failures,
+                        failed_ltd_edition_slugs=recent,
+                    ) from exc
+                continue
+            # Only an edition that actually reached LTD counts as
+            # evidence that the fault was per-edition rather than
+            # systemic — see ``EditionSyncOutcome.contacted_ltd`` for why
+            # tombstone short-circuits and build-less editions are
+            # neutral here, exactly as the ``skip_ltd_ids`` ``continue``
+            # above is.
+            if outcome.contacted_ltd:
+                consecutive_failures = 0
+                ltd_successes += 1
             outcomes.append(outcome)
             if on_edition_synced is not None:
                 try:
@@ -320,11 +913,83 @@ class KeeperSyncService:
                         "on_edition_synced callback raised; continuing",
                         docverse_slug=outcome.docverse_slug,
                     )
+        self._guard_zero_import_run(
+            project=project,
+            ltd_slug=ltd_slug,
+            failures=failures,
+            ltd_successes=ltd_successes,
+            systemic_candidates=systemic_candidates,
+            last_systemic_candidate=last_systemic_candidate,
+        )
         return ProjectSyncResult(
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             edition_outcomes=outcomes,
+            edition_failures=tuple(failures),
         )
+
+    def _guard_zero_import_run(
+        self,
+        *,
+        project: Project,
+        ltd_slug: str,
+        failures: Sequence[EditionSyncFailure],
+        ltd_successes: int,
+        systemic_candidates: int,
+        last_systemic_candidate: Exception | None,
+    ) -> None:
+        """Fail a run that imported nothing, unless every fault is permanent.
+
+        The end-of-loop half of the systemic signal (the mid-list half
+        is the consecutive-failure breaker): a project that finished its
+        edition list with failures and no LTD-contacting outcome
+        imported nothing, which the consecutive breaker cannot catch on
+        a project smaller than its threshold.
+
+        ``systemic_candidates`` counts only failures whose type leaves an
+        outage possible — see :data:`_PERMANENT_EDITION_FAILURE_TYPES`.
+        Zero of them means the run is *degraded*, not systemic: replaying
+        it would fail exactly the same way, so raising here would hand
+        the tier cron a job it re-fails every five minutes forever
+        instead of the ``completed_with_errors`` / ``edition_failures``
+        partial-success path built for a permanently unreadable edition.
+        """
+        if not failures or ltd_successes > 0:
+            return
+        failed_slugs = [failure.ltd_edition_slug for failure in failures]
+        reported_slugs = failed_slugs[:MAX_REPORTED_EDITION_SLUGS]
+        if systemic_candidates == 0:
+            self._logger.warning(
+                "Project sync imported nothing; every failure is a"
+                " permanent per-edition fault",
+                edition_failure_count=len(failures),
+                failed_ltd_edition_slugs=reported_slugs,
+                project_id=project.id,
+                project=project.slug,
+                ltd_slug=ltd_slug,
+            )
+            return
+        self._logger.error(
+            "Failing project sync: every attempted edition failed",
+            edition_failure_count=len(failures),
+            systemic_candidate_count=systemic_candidates,
+            failed_ltd_edition_slugs=reported_slugs,
+            project_id=project.id,
+            project=project.slug,
+            ltd_slug=ltd_slug,
+        )
+        raise KeeperSyncSystemicFailureError(
+            ltd_slug=ltd_slug,
+            consecutive_failures=len(failures),
+            failed_ltd_edition_slugs=failed_slugs,
+            message=(
+                f"Aborting keeper sync for LTD product {ltd_slug}: all"
+                f" {len(failures)} attempted editions failed (editions:"
+                f" {format_ltd_edition_slugs(failed_slugs)}), so nothing"
+                " was imported — a systemic outage rather than"
+                " per-edition faults"
+            ),
+        ) from last_systemic_candidate
 
     async def _proactive_lifecycle_pass(
         self,
@@ -332,6 +997,7 @@ class KeeperSyncService:
         org: Organization,
         project: Project,
         ltd_editions: list[LtdEdition],
+        rewrite_rules: Sequence[AnySlugRewriteRule] = (),
     ) -> set[int]:
         """Tombstone LTD editions a lifecycle rule would delete on import.
 
@@ -411,7 +1077,9 @@ class KeeperSyncService:
             ):
                 continue
             transient = _transient_edition_from_ltd(
-                ltd_edition=ltd_edition, project_id=project.id
+                ltd_edition=ltd_edition,
+                project_id=project.id,
+                rewrite_rules=rewrite_rules,
             )
             if transient is None:
                 continue
@@ -565,8 +1233,21 @@ class KeeperSyncService:
         project: Project,
         ltd_edition: LtdEdition,
         org_slug: str | None = None,
+        rewrite_rules: Sequence[AnySlugRewriteRule] = (),
+        autocreation: EditionAutocreationConfig | None = None,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse.
+
+        ``rewrite_rules`` are the project's resolved slug-rewrite rules,
+        consulted when deriving the edition's kind for ``git_refs`` /
+        ``manual`` editions. The empty default still picks up the
+        built-in version heuristics.
+
+        ``autocreation`` is the project's resolved edition-autocreation
+        config, which gates the semver aggregate backfill;
+        :meth:`sync_project` resolves it project-over-org once per
+        project and passes it in. ``None`` falls back to the built-in
+        defaults for the direct callers that do not resolve it.
 
         Short-circuits *before* ``_ensure_edition`` runs when the
         edition's ``keeper_sync_state`` row is tombstoned. The check
@@ -597,6 +1278,7 @@ class KeeperSyncService:
                 docverse_project_id=project.id,
                 docverse_project_slug=project.slug,
                 build_outcome=None,
+                short_circuited=True,
             )
 
         # ``manual`` editions need the published build's git_refs to
@@ -615,14 +1297,42 @@ class KeeperSyncService:
         tracking_mode, tracking_params = map_edition_tracking(
             ltd_edition, build=ltd_build_for_mapping
         )
-        kind = derive_edition_kind(ltd_edition.slug)
+        kind_derivation = derive_edition_kind(
+            ltd_edition,
+            git_ref=tracking_params.get("git_ref"),
+            rules=rewrite_rules,
+        )
         docverse_slug = derive_edition_slug(ltd_edition.slug)
+        self._logger.debug(
+            "Derived keeper-sync edition kind",
+            ltd_edition_id=ltd_edition.ltd_id,
+            ltd_edition_slug=ltd_edition.slug,
+            ltd_mode=ltd_edition.mode,
+            edition_kind=kind_derivation.kind.value,
+            kind_source=kind_derivation.source.value,
+            kind_detail=kind_derivation.detail,
+            docverse_slug=docverse_slug,
+            project_id=project.id,
+        )
+
+        # ``annotations`` replaces wholesale on upsert, so the aggregate
+        # convergence marker has to be carried forward here or every
+        # sync would erase it and re-run the backfill it records.
+        annotations: dict[str, Any] = {
+            "ltd_mode": ltd_edition.mode,
+            "ltd_tracked_refs": ltd_edition.tracked_refs,
+        }
+        backfilled_build_id = _aggregates_backfilled_build_id(edition_state)
+        if backfilled_build_id is not None:
+            annotations[_AGGREGATES_BACKFILLED_BUILD_ID_KEY] = (
+                backfilled_build_id
+            )
 
         async with self._session.begin():
             edition = await self._ensure_edition(
                 project_id=project.id,
                 docverse_slug=docverse_slug,
-                kind=kind,
+                kind_derivation=kind_derivation,
                 title=ltd_edition.title,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
@@ -635,13 +1345,19 @@ class KeeperSyncService:
                 docverse_id=edition.id,
                 date_last_synced=_now(),
                 date_rebuilt_seen=ltd_edition.date_rebuilt,
-                annotations={
-                    "ltd_mode": ltd_edition.mode,
-                    "ltd_tracked_refs": ltd_edition.tracked_refs,
-                },
+                annotations=annotations,
             )
+        # Outside the transaction above: the kind convergence write takes
+        # the edition's advisory lock, and this service acquires those
+        # with no transaction open (see ``_edition_update_lock``).
+        edition = await self._refresh_kind(
+            org_id=org_id,
+            edition=edition,
+            kind_derivation=kind_derivation,
+        )
 
         build_outcome: BuildSyncOutcome | None = None
+        aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
         if ltd_edition.build_url is not None:
             build_outcome = await self.sync_build(
                 org_id=org_id,
@@ -651,6 +1367,62 @@ class KeeperSyncService:
                 ltd_edition=ltd_edition,
                 ltd_build=ltd_build_for_mapping,
             )
+            if (
+                build_outcome.docverse_build_id is not None
+                # Steady state: the aggregates were already reconciled
+                # against this very build, so there is nothing to look
+                # at. See ``_AGGREGATES_BACKFILLED_BUILD_ID_KEY`` — this
+                # is the check that keeps an unchanged 80-release
+                # project from paying 80 transactions per poll, and it
+                # compares build ids rather than reading
+                # ``short_circuited`` so both the one-time heal and
+                # ``sync_build``'s converged-on-an-existing-build path
+                # (short-circuited, yet a *different* build id) still
+                # run.
+                and backfilled_build_id != build_outcome.docverse_build_id
+            ):
+                # The backfill runs after ``sync_build`` has committed the
+                # build row and repointed the edition, so the edition's
+                # import is already durable by the time we get here.
+                # Letting a backfill error escape would hand the whole
+                # edition to ``sync_project``'s per-edition boundary:
+                # no outcome is emitted, so ``on_edition_synced`` never
+                # enqueues the publish and the tail-end self-heal (which
+                # iterates only ``edition_outcomes``) cannot recover it —
+                # a fully-imported edition would be reported failed and
+                # its CDN pointer never published this run. Swallow it
+                # here instead, exactly as the ``on_edition_synced``
+                # callback's failures are swallowed in ``sync_project``:
+                # the aggregates are a derived nicety, and the next poll
+                # re-runs the backfill for this build anyway.
+                try:
+                    aggregate_outcomes = (
+                        await self._backfill_semver_aggregates(
+                            project_id=project.id,
+                            git_ref=tracking_params.get("git_ref"),
+                            build_id=build_outcome.docverse_build_id,
+                            autocreation=(
+                                autocreation or DEFAULT_EDITION_AUTOCREATION
+                            ),
+                            state_key=_EditionStateKey(
+                                org_id=org_id,
+                                ltd_id=ltd_edition.ltd_id,
+                                ltd_slug=ltd_edition.slug,
+                                annotations=annotations,
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
+                    self._logger.exception(
+                        "Semver aggregate backfill failed; edition sync"
+                        " still succeeded",
+                        ltd_edition_id=ltd_edition.ltd_id,
+                        ltd_edition_slug=ltd_edition.slug,
+                        docverse_slug=edition.slug,
+                        project_id=project.id,
+                        project=project.slug,
+                    )
 
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
@@ -667,6 +1439,237 @@ class KeeperSyncService:
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
             build_outcome=build_outcome,
+            short_circuited=False,
+            aggregate_outcomes=aggregate_outcomes,
+        )
+
+    async def _backfill_semver_aggregates(
+        self,
+        *,
+        project_id: int,
+        git_ref: str | None,
+        build_id: int,
+        autocreation: EditionAutocreationConfig,
+        state_key: _EditionStateKey,
+    ) -> tuple[AggregateEditionOutcome, ...]:
+        """Create/point the ``N`` / ``N.M`` aggregates for a release.
+
+        The migration counterpart of
+        ``EditionTrackingService._auto_create_version_editions``: without
+        it, an imported project's dashboard would list bare release
+        editions where a natively built one groups them under ``15`` and
+        ``15.2``. Both paths build their rows from
+        :func:`~docverse_server.domain.semver_aggregate.semver_aggregate_specs`
+        so they cannot drift.
+
+        The gate is the ref's own semver grammar
+        (:func:`~docverse_server.domain.version.parse_stable_semver`) —
+        neither the persisted kind nor the rule-derived one. The
+        persisted kind would couple the aggregates to unrelated manual
+        PATCHes of a single edition; the derived kind would let any
+        user rule that merely reshapes a slug shadow the built-in
+        ``SemverRule`` and silently switch the backfill off, since user
+        rules match first. The native path gates on the same
+        classification, so a migrated project keeps rendering the same
+        dashboard groups as a natively built one, and
+        ``edition_autocreation.semver_aggregates`` stays the explicit
+        opt-out on both.
+
+        ``autocreation`` is an *autocreation* gate, matching the config's
+        name and the native path exactly: it decides only whether a
+        missing ``N`` / ``N.M`` row may be created. An aggregate that
+        already exists is advanced regardless, because the native
+        counterpart of this method — ``find_matching_editions`` in
+        ``track_build`` — has no knob or kind gate at all and keeps
+        moving those rows. Suppressing advancement here would freeze a
+        migrated project's ``/v/15`` where an identically configured
+        native project's still moves.
+
+        ``state_key`` identifies the edition's ``keeper_sync_state`` row,
+        onto which this method stamps
+        :data:`_AGGREGATES_BACKFILLED_BUILD_ID_KEY` once every spec has
+        been reconciled, so a raising backfill leaves the marker unwritten
+        and retries on the next poll. Callers compare that marker to the
+        build id before calling at all, which is what makes a steady-state
+        poll free; refs with no aggregates to reconcile return before any
+        transaction opens and are therefore left unmarked, since
+        re-deciding that costs nothing but a parse.
+
+        The marker is a claim that this build's ``N`` / ``N.M`` rows are
+        as they should be, so a pass that reconciled *nothing* — creation
+        disabled and no existing aggregate moved — must not write one. It
+        would otherwise pin the caller's skip to this build id for good,
+        and an operator turning ``semver_aggregates`` back on would see no
+        aggregates until LTD happened to publish a new build for the
+        edition. Leaving it unwritten costs such a project one cheap
+        re-decision (a parse plus a ``get_by_slug`` per spec) per poll,
+        which is the price of the knob staying live.
+
+        Each spec is reconciled in its own transaction rather than one
+        transaction spanning the loop, because
+        :meth:`_ensure_aggregate_edition` has to take that aggregate's
+        advisory lock with no transaction open — see
+        :meth:`_edition_update_lock`. The marker is what makes that safe:
+        the per-aggregate writes are individually idempotent, so a crash
+        part-way through simply replays the whole (short) spec list next
+        poll.
+
+        Returns one outcome per aggregate this call actually moved, for
+        the worker to publish; see :class:`AggregateEditionOutcome`.
+        """
+        version = parse_stable_semver(git_ref)
+        if version is None:
+            return ()
+        specs = semver_aggregate_specs(version)
+        if not specs:
+            return ()
+        async with self._session.begin():
+            build = await self._build_store.get_by_id(build_id)
+        if build is None:
+            return ()
+        outcomes: list[AggregateEditionOutcome] = []
+        for spec in specs:
+            outcome = await self._ensure_aggregate_edition(
+                org_id=state_key.org_id,
+                project_id=project_id,
+                spec=spec,
+                build=build,
+                version=version,
+                allow_create=autocreation.semver_aggregates,
+            )
+            if outcome is not None:
+                outcomes.append(outcome)
+        if autocreation.semver_aggregates or outcomes:
+            async with self._session.begin():
+                await self._state_store.upsert(
+                    org_id=state_key.org_id,
+                    resource_type=ResourceType.edition,
+                    ltd_id=state_key.ltd_id,
+                    ltd_slug=state_key.ltd_slug,
+                    annotations={
+                        **state_key.annotations,
+                        _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
+                    },
+                )
+        return tuple(outcomes)
+
+    async def _ensure_aggregate_edition(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        spec: SemverAggregateSpec,
+        build: Build,
+        version: SemverVersion,
+        allow_create: bool,
+    ) -> AggregateEditionOutcome | None:
+        """Ensure one aggregate exists and points at *build*.
+
+        ``allow_create`` carries
+        ``edition_autocreation.semver_aggregates``: ``False`` skips a
+        missing row rather than creating it, but leaves an existing one
+        free to advance — see :meth:`_backfill_semver_aggregates` for
+        why the knob is creation-only.
+
+        Runs as locate-or-create, then decide-and-write under this
+        edition's ``EDITION_UPDATE`` lock. The split matters: the
+        version guard is a read-check-write, and a project mid-migration
+        has a second writer — the native ``build_processing`` path,
+        which takes the same lock around its own pointer update. Without
+        the lock keeper-sync could read ``15``'s ``current_build_git_ref``,
+        watch the native path publish a newer release onto it, and then
+        write its older build over the top, dropping ``/v/15`` back a
+        release until the next one shipped. So the guard re-reads the
+        row inside the lock: the locate step's ``Edition`` is a snapshot
+        from before the wait, and acting on it would be the same
+        unguarded read-check-write the lock is here to close.
+
+        Returns ``None`` — leaving the row untouched — when the slug is
+        occupied by an edition that is not this aggregate (an operator's
+        own ``15``, or a natively created one on a different tracking
+        mode), when the version guard rejects an older release, or when
+        the pointer is already where it should be.
+        """
+        async with self._session.begin():
+            edition = await self._edition_store.get_by_slug(
+                project_id=project_id, slug=spec.slug
+            )
+            if edition is None:
+                if not allow_create:
+                    self._logger.debug(
+                        "Semver aggregate not created: autocreation disabled",
+                        project_id=project_id,
+                        edition_slug=spec.slug,
+                        build_id=build.id,
+                    )
+                    return None
+                edition = await self._edition_store.create_internal(
+                    project_id=project_id,
+                    slug=spec.slug,
+                    title=spec.title,
+                    kind=spec.kind,
+                    tracking_mode=spec.tracking_mode,
+                    tracking_params=spec.tracking_params,
+                )
+                self._logger.info(
+                    "Auto-created semver aggregate edition for synced release",
+                    project_id=project_id,
+                    edition_id=edition.id,
+                    edition_slug=edition.slug,
+                    edition_kind=spec.kind.value,
+                    tracking_mode=spec.tracking_mode.value,
+                )
+        # Steady state on an unchanged project: the pointer is already
+        # where this build wants it, so decline before paying for a lock.
+        # Only ever declines, so a stale read here costs a poll at worst
+        # — the authoritative check runs under the lock below.
+        if edition.current_build_id == build.id:
+            return None
+        async with self._edition_update_lock(
+            org_id=org_id, project_id=project_id, edition_id=edition.id
+        ):
+            async with self._session.begin():
+                current = await self._edition_store.get_by_id(edition.id)
+                if current is None:
+                    # Soft-deleted between the locate and the lock.
+                    return None
+                # Also catches ``create_internal`` losing its ON CONFLICT
+                # race to a concurrent writer that inserted a
+                # differently-tracked row.
+                if current.tracking_mode != spec.tracking_mode:
+                    self._logger.info(
+                        "Semver aggregate slug held by a non-aggregate"
+                        " edition; leaving it untouched",
+                        project_id=project_id,
+                        edition_id=current.id,
+                        edition_slug=current.slug,
+                        edition_kind=current.kind.value,
+                        tracking_mode=current.tracking_mode.value,
+                    )
+                    return None
+                if not _aggregate_accepts(current, version):
+                    return None
+                if current.current_build_id == build.id:
+                    return None
+                updated = await self._edition_store.set_current_build(
+                    edition_id=current.id,
+                    build_id=build.id,
+                    skip_date_guard=True,
+                )
+                if updated is None:
+                    return None
+        self._logger.info(
+            "Pointed semver aggregate at synced release build",
+            project_id=project_id,
+            edition_id=updated.id,
+            edition_slug=updated.slug,
+            build_id=build.id,
+        )
+        return AggregateEditionOutcome(
+            docverse_edition_id=updated.id,
+            docverse_slug=updated.slug,
+            docverse_build_id=build.id,
+            docverse_build_public_id=serialize_base32_id(build.public_id),
         )
 
     async def _ensure_edition(
@@ -674,12 +1677,22 @@ class KeeperSyncService:
         *,
         project_id: int,
         docverse_slug: str,
-        kind: EditionKind,
+        kind_derivation: EditionKindDerivation,
         title: str,
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
     ) -> Edition:
-        """Look up or create an edition; refresh its tracking config."""
+        """Look up or create an edition and realign its tracking columns.
+
+        ``kind_derivation`` seeds a newly created edition's kind
+        outright. Existing rows — matched by slug, adopted by
+        ``git_ref``, or handed back by a ``create_internal`` that lost
+        its ``ON CONFLICT`` race — keep whatever kind they carry here;
+        the caller converges them through :meth:`_refresh_kind` once
+        this transaction has closed, because that write has to take the
+        edition's advisory lock and acquiring one while holding row
+        locks is the deadlock shape ``_edition_update_lock`` documents.
+        """
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
         )
@@ -726,16 +1739,27 @@ class KeeperSyncService:
                 project_id=project_id,
                 slug=docverse_slug,
                 title=title,
-                kind=kind,
+                kind=kind_derivation.kind,
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
             )
-        else:
-            await self._refresh_tracking(
-                edition=edition,
-                tracking_mode=tracking_mode,
-                tracking_params=tracking_params,
-            )
+        # Applied on both paths. ``create_internal`` is race-tolerant: a
+        # concurrent writer (e.g. the native ``track_build`` path handling
+        # an upload for the same ref) that inserted this
+        # ``(project, lower(slug))`` between our SELECT and INSERT wins the
+        # ``ON CONFLICT DO NOTHING``, and we get *its* row back — an
+        # existing edition exactly like a ``get_by_slug`` hit, whose
+        # tracking columns still need realigning with LTD. The store
+        # returns the winner verbatim with no "did I insert?" signal, so
+        # the refresh runs unconditionally; on a genuinely fresh row it
+        # is a no-op, since that row already carries these params. The
+        # caller's ``_refresh_kind`` covers the winner's kind the same
+        # way, and is likewise a no-op on a fresh row.
+        await self._refresh_tracking(
+            edition=edition,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+        )
         return edition
 
     async def _refresh_tracking(
@@ -752,6 +1776,66 @@ class KeeperSyncService:
             tracking_params=tracking_params,
         )
 
+    async def _refresh_kind(
+        self,
+        *,
+        org_id: int,
+        edition: Edition,
+        kind_derivation: EditionKindDerivation,
+    ) -> Edition:
+        """Converge an existing edition's kind on a fresh derivation.
+
+        The gate is provenance, not a transition allow-list: a row whose
+        ``kind_source`` is ``derived`` belongs to Docverse and is
+        rewritten to whatever LTD's mode and the rule chain say *now* —
+        demotions included, so a ``release`` that a wrong mode mapping
+        once produced heals back to ``draft`` on the next poll. A
+        ``declared`` row is an operator's decision and is never touched.
+
+        The write runs under the edition's ``EDITION_UPDATE`` lock and
+        re-reads the row inside it, matching the aggregate path: a
+        ``publish_edition`` job that loaded the edition before an
+        unlocked kind change committed would pick the stale CDN cache
+        profile and skip the hostname purge, leaving the edge serving
+        ``max-age=60`` for a release.
+
+        Returns the edition with the converged kind applied so the
+        caller reports the row's post-sync state rather than the stale
+        read.
+        """
+        if not _kind_needs_convergence(edition, kind_derivation.kind):
+            return edition
+        async with (
+            self._edition_update_lock(
+                org_id=org_id,
+                project_id=edition.project_id,
+                edition_id=edition.id,
+            ),
+            self._session.begin(),
+        ):
+            current = await self._edition_store.get_by_id(edition.id)
+            if current is None:
+                # Soft-deleted between the pre-check and the lock.
+                return edition
+            if not _kind_needs_convergence(current, kind_derivation.kind):
+                return current
+            await self._edition_store.update_kind(
+                edition_id=current.id, kind=kind_derivation.kind
+            )
+            previous_kind = current.kind
+        self._logger.info(
+            "Converged edition kind",
+            project_id=edition.project_id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            previous_kind=previous_kind.value,
+            edition_kind=kind_derivation.kind.value,
+            kind_trigger="keeper_sync",
+            kind_derivation_source=kind_derivation.source.value,
+            kind_detail=kind_derivation.detail,
+        )
+        return edition.model_copy(update={"kind": kind_derivation.kind})
+
     async def sync_build(
         self,
         *,
@@ -765,12 +1849,18 @@ class KeeperSyncService:
         """Sync the LTD edition's current build into Docverse.
 
         Short-circuits when ``keeper_sync_state`` already records a
-        Docverse build whose ``date_rebuilt_seen`` matches LTD's.
+        Docverse build whose ``date_rebuilt_seen`` matches LTD's and
+        has not been retracted (:data:`_DATE_REBUILT_RETRACTED_KEY`).
 
         ``ltd_build`` may be passed in by callers that already fetched
         the build (e.g. ``sync_edition`` does so for ``manual`` editions
         to derive the tracking pair). Skipping the refetch saves a round
         trip to LTD.
+
+        The bucket prefix the content is read from is resolved once, by
+        :meth:`_resolve_build_source`, and that one prefix feeds both the
+        manifest hash and the copy — see that method for the
+        ``AccessDenied`` recovery it performs.
         """
         if ltd_edition.build_url is None:
             msg = "sync_build requires an edition with build_url set"
@@ -797,6 +1887,10 @@ class KeeperSyncService:
         if existing_state is not None and (
             existing_state.date_rebuilt_seen == ltd_edition.date_rebuilt
             and existing_state.docverse_id is not None
+            # A retracted marker is not a matching one, however the two
+            # columns happen to compare — see
+            # :data:`_DATE_REBUILT_RETRACTED_KEY`.
+            and not _date_rebuilt_marker_retracted(existing_state)
         ):
             async with self._session.begin():
                 await self._state_store.upsert(
@@ -820,10 +1914,19 @@ class KeeperSyncService:
                 total_size_bytes=None,
             )
 
-        manifest_hash = await self._manifest_callable(
-            _ensure_trailing_slash(ltd_build.bucket_root_dir)
+        source = await self._resolve_build_source(
+            ltd_build=ltd_build, ltd_edition=ltd_edition, project=project
         )
-        async with self._session.begin():
+        manifest_hash = source.manifest_hash
+        # Both remaining transactions may repoint this edition, so both
+        # run under its EDITION_UPDATE lock — see the audit note on
+        # :meth:`_finalize_synced_build`.
+        async with (
+            self._edition_update_lock(
+                org_id=org_id, project_id=project.id, edition_id=edition.id
+            ),
+            self._session.begin(),
+        ):
             existing_build = (
                 await self._build_store.get_completed_by_content_hash(
                     project_id=project.id, content_hash=manifest_hash
@@ -851,6 +1954,7 @@ class KeeperSyncService:
                     date_last_synced=_now(),
                     date_rebuilt_seen=ltd_edition.date_rebuilt,
                     content_hash=manifest_hash,
+                    annotations=source.annotations,
                 )
         if existing_build is not None:
             self._logger.info(
@@ -886,11 +1990,55 @@ class KeeperSyncService:
             )
 
         copy_result = await self._copy_callable(
-            _ensure_trailing_slash(ltd_build.bucket_root_dir),
-            new_build.storage_prefix,
+            source.prefix, new_build.storage_prefix
         )
 
-        async with self._session.begin():
+        # The hash the dedupe/convergence decision above was made on and
+        # the bytes just copied are two reads of the same prefix at two
+        # different times. For a build prefix that is a distinction
+        # without a difference (LTD never rewrites one), but the ``v/``
+        # fallback reads a prefix LTD overwrites on every republish, so
+        # the two can disagree — see :class:`_ResolvedBuildSource`. The
+        # check is unconditional because a build-prefix disagreement
+        # would be a copier bug worth the same alarm, and because
+        # comparing two strings we already hold is free.
+        source_mutated = copy_result.content_hash != source.manifest_hash
+        annotations = source.annotations
+        if source_mutated:
+            # The hash that is no longer true of anything is still the
+            # hash the resolution branched on, so keep it on the row:
+            # a log line naming it will have rotated away long before
+            # anyone asks why this build exists.
+            annotations = {
+                **annotations,
+                "ltd_source_manifest_hash": source.manifest_hash,
+                # Retracting the marker below is only half the signal:
+                # an LTD edition with no ``date_rebuilt`` would make the
+                # cleared column compare equal to LTD's ``NULL`` and
+                # short-circuit anyway. This says the clear happened.
+                _DATE_REBUILT_RETRACTED_KEY: True,
+            }
+            self._logger.warning(
+                "LTD source prefix changed between hash and copy; importing"
+                " the copied bytes and forcing a re-sync",
+                ltd_build_id=ltd_build.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                edition_slug=edition.slug,
+                project=project.slug,
+                ltd_source_prefix=source.prefix,
+                ltd_source_prefix_origin=annotations[
+                    "ltd_source_prefix_origin"
+                ],
+                resolved_manifest_hash=source.manifest_hash,
+                content_hash=copy_result.content_hash,
+            )
+
+        async with (
+            self._edition_update_lock(
+                org_id=org_id, project_id=project.id, edition_id=edition.id
+            ),
+            self._session.begin(),
+        ):
             await self._finalize_synced_build(
                 build=new_build,
                 edition=edition,
@@ -905,8 +2053,22 @@ class KeeperSyncService:
                 ltd_slug=ltd_build.slug,
                 docverse_id=new_build.id,
                 date_last_synced=_now(),
-                date_rebuilt_seen=ltd_edition.date_rebuilt,
+                # Recording LTD's ``date_rebuilt`` claims "this LTD
+                # rebuild is imported". After a mutation we imported a
+                # prefix state that no longer exists, so the marker is
+                # retracted (not merely left alone — a stale row could
+                # already carry a matching one) and the next poll
+                # re-resolves the edition rather than short-circuiting.
+                # The retraction is carried by the annotation written
+                # above as well as by this clear, because clearing to
+                # ``NULL`` says nothing on an edition LTD reports with a
+                # null ``date_rebuilt``.
+                date_rebuilt_seen=(
+                    None if source_mutated else ltd_edition.date_rebuilt
+                ),
+                clear_date_rebuilt_seen=source_mutated,
                 content_hash=copy_result.content_hash,
+                annotations=annotations,
             )
 
         self._logger.info(
@@ -915,6 +2077,10 @@ class KeeperSyncService:
             docverse_build_public_id=serialize_base32_id(new_build.public_id),
             edition_slug=edition.slug,
             content_hash=copy_result.content_hash,
+            ltd_source_prefix=source.prefix,
+            ltd_source_prefix_origin=source.annotations[
+                "ltd_source_prefix_origin"
+            ],
         )
         return BuildSyncOutcome(
             docverse_build_id=new_build.id,
@@ -923,6 +2089,99 @@ class KeeperSyncService:
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+        )
+
+    async def _resolve_build_source(
+        self,
+        *,
+        ltd_build: LtdBuild,
+        ltd_edition: LtdEdition,
+        project: Project,
+    ) -> _ResolvedBuildSource:
+        """Pick the LTD prefix this build's content is readable from.
+
+        ``LtdBuild.bucket_root_dir`` — ``<product>/builds/<build-slug>/``
+        — is the primary source and stays the source everywhere it
+        works, so already-synced projects re-hash to exactly the same
+        value and nothing is re-copied.
+
+        LTD's earliest uploads, though, wrote those build objects with no
+        public-read ACL, and :class:`~docverse_server.storage.ltd.LtdS3Source`
+        is deliberately anonymous, so every ``GetObject`` under the
+        prefix answers ``AccessDenied`` (#516). LTD's publish step also
+        copied the same bytes to the edition prefix,
+        ``<product>/v/<edition-slug>/``, and *that* copy is public —
+        it is what Fastly serves. Measured on documenteer 2026-08-12:
+        1,863 objects across the 19 denied editions, 100% readable from
+        the edition prefix, object counts matching the build prefixes
+        exactly.
+
+        So a denial — and *only* a denial — falls back to the edition
+        prefix. An empty or missing build prefix hashes to the empty
+        manifest as before rather than silently importing whatever the
+        edition prefix holds, and the default edition has no ``v/``
+        sibling to fall back to at all (LTD serves it from the product
+        root), which :func:`derive_edition_source_prefix` enforces.
+
+        A fallback that finds nothing — denied again, or an edition
+        prefix with no keys under it — re-raises the denial, leaving the
+        edition to ``sync_project``'s per-edition failure boundary
+        exactly as before this recovery path existed.
+        """
+        build_prefix = _ensure_trailing_slash(ltd_build.bucket_root_dir)
+        try:
+            manifest_hash = await self._manifest_callable(build_prefix)
+        except LtdSourceAccessDeniedError:
+            edition_prefix = derive_edition_source_prefix(
+                bucket_root_dir=ltd_build.bucket_root_dir,
+                ltd_edition_slug=ltd_edition.slug,
+            )
+            if edition_prefix is None:
+                raise
+            self._logger.info(
+                "LTD build prefix is unreadable; retrying from the"
+                " edition prefix",
+                ltd_build_id=ltd_build.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                ltd_build_prefix=build_prefix,
+                ltd_edition_prefix=edition_prefix,
+                project=project.slug,
+            )
+            manifest_hash = await self._manifest_callable(edition_prefix)
+            if manifest_hash == EMPTY_MANIFEST_HASH:
+                # Nothing was published under the edition prefix either.
+                # Importing the empty manifest would finalize a
+                # zero-object build and leave the edition serving 404s
+                # while the sync reported success, so the denial stands
+                # and the edition stays retryable.
+                self._logger.warning(
+                    "LTD edition prefix is empty; cannot recover the"
+                    " unreadable build",
+                    ltd_build_id=ltd_build.ltd_id,
+                    ltd_edition_slug=ltd_edition.slug,
+                    ltd_build_prefix=build_prefix,
+                    ltd_edition_prefix=edition_prefix,
+                    project=project.slug,
+                )
+                raise
+            self._logger.info(
+                "Recovered LTD build content from the edition prefix",
+                ltd_build_id=ltd_build.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                ltd_build_prefix=build_prefix,
+                ltd_edition_prefix=edition_prefix,
+                content_hash=manifest_hash,
+                project=project.slug,
+            )
+            return _ResolvedBuildSource(
+                prefix=edition_prefix,
+                manifest_hash=manifest_hash,
+                from_edition_prefix=True,
+            )
+        return _ResolvedBuildSource(
+            prefix=build_prefix,
+            manifest_hash=manifest_hash,
+            from_edition_prefix=False,
         )
 
     async def _reclaim_orphan_placeholders(
@@ -1011,6 +2270,19 @@ class KeeperSyncService:
         Runs inside a single ``session.begin()`` so a crash between the
         build-side update and the edition-side update cannot leave the
         edition pointing at a build that does not exist or vice versa.
+
+        The caller holds this edition's ``EDITION_UPDATE`` lock across
+        that transaction. Unlike the aggregate path, there is no
+        read-check-write here to make atomic — the pointer move is
+        unconditional (``skip_date_guard=True``), so the lock changes no
+        ordering: whichever writer goes second still wins, and correcting
+        *that* would need a version guard on the concrete edition, which
+        is a separate question from this one. What the lock does buy is
+        mutual exclusion with ``publish_edition``, which holds the same
+        key while it reads the edition's build and pushes the CDN
+        pointer: without it a keeper-sync repoint could land mid-publish
+        and leave the CDN serving one build while the row records
+        another as published.
         """
         await self._build_store.update_content_hash(
             build_id=build.id,
@@ -1056,8 +2328,51 @@ def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
 
 
+def _aggregate_accepts(edition: Edition, candidate: SemverVersion) -> bool:
+    """Report whether *candidate* may advance an aggregate's pointer.
+
+    LTD hands editions back in no particular version order, so without a
+    guard a project with 81 releases would leave ``15`` pointing at
+    whichever ``15.x.y`` happened to sync last.
+
+    The policy itself lives in
+    :func:`~docverse_server.domain.version.accepts_version_advance`,
+    shared with the version-mode arm of
+    ``EditionTrackingService._should_update`` so a change to one cannot
+    drift migrated aggregate pointers away from natively built ones.
+    Callers reach here only once ``edition.tracking_mode`` has been
+    confirmed to equal the aggregate spec's, so the mode is always a
+    semver one.
+    """
+    return accepts_version_advance(
+        candidate=candidate,
+        current_build_id=edition.current_build_id,
+        current_build_git_ref=edition.current_build_git_ref,
+        mode=edition.tracking_mode,
+    )
+
+
+def _resolve_rewrite_rules(
+    *, org: Organization, project: Project
+) -> list[AnySlugRewriteRule]:
+    """Resolve the project's effective slug-rewrite rules.
+
+    Mirrors :class:`~docverse_server.services.edition_tracking.EditionTrackingService`:
+    a project's rule list, when set, entirely replaces the org's — there
+    is no merging (SQR-112 inheritance rule). "Set" means not ``None``,
+    so an explicit ``[]`` opts the project out of the org's rules.
+    """  # noqa: E501
+    return resolve_slug_rewrite_rules(
+        project=project.slug_rewrite_rules,
+        org=org.slug_rewrite_rules,
+    )
+
+
 def _transient_edition_from_ltd(
-    *, ltd_edition: LtdEdition, project_id: int
+    *,
+    ltd_edition: LtdEdition,
+    project_id: int,
+    rewrite_rules: Sequence[AnySlugRewriteRule] = (),
 ) -> Edition | None:
     """Build a transient ``Edition`` from an LTD edition for proactive eval.
 
@@ -1069,6 +2384,11 @@ def _transient_edition_from_ltd(
     those two predicates read: ``kind``, ``tracking_mode``,
     ``tracking_params``, ``lifecycle_exempt``, ``date_deleted``, and
     ``date_updated``.
+
+    ``kind`` in particular must come from the same mode-first
+    derivation :meth:`KeeperSyncService.sync_edition` uses, or the
+    proactive pass would evaluate a release-to-be as a ``draft`` and
+    tombstone it ``lifecycle_preemptive`` before it is ever imported.
 
     Returns ``None`` when the LTD edition's mode requires the
     currently-published build to map (``manual``) — the proactive
@@ -1090,7 +2410,11 @@ def _transient_edition_from_ltd(
         slug=derive_edition_slug(ltd_edition.slug),
         title=ltd_edition.title,
         project_id=project_id,
-        kind=derive_edition_kind(ltd_edition.slug),
+        kind=derive_edition_kind(
+            ltd_edition,
+            git_ref=tracking_params.get("git_ref"),
+            rules=rewrite_rules,
+        ).kind,
         tracking_mode=tracking_mode,
         tracking_params=tracking_params or None,
         lifecycle_exempt=False,

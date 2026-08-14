@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
+from .services.cdn_purge_coalescer import CdnPurgeCoalescer
 from .services.credential import CredentialService
 from .services.credential_encryptor import CredentialEncryptor
 from .services.dashboard.enqueue import DashboardBuildEnqueuer
@@ -40,6 +41,7 @@ from .services.edition_tracking import (
 from .services.infrastructure import InfrastructureService
 from .services.inventory_census import InventoryCensusService
 from .services.keeper_sync import (
+    DEFAULT_COPY_CONCURRENCY,
     BuildContentCopier,
     CopyResult,
     KeeperSyncContext,
@@ -127,8 +129,18 @@ class Factory:
         github_webhook_secret: SecretStr | None = None,
         github_app_name: str = "lsst-sqre/docverse",
         github_app_validated: bool = True,
+        purge_coalescer: CdnPurgeCoalescer | None = None,
         default_queue_name: str,
+        keeper_sync_copy_concurrency: int = DEFAULT_COPY_CONCURRENCY,
     ) -> None:
+        # A Factory is per-job / per-request, so an instance created here
+        # coalesces nothing beyond the single publish this Factory drives
+        # — i.e. the pre-coalescing behaviour. Production wiring injects
+        # the process-lifetime instance held by
+        # ``WorkerFactoryBuilder``; the local fallback keeps directly
+        # constructed factories (tests, one-off scripts) working without
+        # sharing coalescing state between them.
+        self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
@@ -142,6 +154,12 @@ class Factory:
         self._github_app_name = github_app_name
         self._github_app_validated = github_app_validated
         self._default_queue_name = default_queue_name
+        # Defaults to the copier's own fallback so directly constructed
+        # factories (tests, scripts) behave exactly as before; the arq
+        # worker — the only process that actually copies build content —
+        # threads ``Config.keeper_sync_copy_concurrency`` through
+        # ``WorkerFactoryBuilder``.
+        self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
@@ -151,6 +169,16 @@ class Factory:
     def discovery(self) -> DiscoveryClient | None:
         """Repertoire discovery client, or ``None`` when not configured."""
         return self._discovery
+
+    @property
+    def purge_coalescer(self) -> CdnPurgeCoalescer:
+        """CDN purge coalescer backing this factory's publishing service."""
+        return self._purge_coalescer
+
+    @property
+    def keeper_sync_copy_concurrency(self) -> int:
+        """Fan-out bound handed to every copier this factory builds."""
+        return self._keeper_sync_copy_concurrency
 
     def create_queue_backend(self) -> QueueBackend:
         """Create a :class:`QueueBackend` for enqueuing jobs."""
@@ -547,6 +575,7 @@ class Factory:
             ),
             publisher_provider=self.create_edition_publisher_for_org,
             purger_provider=self.create_cdn_cache_purger_for_org,
+            purge_coalescer=self._purge_coalescer,
             logger=self._logger,
         )
 
@@ -891,7 +920,6 @@ class Factory:
         *,
         org_id: int,
         service_label: str,
-        max_concurrent: int = 8,
     ) -> AbstractAsyncContextManager[BuildContentCopier]:
         """Return an async-CM that yields a wired-up copier for ``org``.
 
@@ -899,6 +927,12 @@ class Factory:
         org_id=..., service_label=...) as copier:``. Both the LTD source
         and the per-org destination are opened on entry and closed on
         exit so a sync slot's resource lifetime is tightly bounded.
+
+        The copier's fan-out bound comes from this factory's
+        ``keeper_sync_copy_concurrency``, so an operator can move the
+        sync worker's memory ceiling without a code change. Peak
+        resident size scales with the pool's ``max_jobs`` times that
+        bound times the largest object under a build prefix.
         """
 
         @asynccontextmanager
@@ -913,7 +947,7 @@ class Factory:
                     source=source,
                     destination=destination,
                     logger=self._logger,
-                    max_concurrent=max_concurrent,
+                    max_concurrent=self._keeper_sync_copy_concurrency,
                 )
 
         return _open()
@@ -939,7 +973,14 @@ class Factory:
         service_label: str,
         ltd_base_url: str = "https://keeper.lsst.codes",
     ) -> KeeperSyncService:
-        """Create a :class:`KeeperSyncService` for one org's sync run."""
+        """Create a :class:`KeeperSyncService` for one org's sync run.
+
+        Always wires a :class:`LockService`, so the sync worker takes the
+        EDITION_UPDATE advisory lock around the aggregate pointer
+        updates it shares with the native ``build_processing`` path.
+        Direct unit-test constructions of the service may omit it and
+        run unwrapped, exactly as ``EditionTrackingService`` does.
+        """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
         async def copy_callable(
@@ -995,6 +1036,7 @@ class Factory:
             tombstone_service=tombstone_service,
             binding_resolver=binding_resolver,
             ref_set_fetcher=ref_set_fetcher,
+            lock_service=self.create_lock_service(),
         )
 
 

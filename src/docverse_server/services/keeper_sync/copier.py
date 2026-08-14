@@ -1,12 +1,31 @@
 """Copy build content from an LTD S3 source into a Docverse object store.
 
-The copier streams every key under ``source_prefix`` into the
-destination object store under ``dest_prefix`` with a bounded
-``asyncio.Semaphore`` so a single sync slot can never starve other
-work on the worker. It computes a deterministic manifest hash —
+The copier feeds every key under ``source_prefix`` through a bounded
+pool of worker tasks that write into the destination object store under
+``dest_prefix``, so a single sync slot can never starve other work on
+the worker — and, critically, so neither the number of live tasks nor
+the number of buffered object bodies scales with the number of keys
+under the prefix. It computes a deterministic manifest hash —
 ``sha256`` over a sorted ``(relative_key, sha256(data))`` table — so
 re-runs against unchanged input produce byte-identical hashes that
 double as the ``content_hash`` on the resulting Docverse build row.
+
+Object bodies are still buffered whole rather than streamed:
+:meth:`~docverse_server.storage.objectstore.ObjectStore.upload_object`
+takes ``bytes``, so streaming the copy path would mean reworking the
+destination protocol. With the pool bound in place peak resident bytes
+are ``max_concurrent`` times the largest object under the prefix, which
+for LTD's HTML/CSS/JS/image payloads is a small constant — not the term
+that OOM-killed the sync worker.
+
+That is the bound for *one* copier. Each concurrent
+``keeper_sync_project`` arq job drives its own, so the sync worker
+process holds up to ``keeper_sync_max_jobs`` times ``max_concurrent``
+object bodies at once — the number its memory limit is sized against.
+Both factors come from configuration
+(``Config.keeper_sync_max_jobs`` and
+``Config.keeper_sync_copy_concurrency``), so raising either one
+requires raising that limit with it.
 """
 
 from __future__ import annotations
@@ -14,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import mimetypes
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import structlog
@@ -21,10 +41,34 @@ import structlog
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
 
-__all__ = ["BuildContentCopier", "CopyResult"]
+__all__ = [
+    "DEFAULT_COPY_CONCURRENCY",
+    "EMPTY_MANIFEST_HASH",
+    "BuildContentCopier",
+    "CopyResult",
+]
 
-#: Default semaphore bound for parallel object copies.
-_DEFAULT_MAX_CONCURRENT = 8
+DEFAULT_COPY_CONCURRENCY = 8
+"""Default number of worker tasks used for parallel object copies.
+
+The copier's own fallback, used when it is constructed directly (unit
+tests, one-off scripts). Production construction goes through
+:meth:`docverse_server.factory.Factory.create_build_content_copier_for_org`,
+which threads ``Config.keeper_sync_copy_concurrency`` — defaulted to
+this same value — so the operator knob and the fallback cannot drift.
+
+Public rather than module-private because the factory shares it as its
+own default: a second literal in ``factory.py`` was exactly the
+duplication that made the sync worker's real memory bound impossible
+to reason about (#517).
+"""
+
+#: Manifest hash of a prefix with no keys under it. Public because a
+#: caller cannot otherwise tell "hashed an empty prefix" apart from
+#: "hashed real content" by looking at the returned hash, and keeper-sync
+#: has to make exactly that distinction when deciding whether its
+#: edition-prefix fallback actually recovered anything (#516).
+EMPTY_MANIFEST_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -46,12 +90,23 @@ class BuildContentCopier:
         source: LtdSourceProtocol,
         destination: ObjectStore,
         logger: structlog.stdlib.BoundLogger,
-        max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+        max_concurrent: int = DEFAULT_COPY_CONCURRENCY,
     ) -> None:
         self._source = source
         self._destination = destination
         self._logger = logger
         self._max_concurrent = max_concurrent
+
+    @property
+    def max_concurrent(self) -> int:
+        """Upper bound on this copier's simultaneous object transfers.
+
+        Also the count of object bodies this copier can hold in memory
+        at once, so it is the per-copier half of the sync worker's
+        resident-size budget (the other half being the pool's
+        ``max_jobs``).
+        """
+        return self._max_concurrent
 
     async def compute_manifest_hash(self, *, source_prefix: str) -> str:
         """Compute the manifest hash for ``source_prefix`` without copying.
@@ -68,27 +123,22 @@ class BuildContentCopier:
             await self._source.list_keys(prefix=normalized_source_prefix)
         )
         if not keys:
-            return _empty_manifest_hash()
+            return EMPTY_MANIFEST_HASH
+        _reject_escaping_keys(keys, normalized_source_prefix, verb="hash")
 
-        semaphore = asyncio.Semaphore(self._max_concurrent)
         manifest_entries: list[tuple[str, str]] = []
-        manifest_lock = asyncio.Lock()
 
         async def _hash_one(source_key: str) -> None:
             relative = source_key.removeprefix(normalized_source_prefix)
-            if ".." in relative.split("/"):
-                msg = (
-                    f"Refusing to hash source key {source_key!r}:"
-                    " relative path contains '..' segment"
-                )
-                raise RuntimeError(msg)
-            async with semaphore:
-                data = await self._source.download_object(key=source_key)
-            digest = hashlib.sha256(data).hexdigest()
-            async with manifest_lock:
-                manifest_entries.append((relative, digest))
+            # The body is hashed in the same expression that downloads
+            # it and is never bound to a local, so the buffer is
+            # released as soon as sha256 has consumed it.
+            digest = hashlib.sha256(
+                await self._source.download_object(key=source_key)
+            ).hexdigest()
+            manifest_entries.append((relative, digest))
 
-        await asyncio.gather(*(_hash_one(k) for k in keys))
+        await self._run_bounded(keys, _hash_one)
         manifest_entries.sort(key=lambda e: e[0])
         return _hash_manifest_pairs(manifest_entries)
 
@@ -122,38 +172,34 @@ class BuildContentCopier:
             return CopyResult(
                 object_count=0,
                 total_size_bytes=0,
-                content_hash=_empty_manifest_hash(),
+                content_hash=EMPTY_MANIFEST_HASH,
             )
 
-        semaphore = asyncio.Semaphore(self._max_concurrent)
+        _reject_escaping_keys(keys, normalized_source_prefix, verb="copy")
+
         in_flight = _ConcurrencyTracker()
         manifest_entries: list[tuple[str, str, int]] = []
-        manifest_lock = asyncio.Lock()
 
         async def _copy_one(source_key: str) -> None:
             relative = source_key.removeprefix(normalized_source_prefix)
-            if ".." in relative.split("/"):
-                msg = (
-                    f"Refusing to copy source key {source_key!r}:"
-                    " relative path contains '..' segment"
-                )
-                raise RuntimeError(msg)
             dest_key = f"{normalized_dest_prefix}{relative}"
             content_type = (
                 mimetypes.guess_type(relative)[0] or "application/octet-stream"
             )
-            async with semaphore, in_flight:
+            async with in_flight:
                 data = await self._source.download_object(key=source_key)
+                digest = hashlib.sha256(data).hexdigest()
+                size = len(data)
                 await self._destination.upload_object(
                     key=dest_key,
                     data=data,
                     content_type=content_type,
                 )
-            digest = hashlib.sha256(data).hexdigest()
-            async with manifest_lock:
-                manifest_entries.append((relative, digest, len(data)))
+            # ``data`` dies with this coroutine's frame, before the
+            # worker that ran it allocates the next object's buffer.
+            manifest_entries.append((relative, digest, size))
 
-        await asyncio.gather(*(_copy_one(k) for k in keys))
+        await self._run_bounded(keys, _copy_one)
 
         manifest_entries.sort(key=lambda e: e[0])
         manifest_hash = _hash_manifest(manifest_entries)
@@ -172,6 +218,63 @@ class BuildContentCopier:
             total_size_bytes=total_bytes,
             content_hash=manifest_hash,
         )
+
+    async def _run_bounded(
+        self,
+        keys: Sequence[str],
+        handler: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Run ``handler`` over ``keys`` with a bounded worker pool.
+
+        A fixed pool of at most ``max_concurrent`` worker tasks pulls
+        from one shared iterator over ``keys``, so both the number of
+        live task objects and the number of simultaneously buffered
+        object bodies are a function of the pool size rather than of
+        the key count. (Feeding every key to ``asyncio.gather`` up front
+        instead — throttling only the downloads with a semaphore — is
+        what let a prefix with thousands of keys OOM the sync worker.)
+
+        The pool runs inside a :class:`asyncio.TaskGroup`, so the first
+        failing key cancels its siblings — no orphaned download survives
+        the raise still holding its buffer — and the first real error is
+        re-raised so the caller keeps today's contract that a failed
+        copy propagates. That cancellation is the load-bearing half of
+        the fix: ``gather`` left every sibling running after it raised,
+        so a project whose oldest builds fail on every pass accumulated
+        one orphaned fan-out per failed build.
+
+        The re-raise keeps the leaf exactly as its raiser built it,
+        chain included — see the comment on the ``except`` clause.
+        """
+        # One shared iterator, drained cooperatively. ``next()`` never
+        # awaits, so no two workers can observe the same key even though
+        # they pull from the same object.
+        pending = iter(keys)
+
+        async def _worker() -> None:
+            for key in pending:
+                await handler(key)
+
+        # Never spawn more workers than there is work for, and never
+        # zero — a misconfigured bound must not silently drop keys.
+        worker_count = max(1, min(self._max_concurrent, len(keys)))
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                for _ in range(worker_count):
+                    task_group.create_task(_worker())
+        except BaseExceptionGroup as exc_group:
+            leaf = _first_real_error(exc_group)
+            # Re-raising the leaf ``from`` its *own* ``__cause__`` (which
+            # is often ``None``) suppresses the group as ``__context__``
+            # — the only thing worth hiding here — while leaving any
+            # chain the raiser built deliberately intact. Plain ``from
+            # None`` would suppress the context *and* blank the leaf's
+            # cause: ``LtdSourceAccessDeniedError`` is raised ``from``
+            # the botocore ``ClientError`` carrying the S3 error code and
+            # HTTP status, and httpx upload errors chain the same way, so
+            # blanking it leaves Sentry and ``queue_jobs.errors`` holding
+            # a bare Docverse wrapper with no underlying fault to triage.
+            raise leaf from leaf.__cause__
 
 
 class _ConcurrencyTracker:
@@ -193,6 +296,61 @@ def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
 
 
+def _reject_escaping_keys(
+    keys: Sequence[str], source_prefix: str, *, verb: str
+) -> None:
+    """Raise if any key's path relative to ``source_prefix`` escapes it.
+
+    Checked up front, before any worker starts, so a malicious key can
+    never be reached after some of its siblings have already been
+    downloaded or uploaded.
+    """
+    for source_key in keys:
+        relative = source_key.removeprefix(source_prefix)
+        if ".." in relative.split("/"):
+            msg = (
+                f"Refusing to {verb} source key {source_key!r}:"
+                " relative path contains '..' segment"
+            )
+            raise RuntimeError(msg)
+
+
+def _iter_leaf_exceptions(
+    group: BaseExceptionGroup[BaseException],
+) -> Iterator[BaseException]:
+    """Yield every non-group leaf exception in ``group``, depth-first."""
+    for exc in group.exceptions:
+        if isinstance(exc, BaseExceptionGroup):
+            yield from _iter_leaf_exceptions(exc)
+        else:
+            yield exc
+
+
+def _first_real_error(
+    group: BaseExceptionGroup[BaseException],
+) -> BaseException:
+    """Return the first non-cancellation leaf exception in ``group``.
+
+    ``asyncio.TaskGroup`` reports failures as an exception group, but the
+    copier's callers (``sync_edition`` and the keeper-sync worker's
+    ``except Exception`` isolation blocks) expect the underlying error
+    itself — an S3 ``AccessDenied``, say — exactly as the old
+    ``asyncio.gather`` call raised it. So the group is flattened back
+    down to its first real failure. Cancellations are skipped: they are
+    the pool tearing down siblings, not the cause.
+
+    If two keys fail close enough together that both land before
+    cancellation does, only the first is raised. That matches the
+    ``gather`` contract this replaces, which likewise surfaced one
+    error; the group itself is returned only when *every* leaf is a
+    cancellation, which should not happen for a group the pool raised.
+    """
+    for exc in _iter_leaf_exceptions(group):
+        if not isinstance(exc, asyncio.CancelledError):
+            return exc
+    return group
+
+
 def _hash_manifest(entries: list[tuple[str, str, int]]) -> str:
     r"""Compute ``sha256:`` over sorted ``relative\tdigest\n`` lines.
 
@@ -211,7 +369,3 @@ def _hash_manifest_pairs(entries: list[tuple[str, str]]) -> str:
     for relative, digest in entries:
         hasher.update(f"{relative}\t{digest}\n".encode())
     return f"sha256:{hasher.hexdigest()}"
-
-
-def _empty_manifest_hash() -> str:
-    return f"sha256:{hashlib.sha256(b'').hexdigest()}"

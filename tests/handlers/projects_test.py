@@ -11,9 +11,11 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
+from docverse.models import EditionKind
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.dependencies.context import context_dependency
+from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
 from docverse_server.metrics import LifecycleAction
 from docverse_server.storage.editionpublisher import (
@@ -1405,3 +1407,84 @@ async def test_delete_project_publishes_project_lifecycle(
     event = delete_events[0]
     assert event.organization == "proj-org"
     assert event.project == "lifecycle-delete-proj"
+
+
+@pytest.mark.asyncio
+async def test_patch_project_version_slug_rules(
+    client: AsyncClient,
+) -> None:
+    """Version rule types round-trip through project PATCH and GET."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "slugrules-proj",
+            "title": "Slug Rules",
+            "source_url": "https://gitlab.com/lsst/slugrules-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    rules = [
+        {"type": "semver"},
+        {"type": "lsst_doc"},
+        {"type": "eups_major"},
+        {"type": "eups_weekly"},
+    ]
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/slugrules-proj",
+        json={"slug_rewrite_rules": rules},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["slug_rewrite_rules"] == rules
+
+    get_response = await client.get(
+        "/docverse/orgs/proj-org/projects/slugrules-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert get_response.status_code == 200
+    stored = get_response.json()["slug_rewrite_rules"]
+    assert stored == rules
+    parsed = parse_slug_rewrite_rules(stored)
+    assert all(isinstance(rule, VersionRule) for rule in parsed)
+    assert all(
+        rule.edition_kind == EditionKind.release
+        for rule in parsed
+        if isinstance(rule, VersionRule)
+    )
+
+
+@pytest.mark.asyncio
+async def test_patch_project_edition_autocreation(
+    client: AsyncClient,
+) -> None:
+    """``edition_autocreation`` round-trips through project PATCH/GET."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "autocreate-proj",
+            "title": "Autocreate",
+            "source_url": "https://gitlab.com/lsst/autocreate-proj",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/autocreate-proj",
+        json={"edition_autocreation": {"semver_aggregates": False}},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }
+
+    get_response = await client.get(
+        "/docverse/orgs/proj-org/projects/autocreate-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["edition_autocreation"] == {
+        "semver_aggregates": False
+    }

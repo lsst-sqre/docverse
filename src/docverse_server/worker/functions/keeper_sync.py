@@ -18,7 +18,11 @@ This module owns the ``docverse:sync-queue`` callable surface:
   ``on_edition_synced`` callback so a partial-failure mid-sync still
   publishes everything that succeeded; a tail-end self-heal pass
   catches editions whose build was already imported but never made it
-  through the publish path.
+  through the publish path. Per-edition failures the service isolated
+  are recorded on the job's ``progress`` and leave its status
+  ``completed_with_errors``; a whole-project failure — including the
+  service's systemic-outage abort after too many consecutive edition
+  failures — fails the job.
 
 * ``keeper_sync_tier_main`` / ``_tier_discovery`` / ``_tier_other`` —
   cron-driven steady-state reconcilers that enqueue ``keeper_sync_
@@ -29,7 +33,7 @@ This module owns the ``docverse:sync-queue`` callable surface:
 from __future__ import annotations
 
 import traceback
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
@@ -40,9 +44,16 @@ from safir.arq import ArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.models import JobKind, KeeperSyncConfig, KeeperSyncRunStatus
+from docverse.models import (
+    JobKind,
+    KeeperSyncConfig,
+    KeeperSyncRunStatus,
+    TrackingMode,
+)
 from docverse_server.config import config
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
 from docverse_server.factory import Factory
@@ -63,6 +74,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_refresh_other_edition,
 )
 from docverse_server.services.keeper_sync.service import (
+    EditionSyncFailure,
     EditionSyncOutcome,
     ProjectSyncResult,
 )
@@ -74,6 +86,10 @@ from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
 )
+from docverse_server.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
@@ -119,6 +135,26 @@ _MAIN_EDITION_URL_KEY = "main_edition_url"
 #: to re-parse the URL.
 _MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
+#: Cap on the number of per-edition failure detail entries written into
+#: a ``keeper_sync_project`` job's ``progress`` JSONB (and into the
+#: accompanying log line). ``edition_failure_count`` is always exact;
+#: only the detail list is truncated, so a project whose entire release
+#: history is unreadable — LTD's oldest uploads carry no public-read
+#: object ACL — cannot write an unbounded blob into the job record.
+_MAX_RECORDED_EDITION_FAILURES = 20
+
+#: Tracking modes that identify a semver aggregate edition (``15`` /
+#: ``15.2``). These rows are not LTD resources, so they never appear as
+#: their own :class:`EditionSyncOutcome` and
+#: :func:`_self_heal_unpublished_aggregates` has to find them by shape.
+#: Kept in sync with
+#: :func:`~docverse_server.domain.semver_aggregate.semver_aggregate_specs`,
+#: the single source of the rows both the native and keeper-sync paths
+#: create.
+_AGGREGATE_TRACKING_MODES = frozenset(
+    {TrackingMode.semver_major, TrackingMode.semver_minor}
+)
+
 
 async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     """Cron-driven backstop that finalises silently-stuck keeper-sync rows.
@@ -149,9 +185,15 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
        commit and ``arq_queue.enqueue``.
 
     Thresholds: the silent paths use
-    ``config.keeper_sync_reaper_threshold_seconds`` (default 6 h,
-    env-overridable so test/staging environments can drive it down to
-    seconds for fast verification). The orphan path uses
+    ``config.keeper_sync_reaper_threshold_seconds``, which defaults to
+    ``config.keeper_sync_job_timeout_seconds`` plus
+    :data:`~docverse_server.config.KEEPER_SYNC_REAPER_MARGIN_SECONDS`
+    (5400 s at stock settings) and is env-overridable so test/staging
+    environments can drive it down to seconds for fast verification.
+    Deriving it keeps the wait just past the point where arq — running
+    these functions with ``max_tries=1`` — has definitely cancelled the
+    job, instead of parking the project behind its active-job mutex for
+    hours after the row is known dead. The orphan path uses
     :data:`_ORPHAN_IDLE_WINDOW` (5 min) so the staleness check matches
     the existing discovery-side orphan sweep.
 
@@ -389,11 +431,33 @@ async def keeper_sync_project(
        (e.g. they were imported before this enqueue logic landed). The
        freshly-synced branch is no longer needed here — it's handled
        by the per-edition callback.
-    4. On success, mark the queue job ``completed``; on a caught
-       exception, mark it ``failed`` with structured error details and
-       re-raise so arq records the job as failed. Both branches call
-       :func:`maybe_finalise_run` so a terminal child cannot leave the
-       parent run stuck in ``in_progress``.
+    4. On success, mark the queue job ``completed`` (or
+       ``completed_with_errors`` when the service isolated any
+       per-edition failure); on a caught exception, mark it ``failed``
+       with structured error details and re-raise so arq records the job
+       as failed. Both branches call :func:`maybe_finalise_run` so a
+       terminal child cannot leave the parent run stuck in
+       ``in_progress``.
+
+    :meth:`~KeeperSyncService.sync_project` gives each edition its own
+    failure boundary, so an unreadable LTD build no longer reaches the
+    outer ``except`` — it lands on
+    :attr:`ProjectSyncResult.edition_failures` instead. Those runs still
+    reach the end of the edition list rather than aborting, but they
+    finish ``completed_with_errors``, with the skipped LTD editions
+    recorded on the ``queue_jobs`` row's ``progress`` (see
+    :func:`_edition_failure_progress`) and repeated in a ``warning`` log
+    line; the parent run rolls up ``partial_failure``. A failure of the
+    project as a whole — the LTD product fetch, the org lookup, the
+    copier's destination store — still fails the job outright, as does
+    either of the service's systemic-outage signals, which raise
+    :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+    out of ``sync_project``:
+    :data:`~docverse_server.services.keeper_sync.service.MAX_CONSECUTIVE_EDITION_FAILURES`
+    consecutive edition failures (a mid-run LTD or database outage fails
+    the job rather than quietly reporting a 3-of-80 import as done), and
+    a run that ends with failures and nothing imported at all (the same
+    outage on a project too small to reach that threshold).
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -489,13 +553,15 @@ async def keeper_sync_project(
             )
             raise
 
-        completion = None
-        async with session.begin():
-            await queue_job_store.complete(queue_job_id)
-            if run_id is not None:
-                completion = await maybe_finalise_run(
-                    run_store=run_store, run_id=run_id
-                )
+        edition_failures = sync_result.edition_failures
+        completion = await _finalise_project_job(
+            session=session,
+            queue_job_store=queue_job_store,
+            run_store=run_store,
+            queue_job_id=queue_job_id,
+            run_id=run_id,
+            edition_failures=edition_failures,
+        )
         await publish_run_completed(
             events=ctx.get("events"),
             session=session,
@@ -503,11 +569,108 @@ async def keeper_sync_project(
             completion=completion,
             logger=logger,
         )
-        logger.info("Keeper-sync project completed")
-        return "completed"
+        _log_project_completion(
+            logger=logger, edition_failures=edition_failures
+        )
+        return "completed_with_errors" if edition_failures else "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _finalise_project_job(
+    *,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    run_store: KeeperSyncRunStore,
+    queue_job_id: int,
+    run_id: int | None,
+    edition_failures: Sequence[EditionSyncFailure],
+) -> KeeperSyncRunWithActivity | None:
+    """Close out a ``keeper_sync_project`` job that reached its end.
+
+    Records any per-edition failures the service isolated on the job's
+    ``progress`` and marks the job terminal in the *same* transaction
+    that rolls the parent run, so the job record and its terminal
+    status can never disagree. Returns whatever
+    :func:`maybe_finalise_run` returned (always ``None`` for a
+    tier-cron job, which carries no ``run_id``) for the caller to
+    publish after the transaction commits.
+
+    A job with isolated per-edition failures completes
+    ``completed_with_errors`` rather than plain ``completed`` — the same
+    ``complete(has_errors=...)`` signal the ``git_ref_audit`` worker
+    uses for its own per-project isolation. Reaching the end of the
+    edition loop is not the same as importing the project, and a
+    partial import must not be indistinguishable from a clean one at
+    the status level. The status carries up to the run for free:
+    ``KeeperSyncRunStore.aggregate_activity`` buckets
+    ``completed_with_errors`` into ``failed_count``, so
+    :func:`maybe_finalise_run` rolls the parent run to the existing
+    ``partial_failure`` status once every child is terminal. No new run
+    status is needed.
+    """
+    async with session.begin():
+        if edition_failures:
+            await queue_job_store.update_progress(
+                queue_job_id, _edition_failure_progress(edition_failures)
+            )
+        await queue_job_store.complete(
+            queue_job_id, has_errors=bool(edition_failures)
+        )
+        if run_id is None:
+            return None
+        return await maybe_finalise_run(run_store=run_store, run_id=run_id)
+
+
+def _log_project_completion(
+    *,
+    logger: structlog.stdlib.BoundLogger,
+    edition_failures: Sequence[EditionSyncFailure],
+) -> None:
+    """Emit the project sync's terminal log line, partial or clean."""
+    if not edition_failures:
+        logger.info("Keeper-sync project completed")
+        return
+    logger.warning(
+        "Keeper-sync project completed with edition failures",
+        edition_failure_count=len(edition_failures),
+        failed_ltd_edition_slugs=[
+            failure.ltd_edition_slug
+            for failure in edition_failures[:_MAX_RECORDED_EDITION_FAILURES]
+        ],
+    )
+
+
+def _edition_failure_progress(
+    failures: Sequence[EditionSyncFailure],
+) -> dict[str, Any]:
+    """Build the ``progress`` payload for a partially-synced project.
+
+    The job finishes ``completed_with_errors`` rather than ``failed``:
+    a permanently unreadable LTD build (an old upload with no
+    public-read ACL) must not abort the project's import on every
+    subsequent poll, but it must not read as a clean sync either. These
+    per-edition entries carry the detail behind that status, so an
+    operator reading ``GET /jobs/<id>`` can see exactly which LTD
+    editions were skipped and why.
+    """
+    return {
+        "message": (
+            f"Project synced with {len(failures)} edition failure(s);"
+            " the remaining editions synced normally"
+        ),
+        "edition_failure_count": len(failures),
+        "edition_failures": [
+            {
+                "ltd_edition_id": failure.ltd_edition_id,
+                "ltd_edition_slug": failure.ltd_edition_slug,
+                "error_type": failure.error_type,
+                "error_message": failure.error_message,
+            }
+            for failure in failures[:_MAX_RECORDED_EDITION_FAILURES]
+        ],
+    }
 
 
 def _build_on_edition_synced(
@@ -530,6 +693,15 @@ def _build_on_edition_synced(
 
     async def callback(outcome: EditionSyncOutcome) -> None:
         await _enqueue_publish_for_synced_edition(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            outcome=outcome,
+            logger=logger,
+        )
+        await _enqueue_publish_for_aggregates(
             factory=factory,
             session=session,
             queue_job_store=queue_job_store,
@@ -610,6 +782,70 @@ async def _enqueue_publish_for_synced_edition(
     )
 
 
+async def _enqueue_publish_for_aggregates(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    outcome: EditionSyncOutcome,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Publish the semver aggregates the synced release just moved.
+
+    The ``15`` / ``15.2`` editions keeper-sync backfills carry a current
+    build but are not LTD resources, so they never appear as their own
+    :class:`EditionSyncOutcome` — without this pass the dashboard would
+    link to an unpublished aggregate.
+
+    Runs regardless of ``build_outcome.short_circuited``: an aggregate
+    can be created on a re-sync whose build short-circuited (the release
+    was imported before this backfill existed). The service only emits
+    an outcome when it actually created or advanced the row, so the
+    steady state enqueues nothing.
+
+    This is a one-shot enqueue and the only outcome-driven one an
+    aggregate ever gets: the next sync skips the backfill outright
+    (its ``aggregates_backfilled_build_id`` state marker already names
+    this build) and would emit no outcome even if it ran, because the
+    pointer is where it should be — nothing here fires again. Whatever
+    this
+    call loses — ``sync_project`` swallows this callback's exceptions,
+    and a worker can die between the backfill's commit and this enqueue
+    — is recovered from persistent state by
+    :func:`_self_heal_unpublished_aggregates`.
+    """
+    if not outcome.aggregate_outcomes:
+        return
+    edition_store = factory.create_edition_store()
+    history_store = factory.create_edition_build_history_store()
+    queue_backend = factory.create_queue_backend()
+
+    for aggregate in outcome.aggregate_outcomes:
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=edition_store,
+            history_store=history_store,
+            queue_job_store=queue_job_store,
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=outcome.docverse_project_id,
+            project_slug=outcome.docverse_project_slug,
+            edition_id=aggregate.docverse_edition_id,
+            edition_slug=aggregate.docverse_slug,
+            build_id=aggregate.docverse_build_id,
+            build_public_id=aggregate.docverse_build_public_id,
+            keeper_sync_run_id=run_id,
+        )
+        logger.info(
+            "Enqueued publish_edition for synced build",
+            edition_slug=aggregate.docverse_slug,
+            build_id=aggregate.docverse_build_id,
+            phase="semver_aggregate",
+        )
+
+
 async def _self_heal_unpublished_editions(
     *,
     factory: Factory,
@@ -620,31 +856,49 @@ async def _self_heal_unpublished_editions(
     sync_result: ProjectSyncResult,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Tail-end pass: publish short-circuited editions still unpublished.
+    """Tail-end pass: publish editions whose build was never published.
+
+    Two legs run here. The first iterates
+    ``sync_result.edition_outcomes`` — the LTD-backed editions — and is
+    described below. The second,
+    :func:`_self_heal_unpublished_aggregates`, covers the semver
+    aggregates, which are not LTD resources and therefore never appear
+    in ``edition_outcomes`` at all; it heals from persistent state
+    instead, and runs only on the runs
+    :func:`_run_may_have_moved_aggregates` admits — reading that state
+    means a full-project scan, which must not be on the steady-state
+    poll's bill.
 
     Iterates ``sync_result.edition_outcomes`` looking for editions whose
     sync short-circuited (``build_outcome.short_circuited`` is ``True``)
-    *and* whose Docverse-side ``publish_status`` is still ``NULL``. The
-    freshly-synced branch is now handled by
+    and whose current build has no publish on record, as
+    :func:`_resolve_unpublished_build_target` decides. The freshly-synced
+    branch is now handled by
     :func:`_enqueue_publish_for_synced_edition` as an
     ``on_edition_synced`` callback — running that path here too would
     double-publish.
 
-    A short-circuit + ``publish_status IS NULL`` edition can arise when:
+    A short-circuited edition can be missing its build's publish when:
 
     * The build pre-dates this enqueue logic landing (i.e. it was
       synced before the per-edition publish path existed).
     * A prior publish enqueue was lost (Phase B failure between the
       ``QueueJob`` insert and the arq enqueue).
+    * A convergence repoint moved the edition onto a build the
+      short-circuit path never publishes: ``sync_build`` re-points the
+      edition at the older completed build carrying the same content
+      hash and returns ``short_circuited=True``, which
+      :func:`_enqueue_publish_for_synced_edition` skips by design. This
+      leg is the only path that can publish that pair.
 
-    Editions whose ``publish_status`` is already ``pending`` /
-    ``published`` / ``failed`` are left alone — a stuck pending publish
-    is the in-flight publisher's problem to resolve, not ours, and a
-    successful or failed prior publish does not need re-running on
-    every reconciliation tick. The tail-end position keeps this pass
-    cheap on the steady-state common case (almost every edition either
-    short-circuited and is already published, or was freshly synced and
-    just got published by the per-edition callback).
+    Pairs whose publish is already ``pending`` / ``published`` /
+    ``failed`` are left alone — a stuck pending publish is the in-flight
+    publisher's problem to resolve, not ours, and a successful or failed
+    prior publish does not need re-running on every reconciliation tick.
+    The tail-end position keeps this pass cheap on the steady-state
+    common case (almost every edition either short-circuited and is
+    already published, or was freshly synced and just got published by
+    the per-edition callback).
     """
     project_id = sync_result.docverse_project_id
     if project_id is None:
@@ -669,6 +923,7 @@ async def _self_heal_unpublished_editions(
         target = await _resolve_self_heal_target(
             session=session,
             edition_store=edition_store,
+            history_store=history_store,
             project_id=project_id,
             edition_slug=outcome.docverse_slug,
         )
@@ -698,22 +953,268 @@ async def _self_heal_unpublished_editions(
             phase="self_heal",
         )
 
+    if _run_may_have_moved_aggregates(sync_result):
+        await _self_heal_unpublished_aggregates(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            logger=logger,
+        )
+
+
+def _run_may_have_moved_aggregates(sync_result: ProjectSyncResult) -> bool:
+    """Report whether this run could have moved a semver aggregate.
+
+    The gate on :func:`_self_heal_unpublished_aggregates`, whose scan is
+    the one part of a ``keeper_sync_project`` job that costs the same on
+    a run that changed nothing as on a run that imported the whole
+    project. A migrated project with 80 releases carries ~30 ``N`` /
+    ``N.M`` rows, and the reconciliation tiers re-poll every project
+    every few minutes forever — so an ungated pass is a permanent
+    per-project tax paid for a result that is, in the steady state,
+    always "nothing to do".
+
+    Two signals open the gate, matching exactly the ways an aggregate's
+    build pointer can end up unpublished in the first place:
+
+    * **An aggregate outcome.** ``_backfill_semver_aggregates`` created
+      or advanced a row this run, so the one publish enqueue it gets
+      (from :func:`_enqueue_publish_for_aggregates`) is in flight — and
+      may have been swallowed, which is the loss mode the self-heal
+      exists for. The pass runs in the same job, so the recovery lands
+      on the run that opened the hole.
+    * **A build outcome that did not short-circuit.** An edition
+      imported a fresh build, which is the only way the backfill can
+      have run at all this poll — including the paths that lose their
+      outcome, where ``_backfill_semver_aggregates`` raised (or the
+      worker died) after committing an aggregate but before reporting
+      it. Those emit no ``aggregate_outcomes`` by construction, so the
+      build-level signal is what covers them.
+
+    A run with neither signal imported no build and reconciled no
+    aggregate, so anything it would find was already in place when the
+    previous run ended — healed there, or left for the next run that
+    moves something on the project, which for a project still receiving
+    LTD builds is its next rebuild. The window this trades away is a
+    project whose editions have *all* frozen and which lost an enqueue on
+    the last run that touched them: its aggregate stays unpublished until
+    something moves again. Scanning every project on every poll forever
+    is too much to pay to close it.
+    """
+    for outcome in sync_result.edition_outcomes:
+        if outcome.aggregate_outcomes:
+            return True
+        build_outcome = outcome.build_outcome
+        if build_outcome is not None and not build_outcome.short_circuited:
+            return True
+    return False
+
+
+async def _self_heal_unpublished_aggregates(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    project_id: int,
+    project_slug: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Tail-end pass: publish semver aggregates left pointing at nothing.
+
+    The aggregates (``15`` / ``15.2``) get exactly one publish enqueue,
+    from :func:`_enqueue_publish_for_aggregates` on the
+    ``on_edition_synced`` path, and three things can swallow it:
+
+    * The enqueue itself raises — ``sync_project`` deliberately absorbs
+      ``on_edition_synced`` failures so one edition's callback cannot
+      abort the project.
+    * The worker dies after ``_backfill_semver_aggregates`` commits the
+      repointed row but before the enqueue runs.
+    * ``_backfill_semver_aggregates`` raises and ``sync_edition``
+      absorbs it, returning an outcome with no ``aggregate_outcomes``
+      even though an earlier spec in the loop already committed.
+
+    Any of those leaves the aggregate row pointing at the release build
+    with its KV pointer never written — a URL that serves 404 (or stale
+    content) indefinitely, because no later pass recovers it: the LTD
+    leg of :func:`_self_heal_unpublished_editions` iterates only
+    ``edition_outcomes``, and a re-sync of an unchanged edition skips
+    the backfill on its ``aggregates_backfilled_build_id`` marker (and
+    ``_ensure_aggregate_edition`` would return ``None`` anyway once
+    ``current_build_id`` already equals the build), so no outcome is
+    emitted and nothing re-enqueues.
+
+    Healing therefore reads persistent state rather than this run's
+    in-memory outcomes: every aggregate-shaped edition on the project is
+    a candidate, and :func:`_unpublished_build_target` decides which ones
+    are genuinely unpublished. That covers all three loss modes,
+    including the ones whose outcome never existed.
+
+    *Which runs* look at that state is a separate question, answered by
+    :func:`_run_may_have_moved_aggregates` — the caller's gate keeps this
+    scan off the steady-state poll entirely.
+
+    The scan itself is two queries in one transaction: the project's
+    editions, then every candidate's ``edition_build_history`` row in a
+    single batched lookup. The per-aggregate alternative
+    (:func:`_resolve_unpublished_build_target`, still used by the LTD
+    leg, which reaches its editions one at a time anyway) would open a
+    transaction per row, and a migrated project carries one aggregate
+    per release series.
+    """
+    edition_store = factory.create_edition_store()
+    history_store = factory.create_edition_build_history_store()
+    queue_backend = factory.create_queue_backend()
+
+    aggregates: list[tuple[Edition, int]] = []
+    async with session.begin():
+        for edition in await edition_store.list_all_by_project(project_id):
+            if edition.tracking_mode not in _AGGREGATE_TRACKING_MODES:
+                continue
+            current_build_id = edition.current_build_id
+            if current_build_id is None:
+                continue
+            aggregates.append((edition, current_build_id))
+        histories = await history_store.list_by_edition_build_pairs(
+            [(edition.id, build_id) for edition, build_id in aggregates]
+        )
+
+    history_by_pair: dict[tuple[int, int], EditionBuildHistory] = {}
+    for history in histories:
+        history_by_pair.setdefault(
+            (history.edition_id, history.build_id), history
+        )
+
+    for aggregate, current_build_id in aggregates:
+        target = _unpublished_build_target(
+            edition=aggregate,
+            history=history_by_pair.get((aggregate.id, current_build_id)),
+        )
+        if target is None:
+            continue
+        build_id, build_public_id = target
+
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=edition_store,
+            history_store=history_store,
+            queue_job_store=queue_job_store,
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=aggregate.id,
+            edition_slug=aggregate.slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+            keeper_sync_run_id=run_id,
+        )
+        logger.info(
+            "Enqueued publish_edition for synced build",
+            edition_slug=aggregate.slug,
+            build_id=build_id,
+            phase="aggregate_self_heal",
+        )
+
+
+def _unpublished_build_target(
+    *,
+    edition: Edition,
+    history: EditionBuildHistory | None,
+) -> tuple[int, str] | None:
+    """Return ``(build_id, build_public_id)`` if the pair needs a publish.
+
+    The single "is this edition's current build unpublished?" rule,
+    shared by both legs of :func:`_self_heal_unpublished_editions`. It
+    takes *history* — the ``edition_build_history`` row for the
+    ``(edition, current_build)`` pair, or ``None`` when there is none —
+    rather than loading it, so the aggregate leg can supply rows from
+    one batched query while the LTD leg loads them one at a time via
+    :func:`_resolve_unpublished_build_target`.
+
+    "Unpublished" is decided per ``(edition, current_build)`` pair via the
+    ``edition_build_history`` row rather than the edition's own
+    ``publish_status``. The edition-level column is a single slot that
+    survives a repoint — ``set_current_build`` never clears it — so an
+    edition published for ``15.2.0`` and then advanced to ``15.2.1`` with
+    a lost enqueue still reads ``published``. Reading that column would
+    call the pair healthy and leave the new build unpublished forever,
+    which is load-bearing for convergence repoints: a short-circuited
+    build sync skips ``_enqueue_publish_for_synced_edition`` by design,
+    so self-heal is the only path that can publish it.
+
+    The history row is per pair and, on both keeper-sync paths, is
+    written only by
+    :func:`~docverse_server.services.publish_enqueue.enqueue_publish_for_edition`
+    itself: keeper-sync skips ``EditionTrackingService`` entirely, and
+    the two places it advances a pointer — ``_finalize_synced_build`` and
+    ``_ensure_aggregate_edition`` — only call ``set_current_build``. So
+    "no history row, or one whose ``publish_status`` is still ``NULL``"
+    is exactly "a publish for this build was never enqueued". That covers
+    pre-enqueue-era rows too: their builds were imported before the
+    publish path existed, so no history row was ever recorded.
+
+    The same signal supplies the dedup: a publish already in flight
+    leaves the pair ``pending``, and a prior ``published`` / ``failed``
+    publish is not something to re-run on every reconciliation tick —
+    all three are left alone. An edition that does re-enqueue does so at
+    most once, because the enqueue itself records the pair ``pending``.
+    """
+    if edition.current_build_id is None:
+        return None
+    if edition.current_build_public_id is None:
+        return None
+    if history is not None and history.publish_status is not None:
+        return None
+    return edition.current_build_id, serialize_base32_id(
+        edition.current_build_public_id
+    )
+
+
+async def _resolve_unpublished_build_target(
+    *,
+    session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    edition: Edition,
+) -> tuple[int, str] | None:
+    """Load one pair's history row and apply :func:`_unpublished_build_target`.
+
+    The LTD leg's accessor. It reaches its editions one at a time — the
+    slug-keyed lookup in :func:`_resolve_self_heal_target` — so there is
+    no pair set to batch, unlike the aggregate leg.
+
+    The read happens inside its own transaction so it does not interfere
+    with ``enqueue_publish_for_edition``'s phased commits.
+    """
+    if edition.current_build_id is None:
+        return None
+    async with session.begin():
+        history = await history_store.get_by_edition_and_build(
+            edition_id=edition.id, build_id=edition.current_build_id
+        )
+    return _unpublished_build_target(edition=edition, history=history)
+
 
 async def _resolve_self_heal_target(
     *,
     session: AsyncSession,
-    edition_store: Any,
+    edition_store: EditionStore,
+    history_store: EditionBuildHistoryStore,
     project_id: int,
     edition_slug: str,
 ) -> tuple[int, str] | None:
     """Return ``(build_id, build_public_id)`` if the edition needs catch-up.
 
-    Returns ``None`` when the edition has no ``current_build_id``, when
-    its ``publish_status`` is already set (so a publish has run, is in
-    flight, or previously failed), or when the joined build public_id
-    is missing for any reason. The read happens inside its own
-    transaction so it does not interfere with
-    ``enqueue_publish_for_edition``'s phased commits.
+    The LTD leg reaches its edition by slug — ``edition_outcomes`` carries
+    the Docverse slug, not the row — then defers to
+    :func:`_resolve_unpublished_build_target` for the decision itself, so
+    both legs of the self-heal pass share one rule.
     """
     async with session.begin():
         edition = await edition_store.get_by_slug(
@@ -721,14 +1222,8 @@ async def _resolve_self_heal_target(
         )
     if edition is None:
         return None
-    if edition.publish_status is not None:
-        return None
-    if edition.current_build_id is None:
-        return None
-    if edition.current_build_public_id is None:
-        return None
-    return edition.current_build_id, serialize_base32_id(
-        edition.current_build_public_id
+    return await _resolve_unpublished_build_target(
+        session=session, history_store=history_store, edition=edition
     )
 
 
@@ -846,6 +1341,31 @@ async def _enqueue_children(
     slug from racing through ``_ensure_edition`` and losing the
     ``uq_editions_project_lower_slug`` race.
 
+    The pre-check is the fast path, not the guarantee: the 5-minute
+    ``keeper_sync_tier`` cron can claim the same slug between the
+    ``SELECT`` and the ``INSERT``, and
+    ``idx_queue_jobs_keeper_sync_project_active_uq`` — not the
+    pre-check — is what actually enforces the mutex. The insert
+    therefore goes through
+    :meth:`~docverse_server.storage.queue_job_store.QueueJobStore.create_unless_active`,
+    which turns that lost race into the same per-slug skip, exactly as
+    ``_enqueue_tier_child`` does. Letting the ``IntegrityError`` escape
+    instead would unwind this loop into
+    ``keeper_sync_run_discovery``'s outer ``except``, failing both the
+    discovery job and the whole run while silently dropping every
+    remaining in-scope project.
+
+    Run bookkeeping needs no adjustment for a skip. The run has no
+    stored expected-child count: :func:`maybe_finalise_run` aggregates
+    the ``queue_jobs`` rows actually attributed to the run, so a slug
+    with no row simply never enters the aggregate. The two counters
+    that do care are handled here — ``enqueued`` (returned, and the
+    trigger for the caller's zero-child run termination) only counts
+    real inserts, and the ``pending → in_progress`` transition is keyed
+    off ``enqueued == 0`` rather than the loop index, so a run whose
+    first slugs all lost the race still transitions on its first
+    surviving child.
+
     The order leaves an orphan tail: if the worker dies between the
     SQL commit and ``arq_queue.enqueue``, the row sits in ``queued``
     with ``backend_job_id IS NULL`` and no arq job will ever pick it
@@ -874,12 +1394,21 @@ async def _enqueue_children(
                     source="run_discovery",
                 )
                 continue
-            queue_job = await queue_job_store.create(
+            queue_job = await queue_job_store.create_unless_active(
                 kind=JobKind.keeper_sync_project,
                 org_id=org_id,
                 keeper_sync_run_id=run_id,
                 subject_label=ltd_slug,
             )
+            if queue_job is None:
+                logger.info(
+                    "Skipping keeper_sync_project enqueue: "
+                    "lost the race for this project's active-job slot",
+                    org=org_slug,
+                    ltd_slug=ltd_slug,
+                    source="run_discovery",
+                )
+                continue
             if enqueued == 0:
                 await run_store.transition_status(
                     run_id=run_id,
@@ -1796,6 +2325,15 @@ async def _enqueue_tier_project_sync(
     ``uq_editions_project_lower_slug`` race. Returns ``True`` on
     enqueue, ``False`` on skip so the caller can update its
     ``enqueued`` counter accurately.
+
+    The pre-check is the fast path, not the guarantee: another worker
+    can claim the slug between the ``SELECT`` and the ``INSERT``. The
+    insert therefore goes through
+    :meth:`~docverse_server.storage.queue_job_store.QueueJobStore.create_unless_active`,
+    which turns that lost race into the same ``False`` skip. Letting the
+    ``IntegrityError`` escape instead would unwind the caller's per-slug
+    loop and — because ``_run_tier`` catches per *org* — silently drop
+    every remaining project in that org for the tick.
     """
     async with session.begin():
         if await queue_job_store.has_active_for_subject(
@@ -1811,12 +2349,21 @@ async def _enqueue_tier_project_sync(
                 tier=tier,
             )
             return False
-        queue_job = await queue_job_store.create(
+        queue_job = await queue_job_store.create_unless_active(
             kind=JobKind.keeper_sync_project,
             org_id=org_id,
             keeper_sync_run_id=None,
             subject_label=ltd_slug,
         )
+        if queue_job is None:
+            logger.info(
+                "Skipping keeper_sync_project enqueue: "
+                "lost the race for this project's active-job slot",
+                org=org_slug,
+                ltd_slug=ltd_slug,
+                tier=tier,
+            )
+            return False
     metadata = await arq_queue.enqueue(
         "keeper_sync_project",
         _queue_name=KEEPER_SYNC_QUEUE_NAME,
