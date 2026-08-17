@@ -14,6 +14,7 @@ env:
     branches-ignore:
       - "dependabot/**"
       - "renovate/**"
+      - "t/**"
       - "u/**"
   release:
     types: [published]
@@ -142,6 +143,9 @@ jobs:
         run: uv run --only-group=nox nox -s deploy_worker_test
 
   build:
+    concurrency:
+      group: docker
+      queue: max
     needs: [test, client-test, worker-test, deploy-worker-test]
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
     with:
