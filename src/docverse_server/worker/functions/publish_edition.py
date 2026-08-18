@@ -291,8 +291,9 @@ async def _mark_publishing(
 
     Returns ``False`` — having transitioned nothing — when the late-
     delivery guard (PRD #538) finds the queue job's row already off
-    ``queued`` because a reaper failed it; the caller then returns
-    without publishing.
+    ``queued``: terminal because a reaper failed it, or in progress
+    because arq re-delivered the job. The caller then returns without
+    publishing.
     """
     if await queue_job_store.start_if_queued(queue_job_id) is None:
         return False

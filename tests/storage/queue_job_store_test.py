@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,7 @@ from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
@@ -36,6 +38,7 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import (
     _ACTIVE_JOB_UNIQUE_INDEXES,
+    LATE_DELIVERY_IN_PROGRESS_MESSAGE,
     QueueJobStore,
 )
 
@@ -116,30 +119,15 @@ async def test_publish_edition_job_with_edition_id(
         assert row.edition_id == edition.id
 
 
-@pytest.mark.asyncio
-async def test_start_job(
-    db_session: AsyncSession,
-    store: QueueJobStore,
-) -> None:
-    async with db_session.begin():
-        job = await store.create(kind=JobKind.build_processing, org_id=1)
-        started = await store.start(job.id)
-        await db_session.commit()
-    assert started.status == JobStatus.in_progress
-    assert started.date_started is not None
+def test_store_has_no_raising_start_method() -> None:
+    """``start`` is gone so no pickup path can get raising semantics.
 
-
-@pytest.mark.asyncio
-async def test_start_job_wrong_status(
-    db_session: AsyncSession,
-    store: QueueJobStore,
-) -> None:
-    async with db_session.begin():
-        job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
-        with pytest.raises(InvalidJobStateError):
-            await store.start(job.id)
-        await db_session.commit()
+    Task #547: the raising ``start`` had zero production callers once
+    every pickup site moved to :meth:`QueueJobStore.start_if_queued`, and
+    leaving a natural-named sibling around invited the next pickup point
+    to reach for it and reintroduce ``InvalidJobStateError`` at pickup.
+    """
+    assert not hasattr(QueueJobStore, "start")
 
 
 @pytest.mark.asyncio
@@ -147,7 +135,7 @@ async def test_start_if_queued_starts_queued_row(
     db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
-    """A ``queued`` row transitions just the way ``start`` transitions it."""
+    """A ``queued`` row is picked up: in_progress with a start timestamp."""
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
         started = await store.start_if_queued(job.id)
@@ -164,6 +152,7 @@ async def test_start_if_queued_starts_queued_row(
         JobStatus.failed,
         JobStatus.cancelled,
         JobStatus.completed,
+        JobStatus.completed_with_errors,
         JobStatus.in_progress,
     ],
 )
@@ -196,6 +185,88 @@ async def test_start_if_queued_returns_none_for_non_queued_row(
         assert unchanged.date_started is None
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.failed,
+        JobStatus.cancelled,
+        JobStatus.completed,
+        JobStatus.completed_with_errors,
+    ],
+)
+@pytest.mark.asyncio
+async def test_start_if_queued_terminal_row_captures_no_sentry_event(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+    status: JobStatus,
+) -> None:
+    """A terminal row is the race the reaper triad is meant to absorb.
+
+    Task #547 splits the two non-``queued`` cases apart: a row a reaper
+    (or a cancel, or a prior successful run) already moved to a terminal
+    status is expected fallout of the reap/deliver race, so it stays a
+    warning log with **no** Sentry event.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        row.status = status.value
+        await db_session.flush()
+
+        with sentry_init_fixture() as init:
+            init(environment="test")
+            captured = capture_events_fixture(monkeypatch)()
+            result = await store.start_if_queued(job.id)
+        await db_session.commit()
+
+    assert result is None
+    assert captured.errors == []
+
+
+@pytest.mark.asyncio
+async def test_start_if_queued_in_progress_row_captures_warning_event(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``in_progress`` row means arq re-delivered a job already running.
+
+    Task #547: on the default pool (``retry_jobs=True``, ``max_tries``
+    unset) arq re-delivers after worker death or a routine SIGTERM pod
+    rotation. Absorbing that silently would hide a crash-looping kind
+    until the reaper noticed hours later, so the guard captures a
+    warning-level Sentry event naming the job's public id, kind, and
+    current status.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.dashboard_build, org_id=1)
+        picked_up = await store.start_if_queued(job.id)
+        assert picked_up is not None
+
+        with sentry_init_fixture() as init:
+            init(environment="test")
+            captured = capture_events_fixture(monkeypatch)()
+            result = await store.start_if_queued(job.id)
+        await db_session.commit()
+
+    assert result is None
+    assert len(captured.errors) == 1
+    event = captured.errors[0]
+    assert event["level"] == "warning"
+    assert event["message"] == LATE_DELIVERY_IN_PROGRESS_MESSAGE
+    assert event["tags"]["job_function"] == JobKind.dashboard_build.value
+    assert event["tags"]["job_current_state"] == JobStatus.in_progress.value
+    # The public id is high-cardinality, so it rides in the context
+    # rather than a tag (see the docverse-exceptions recipe).
+    assert "job_public_id" not in event["tags"]
+    context = event["contexts"]["queue_job_late_delivery"]
+    assert context["job_public_id"] == serialize_base32_id(job.public_id)
+    assert context["job_function"] == JobKind.dashboard_build.value
+    assert context["current_state"] == JobStatus.in_progress.value
+
+
 @pytest.mark.asyncio
 async def test_start_if_queued_raises_for_missing_row(
     db_session: AsyncSession,
@@ -214,7 +285,7 @@ async def test_update_phase(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         updated = await store.update_phase(
             job.id, "uploading", progress={"step": 1}
         )
@@ -230,7 +301,7 @@ async def test_update_progress_merge(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         await store.update_progress(job.id, {"a": 1, "b": 2})
         merged = await store.update_progress(job.id, {"b": 99, "c": 3})
         await db_session.commit()
@@ -259,7 +330,7 @@ async def test_complete_job(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         completed = await store.complete(job.id)
         await db_session.commit()
     assert completed.status == JobStatus.completed
@@ -273,7 +344,7 @@ async def test_complete_with_errors(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         completed = await store.complete(job.id, has_errors=True)
         await db_session.commit()
     assert completed.status == JobStatus.completed_with_errors
@@ -287,7 +358,7 @@ async def test_fail_job(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         failed = await store.fail(
             job.id, errors={"message": "something went wrong"}
         )
@@ -317,7 +388,7 @@ async def test_cancel_in_progress_job(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         cancelled = await store.cancel(job.id)
         await db_session.commit()
     assert cancelled.status == JobStatus.cancelled
@@ -331,7 +402,7 @@ async def test_cancel_completed_job_raises(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         await store.complete(job.id)
         with pytest.raises(InvalidJobStateError):
             await store.cancel(job.id)
@@ -495,7 +566,7 @@ async def test_fail_orphaned_run_children_skips_started_rows(
             org_id=org_id,
             keeper_sync_run_id=run_id,
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         row = await db_session.get(SqlQueueJob, job.id)
         assert row is not None
         row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
@@ -523,7 +594,7 @@ async def test_fail_silent_run_children_fails_old_in_progress(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-job-stuck",
         )
-        await store.start(stuck.id)
+        await store.start_if_queued(stuck.id)
         # Backdate date_started past the idle threshold.
         row = await db_session.get(SqlQueueJob, stuck.id)
         assert row is not None
@@ -558,7 +629,7 @@ async def test_fail_silent_run_children_skips_recent_in_progress(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-job-recent",
         )
-        await store.start(recent.id)
+        await store.start_if_queued(recent.id)
 
         reaped = await store.fail_silent_run_children(
             idle_after=timedelta(hours=6)
@@ -582,7 +653,7 @@ async def test_fail_silent_run_children_skips_completed_rows(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-job-done",
         )
-        await store.start(done.id)
+        await store.start_if_queued(done.id)
         await store.complete(done.id)
         row = await db_session.get(SqlQueueJob, done.id)
         assert row is not None
@@ -636,7 +707,7 @@ async def test_fail_silent_run_children_skips_non_keeper_sync_rows(
             kind=JobKind.build_processing,
             org_id=1,
         )
-        await store.start(unrelated.id)
+        await store.start_if_queued(unrelated.id)
         row = await db_session.get(SqlQueueJob, unrelated.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -667,7 +738,7 @@ async def test_fail_silent_run_children_returns_distinct_run_ids(
                 keeper_sync_run_id=run_a_id,
                 backend_job_id=backend_id,
             )
-            await store.start(j.id)
+            await store.start_if_queued(j.id)
             r = await db_session.get(SqlQueueJob, j.id)
             assert r is not None
             r.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -677,7 +748,7 @@ async def test_fail_silent_run_children_returns_distinct_run_ids(
             keeper_sync_run_id=run_b_id,
             backend_job_id="arq-b1",
         )
-        await store.start(b_job.id)
+        await store.start_if_queued(b_job.id)
         r = await db_session.get(SqlQueueJob, b_job.id)
         assert r is not None
         r.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -723,7 +794,7 @@ async def test_fail_silent_tier_cron_jobs_fails_old_in_progress(
             subject_label="phalanx",
             backend_job_id="arq-tc-stuck",
         )
-        await store.start(stuck.id)
+        await store.start_if_queued(stuck.id)
         row = await db_session.get(SqlQueueJob, stuck.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -757,7 +828,7 @@ async def test_fail_silent_tier_cron_jobs_skips_recent_in_progress(
             subject_label="phalanx",
             backend_job_id="arq-tc-recent",
         )
-        await store.start(recent.id)
+        await store.start_if_queued(recent.id)
 
         reaped = await store.fail_silent_tier_cron_jobs(
             idle_after=timedelta(hours=6)
@@ -783,7 +854,7 @@ async def test_fail_silent_tier_cron_jobs_skips_run_attributed_rows(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-with-run",
         )
-        await store.start(run_attrib.id)
+        await store.start_if_queued(run_attrib.id)
         row = await db_session.get(SqlQueueJob, run_attrib.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -810,7 +881,7 @@ async def test_fail_silent_tier_cron_jobs_skips_non_keeper_sync_kinds(
             org_id=org_id,
             backend_job_id="arq-build",
         )
-        await store.start(unrelated.id)
+        await store.start_if_queued(unrelated.id)
         row = await db_session.get(SqlQueueJob, unrelated.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -839,7 +910,7 @@ async def test_fail_silent_tier_cron_jobs_skips_completed_rows(
             subject_label="phalanx",
             backend_job_id="arq-tc-done",
         )
-        await store.start(done.id)
+        await store.start_if_queued(done.id)
         await store.complete(done.id)
         row = await db_session.get(SqlQueueJob, done.id)
         assert row is not None
@@ -869,7 +940,7 @@ async def test_fail_silent_tier_cron_jobs_unblocks_has_active_for_subject(
             subject_label="phalanx",
             backend_job_id="arq-tc-unblock",
         )
-        await store.start(stuck.id)
+        await store.start_if_queued(stuck.id)
         row = await db_session.get(SqlQueueJob, stuck.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -1051,7 +1122,7 @@ async def test_fail_orphaned_tier_cron_jobs_skips_started_rows(
             keeper_sync_run_id=None,
             subject_label="phalanx",
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         row = await db_session.get(SqlQueueJob, job.id)
         assert row is not None
         row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
@@ -1139,7 +1210,7 @@ async def test_has_active_for_subject_returns_true_for_in_progress_row(
             org_id=42,
             subject_label="pipelines",
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         active = await store.has_active_for_subject(
             org_id=42,
             kind=JobKind.keeper_sync_project,
@@ -1161,7 +1232,7 @@ async def test_has_active_for_subject_returns_false_for_terminal_rows(
             org_id=42,
             subject_label="pipelines",
         )
-        await store.start(completed.id)
+        await store.start_if_queued(completed.id)
         await store.complete(completed.id)
 
         failed = await store.create(
@@ -1169,7 +1240,7 @@ async def test_has_active_for_subject_returns_false_for_terminal_rows(
             org_id=42,
             subject_label="pipelines",
         )
-        await store.start(failed.id)
+        await store.start_if_queued(failed.id)
         await store.fail(failed.id)
 
         cancelled = await store.create(
@@ -1285,7 +1356,7 @@ async def test_has_active_dashboard_build_returns_true_for_in_progress_row(
             org_id=42,
             project_id=7,
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         active = await store.has_active_dashboard_build(
             org_id=42, project_id=7
         )
@@ -1305,7 +1376,7 @@ async def test_has_active_dashboard_build_returns_false_for_terminal_rows(
             org_id=42,
             project_id=7,
         )
-        await store.start(completed.id)
+        await store.start_if_queued(completed.id)
         await store.complete(completed.id)
 
         failed = await store.create(
@@ -1313,7 +1384,7 @@ async def test_has_active_dashboard_build_returns_false_for_terminal_rows(
             org_id=42,
             project_id=7,
         )
-        await store.start(failed.id)
+        await store.start_if_queued(failed.id)
         await store.fail(failed.id)
 
         cancelled = await store.create(
@@ -1527,7 +1598,7 @@ async def test_fail_silent_lifecycle_eval_jobs_skips_other_kinds(
             org_id=org_id,
             backend_job_id="arq-build",
         )
-        await store.start(unrelated.id)
+        await store.start_if_queued(unrelated.id)
         row = await db_session.get(SqlQueueJob, unrelated.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -1809,7 +1880,7 @@ async def test_fail_silent_jobs_skips_other_kinds(
                 org_id=org_id,
                 backend_job_id=f"arq-other-{idx}",
             )
-            await store.start(unrelated.id)
+            await store.start_if_queued(unrelated.id)
             row = await db_session.get(SqlQueueJob, unrelated.id)
             assert row is not None
             row.date_started = datetime.now(tz=UTC) - spec.silent_past_offset
@@ -3583,7 +3654,7 @@ async def test_list_by_org_filters_by_status(
         started = await store.create(
             kind=JobKind.build_processing, org_id=org_id
         )
-        await store.start(started.id)
+        await store.start_if_queued(started.id)
         result = await store.list_by_org(
             org_id=org_id, status=JobStatus.in_progress, limit=10
         )

@@ -16,6 +16,7 @@ from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse_server.sentry import capture_warning
 from docverse_server.storage._integrity import (
     is_unique_violation,
     violated_constraint_name,
@@ -26,7 +27,20 @@ from docverse_server.storage._public_id import (
 from docverse_server.storage.pagination import QueueJobDateCreatedCursor
 from docverse_server.storage.queue_backend import QueueBackend
 
-__all__ = ["QueueJobStore"]
+__all__ = ["LATE_DELIVERY_IN_PROGRESS_MESSAGE", "QueueJobStore"]
+
+LATE_DELIVERY_IN_PROGRESS_MESSAGE = (
+    "Queue job re-delivered while already in progress"
+)
+"""Sentry issue title for an ``in_progress`` late delivery.
+
+Deliberately constant — no public id, kind, or status is interpolated —
+because the message is the Sentry grouping key: a per-job title would
+open a fresh issue for every re-delivery and defeat the "is this kind
+crash-looping?" read the event exists to give. The identifiers ride in
+the event's tags and ``queue_job_late_delivery`` context instead (see
+:meth:`QueueJobStore.start_if_queued`).
+"""
 
 ACTIVE_JOB_INDEX_SUFFIX = "_active_uq"
 """Naming convention for the ``queue_jobs`` active-job mutex indexes.
@@ -226,50 +240,48 @@ class QueueJobStore:
             return None
         return QueueJob.model_validate(row, from_attributes=True)
 
-    async def start(self, job_id: int) -> QueueJob:
-        """Mark job as in_progress, set date_started=now().
-
-        Raises
-        ------
-        InvalidJobStateError
-            If the job is not in queued status.
-        """
-        row = await self._get_row(job_id)
-        if row.status != JobStatus.queued.value:
-            raise InvalidJobStateError(
-                current_state=row.status,
-                target_state=JobStatus.in_progress.value,
-                job_public_id=serialize_base32_id(row.public_id),
-                job_function=row.kind,
-            )
-        return await self._mark_started(row)
-
     async def start_if_queued(self, job_id: int) -> QueueJob | None:
-        """Mark job as in_progress, or return ``None`` if it is not queued.
+        """Pick a job up: mark it in_progress, or ``None`` if not queued.
+
+        The only queued → in_progress transition in the codebase, and
+        therefore the shared pickup primitive: every worker function
+        picks its row up here so no pickup path can raise
+        :exc:`~docverse_server.exceptions.InvalidJobStateError` at
+        pickup, and so the decision about what a non-``queued`` row means
+        is made once rather than pasted at every call site.
 
         Late-delivery guard for the reaper triad (PRD #538). The
         abandoned sweep asks arq whether it still knows a queued job
         before failing its row, but a job re-appearing between that
         check and the ``UPDATE`` — or any other residual reap/deliver
         race — can still hand a worker a row that is no longer
-        ``queued``. Picking such a row up with :meth:`start` would raise
-        :exc:`~docverse_server.exceptions.InvalidJobStateError` into
-        Sentry for a race the reaper is meant to absorb, so worker
-        pickup paths call this instead and return without running the
-        job body when it yields ``None``.
+        ``queued``. Raising there would page an operator for a race the
+        reaper is meant to absorb, so the row is skipped instead and the
+        caller returns without running the job body.
 
-        On the ``queued`` path the transition is identical to
-        :meth:`start`; :meth:`start` keeps its raising semantics for
-        non-pickup callers, where an unexpected status *is* a bug.
+        The two non-``queued`` cases are *not* equivalent, and the
+        primitive reports them differently (task #547):
+
+        - **Terminal** (``failed`` / ``cancelled`` / ``completed`` /
+          ``completed_with_errors``) — expected reap fallout. Warning
+          log only; no Sentry event.
+        - **``in_progress``** — arq re-delivered a job a worker had
+          already picked up. The default pool runs with ``retry_jobs=
+          True`` and ``max_tries`` deliberately unset, so this is what
+          worker death or a routine SIGTERM pod rotation looks like from
+          the next delivery's point of view. The body still must not run
+          twice, but absorbing it silently would hide a crash-looping
+          kind until the reaper noticed hours later — so the skip also
+          captures a warning-level Sentry event (see
+          :func:`~docverse_server.sentry.capture_warning`).
 
         Returns
         -------
         QueueJob or None
             The started job when the row was ``queued``; ``None`` when
-            it exists in any other status — terminal because a reaper
-            failed it, or already ``in_progress`` because a duplicate
-            delivery beat this one. The skip is logged as a warning
-            carrying the job's public id, kind, and current status.
+            it exists in any other status. The skip is always logged as
+            a warning carrying the job's public id, kind, and current
+            status.
 
         Raises
         ------
@@ -280,14 +292,35 @@ class QueueJobStore:
         """
         row = await self._get_row(job_id)
         if row.status != JobStatus.queued.value:
-            self._logger.warning(
-                "Skipping late-delivered queue job",
-                queue_job_id=serialize_base32_id(row.public_id),
-                queue_job_kind=row.kind,
-                queue_job_status=row.status,
-            )
+            self._report_late_delivery(row)
             return None
         return await self._mark_started(row)
+
+    def _report_late_delivery(self, row: SqlQueueJob) -> None:
+        """Log — and for a re-delivery, page — a skipped late delivery."""
+        public_id = serialize_base32_id(row.public_id)
+        self._logger.warning(
+            "Skipping late-delivered queue job",
+            queue_job_id=public_id,
+            queue_job_kind=row.kind,
+            queue_job_status=row.status,
+        )
+        if row.status != JobStatus.in_progress.value:
+            return
+        capture_warning(
+            LATE_DELIVERY_IN_PROGRESS_MESSAGE,
+            tags={
+                "job_function": row.kind,
+                "job_current_state": row.status,
+            },
+            contexts={
+                "queue_job_late_delivery": {
+                    "job_public_id": public_id,
+                    "job_function": row.kind,
+                    "current_state": row.status,
+                }
+            },
+        )
 
     async def _mark_started(self, row: SqlQueueJob) -> QueueJob:
         """Apply the queued → in_progress transition to a loaded row."""

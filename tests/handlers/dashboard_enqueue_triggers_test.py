@@ -158,7 +158,7 @@ async def test_edition_delete_enqueues_dashboard_build(
         existing = list(result.scalars().all())
         assert len(existing) == 1
         store = QueueJobStore(session=db_session, logger=logger)
-        await store.start(existing[0].id)
+        await store.start_if_queued(existing[0].id)
         await store.complete(existing[0].id)
         await db_session.commit()
     assert before == 1

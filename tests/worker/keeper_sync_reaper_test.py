@@ -89,7 +89,7 @@ async def _seed_stuck_child(
         keeper_sync_run_id=run_id,
         backend_job_id=backend_job_id,
     )
-    await queue_job_store.start(job.id)
+    await queue_job_store.start_if_queued(job.id)
     row = await db_session.get(SqlQueueJob, job.id)
     assert row is not None
     row.date_started = datetime.now(tz=UTC) - timedelta(
@@ -245,7 +245,7 @@ async def _seed_silent_tier_cron(
         subject_label=subject_label,
         backend_job_id=f"arq-tc-silent-{subject_label}",
     )
-    await queue_job_store.start(job.id)
+    await queue_job_store.start_if_queued(job.id)
     row = await db_session.get(SqlQueueJob, job.id)
     assert row is not None
     row.date_started = datetime.now(tz=UTC) - timedelta(

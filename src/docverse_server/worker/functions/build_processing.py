@@ -70,8 +70,13 @@ class _QueueJobPickup:
     queue_job_id: int | None
     """Internal id of the row this worker started, if it started one."""
 
-    reaped: bool
-    """True when the row existed but a reaper had already failed it."""
+    skipped: bool
+    """True when the row existed but the late-delivery guard refused it.
+
+    Covers both non-``queued`` cases the guard reports — terminal because
+    a reaper failed the row, or ``in_progress`` because arq re-delivered
+    the job — since the body must be skipped either way.
+    """
 
 
 async def build_processing(
@@ -163,7 +168,7 @@ async def build_processing(
                     logger=logger,
                 )
 
-        # A reaped queue job produces no outcome: the build body never
+        # A skipped queue job produces no outcome: the build body never
         # ran, so there is nothing to report as processed.
         if outcome is None:
             return result
@@ -275,16 +280,16 @@ async def _process_build_locked(
 
     Returns the arq status message paired with the terminal metrics for
     the run so the caller can emit one ``build_processed`` event. The
-    metrics are ``None`` when the late-delivery guard (PRD #538) skipped
-    the build because a reaper had already failed its queue job: nothing
-    ran, so there is no build outcome to report.
+    metrics are ``None`` when the late-delivery guard (PRD #538) refused
+    to pick the queue job up: nothing ran, so there is no build outcome
+    to report.
     """
     # Phase 1: Mark QueueJob as in_progress and load metadata. The
-    # pickup guard runs first so a reaped row costs nothing beyond the
+    # pickup guard runs first so a skipped row costs nothing beyond the
     # lookup — no org read, no object store resolved.
     async with session.begin():
         pickup = await _start_queue_job(ctx, queue_job_store)
-        if pickup.reaped:
+        if pickup.skipped:
             return "skipped", None
 
         org = await org_store.get_by_id(org_id)
@@ -392,9 +397,9 @@ async def _mark_stale_skipped(
         latest_build_id=latest_build_id,
     )
     async with session.begin():
-        # A reaped row (``pickup.reaped``) is handled the same way as no
-        # row at all here: the build really is superseded either way, so
-        # only the queue-job bookkeeping is skipped.
+        # A guard-skipped row (``pickup.skipped``) is handled the same
+        # way as no row at all here: the build really is superseded
+        # either way, so only the queue-job bookkeeping is skipped.
         pickup = await _start_queue_job(ctx, queue_job_store)
         if pickup.queue_job_id is not None:
             queue_job_id = pickup.queue_job_id
@@ -422,18 +427,19 @@ async def _start_queue_job(
     Distinguishes the two "no queue job to drive" cases the callers
     treat differently: no row at all (``build_processing`` can still be
     enqueued without one, so the build is processed anyway) versus a row
-    a reaper already failed, where the late-delivery guard from PRD #538
-    requires the job body to be skipped entirely.
+    the late-delivery guard from PRD #538 refused to pick up — terminal
+    because a reaper failed it, or in progress because arq re-delivered
+    the job — where the job body must be skipped entirely.
     """
     arq_job_id: str | None = ctx.get("job_id")
     if arq_job_id is None:
-        return _QueueJobPickup(queue_job_id=None, reaped=False)
+        return _QueueJobPickup(queue_job_id=None, skipped=False)
     queue_job = await queue_job_store.get_by_backend_job_id(arq_job_id)
     if queue_job is None:
-        return _QueueJobPickup(queue_job_id=None, reaped=False)
+        return _QueueJobPickup(queue_job_id=None, skipped=False)
     if await queue_job_store.start_if_queued(queue_job.id) is None:
-        return _QueueJobPickup(queue_job_id=None, reaped=True)
-    return _QueueJobPickup(queue_job_id=queue_job.id, reaped=False)
+        return _QueueJobPickup(queue_job_id=None, skipped=True)
+    return _QueueJobPickup(queue_job_id=queue_job.id, skipped=False)
 
 
 async def _resolve_api_base_url(

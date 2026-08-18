@@ -58,9 +58,10 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         lock_key = LockKey.for_project(org_id=org_id, project_id=project_id)
         async with lock_service.acquire(lock_key):
             async with session.begin():
-                # Late-delivery guard (PRD #538): a reaper may have
-                # already failed this row, in which case the store logs
-                # the skip and we return without doing any work.
+                # Late-delivery guard (PRD #538): the row may be terminal
+                # (a reaper failed it) or already in progress (arq
+                # re-delivered the job). The store reports either; we
+                # return without doing any work.
                 if await queue_job_store.start_if_queued(queue_job_id) is None:
                     return "skipped"
                 await queue_job_store.update_phase(

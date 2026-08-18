@@ -188,7 +188,7 @@ async def test_completed_row_does_not_block_next_enqueue(
     # Drive the first job through queued → in_progress → completed.
     queue_job_store = QueueJobStore(session=db_session, logger=_logger())
     async with db_session.begin():
-        await queue_job_store.start(first.id)
+        await queue_job_store.start_if_queued(first.id)
         await queue_job_store.complete(first.id)
         await db_session.commit()
 

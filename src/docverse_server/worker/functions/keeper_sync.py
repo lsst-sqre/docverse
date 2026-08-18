@@ -393,8 +393,9 @@ async def keeper_sync_run_discovery(
 
         async with session.begin():
             # Late-delivery guard (PRD #538): a reaper may have already
-            # failed this row — and rolled the run up with it — so the
-            # discovery must not fan out a second time.
+            # failed this row — and rolled the run up with it — or arq
+            # may have re-delivered a job another worker is still
+            # running. The discovery must not fan out a second time.
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
             await _reconcile_orphan_children(
@@ -583,7 +584,8 @@ async def keeper_sync_project(
         async with session.begin():
             # Late-delivery guard (PRD #538): a reaper may have already
             # failed this row and, for a run child, rolled the parent run
-            # up on its behalf.
+            # up on its behalf — or arq may have re-delivered a job
+            # another worker is still running.
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
             org = await org_store.get_by_id(org_id)
