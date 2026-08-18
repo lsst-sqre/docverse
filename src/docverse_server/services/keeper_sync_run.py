@@ -23,10 +23,10 @@ from docverse_server.domain.keeper_sync_run import (
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import ConflictError, NotFoundError
+from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import KeeperSyncRunDateStartedCursor
-from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.queues import KEEPER_SYNC_QUEUE_NAME
 
@@ -41,13 +41,13 @@ class KeeperSyncRunService:
         *,
         org_store: OrganizationStore,
         run_store: KeeperSyncRunStore,
-        queue_backend: QueueBackend,
+        dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
         self._run_store = run_store
-        self._queue_backend = queue_backend
+        self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
         self._logger = logger
 
@@ -105,18 +105,15 @@ class KeeperSyncRunService:
             keeper_sync_run_id=run.id,
             subject_label=f"discovery for {org_slug}",
         )
-        enqueued = await self._queue_backend.enqueue(
-            "keeper_sync_run_discovery",
-            {
+        self._dispatcher.defer(
+            queue_job=queue_job,
+            job_type="keeper_sync_run_discovery",
+            payload={
                 "org_id": org.id,
                 "org_slug": org.slug,
                 "run_id": run.id,
-                "queue_job_id": queue_job.id,
             },
             queue_name=KEEPER_SYNC_QUEUE_NAME,
-        )
-        queue_job = await self._queue_job_store.set_backend_job_id(
-            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
         )
         self._logger.info(
             "Started keeper-sync run",
@@ -202,19 +199,16 @@ class KeeperSyncRunService:
             keeper_sync_run_id=None,
             subject_label=ltd_slug,
         )
-        enqueued = await self._queue_backend.enqueue(
-            "keeper_sync_project",
-            {
+        self._dispatcher.defer(
+            queue_job=queue_job,
+            job_type="keeper_sync_project",
+            payload={
                 "org_id": org.id,
                 "org_slug": org.slug,
-                "queue_job_id": queue_job.id,
                 "ltd_slug": ltd_slug,
                 "ltd_base_url": str(config.ltd_base_url),
             },
             queue_name=KEEPER_SYNC_QUEUE_NAME,
-        )
-        queue_job = await self._queue_job_store.set_backend_job_id(
-            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
         )
         self._logger.info(
             "Enqueued keeper-sync project refresh",

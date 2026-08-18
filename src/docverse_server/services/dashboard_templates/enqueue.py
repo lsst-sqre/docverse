@@ -8,13 +8,12 @@ import sentry_sdk
 import structlog
 
 from docverse.models.queue_enums import JobKind
-from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import NotFoundError
+from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
 )
-from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 
 from ._sync_failure import mark_dashboard_sync_failed
@@ -43,12 +42,12 @@ class DashboardSyncEnqueuer:
         self,
         *,
         binding_store: DashboardGitHubTemplateBindingStore,
-        queue_backend: QueueBackend,
+        dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._binding_store = binding_store
-        self._queue_backend = queue_backend
+        self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
         self._logger = logger
 
@@ -73,24 +72,17 @@ class DashboardSyncEnqueuer:
         # Back-point the binding at the freshly-created queue job so an
         # operator who reads ``last_sync_status="failed"`` can click
         # straight through to the traceback. Runs in the same
-        # transaction as the queue-job insert; if the backend enqueue
-        # below fails, both writes roll back.
+        # transaction as the queue-job insert, so the two rows land
+        # together or not at all.
         await self._binding_store.set_last_sync_queue_job(
             binding_id=binding.id, queue_job_id=queue_job.id
         )
-        enqueued = await self._queue_backend.enqueue(
-            "dashboard_sync",
-            {
-                "binding_id": binding.id,
-                "queue_job_id": queue_job.id,
-                "queue_job_public_id": serialize_base32_id(
-                    queue_job.public_id
-                ),
-            },
+        self._dispatcher.defer(
+            queue_job=queue_job,
+            job_type="dashboard_sync",
+            payload={"binding_id": binding.id},
         )
-        return await self._queue_job_store.set_backend_job_id(
-            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
-        )
+        return queue_job
 
 
 async def try_enqueue_dashboard_sync(
@@ -108,9 +100,10 @@ async def try_enqueue_dashboard_sync(
     re-raised, so the caller's flow (typically a binding PUT handler)
     is not broken by an enqueue failure.
 
-    The enqueue runs in a freshly started transaction on ``session`` —
-    the caller must have already committed the binding write it wants
-    persisted.
+    The ``queue_jobs`` row is written in a freshly started transaction
+    on ``session`` — the caller must have already committed the binding
+    write it wants persisted — and the arq enqueue follows that
+    transaction's commit, never precedes it (task #550).
 
     If the enqueue fails, a second transaction flips the binding's
     ``last_sync_status`` to ``"failed"`` with a descriptive
@@ -124,6 +117,7 @@ async def try_enqueue_dashboard_sync(
             service = factory.create_dashboard_sync_enqueuer()
             queue_job = await service.enqueue(binding_id)
             await session.commit()
+        await factory.queue_dispatcher.dispatch()
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
         logger.exception(

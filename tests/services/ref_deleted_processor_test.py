@@ -34,8 +34,8 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import NullQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from tests.support.queue_dispatch import make_dispatcher
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -85,7 +85,7 @@ def _make_edition_service(session: AsyncSession) -> EditionService:
         logger=log,
         history_store=EditionBuildHistoryStore(session=session, logger=log),
         build_store=BuildStore(session=session, logger=log),
-        queue_backend=NullQueueBackend(),
+        dispatcher=make_dispatcher(session),
         queue_job_store=QueueJobStore(session=session, logger=log),
     )
 

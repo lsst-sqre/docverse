@@ -90,7 +90,9 @@ async def build_processing(
         arq worker context (``factory_builder``, ``http_client``,
         ``arq_queue``).
     payload
-        Job payload with ``org_id``, ``project_id``, ``build_id``.
+        Job payload with ``org_id``, ``project_id``, ``build_id`` and —
+        for anything enqueued since task #550 — ``queue_job_id`` /
+        ``queue_job_public_id``.
 
     Returns
     -------
@@ -136,6 +138,7 @@ async def build_processing(
             if await _guard_stale_build(
                 session=session,
                 ctx=ctx,
+                payload=payload,
                 build_store=build_store,
                 queue_job_store=queue_job_store,
                 build=build,
@@ -160,6 +163,7 @@ async def build_processing(
                     org_store=org_store,
                     queue_job_store=queue_job_store,
                     ctx=ctx,
+                    payload=payload,
                     build=build,
                     org_id=org_id,
                     project_slug=project_slug,
@@ -220,6 +224,7 @@ async def _guard_stale_build(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     build: Build,
@@ -248,6 +253,7 @@ async def _guard_stale_build(
         await _mark_stale_skipped(
             session=session,
             ctx=ctx,
+            payload=payload,
             queue_job_store=queue_job_store,
             build_id=build_id,
             latest_build_id=latest_build_id,
@@ -265,6 +271,7 @@ async def _process_build_locked(
     org_store: OrganizationStore,
     queue_job_store: QueueJobStore,
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     build: Build,
     org_id: int,
     org_slug: str,
@@ -288,7 +295,7 @@ async def _process_build_locked(
     # pickup guard runs first so a skipped row costs nothing beyond the
     # lookup — no org read, no object store resolved.
     async with session.begin():
-        pickup = await _start_queue_job(ctx, queue_job_store)
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
         if pickup.skipped:
             return "skipped", None
 
@@ -379,6 +386,7 @@ async def _mark_stale_skipped(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     queue_job_store: QueueJobStore,
     build_id: int,
     latest_build_id: int,
@@ -400,7 +408,7 @@ async def _mark_stale_skipped(
         # A guard-skipped row (``pickup.skipped``) is handled the same
         # way as no row at all here: the build really is superseded
         # either way, so only the queue-job bookkeeping is skipped.
-        pickup = await _start_queue_job(ctx, queue_job_store)
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
         if pickup.queue_job_id is not None:
             queue_job_id = pickup.queue_job_id
             await queue_job_store.update_phase(
@@ -418,8 +426,37 @@ async def _mark_stale_skipped(
             await queue_job_store.complete(queue_job_id)
 
 
+async def _resolve_queue_job_id(
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    queue_job_store: QueueJobStore,
+) -> int | None:
+    """Resolve this delivery's ``queue_jobs`` row id, or ``None``.
+
+    The payload's ``queue_job_id`` is authoritative and is what every
+    other job kind uses. It matters here beyond consistency: the enqueue
+    now happens *after* the row commits (task #550), so at delivery time
+    the row's ``backend_job_id`` may not be stamped yet and the
+    ``backend_job_id`` lookup below would miss a row that plainly
+    exists.
+
+    That lookup survives only as the compatibility path for jobs enqueued
+    by the previous release, whose payloads predate the key and which can
+    still be sitting in the queue across a rolling deploy.
+    """
+    payload_job_id = payload.get("queue_job_id")
+    if payload_job_id is not None:
+        return int(payload_job_id)
+    arq_job_id: str | None = ctx.get("job_id")
+    if arq_job_id is None:
+        return None
+    queue_job = await queue_job_store.get_by_backend_job_id(arq_job_id)
+    return None if queue_job is None else queue_job.id
+
+
 async def _start_queue_job(
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     queue_job_store: QueueJobStore,
 ) -> _QueueJobPickup:
     """Look up and start the QueueJob for this arq job.
@@ -431,15 +468,12 @@ async def _start_queue_job(
     because a reaper failed it, or in progress because arq re-delivered
     the job — where the job body must be skipped entirely.
     """
-    arq_job_id: str | None = ctx.get("job_id")
-    if arq_job_id is None:
+    queue_job_id = await _resolve_queue_job_id(ctx, payload, queue_job_store)
+    if queue_job_id is None:
         return _QueueJobPickup(queue_job_id=None, skipped=False)
-    queue_job = await queue_job_store.get_by_backend_job_id(arq_job_id)
-    if queue_job is None:
-        return _QueueJobPickup(queue_job_id=None, skipped=False)
-    if await queue_job_store.start_if_queued(queue_job.id) is None:
+    if await queue_job_store.start_if_queued(queue_job_id) is None:
         return _QueueJobPickup(queue_job_id=None, skipped=True)
-    return _QueueJobPickup(queue_job_id=queue_job.id, skipped=False)
+    return _QueueJobPickup(queue_job_id=queue_job_id, skipped=False)
 
 
 async def _resolve_api_base_url(

@@ -213,6 +213,12 @@ async def patch_build(
 
         await context.session.commit()
 
+    # Hand build_processing to arq only now. The queue job's row is
+    # committed above, so a worker that picks the job up immediately can
+    # already see it — enqueuing inside the transaction would let a fast
+    # delivery race the commit and find nothing (PRD #538, task #550).
+    await context.factory.queue_dispatcher.dispatch()
+
     # Emit the build_uploaded metric only for a real upload-complete
     # transition, and only after the commit so the event reflects durably
     # persisted state. Production runs raise_on_error=False, so a metrics

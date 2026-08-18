@@ -87,11 +87,11 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.support.queue_dispatch import make_dispatcher
 from tests.worker.conftest import make_worker_ctx
 
 LTD_BASE = "https://keeper.lsst.codes"
@@ -1607,8 +1607,10 @@ async def test_keeper_sync_project_dedups_dashboard_build_cascade(
         enqueuer = DashboardBuildEnqueuer(
             org_store=OrganizationStore(session=session, logger=_logger()),
             project_store=ProjectStore(session=session, logger=_logger()),
-            queue_backend=ArqQueueBackend(
-                arq_queue=mock_arq, default_queue_name="docverse:queue"
+            dispatcher=make_dispatcher(
+                session,
+                arq_queue=mock_arq,
+                default_queue_name="docverse:queue",
             ),
             queue_job_store=QueueJobStore(session=session, logger=_logger()),
             logger=_logger(),

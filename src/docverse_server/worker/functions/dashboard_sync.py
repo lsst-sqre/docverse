@@ -163,6 +163,9 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     fanout = factory.create_dashboard_rebuild_fanout()
                     jobs = await fanout.fan_out(template_id)
                     fan_out_count = len(jobs)
+                # The fan-out's rows are committed above; only now may
+                # arq learn about them (task #550).
+                await factory.queue_dispatcher.dispatch()
 
             async with session.begin():
                 await queue_job_store.update_phase(

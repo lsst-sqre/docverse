@@ -292,6 +292,7 @@ async def post_edition_rollback(
             build_public_id=data.build,
         )
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
     # Publish after the commit (best-effort; raise_on_error=False).
     await context.events.edition_lifecycle.publish(
         EditionLifecycleEvent(
@@ -345,6 +346,7 @@ async def patch_edition(
             data=data,
         )
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
     # Publish after the commit (best-effort; raise_on_error=False).
     await context.events.edition_lifecycle.publish(
         EditionLifecycleEvent(
