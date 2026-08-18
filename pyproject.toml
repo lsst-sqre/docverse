@@ -18,7 +18,7 @@ dependencies = [
     "base32-lib",
     "rubin-gafaelfawr",
     "rubin-repertoire",
-    "safir[db,arq,kafka]>=13",
+    "safir[db,arq,kafka]>=15.2.0",
     "uvicorn[standard]>=0.34",
 ]
 
