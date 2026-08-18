@@ -15,6 +15,7 @@ import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
+from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -62,6 +63,7 @@ from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
 )
+from docverse_server.storage.keeper_sync.state_store import TombstoneReason
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
@@ -1330,3 +1332,111 @@ async def test_publish_edition_survives_cancellation_during_purge(
             refreshed_ed = await ed_store.get_by_id(edition.id)
             assert refreshed_ed is not None
             assert refreshed_ed.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_reaped_row_with_deleted_edition_skips(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reaped row whose edition is gone skips instead of raising.
+
+    Task #551: the reap/deliver race the late-delivery guard absorbs and
+    the ``lifecycle_eval`` soft-delete arrive together. The abandoned
+    sweep fails the ``queue_jobs`` row, ``lifecycle_eval`` soft-deletes
+    the edition it pointed at, and arq only then delivers the job.
+    Because ``EditionStore.get_by_slug`` filters ``date_deleted IS
+    NULL``, resolving the job's resources before the guard raised
+    ``NotFoundError`` into Sentry for a race the guard exists to
+    swallow. The guard now runs first, so the delivery is a logged skip
+    with no exception and no Sentry event.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-reaped-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-reaped",
+        )
+        # The abandoned sweep failed the row between enqueue and this
+        # (late) delivery...
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.fail(
+            queue_job.id,
+            errors={
+                "message": "Abandoned publish_edition",
+                "type": "AbandonedQueueJob",
+            },
+        )
+        # ...and lifecycle_eval then soft-deleted the edition it named.
+        edition_store = EditionStore(session=db_session, logger=logger)
+        deleted = await edition_store.soft_delete(
+            org_id=org.id,
+            project_id=project.id,
+            slug=edition.slug,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        assert deleted is True
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-reaped",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+    queue_job_public_id = serialize_base32_id(queue_job.public_id)
+
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        sentry_events = capture_events_fixture(monkeypatch)()
+        with capture_logs() as captured:
+            result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "skipped"
+
+    warnings = [
+        event
+        for event in captured
+        if event.get("log_level") == "warning"
+        and event.get("queue_job_status") == JobStatus.failed.value
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["queue_job_id"] == queue_job_public_id
+    assert warnings[0]["queue_job_kind"] == JobKind.publish_edition.value
+
+    # A reaped row is expected fallout, so the skip stays log-only.
+    assert sentry_events.errors == []
+
+    # Nothing published, and the terminal row is untouched.
+    assert mock_publisher.calls == []
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.date_started is None
+            assert job.phase is None

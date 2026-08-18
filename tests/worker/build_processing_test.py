@@ -18,6 +18,7 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
     BuildCreate,
@@ -890,9 +891,14 @@ async def test_build_processing_skips_stale_build(
     pair, marks the parent ``QueueJob`` ``completed`` with
     ``progress["stale_skipped"] = True`` and the latest id, and
     returns without invoking any uploads or touching edition state.
+
+    This is the *started*-then-stale skip: the row was picked up
+    normally, so it keeps reporting a stale-skipped success metric (the
+    contrast case for the reaped skip below).
     """
     logger = _logger()
     mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
 
     async with db_session.begin():
         org, project = await _setup_org_and_project(db_session)
@@ -936,6 +942,7 @@ async def test_build_processing_skips_stale_build(
     ctx = make_worker_ctx(
         http_client=httpx.AsyncClient(),
         job_id="test-arq-stale",
+        events=events,
     )
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -949,6 +956,13 @@ async def test_build_processing_skips_stale_build(
     await ctx["http_client"].aclose()
 
     assert result == "completed"
+
+    # The run is reported as a stale-skipped success.
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].success is True
+    assert publisher.published[0].stale_skipped is True
 
     # No uploads or downloads occurred — the mock store stayed empty.
     assert mock_store.objects == {}
@@ -977,6 +991,111 @@ async def test_build_processing_skips_stale_build(
             refreshed_older = await build_store.get_by_id(older_build.id)
             assert refreshed_older is not None
             assert refreshed_older.status == BuildStatus.processing
+
+
+@pytest.mark.asyncio
+async def test_build_processing_stale_reaped_build_reports_no_success(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reaped row that is *also* stale skips instead of succeeding.
+
+    Task #551: the stale branch used to report ``"completed"`` and a
+    ``build_processed(success=True, stale_skipped=True)`` event
+    unconditionally, even when the pickup guard refused the row — so a
+    job the abandoned sweep had already failed still emitted a success
+    for work nobody did. The reaped delivery now matches its sibling
+    pickup path: ``"skipped"``, no metric, terminal row untouched.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        older_build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=older_build.id,
+            backend_job_id="test-arq-stale-reaped",
+        )
+        # Stand in for the reaper's abandoned sweep having failed the row
+        # between enqueue and this (late) delivery.
+        await queue_job_store.fail(
+            queue_job.id,
+            errors={
+                "message": "Abandoned build_processing",
+                "type": "AbandonedQueueJob",
+            },
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-stale-reaped",
+        events=events,
+    )
+    queue_job_public_id = serialize_base32_id(queue_job.public_id)
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": older_build.id,
+        "build_public_id": serialize_base32_id(older_build.public_id),
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": queue_job_public_id,
+    }
+
+    with capture_logs() as captured:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "skipped"
+
+    # The pickup guard's skip warning is the only thing logged about
+    # this delivery; nothing claimed the build was stale-skipped.
+    warnings = [
+        event
+        for event in captured
+        if event.get("log_level") == "warning"
+        and event.get("queue_job_status") == JobStatus.failed.value
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["queue_job_id"] == queue_job_public_id
+    assert not [
+        event for event in captured if event["event"] == "Stale build skipped"
+    ]
+
+    # No outcome to report: the reaped row emits no build_processed event.
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+
+    # No uploads, and the terminal row keeps its reaped bookkeeping.
+    assert mock_store.objects == {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.date_started is None
+            assert job.phase is None
+            assert job.progress is None
 
 
 @pytest.mark.asyncio
