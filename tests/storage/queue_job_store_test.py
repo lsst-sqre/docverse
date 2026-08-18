@@ -35,12 +35,17 @@ from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import QueueBackend
+from docverse_server.storage.queue_backend import (
+    EnqueuedJob,
+    NullQueueBackend,
+    QueueBackend,
+)
 from docverse_server.storage.queue_job_store import (
     _ACTIVE_JOB_UNIQUE_INDEXES,
     LATE_DELIVERY_IN_PROGRESS_MESSAGE,
     QueueJobStore,
 )
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 
 @pytest.fixture
@@ -418,7 +423,9 @@ async def test_set_backend_job_id(
     async with db_session.begin():
         job = await store.create(kind=JobKind.publish_edition, org_id=1)
         assert job.backend_job_id is None
-        updated = await store.set_backend_job_id(job.id, "arq-job-42")
+        updated = await store.set_backend_job_id(
+            job.id, "arq-job-42", queue_name="docverse:queue"
+        )
         await db_session.commit()
     assert updated.backend_job_id == "arq-job-42"
 
@@ -1762,6 +1769,7 @@ async def _seed_runless_row(
     org_id: int,
     status: JobStatus,
     backend_job_id: str | None,
+    backend_queue_name: str | None = None,
     date_started: datetime | None = None,
     date_created_offset: timedelta | None = None,
     project_id: int | None = None,
@@ -1771,6 +1779,7 @@ async def _seed_runless_row(
     row = SqlQueueJob(
         public_id=validate_base32_id(generate_base32_id()),
         backend_job_id=backend_job_id,
+        backend_queue_name=backend_queue_name,
         kind=kind.value,
         status=status.value,
         org_id=org_id,
@@ -2088,6 +2097,7 @@ class _StubQueueBackend:
         self.known_ids = known_ids if known_ids is not None else set()
         self.error = error
         self.queried: list[str] = []
+        self.probes: list[tuple[str, str | None]] = []
 
     async def enqueue(
         self,
@@ -2095,13 +2105,17 @@ class _StubQueueBackend:
         payload: dict[str, Any],
         *,
         queue_name: str | None = None,
-    ) -> str:
+    ) -> EnqueuedJob:
         raise NotImplementedError
 
     async def get_job_metadata(
-        self, backend_job_id: str
+        self,
+        backend_job_id: str,
+        *,
+        queue_name: str | None = None,
     ) -> dict[str, Any] | None:
         self.queried.append(backend_job_id)
+        self.probes.append((backend_job_id, queue_name))
         if self.error is not None:
             raise self.error
         if backend_job_id in self.known_ids:
@@ -2419,6 +2433,190 @@ async def test_fail_abandoned_jobs_aborts_when_backend_unreachable(
         assert candidate is not None
         assert candidate.status == JobStatus.queued
         assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_propagates_programming_errors(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A bug in the backend call is not "Redis is down".
+
+    The soft-abort exists for backend I/O — a ``TypeError`` from a
+    signature change or an ``AttributeError`` from a refactor would
+    otherwise be logged as "Queue backend unreachable" at warning level
+    and silently disable the sweep forever, with no Sentry event. Such
+    errors must reach the instrumented task wrapper instead.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-typeerror")
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-programming-error",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(
+            error=TypeError("get_job_metadata() got an unexpected keyword")
+        )
+        with pytest.raises(TypeError):
+            await store.fail_abandoned_jobs(
+                JobKind.dashboard_build,
+                idle_after=timedelta(minutes=30),
+                queue_backend=backend,
+            )
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_raises_on_null_queue_backend(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queue-less factory path must not mass-fail healthy rows.
+
+    ``NullQueueBackend`` answers "no record" for every id, which is the
+    exact answer the sweep reads as "arq lost this job". It therefore
+    raises instead, and the error propagates rather than reaping.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug="abandoned-null-backend"
+        )
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-null-backend",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        with pytest.raises(RuntimeError):
+            await store.fail_abandoned_jobs(
+                JobKind.dashboard_build,
+                idle_after=timedelta(minutes=30),
+                queue_backend=NullQueueBackend(),
+            )
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_verify_abandoned_probes_the_rows_own_queue(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Verification asks the queue the row was actually enqueued onto.
+
+    Recording the enqueueing queue on the row retires the hand-listed
+    pool-queue walk: a job on any queue — including one added after this
+    code was written — is verified with a single, correct probe.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-own-queue")
+        await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-on-maintenance",
+            backend_queue_name=MAINTENANCE_QUEUE_NAME,
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-on-maintenance"})
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert failed == []
+    assert backend.probes == [("arq-on-maintenance", MAINTENANCE_QUEUE_NAME)]
+
+
+@pytest.mark.asyncio
+async def test_verify_abandoned_falls_back_for_legacy_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Rows predating the column probe with no queue name at all.
+
+    ``backend_queue_name`` is nullable so the migration needs no
+    backfill; a legacy row therefore hands the backend ``None``, which
+    is its signal to walk every pool queue as before.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-legacy-row")
+        await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-legacy",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-legacy"})
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert failed == []
+    assert backend.probes == [("arq-legacy", None)]
+
+
+@pytest.mark.asyncio
+async def test_set_backend_job_id_stamps_the_enqueueing_queue(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Both halves of an enqueue's provenance land in one call."""
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.lifecycle_eval, org_id=1)
+        updated = await store.set_backend_job_id(
+            job.id, "arq-stamped", queue_name=MAINTENANCE_QUEUE_NAME
+        )
+        await db_session.commit()
+
+    assert updated.backend_job_id == "arq-stamped"
+    assert updated.backend_queue_name == MAINTENANCE_QUEUE_NAME
+
+
+@pytest.mark.asyncio
+async def test_create_stamps_the_enqueueing_queue(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The single-shot create path records the queue name too."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.build_processing,
+            org_id=1,
+            backend_job_id="arq-created",
+            backend_queue_name="docverse:queue",
+        )
+        await db_session.commit()
+
+    assert job.backend_job_id == "arq-created"
+    assert job.backend_queue_name == "docverse:queue"
 
 
 @pytest.mark.asyncio

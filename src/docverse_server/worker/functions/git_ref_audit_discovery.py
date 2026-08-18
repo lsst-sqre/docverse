@@ -257,7 +257,9 @@ async def _enqueue_arq_jobs(
             },
         )
         async with session.begin():
-            await queue_job_store.set_backend_job_id(queue_job.id, metadata.id)
+            await queue_job_store.set_backend_job_id(
+                queue_job.id, metadata.id, queue_name=metadata.queue_name
+            )
         logger.debug(
             "Enqueued git_ref_audit for org",
             org=org.slug,

@@ -24,6 +24,7 @@ class QueueJob(BaseModel):
     id: int
     public_id: Base32Id
     backend_job_id: str | None = None
+    backend_queue_name: str | None = None
     kind: JobKind
     status: JobStatus
     phase: str | None = None

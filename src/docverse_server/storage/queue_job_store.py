@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 import structlog
+from redis.exceptions import RedisError
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
 from sqlalchemy import ColumnExpressionArgument, select, update
 from sqlalchemy.exc import IntegrityError
@@ -47,6 +48,23 @@ open a fresh issue for every re-delivery and defeat the "is this kind
 crash-looping?" read the event exists to give. The identifiers ride in
 the event's tags and ``queue_job_late_delivery`` context instead (see
 :meth:`QueueJobStore.start_if_queued`).
+"""
+
+_BACKEND_IO_ERRORS = (RedisError, OSError)
+"""Failures that mean "the queue backend could not be reached".
+
+The abandoned sweep soft-aborts on these and only these.
+:exc:`redis.exceptions.RedisError` is redis-py's base class, covering
+its ``ConnectionError``/``TimeoutError``/``BusyLoadingError`` family
+(none of which derive from the builtins of the same name).
+:exc:`OSError` covers raw socket failures and the builtin
+:exc:`TimeoutError` — the ``asyncio.TimeoutError`` alias — that a
+cancelled round trip surfaces.
+
+Everything else, notably :exc:`TypeError` and :exc:`AttributeError`, is
+a programming error: classifying it as "unreachable" would disable the
+sweep at warning level with no Sentry event, so it must propagate to
+the instrumented task wrapper.
 """
 
 ACTIVE_JOB_INDEX_SUFFIX = "_active_uq"
@@ -106,6 +124,14 @@ class AbandonedCandidate:
     backend_job_id: str
     """The arq job ID the abandoned sweep verifies against the backend."""
 
+    backend_queue_name: str | None
+    """The queue that job was enqueued onto, or ``None`` for legacy rows.
+
+    Passed straight through to
+    :meth:`~docverse_server.storage.queue_backend.QueueBackend.get_job_metadata`,
+    where ``None`` selects the multi-queue fallback probe.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class AbandonedCandidates:
@@ -158,6 +184,7 @@ class QueueJobStore:
         kind: JobKind,
         org_id: int,
         backend_job_id: str | None = None,
+        backend_queue_name: str | None = None,
         project_id: int | None = None,
         build_id: int | None = None,
         edition_id: int | None = None,
@@ -171,12 +198,19 @@ class QueueJobStore:
         Mints a time-ordered Base32 ``public_id`` at insert time, re-minting
         on the (rare) same-millisecond collision. Calls flush() to get DB
         defaults.
+
+        ``backend_queue_name`` travels with ``backend_job_id`` — callers
+        take both from the :class:`~docverse_server.storage.queue_backend.
+        EnqueuedJob` their enqueue returned — so the abandoned sweep can
+        later verify the row against the queue it was actually enqueued
+        onto.
         """
 
         def _make_row(public_id: int) -> SqlQueueJob:
             return SqlQueueJob(
                 public_id=public_id,
                 backend_job_id=backend_job_id,
+                backend_queue_name=backend_queue_name,
                 kind=kind.value,
                 status=JobStatus.queued.value,
                 org_id=org_id,
@@ -201,6 +235,7 @@ class QueueJobStore:
         kind: JobKind,
         org_id: int,
         backend_job_id: str | None = None,
+        backend_queue_name: str | None = None,
         project_id: int | None = None,
         build_id: int | None = None,
         edition_id: int | None = None,
@@ -245,6 +280,7 @@ class QueueJobStore:
                 kind=kind,
                 org_id=org_id,
                 backend_job_id=backend_job_id,
+                backend_queue_name=backend_queue_name,
                 project_id=project_id,
                 build_id=build_id,
                 edition_id=edition_id,
@@ -393,14 +429,22 @@ class QueueJobStore:
         self,
         job_id: int,
         backend_job_id: str,
+        *,
+        queue_name: str,
     ) -> QueueJob:
-        """Record the arq job ID on a previously-created QueueJob row.
+        """Record the arq job ID and its queue on a QueueJob row.
 
         Used by two-phase enqueue flows that insert the row before they
         have a backend job ID (see ``_enqueue_publish_jobs``).
+
+        ``queue_name`` is required rather than optional so no stamping
+        path can record half of a job's backend provenance: the queue
+        name is what lets the abandoned sweep verify the row against the
+        queue it was actually enqueued onto.
         """
         row = await self._get_row(job_id)
         row.backend_job_id = backend_job_id
+        row.backend_queue_name = queue_name
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
@@ -1505,7 +1549,11 @@ class QueueJobStore:
         """
         now = (await self._session.execute(select(func.now()))).scalar_one()
         cutoff = now - idle_after
-        stmt = select(SqlQueueJob.id, SqlQueueJob.backend_job_id).where(
+        stmt = select(
+            SqlQueueJob.id,
+            SqlQueueJob.backend_job_id,
+            SqlQueueJob.backend_queue_name,
+        ).where(
             SqlQueueJob.status == JobStatus.queued.value,
             SqlQueueJob.backend_job_id.is_not(None),
             SqlQueueJob.date_created < cutoff,
@@ -1515,9 +1563,11 @@ class QueueJobStore:
         return AbandonedCandidates(
             rows=tuple(
                 AbandonedCandidate(
-                    job_id=job_id, backend_job_id=backend_job_id
+                    job_id=job_id,
+                    backend_job_id=backend_job_id,
+                    backend_queue_name=backend_queue_name,
                 )
-                for job_id, backend_job_id in rows
+                for job_id, backend_job_id, backend_queue_name in rows
                 if backend_job_id is not None  # pragma: no branch - SQL
             ),
             message=message,
@@ -1545,14 +1595,28 @@ class QueueJobStore:
         §Scope, backend-unreachable bullet). Failing open this way is
         deliberate — reaping a row whose arq job may well be alive would
         cancel healthy work.
+
+        Only backend *I/O* failures soft-abort (see
+        :data:`_BACKEND_IO_ERRORS`). A ``TypeError`` from a changed
+        signature or an ``AttributeError`` from a refactor is a bug, not
+        an unreachable Redis: swallowing it here would disable the sweep
+        permanently at warning level with no Sentry event, so it
+        propagates to the instrumented task wrapper instead.
+
+        Each candidate is probed on the queue its row recorded, so a job
+        on any pool — including one added after this code was written —
+        is verified with one correct round trip. Rows predating
+        ``queue_jobs.backend_queue_name`` pass ``None`` and fall back to
+        the backend's multi-queue walk.
         """
         lost: list[int] = []
         for candidate in candidates.rows:
             try:
                 metadata = await queue_backend.get_job_metadata(
-                    candidate.backend_job_id
+                    candidate.backend_job_id,
+                    queue_name=candidate.backend_queue_name,
                 )
-            except Exception as exc:
+            except _BACKEND_IO_ERRORS as exc:
                 self._logger.warning(
                     "Queue backend unreachable; skipping abandoned sweep",
                     error=str(exc),

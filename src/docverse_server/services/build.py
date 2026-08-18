@@ -131,7 +131,7 @@ class BuildService:
             project=project_slug,
         )
 
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "build_processing",
             {
                 "org_id": project.org_id,
@@ -145,7 +145,8 @@ class BuildService:
         queue_job = await self._queue_job_store.create(
             kind=JobKind.build_processing,
             org_id=project.org_id,
-            backend_job_id=backend_job_id,
+            backend_job_id=enqueued.id,
+            backend_queue_name=enqueued.queue_name,
             project_id=project.id,
             build_id=build.id,
         )

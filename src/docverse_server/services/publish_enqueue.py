@@ -127,7 +127,7 @@ async def enqueue_publish_for_edition(
         child_job_id = child_job.id
         child_public_id = serialize_base32_id(child_job.public_id)
 
-    backend_job_id = await queue_backend.enqueue(
+    enqueued = await queue_backend.enqueue(
         "publish_edition",
         {
             "org_id": org_id,
@@ -141,11 +141,13 @@ async def enqueue_publish_for_edition(
         },
     )
     async with session.begin():
-        await queue_job_store.set_backend_job_id(child_job_id, backend_job_id)
+        await queue_job_store.set_backend_job_id(
+            child_job_id, enqueued.id, queue_name=enqueued.queue_name
+        )
 
     return PublishEnqueueResult(
         edition_slug=edition_slug,
         queue_job_id=child_job_id,
         queue_job_public_id=child_public_id,
-        backend_job_id=backend_job_id,
+        backend_job_id=enqueued.id,
     )

@@ -246,7 +246,7 @@ class EditionService:
             build_id=build.id,
             edition_id=edition.id,
         )
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "publish_edition",
             {
                 "org_id": org_id,
@@ -269,7 +269,7 @@ class EditionService:
             publish_queue_job_public_id=serialize_base32_id(
                 child_job.public_id
             ),
-            publish_backend_job_id=backend_job_id,
+            publish_backend_job_id=enqueued.id,
         )
         return updated_edition
 
@@ -408,7 +408,7 @@ class EditionService:
             build_id=build.id,
             edition_id=edition.id,
         )
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "publish_edition",
             {
                 "org_id": org.id,
@@ -437,7 +437,7 @@ class EditionService:
             publish_queue_job_public_id=serialize_base32_id(
                 child_job.public_id
             ),
-            publish_backend_job_id=backend_job_id,
+            publish_backend_job_id=enqueued.id,
         )
         return org, project, updated_edition
 

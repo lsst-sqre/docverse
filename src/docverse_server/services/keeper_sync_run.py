@@ -28,17 +28,9 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import KeeperSyncRunDateStartedCursor
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.queues import KEEPER_SYNC_QUEUE_NAME
 
 __all__ = ["KEEPER_SYNC_QUEUE_NAME", "KeeperSyncRunService"]
-
-
-KEEPER_SYNC_QUEUE_NAME = "docverse:sync-queue"
-"""arq queue name dedicated to LTD-sync work.
-
-The queue is isolated from the regular ``docverse:queue`` so a noisy
-backfill cannot starve ``build_processing`` and ``publish_edition``
-jobs.
-"""
 
 
 class KeeperSyncRunService:
@@ -113,7 +105,7 @@ class KeeperSyncRunService:
             keeper_sync_run_id=run.id,
             subject_label=f"discovery for {org_slug}",
         )
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "keeper_sync_run_discovery",
             {
                 "org_id": org.id,
@@ -124,7 +116,7 @@ class KeeperSyncRunService:
             queue_name=KEEPER_SYNC_QUEUE_NAME,
         )
         queue_job = await self._queue_job_store.set_backend_job_id(
-            queue_job.id, backend_job_id
+            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
         )
         self._logger.info(
             "Started keeper-sync run",
@@ -210,7 +202,7 @@ class KeeperSyncRunService:
             keeper_sync_run_id=None,
             subject_label=ltd_slug,
         )
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "keeper_sync_project",
             {
                 "org_id": org.id,
@@ -222,7 +214,7 @@ class KeeperSyncRunService:
             queue_name=KEEPER_SYNC_QUEUE_NAME,
         )
         queue_job = await self._queue_job_store.set_backend_job_id(
-            queue_job.id, backend_job_id
+            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
         )
         self._logger.info(
             "Enqueued keeper-sync project refresh",

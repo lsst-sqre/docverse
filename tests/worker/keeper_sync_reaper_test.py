@@ -379,12 +379,16 @@ async def _seed_abandoned_row(
     run_id: int | None = None,
     subject_label: str | None = None,
     kind: JobKind = JobKind.keeper_sync_project,
+    backend_queue_name: str | None = None,
 ) -> int:
     """Create a queued row of ``kind`` with an arq job ID.
 
     The PRD #538 shape: the row reached arq (so the orphan sweeps, which
     require ``backend_job_id IS NULL``, cannot see it) but never started
     (so the silent sweeps, which require ``in_progress``, cannot either).
+
+    ``backend_queue_name`` defaults to ``None`` — the legacy shape,
+    which makes the sweep fall back to probing every pool queue.
     """
     queue_job_store = QueueJobStore(session=db_session, logger=_logger())
     job = await queue_job_store.create(
@@ -393,6 +397,7 @@ async def _seed_abandoned_row(
         keeper_sync_run_id=run_id,
         subject_label=subject_label,
         backend_job_id=backend_job_id,
+        backend_queue_name=backend_queue_name,
     )
     row = await db_session.get(SqlQueueJob, job.id)
     assert row is not None
@@ -668,13 +673,16 @@ async def test_reaper_spares_row_whose_job_is_on_the_keeper_sync_queue(
     app: None,
     db_session: AsyncSession,
 ) -> None:
-    """Verification is queue-name-agnostic, so live work survives.
+    """Verification follows the row's own queue, so live work survives.
 
     Keeper-sync jobs are enqueued onto ``docverse:sync-queue``, not the
     default queue the backend is configured with. arq resolves a queued
-    job's status through its own queue, so a lookup that only consults
-    the default queue reports "no record" for a perfectly healthy job —
-    and the abandoned sweep would reap it.
+    job's status through its own queue, so a lookup aimed anywhere else
+    reports "no record" for a perfectly healthy job — and the abandoned
+    sweep would reap it. The tier-cron row carries the queue name its
+    enqueue recorded (the current shape); the run child leaves it
+    ``NULL`` (the legacy shape), so one tick exercises both the direct
+    probe and the multi-queue fallback.
     """
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -689,6 +697,7 @@ async def test_reaper_spares_row_whose_job_is_on_the_keeper_sync_queue(
             db_session,
             org_id=org_id,
             backend_job_id=live.id,
+            backend_queue_name=KEEPER_SYNC_QUEUE_NAME,
             created_minutes_ago=6000,
             subject_label="phalanx",
         )

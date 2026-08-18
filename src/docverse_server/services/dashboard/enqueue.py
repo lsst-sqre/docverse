@@ -121,7 +121,7 @@ class DashboardBuildEnqueuer:
                 project_id=project_id,
             )
             return None
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "dashboard_build",
             {
                 "org_id": org_id,
@@ -135,7 +135,7 @@ class DashboardBuildEnqueuer:
             },
         )
         return await self._queue_job_store.set_backend_job_id(
-            queue_job.id, backend_job_id
+            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
         )
 
     async def enqueue_for_project_slug(

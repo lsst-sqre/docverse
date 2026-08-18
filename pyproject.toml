@@ -15,6 +15,11 @@ dependencies = [
     "jinja2>=3.1",
     "pydantic>=2",
     "pydantic-settings>=2.14.2",
+    # Imported directly for redis-py's error hierarchy, which the
+    # abandoned reaper sweep uses to tell "backend unreachable" from a
+    # programming error. arq pulls redis in anyway; declaring it keeps
+    # the direct import honest.
+    "redis>=5",
     "base32-lib",
     "rubin-gafaelfawr",
     "rubin-repertoire",

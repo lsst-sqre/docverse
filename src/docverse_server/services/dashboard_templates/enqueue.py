@@ -78,7 +78,7 @@ class DashboardSyncEnqueuer:
         await self._binding_store.set_last_sync_queue_job(
             binding_id=binding.id, queue_job_id=queue_job.id
         )
-        backend_job_id = await self._queue_backend.enqueue(
+        enqueued = await self._queue_backend.enqueue(
             "dashboard_sync",
             {
                 "binding_id": binding.id,
@@ -89,7 +89,7 @@ class DashboardSyncEnqueuer:
             },
         )
         return await self._queue_job_store.set_backend_job_id(
-            queue_job.id, backend_job_id
+            queue_job.id, enqueued.id, queue_name=enqueued.queue_name
         )
 
 

@@ -83,7 +83,6 @@ from docverse_server.services.keeper_sync_finalisation import (
     maybe_finalise_run,
     publish_run_completed,
 )
-from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
 )
@@ -103,6 +102,7 @@ from docverse_server.storage.ltd import (
     LtdNotFoundError,
 )
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.queues import KEEPER_SYNC_QUEUE_NAME
 
 # Window before a queued child with no ``backend_job_id`` is treated as
 # orphaned by ``_reconcile_orphan_children``. Long enough to never race
@@ -1612,7 +1612,9 @@ async def _enqueue_children(
             },
         )
         async with session.begin():
-            await queue_job_store.set_backend_job_id(queue_job.id, metadata.id)
+            await queue_job_store.set_backend_job_id(
+                queue_job.id, metadata.id, queue_name=metadata.queue_name
+            )
         enqueued += 1
         logger.debug(
             "Enqueued keeper_sync_project",
@@ -2558,5 +2560,7 @@ async def _enqueue_tier_project_sync(
         },
     )
     async with session.begin():
-        await queue_job_store.set_backend_job_id(queue_job.id, metadata.id)
+        await queue_job_store.set_backend_job_id(
+            queue_job.id, metadata.id, queue_name=metadata.queue_name
+        )
     return True

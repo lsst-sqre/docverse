@@ -854,9 +854,10 @@ async def test_reaper_spares_rows_arq_still_knows(
     """A job arq still has a record of survives regardless of age.
 
     Both families run on the maintenance pool, which arq resolves
-    through its own queue's sorted set — so this also pins the
-    queue-agnostic lookup: a queue-scoped one would read the live job as
-    missing and reap it.
+    through its own queue's sorted set. These rows carry no
+    ``backend_queue_name`` (the legacy shape), so they also pin the
+    multi-queue fallback: without it the live job on the maintenance
+    queue would read as missing and be reaped.
     """
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
