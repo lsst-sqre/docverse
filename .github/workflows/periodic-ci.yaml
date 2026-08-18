@@ -1,0 +1,215 @@
+# This is a separate run of the test suites that runs from a schedule and
+# resolves dependencies fresh instead of installing the pinned uv.lock and
+# package-lock.json. `ci.yaml` runs against the pins, so it can stay green
+# indefinitely while the ecosystem moves underneath them; this workflow is
+# what catches a breaking upstream release before `make update` is run for a
+# release.
+#
+# docverse is a three-component monorepo, so every test path in `ci.yaml`
+# has a job here: the server (lint, typing, tests), the client (including
+# the older-Python and oldest-dependency matrices), the Cloudflare worker,
+# the deploy-worker integration test that spans both, and client packaging.
+# The Docker image build is deliberately not repeated: it is the most
+# expensive job in `ci.yaml` and the lock it would install is already
+# exercised by the `test` job here.
+
+name: Periodic CI
+
+env:
+  # Current supported uv version. The uv documentation recommends pinning
+  # this. The version should match the version used in
+  # .pre-commit-config.yaml and frozen in uv.lock. It is updated by
+  # make update-deps.
+  UV_VERSION: "0.12.3"
+
+"on":
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # Timeouts are more generous than in `ci.yaml`: every job here pays for a
+  # dependency refresh and cannot reuse a warm cache, and a timeout would
+  # page Slack as if it were a real upstream breakage.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Update dependencies
+        run: make update-deps
+
+      - name: Run nox
+        run: uv run --only-group=nox nox -s lint typing test
+
+      - name: Report status
+        if: failure()
+        uses: ravsamhq/notify-slack-action@v2
+        with:
+          status: ${{ job.status }}
+          notify_when: "failure"
+          notification_title: "Periodic test for {repo} failed"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERT_WEBHOOK }}
+
+  # The test job covers the client against the refreshed lock on the
+  # project's own Python. The client additionally supports older Pythons and
+  # declares lower bounds on its dependencies, so those matrices run here
+  # too: they resolve from PyPI rather than from uv.lock, which is where a
+  # new transitive release can break the declared floor.
+  client-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Update dependencies
+        run: make update-deps
+
+      - name: Run nox
+        run: >-
+          uv run --only-group=nox nox -s
+          client_test
+          client_test_compat
+          client_test_oldest
+
+      - name: Report status
+        if: failure()
+        uses: ravsamhq/notify-slack-action@v2
+        with:
+          status: ${{ job.status }}
+          notify_when: "failure"
+          notification_title: "Periodic client test for {repo} failed"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERT_WEBHOOK }}
+
+  worker-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cloudflare-worker
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: cloudflare-worker/package.json
+
+      # `npm update` is the npm analogue of `uv lock --upgrade`: it moves
+      # every dependency to the newest release allowed by package.json and
+      # rewrites package-lock.json, where `npm ci` would reinstall the
+      # pinned tree and defeat the point of this workflow. The npm download
+      # cache is likewise skipped, since it is keyed on the lockfile hash.
+      - name: Update dependencies
+        run: npm update
+
+      - name: Build the worker
+        run: npm run build
+
+      - name: Run worker tests
+        run: npm test
+
+      - name: Report status
+        if: failure()
+        uses: ravsamhq/notify-slack-action@v2
+        with:
+          status: ${{ job.status }}
+          notify_when: "failure"
+          notification_title: "Periodic worker test for {repo} failed"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERT_WEBHOOK }}
+
+  # The deploy-worker CLI packs the worker with npm and hands it to
+  # wrangler, so this job needs both toolchains updated.
+  deploy-worker-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: cloudflare-worker/package.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Update Python dependencies
+        run: make update-deps
+
+      # This also populates cloudflare-worker/node_modules, which the
+      # integration test copies into its scratch deployments repo.
+      - name: Update worker dependencies
+        run: npm update
+        working-directory: cloudflare-worker
+
+      - name: Run nox
+        run: uv run --only-group=nox nox -s deploy_worker_test
+
+      - name: Report status
+        if: failure()
+        uses: ravsamhq/notify-slack-action@v2
+        with:
+          status: ${{ job.status }}
+          notify_when: "failure"
+          notification_title: "Periodic deploy-worker test for {repo} failed"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERT_WEBHOOK }}
+
+  # Build the client sdist and wheel with the build backend resolved fresh,
+  # so a breaking setuptools or setuptools_scm release surfaces here rather
+  # than on release day.
+  client-packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history for setuptools_scm
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Build the client
+        run: uv build --no-sources
+        working-directory: client
+
+      - name: Report status
+        if: failure()
+        uses: ravsamhq/notify-slack-action@v2
+        with:
+          status: ${{ job.status }}
+          notify_when: "failure"
+          notification_title: "Periodic packaging test for {repo} failed"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERT_WEBHOOK }}
