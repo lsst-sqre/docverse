@@ -6,16 +6,21 @@ cron-driven backstops for the case where arq itself loses a queue
 job (worker pod OOM-killed mid-job that never gets to surface a
 timeout, or dispatcher crashed between the ``queue_jobs`` SQL commit
 and ``arq_queue.enqueue``). Each reaper marks any silently-stuck row
-as ``failed`` and sweeps orphan queued rows.
+as ``failed``, sweeps orphan queued rows, and — per PRD #538 — fails
+``queued`` rows that reached arq and were then lost by it, verified
+against the queue backend first.
 
-Parametrized over :data:`RUNLESS_REAPER_SPECS` so the same six
-behaviors are exercised against every run-less kind without
-copy-pasted per-kind test modules. pytest IDs like
-``[dashboard_build]`` keep per-kind failure attribution.
+Parametrized over :data:`RUNLESS_REAPER_SPECS` so the same behaviors
+are exercised against every run-less kind without copy-pasted per-kind
+test modules. pytest IDs like ``[dashboard_build]`` keep per-kind
+failure attribution. The end-to-end unwedge test is ``dashboard_build``
+only, since that is the kind whose mutex actually froze a production
+dashboard.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,6 +39,7 @@ from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobKind, JobStatus
@@ -164,6 +170,33 @@ async def _seed_orphan_row(
     row = SqlQueueJob(
         public_id=validate_base32_id(generate_base32_id()),
         backend_job_id=None,
+        kind=kind.value,
+        status=JobStatus.queued.value,
+        org_id=org_id,
+        project_id=project_id,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    row.date_created = datetime.now(tz=UTC) - timedelta(
+        minutes=created_minutes_ago
+    )
+    await db_session.flush()
+    return row.id
+
+
+async def _seed_abandoned_row(
+    db_session: AsyncSession,
+    *,
+    kind: JobKind,
+    org_id: int,
+    backend_job_id: str,
+    created_minutes_ago: int,
+    project_id: int | None = None,
+) -> int:
+    """Insert one abandoned row: queued, has an arq ID, past the window."""
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        backend_job_id=backend_job_id,
         kind=kind.value,
         status=JobStatus.queued.value,
         org_id=org_id,
@@ -387,9 +420,10 @@ async def test_reaper_warning_includes_count_and_public_ids(
             orphan_qj = await qj_store.get(orphan_id)
             assert silent_qj is not None
             assert orphan_qj is not None
-            assert {silent_qj.public_id, orphan_qj.public_id} == set(
-                warnings[0]["reaped_public_ids"]
-            )
+            assert {
+                serialize_base32_id(silent_qj.public_id),
+                serialize_base32_id(orphan_qj.public_id),
+            } == set(warnings[0]["reaped_public_ids"])
 
 
 @pytest.mark.asyncio
@@ -502,3 +536,504 @@ async def test_reaper_isolates_other_main_pool_kinds(
                 other = await qj_store.get(other_id)
                 assert other is not None
                 assert other.status == JobStatus.in_progress
+
+
+@pytest.mark.asyncio
+@_reaper_param
+async def test_reaper_fails_abandoned_queued_row(
+    app: None,
+    db_session: AsyncSession,
+    spec: ReaperSpec,
+) -> None:
+    """A ``queued`` row arq has lost is reaped past the threshold.
+
+    The PRD #538 wedge shape: the row reached arq (it has a
+    ``backend_job_id``) and arq then lost the job, so neither the
+    silent sweep (``in_progress`` only) nor the orphan sweep
+    (``backend_job_id IS NULL`` only) can see it while the active-job
+    partial unique index keeps counting it as live work.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab1")
+        abandoned_id = await _seed_abandoned_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-lost-forever",
+            created_minutes_ago=spec.well_past_minutes,
+            project_id=707,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await spec.reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            qj = await qj_store.get(abandoned_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "AbandonedQueueJob"
+            assert qj.date_completed is not None
+
+
+@pytest.mark.asyncio
+@_reaper_param
+async def test_reaper_spares_queued_row_arq_still_knows(
+    app: None,
+    db_session: AsyncSession,
+    spec: ReaperSpec,
+) -> None:
+    """Healthy-job race: a live arq job survives ticks at any age.
+
+    Pure age-based reaping would cancel a job merely backed up behind
+    a saturated worker pool. Verifying against the backend first is
+    what makes the abandoned sweep safe, so a row whose
+    ``backend_job_id`` arq still knows must survive even when it is
+    orders of magnitude older than the threshold.
+    """
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    live_metadata = await ctx["arq_queue"].enqueue(spec.kind.value)
+
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab2")
+        healthy_id = await _seed_abandoned_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id=live_metadata.id,
+            created_minutes_ago=spec.well_past_minutes * 100,
+            project_id=708,
+        )
+
+    try:
+        await spec.reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            qj = await qj_store.get(healthy_id)
+            assert qj is not None
+            assert qj.status == JobStatus.queued
+            assert qj.errors is None
+
+
+@pytest.mark.asyncio
+@_reaper_param
+async def test_reaper_backend_unreachable_skips_only_abandoned_sweep(
+    app: None,
+    db_session: AsyncSession,
+    spec: ReaperSpec,
+) -> None:
+    """An unreachable backend costs the tick only its abandoned sweep.
+
+    With Redis down the reaper cannot tell a lost job from a live one,
+    so it logs a warning and leaves every abandoned candidate alone —
+    but the silent and orphan sweeps need no backend, so they must
+    still reap that tick (PRD #538 §Scope, backend-unreachable
+    bullet).
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab3")
+        silent_id = await _seed_silent_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-stuck-unreachable",
+            started_minutes_ago=spec.well_past_minutes,
+            project_id=709,
+        )
+        orphan_id = await _seed_orphan_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            created_minutes_ago=10,
+            project_id=710,
+        )
+        abandoned_id = await _seed_abandoned_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-unverifiable",
+            created_minutes_ago=spec.well_past_minutes,
+            project_id=711,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+
+    async def _explode(*args: Any, **kwargs: Any) -> None:
+        raise ConnectionError("redis is unreachable")
+
+    ctx["arq_queue"].get_job_metadata = _explode
+
+    try:
+        with capture_logs() as captured:
+            result = await spec.reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    backend_warnings = [
+        entry
+        for entry in captured
+        if entry.get("log_level") == "warning"
+        and entry.get("event")
+        == "Queue backend unreachable; skipping abandoned sweep"
+    ]
+    assert len(backend_warnings) == 1
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+
+            silent = await qj_store.get(silent_id)
+            assert silent is not None
+            assert silent.status == JobStatus.failed
+            assert silent.errors is not None
+            assert silent.errors["type"] == "SilentWorker"
+
+            orphan = await qj_store.get(orphan_id)
+            assert orphan is not None
+            assert orphan.status == JobStatus.failed
+            assert orphan.errors is not None
+            assert orphan.errors["type"] == "OrphanedQueueJob"
+
+            abandoned = await qj_store.get(abandoned_id)
+            assert abandoned is not None
+            assert abandoned.status == JobStatus.queued
+            assert abandoned.errors is None
+
+
+@pytest.mark.asyncio
+@_reaper_param
+async def test_reaper_backend_stall_keeps_silent_and_orphan_reaps(
+    app: None,
+    db_session: AsyncSession,
+    spec: ReaperSpec,
+) -> None:
+    """A stalled backend costs the tick only its abandoned sweep.
+
+    The failure mode task #548 fixes: a hung Redis — exactly the
+    post-outage scenario the abandoned sweep exists for — used to push
+    the tick past arq's job timeout while the silent and orphan sweeps'
+    updates sat uncommitted in the same transaction. The resulting
+    ``CancelledError`` is a ``BaseException``, so the sweep's
+    ``except Exception`` soft-abort never saw it: the transaction
+    unwound and every reap that tick was lost, tick after tick.
+
+    Modelled deterministically by cancelling the reaper only once the
+    backend call is actually in flight. The silent and orphan reaps must
+    already be committed by then.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab5")
+        silent_id = await _seed_silent_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-stuck-stall",
+            started_minutes_ago=spec.well_past_minutes,
+            project_id=715,
+        )
+        orphan_id = await _seed_orphan_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            created_minutes_ago=10,
+            project_id=716,
+        )
+        abandoned_id = await _seed_abandoned_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-stalled",
+            created_minutes_ago=spec.well_past_minutes,
+            project_id=717,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    reached_backend = asyncio.Event()
+
+    async def _hang(*args: Any, **kwargs: Any) -> None:
+        reached_backend.set()
+        await asyncio.Event().wait()
+
+    ctx["arq_queue"].get_job_metadata = _hang
+
+    async def _tick() -> str:
+        return await spec.reaper(ctx)
+
+    try:
+        task = asyncio.create_task(_tick())
+        await asyncio.wait_for(reached_backend.wait(), timeout=30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+
+            silent = await qj_store.get(silent_id)
+            assert silent is not None
+            assert silent.status == JobStatus.failed
+            assert silent.errors is not None
+            assert silent.errors["type"] == "SilentWorker"
+
+            orphan = await qj_store.get(orphan_id)
+            assert orphan is not None
+            assert orphan.status == JobStatus.failed
+            assert orphan.errors is not None
+            assert orphan.errors["type"] == "OrphanedQueueJob"
+
+            abandoned = await qj_store.get(abandoned_id)
+            assert abandoned is not None
+            assert abandoned.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_reaper_param
+async def test_reaper_warning_names_sweep_and_backend_job_id(
+    app: None,
+    db_session: AsyncSession,
+    spec: ReaperSpec,
+) -> None:
+    """Reaped-row log context carries the sweep name and arq job ID.
+
+    PRD #538 §Summary ("Observability — logs only"): with three loss
+    modes now sharing one warning line, an operator needs to see which
+    sweep claimed each row and the ``backend_job_id`` that went
+    missing, since that field is deliberately not on the jobs API.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab4")
+        silent_id = await _seed_silent_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-silent-ctx",
+            started_minutes_ago=spec.well_past_minutes,
+            project_id=712,
+        )
+        orphan_id = await _seed_orphan_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            created_minutes_ago=10,
+            project_id=713,
+        )
+        abandoned_id = await _seed_abandoned_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-abandoned-ctx",
+            created_minutes_ago=spec.well_past_minutes,
+            project_id=714,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            await spec.reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    warnings = [
+        entry
+        for entry in captured
+        if entry.get("log_level") == "warning"
+        and entry.get("event") == f"Reaped stuck {spec.kind.value} queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["reaped_count"] == 3
+    assert warnings[0]["silent_count"] == 1
+    assert warnings[0]["orphan_count"] == 1
+    assert warnings[0]["abandoned_count"] == 1
+
+    public_ids: dict[str, str] = {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            for label, job_id in (
+                ("silent", silent_id),
+                ("orphan", orphan_id),
+                ("abandoned", abandoned_id),
+            ):
+                qj = await qj_store.get(job_id)
+                assert qj is not None
+                public_ids[label] = serialize_base32_id(qj.public_id)
+
+    by_public_id = {
+        entry["public_id"]: entry for entry in warnings[0]["reaped_jobs"]
+    }
+    assert by_public_id[public_ids["silent"]] == {
+        "public_id": public_ids["silent"],
+        "sweep": "silent",
+        "backend_job_id": "arq-silent-ctx",
+    }
+    assert by_public_id[public_ids["orphan"]] == {
+        "public_id": public_ids["orphan"],
+        "sweep": "orphan",
+        "backend_job_id": None,
+    }
+    assert by_public_id[public_ids["abandoned"]] == {
+        "public_id": public_ids["abandoned"],
+        "sweep": "abandoned",
+        "backend_job_id": "arq-abandoned-ctx",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_reaper_unwedges_the_project(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The production wedge, end to end, for ``dashboard_build``.
+
+    Reproduces the roundtable-dev incident PRD #538 was filed for: one
+    abandoned row holds ``idx_queue_jobs_dashboard_build_active_uq``,
+    so ``has_active_dashboard_build`` keeps reporting an in-flight
+    build and every publish cascade skips the enqueue, freezing the
+    project's version dashboard. One reaper tick must both fail the
+    row and let the next enqueue through.
+    """
+    project_id = 8080
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="dbr-wedge")
+        wedged_id = await _seed_abandoned_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            backend_job_id="arq-documenteer-lost",
+            created_minutes_ago=60,
+            project_id=project_id,
+        )
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            assert await qj_store.has_active_dashboard_build(
+                org_id=org_id, project_id=project_id
+            )
+            assert (
+                await qj_store.create_unless_active(
+                    kind=JobKind.dashboard_build,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+                is None
+            )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        await dashboard_build_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            wedged = await qj_store.get(wedged_id)
+            assert wedged is not None
+            assert wedged.status == JobStatus.failed
+            assert wedged.errors is not None
+            assert wedged.errors["type"] == "AbandonedQueueJob"
+
+            assert not await qj_store.has_active_dashboard_build(
+                org_id=org_id, project_id=project_id
+            )
+            fresh = await qj_store.create_unless_active(
+                kind=JobKind.dashboard_build,
+                org_id=org_id,
+                project_id=project_id,
+            )
+            await session.commit()
+
+    assert fresh is not None
+    assert fresh.id != wedged_id
+    assert fresh.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_reaped_jobs_ids_grep_against_the_skip_warning(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The postmortem payload's ids match what a late delivery logs.
+
+    ``reaped_jobs`` exists so an operator can cross-reference a job that
+    quietly did nothing against the sweep that claimed it. That only
+    works if both sides spell the id the same way: the pickup guard logs
+    ``queue_job_id`` as a base32 string, so the reaper's payload must
+    too. Logging the raw ``int`` behind
+    :class:`~docverse_server.domain.base32id.Base32Id` — whose
+    serializer only fires in Pydantic JSON dumps, not in structlog
+    context — makes the grep come back empty (task #553).
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="dbr-grep")
+        reaped_id = await _seed_abandoned_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            backend_job_id="arq-grep-lost",
+            created_minutes_ago=60,
+            project_id=9090,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as reaper_logs:
+            await dashboard_build_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    warnings = [
+        entry
+        for entry in reaper_logs
+        if entry.get("event") == "Reaped stuck dashboard_build queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert len(warnings[0]["reaped_jobs"]) == 1
+    reaped_public_id = warnings[0]["reaped_jobs"][0]["public_id"]
+
+    # The late delivery arq never cancelled: the same row, handed to a
+    # worker after the sweep failed it.
+    row_public_id: int | None = None
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            with capture_logs() as pickup_logs:
+                assert await qj_store.start_if_queued(reaped_id) is None
+            row = await qj_store.get(reaped_id)
+            assert row is not None
+            row_public_id = row.public_id
+
+    skips = [
+        entry
+        for entry in pickup_logs
+        if entry.get("event") == "Skipping late-delivered queue job"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["queue_job_id"] == reaped_public_id
+    # Both sides carry the id an operator actually sees in the API, not
+    # the internal integer.
+    assert validate_base32_id(reaped_public_id) == row_public_id

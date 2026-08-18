@@ -14,6 +14,7 @@ import tarfile
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum, auto
 from typing import Any
 
 import sentry_sdk
@@ -63,6 +64,46 @@ class _BuildProcessedOutcome:
     stale_skipped: bool
 
 
+class _StaleGuardOutcome(Enum):
+    """How the stale-build guard resolved one ``build_processing`` job."""
+
+    not_stale = auto()
+    """This build is the newest for its ``(project, git_ref)``: run it."""
+
+    stale_skipped = auto()
+    """Superseded by a newer build, and the skip was recorded.
+
+    Covers both rows the bookkeeping treats alike: a queue job started
+    and marked ``completed`` with ``stale_skipped``, and a delivery with
+    no ``queue_jobs`` row at all. The build really is superseded either
+    way, so the run reports a stale-skipped success.
+    """
+
+    late_delivery = auto()
+    """The pickup guard refused the row, so nothing was recorded.
+
+    A reaper had already failed the row, or arq re-delivered a job
+    another worker owns. Either way this delivery did no work and must
+    not claim any (see :meth:`QueueJobStore.start_if_queued`).
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _QueueJobPickup:
+    """Outcome of resolving this arq job's ``queue_jobs`` row at pickup."""
+
+    queue_job_id: int | None
+    """Internal id of the row this worker started, if it started one."""
+
+    skipped: bool
+    """True when the row existed but the late-delivery guard refused it.
+
+    Covers both non-``queued`` cases the guard reports — terminal because
+    a reaper failed the row, or ``in_progress`` because arq re-delivered
+    the job — since the body must be skipped either way.
+    """
+
+
 async def build_processing(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -74,7 +115,9 @@ async def build_processing(
         arq worker context (``factory_builder``, ``http_client``,
         ``arq_queue``).
     payload
-        Job payload with ``org_id``, ``project_id``, ``build_id``.
+        Job payload with ``org_id``, ``project_id``, ``build_id`` and —
+        for anything enqueued since task #550 — ``queue_job_id`` /
+        ``queue_job_public_id``.
 
     Returns
     -------
@@ -116,25 +159,18 @@ async def build_processing(
             git_ref=build.git_ref,
         )
         async with lock_service.acquire(lock_key):
-            if await _guard_stale_build(
+            outcome: _BuildProcessedOutcome | None
+            stale_guard = await _guard_stale_build(
                 session=session,
                 ctx=ctx,
+                payload=payload,
                 build_store=build_store,
                 queue_job_store=queue_job_store,
                 build=build,
                 build_id=build_id,
                 logger=logger,
-            ):
-                result = "completed"
-                outcome = _BuildProcessedOutcome(
-                    success=True,
-                    object_count=None,
-                    total_size_bytes=None,
-                    editions_updated=0,
-                    editions_skipped=0,
-                    stale_skipped=True,
-                )
-            else:
+            )
+            if stale_guard is _StaleGuardOutcome.not_stale:
                 result, outcome = await _process_build_locked(
                     session=session,
                     factory=factory,
@@ -143,6 +179,7 @@ async def build_processing(
                     org_store=org_store,
                     queue_job_store=queue_job_store,
                     ctx=ctx,
+                    payload=payload,
                     build=build,
                     org_id=org_id,
                     project_slug=project_slug,
@@ -150,6 +187,13 @@ async def build_processing(
                     build_public_id=build_public_id,
                     logger=logger,
                 )
+            else:
+                result, outcome = _stale_guard_result(stale_guard)
+
+        # A skipped queue job produces no outcome: the build body never
+        # ran, so there is nothing to report as processed.
+        if outcome is None:
+            return result
 
         # Publish after releasing the lock and after the terminal DB
         # transition has committed. Best-effort: production runs
@@ -165,6 +209,29 @@ async def build_processing(
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+def _stale_guard_result(
+    guard: _StaleGuardOutcome,
+) -> tuple[str, _BuildProcessedOutcome | None]:
+    """Map a terminal stale-guard verdict to (arq result, metrics).
+
+    A recorded stale skip is a success the operator should see in
+    ``build_processed``. A late delivery is not: the row is terminal or
+    owned by another worker, so it reports ``"skipped"`` and no metric —
+    the same "a skipped queue job produces no outcome" rule
+    :func:`_process_build_locked` follows for the non-stale path.
+    """
+    if guard is _StaleGuardOutcome.late_delivery:
+        return "skipped", None
+    return "completed", _BuildProcessedOutcome(
+        success=True,
+        object_count=None,
+        total_size_bytes=None,
+        editions_updated=0,
+        editions_skipped=0,
+        stale_skipped=True,
+    )
 
 
 async def _publish_build_processed(
@@ -198,20 +265,22 @@ async def _guard_stale_build(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     build: Build,
     build_id: int,
     logger: structlog.stdlib.BoundLogger,
-) -> bool:
+) -> _StaleGuardOutcome:
     """Skip and mark stale if a newer build exists for ``(project, git_ref)``.
 
     Runs *inside* the BUILD_PROCESSING lock so two concurrent supersession
     checks cannot race: only the newest build for ``(project, git_ref)``
     does any work; any older build observes a higher latest id and skips.
 
-    Returns ``True`` when this build was marked stale-skipped and the
-    caller should return ``"completed"`` immediately.
+    Returns the verdict the caller turns into an arq result and metrics
+    (see :func:`_stale_guard_result`); ``not_stale`` means this build
+    should be processed.
     """
     async with session.begin():
         latest_build_id = await build_store.get_latest_build_id_for_ref(
@@ -223,16 +292,16 @@ async def _guard_stale_build(
     # checks, so the newer build's own check will discard this
     # build's "stale" verdict and proceed correctly.
     if latest_build_id is not None and latest_build_id != build_id:
-        await _mark_stale_skipped(
+        return await _mark_stale_skipped(
             session=session,
             ctx=ctx,
+            payload=payload,
             queue_job_store=queue_job_store,
             build_id=build_id,
             latest_build_id=latest_build_id,
             logger=logger,
         )
-        return True
-    return False
+    return _StaleGuardOutcome.not_stale
 
 
 async def _process_build_locked(
@@ -243,6 +312,7 @@ async def _process_build_locked(
     org_store: OrganizationStore,
     queue_job_store: QueueJobStore,
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     build: Build,
     org_id: int,
     org_slug: str,
@@ -250,17 +320,26 @@ async def _process_build_locked(
     build_id: int,
     build_public_id: str,
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[str, _BuildProcessedOutcome]:
+) -> tuple[str, _BuildProcessedOutcome | None]:
     """Unpack, upload, and finalize a non-stale build under the lock.
 
     Assumes the caller holds the BUILD_PROCESSING advisory lock and has
     already confirmed this build is the latest for ``(project, git_ref)``.
 
     Returns the arq status message paired with the terminal metrics for
-    the run so the caller can emit one ``build_processed`` event.
+    the run so the caller can emit one ``build_processed`` event. The
+    metrics are ``None`` when the late-delivery guard (PRD #538) refused
+    to pick the queue job up: nothing ran, so there is no build outcome
+    to report.
     """
-    # Phase 1: Load metadata and mark QueueJob as in_progress
+    # Phase 1: Mark QueueJob as in_progress and load metadata. The
+    # pickup guard runs first so a skipped row costs nothing beyond the
+    # lookup — no org read, no object store resolved.
     async with session.begin():
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
+        if pickup.skipped:
+            return "skipped", None
+
         org = await org_store.get_by_id(org_id)
         if org is None:
             msg = f"Organization {org_id} not found"
@@ -275,7 +354,7 @@ async def _process_build_locked(
             org_id=org_id, service_label=service_label
         )
 
-        queue_job_id = await _start_queue_job(ctx, queue_job_store)
+        queue_job_id = pickup.queue_job_id
         if queue_job_id is not None:
             await queue_job_store.update_phase(
                 queue_job_id,
@@ -348,26 +427,37 @@ async def _mark_stale_skipped(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     queue_job_store: QueueJobStore,
     build_id: int,
     latest_build_id: int,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> _StaleGuardOutcome:
     """Mark a superseded build's QueueJob complete with a stale-skip flag.
 
     Operators identify these runs by ``progress["stale_skipped"]`` plus
     the dedicated log line; the QueueJob status stays ``completed``
     because nothing was wrong with the build itself — a newer build
     for the same ``(project, git_ref)`` simply took over.
+
+    The pickup guard runs before any of that, and a row it refuses
+    (task #551) short-circuits to ``late_delivery`` with nothing written
+    and nothing logged as skipped: the row is terminal or in another
+    worker's hands, so this delivery has no stale skip to record. A
+    delivery with no ``queue_jobs`` row at all still counts as a
+    recorded skip — there is simply no bookkeeping to do.
     """
-    logger.info(
-        "Stale build skipped",
-        build_id=build_id,
-        latest_build_id=latest_build_id,
-    )
     async with session.begin():
-        queue_job_id = await _start_queue_job(ctx, queue_job_store)
-        if queue_job_id is not None:
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
+        if pickup.skipped:
+            return _StaleGuardOutcome.late_delivery
+        logger.info(
+            "Stale build skipped",
+            build_id=build_id,
+            latest_build_id=latest_build_id,
+        )
+        if pickup.queue_job_id is not None:
+            queue_job_id = pickup.queue_job_id
             await queue_job_store.update_phase(
                 queue_job_id,
                 "complete",
@@ -381,25 +471,57 @@ async def _mark_stale_skipped(
                 },
             )
             await queue_job_store.complete(queue_job_id)
+    return _StaleGuardOutcome.stale_skipped
 
 
-async def _start_queue_job(
+async def _resolve_queue_job_id(
     ctx: dict[str, Any],
+    payload: dict[str, Any],
     queue_job_store: QueueJobStore,
 ) -> int | None:
-    """Look up and start the QueueJob for this arq job.
+    """Resolve this delivery's ``queue_jobs`` row id, or ``None``.
 
-    Returns the queue job's internal ID, or ``None`` if no matching
-    QueueJob exists.
+    The payload's ``queue_job_id`` is authoritative and is what every
+    other job kind uses. It matters here beyond consistency: the enqueue
+    now happens *after* the row commits (task #550), so at delivery time
+    the row's ``backend_job_id`` may not be stamped yet and the
+    ``backend_job_id`` lookup below would miss a row that plainly
+    exists.
+
+    That lookup survives only as the compatibility path for jobs enqueued
+    by the previous release, whose payloads predate the key and which can
+    still be sitting in the queue across a rolling deploy.
     """
+    payload_job_id = payload.get("queue_job_id")
+    if payload_job_id is not None:
+        return int(payload_job_id)
     arq_job_id: str | None = ctx.get("job_id")
     if arq_job_id is None:
         return None
     queue_job = await queue_job_store.get_by_backend_job_id(arq_job_id)
-    if queue_job is None:
-        return None
-    await queue_job_store.start(queue_job.id)
-    return queue_job.id
+    return None if queue_job is None else queue_job.id
+
+
+async def _start_queue_job(
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    queue_job_store: QueueJobStore,
+) -> _QueueJobPickup:
+    """Look up and start the QueueJob for this arq job.
+
+    Distinguishes the two "no queue job to drive" cases the callers
+    treat differently: no row at all (``build_processing`` can still be
+    enqueued without one, so the build is processed anyway) versus a row
+    the late-delivery guard from PRD #538 refused to pick up — terminal
+    because a reaper failed it, or in progress because arq re-delivered
+    the job — where the job body must be skipped entirely.
+    """
+    queue_job_id = await _resolve_queue_job_id(ctx, payload, queue_job_store)
+    if queue_job_id is None:
+        return _QueueJobPickup(queue_job_id=None, skipped=False)
+    if await queue_job_store.start_if_queued(queue_job_id) is None:
+        return _QueueJobPickup(queue_job_id=None, skipped=True)
+    return _QueueJobPickup(queue_job_id=queue_job_id, skipped=False)
 
 
 async def _resolve_api_base_url(

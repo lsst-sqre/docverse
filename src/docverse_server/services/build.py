@@ -11,11 +11,11 @@ from docverse_server.domain.build import Build
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import NotFoundError
+from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import BuildDateCreatedCursor
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
 
@@ -29,14 +29,14 @@ class BuildService:
         store: BuildStore,
         org_store: OrganizationStore,
         project_store: ProjectStore,
-        queue_backend: QueueBackend,
+        dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._store = store
         self._org_store = org_store
         self._project_store = project_store
-        self._queue_backend = queue_backend
+        self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
         self._logger = logger
 
@@ -103,7 +103,14 @@ class BuildService:
         project_slug: str,
         build_id: str,
     ) -> tuple[Build, QueueJob]:
-        """Signal upload complete, transition to processing, enqueue job.
+        """Signal upload complete, transition to processing, queue the job.
+
+        The arq enqueue is *deferred*, not skipped: this runs inside the
+        handler's transaction, so anything handed to arq here could be
+        delivered to a worker that cannot yet see the ``queue_jobs`` row
+        this method inserts. The enqueue is registered on the factory's
+        :class:`~docverse_server.services.queue_dispatch.QueueDispatcher`
+        instead, and the handler issues it after committing.
 
         Parameters
         ----------
@@ -113,7 +120,9 @@ class BuildService:
         Returns
         -------
         tuple
-            The updated Build and the created QueueJob.
+            The updated Build and the created QueueJob. The job's
+            ``backend_job_id`` is still ``None`` — the dispatcher stamps
+            it once arq has accepted the job.
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
@@ -131,9 +140,16 @@ class BuildService:
             project=project_slug,
         )
 
-        backend_job_id = await self._queue_backend.enqueue(
-            "build_processing",
-            {
+        queue_job = await self._queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=project.org_id,
+            project_id=project.id,
+            build_id=build.id,
+        )
+        self._dispatcher.defer(
+            queue_job=queue_job,
+            job_type="build_processing",
+            payload={
                 "org_id": project.org_id,
                 "org_slug": org_slug,
                 "project_id": project.id,
@@ -141,13 +157,6 @@ class BuildService:
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
             },
-        )
-        queue_job = await self._queue_job_store.create(
-            kind=JobKind.build_processing,
-            org_id=project.org_id,
-            backend_job_id=backend_job_id,
-            project_id=project.id,
-            build_id=build.id,
         )
         return build, queue_job
 

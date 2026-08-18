@@ -55,6 +55,7 @@ from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .services.project_github_binding import ProjectGitHubBindingResolver
+from .services.queue_dispatch import QueueDispatcher
 from .services.ref_deleted_processor import RefDeletedWebhookProcessor
 from .storage.build_store import BuildStore
 from .storage.cdncachepurger import CdnCachePurger, create_cdn_cache_purger
@@ -92,6 +93,7 @@ from .storage.queue_backend import (
 )
 from .storage.queue_job_store import QueueJobStore
 from .storage.user_info_store import UserInfoStore
+from .worker.queues import POOL_QUEUE_NAMES
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,10 @@ class Factory:
         # threads ``Config.keeper_sync_copy_concurrency`` through
         # ``WorkerFactoryBuilder``.
         self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
+        # Created lazily and then shared: a service defers an enqueue on
+        # it and the caller that owns the commit dispatches from the same
+        # instance, so the pending list has to survive between the two.
+        self._queue_dispatcher: QueueDispatcher | None = None
 
     def set_logger(self, logger: structlog.stdlib.BoundLogger) -> None:
         """Set the logger for the factory."""
@@ -180,6 +186,25 @@ class Factory:
         """Fan-out bound handed to every copier this factory builds."""
         return self._keeper_sync_copy_concurrency
 
+    @property
+    def queue_dispatcher(self) -> QueueDispatcher:
+        """Deferred queue dispatcher shared across this factory.
+
+        One instance per factory — i.e. per request or per worker job —
+        so a service that defers an enqueue and the caller that
+        dispatches it after committing share the same pending list. See
+        :mod:`docverse_server.services.queue_dispatch` for why the
+        enqueue has to wait for the commit.
+        """
+        if self._queue_dispatcher is None:
+            self._queue_dispatcher = QueueDispatcher(
+                session=self._session,
+                queue_backend=self.create_queue_backend(),
+                queue_job_store=self.create_queue_job_store(),
+                logger=self._logger,
+            )
+        return self._queue_dispatcher
+
     def create_queue_backend(self) -> QueueBackend:
         """Create a :class:`QueueBackend` for enqueuing jobs."""
         if self._arq_queue is None:
@@ -187,6 +212,7 @@ class Factory:
         return ArqQueueBackend(
             arq_queue=self._arq_queue,
             default_queue_name=self._default_queue_name,
+            additional_queue_names=POOL_QUEUE_NAMES,
         )
 
     def create_org_store(self) -> OrganizationStore:
@@ -271,7 +297,7 @@ class Factory:
         return KeeperSyncRunService(
             org_store=self.create_org_store(),
             run_store=self.create_keeper_sync_run_store(),
-            queue_backend=self.create_queue_backend(),
+            dispatcher=self.queue_dispatcher,
             queue_job_store=self.create_queue_job_store(),
             logger=self._logger,
         )
@@ -325,7 +351,6 @@ class Factory:
         store = self.create_build_store()
         org_store = self.create_org_store()
         project_store = self.create_project_store()
-        queue_backend = self.create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
         )
@@ -333,7 +358,7 @@ class Factory:
             store=store,
             org_store=org_store,
             project_store=project_store,
-            queue_backend=queue_backend,
+            dispatcher=self.queue_dispatcher,
             queue_job_store=queue_job_store,
             logger=self._logger,
         )
@@ -376,7 +401,6 @@ class Factory:
             session=self._session, logger=self._logger
         )
         build_store = self.create_build_store()
-        queue_backend = self.create_queue_backend()
         queue_job_store = QueueJobStore(
             session=self._session, logger=self._logger
         )
@@ -387,7 +411,7 @@ class Factory:
             logger=self._logger,
             history_store=history_store,
             build_store=build_store,
-            queue_backend=queue_backend,
+            dispatcher=self.queue_dispatcher,
             queue_job_store=queue_job_store,
         )
 
@@ -605,7 +629,7 @@ class Factory:
         return DashboardBuildEnqueuer(
             org_store=self.create_org_store(),
             project_store=self.create_project_store(),
-            queue_backend=self.create_queue_backend(),
+            dispatcher=self.queue_dispatcher,
             queue_job_store=self.create_queue_job_store(),
             logger=self._logger,
         )
@@ -628,7 +652,7 @@ class Factory:
         """Create a :class:`DashboardSyncEnqueuer`."""
         return DashboardSyncEnqueuer(
             binding_store=self.create_dashboard_github_template_binding_store(),
-            queue_backend=self.create_queue_backend(),
+            dispatcher=self.queue_dispatcher,
             queue_job_store=self.create_queue_job_store(),
             logger=self._logger,
         )

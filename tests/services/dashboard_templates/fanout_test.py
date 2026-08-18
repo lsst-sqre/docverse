@@ -23,8 +23,8 @@ from docverse_server.storage.dashboard_templates.github import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from tests.support.queue_dispatch import make_dispatcher
 
 _config = Configuration()
 
@@ -97,14 +97,11 @@ def _make_fanout(
     binding_store = DashboardGitHubTemplateBindingStore(
         session=session, logger=logger
     )
-    queue_backend = ArqQueueBackend(
-        arq_queue=arq_queue, default_queue_name=_config.arq_queue_name
-    )
     queue_job_store = QueueJobStore(session=session, logger=logger)
     enqueuer = DashboardBuildEnqueuer(
         org_store=org_store,
         project_store=proj_store,
-        queue_backend=queue_backend,
+        dispatcher=make_dispatcher(session, arq_queue=arq_queue),
         queue_job_store=queue_job_store,
         logger=logger,
     )

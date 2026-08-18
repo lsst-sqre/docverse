@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,17 +27,25 @@ from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
-from docverse_server.exceptions import InvalidJobStateError
+from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_backend import (
+    EnqueuedJob,
+    NullQueueBackend,
+    QueueBackend,
+)
 from docverse_server.storage.queue_job_store import (
     _ACTIVE_JOB_UNIQUE_INDEXES,
+    LATE_DELIVERY_IN_PROGRESS_MESSAGE,
     QueueJobStore,
 )
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 
 @pytest.fixture
@@ -114,30 +124,163 @@ async def test_publish_edition_job_with_edition_id(
         assert row.edition_id == edition.id
 
 
+def test_store_has_no_raising_start_method() -> None:
+    """``start`` is gone so no pickup path can get raising semantics.
+
+    Task #547: the raising ``start`` had zero production callers once
+    every pickup site moved to :meth:`QueueJobStore.start_if_queued`, and
+    leaving a natural-named sibling around invited the next pickup point
+    to reach for it and reintroduce ``InvalidJobStateError`` at pickup.
+    """
+    assert not hasattr(QueueJobStore, "start")
+
+
 @pytest.mark.asyncio
-async def test_start_job(
+async def test_start_if_queued_starts_queued_row(
     db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
+    """A ``queued`` row is picked up: in_progress with a start timestamp."""
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        started = await store.start(job.id)
+        started = await store.start_if_queued(job.id)
         await db_session.commit()
+    assert started is not None
+    assert started.id == job.id
     assert started.status == JobStatus.in_progress
     assert started.date_started is not None
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.failed,
+        JobStatus.cancelled,
+        JobStatus.completed,
+        JobStatus.completed_with_errors,
+        JobStatus.in_progress,
+    ],
+)
 @pytest.mark.asyncio
-async def test_start_job_wrong_status(
+async def test_start_if_queued_returns_none_for_non_queued_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    status: JobStatus,
+) -> None:
+    """A row a reaper already moved off ``queued`` yields ``None``.
+
+    This is the late-delivery guard: arq handing the worker a job whose
+    row is no longer ``queued`` must not raise ``InvalidJobStateError``.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        row.status = status.value
+        await db_session.flush()
+
+        result = await store.start_if_queued(job.id)
+        await db_session.commit()
+
+    assert result is None
+    async with db_session.begin():
+        unchanged = await store.get(job.id)
+        assert unchanged is not None
+        assert unchanged.status == status
+        assert unchanged.date_started is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.failed,
+        JobStatus.cancelled,
+        JobStatus.completed,
+        JobStatus.completed_with_errors,
+    ],
+)
+@pytest.mark.asyncio
+async def test_start_if_queued_terminal_row_captures_no_sentry_event(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+    status: JobStatus,
+) -> None:
+    """A terminal row is the race the reaper triad is meant to absorb.
+
+    Task #547 splits the two non-``queued`` cases apart: a row a reaper
+    (or a cancel, or a prior successful run) already moved to a terminal
+    status is expected fallout of the reap/deliver race, so it stays a
+    warning log with **no** Sentry event.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        row = await db_session.get(SqlQueueJob, job.id)
+        assert row is not None
+        row.status = status.value
+        await db_session.flush()
+
+        with sentry_init_fixture() as init:
+            init(environment="test")
+            captured = capture_events_fixture(monkeypatch)()
+            result = await store.start_if_queued(job.id)
+        await db_session.commit()
+
+    assert result is None
+    assert captured.errors == []
+
+
+@pytest.mark.asyncio
+async def test_start_if_queued_in_progress_row_captures_warning_event(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``in_progress`` row means arq re-delivered a job already running.
+
+    Task #547: on the default pool (``retry_jobs=True``, ``max_tries``
+    unset) arq re-delivers after worker death or a routine SIGTERM pod
+    rotation. Absorbing that silently would hide a crash-looping kind
+    until the reaper noticed hours later, so the guard captures a
+    warning-level Sentry event naming the job's public id, kind, and
+    current status.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.dashboard_build, org_id=1)
+        picked_up = await store.start_if_queued(job.id)
+        assert picked_up is not None
+
+        with sentry_init_fixture() as init:
+            init(environment="test")
+            captured = capture_events_fixture(monkeypatch)()
+            result = await store.start_if_queued(job.id)
+        await db_session.commit()
+
+    assert result is None
+    assert len(captured.errors) == 1
+    event = captured.errors[0]
+    assert event["level"] == "warning"
+    assert event["message"] == LATE_DELIVERY_IN_PROGRESS_MESSAGE
+    assert event["tags"]["job_function"] == JobKind.dashboard_build.value
+    assert event["tags"]["job_current_state"] == JobStatus.in_progress.value
+    # The public id is high-cardinality, so it rides in the context
+    # rather than a tag (see the docverse-exceptions recipe).
+    assert "job_public_id" not in event["tags"]
+    context = event["contexts"]["queue_job_late_delivery"]
+    assert context["job_public_id"] == serialize_base32_id(job.public_id)
+    assert context["job_function"] == JobKind.dashboard_build.value
+    assert context["current_state"] == JobStatus.in_progress.value
+
+
+@pytest.mark.asyncio
+async def test_start_if_queued_raises_for_missing_row(
     db_session: AsyncSession,
     store: QueueJobStore,
 ) -> None:
+    """A missing row is a programming error, not a race — it still raises."""
     async with db_session.begin():
-        job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
-        with pytest.raises(InvalidJobStateError):
-            await store.start(job.id)
-        await db_session.commit()
+        with pytest.raises(JobNotFoundError):
+            await store.start_if_queued(-1)
 
 
 @pytest.mark.asyncio
@@ -147,7 +290,7 @@ async def test_update_phase(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         updated = await store.update_phase(
             job.id, "uploading", progress={"step": 1}
         )
@@ -163,7 +306,7 @@ async def test_update_progress_merge(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         await store.update_progress(job.id, {"a": 1, "b": 2})
         merged = await store.update_progress(job.id, {"b": 99, "c": 3})
         await db_session.commit()
@@ -192,7 +335,7 @@ async def test_complete_job(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         completed = await store.complete(job.id)
         await db_session.commit()
     assert completed.status == JobStatus.completed
@@ -206,7 +349,7 @@ async def test_complete_with_errors(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         completed = await store.complete(job.id, has_errors=True)
         await db_session.commit()
     assert completed.status == JobStatus.completed_with_errors
@@ -220,7 +363,7 @@ async def test_fail_job(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         failed = await store.fail(
             job.id, errors={"message": "something went wrong"}
         )
@@ -250,7 +393,7 @@ async def test_cancel_in_progress_job(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         cancelled = await store.cancel(job.id)
         await db_session.commit()
     assert cancelled.status == JobStatus.cancelled
@@ -264,7 +407,7 @@ async def test_cancel_completed_job_raises(
 ) -> None:
     async with db_session.begin():
         job = await store.create(kind=JobKind.build_processing, org_id=1)
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         await store.complete(job.id)
         with pytest.raises(InvalidJobStateError):
             await store.cancel(job.id)
@@ -280,7 +423,9 @@ async def test_set_backend_job_id(
     async with db_session.begin():
         job = await store.create(kind=JobKind.publish_edition, org_id=1)
         assert job.backend_job_id is None
-        updated = await store.set_backend_job_id(job.id, "arq-job-42")
+        updated = await store.set_backend_job_id(
+            job.id, "arq-job-42", queue_name="docverse:queue"
+        )
         await db_session.commit()
     assert updated.backend_job_id == "arq-job-42"
 
@@ -428,7 +573,7 @@ async def test_fail_orphaned_run_children_skips_started_rows(
             org_id=org_id,
             keeper_sync_run_id=run_id,
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         row = await db_session.get(SqlQueueJob, job.id)
         assert row is not None
         row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
@@ -456,7 +601,7 @@ async def test_fail_silent_run_children_fails_old_in_progress(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-job-stuck",
         )
-        await store.start(stuck.id)
+        await store.start_if_queued(stuck.id)
         # Backdate date_started past the idle threshold.
         row = await db_session.get(SqlQueueJob, stuck.id)
         assert row is not None
@@ -491,7 +636,7 @@ async def test_fail_silent_run_children_skips_recent_in_progress(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-job-recent",
         )
-        await store.start(recent.id)
+        await store.start_if_queued(recent.id)
 
         reaped = await store.fail_silent_run_children(
             idle_after=timedelta(hours=6)
@@ -515,7 +660,7 @@ async def test_fail_silent_run_children_skips_completed_rows(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-job-done",
         )
-        await store.start(done.id)
+        await store.start_if_queued(done.id)
         await store.complete(done.id)
         row = await db_session.get(SqlQueueJob, done.id)
         assert row is not None
@@ -569,7 +714,7 @@ async def test_fail_silent_run_children_skips_non_keeper_sync_rows(
             kind=JobKind.build_processing,
             org_id=1,
         )
-        await store.start(unrelated.id)
+        await store.start_if_queued(unrelated.id)
         row = await db_session.get(SqlQueueJob, unrelated.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -600,7 +745,7 @@ async def test_fail_silent_run_children_returns_distinct_run_ids(
                 keeper_sync_run_id=run_a_id,
                 backend_job_id=backend_id,
             )
-            await store.start(j.id)
+            await store.start_if_queued(j.id)
             r = await db_session.get(SqlQueueJob, j.id)
             assert r is not None
             r.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -610,7 +755,7 @@ async def test_fail_silent_run_children_returns_distinct_run_ids(
             keeper_sync_run_id=run_b_id,
             backend_job_id="arq-b1",
         )
-        await store.start(b_job.id)
+        await store.start_if_queued(b_job.id)
         r = await db_session.get(SqlQueueJob, b_job.id)
         assert r is not None
         r.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -656,7 +801,7 @@ async def test_fail_silent_tier_cron_jobs_fails_old_in_progress(
             subject_label="phalanx",
             backend_job_id="arq-tc-stuck",
         )
-        await store.start(stuck.id)
+        await store.start_if_queued(stuck.id)
         row = await db_session.get(SqlQueueJob, stuck.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -690,7 +835,7 @@ async def test_fail_silent_tier_cron_jobs_skips_recent_in_progress(
             subject_label="phalanx",
             backend_job_id="arq-tc-recent",
         )
-        await store.start(recent.id)
+        await store.start_if_queued(recent.id)
 
         reaped = await store.fail_silent_tier_cron_jobs(
             idle_after=timedelta(hours=6)
@@ -716,7 +861,7 @@ async def test_fail_silent_tier_cron_jobs_skips_run_attributed_rows(
             keeper_sync_run_id=run_id,
             backend_job_id="arq-with-run",
         )
-        await store.start(run_attrib.id)
+        await store.start_if_queued(run_attrib.id)
         row = await db_session.get(SqlQueueJob, run_attrib.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -743,7 +888,7 @@ async def test_fail_silent_tier_cron_jobs_skips_non_keeper_sync_kinds(
             org_id=org_id,
             backend_job_id="arq-build",
         )
-        await store.start(unrelated.id)
+        await store.start_if_queued(unrelated.id)
         row = await db_session.get(SqlQueueJob, unrelated.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -772,7 +917,7 @@ async def test_fail_silent_tier_cron_jobs_skips_completed_rows(
             subject_label="phalanx",
             backend_job_id="arq-tc-done",
         )
-        await store.start(done.id)
+        await store.start_if_queued(done.id)
         await store.complete(done.id)
         row = await db_session.get(SqlQueueJob, done.id)
         assert row is not None
@@ -802,7 +947,7 @@ async def test_fail_silent_tier_cron_jobs_unblocks_has_active_for_subject(
             subject_label="phalanx",
             backend_job_id="arq-tc-unblock",
         )
-        await store.start(stuck.id)
+        await store.start_if_queued(stuck.id)
         row = await db_session.get(SqlQueueJob, stuck.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -984,7 +1129,7 @@ async def test_fail_orphaned_tier_cron_jobs_skips_started_rows(
             keeper_sync_run_id=None,
             subject_label="phalanx",
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         row = await db_session.get(SqlQueueJob, job.id)
         assert row is not None
         row.date_created = datetime.now(tz=UTC) - timedelta(minutes=30)
@@ -1072,7 +1217,7 @@ async def test_has_active_for_subject_returns_true_for_in_progress_row(
             org_id=42,
             subject_label="pipelines",
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         active = await store.has_active_for_subject(
             org_id=42,
             kind=JobKind.keeper_sync_project,
@@ -1094,7 +1239,7 @@ async def test_has_active_for_subject_returns_false_for_terminal_rows(
             org_id=42,
             subject_label="pipelines",
         )
-        await store.start(completed.id)
+        await store.start_if_queued(completed.id)
         await store.complete(completed.id)
 
         failed = await store.create(
@@ -1102,7 +1247,7 @@ async def test_has_active_for_subject_returns_false_for_terminal_rows(
             org_id=42,
             subject_label="pipelines",
         )
-        await store.start(failed.id)
+        await store.start_if_queued(failed.id)
         await store.fail(failed.id)
 
         cancelled = await store.create(
@@ -1218,7 +1363,7 @@ async def test_has_active_dashboard_build_returns_true_for_in_progress_row(
             org_id=42,
             project_id=7,
         )
-        await store.start(job.id)
+        await store.start_if_queued(job.id)
         active = await store.has_active_dashboard_build(
             org_id=42, project_id=7
         )
@@ -1238,7 +1383,7 @@ async def test_has_active_dashboard_build_returns_false_for_terminal_rows(
             org_id=42,
             project_id=7,
         )
-        await store.start(completed.id)
+        await store.start_if_queued(completed.id)
         await store.complete(completed.id)
 
         failed = await store.create(
@@ -1246,7 +1391,7 @@ async def test_has_active_dashboard_build_returns_false_for_terminal_rows(
             org_id=42,
             project_id=7,
         )
-        await store.start(failed.id)
+        await store.start_if_queued(failed.id)
         await store.fail(failed.id)
 
         cancelled = await store.create(
@@ -1353,32 +1498,34 @@ async def test_fail_orphaned_run_children_scoped_to_run(
 
 
 # ---------------------------------------------------------------------
-# lifecycle_eval reaper helpers
+# lifecycle reaper helpers
 # ---------------------------------------------------------------------
 
 
-async def _seed_lifecycle_eval_row(
+async def _seed_lifecycle_family_row(
     db_session: AsyncSession,
     *,
+    kind: JobKind,
     org_id: int,
     status: JobStatus,
     backend_job_id: str | None,
     date_started: datetime | None = None,
     date_created_offset: timedelta | None = None,
 ) -> int:
-    """Insert one ``kind='lifecycle_eval'`` row with explicit timestamps.
+    """Insert one ``lifecycle_reaper``-owned row with explicit timestamps.
 
-    The store's ``create`` does not expose ``lifecycle_eval_run_id`` (the
-    dispatcher sibling task adds that), and ``status`` defaults to
-    ``queued``. The reaper-helper tests drive every field that the
-    sweep predicates consult, so direct ``SqlQueueJob`` construction is
-    cleaner than threading two-step setup through ``create`` +
-    ``start``.
+    ``kind`` selects the family — ``lifecycle_eval`` or
+    ``git_ref_audit``, the two the reaper sweeps. The store's ``create``
+    does not expose ``lifecycle_eval_run_id`` (the dispatcher sibling
+    task adds that), and ``status`` defaults to ``queued``. The
+    reaper-helper tests drive every field that the sweep predicates
+    consult, so direct ``SqlQueueJob`` construction is cleaner than
+    threading two-step setup through ``create`` + ``start``.
     """
     row = SqlQueueJob(
         public_id=validate_base32_id(generate_base32_id()),
         backend_job_id=backend_job_id,
-        kind=JobKind.lifecycle_eval.value,
+        kind=kind.value,
         status=status.value,
         org_id=org_id,
         date_started=date_started,
@@ -1399,8 +1546,9 @@ async def test_fail_silent_lifecycle_eval_jobs_reaps_old_in_progress(
     """An ``in_progress`` lifecycle_eval row past the threshold is failed."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-reap-1")
-        stuck_id = await _seed_lifecycle_eval_row(
+        stuck_id = await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.in_progress,
             backend_job_id="arq-lce-stuck",
@@ -1427,8 +1575,9 @@ async def test_fail_silent_lifecycle_eval_jobs_skips_recent(
     """An ``in_progress`` row within the idle window is left alone."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-reap-2")
-        await _seed_lifecycle_eval_row(
+        await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.in_progress,
             backend_job_id="arq-lce-fresh",
@@ -1456,7 +1605,7 @@ async def test_fail_silent_lifecycle_eval_jobs_skips_other_kinds(
             org_id=org_id,
             backend_job_id="arq-build",
         )
-        await store.start(unrelated.id)
+        await store.start_if_queued(unrelated.id)
         row = await db_session.get(SqlQueueJob, unrelated.id)
         assert row is not None
         row.date_started = datetime.now(tz=UTC) - timedelta(hours=10)
@@ -1478,8 +1627,9 @@ async def test_fail_orphaned_lifecycle_eval_jobs_reaps_old_orphan(
     """A ``queued`` lifecycle_eval row with no ``backend_job_id`` is failed."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-orphan-1")
-        orphan_id = await _seed_lifecycle_eval_row(
+        orphan_id = await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.queued,
             backend_job_id=None,
@@ -1506,8 +1656,9 @@ async def test_fail_orphaned_lifecycle_eval_jobs_skips_rows_with_backend_id(
     """A queued row that already has a backend_job_id is not an orphan."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-orphan-2")
-        await _seed_lifecycle_eval_row(
+        await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.queued,
             backend_job_id="arq-lce-enqueued",
@@ -1530,8 +1681,9 @@ async def test_fail_orphaned_lifecycle_eval_jobs_skips_started_rows(
     """An ``in_progress`` row is not an orphan; silent sweep owns it."""
     async with db_session.begin():
         org_id = await _seed_org_only(db_session, slug="lce-orphan-3")
-        await _seed_lifecycle_eval_row(
+        await _seed_lifecycle_family_row(
             db_session,
+            kind=JobKind.lifecycle_eval,
             org_id=org_id,
             status=JobStatus.in_progress,
             backend_job_id=None,
@@ -1617,16 +1769,22 @@ async def _seed_runless_row(
     org_id: int,
     status: JobStatus,
     backend_job_id: str | None,
+    backend_queue_name: str | None = None,
     date_started: datetime | None = None,
     date_created_offset: timedelta | None = None,
+    project_id: int | None = None,
+    keeper_sync_run_id: int | None = None,
 ) -> int:
     """Insert one row of ``kind`` with explicit timestamps for sweep tests."""
     row = SqlQueueJob(
         public_id=validate_base32_id(generate_base32_id()),
         backend_job_id=backend_job_id,
+        backend_queue_name=backend_queue_name,
         kind=kind.value,
         status=status.value,
         org_id=org_id,
+        project_id=project_id,
+        keeper_sync_run_id=keeper_sync_run_id,
         date_started=date_started,
     )
     db_session.add(row)
@@ -1731,7 +1889,7 @@ async def test_fail_silent_jobs_skips_other_kinds(
                 org_id=org_id,
                 backend_job_id=f"arq-other-{idx}",
             )
-            await store.start(unrelated.id)
+            await store.start_if_queued(unrelated.id)
             row = await db_session.get(SqlQueueJob, unrelated.id)
             assert row is not None
             row.date_started = datetime.now(tz=UTC) - spec.silent_past_offset
@@ -1909,6 +2067,1679 @@ async def test_fail_orphaned_jobs_skips_other_kinds(
     assert failed == []
 
 
+# ---------------------------------------------------------------------
+# Abandoned sweep storage tests (PRD #538)
+# ---------------------------------------------------------------------
+#
+# The abandoned sweep closes the gap between the silent sweep (which
+# requires ``in_progress``) and the orphan sweep (which requires
+# ``backend_job_id IS NULL``): a ``queued`` row that *did* reach arq
+# and was then lost by it. Because age alone cannot distinguish "lost"
+# from "backed up behind a long queue", every candidate is verified
+# against :meth:`QueueBackend.get_job_metadata` before being failed.
+
+
+class _StubQueueBackend:
+    """Minimal :class:`QueueBackend` double for the abandoned sweeps.
+
+    ``known_ids`` are the ``backend_job_id`` values arq still has a
+    record of; any other ID reads as lost. ``error``, when set, makes
+    :meth:`get_job_metadata` raise instead — modelling an unreachable
+    Redis so the sweep's abort path can be exercised.
+    """
+
+    def __init__(
+        self,
+        *,
+        known_ids: set[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.known_ids = known_ids if known_ids is not None else set()
+        self.error = error
+        self.queried: list[str] = []
+        self.probes: list[tuple[str, str | None]] = []
+
+    async def enqueue(
+        self,
+        job_type: str,
+        payload: dict[str, Any],
+        *,
+        queue_name: str | None = None,
+    ) -> EnqueuedJob:
+        raise NotImplementedError
+
+    async def get_job_metadata(
+        self,
+        backend_job_id: str,
+        *,
+        queue_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        self.queried.append(backend_job_id)
+        self.probes.append((backend_job_id, queue_name))
+        if self.error is not None:
+            raise self.error
+        if backend_job_id in self.known_ids:
+            return {"id": backend_job_id, "status": "queued"}
+        return None
+
+    async def get_job_result(self, backend_job_id: str) -> object | None:
+        return None
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_reaps_arq_lost_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """A ``queued`` row past the threshold that arq lost is failed."""
+    backend_job_id = f"arq-{spec.slug_prefix}-lost"
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-1"
+        )
+        abandoned_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=spec.silent_past_offset,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert len(failed) == 1
+    assert failed[0].id == abandoned_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_spares_row_arq_still_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """The healthy-job race: a backed-up but live job is never reaped.
+
+    A ``queued`` row can sit past the threshold simply because the
+    worker pool is saturated. Verifying against the backend before
+    failing is what separates that case from a genuinely lost job, so
+    an arq-known row survives *regardless* of age.
+    """
+    backend_job_id = f"arq-{spec.slug_prefix}-alive"
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-2"
+        )
+        healthy_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=timedelta(days=30),
+        )
+
+        backend = _StubQueueBackend(known_ids={backend_job_id})
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_skips_row_inside_threshold(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Threshold boundary: a fresh queued row is not even a candidate.
+
+    A row younger than ``idle_after`` must not be queried against the
+    backend at all — the dispatcher may still be mid-enqueue, and a
+    just-created job legitimately has no arq record yet.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-3"
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-fresh",
+            date_created_offset=spec.silent_idle_after - timedelta(minutes=1),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_leaves_silent_and_orphan_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Sweep non-interference: the other two sweeps keep their rows.
+
+    An ``in_progress`` row belongs to :meth:`fail_silent_jobs` and a
+    ``queued`` row with no ``backend_job_id`` to
+    :meth:`fail_orphaned_jobs`; the abandoned sweep must claim neither,
+    so the three sweeps stay attributable in postmortems.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-4"
+        )
+        silent_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.in_progress,
+            backend_job_id=f"arq-{spec.slug_prefix}-silent",
+            date_started=datetime.now(tz=UTC) - spec.silent_past_offset,
+            date_created_offset=spec.silent_past_offset,
+        )
+        orphan_id = await _seed_runless_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=spec.silent_past_offset,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+    async with db_session.begin():
+        silent = await store.get(silent_id)
+        orphan = await store.get(orphan_id)
+        assert silent is not None
+        assert silent.status == JobStatus.in_progress
+        assert orphan is not None
+        assert orphan.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_runless_param
+async def test_fail_abandoned_jobs_skips_other_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: RunlessReaperSpec,
+) -> None:
+    """Cross-kind scoping for the abandoned sweep.
+
+    An arq-lost ``queued`` row of every other run-less kind plus
+    ``lifecycle_eval`` must be left to that kind's own reaper.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-abandoned-5"
+        )
+        for idx, kind in enumerate(_other_runless_kinds(spec)):
+            await _seed_runless_row(
+                db_session,
+                kind=kind,
+                org_id=org_id,
+                status=JobStatus.queued,
+                backend_job_id=f"arq-other-lost-{idx}",
+                date_created_offset=spec.silent_past_offset,
+            )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            spec.kind,
+            idle_after=spec.silent_idle_after,
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_skips_run_attributed_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Run-attributed rows have exactly one owner: the run-children sweep.
+
+    ``publish_edition`` jobs cascaded out of a keeper-sync project sync
+    carry a ``keeper_sync_run_id``, so without this scoping both the
+    run-less ``publish_edition`` sweep and
+    :meth:`QueueJobStore.fail_abandoned_run_children` claim them. The
+    run-less sweep does not participate in run finalisation, so when it
+    won the row the parent ``keeper_sync_runs`` row stayed
+    ``in_progress`` forever and 409-blocked every later run for the org.
+    """
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="per-abandoned-run-attributed"
+        )
+        attributed_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-per-run-attributed",
+            date_created_offset=timedelta(hours=5),
+            keeper_sync_run_id=run_id,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_jobs(
+            JobKind.publish_edition,
+            idle_after=timedelta(hours=4),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(attributed_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+        # The single owner does claim it, so the row is not stranded.
+        claimed = await store.fail_abandoned_run_children(
+            run_id=None,
+            idle_after=timedelta(minutes=90),
+            queue_backend=_StubQueueBackend(),
+        )
+        await db_session.commit()
+
+    assert [job.id for job in claimed] == [attributed_id]
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_aborts_when_backend_unreachable(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """An unreachable backend aborts the sweep instead of reaping blind.
+
+    ``get_job_metadata`` raising means the sweep cannot tell a lost job
+    from a live one, so it must fail open: no row is mutated and the
+    next tick retries once Redis is back.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-unreachable")
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-unreachable",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(error=ConnectionError("redis is down"))
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert failed == []
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_propagates_programming_errors(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A bug in the backend call is not "Redis is down".
+
+    The soft-abort exists for backend I/O — a ``TypeError`` from a
+    signature change or an ``AttributeError`` from a refactor would
+    otherwise be logged as "Queue backend unreachable" at warning level
+    and silently disable the sweep forever, with no Sentry event. Such
+    errors must reach the instrumented task wrapper instead.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-typeerror")
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-programming-error",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(
+            error=TypeError("get_job_metadata() got an unexpected keyword")
+        )
+        with pytest.raises(TypeError):
+            await store.fail_abandoned_jobs(
+                JobKind.dashboard_build,
+                idle_after=timedelta(minutes=30),
+                queue_backend=backend,
+            )
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_raises_on_null_queue_backend(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queue-less factory path must not mass-fail healthy rows.
+
+    ``NullQueueBackend`` answers "no record" for every id, which is the
+    exact answer the sweep reads as "arq lost this job". It therefore
+    raises instead, and the error propagates rather than reaping.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(
+            db_session, slug="abandoned-null-backend"
+        )
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-null-backend",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        with pytest.raises(RuntimeError):
+            await store.fail_abandoned_jobs(
+                JobKind.dashboard_build,
+                idle_after=timedelta(minutes=30),
+                queue_backend=NullQueueBackend(),
+            )
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_verify_abandoned_probes_the_rows_own_queue(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Verification asks the queue the row was actually enqueued onto.
+
+    Recording the enqueueing queue on the row retires the hand-listed
+    pool-queue walk: a job on any queue — including one added after this
+    code was written — is verified with a single, correct probe.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-own-queue")
+        await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-on-maintenance",
+            backend_queue_name=MAINTENANCE_QUEUE_NAME,
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-on-maintenance"})
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert failed == []
+    assert backend.probes == [("arq-on-maintenance", MAINTENANCE_QUEUE_NAME)]
+
+
+@pytest.mark.asyncio
+async def test_verify_abandoned_falls_back_for_legacy_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Rows predating the column probe with no queue name at all.
+
+    ``backend_queue_name`` is nullable so the migration needs no
+    backfill; a legacy row therefore hands the backend ``None``, which
+    is its signal to walk every pool queue as before.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-legacy-row")
+        await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-legacy",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-legacy"})
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert failed == []
+    assert backend.probes == [("arq-legacy", None)]
+
+
+@pytest.mark.asyncio
+async def test_set_backend_job_id_stamps_the_enqueueing_queue(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Both halves of an enqueue's provenance land in one call."""
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.lifecycle_eval, org_id=1)
+        updated = await store.set_backend_job_id(
+            job.id, "arq-stamped", queue_name=MAINTENANCE_QUEUE_NAME
+        )
+        await db_session.commit()
+
+    assert updated.backend_job_id == "arq-stamped"
+    assert updated.backend_queue_name == MAINTENANCE_QUEUE_NAME
+
+
+@pytest.mark.asyncio
+async def test_create_stamps_the_enqueueing_queue(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The single-shot create path records the queue name too."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.build_processing,
+            org_id=1,
+            backend_job_id="arq-created",
+            backend_queue_name="docverse:queue",
+        )
+        await db_session.commit()
+
+    assert job.backend_job_id == "arq-created"
+    assert job.backend_queue_name == "docverse:queue"
+
+
+@pytest.mark.asyncio
+async def test_apply_abandoned_reaps_skips_row_that_left_queued(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The write step re-checks ``status='queued'`` per row.
+
+    Splitting the sweep so the arq verification runs outside the write
+    transaction opens a TOCTOU window: a worker can pick the job up
+    between the backend saying "arq has no record" and the reaper
+    applying the reap. The write step must therefore re-check each row
+    is *still* ``queued`` and silently drop any that moved on, rather
+    than stamping ``failed`` over a job that is now running.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-toctou")
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-raced",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        candidates = await store.select_abandoned_jobs(
+            JobKind.dashboard_build, idle_after=timedelta(minutes=30)
+        )
+        assert [c.job_id for c in candidates.rows] == [candidate_id]
+
+        backend = _StubQueueBackend()
+        reaps = await store.verify_abandoned_candidates(
+            candidates, queue_backend=backend
+        )
+        assert reaps.job_ids == (candidate_id,)
+
+        # The race: a worker starts the job after arq was asked about
+        # it but before the reap lands.
+        started = await store.start_if_queued(candidate_id)
+        assert started is not None
+
+        failed = await store.apply_abandoned_reaps(reaps)
+        await db_session.commit()
+
+    assert failed == []
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.in_progress
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_jobs_frees_dashboard_build_mutex(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The wedge this PRD exists to clear: reaping frees the mutex.
+
+    ``idx_queue_jobs_dashboard_build_active_uq`` counts a ``queued`` row
+    as an active job, so an abandoned row blocks every later dashboard
+    build for that project. After the sweep,
+    :meth:`create_unless_active` must hand back a fresh row rather than
+    ``None``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-mutex")
+        wedged_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-wedged",
+            date_created_offset=timedelta(hours=1),
+            project_id=4242,
+        )
+
+        blocked = await store.create_unless_active(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=4242,
+        )
+        assert blocked is None
+
+        failed = await store.fail_abandoned_jobs(
+            JobKind.dashboard_build,
+            idle_after=timedelta(minutes=30),
+            queue_backend=_StubQueueBackend(),
+        )
+        assert len(failed) == 1
+
+        fresh = await store.create_unless_active(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=4242,
+        )
+        await db_session.commit()
+
+    assert fresh is not None
+    assert fresh.id != wedged_id
+    assert fresh.status == JobStatus.queued
+
+
+# ---------------------------------------------------------------------
+# Keeper-sync abandoned sweeps (PRD #538, task #540)
+# ---------------------------------------------------------------------
+#
+# The two keeper-sync families each guard something a wedged ``queued``
+# row freezes: the tier-cron rows guard
+# :meth:`QueueJobStore.has_active_for_subject` (so a wedge stops the
+# project's cron sync forever), and the run children guard run
+# finalisation (so a wedge parks the parent run in ``in_progress``).
+# Both mirror their orphan sibling's scoping, swapping
+# ``backend_job_id IS NULL`` for the arq-verified
+# ``backend_job_id IS NOT NULL`` predicate.
+
+
+async def _seed_abandoned_keeper_sync_row(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    backend_job_id: str,
+    created_offset: timedelta,
+    run_id: int | None = None,
+    subject_label: str | None = None,
+) -> int:
+    """Insert one ``keeper_sync_project`` row: queued, with an arq ID."""
+    store = QueueJobStore(
+        session=db_session, logger=structlog.get_logger("docverse")
+    )
+    job = await store.create(
+        kind=JobKind.keeper_sync_project,
+        org_id=org_id,
+        keeper_sync_run_id=run_id,
+        subject_label=subject_label,
+        backend_job_id=backend_job_id,
+    )
+    row = await db_session.get(SqlQueueJob, job.id)
+    assert row is not None
+    row.date_created = datetime.now(tz=UTC) - created_offset
+    await db_session.flush()
+    return job.id
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_tier_cron_jobs_reaps_arq_lost_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A run-less queued row whose arq job vanished is failed."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-abandoned-1")
+        abandoned_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-tc-lost",
+            created_offset=timedelta(hours=3),
+            subject_label="phalanx",
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_tier_cron_jobs(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-tc-lost"]
+    assert len(failed) == 1
+    assert failed[0].id == abandoned_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_tier_cron_jobs_spares_row_arq_still_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A tier-cron row arq still knows about survives at any age."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-abandoned-2")
+        healthy_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-tc-alive",
+            created_offset=timedelta(days=30),
+            subject_label="phalanx",
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-tc-alive"})
+        failed = await store.fail_abandoned_tier_cron_jobs(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-tc-alive"]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_tier_cron_jobs_skips_row_inside_threshold(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Threshold boundary: a fresh tier-cron row is not even a candidate."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-abandoned-3")
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-tc-fresh",
+            created_offset=timedelta(minutes=89),
+            subject_label="phalanx",
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_tier_cron_jobs(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_tier_cron_jobs_skips_run_attributed_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Run-attributed rows belong to ``fail_abandoned_run_children``."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-tc-abandoned-4"
+        )
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-tc-run-attributed",
+            created_offset=timedelta(hours=3),
+            run_id=run_id,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_tier_cron_jobs(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_tier_cron_jobs_skips_non_keeper_sync_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Only ``keeper_sync_project`` rows are in scope for this sweep."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-abandoned-5")
+        unrelated = await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            backend_job_id="arq-tc-other-kind",
+        )
+        row = await db_session.get(SqlQueueJob, unrelated.id)
+        assert row is not None
+        row.date_created = datetime.now(tz=UTC) - timedelta(hours=3)
+        await db_session.flush()
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_tier_cron_jobs(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_tier_cron_jobs_unblocks_subject_mutex(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The wedge this sweep clears: the subject mutex frees up.
+
+    ``has_active_for_subject`` counts a ``queued`` row as an in-flight
+    sync, so one abandoned tier-cron row parks its project behind the
+    mutex on every later tier tick.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="ks-tc-abandoned-6")
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-tc-wedged",
+            created_offset=timedelta(hours=3),
+            subject_label="phalanx",
+        )
+
+        before = await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="phalanx",
+        )
+        assert before is True
+
+        failed = await store.fail_abandoned_tier_cron_jobs(
+            idle_after=timedelta(minutes=90),
+            queue_backend=_StubQueueBackend(),
+        )
+        await db_session.commit()
+
+    assert len(failed) == 1
+    async with db_session.begin():
+        after = await store.has_active_for_subject(
+            org_id=org_id,
+            kind=JobKind.keeper_sync_project,
+            subject_label="phalanx",
+        )
+    assert after is False
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_reaps_arq_lost_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A run child whose arq job vanished is failed for its own run."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-1"
+        )
+        abandoned_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-rc-lost",
+            created_offset=timedelta(hours=3),
+            run_id=run_id,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_run_children(
+            run_id=run_id,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-rc-lost"]
+    assert len(failed) == 1
+    assert failed[0].id == abandoned_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_spares_row_arq_still_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A run child arq still knows about survives at any age."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-2"
+        )
+        healthy_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-rc-alive",
+            created_offset=timedelta(days=30),
+            run_id=run_id,
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-rc-alive"})
+        failed = await store.fail_abandoned_run_children(
+            run_id=run_id,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-rc-alive"]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_skips_row_inside_threshold(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Threshold boundary: a fresh run child is not even a candidate."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-3"
+        )
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-rc-fresh",
+            created_offset=timedelta(minutes=89),
+            run_id=run_id,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_run_children(
+            run_id=run_id,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_skips_tier_cron_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Tier-cron rows never cross-match the run-scoped sweep.
+
+    Neither the per-run form nor the reaper's all-runs form may claim a
+    row with no ``keeper_sync_run_id`` — those belong to
+    :meth:`QueueJobStore.fail_abandoned_tier_cron_jobs`.
+    """
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-4"
+        )
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-rc-tier-cron",
+            created_offset=timedelta(hours=3),
+            subject_label="phalanx",
+        )
+
+        backend = _StubQueueBackend()
+        scoped = await store.fail_abandoned_run_children(
+            run_id=run_id,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        all_runs = await store.fail_abandoned_run_children(
+            run_id=None,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert scoped == []
+    assert all_runs == []
+
+
+async def _seed_abandoned_discovery_row(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    run_id: int,
+    backend_job_id: str,
+    created_offset: timedelta,
+) -> int:
+    """Insert the run's own ``keeper_sync_run_discovery`` row, queued.
+
+    ``KeeperSyncRunService.start_run`` writes exactly this shape —
+    ``keeper_sync_run_id`` set to the run it fans out for — so the
+    discovery row is run-attributed just like the children it enqueues.
+    """
+    store = QueueJobStore(
+        session=db_session, logger=structlog.get_logger("docverse")
+    )
+    job = await store.create(
+        kind=JobKind.keeper_sync_run_discovery,
+        org_id=org_id,
+        keeper_sync_run_id=run_id,
+        subject_label="discovery for ks-org",
+        backend_job_id=backend_job_id,
+    )
+    row = await db_session.get(SqlQueueJob, job.id)
+    assert row is not None
+    row.date_created = datetime.now(tz=UTC) - created_offset
+    await db_session.flush()
+    return job.id
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_skips_discovery_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The run's own discovery row is not one of its children.
+
+    ``fail_abandoned_run_children`` claims run-attributed rows so the
+    caller can roll the parent up via ``maybe_finalise_run``, which
+    computes ``partial_failure`` from the child counters. A failed
+    *discovery* means the fan-out never happened at all, and the worker
+    path fails the whole run — so the discovery row needs its own sweep
+    rather than being mislabelled and mis-finalised as a child.
+    """
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-7"
+        )
+        discovery_id = await _seed_abandoned_discovery_row(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="arq-discovery-lost",
+            created_offset=timedelta(hours=3),
+        )
+
+        backend = _StubQueueBackend()
+        scoped = await store.fail_abandoned_run_children(
+            run_id=run_id,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        all_runs = await store.fail_abandoned_run_children(
+            run_id=None,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert scoped == []
+    assert all_runs == []
+
+    async with db_session.begin():
+        survivor = await store.get(discovery_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_scoped_to_run(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """With a ``run_id``, another run's abandoned child is left alone."""
+    async with db_session.begin():
+        org_a_id, run_a_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-5a"
+        )
+        org_b_id, run_b_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-5b"
+        )
+        mine_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_a_id,
+            backend_job_id="arq-rc-mine",
+            created_offset=timedelta(hours=3),
+            run_id=run_a_id,
+        )
+        other_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_b_id,
+            backend_job_id="arq-rc-other",
+            created_offset=timedelta(hours=3),
+            run_id=run_b_id,
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_run_children(
+            run_id=run_a_id,
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-rc-mine"]
+    assert [job.id for job in failed] == [mine_id]
+
+    async with db_session.begin():
+        other = await store.get(other_id)
+        assert other is not None
+        assert other.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_children_without_run_id_sweeps_all_runs(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The cron reaper's mode reaps every run's abandoned children.
+
+    The reaper has no run in hand, so it sweeps run-attributed rows in
+    one query and reads the affected run IDs back off the reaped rows.
+    """
+    async with db_session.begin():
+        org_a_id, run_a_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-6a"
+        )
+        org_b_id, run_b_id = await _seed_org_and_run(
+            db_session, slug="ks-rc-abandoned-6b"
+        )
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_a_id,
+            backend_job_id="arq-rc-all-a",
+            created_offset=timedelta(hours=3),
+            run_id=run_a_id,
+        )
+        await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_b_id,
+            backend_job_id="arq-rc-all-b",
+            created_offset=timedelta(hours=3),
+            run_id=run_b_id,
+        )
+
+        failed = await store.fail_abandoned_run_children(
+            run_id=None,
+            idle_after=timedelta(minutes=90),
+            queue_backend=_StubQueueBackend(),
+        )
+        await db_session.commit()
+
+    assert {job.keeper_sync_run_id for job in failed} == {run_a_id, run_b_id}
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_discovery_reaps_arq_lost_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A lost discovery row is failed with a discovery-specific message.
+
+    The message must not read "Abandoned keeper-sync child": the row is
+    the fan-out's parent, and a postmortem needs to tell "the run never
+    started" apart from "one project of the run was lost".
+    """
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rd-abandoned-1"
+        )
+        discovery_id = await _seed_abandoned_discovery_row(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="arq-rd-lost",
+            created_offset=timedelta(hours=3),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_run_discovery(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-rd-lost"]
+    assert len(failed) == 1
+    assert failed[0].id == discovery_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+    assert "run discovery" in failed[0].errors["message"]
+    assert "child" not in failed[0].errors["message"]
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_discovery_spares_row_arq_still_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A discovery job arq still knows about survives at any age."""
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rd-abandoned-2"
+        )
+        healthy_id = await _seed_abandoned_discovery_row(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="arq-rd-alive",
+            created_offset=timedelta(days=30),
+        )
+
+        backend = _StubQueueBackend(known_ids={"arq-rd-alive"})
+        failed = await store.fail_abandoned_run_discovery(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == ["arq-rd-alive"]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_fail_abandoned_run_discovery_skips_children_and_tier_cron(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Three-way scoping: discovery, run children, and tier-cron rows.
+
+    Each keeper-sync abandoned sweep owns exactly one population, so a
+    single tick cannot double-fail a row or leave one unclaimed.
+    """
+    async with db_session.begin():
+        org_id, run_id = await _seed_org_and_run(
+            db_session, slug="ks-rd-abandoned-3"
+        )
+        child_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-rd-child",
+            created_offset=timedelta(hours=3),
+            run_id=run_id,
+        )
+        tier_cron_id = await _seed_abandoned_keeper_sync_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-rd-tier-cron",
+            created_offset=timedelta(hours=3),
+            subject_label="phalanx",
+        )
+
+        backend = _StubQueueBackend()
+        failed = await store.fail_abandoned_run_discovery(
+            idle_after=timedelta(minutes=90),
+            queue_backend=backend,
+        )
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+    async with db_session.begin():
+        for job_id in (child_id, tier_cron_id):
+            survivor = await store.get(job_id)
+            assert survivor is not None
+            assert survivor.status == JobStatus.queued
+
+
+# ---------------------------------------------------------------------
+# lifecycle_eval / git_ref_audit abandoned sweeps (PRD #538, task #541)
+# ---------------------------------------------------------------------
+#
+# The two families ``lifecycle_reaper`` owns are structurally identical
+# — each is scoped by ``kind`` alone and each guards a per-org active
+# mutex (``idx_queue_jobs_lifecycle_eval_active_uq`` /
+# ``idx_queue_jobs_git_ref_audit_active_uq``) that a wedged ``queued``
+# row holds forever — so the predicate tests are parametrized over a
+# two-row spec table rather than written twice.
+
+
+_LifecycleSweep = Callable[
+    [QueueJobStore, timedelta, QueueBackend], Awaitable[list[QueueJob]]
+]
+
+
+async def _sweep_abandoned_lifecycle_eval(
+    store: QueueJobStore,
+    idle_after: timedelta,
+    queue_backend: QueueBackend,
+) -> list[QueueJob]:
+    return await store.fail_abandoned_lifecycle_eval_jobs(
+        idle_after=idle_after, queue_backend=queue_backend
+    )
+
+
+async def _sweep_abandoned_git_ref_audit(
+    store: QueueJobStore,
+    idle_after: timedelta,
+    queue_backend: QueueBackend,
+) -> list[QueueJob]:
+    return await store.fail_abandoned_git_ref_audit_jobs(
+        idle_after=idle_after, queue_backend=queue_backend
+    )
+
+
+@dataclass(frozen=True)
+class LifecycleAbandonedSpec:
+    """One row per family the ``lifecycle_reaper`` abandoned sweeps own."""
+
+    kind: JobKind
+    other_kind: JobKind
+    slug_prefix: str
+    sweep: _LifecycleSweep
+
+    @property
+    def label(self) -> str:
+        return self.kind.value
+
+
+LIFECYCLE_ABANDONED_SPECS = [
+    LifecycleAbandonedSpec(
+        kind=JobKind.lifecycle_eval,
+        other_kind=JobKind.git_ref_audit,
+        slug_prefix="lce-ab",
+        sweep=_sweep_abandoned_lifecycle_eval,
+    ),
+    LifecycleAbandonedSpec(
+        kind=JobKind.git_ref_audit,
+        other_kind=JobKind.lifecycle_eval,
+        slug_prefix="gra-ab",
+        sweep=_sweep_abandoned_git_ref_audit,
+    ),
+]
+
+
+_lifecycle_abandoned_param = pytest.mark.parametrize(
+    "spec",
+    LIFECYCLE_ABANDONED_SPECS,
+    ids=lambda s: s.label,
+)
+
+
+#: Stands in for ``config.lifecycle_reaper_threshold_seconds`` (6 h in
+#: production), which both families use as their abandoned-sweep age
+#: gate.
+_LIFECYCLE_THRESHOLD = timedelta(hours=6)
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_reaped_when_arq_lost(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """A ``queued`` row past the threshold that arq lost is failed."""
+    backend_job_id = f"arq-{spec.slug_prefix}-lost"
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-1")
+        abandoned_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert len(failed) == 1
+    assert failed[0].id == abandoned_id
+    assert failed[0].status == JobStatus.failed
+    assert failed[0].date_completed is not None
+    assert failed[0].errors is not None
+    assert failed[0].errors["type"] == "AbandonedQueueJob"
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_spared_when_arq_knows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """A job arq still knows about survives regardless of age.
+
+    Both families run on pools that can back up (the lifecycle
+    dispatcher fans out one job per org), so age alone would cancel
+    healthy work. The backend check is what separates "lost" from
+    "waiting its turn".
+    """
+    backend_job_id = f"arq-{spec.slug_prefix}-alive"
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-2")
+        healthy_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=backend_job_id,
+            date_created_offset=timedelta(days=30),
+        )
+
+        backend = _StubQueueBackend(known_ids={backend_job_id})
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == [backend_job_id]
+    assert failed == []
+
+    async with db_session.begin():
+        survivor = await store.get(healthy_id)
+        assert survivor is not None
+        assert survivor.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_inside_threshold_untouched(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Threshold boundary: a row younger than the gate is not a candidate.
+
+    A just-dispatched row legitimately has no settled arq record yet, so
+    it must not even be queried against the backend.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-3")
+        await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-fresh",
+            date_created_offset=_LIFECYCLE_THRESHOLD - timedelta(minutes=1),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_row_scoped_to_its_kind(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Kind scoping: the sibling family's rows belong to its own sweep.
+
+    ``lifecycle_reaper`` runs both sweeps in one transaction, so a
+    predicate that leaked across kinds would double-count reaped rows
+    and misattribute them in the log context.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-4")
+        await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.other_kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-sibling",
+            date_created_offset=timedelta(hours=7),
+        )
+        await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-runless",
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_leaves_silent_and_orphan_rows(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Sweep non-interference within the family.
+
+    An ``in_progress`` row belongs to the silent sweep and a ``queued``
+    row with no ``backend_job_id`` to the orphan sweep; claiming either
+    here would make the three loss modes indistinguishable in a
+    postmortem.
+    """
+    async with db_session.begin():
+        org_a_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-5a"
+        )
+        org_b_id = await _seed_org_only(
+            db_session, slug=f"{spec.slug_prefix}-5b"
+        )
+        silent_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_a_id,
+            status=JobStatus.in_progress,
+            backend_job_id=f"arq-{spec.slug_prefix}-silent",
+            date_started=datetime.now(tz=UTC) - timedelta(hours=7),
+            date_created_offset=timedelta(hours=7),
+        )
+        orphan_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_b_id,
+            status=JobStatus.queued,
+            backend_job_id=None,
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend()
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert backend.queried == []
+    assert failed == []
+
+    async with db_session.begin():
+        silent = await store.get(silent_id)
+        orphan = await store.get(orphan_id)
+        assert silent is not None
+        assert silent.status == JobStatus.in_progress
+        assert orphan is not None
+        assert orphan.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_aborts_when_backend_unreachable(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """An unreachable backend leaves every candidate alone."""
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-6")
+        candidate_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-unreachable",
+            date_created_offset=timedelta(hours=7),
+        )
+
+        backend = _StubQueueBackend(error=ConnectionError("redis is down"))
+        failed = await spec.sweep(store, _LIFECYCLE_THRESHOLD, backend)
+        await db_session.commit()
+
+    assert failed == []
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.queued
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
+@_lifecycle_abandoned_param
+async def test_fail_abandoned_lifecycle_frees_per_org_mutex(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    spec: LifecycleAbandonedSpec,
+) -> None:
+    """Reaping releases the family's per-org active-job mutex.
+
+    Both mutexes count a ``queued`` row as live work, so until the sweep
+    fails the wedged row the next dispatcher / discovery tick cannot
+    enqueue for that org at all.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug=f"{spec.slug_prefix}-7")
+        wedged_id = await _seed_lifecycle_family_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id=f"arq-{spec.slug_prefix}-wedged",
+            date_created_offset=timedelta(hours=7),
+        )
+
+        blocked = await store.create_unless_active(
+            kind=spec.kind, org_id=org_id
+        )
+        assert blocked is None
+
+        failed = await spec.sweep(
+            store, _LIFECYCLE_THRESHOLD, _StubQueueBackend()
+        )
+        assert len(failed) == 1
+
+        fresh = await store.create_unless_active(kind=spec.kind, org_id=org_id)
+        await db_session.commit()
+
+    assert fresh is not None
+    assert fresh.id != wedged_id
+    assert fresh.status == JobStatus.queued
+
+
 @pytest.mark.asyncio
 async def test_public_ids_are_time_ordered(
     db_session: AsyncSession,
@@ -2078,7 +3909,7 @@ async def test_list_by_org_filters_by_status(
         started = await store.create(
             kind=JobKind.build_processing, org_id=org_id
         )
-        await store.start(started.id)
+        await store.start_if_queued(started.id)
         result = await store.list_by_org(
             org_id=org_id, status=JobStatus.in_progress, limit=10
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
 from importlib.metadata import version
 from typing import Any, Literal
 
@@ -15,6 +16,7 @@ from sentry_sdk.tracing import TransactionSource
 
 __all__ = [
     "DocverseSentryComponent",
+    "capture_warning",
     "initialize_sentry",
     "instrument_arq_task",
 ]
@@ -47,6 +49,50 @@ def initialize_sentry(component: DocverseSentryComponent) -> None:
     scope = sentry_sdk.get_global_scope()
     scope.set_tag("service", "docverse")
     scope.set_tag("component", component)
+
+
+def capture_warning(
+    message: str,
+    *,
+    tags: Mapping[str, str] | None = None,
+    contexts: Mapping[str, dict[str, Any]] | None = None,
+) -> None:
+    """Capture a warning-level Sentry event for a non-exceptional condition.
+
+    Docverse's other Sentry reports all start from an exception, where
+    Safir's ``before_send_handler`` merges
+    :meth:`~docverse_server.exceptions.DocverseSlackException.to_sentry`
+    metadata onto the event automatically. Some conditions an operator
+    still needs to see are not exceptions at all — the caller absorbed
+    them deliberately — so this helper is the seam that reports them
+    without inventing an exception class nobody raises.
+
+    ``message`` becomes the Sentry issue title and is therefore also the
+    grouping key: pass a **constant** string and put the per-event
+    identifiers in ``tags`` / ``contexts``, or every occurrence opens its
+    own issue. The tags/contexts split follows the same cardinality rule
+    as the ``to_sentry`` overrides — low-cardinality, searchable values
+    (states, kinds, queue names) in ``tags``; per-event snapshots
+    (public ids, payload detail) in ``contexts``.
+
+    A no-op when Sentry is uninitialised (no ``SENTRY_DSN``), like every
+    other SDK call in the tree.
+
+    Parameters
+    ----------
+    message
+        Constant, human-readable summary; becomes the Sentry issue title.
+    tags
+        Low-cardinality searchable key/value pairs.
+    contexts
+        Named structured snapshots attached to the event.
+    """
+    with sentry_sdk.new_scope() as scope:
+        for tag_key, tag_value in (tags or {}).items():
+            scope.set_tag(tag_key, tag_value)
+        for context_key, context_value in (contexts or {}).items():
+            scope.set_context(context_key, context_value)
+        sentry_sdk.capture_message(message, level="warning")
 
 
 def instrument_arq_task(fn: WorkerCoroutine) -> WorkerCoroutine:

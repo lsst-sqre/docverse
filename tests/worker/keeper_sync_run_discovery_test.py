@@ -14,6 +14,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
     JobKind,
@@ -530,6 +531,223 @@ async def test_discovery_leaves_recent_unenqueued_children_alone(
             untouched = await queue_job_store.get(recent.id)
             assert untouched is not None
             assert untouched.status == JobStatus.queued
+
+
+async def _seed_abandoned_child(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    run_id: int,
+    subject_label: str,
+    backend_job_id: str,
+    created_minutes_ago: int,
+) -> int:
+    """Seed a run child that reached arq and was then lost by it.
+
+    The PRD #538 shape, one level down from the reaper tests: the row
+    has a ``backend_job_id`` (so the orphan sweep, which requires it to
+    be ``NULL``, cannot see it) and never started (so the silent sweep,
+    which requires ``in_progress``, cannot either). ``backend_job_id``
+    is one the mock queue has never issued, so verification reads it
+    back as lost.
+    """
+    queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+    child = await queue_job_store.create(
+        kind=JobKind.keeper_sync_project,
+        org_id=org_id,
+        keeper_sync_run_id=run_id,
+        subject_label=subject_label,
+        backend_job_id=backend_job_id,
+    )
+    row = await db_session.get(SqlQueueJob, child.id)
+    assert row is not None
+    row.date_created = datetime.now(tz=UTC) - timedelta(
+        minutes=created_minutes_ago
+    )
+    await db_session.flush()
+    return child.id
+
+
+@pytest.mark.asyncio
+async def test_discovery_reconciles_abandoned_child_and_refans_its_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A re-delivered discovery reaps an arq-lost child and re-fans its slug.
+
+    The gap task #552 closes: reconciliation only swept orphans
+    (``backend_job_id IS NULL``), so a child that *did* reach arq before
+    arq lost it kept holding
+    ``idx_queue_jobs_keeper_sync_project_subject_active_uq``. The
+    re-fan-out's ``has_active_for_subject`` pre-check therefore skipped
+    that slug and the run stayed a child short until the 30-minute cron
+    reaper caught up. The discovery-side pass must fail the row and let
+    the same run enqueue the slug again.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            subject_label="dmtn-001",
+            backend_job_id="arq-child-lost",
+            created_minutes_ago=600,
+        )
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    # The slug is back in the fan-out rather than skipped as active.
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert [j.kwargs["payload"]["ltd_slug"] for j in project_jobs] == [
+        "dmtn-001"
+    ]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            reaped = await queue_job_store.get(abandoned_id)
+            assert reaped is not None
+            assert reaped.status == JobStatus.failed
+            assert reaped.errors is not None
+            assert reaped.errors["type"] == "AbandonedQueueJob"
+
+            # The replacement child belongs to the same run, so the
+            # run's aggregate covers the slug again.
+            stmt = select(SqlQueueJob).where(
+                SqlQueueJob.keeper_sync_run_id == run_id,
+                SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                SqlQueueJob.status == JobStatus.queued.value,
+            )
+            fresh = (await session.execute(stmt)).scalars().all()
+            assert len(fresh) == 1
+            assert fresh[0].id != abandoned_id
+            assert fresh[0].subject_label == "dmtn-001"
+            assert fresh[0].backend_job_id is not None
+
+
+@pytest.mark.asyncio
+async def test_discovery_soft_skips_abandoned_pass_when_backend_is_down(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An unreachable backend costs the discovery only its abandoned pass.
+
+    With Redis down the sweep cannot tell a lost child from a live one,
+    so it must leave every candidate alone and warn — but the discovery
+    itself has to finish: the orphan pass still reaps, and every slug
+    whose subject is free still fans out.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001", "sqr-112"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            subject_label="dmtn-001",
+            backend_job_id="arq-unverifiable",
+            created_minutes_ago=600,
+        )
+        # An orphan too: the backend-free pass must still reap it.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        orphan = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            subject_label="sqr-112",
+        )
+        orphan_row = await db_session.get(SqlQueueJob, orphan.id)
+        assert orphan_row is not None
+        orphan_row.date_created = datetime.now(tz=UTC) - timedelta(minutes=10)
+        await db_session.flush()
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001", "sqr-112"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    async def _explode(*args: Any, **kwargs: Any) -> None:
+        raise ConnectionError("redis is unreachable")
+
+    ctx["arq_queue"].get_job_metadata = _explode
+
+    with capture_logs() as captured:
+        result = await keeper_sync_run_discovery(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert any(
+        entry["event"] == "Queue backend unreachable; skipping abandoned sweep"
+        for entry in captured
+    )
+
+    # ``sqr-112``'s orphan was reaped, so that slug re-fans out;
+    # ``dmtn-001`` keeps its unverifiable child and stays skipped.
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert [j.kwargs["payload"]["ltd_slug"] for j in project_jobs] == [
+        "sqr-112"
+    ]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            spared = await queue_job_store.get(abandoned_id)
+            assert spared is not None
+            assert spared.status == JobStatus.queued
+            assert spared.errors is None
+
+            reaped_orphan = await queue_job_store.get(orphan.id)
+            assert reaped_orphan is not None
+            assert reaped_orphan.status == JobStatus.failed
+
+            disc = await queue_job_store.get(queue_job_id)
+            assert disc is not None
+            assert disc.status == JobStatus.completed
 
 
 @pytest.mark.asyncio

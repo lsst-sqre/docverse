@@ -63,14 +63,16 @@ async def _handle_push(
 
     The processor owns transaction-free DB writes through the
     enqueuer; the handler wraps both the binding lookup and the
-    enqueue in a single ``session.begin()`` so a failure aborts the
-    whole webhook delivery cleanly. ``**_unused`` absorbs the
+    ``queue_jobs`` inserts in a single ``session.begin()`` so a failure
+    aborts the whole webhook delivery cleanly. Handing those rows to arq
+    waits until after that commit (task #550). ``**_unused`` absorbs the
     rename/installation processors that gidgethub's dispatcher passes
     to every callback uniformly.
     """
     async with context.session.begin():
         jobs = await push.process(event.data)
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
     context.logger.info("Processed push webhook", enqueued=len(jobs))
 
 

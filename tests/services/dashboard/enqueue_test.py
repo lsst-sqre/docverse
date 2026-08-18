@@ -25,8 +25,8 @@ from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from tests.support.queue_dispatch import make_dispatcher
 
 _config = Configuration()
 
@@ -71,9 +71,7 @@ def _make_enqueuer(
     return DashboardBuildEnqueuer(
         org_store=OrganizationStore(session=session, logger=logger),
         project_store=ProjectStore(session=session, logger=logger),
-        queue_backend=ArqQueueBackend(
-            arq_queue=arq_queue, default_queue_name=_config.arq_queue_name
-        ),
+        dispatcher=make_dispatcher(session, arq_queue=arq_queue),
         queue_job_store=QueueJobStore(session=session, logger=logger),
         logger=logger,
     )
@@ -188,7 +186,7 @@ async def test_completed_row_does_not_block_next_enqueue(
     # Drive the first job through queued → in_progress → completed.
     queue_job_store = QueueJobStore(session=db_session, logger=_logger())
     async with db_session.begin():
-        await queue_job_store.start(first.id)
+        await queue_job_store.start_if_queued(first.id)
         await queue_job_store.complete(first.id)
         await db_session.commit()
 

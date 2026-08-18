@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 import structlog
+from redis.exceptions import RedisError
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select, update
+from sqlalchemy import ColumnExpressionArgument, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -16,6 +18,7 @@ from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.exceptions import InvalidJobStateError, JobNotFoundError
+from docverse_server.sentry import capture_warning
 from docverse_server.storage._integrity import (
     is_unique_violation,
     violated_constraint_name,
@@ -24,8 +27,45 @@ from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
 )
 from docverse_server.storage.pagination import QueueJobDateCreatedCursor
+from docverse_server.storage.queue_backend import QueueBackend
 
-__all__ = ["QueueJobStore"]
+__all__ = [
+    "LATE_DELIVERY_IN_PROGRESS_MESSAGE",
+    "AbandonedCandidate",
+    "AbandonedCandidates",
+    "AbandonedReaps",
+    "QueueJobStore",
+]
+
+LATE_DELIVERY_IN_PROGRESS_MESSAGE = (
+    "Queue job re-delivered while already in progress"
+)
+"""Sentry issue title for an ``in_progress`` late delivery.
+
+Deliberately constant — no public id, kind, or status is interpolated —
+because the message is the Sentry grouping key: a per-job title would
+open a fresh issue for every re-delivery and defeat the "is this kind
+crash-looping?" read the event exists to give. The identifiers ride in
+the event's tags and ``queue_job_late_delivery`` context instead (see
+:meth:`QueueJobStore.start_if_queued`).
+"""
+
+_BACKEND_IO_ERRORS = (RedisError, OSError)
+"""Failures that mean "the queue backend could not be reached".
+
+The abandoned sweep soft-aborts on these and only these.
+:exc:`redis.exceptions.RedisError` is redis-py's base class, covering
+its ``ConnectionError``/``TimeoutError``/``BusyLoadingError`` family
+(none of which derive from the builtins of the same name).
+:exc:`OSError` covers raw socket failures and the builtin
+:exc:`TimeoutError` — the ``asyncio.TimeoutError`` alias — that a
+cancelled round trip surfaces.
+
+Everything else, notably :exc:`TypeError` and :exc:`AttributeError`, is
+a programming error: classifying it as "unreachable" would disable the
+sweep at warning level with no Sentry event, so it must propagate to
+the instrumented task wrapper.
+"""
 
 ACTIVE_JOB_INDEX_SUFFIX = "_active_uq"
 """Naming convention for the ``queue_jobs`` active-job mutex indexes.
@@ -67,6 +107,66 @@ def _is_active_job_conflict(exc: IntegrityError) -> bool:
     return any(index in message for index in _ACTIVE_JOB_UNIQUE_INDEXES)
 
 
+@dataclass(frozen=True, slots=True)
+class AbandonedCandidate:
+    """One ``queue_jobs`` row matching a family's abandoned predicate.
+
+    Deliberately plain data rather than a :class:`SqlQueueJob`: the
+    reapers select candidates in one transaction, ask arq about them
+    with no transaction open, and apply the reaps in another, so nothing
+    that survives across those boundaries may be a session-bound ORM
+    instance.
+    """
+
+    job_id: int
+    """Primary key of the candidate ``queue_jobs`` row."""
+
+    backend_job_id: str
+    """The arq job ID the abandoned sweep verifies against the backend."""
+
+    backend_queue_name: str | None
+    """The queue that job was enqueued onto, or ``None`` for legacy rows.
+
+    Passed straight through to
+    :meth:`~docverse_server.storage.queue_backend.QueueBackend.get_job_metadata`,
+    where ``None`` selects the multi-queue fallback probe.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonedCandidates:
+    """A family's abandoned-sweep candidates, not yet verified.
+
+    Produced by the ``select_abandoned_*`` methods and consumed by
+    :meth:`QueueJobStore.verify_abandoned_candidates`. Carries the
+    family's reap ``message`` along with the rows so the per-family
+    wording stays in the store rather than leaking into every reaper.
+    """
+
+    rows: tuple[AbandonedCandidate, ...]
+    """Candidate rows, in no particular order."""
+
+    message: str
+    """``errors.message`` to stamp on whichever candidates are reaped."""
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonedReaps:
+    """Candidates the queue backend confirmed arq has no record of.
+
+    Produced by :meth:`QueueJobStore.verify_abandoned_candidates` and
+    consumed by :meth:`QueueJobStore.apply_abandoned_reaps`. Empty when
+    every candidate is still live — or when the backend was unreachable,
+    in which case the sweep soft-aborts for the tick.
+    """
+
+    job_ids: tuple[int, ...]
+    """Primary keys of the rows to fail, subject to a ``queued``recheck."""
+
+    message: str
+    """``errors.message`` to stamp on each reaped row."""
+
+
 class QueueJobStore:
     """Direct database operations for queue jobs."""
 
@@ -84,6 +184,7 @@ class QueueJobStore:
         kind: JobKind,
         org_id: int,
         backend_job_id: str | None = None,
+        backend_queue_name: str | None = None,
         project_id: int | None = None,
         build_id: int | None = None,
         edition_id: int | None = None,
@@ -97,12 +198,19 @@ class QueueJobStore:
         Mints a time-ordered Base32 ``public_id`` at insert time, re-minting
         on the (rare) same-millisecond collision. Calls flush() to get DB
         defaults.
+
+        ``backend_queue_name`` travels with ``backend_job_id`` — callers
+        take both from the :class:`~docverse_server.storage.queue_backend.
+        EnqueuedJob` their enqueue returned — so the abandoned sweep can
+        later verify the row against the queue it was actually enqueued
+        onto.
         """
 
         def _make_row(public_id: int) -> SqlQueueJob:
             return SqlQueueJob(
                 public_id=public_id,
                 backend_job_id=backend_job_id,
+                backend_queue_name=backend_queue_name,
                 kind=kind.value,
                 status=JobStatus.queued.value,
                 org_id=org_id,
@@ -127,6 +235,7 @@ class QueueJobStore:
         kind: JobKind,
         org_id: int,
         backend_job_id: str | None = None,
+        backend_queue_name: str | None = None,
         project_id: int | None = None,
         build_id: int | None = None,
         edition_id: int | None = None,
@@ -171,6 +280,7 @@ class QueueJobStore:
                 kind=kind,
                 org_id=org_id,
                 backend_job_id=backend_job_id,
+                backend_queue_name=backend_queue_name,
                 project_id=project_id,
                 build_id=build_id,
                 edition_id=edition_id,
@@ -225,22 +335,90 @@ class QueueJobStore:
             return None
         return QueueJob.model_validate(row, from_attributes=True)
 
-    async def start(self, job_id: int) -> QueueJob:
-        """Mark job as in_progress, set date_started=now().
+    async def start_if_queued(self, job_id: int) -> QueueJob | None:
+        """Pick a job up: mark it in_progress, or ``None`` if not queued.
+
+        The only queued → in_progress transition in the codebase, and
+        therefore the shared pickup primitive: every worker function
+        picks its row up here so no pickup path can raise
+        :exc:`~docverse_server.exceptions.InvalidJobStateError` at
+        pickup, and so the decision about what a non-``queued`` row means
+        is made once rather than pasted at every call site.
+
+        Late-delivery guard for the reaper triad (PRD #538). The
+        abandoned sweep asks arq whether it still knows a queued job
+        before failing its row, but a job re-appearing between that
+        check and the ``UPDATE`` — or any other residual reap/deliver
+        race — can still hand a worker a row that is no longer
+        ``queued``. Raising there would page an operator for a race the
+        reaper is meant to absorb, so the row is skipped instead and the
+        caller returns without running the job body.
+
+        The two non-``queued`` cases are *not* equivalent, and the
+        primitive reports them differently (task #547):
+
+        - **Terminal** (``failed`` / ``cancelled`` / ``completed`` /
+          ``completed_with_errors``) — expected reap fallout. Warning
+          log only; no Sentry event.
+        - **``in_progress``** — arq re-delivered a job a worker had
+          already picked up. The default pool runs with ``retry_jobs=
+          True`` and ``max_tries`` deliberately unset, so this is what
+          worker death or a routine SIGTERM pod rotation looks like from
+          the next delivery's point of view. The body still must not run
+          twice, but absorbing it silently would hide a crash-looping
+          kind until the reaper noticed hours later — so the skip also
+          captures a warning-level Sentry event (see
+          :func:`~docverse_server.sentry.capture_warning`).
+
+        Returns
+        -------
+        QueueJob or None
+            The started job when the row was ``queued``; ``None`` when
+            it exists in any other status. The skip is always logged as
+            a warning carrying the job's public id, kind, and current
+            status.
 
         Raises
         ------
-        InvalidJobStateError
-            If the job is not in queued status.
+        JobNotFoundError
+            If no row with ``job_id`` exists. A missing row is not the
+            reap race this guards — it means the caller was handed an id
+            that never existed — so it still raises.
         """
         row = await self._get_row(job_id)
         if row.status != JobStatus.queued.value:
-            raise InvalidJobStateError(
-                current_state=row.status,
-                target_state=JobStatus.in_progress.value,
-                job_public_id=serialize_base32_id(row.public_id),
-                job_function=row.kind,
-            )
+            self._report_late_delivery(row)
+            return None
+        return await self._mark_started(row)
+
+    def _report_late_delivery(self, row: SqlQueueJob) -> None:
+        """Log — and for a re-delivery, page — a skipped late delivery."""
+        public_id = serialize_base32_id(row.public_id)
+        self._logger.warning(
+            "Skipping late-delivered queue job",
+            queue_job_id=public_id,
+            queue_job_kind=row.kind,
+            queue_job_status=row.status,
+        )
+        if row.status != JobStatus.in_progress.value:
+            return
+        capture_warning(
+            LATE_DELIVERY_IN_PROGRESS_MESSAGE,
+            tags={
+                "job_function": row.kind,
+                "job_current_state": row.status,
+            },
+            contexts={
+                "queue_job_late_delivery": {
+                    "job_public_id": public_id,
+                    "job_function": row.kind,
+                    "current_state": row.status,
+                }
+            },
+        )
+
+    async def _mark_started(self, row: SqlQueueJob) -> QueueJob:
+        """Apply the queued → in_progress transition to a loaded row."""
         row.status = JobStatus.in_progress.value
         row.date_started = func.now()
         await self._session.flush()
@@ -251,14 +429,22 @@ class QueueJobStore:
         self,
         job_id: int,
         backend_job_id: str,
+        *,
+        queue_name: str,
     ) -> QueueJob:
-        """Record the arq job ID on a previously-created QueueJob row.
+        """Record the arq job ID and its queue on a QueueJob row.
 
         Used by two-phase enqueue flows that insert the row before they
         have a backend job ID (see ``_enqueue_publish_jobs``).
+
+        ``queue_name`` is required rather than optional so no stamping
+        path can record half of a job's backend provenance: the queue
+        name is what lets the abandoned sweep verify the row against the
+        queue it was actually enqueued onto.
         """
         row = await self._get_row(job_id)
         row.backend_job_id = backend_job_id
+        row.backend_queue_name = queue_name
         await self._session.flush()
         await self._session.refresh(row)
         return QueueJob.model_validate(row, from_attributes=True)
@@ -958,6 +1144,529 @@ class QueueJobStore:
                     "crashed between SQL commit and arq_queue.enqueue)"
                 ),
                 "type": "OrphanedQueueJob",
+            }
+            failed.append(QueueJob.model_validate(row, from_attributes=True))
+        if failed:
+            await self._session.flush()
+        return failed
+
+    async def fail_abandoned_jobs(
+        self,
+        kind: JobKind,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail rows of ``kind`` that reached arq and were then lost.
+
+        Third sweep of the reaper triad, closing the gap PRD #538
+        describes: :meth:`fail_silent_jobs` only looks at
+        ``in_progress`` rows and :meth:`fail_orphaned_jobs` only at
+        ``queued`` rows with ``backend_job_id IS NULL``, so a row that
+        *did* get an arq job ID and then had that job vanish (Redis
+        eviction, a queue flush, a lost `arq:queue` entry) is swept by
+        neither. Because the active-job partial unique indexes count a
+        ``queued`` row as holding the mutex, one such row wedges its
+        slot permanently — on roundtable-dev this silently froze the
+        documenteer version dashboard.
+
+        Age alone cannot separate "arq lost this job" from "arq is
+        backed up", so each candidate (``status='queued'``,
+        ``backend_job_id IS NOT NULL``, ``date_created`` older than
+        ``now - idle_after``) is verified against
+        :meth:`QueueBackend.get_job_metadata` first and failed only when
+        the backend has no record of it. Reaped rows carry
+        ``errors.type='AbandonedQueueJob'``, distinct from
+        ``SilentWorker`` and ``OrphanedQueueJob`` so postmortem queries
+        can separate the three loss modes.
+
+        Run-attributed rows (``keeper_sync_run_id IS NOT NULL``) are out
+        of scope, mirroring :meth:`fail_abandoned_tier_cron_jobs`'
+        run-less scoping. A keeper-sync project sync cascades
+        ``publish_edition`` jobs that carry the run's id, so without this
+        predicate both this sweep and
+        :meth:`fail_abandoned_run_children` would claim them — and only
+        the latter feeds its reaped rows into ``maybe_finalise_run``.
+        Whichever won, the loser's contract broke: a win here left the
+        parent ``keeper_sync_runs`` row ``in_progress`` forever, which
+        409-blocks every later run for the org. Giving run-attributed
+        rows a single owner removes the ambiguity.
+
+        One-shot form: selects, verifies, and applies in the caller's
+        current transaction. The reapers instead drive
+        :meth:`select_abandoned_jobs` /
+        :meth:`verify_abandoned_candidates` /
+        :meth:`apply_abandoned_reaps` separately so the backend round
+        trips happen with no write transaction open (task #548).
+        """
+        return await self._sweep_abandoned(
+            await self.select_abandoned_jobs(kind, idle_after=idle_after),
+            queue_backend=queue_backend,
+        )
+
+    async def select_abandoned_jobs(
+        self,
+        kind: JobKind,
+        *,
+        idle_after: timedelta,
+    ) -> AbandonedCandidates:
+        """Select unverified abandoned candidates of ``kind``.
+
+        Read-only half of :meth:`fail_abandoned_jobs` — see there for the
+        predicate's rationale and the run-attributed exclusion.
+        """
+        return await self._select_abandoned_candidates(
+            SqlQueueJob.kind == kind.value,
+            SqlQueueJob.keeper_sync_run_id.is_(None),
+            idle_after=idle_after,
+            message=(
+                f"Abandoned {kind.value}: queue_jobs row still queued past "
+                f"the {kind.value}_reaper threshold and arq has no record "
+                "of its backend_job_id (reaped by the abandoned sweep)"
+            ),
+        )
+
+    async def fail_abandoned_tier_cron_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail run-less ``keeper_sync_project`` rows that arq lost.
+
+        Abandoned-sweep sibling of
+        :meth:`fail_orphaned_tier_cron_jobs`, scoped identically
+        (``kind='keeper_sync_project'``, ``keeper_sync_run_id IS NULL``)
+        but for rows that *did* reach arq. The orphan sweep can only see
+        rows whose ``backend_job_id`` is still ``NULL``, so a tier-cron
+        row whose arq job later vanished stays ``queued`` forever, and
+        :meth:`has_active_for_subject` — which the tier crons consult
+        before enqueuing — keeps reporting an in-flight sync and skips
+        that subject on every subsequent tick.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`verify_abandoned_candidates` for the shared
+        verification pass and its backend-unreachable behaviour.
+        Run-attributed rows belong to
+        :meth:`fail_abandoned_run_children`.
+        """
+        return await self._sweep_abandoned(
+            await self.select_abandoned_tier_cron_jobs(idle_after=idle_after),
+            queue_backend=queue_backend,
+        )
+
+    async def select_abandoned_tier_cron_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> AbandonedCandidates:
+        """Select unverified abandoned tier-cron candidates.
+
+        Read-only half of :meth:`fail_abandoned_tier_cron_jobs` — see
+        there for the predicate's rationale.
+        """
+        return await self._select_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+            SqlQueueJob.keeper_sync_run_id.is_(None),
+            idle_after=idle_after,
+            message=(
+                "Abandoned tier-cron keeper_sync_project: queue_jobs row "
+                "still queued past the keeper_sync_reaper threshold and "
+                "arq has no record of its backend_job_id (reaped by the "
+                "abandoned sweep)"
+            ),
+        )
+
+    async def fail_abandoned_run_children(
+        self,
+        *,
+        run_id: int | None,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail keeper-sync child rows that arq lost.
+
+        Abandoned-sweep sibling of :meth:`fail_orphaned_run_children`,
+        scoped identically (``keeper_sync_run_id == run_id``) but for
+        rows that *did* reach arq. Such a child stays ``queued``
+        forever, so it counts toward the parent run's ``pending_count``
+        and blocks finalisation exactly the way an orphan does —
+        callers therefore feed the reaped rows into the same
+        ``maybe_finalise_run`` path.
+
+        The run's own ``keeper_sync_run_discovery`` row is run-attributed
+        too (``start_run`` stamps it with the run id), but it is the
+        parent of the fan-out rather than one of its children, so it is
+        excluded here and swept by
+        :meth:`fail_abandoned_run_discovery` instead. Rolling a lost
+        discovery up as a child would label it "Abandoned keeper-sync
+        child" and let ``maybe_finalise_run`` compute
+        ``partial_failure`` from the child counters, where a
+        worker-failed discovery fails the whole run.
+
+        ``run_id`` narrows the sweep to one run — the discovery-side
+        reconciliation shape, where ``_reconcile_run_children`` clears
+        the run's own wedged children before re-fanning out. ``None``
+        (the cron reaper's mode) sweeps every run-attributed row in one
+        query, since the reaper has no run in hand and would otherwise
+        have to enumerate runs just to find the ones that are wedged;
+        callers in that mode take the affected run IDs from the returned
+        rows. It has no default: :meth:`fail_orphaned_run_children`, the
+        orphan sibling this mirrors, makes every caller name its run, and
+        a silent default here would let a caller that meant one run sweep
+        every org's.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`verify_abandoned_candidates` for the shared
+        verification pass and its backend-unreachable behaviour.
+        """
+        return await self._sweep_abandoned(
+            await self.select_abandoned_run_children(
+                run_id=run_id, idle_after=idle_after
+            ),
+            queue_backend=queue_backend,
+        )
+
+    async def select_abandoned_run_children(
+        self,
+        *,
+        run_id: int | None,
+        idle_after: timedelta,
+    ) -> AbandonedCandidates:
+        """Select unverified abandoned keeper-sync child candidates.
+
+        Read-only half of :meth:`fail_abandoned_run_children` — see there
+        for the predicate's rationale and the ``run_id`` scoping.
+        """
+        scope: ColumnExpressionArgument[bool] = (
+            SqlQueueJob.keeper_sync_run_id.is_not(None)
+            if run_id is None
+            else SqlQueueJob.keeper_sync_run_id == run_id
+        )
+        return await self._select_abandoned_candidates(
+            scope,
+            SqlQueueJob.kind != JobKind.keeper_sync_run_discovery.value,
+            idle_after=idle_after,
+            message=(
+                "Abandoned keeper-sync child: queue_jobs row still queued "
+                "past the keeper_sync_reaper threshold and arq has no "
+                "record of its backend_job_id (reaped by the abandoned "
+                "sweep)"
+            ),
+        )
+
+    async def fail_abandoned_run_discovery(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail ``keeper_sync_run_discovery`` rows that arq lost.
+
+        Counterpart to :meth:`fail_abandoned_run_children` for the one
+        run-attributed row that is not a child: the discovery job
+        ``KeeperSyncRunService.start_run`` enqueues before any fan-out
+        exists. When arq loses it the run never leaves ``pending``, and
+        because ``has_non_terminal_run`` treats ``pending`` as active,
+        every later ``POST .../runs`` for the org returns 409 — the same
+        wedge the children sweep clears, one level up.
+
+        Reaped rows carry a discovery-specific ``errors.message`` (still
+        ``errors.type='AbandonedQueueJob'``, so the three loss modes stay
+        comparable) and callers drive the parent run to
+        :attr:`~docverse.models.KeeperSyncRunStatus.failed` — matching
+        ``keeper_sync_run_discovery``'s own failure path — rather than
+        through ``maybe_finalise_run``, which would read the lone
+        discovery row as a failed child and pick ``partial_failure``.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`verify_abandoned_candidates` for the shared
+        verification pass and its backend-unreachable behaviour.
+        """
+        return await self._sweep_abandoned(
+            await self.select_abandoned_run_discovery(idle_after=idle_after),
+            queue_backend=queue_backend,
+        )
+
+    async def select_abandoned_run_discovery(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> AbandonedCandidates:
+        """Select unverified abandoned run-discovery candidates.
+
+        Read-only half of :meth:`fail_abandoned_run_discovery` — see
+        there for the predicate's rationale.
+        """
+        return await self._select_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.keeper_sync_run_discovery.value,
+            SqlQueueJob.keeper_sync_run_id.is_not(None),
+            idle_after=idle_after,
+            message=(
+                "Abandoned keeper-sync run discovery: queue_jobs row still "
+                "queued past the keeper_sync_reaper threshold and arq has "
+                "no record of its backend_job_id, so the run never fanned "
+                "out (reaped by the abandoned sweep)"
+            ),
+        )
+
+    async def fail_abandoned_lifecycle_eval_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail ``lifecycle_eval`` rows that reached arq and were then lost.
+
+        Abandoned-sweep sibling of
+        :meth:`fail_orphaned_lifecycle_eval_jobs`, scoped identically
+        (``kind='lifecycle_eval'``) but for rows that *did* reach arq.
+        The orphan sweep only sees rows whose ``backend_job_id`` is still
+        ``NULL``, so a row whose arq job later vanished stays ``queued``
+        forever — and because
+        ``idx_queue_jobs_lifecycle_eval_active_uq`` counts a ``queued``
+        row as active work, every subsequent dispatcher tick for that org
+        is blocked. Reaping the row releases the mutex so the next tick
+        enqueues fresh work.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`verify_abandoned_candidates` for the shared
+        verification pass and its backend-unreachable behaviour. Reaped
+        rows keep their ``lifecycle_eval_run_id``, so the reaper feeds
+        them into the same ``maybe_finalise_lifecycle_run`` pass as the
+        silent and orphan sweeps.
+        """
+        return await self._sweep_abandoned(
+            await self.select_abandoned_lifecycle_eval_jobs(
+                idle_after=idle_after
+            ),
+            queue_backend=queue_backend,
+        )
+
+    async def select_abandoned_lifecycle_eval_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> AbandonedCandidates:
+        """Select unverified abandoned ``lifecycle_eval`` candidates.
+
+        Read-only half of :meth:`fail_abandoned_lifecycle_eval_jobs` —
+        see there for the predicate's rationale.
+        """
+        return await self._select_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.lifecycle_eval.value,
+            idle_after=idle_after,
+            message=(
+                "Abandoned lifecycle_eval: queue_jobs row still queued past "
+                "the lifecycle_reaper threshold and arq has no record of its "
+                "backend_job_id (reaped by the abandoned sweep)"
+            ),
+        )
+
+    async def fail_abandoned_git_ref_audit_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail ``git_ref_audit`` rows that reached arq and were then lost.
+
+        Abandoned-sweep sibling of
+        :meth:`fail_orphaned_git_ref_audit_jobs`, scoped identically
+        (``kind='git_ref_audit'``) but for rows that *did* reach arq.
+        Same wedge as the lifecycle_eval variant one mutex over:
+        ``idx_queue_jobs_git_ref_audit_active_uq`` treats the stranded
+        ``queued`` row as an in-flight audit, so the next day's discovery
+        tick skips that org indefinitely.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`verify_abandoned_candidates` for the shared
+        verification pass and its backend-unreachable behaviour. Reaped
+        rows keep their ``git_ref_audit_run_id`` so the reaper can roll
+        the parent run up in the same tick.
+        """
+        return await self._sweep_abandoned(
+            await self.select_abandoned_git_ref_audit_jobs(
+                idle_after=idle_after
+            ),
+            queue_backend=queue_backend,
+        )
+
+    async def select_abandoned_git_ref_audit_jobs(
+        self,
+        *,
+        idle_after: timedelta,
+    ) -> AbandonedCandidates:
+        """Select unverified abandoned ``git_ref_audit`` candidates.
+
+        Read-only half of :meth:`fail_abandoned_git_ref_audit_jobs` —
+        see there for the predicate's rationale.
+        """
+        return await self._select_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.git_ref_audit.value,
+            idle_after=idle_after,
+            message=(
+                "Abandoned git_ref_audit: queue_jobs row still queued past "
+                "the lifecycle_reaper threshold and arq has no record of its "
+                "backend_job_id (reaped by the abandoned sweep)"
+            ),
+        )
+
+    async def _sweep_abandoned(
+        self,
+        candidates: AbandonedCandidates,
+        *,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Verify then apply one family's candidates in one transaction.
+
+        The one-shot composition every ``fail_abandoned_*`` method
+        delegates to, for callers already inside a short write
+        transaction that carries no other sweep's updates. The reapers
+        must *not* use it: their transaction also carries the silent and
+        orphan sweeps' reaps, and a stalled backend inside it would take
+        those down with it (task #548).
+        """
+        return await self.apply_abandoned_reaps(
+            await self.verify_abandoned_candidates(
+                candidates, queue_backend=queue_backend
+            )
+        )
+
+    async def _select_abandoned_candidates(
+        self,
+        *scope: ColumnExpressionArgument[bool],
+        idle_after: timedelta,
+        message: str,
+    ) -> AbandonedCandidates:
+        """Shared candidate query behind every ``select_abandoned_*``.
+
+        ``scope`` narrows the base abandoned predicate
+        (``status='queued'``, ``backend_job_id IS NOT NULL``,
+        ``date_created < now - idle_after``) to one family — a ``kind``
+        equality for :meth:`select_abandoned_jobs`, or the scoping the
+        per-family variants use.
+
+        Selects columns rather than ORM entities: the reapers carry the
+        result across a transaction boundary (verification runs with no
+        transaction open), which a session-bound :class:`SqlQueueJob`
+        could not survive without a silent lazy refresh.
+        """
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
+        stmt = select(
+            SqlQueueJob.id,
+            SqlQueueJob.backend_job_id,
+            SqlQueueJob.backend_queue_name,
+        ).where(
+            SqlQueueJob.status == JobStatus.queued.value,
+            SqlQueueJob.backend_job_id.is_not(None),
+            SqlQueueJob.date_created < cutoff,
+            *scope,
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return AbandonedCandidates(
+            rows=tuple(
+                AbandonedCandidate(
+                    job_id=job_id,
+                    backend_job_id=backend_job_id,
+                    backend_queue_name=backend_queue_name,
+                )
+                for job_id, backend_job_id, backend_queue_name in rows
+                if backend_job_id is not None  # pragma: no branch - SQL
+            ),
+            message=message,
+        )
+
+    async def verify_abandoned_candidates(
+        self,
+        candidates: AbandonedCandidates,
+        *,
+        queue_backend: QueueBackend,
+    ) -> AbandonedReaps:
+        """Ask the queue backend which candidates arq has actually lost.
+
+        Touches no database session at all, so the reapers can run it
+        between two write transactions with none of their own open — the
+        whole point of the split (task #548). A backend that stalls here
+        can therefore neither roll back nor block the silent and orphan
+        sweeps, whose reaps are already committed by the time this runs.
+
+        Every candidate is verified before any row is mutated, so a
+        backend that becomes unreachable partway through leaves no
+        half-applied reap behind. On such a failure the sweep aborts for
+        this tick with a warning and returns no reaps: the sibling
+        sweeps are unaffected and the next tick retries (PRD #538
+        §Scope, backend-unreachable bullet). Failing open this way is
+        deliberate — reaping a row whose arq job may well be alive would
+        cancel healthy work.
+
+        Only backend *I/O* failures soft-abort (see
+        :data:`_BACKEND_IO_ERRORS`). A ``TypeError`` from a changed
+        signature or an ``AttributeError`` from a refactor is a bug, not
+        an unreachable Redis: swallowing it here would disable the sweep
+        permanently at warning level with no Sentry event, so it
+        propagates to the instrumented task wrapper instead.
+
+        Each candidate is probed on the queue its row recorded, so a job
+        on any pool — including one added after this code was written —
+        is verified with one correct round trip. Rows predating
+        ``queue_jobs.backend_queue_name`` pass ``None`` and fall back to
+        the backend's multi-queue walk.
+        """
+        lost: list[int] = []
+        for candidate in candidates.rows:
+            try:
+                metadata = await queue_backend.get_job_metadata(
+                    candidate.backend_job_id,
+                    queue_name=candidate.backend_queue_name,
+                )
+            except _BACKEND_IO_ERRORS as exc:
+                self._logger.warning(
+                    "Queue backend unreachable; skipping abandoned sweep",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    candidate_count=len(candidates.rows),
+                )
+                return AbandonedReaps(job_ids=(), message=candidates.message)
+            if metadata is None:
+                lost.append(candidate.job_id)
+        return AbandonedReaps(job_ids=tuple(lost), message=candidates.message)
+
+    async def apply_abandoned_reaps(
+        self, reaps: AbandonedReaps
+    ) -> list[QueueJob]:
+        """Fail the verified rows, re-checking each is still ``queued``.
+
+        The write half of the split sweep, meant to be held in as short a
+        transaction as possible. Verification happens outside any
+        transaction, so a worker can pick a job up between arq answering
+        "no record" and this update landing; the ``status='queued'``
+        predicate (taken ``FOR UPDATE``, so a concurrent
+        :meth:`start_if_queued` cannot slip in between the re-check and
+        the flush) drops any such row instead of stamping ``failed`` over
+        a job that is now running. The dropped row simply becomes a
+        candidate again on a later tick if it really is stuck.
+        """
+        if not reaps.job_ids:
+            return []
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        stmt = (
+            select(SqlQueueJob)
+            .where(
+                SqlQueueJob.id.in_(reaps.job_ids),
+                SqlQueueJob.status == JobStatus.queued.value,
+            )
+            .with_for_update()
+        )
+        result = await self._session.execute(stmt)
+        failed: list[QueueJob] = []
+        for row in result.scalars().all():
+            row.status = JobStatus.failed.value
+            row.date_completed = now
+            row.errors = {
+                "message": reaps.message,
+                "type": "AbandonedQueueJob",
             }
             failed.append(QueueJob.model_validate(row, from_attributes=True))
         if failed:

@@ -156,6 +156,7 @@ async def sync_org_dashboard_template(
         enqueuer = context.factory.create_dashboard_sync_enqueuer()
         queue_job = await enqueuer.enqueue(binding.id)
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
     response_model = DashboardTemplateSyncEnqueuedResponse.from_queue_job(
         queue_job, context.request, org_slug
     )
@@ -281,6 +282,7 @@ async def sync_project_dashboard_template(
         enqueuer = context.factory.create_dashboard_sync_enqueuer()
         queue_job = await enqueuer.enqueue(binding.id)
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
     response_model = DashboardTemplateSyncEnqueuedResponse.from_queue_job(
         queue_job, context.request, org_slug
     )

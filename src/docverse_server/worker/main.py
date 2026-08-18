@@ -43,7 +43,6 @@ from docverse_server.services.keeper_sync.scheduler import (
     TIER_MAIN_CRON_INTERVAL,
     TIER_OTHER_CRON_INTERVAL,
 )
-from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.storage.github import validate_github_app
 
 from .functions import (
@@ -70,7 +69,7 @@ from .functions import (
     publish_edition,
     publish_edition_reaper,
 )
-from .queues import MAINTENANCE_QUEUE_NAME
+from .queues import KEEPER_SYNC_QUEUE_NAME, MAINTENANCE_QUEUE_NAME
 
 config = Configuration()
 

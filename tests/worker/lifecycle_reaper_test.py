@@ -14,6 +14,7 @@ never sees a stuck run.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,6 +24,7 @@ import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
     GitRefAuditRunStatus,
@@ -34,6 +36,7 @@ from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
@@ -44,6 +47,8 @@ from docverse_server.storage.lifecycle_eval_run_store import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.lifecycle_reaper import lifecycle_reaper
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
+from tests.support.arq_testing import register_queue
 from tests.worker.conftest import make_worker_ctx
 
 
@@ -152,6 +157,9 @@ async def _seed_orphan_child(
 
 def _make_ctx(http_client: httpx.AsyncClient) -> dict[str, Any]:
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    # ``lifecycle_reaper`` runs on the maintenance pool, so its abandoned
+    # sweeps look jobs up on that queue as well as the default one.
+    register_queue(mock_arq, MAINTENANCE_QUEUE_NAME)
     return make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
 
@@ -682,3 +690,434 @@ async def test_reaper_sweeps_both_subsystems_in_one_tick(
             audit_run = await audit_run_store.get(audit_run_id)
             assert audit_run is not None
             assert audit_run.status is GitRefAuditRunStatus.partial_failure
+
+
+# -- abandoned sweep coverage (PRD #538, task #541) ----
+#
+# The third loss mode: a row that reached ``status='queued'`` *with* a
+# ``backend_job_id`` and was then lost by arq. Neither sibling sweep can
+# see it (silent needs ``in_progress``, orphan needs
+# ``backend_job_id IS NULL``) while the per-org active mutex keeps
+# counting it as live work, so it wedges its org's slot forever.
+
+
+async def _seed_abandoned_child(
+    db_session: AsyncSession,
+    *,
+    kind: JobKind,
+    org_id: int,
+    org_slug: str,
+    run_id: int,
+    backend_job_id: str,
+    created_minutes_ago: int,
+) -> int:
+    """Insert a queued row of ``kind`` that already carries an arq job ID."""
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        backend_job_id=backend_job_id,
+        kind=kind.value,
+        status=JobStatus.queued.value,
+        org_id=org_id,
+        subject_label=org_slug,
+    )
+    if kind is JobKind.lifecycle_eval:
+        row.lifecycle_eval_run_id = run_id
+    else:
+        row.git_ref_audit_run_id = run_id
+    db_session.add(row)
+    await db_session.flush()
+    row.date_created = datetime.now(tz=UTC) - timedelta(
+        minutes=created_minutes_ago
+    )
+    await db_session.flush()
+    return row.id
+
+
+@pytest.mark.asyncio
+async def test_reaper_fails_abandoned_lifecycle_eval_row(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """An arq-lost lifecycle_eval row is reaped and its mutex released.
+
+    Until the abandoned sweep exists the row holds
+    ``idx_queue_jobs_lifecycle_eval_active_uq`` forever, so no later
+    dispatcher tick can enqueue an evaluation for that org.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="lcr-ab-le")
+        run_id = await _seed_run(db_session)
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.lifecycle_eval,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            backend_job_id="arq-le-lost",
+            created_minutes_ago=600,
+        )
+
+        blocked = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create_unless_active(kind=JobKind.lifecycle_eval, org_id=org_id)
+        assert blocked is None
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await lifecycle_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            qj = await qj_store.get(abandoned_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "AbandonedQueueJob"
+            assert qj.date_completed is not None
+
+            fresh = await qj_store.create_unless_active(
+                kind=JobKind.lifecycle_eval, org_id=org_id
+            )
+            assert fresh is not None
+            assert fresh.id != abandoned_id
+
+            run_store = LifecycleEvalRunStore(
+                session=session, logger=_logger()
+            )
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status is LifecycleEvalRunStatus.partial_failure
+
+
+@pytest.mark.asyncio
+async def test_reaper_fails_abandoned_git_ref_audit_row(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Same coverage one mutex over: the daily audit's per-org slot."""
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="lcr-ab-gra")
+        run_id = await _seed_git_ref_audit_run(db_session)
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.git_ref_audit,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            backend_job_id="arq-gra-lost",
+            created_minutes_ago=600,
+        )
+
+        blocked = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create_unless_active(kind=JobKind.git_ref_audit, org_id=org_id)
+        assert blocked is None
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        await lifecycle_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            qj = await qj_store.get(abandoned_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "AbandonedQueueJob"
+
+            fresh = await qj_store.create_unless_active(
+                kind=JobKind.git_ref_audit, org_id=org_id
+            )
+            assert fresh is not None
+            assert fresh.id != abandoned_id
+
+            run_store = GitRefAuditRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status is GitRefAuditRunStatus.partial_failure
+
+
+@pytest.mark.asyncio
+async def test_reaper_spares_rows_arq_still_knows(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A job arq still has a record of survives regardless of age.
+
+    Both families run on the maintenance pool, which arq resolves
+    through its own queue's sorted set. These rows carry no
+    ``backend_queue_name`` (the legacy shape), so they also pin the
+    multi-queue fallback: without it the live job on the maintenance
+    queue would read as missing and be reaped.
+    """
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    live = await ctx["arq_queue"].enqueue(
+        "lifecycle_eval", _queue_name=MAINTENANCE_QUEUE_NAME
+    )
+
+    async with db_session.begin():
+        org_a_id, org_a_slug = await _seed_org(db_session, slug="lcr-ab-live1")
+        org_b_id, org_b_slug = await _seed_org(db_session, slug="lcr-ab-live2")
+        le_run_id = await _seed_run(db_session)
+        audit_run_id = await _seed_git_ref_audit_run(db_session)
+        le_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.lifecycle_eval,
+            org_id=org_a_id,
+            org_slug=org_a_slug,
+            run_id=le_run_id,
+            backend_job_id=live.id,
+            created_minutes_ago=60000,
+        )
+        audit_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.git_ref_audit,
+            org_id=org_b_id,
+            org_slug=org_b_slug,
+            run_id=audit_run_id,
+            backend_job_id=live.id,
+            created_minutes_ago=60000,
+        )
+
+    try:
+        await lifecycle_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            for job_id in (le_id, audit_id):
+                qj = await qj_store.get(job_id)
+                assert qj is not None
+                assert qj.status == JobStatus.queued
+                assert qj.errors is None
+
+
+@pytest.mark.asyncio
+async def test_reaper_backend_unreachable_skips_only_abandoned_sweeps(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """An unreachable backend costs the tick only its abandoned passes.
+
+    With Redis down the sweep cannot tell a lost job from a live one, so
+    every abandoned candidate must survive — while the silent and orphan
+    sweeps, which need no backend, still reap that tick.
+    """
+    async with db_session.begin():
+        org_a_id, org_a_slug = await _seed_org(db_session, slug="lcr-ab-down1")
+        org_b_id, org_b_slug = await _seed_org(db_session, slug="lcr-ab-down2")
+        run_id = await _seed_run(db_session)
+        silent_id = await _seed_silent_child(
+            db_session,
+            org_id=org_a_id,
+            org_slug=org_a_slug,
+            run_id=run_id,
+            backend_job_id="arq-down-silent",
+            started_minutes_ago=600,
+        )
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.lifecycle_eval,
+            org_id=org_b_id,
+            org_slug=org_b_slug,
+            run_id=run_id,
+            backend_job_id="arq-down-abandoned",
+            created_minutes_ago=600,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+
+    async def _explode(*args: Any, **kwargs: Any) -> None:
+        raise ConnectionError("redis is unreachable")
+
+    ctx["arq_queue"].get_job_metadata = _explode
+
+    try:
+        with capture_logs() as captured:
+            result = await lifecycle_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert any(
+        entry["event"] == "Queue backend unreachable; skipping abandoned sweep"
+        for entry in captured
+    )
+
+    warnings = [
+        entry
+        for entry in captured
+        if entry["event"] == "Reaped stuck lifecycle queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["lifecycle_eval_silent_count"] == 1
+    assert warnings[0]["lifecycle_eval_abandoned_count"] == 0
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            reaped = await qj_store.get(silent_id)
+            assert reaped is not None
+            assert reaped.status == JobStatus.failed
+            spared = await qj_store.get(abandoned_id)
+            assert spared is not None
+            assert spared.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_reaper_backend_stall_keeps_silent_and_orphan_reaps(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A stalled backend costs the tick only its abandoned passes.
+
+    The failure mode task #548 fixes: a hung Redis pushed the tick past
+    arq's job timeout while the silent and orphan sweeps' updates sat
+    uncommitted in the same transaction. ``CancelledError`` is a
+    ``BaseException``, so the sweep's ``except Exception`` soft-abort
+    never saw it — the transaction unwound and every reap that tick was
+    lost, tick after tick, with row locks held throughout.
+
+    Modelled deterministically by cancelling the reaper only once the
+    backend call is actually in flight.
+    """
+    async with db_session.begin():
+        org_a_id, org_a_slug = await _seed_org(db_session, slug="lcr-ab-stal1")
+        org_b_id, org_b_slug = await _seed_org(db_session, slug="lcr-ab-stal2")
+        run_id = await _seed_run(db_session)
+        silent_id = await _seed_silent_child(
+            db_session,
+            org_id=org_a_id,
+            org_slug=org_a_slug,
+            run_id=run_id,
+            backend_job_id="arq-stall-silent",
+            started_minutes_ago=600,
+        )
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.lifecycle_eval,
+            org_id=org_b_id,
+            org_slug=org_b_slug,
+            run_id=run_id,
+            backend_job_id="arq-stall-abandoned",
+            created_minutes_ago=600,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    reached_backend = asyncio.Event()
+
+    async def _hang(*args: Any, **kwargs: Any) -> None:
+        reached_backend.set()
+        await asyncio.Event().wait()
+
+    ctx["arq_queue"].get_job_metadata = _hang
+
+    try:
+        task = asyncio.create_task(lifecycle_reaper(ctx))
+        await asyncio.wait_for(reached_backend.wait(), timeout=30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            reaped = await qj_store.get(silent_id)
+            assert reaped is not None
+            assert reaped.status == JobStatus.failed
+            spared = await qj_store.get(abandoned_id)
+            assert spared is not None
+            assert spared.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_reaper_logs_backend_job_id_and_matched_sweep(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Reaped-row log context names the sweep and the lost arq job ID.
+
+    PRD #538's observability requirement: a postmortem must be able to
+    tell which sweep claimed a row, and cross-reference the arq job that
+    went missing, without querying the database.
+    """
+    async with db_session.begin():
+        org_a_id, org_a_slug = await _seed_org(db_session, slug="lcr-ab-log1")
+        org_b_id, org_b_slug = await _seed_org(db_session, slug="lcr-ab-log2")
+        le_run_id = await _seed_run(db_session)
+        audit_run_id = await _seed_git_ref_audit_run(db_session)
+        orphan_id = await _seed_orphan_child(
+            db_session,
+            org_id=org_a_id,
+            org_slug=org_a_slug,
+            run_id=le_run_id,
+            created_minutes_ago=10,
+        )
+        abandoned_id = await _seed_abandoned_child(
+            db_session,
+            kind=JobKind.git_ref_audit,
+            org_id=org_b_id,
+            org_slug=org_b_slug,
+            run_id=audit_run_id,
+            backend_job_id="arq-gra-log-lost",
+            created_minutes_ago=600,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            await lifecycle_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    warnings = [
+        entry
+        for entry in captured
+        if entry["event"] == "Reaped stuck lifecycle queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["git_ref_audit_abandoned_count"] == 1
+
+    public_ids: dict[str, str] = {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            for label, job_id in (
+                ("orphan", orphan_id),
+                ("abandoned", abandoned_id),
+            ):
+                qj = await qj_store.get(job_id)
+                assert qj is not None
+                public_ids[label] = serialize_base32_id(qj.public_id)
+
+    by_public_id = {
+        entry["public_id"]: entry for entry in warnings[0]["reaped_jobs"]
+    }
+    assert by_public_id[public_ids["orphan"]] == {
+        "public_id": public_ids["orphan"],
+        "sweep": "lifecycle_eval_orphan",
+        "backend_job_id": None,
+    }
+    assert by_public_id[public_ids["abandoned"]] == {
+        "public_id": public_ids["abandoned"],
+        "sweep": "git_ref_audit_abandoned",
+        "backend_job_id": "arq-gra-log-lost",
+    }

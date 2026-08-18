@@ -22,14 +22,21 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import KeeperSyncRunStatus
-from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
+from docverse_server.domain.keeper_sync_run import (
+    KeeperSyncRun,
+    KeeperSyncRunWithActivity,
+)
 from docverse_server.exceptions import NotFoundError
 from docverse_server.metrics import KeeperSyncRunCompletedEvent
 from docverse_server.metrics.events import DocverseEvents
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.organization_store import OrganizationStore
 
-__all__ = ["maybe_finalise_run", "publish_run_completed"]
+__all__ = [
+    "fail_run_for_lost_discovery",
+    "maybe_finalise_run",
+    "publish_run_completed",
+]
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -87,6 +94,36 @@ async def maybe_finalise_run(
         run_id=run_id, new_status=new_status
     )
     return KeeperSyncRunWithActivity(run=finalised, activity=activity)
+
+
+async def fail_run_for_lost_discovery(
+    *,
+    run_store: KeeperSyncRunStore,
+    run_id: int,
+) -> KeeperSyncRun | None:
+    """Drive a run to ``failed`` after its discovery job was lost.
+
+    The terminal-status counterpart to :func:`maybe_finalise_run` for the
+    one case where child counters cannot describe the outcome: the
+    ``keeper_sync_run_discovery`` job never ran, so the run has no
+    children and never will. ``keeper_sync_run_discovery``'s own
+    ``except`` branch writes
+    :attr:`~docverse.models.KeeperSyncRunStatus.failed` when discovery
+    raises, and the reaper's abandoned-discovery sweep matches it —
+    otherwise the same loss reaches a different terminal status
+    depending on whether the worker died loudly or arq lost the job.
+
+    Returns the run when this call drove it terminal, or ``None`` when
+    the run is missing or already terminal (another finaliser won, or a
+    previous tick already reaped the same row). No metric is published
+    on this path, matching the worker's discovery-failure branch.
+    """
+    run = await run_store.get(run_id)
+    if run is None or run.status in _TERMINAL_STATUSES:
+        return None
+    return await run_store.transition_status(
+        run_id=run_id, new_status=KeeperSyncRunStatus.failed
+    )
 
 
 async def publish_run_completed(

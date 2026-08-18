@@ -113,7 +113,7 @@ async def test_mark_dashboard_sync_failed_full_mode(
         )
         # QueueJobStore.fail rejects rows still in queued, so put it in
         # in_progress first to mirror the worker's pre-failure state.
-        await queue_job_store.start(queue_job.id)
+        await queue_job_store.start_if_queued(queue_job.id)
 
     exc = RuntimeError("syncer exploded")
     await mark_dashboard_sync_failed(

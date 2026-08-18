@@ -47,6 +47,7 @@ async def post_dashboard_rebuild(
             org_slug=user.org.slug, project_slug=project_slug
         )
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
 
     if queue_job is None:
         msg = f"dashboard_build already queued for project {project_slug!r}"
@@ -75,6 +76,7 @@ async def post_org_dashboard_rebuild(
         service = context.factory.create_dashboard_build_enqueuer()
         results = await service.enqueue_for_org(org_id=user.org.id)
         await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
 
     # This batch enqueues one job per project, so there is no single job
     # resource to point at. Per RFC 7231 the 202 ``Location`` names a status

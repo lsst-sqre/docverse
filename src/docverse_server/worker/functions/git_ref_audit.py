@@ -104,7 +104,13 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         run_store = factory.create_git_ref_audit_run_store()
 
         async with session.begin():
-            await queue_job_store.start(queue_job_id)
+            # Late-delivery guard (PRD #538): a reaper may have already
+            # failed this row and finalised the parent run on its
+            # behalf, or arq may have re-delivered a job another worker
+            # is still running — re-auditing would double-count either
+            # way.
+            if await queue_job_store.start_if_queued(queue_job_id) is None:
+                return "skipped"
 
         # Collected inside the soft-delete transaction and published only
         # after it commits below: one (project_slug, action) per reaped

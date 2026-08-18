@@ -81,7 +81,7 @@ async def _seed_job(
                 keeper_sync_run_id=keeper_sync_run_id,
             )
             if start:
-                await store.start(job.id)
+                await store.start_if_queued(job.id)
             if phase is not None:
                 await store.update_phase(job.id, phase, progress=progress)
             await session.commit()

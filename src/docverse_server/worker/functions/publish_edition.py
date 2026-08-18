@@ -93,6 +93,20 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         project_store = factory.create_project_store()
         lock_service = factory.create_lock_service()
 
+        # Late-delivery guard first, ahead of every read (task #551).
+        # Both the pre-lock project resolve below and ``_load_resources``
+        # filter soft-deleted rows out, and the reap/deliver race this
+        # guard absorbs arrives alongside exactly such a delete:
+        # ``lifecycle_eval`` soft-deletes the edition whose publish the
+        # abandoned sweep just reaped. Resolving resources first would
+        # therefore raise ``NotFoundError`` into Sentry for a race the
+        # reaper is meant to swallow, so the guard runs before anything
+        # can fail to find a row — matching ``build_processing``'s
+        # guard-first pickup ordering.
+        async with session.begin():
+            if await queue_job_store.start_if_queued(queue_job_id) is None:
+                return "skipped"
+
         # Pre-lock: resolve project_id from the payload's project_slug so
         # the EDITION_UPDATE lock key can be computed. The arq payload
         # carries project_slug rather than project_id, so a small SELECT
@@ -285,8 +299,13 @@ async def _mark_publishing(
     resources: _PublishResources,
     queue_job_id: int,
 ) -> None:
-    """Transition the queue job, edition, and history to publishing."""
-    await queue_job_store.start(queue_job_id)
+    """Transition the queue job, edition, and history to publishing.
+
+    The queued → in_progress pickup itself already happened, before the
+    resource loads, so this only records the phase the picked-up job has
+    reached (see the late-delivery guard at the top of
+    :func:`publish_edition`).
+    """
     await queue_job_store.update_phase(
         queue_job_id,
         "publishing",

@@ -34,6 +34,7 @@ from safir.testing.sentry import (
 )
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
     BuildStatus,
@@ -86,11 +87,11 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.support.queue_dispatch import make_dispatcher
 from tests.worker.conftest import make_worker_ctx
 
 LTD_BASE = "https://keeper.lsst.codes"
@@ -792,6 +793,87 @@ async def test_keeper_sync_project_failure_marks_queue_job_and_finalises_run(
 
     # Nothing was copied to the destination on the failure path.
     assert object_store.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_skips_reaped_queue_job(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run child a reaper already failed is skipped, not raised on.
+
+    The late-delivery guard from PRD #538. LTD is deliberately left
+    unstubbed: if the guard let the job body run, the sync would raise
+    instead of returning cleanly.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        # Stand in for the abandoned sweep having failed this child
+        # (and rolled the run up) before arq delivered it.
+        queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+        await queue_job_store.fail(
+            queue_job_id,
+            errors={
+                "message": "Abandoned keeper_sync_project",
+                "type": "AbandonedQueueJob",
+            },
+        )
+
+    object_store = MockObjectStore()
+    _patch_factory_io(
+        monkeypatch, object_store=object_store, source_objects={}
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with capture_logs() as captured:
+        result = await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    assert result == "skipped"
+    warnings = [
+        event
+        for event in captured
+        if event.get("log_level") == "warning"
+        and event.get("queue_job_status") == JobStatus.failed.value
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["queue_job_kind"] == JobKind.keeper_sync_project.value
+
+    # No job body ran: nothing copied, the reaped row untouched, and the
+    # parent run left exactly as the reaper left it.
+    assert object_store.objects == {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = QueueJobStore(session=session, logger=_logger())
+            qj = await store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.date_started is None
+
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.in_progress
 
 
 @pytest.mark.asyncio
@@ -1525,8 +1607,10 @@ async def test_keeper_sync_project_dedups_dashboard_build_cascade(
         enqueuer = DashboardBuildEnqueuer(
             org_store=OrganizationStore(session=session, logger=_logger()),
             project_store=ProjectStore(session=session, logger=_logger()),
-            queue_backend=ArqQueueBackend(
-                arq_queue=mock_arq, default_queue_name="docverse:queue"
+            dispatcher=make_dispatcher(
+                session,
+                arq_queue=mock_arq,
+                default_queue_name="docverse:queue",
             ),
             queue_job_store=QueueJobStore(session=session, logger=_logger()),
             logger=_logger(),

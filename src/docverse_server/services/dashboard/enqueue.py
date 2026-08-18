@@ -8,13 +8,12 @@ import sentry_sdk
 import structlog
 
 from docverse.models.queue_enums import JobKind
-from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import NotFoundError
+from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 
 if TYPE_CHECKING:
@@ -43,13 +42,13 @@ class DashboardBuildEnqueuer:
         *,
         org_store: OrganizationStore,
         project_store: ProjectStore,
-        queue_backend: QueueBackend,
+        dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
         self._project_store = project_store
-        self._queue_backend = queue_backend
+        self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
         self._logger = logger
 
@@ -121,22 +120,17 @@ class DashboardBuildEnqueuer:
                 project_id=project_id,
             )
             return None
-        backend_job_id = await self._queue_backend.enqueue(
-            "dashboard_build",
-            {
+        self._dispatcher.defer(
+            queue_job=queue_job,
+            job_type="dashboard_build",
+            payload={
                 "org_id": org_id,
                 "org_slug": org.slug,
                 "project_id": project_id,
                 "project_slug": project.slug,
-                "queue_job_id": queue_job.id,
-                "queue_job_public_id": serialize_base32_id(
-                    queue_job.public_id
-                ),
             },
         )
-        return await self._queue_job_store.set_backend_job_id(
-            queue_job.id, backend_job_id
-        )
+        return queue_job
 
     async def enqueue_for_project_slug(
         self,
@@ -217,9 +211,11 @@ async def try_enqueue_dashboard_build_by_slug(
     """Enqueue one ``dashboard_build`` job in its own transaction.
 
     Exceptions are logged but never re-raised, so the caller's flow is
-    not broken by an enqueue failure. The enqueue runs in a freshly
-    started transaction on ``session`` — the caller must have already
-    committed any work it wants persisted.
+    not broken by an enqueue failure. The ``queue_jobs`` row is written
+    in a freshly started transaction on ``session`` — the caller must
+    have already committed any work it wants persisted — and only once
+    that transaction commits is the job handed to arq, so a worker
+    cannot be delivered a job whose row it can't yet see (task #550).
     """
     try:
         async with session.begin():
@@ -228,6 +224,7 @@ async def try_enqueue_dashboard_build_by_slug(
                 org_slug=org_slug, project_slug=project_slug
             )
             await session.commit()
+        await factory.queue_dispatcher.dispatch()
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
         logger.exception(
@@ -253,6 +250,7 @@ async def try_enqueue_dashboard_build_by_id(
                 org_id=org_id, project_id=project_id
             )
             await session.commit()
+        await factory.queue_dispatcher.dispatch()
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
         logger.exception(

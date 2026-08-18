@@ -16,6 +16,7 @@ from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.metrics import EditionPublishTrigger
+from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -27,7 +28,6 @@ from docverse_server.storage.pagination import (
     EditionBuildHistoryPositionCursor,
 )
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
 
@@ -44,7 +44,7 @@ class EditionService:
         logger: structlog.stdlib.BoundLogger,
         history_store: EditionBuildHistoryStore,
         build_store: BuildStore,
-        queue_backend: QueueBackend,
+        dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
     ) -> None:
         self._store = store
@@ -53,7 +53,7 @@ class EditionService:
         self._logger = logger
         self._history_store = history_store
         self._build_store = build_store
-        self._queue_backend = queue_backend
+        self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
 
     async def _resolve_org_project(
@@ -246,19 +246,16 @@ class EditionService:
             build_id=build.id,
             edition_id=edition.id,
         )
-        backend_job_id = await self._queue_backend.enqueue(
-            "publish_edition",
-            {
+        self._dispatcher.defer(
+            queue_job=child_job,
+            job_type="publish_edition",
+            payload={
                 "org_id": org_id,
                 "project_slug": project_slug,
                 "edition_id": edition.id,
                 "edition_slug": edition.slug,
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
-                "queue_job_id": child_job.id,
-                "queue_job_public_id": serialize_base32_id(
-                    child_job.public_id
-                ),
             },
         )
 
@@ -269,7 +266,6 @@ class EditionService:
             publish_queue_job_public_id=serialize_base32_id(
                 child_job.public_id
             ),
-            publish_backend_job_id=backend_job_id,
         )
         return updated_edition
 
@@ -408,19 +404,16 @@ class EditionService:
             build_id=build.id,
             edition_id=edition.id,
         )
-        backend_job_id = await self._queue_backend.enqueue(
-            "publish_edition",
-            {
+        self._dispatcher.defer(
+            queue_job=child_job,
+            job_type="publish_edition",
+            payload={
                 "org_id": org.id,
                 "project_slug": project_slug,
                 "edition_id": edition.id,
                 "edition_slug": edition.slug,
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
-                "queue_job_id": child_job.id,
-                "queue_job_public_id": serialize_base32_id(
-                    child_job.public_id
-                ),
                 # Tag the publish so its edition_published metric reports
                 # trigger=rollback rather than the default build fan-out
                 # (the queue job carries no keeper_sync_run_id). SQR-112 D7.
@@ -437,7 +430,6 @@ class EditionService:
             publish_queue_job_public_id=serialize_base32_id(
                 child_job.public_id
             ),
-            publish_backend_job_id=backend_job_id,
         )
         return org, project, updated_edition
 

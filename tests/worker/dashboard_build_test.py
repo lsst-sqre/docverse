@@ -11,6 +11,7 @@ import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
+from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -39,7 +40,10 @@ from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.storage.queue_job_store import (
+    LATE_DELIVERY_IN_PROGRESS_MESSAGE,
+    QueueJobStore,
+)
 from docverse_server.worker.functions.dashboard_build import dashboard_build
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
@@ -369,6 +373,185 @@ async def test_dashboard_build_publishes_dashboard_built_on_failure(
     assert event.object_count is None
     assert event.total_size_bytes is None
     assert event.elapsed >= timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_skips_reaped_queue_job(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job whose row a reaper already failed is skipped, not raised on.
+
+    The late-delivery guard from PRD #538: arq hands the worker a job
+    the abandoned sweep has already reaped, so the pickup path must log
+    a warning and return without touching the object store or the
+    terminal row.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-reaped",
+        )
+        # Stand in for the reaper's abandoned sweep having failed the row
+        # between enqueue and this (late) delivery.
+        await queue_job_store.fail(
+            queue_job.id,
+            errors={
+                "message": "Abandoned dashboard_build",
+                "type": "AbandonedQueueJob",
+            },
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-reaped",
+    )
+    queue_job_public_id = serialize_base32_id(queue_job.public_id)
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": queue_job_public_id,
+    }
+
+    with capture_logs() as captured:
+        result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "skipped"
+
+    warnings = [
+        event
+        for event in captured
+        if event.get("log_level") == "warning"
+        and event.get("queue_job_status") == JobStatus.failed.value
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["queue_job_id"] == queue_job_public_id
+    assert warnings[0]["queue_job_kind"] == JobKind.dashboard_build.value
+
+    # No job body ran: nothing uploaded, and the reaped row is untouched.
+    assert mock_store.objects == {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.date_started is None
+            assert job.phase is None
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_in_progress_redelivery_reports_to_sentry(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arq re-delivering a job already ``in_progress`` stays observable.
+
+    Task #547: the terminal-row skip above is expected reap fallout and
+    stays log-only, but an ``in_progress`` row means the default pool
+    re-delivered a job after worker death or a SIGTERM pod rotation. The
+    worker still skips the body — running it twice concurrently is worse
+    — but the pickup guard captures a warning-level Sentry event so a
+    crash-looping kind is visible immediately rather than hours later
+    when the reaper notices.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-redelivered",
+        )
+        # The first delivery picked the row up; the worker then died
+        # before it could complete or fail the row.
+        picked_up = await queue_job_store.start_if_queued(queue_job.id)
+        assert picked_up is not None
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(
+        http_client=http_client,
+        job_id="test-arq-dash-redelivered",
+    )
+    queue_job_public_id = serialize_base32_id(queue_job.public_id)
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": queue_job_public_id,
+    }
+
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        sentry_events = capture_events_fixture(monkeypatch)()
+        with capture_logs() as captured:
+            result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "skipped"
+
+    warnings = [
+        event
+        for event in captured
+        if event.get("log_level") == "warning"
+        and event.get("queue_job_status") == JobStatus.in_progress.value
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["queue_job_id"] == queue_job_public_id
+
+    assert len(sentry_events.errors) == 1
+    event = sentry_events.errors[0]
+    assert event["level"] == "warning"
+    assert event["message"] == LATE_DELIVERY_IN_PROGRESS_MESSAGE
+    assert event["tags"]["job_function"] == JobKind.dashboard_build.value
+    assert event["tags"]["job_current_state"] == JobStatus.in_progress.value
+    context = event["contexts"]["queue_job_late_delivery"]
+    assert context["job_public_id"] == queue_job_public_id
+    assert context["job_function"] == JobKind.dashboard_build.value
+    assert context["current_state"] == JobStatus.in_progress.value
+
+    # The body never ran: nothing uploaded and no phase progress written
+    # over the first delivery's bookkeeping.
+    assert mock_store.objects == {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.in_progress
+            assert job.phase is None
 
 
 class _RecordingMockObjectStore(MockObjectStore):

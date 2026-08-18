@@ -39,6 +39,17 @@ class SqlQueueJob(Base):
         String(256), nullable=True
     )
 
+    # Name of the arq queue ``backend_job_id`` was enqueued onto. arq
+    # resolves a job's *status* through its queue's sorted set, so the
+    # abandoned reaper sweep (PRD #538) must ask the right queue or a
+    # healthy job reads as lost. Nullable because rows predating this
+    # column cannot say; those fall back to probing every pool queue
+    # (see ``ArqQueueBackend.get_job_metadata``). Always NULL when
+    # ``backend_job_id`` is NULL — nothing has been enqueued yet.
+    backend_queue_name: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
 
     status: Mapped[str] = mapped_column(

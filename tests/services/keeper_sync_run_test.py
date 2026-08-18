@@ -22,13 +22,9 @@ from docverse_server.domain.base32id import (
 )
 from docverse_server.domain.queue import JobKind
 from docverse_server.exceptions import ConflictError, NotFoundError
-from docverse_server.services.keeper_sync_run import (
-    KEEPER_SYNC_QUEUE_NAME,
-    KeeperSyncRunService,
-)
-from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.factory import Factory
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.storage.organization_store import OrganizationStore
-from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from tests.support.arq_testing import register_queue
 
@@ -61,18 +57,20 @@ async def _seed_org(
     return org.id, org.slug
 
 
-def _make_service(
+def _make_factory(
     *, db_session: AsyncSession, mock_arq: MockArqQueue
-) -> KeeperSyncRunService:
-    logger = _logger()
-    return KeeperSyncRunService(
-        org_store=OrganizationStore(session=db_session, logger=logger),
-        run_store=KeeperSyncRunStore(session=db_session, logger=logger),
-        queue_backend=ArqQueueBackend(
-            arq_queue=mock_arq, default_queue_name="docverse:queue"
-        ),
-        queue_job_store=QueueJobStore(session=db_session, logger=logger),
-        logger=logger,
+) -> Factory:
+    """Build a factory so the service shares its queue dispatcher.
+
+    The enqueue is deferred until after the caller commits (task
+    #550), so tests that assert on arq have to reach the same
+    ``QueueDispatcher`` the service deferred onto.
+    """
+    return Factory(
+        session=db_session,
+        logger=_logger(),
+        arq_queue=mock_arq,
+        default_queue_name="docverse:queue",
     )
 
 
@@ -86,14 +84,17 @@ async def test_start_run_creates_row_and_enqueues_discovery(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session)
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         run, queue_job = await service.start_run(org_slug=org_slug)
         await db_session.commit()
+    # The handler's post-commit hand-off (task #550).
+    (stamped,) = await factory.queue_dispatcher.dispatch()
 
     assert run.status == KeeperSyncRunStatus.pending
     assert queue_job.kind == JobKind.keeper_sync_run_discovery
     assert queue_job.keeper_sync_run_id == run.id
-    assert queue_job.backend_job_id is not None
+    assert stamped.backend_job_id is not None
 
     # Verify the enqueue went to the dedicated queue.
     sync_queue = mock_arq._job_metadata[KEEPER_SYNC_QUEUE_NAME]
@@ -110,7 +111,8 @@ async def test_start_run_409_when_disabled(
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, enabled=False)
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(ConflictError):
             await service.start_run(org_slug=org_slug)
 
@@ -125,12 +127,14 @@ async def test_start_run_409_when_concurrent(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session)
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         await service.start_run(org_slug=org_slug)
         await db_session.commit()
 
     async with db_session.begin():
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(ConflictError):
             await service.start_run(org_slug=org_slug)
 
@@ -145,7 +149,8 @@ async def test_get_run_returns_aggregate_counters(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         run, _ = await service.start_run(org_slug=org_slug)
         # Seed three more queue_jobs in mixed states.
         queue_job_store = QueueJobStore(session=db_session, logger=_logger())
@@ -168,7 +173,8 @@ async def test_get_run_returns_aggregate_counters(
         await db_session.commit()
 
     async with db_session.begin():
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         result = await service.get_run(
             org_slug=org_slug, public_id=run.public_id
         )
@@ -188,7 +194,8 @@ async def test_get_run_404_for_unknown_run(
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session)
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(NotFoundError):
             await service.get_run(org_slug=org_slug, public_id=9999)
 
@@ -208,16 +215,19 @@ async def test_refresh_project_enqueues_keeper_sync_project(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, project_slugs=["pipelines"])
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         queue_job = await service.refresh_project(
             org_slug=org_slug, ltd_slug="pipelines"
         )
         await db_session.commit()
+    # The handler's post-commit hand-off (task #550).
+    (stamped,) = await factory.queue_dispatcher.dispatch()
 
     assert queue_job.kind == JobKind.keeper_sync_project
     assert queue_job.keeper_sync_run_id is None
     assert queue_job.subject_label == "pipelines"
-    assert queue_job.backend_job_id is not None
+    assert stamped.backend_job_id is not None
 
     # Enqueue went to the dedicated keeper-sync queue and the payload
     # omits ``run_id`` so the receiving worker takes the run-less path.
@@ -239,7 +249,8 @@ async def test_refresh_project_404_when_disabled(
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, enabled=False)
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(NotFoundError):
             await service.refresh_project(
                 org_slug=org_slug, ltd_slug="pipelines"
@@ -256,7 +267,8 @@ async def test_refresh_project_404_when_slug_outside_allowlist(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, project_slugs=["pipelines"])
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(NotFoundError):
             await service.refresh_project(
                 org_slug=org_slug, ltd_slug="not-allowed"
@@ -278,13 +290,15 @@ async def test_refresh_project_409_when_active_job_exists(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, project_slugs=["pipelines"])
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         # First call enqueues, leaves a queued row.
         await service.refresh_project(org_slug=org_slug, ltd_slug="pipelines")
         await db_session.commit()
 
     async with db_session.begin():
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(ConflictError):
             await service.refresh_project(
                 org_slug=org_slug, ltd_slug="pipelines"
@@ -331,7 +345,8 @@ async def test_refresh_project_409_when_tier_cron_job_already_active(
         await db_session.commit()
 
     async with db_session.begin():
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         with pytest.raises(ConflictError):
             await service.refresh_project(
                 org_slug=org_slug, ltd_slug="pipelines"
@@ -348,7 +363,8 @@ async def test_refresh_project_wildcard_allowlist_admits_any_slug(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     async with db_session.begin():
         _, org_slug = await _seed_org(db_session, project_slugs="*")
-        service = _make_service(db_session=db_session, mock_arq=mock_arq)
+        factory = _make_factory(db_session=db_session, mock_arq=mock_arq)
+        service = factory.create_keeper_sync_run_service()
         queue_job = await service.refresh_project(
             org_slug=org_slug, ltd_slug="any-slug-at-all"
         )
