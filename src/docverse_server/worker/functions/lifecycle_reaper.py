@@ -34,6 +34,9 @@ from docverse_server.services.git_ref_audit_finalisation import (
 from docverse_server.services.lifecycle_finalisation import (
     maybe_finalise_lifecycle_run,
 )
+from docverse_server.worker.functions._reaper_log import (
+    create_reaped_jobs_payload,
+)
 
 if TYPE_CHECKING:
     from docverse_server.storage.git_ref_audit_run_store import (
@@ -280,18 +283,7 @@ async def lifecycle_reaper(ctx: dict[str, Any]) -> str:
                 git_ref_audit_run_ids=sorted(
                     r for r in audit_run_ids if r is not None
                 ),
-                # Per-row detail so a postmortem can tell which sweep
-                # claimed a row and cross-reference the arq job ID that
-                # went missing, without querying the database.
-                reaped_jobs=[
-                    {
-                        "public_id": qj.public_id,
-                        "sweep": sweep,
-                        "backend_job_id": qj.backend_job_id,
-                    }
-                    for sweep, jobs in by_sweep
-                    for qj in jobs
-                ],
+                reaped_jobs=create_reaped_jobs_payload(by_sweep),
             )
         else:
             logger.debug("No stuck lifecycle queue jobs to reap")

@@ -26,6 +26,10 @@ from safir.dependencies.db_session import db_session_dependency
 
 from docverse_server.config import config
 from docverse_server.domain.queue import JobKind
+from docverse_server.worker.functions._reaper_log import (
+    create_reaped_jobs_payload,
+    create_reaped_public_ids,
+)
 
 __all__ = ["ORPHAN_IDLE_WINDOW", "sweep_runless_kind"]
 
@@ -137,21 +141,8 @@ async def sweep_runless_kind(
                 silent_count=len(silent),
                 orphan_count=len(orphan),
                 abandoned_count=len(abandoned),
-                reaped_public_ids=sorted(
-                    qj.public_id for jobs in by_sweep for qj in jobs[1]
-                ),
-                # Per-row detail so a postmortem can tell which sweep
-                # claimed a row and cross-reference the arq job ID that
-                # went missing, without querying the database.
-                reaped_jobs=[
-                    {
-                        "public_id": qj.public_id,
-                        "sweep": sweep,
-                        "backend_job_id": qj.backend_job_id,
-                    }
-                    for sweep, jobs in by_sweep
-                    for qj in jobs
-                ],
+                reaped_public_ids=create_reaped_public_ids(by_sweep),
+                reaped_jobs=create_reaped_jobs_payload(by_sweep),
             )
         else:
             logger.debug(debug_event)

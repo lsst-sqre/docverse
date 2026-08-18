@@ -39,6 +39,7 @@ from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobKind, JobStatus
@@ -419,9 +420,10 @@ async def test_reaper_warning_includes_count_and_public_ids(
             orphan_qj = await qj_store.get(orphan_id)
             assert silent_qj is not None
             assert orphan_qj is not None
-            assert {silent_qj.public_id, orphan_qj.public_id} == set(
-                warnings[0]["reaped_public_ids"]
-            )
+            assert {
+                serialize_base32_id(silent_qj.public_id),
+                serialize_base32_id(orphan_qj.public_id),
+            } == set(warnings[0]["reaped_public_ids"])
 
 
 @pytest.mark.asyncio
@@ -864,7 +866,7 @@ async def test_reaper_warning_names_sweep_and_backend_job_id(
     assert warnings[0]["orphan_count"] == 1
     assert warnings[0]["abandoned_count"] == 1
 
-    public_ids: dict[str, int] = {}
+    public_ids: dict[str, str] = {}
     async for session in db_session_dependency():
         async with session.begin():
             qj_store = QueueJobStore(session=session, logger=_logger())
@@ -875,7 +877,7 @@ async def test_reaper_warning_names_sweep_and_backend_job_id(
             ):
                 qj = await qj_store.get(job_id)
                 assert qj is not None
-                public_ids[label] = qj.public_id
+                public_ids[label] = serialize_base32_id(qj.public_id)
 
     by_public_id = {
         entry["public_id"]: entry for entry in warnings[0]["reaped_jobs"]
@@ -967,3 +969,71 @@ async def test_dashboard_build_reaper_unwedges_the_project(
     assert fresh is not None
     assert fresh.id != wedged_id
     assert fresh.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_reaped_jobs_ids_grep_against_the_skip_warning(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The postmortem payload's ids match what a late delivery logs.
+
+    ``reaped_jobs`` exists so an operator can cross-reference a job that
+    quietly did nothing against the sweep that claimed it. That only
+    works if both sides spell the id the same way: the pickup guard logs
+    ``queue_job_id`` as a base32 string, so the reaper's payload must
+    too. Logging the raw ``int`` behind
+    :class:`~docverse_server.domain.base32id.Base32Id` — whose
+    serializer only fires in Pydantic JSON dumps, not in structlog
+    context — makes the grep come back empty (task #553).
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="dbr-grep")
+        reaped_id = await _seed_abandoned_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            backend_job_id="arq-grep-lost",
+            created_minutes_ago=60,
+            project_id=9090,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as reaper_logs:
+            await dashboard_build_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    warnings = [
+        entry
+        for entry in reaper_logs
+        if entry.get("event") == "Reaped stuck dashboard_build queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert len(warnings[0]["reaped_jobs"]) == 1
+    reaped_public_id = warnings[0]["reaped_jobs"][0]["public_id"]
+
+    # The late delivery arq never cancelled: the same row, handed to a
+    # worker after the sweep failed it.
+    row_public_id: int | None = None
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            with capture_logs() as pickup_logs:
+                assert await qj_store.start_if_queued(reaped_id) is None
+            row = await qj_store.get(reaped_id)
+            assert row is not None
+            row_public_id = row.public_id
+
+    skips = [
+        entry
+        for entry in pickup_logs
+        if entry.get("event") == "Skipping late-delivered queue job"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["queue_job_id"] == reaped_public_id
+    # Both sides carry the id an operator actually sees in the API, not
+    # the internal integer.
+    assert validate_base32_id(reaped_public_id) == row_public_id

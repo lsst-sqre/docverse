@@ -36,6 +36,7 @@ from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
@@ -1095,7 +1096,7 @@ async def test_reaper_logs_backend_job_id_and_matched_sweep(
     assert len(warnings) == 1
     assert warnings[0]["git_ref_audit_abandoned_count"] == 1
 
-    public_ids: dict[str, int] = {}
+    public_ids: dict[str, str] = {}
     async for session in db_session_dependency():
         async with session.begin():
             qj_store = QueueJobStore(session=session, logger=_logger())
@@ -1105,7 +1106,7 @@ async def test_reaper_logs_backend_job_id_and_matched_sweep(
             ):
                 qj = await qj_store.get(job_id)
                 assert qj is not None
-                public_ids[label] = qj.public_id
+                public_ids[label] = serialize_base32_id(qj.public_id)
 
     by_public_id = {
         entry["public_id"]: entry for entry in warnings[0]["reaped_jobs"]

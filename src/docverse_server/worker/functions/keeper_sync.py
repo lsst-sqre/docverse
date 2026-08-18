@@ -103,6 +103,9 @@ from docverse_server.storage.ltd import (
 )
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._reaper_log import (
+    create_reaped_jobs_payload,
+)
 from docverse_server.worker.queues import KEEPER_SYNC_QUEUE_NAME
 
 # Window before a queued child with no ``backend_job_id`` is treated as
@@ -414,18 +417,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                 run_attributed_abandoned_count=len(run_abandoned),
                 run_discovery_abandoned_count=len(discovery_abandoned),
                 run_ids=sorted(r for r in run_ids if r is not None),
-                # Per-row detail so a postmortem can tell which sweep
-                # claimed a row and cross-reference the arq job ID that
-                # went missing, without querying the database.
-                reaped_jobs=[
-                    {
-                        "public_id": qj.public_id,
-                        "sweep": sweep,
-                        "backend_job_id": qj.backend_job_id,
-                    }
-                    for sweep, jobs in by_sweep
-                    for qj in jobs
-                ],
+                reaped_jobs=create_reaped_jobs_payload(by_sweep),
             )
         else:
             logger.debug("No stuck keeper-sync queue jobs to reap")
