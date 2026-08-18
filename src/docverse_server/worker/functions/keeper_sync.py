@@ -101,11 +101,12 @@ from docverse_server.storage.ltd import (
     LtdEdition,
     LtdNotFoundError,
 )
+from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.queues import KEEPER_SYNC_QUEUE_NAME
 
 # Window before a queued child with no ``backend_job_id`` is treated as
-# orphaned by ``_reconcile_orphan_children``. Long enough to never race
+# orphaned by ``_reconcile_run_children``. Long enough to never race
 # a healthy concurrent discovery worker that's mid-fanout, short enough
 # to free a stuck run on the next discovery attempt.
 _ORPHAN_IDLE_WINDOW = timedelta(minutes=5)
@@ -305,12 +306,13 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                     idle_after=threshold
                 )
             )
-            # No ``run_id``: the reaper has no run in hand, so it sweeps
-            # every run-attributed row at once and reads the runs that
-            # need finalising back off the reaped rows below.
+            # ``run_id=None``: the reaper has no run in hand, so it
+            # sweeps every run-attributed row at once and reads the runs
+            # that need finalising back off the reaped rows below. The
+            # discovery worker takes the scoped mode instead.
             run_candidates = (
                 await queue_job_store.select_abandoned_run_children(
-                    idle_after=threshold
+                    run_id=None, idle_after=threshold
                 )
             )
             discovery_candidates = (
@@ -438,6 +440,16 @@ async def keeper_sync_run_discovery(
 ) -> str:
     """Fan out one ``keeper_sync_project`` job per in-scope LTD product.
 
+    Before fanning out, :func:`_reconcile_run_children` clears the
+    children a previous attempt at this same run stranded — a
+    re-delivered discovery would otherwise skip each stranded child's
+    slug, because a ``queued`` row holds the per-subject active-job
+    mutex the fan-out's pre-check consults. That pass asks the queue
+    backend about candidates it cannot judge from the row alone, so it
+    is also why this function needs a
+    :class:`~docverse_server.storage.queue_backend.QueueBackend`; an
+    unreachable backend costs it only the arq-verified half.
+
     Parameters
     ----------
     ctx
@@ -475,11 +487,13 @@ async def keeper_sync_run_discovery(
             # running. The discovery must not fan out a second time.
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
-            await _reconcile_orphan_children(
-                queue_job_store=queue_job_store,
-                run_id=run_id,
-                logger=logger,
-            )
+        await _reconcile_run_children(
+            session=session,
+            queue_job_store=queue_job_store,
+            queue_backend=factory.create_queue_backend(),
+            run_id=run_id,
+            logger=logger,
+        )
 
         try:
             config = await _load_config_snapshot(
@@ -1552,7 +1566,7 @@ async def _enqueue_children(
     SQL commit and ``arq_queue.enqueue``, the row sits in ``queued``
     with ``backend_job_id IS NULL`` and no arq job will ever pick it
     up — pending forever, blocking finalisation. The next discovery
-    attempt sweeps these rows via ``_reconcile_orphan_children`` once
+    attempt sweeps these rows via ``_reconcile_run_children`` once
     they age past ``_ORPHAN_IDLE_WINDOW``.
 
     Returns the number of slugs that were enqueued (skipped slugs do
@@ -1624,30 +1638,71 @@ async def _enqueue_children(
     return enqueued
 
 
-async def _reconcile_orphan_children(
+async def _reconcile_run_children(
     *,
+    session: AsyncSession,
     queue_job_store: QueueJobStore,
+    queue_backend: QueueBackend,
     run_id: int,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Fail any orphan child rows left by a previous discovery attempt.
+    """Fail this run's dead child rows before the fan-out re-runs.
 
-    ``_enqueue_children`` commits each child ``queue_jobs`` row before
-    calling ``arq_queue.enqueue``, so a worker crash in that window
-    leaves an orphan: ``status='queued'``, ``backend_job_id IS NULL``,
-    no arq job ever scheduled. Without reconciliation the orphan
-    counts toward ``pending_count`` forever and the run can never
-    finalise. We sweep them at the top of each discovery attempt so a
-    retried (or operator-replayed) discovery can finish cleanly.
+    A re-delivered (or operator-replayed) discovery re-enters the
+    fan-out, but every child its earlier attempt left stranded in
+    ``queued`` still holds
+    ``idx_queue_jobs_keeper_sync_project_subject_active_uq``, so
+    ``_enqueue_children``'s ``has_active_for_subject`` pre-check skips
+    that slug and the row keeps counting toward the run's
+    ``pending_count``. Both of the two ways a child strands are swept
+    here, mirroring the cron reaper's populations one run at a time:
+
+    * **Orphans.** ``_enqueue_children`` commits each child row before
+      calling ``arq_queue.enqueue``, so a crash in that window leaves
+      ``status='queued'``, ``backend_job_id IS NULL``, and no arq job.
+      Aged out against :data:`_ORPHAN_IDLE_WINDOW`, which is short
+      because "never reached arq" is decidable from the row alone.
+    * **Abandoned children.** The row *did* reach arq and arq then lost
+      the job (PRD #538). Age cannot distinguish that from a job merely
+      backed up behind a saturated pool, so each candidate is verified
+      against the queue backend and failed only when the backend has no
+      record of it — and the threshold is the reaper's
+      ``keeper_sync_reaper_threshold_seconds`` rather than the orphan
+      window, so both sweeps of this population judge a row by the same
+      clock.
+
+    Runs in three steps rather than one transaction, for the reason
+    :func:`keeper_sync_reaper` splits its tick (task #548): the backend
+    round trips happen with nothing open, so a stalled Redis can neither
+    roll back the orphan reaps nor hold row locks while the discovery
+    burns down its arq timeout. A backend that is unreachable outright
+    soft-aborts inside
+    :meth:`~QueueJobStore.verify_abandoned_candidates` — it warns,
+    reaps nothing, and leaves the discovery to fan out whatever slugs
+    are not wedged; the cron reaper retries the population later.
     """
-    failed = await queue_job_store.fail_orphaned_run_children(
-        run_id=run_id, idle_after=_ORPHAN_IDLE_WINDOW
+    abandoned_after = timedelta(
+        seconds=config.keeper_sync_reaper_threshold_seconds
     )
-    if failed:
+    async with session.begin():
+        orphans = await queue_job_store.fail_orphaned_run_children(
+            run_id=run_id, idle_after=_ORPHAN_IDLE_WINDOW
+        )
+        candidates = await queue_job_store.select_abandoned_run_children(
+            run_id=run_id, idle_after=abandoned_after
+        )
+    reaps = await queue_job_store.verify_abandoned_candidates(
+        candidates, queue_backend=queue_backend
+    )
+    async with session.begin():
+        abandoned = await queue_job_store.apply_abandoned_reaps(reaps)
+    if orphans or abandoned:
         logger.warning(
-            "Reconciled orphan keeper-sync child queue jobs",
-            orphan_count=len(failed),
-            orphan_ids=[job.id for job in failed],
+            "Reconciled dead keeper-sync child queue jobs",
+            orphan_count=len(orphans),
+            orphan_ids=[job.id for job in orphans],
+            abandoned_count=len(abandoned),
+            abandoned_ids=[job.id for job in abandoned],
         )
 
 

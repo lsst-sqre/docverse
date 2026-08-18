@@ -1280,7 +1280,7 @@ class QueueJobStore:
     async def fail_abandoned_run_children(
         self,
         *,
-        run_id: int | None = None,
+        run_id: int | None,
         idle_after: timedelta,
         queue_backend: QueueBackend,
     ) -> list[QueueJob]:
@@ -1304,12 +1304,17 @@ class QueueJobStore:
         ``partial_failure`` from the child counters, where a
         worker-failed discovery fails the whole run.
 
-        ``run_id`` narrows the sweep to one run for the discovery-side
-        reconciliation shape; ``None`` (the cron reaper's mode) sweeps
-        every run-attributed row in one query, since the reaper has no
-        run in hand and would otherwise have to enumerate runs just to
-        find the ones that are wedged. Callers in that mode take the
-        affected run IDs from the returned rows.
+        ``run_id`` narrows the sweep to one run — the discovery-side
+        reconciliation shape, where ``_reconcile_run_children`` clears
+        the run's own wedged children before re-fanning out. ``None``
+        (the cron reaper's mode) sweeps every run-attributed row in one
+        query, since the reaper has no run in hand and would otherwise
+        have to enumerate runs just to find the ones that are wedged;
+        callers in that mode take the affected run IDs from the returned
+        rows. It has no default: :meth:`fail_orphaned_run_children`, the
+        orphan sibling this mirrors, makes every caller name its run, and
+        a silent default here would let a caller that meant one run sweep
+        every org's.
 
         Candidates are verified against the queue backend before being
         failed; see :meth:`verify_abandoned_candidates` for the shared
@@ -1325,7 +1330,7 @@ class QueueJobStore:
     async def select_abandoned_run_children(
         self,
         *,
-        run_id: int | None = None,
+        run_id: int | None,
         idle_after: timedelta,
     ) -> AbandonedCandidates:
         """Select unverified abandoned keeper-sync child candidates.

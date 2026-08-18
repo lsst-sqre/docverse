@@ -2388,6 +2388,7 @@ async def test_fail_abandoned_jobs_skips_run_attributed_rows(
         assert survivor.status == JobStatus.queued
         # The single owner does claim it, so the row is not stranded.
         claimed = await store.fail_abandoned_run_children(
+            run_id=None,
             idle_after=timedelta(minutes=90),
             queue_backend=_StubQueueBackend(),
         )
@@ -3088,6 +3089,7 @@ async def test_fail_abandoned_run_children_skips_tier_cron_rows(
             queue_backend=backend,
         )
         all_runs = await store.fail_abandoned_run_children(
+            run_id=None,
             idle_after=timedelta(minutes=90),
             queue_backend=backend,
         )
@@ -3162,6 +3164,7 @@ async def test_fail_abandoned_run_children_skips_discovery_rows(
             queue_backend=backend,
         )
         all_runs = await store.fail_abandoned_run_children(
+            run_id=None,
             idle_after=timedelta(minutes=90),
             queue_backend=backend,
         )
@@ -3255,6 +3258,7 @@ async def test_fail_abandoned_run_children_without_run_id_sweeps_all_runs(
         )
 
         failed = await store.fail_abandoned_run_children(
+            run_id=None,
             idle_after=timedelta(minutes=90),
             queue_backend=_StubQueueBackend(),
         )
