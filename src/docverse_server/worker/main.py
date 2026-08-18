@@ -182,6 +182,7 @@ async def initialize_worker_db_pool(*, max_jobs: int) -> None:
         config.database_password,
         pool_size=sizing.pool_size,
         max_overflow=sizing.max_overflow,
+        pool_pre_ping=True,
     )
 
 

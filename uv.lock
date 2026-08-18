@@ -852,7 +852,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "rubin-gafaelfawr" },
     { name = "rubin-repertoire" },
-    { name = "safir", extras = ["arq", "db", "kafka"], specifier = ">=13" },
+    { name = "safir", extras = ["arq", "db", "kafka"], specifier = ">=15.2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]
 

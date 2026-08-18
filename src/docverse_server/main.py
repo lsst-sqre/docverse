@@ -71,6 +71,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await db_session_dependency.initialize(
         config.database_url,
         config.database_password,
+        pool_pre_ping=True,
     )
     await arq_dependency.initialize(
         mode=config.arq_mode,
