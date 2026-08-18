@@ -79,6 +79,7 @@ from docverse_server.services.keeper_sync.service import (
     ProjectSyncResult,
 )
 from docverse_server.services.keeper_sync_finalisation import (
+    fail_run_for_lost_discovery,
     maybe_finalise_run,
     publish_run_completed,
 )
@@ -171,7 +172,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     ``keeper_sync_run_id`` so they have no run finalisation hook, but
     the same OOM / orphan windows wedge their per-subject
     :meth:`~QueueJobStore.has_active_for_subject` mutex. The reaper
-    therefore sweeps three populations in one transaction:
+    therefore sweeps these populations in one transaction:
 
     1. Run-attributed silent rows
        (:meth:`QueueJobStore.fail_silent_run_children`) — followed by
@@ -194,13 +195,23 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
        loss mode under a run, folded into the same ``run_ids``
        finalisation pass as population 1 so an abandoned child stops
        blocking its parent run exactly like an orphaned one does.
+    6. Abandoned run discoveries
+       (:meth:`QueueJobStore.fail_abandoned_run_discovery`) — the run's
+       own fan-out job, lost by arq before it enqueued anything. It is
+       run-attributed like population 5 but is not a child, so it gets
+       its own sweep, its own ``errors.message``, and
+       :func:`fail_run_for_lost_discovery` rather than
+       :func:`maybe_finalise_run`: with no children to aggregate, the
+       run fails outright the way a worker-raised discovery failure
+       fails it. Until that happens ``has_non_terminal_run`` 409-blocks
+       every later run for the org.
 
-    Populations 4 and 5 ask the queue backend whether arq still knows
+    Populations 4, 5, and 6 ask the queue backend whether arq still knows
     each candidate before failing it, so a job merely backed up behind a
     saturated pool is never cancelled. That is the reaper's only
     dependency beyond the queue-job store; when the backend is
-    unreachable those two passes abort for the tick (logging a warning
-    and mutating nothing) while the first three proceed.
+    unreachable those passes abort for the tick (logging a warning and
+    mutating nothing) while the first three proceed.
 
     Thresholds: the silent paths use
     ``config.keeper_sync_reaper_threshold_seconds``, which defaults to
@@ -257,8 +268,31 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             run_abandoned = await queue_job_store.fail_abandoned_run_children(
                 idle_after=threshold, queue_backend=queue_backend
             )
+            discovery_abandoned = (
+                await queue_job_store.fail_abandoned_run_discovery(
+                    idle_after=threshold, queue_backend=queue_backend
+                )
+            )
+            # A lost discovery means the run never fanned out, so it
+            # fails outright — the terminal status
+            # ``keeper_sync_run_discovery``'s own except-branch writes —
+            # instead of going through ``maybe_finalise_run``, which
+            # would read the lone discovery row as a failed child and
+            # settle on ``partial_failure``. Doing it before the
+            # finalisation loop leaves those runs terminal, so the loop's
+            # own terminal pre-check turns into a no-op for them.
+            discovery_run_ids = {
+                qj.keeper_sync_run_id for qj in discovery_abandoned
+            }
+            for run_id in discovery_run_ids:
+                if run_id is None:
+                    continue
+                await fail_run_for_lost_discovery(
+                    run_store=run_store, run_id=run_id
+                )
             run_ids = {
-                qj.keeper_sync_run_id for qj in (*reaped, *run_abandoned)
+                qj.keeper_sync_run_id
+                for qj in (*reaped, *run_abandoned, *discovery_abandoned)
             }
             for run_id in run_ids:
                 if run_id is None:
@@ -287,6 +321,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             ("tier_cron_orphan", tier_orphans),
             ("tier_cron_abandoned", tier_abandoned),
             ("run_attributed_abandoned", run_abandoned),
+            ("run_discovery_abandoned", discovery_abandoned),
         )
         total_reaped = sum(len(jobs) for _, jobs in by_sweep)
         if total_reaped:
@@ -298,6 +333,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                 tier_cron_orphan_count=len(tier_orphans),
                 tier_cron_abandoned_count=len(tier_abandoned),
                 run_attributed_abandoned_count=len(run_abandoned),
+                run_discovery_abandoned_count=len(discovery_abandoned),
                 run_ids=sorted(r for r in run_ids if r is not None),
                 # Per-row detail so a postmortem can tell which sweep
                 # claimed a row and cross-reference the arq job ID that

@@ -36,6 +36,9 @@ from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import keeper_sync_reaper
+from docverse_server.worker.functions.publish_edition_reaper import (
+    publish_edition_reaper,
+)
 from tests.support.arq_testing import register_queue
 from tests.worker.conftest import make_worker_ctx
 
@@ -374,8 +377,9 @@ async def _seed_abandoned_row(
     created_minutes_ago: int,
     run_id: int | None = None,
     subject_label: str | None = None,
+    kind: JobKind = JobKind.keeper_sync_project,
 ) -> int:
-    """Create a queued keeper_sync_project row with an arq job ID.
+    """Create a queued row of ``kind`` with an arq job ID.
 
     The PRD #538 shape: the row reached arq (so the orphan sweeps, which
     require ``backend_job_id IS NULL``, cannot see it) but never started
@@ -383,7 +387,7 @@ async def _seed_abandoned_row(
     """
     queue_job_store = QueueJobStore(session=db_session, logger=_logger())
     job = await queue_job_store.create(
-        kind=JobKind.keeper_sync_project,
+        kind=kind,
         org_id=org_id,
         keeper_sync_run_id=run_id,
         subject_label=subject_label,
@@ -489,6 +493,173 @@ async def test_reaper_fails_abandoned_run_child_and_finalises_run(
             assert run is not None
             assert run.status == KeeperSyncRunStatus.partial_failure
             assert run.date_finished is not None
+
+
+@pytest.mark.asyncio
+async def test_run_attributed_publish_row_reaped_only_by_keeper_sync(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A cascaded ``publish_edition`` row has one reaper, not two.
+
+    A keeper-sync project sync enqueues ``publish_edition`` jobs stamped
+    with the run's id. Both ``publish_edition_reaper`` and the
+    keeper-sync reaper used to match such a row; only the latter rolls
+    the parent run up, so when the run-less sweep won, the run stayed
+    ``in_progress`` forever and ``has_non_terminal_run`` 409-blocked
+    every later run for the org.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-reaper-per-run")
+        run_id = await _seed_run(db_session, org_id=org_id)
+        publish_id = await _seed_abandoned_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-publish-lost",
+            # Past the 4 h publish_edition threshold as well as the
+            # keeper-sync one, so scoping — not age — decides the owner.
+            created_minutes_ago=600,
+            run_id=run_id,
+            kind=JobKind.publish_edition,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        await publish_edition_reaper(ctx)
+
+        async for session in db_session_dependency():
+            async with session.begin():
+                qj_store = QueueJobStore(session=session, logger=_logger())
+                untouched = await qj_store.get(publish_id)
+                assert untouched is not None
+                assert untouched.status == JobStatus.queued
+                assert untouched.errors is None
+            break
+
+        await keeper_sync_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            reaped = await qj_store.get(publish_id)
+            assert reaped is not None
+            assert reaped.status == JobStatus.failed
+            assert reaped.errors is not None
+            assert reaped.errors["type"] == "AbandonedQueueJob"
+
+            # Last pending child gone, so the run finalises rather than
+            # sitting in ``in_progress`` forever.
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+            assert run.date_finished is not None
+            assert not await run_store.has_non_terminal_run(org_id=org_id)
+
+
+async def _seed_abandoned_discovery(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    run_id: int,
+    backend_job_id: str,
+    created_minutes_ago: int,
+) -> int:
+    """Create the run's own queued ``keeper_sync_run_discovery`` row.
+
+    ``KeeperSyncRunService.start_run`` writes this row with the run's id
+    and then stamps the arq job ID on it, so a discovery job arq loses
+    leaves exactly this shape behind.
+    """
+    queue_job_store = QueueJobStore(session=db_session, logger=_logger())
+    job = await queue_job_store.create(
+        kind=JobKind.keeper_sync_run_discovery,
+        org_id=org_id,
+        keeper_sync_run_id=run_id,
+        subject_label="discovery for ks-org",
+        backend_job_id=backend_job_id,
+    )
+    row = await db_session.get(SqlQueueJob, job.id)
+    assert row is not None
+    row.date_created = datetime.now(tz=UTC) - timedelta(
+        minutes=created_minutes_ago
+    )
+    await db_session.flush()
+    return job.id
+
+
+@pytest.mark.asyncio
+async def test_reaper_fails_abandoned_discovery_and_fails_its_run(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A lost discovery row fails its run outright and clears the 409 wedge.
+
+    The run never fanned out, so the reaper must reach the same terminal
+    status ``keeper_sync_run_discovery``'s own failure branch writes
+    (``failed``) rather than the ``partial_failure`` a child roll-up
+    would compute. Until the run is terminal, ``has_non_terminal_run``
+    409-blocks every later ``POST .../runs`` for the org.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-reaper-ab-disc")
+        # ``pending``: a lost discovery never got to flip the run to
+        # ``in_progress`` with its first child enqueue.
+        run_id = await _seed_run(db_session, org_id=org_id, status="pending")
+        discovery_id = await _seed_abandoned_discovery(
+            db_session,
+            org_id=org_id,
+            run_id=run_id,
+            backend_job_id="arq-discovery-lost",
+            created_minutes_ago=600,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            await keeper_sync_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            qj = await qj_store.get(discovery_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "AbandonedQueueJob"
+            assert "run discovery" in qj.errors["message"]
+
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.failed
+            assert run.date_finished is not None
+            # No lingering 409 wedge for the org.
+            assert not await run_store.has_non_terminal_run(org_id=org_id)
+
+            public_id = qj.public_id
+
+    warnings = [
+        entry
+        for entry in captured
+        if entry["event"] == "Reaped stuck keeper-sync queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["run_discovery_abandoned_count"] == 1
+    by_public_id = {
+        entry["public_id"]: entry for entry in warnings[0]["reaped_jobs"]
+    }
+    assert by_public_id[public_id] == {
+        "public_id": public_id,
+        "sweep": "run_discovery_abandoned",
+        "backend_job_id": "arq-discovery-lost",
+    }
 
 
 @pytest.mark.asyncio

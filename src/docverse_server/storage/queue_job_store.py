@@ -1043,9 +1043,22 @@ class QueueJobStore:
         ``errors.type='AbandonedQueueJob'``, distinct from
         ``SilentWorker`` and ``OrphanedQueueJob`` so postmortem queries
         can separate the three loss modes.
+
+        Run-attributed rows (``keeper_sync_run_id IS NOT NULL``) are out
+        of scope, mirroring :meth:`fail_abandoned_tier_cron_jobs`'
+        run-less scoping. A keeper-sync project sync cascades
+        ``publish_edition`` jobs that carry the run's id, so without this
+        predicate both this sweep and
+        :meth:`fail_abandoned_run_children` would claim them — and only
+        the latter feeds its reaped rows into ``maybe_finalise_run``.
+        Whichever won, the loser's contract broke: a win here left the
+        parent ``keeper_sync_runs`` row ``in_progress`` forever, which
+        409-blocks every later run for the org. Giving run-attributed
+        rows a single owner removes the ambiguity.
         """
         return await self._fail_abandoned_candidates(
             SqlQueueJob.kind == kind.value,
+            SqlQueueJob.keeper_sync_run_id.is_(None),
             idle_after=idle_after,
             queue_backend=queue_backend,
             message=(
@@ -1108,6 +1121,16 @@ class QueueJobStore:
         callers therefore feed the reaped rows into the same
         ``maybe_finalise_run`` path.
 
+        The run's own ``keeper_sync_run_discovery`` row is run-attributed
+        too (``start_run`` stamps it with the run id), but it is the
+        parent of the fan-out rather than one of its children, so it is
+        excluded here and swept by
+        :meth:`fail_abandoned_run_discovery` instead. Rolling a lost
+        discovery up as a child would label it "Abandoned keeper-sync
+        child" and let ``maybe_finalise_run`` compute
+        ``partial_failure`` from the child counters, where a
+        worker-failed discovery fails the whole run.
+
         ``run_id`` narrows the sweep to one run for the discovery-side
         reconciliation shape; ``None`` (the cron reaper's mode) sweeps
         every run-attributed row in one query, since the reaper has no
@@ -1126,6 +1149,7 @@ class QueueJobStore:
         )
         return await self._fail_abandoned_candidates(
             scope,
+            SqlQueueJob.kind != JobKind.keeper_sync_run_discovery.value,
             idle_after=idle_after,
             queue_backend=queue_backend,
             message=(
@@ -1133,6 +1157,47 @@ class QueueJobStore:
                 "past the keeper_sync_reaper threshold and arq has no "
                 "record of its backend_job_id (reaped by the abandoned "
                 "sweep)"
+            ),
+        )
+
+    async def fail_abandoned_run_discovery(
+        self,
+        *,
+        idle_after: timedelta,
+        queue_backend: QueueBackend,
+    ) -> list[QueueJob]:
+        """Fail ``keeper_sync_run_discovery`` rows that arq lost.
+
+        Counterpart to :meth:`fail_abandoned_run_children` for the one
+        run-attributed row that is not a child: the discovery job
+        ``KeeperSyncRunService.start_run`` enqueues before any fan-out
+        exists. When arq loses it the run never leaves ``pending``, and
+        because ``has_non_terminal_run`` treats ``pending`` as active,
+        every later ``POST .../runs`` for the org returns 409 — the same
+        wedge the children sweep clears, one level up.
+
+        Reaped rows carry a discovery-specific ``errors.message`` (still
+        ``errors.type='AbandonedQueueJob'``, so the three loss modes stay
+        comparable) and callers drive the parent run to
+        :attr:`~docverse.models.KeeperSyncRunStatus.failed` — matching
+        ``keeper_sync_run_discovery``'s own failure path — rather than
+        through ``maybe_finalise_run``, which would read the lone
+        discovery row as a failed child and pick ``partial_failure``.
+
+        Candidates are verified against the queue backend before being
+        failed; see :meth:`_fail_abandoned_candidates` for the shared
+        core and its backend-unreachable behaviour.
+        """
+        return await self._fail_abandoned_candidates(
+            SqlQueueJob.kind == JobKind.keeper_sync_run_discovery.value,
+            SqlQueueJob.keeper_sync_run_id.is_not(None),
+            idle_after=idle_after,
+            queue_backend=queue_backend,
+            message=(
+                "Abandoned keeper-sync run discovery: queue_jobs row still "
+                "queued past the keeper_sync_reaper threshold and arq has "
+                "no record of its backend_job_id, so the run never fanned "
+                "out (reaped by the abandoned sweep)"
             ),
         )
 
