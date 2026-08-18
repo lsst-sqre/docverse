@@ -9,6 +9,7 @@ sees a sync stuck in ``in_progress`` forever.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -776,6 +777,76 @@ async def test_reaper_backend_unreachable_skips_only_abandoned_sweeps(
     assert warnings[0]["tier_cron_silent_count"] == 1
     assert warnings[0]["tier_cron_orphan_count"] == 1
     assert warnings[0]["tier_cron_abandoned_count"] == 0
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            for job_id in (silent_id, orphan_id):
+                reaped = await qj_store.get(job_id)
+                assert reaped is not None
+                assert reaped.status == JobStatus.failed
+            spared = await qj_store.get(abandoned_id)
+            assert spared is not None
+            assert spared.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_reaper_backend_stall_keeps_silent_and_orphan_reaps(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A stalled backend costs the tick only its abandoned passes.
+
+    The failure mode task #548 fixes: a hung Redis pushed the tick past
+    arq's job timeout while the silent and orphan sweeps' updates sat
+    uncommitted in the same transaction. ``CancelledError`` is a
+    ``BaseException``, so the sweep's ``except Exception`` soft-abort
+    never saw it — the transaction unwound and every reap that tick was
+    lost, tick after tick, with row locks held throughout.
+
+    Modelled deterministically by cancelling the reaper only once the
+    backend call is actually in flight.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-reaper-ab-stall")
+        silent_id = await _seed_silent_tier_cron(
+            db_session,
+            org_id=org_id,
+            subject_label="phalanx",
+            started_minutes_ago=600,
+        )
+        orphan_id = await _seed_orphan_tier_cron(
+            db_session,
+            org_id=org_id,
+            subject_label="pipelines",
+            created_minutes_ago=10,
+        )
+        abandoned_id = await _seed_abandoned_row(
+            db_session,
+            org_id=org_id,
+            backend_job_id="arq-stalled",
+            created_minutes_ago=600,
+            subject_label="squarebot",
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    reached_backend = asyncio.Event()
+
+    async def _hang(*args: Any, **kwargs: Any) -> None:
+        reached_backend.set()
+        await asyncio.Event().wait()
+
+    ctx["arq_queue"].get_job_metadata = _hang
+
+    try:
+        task = asyncio.create_task(keeper_sync_reaper(ctx))
+        await asyncio.wait_for(reached_backend.wait(), timeout=30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await ctx["http_client"].aclose()
 
     async for session in db_session_dependency():
         async with session.begin():

@@ -3,11 +3,11 @@
 A "run-less" reaper is the cron-driven backstop for a :class:`JobKind`
 that does not aggregate into a parent run row — currently
 ``dashboard_build``, ``publish_edition``, ``build_processing``, and
-``dashboard_sync``. Each sweeps stuck ``queue_jobs`` rows in one
-transaction and finalises nothing. Three passes cover the three ways a
-row goes stuck: silent (``in_progress`` but the worker died), orphan
-(``queued`` and never reached arq), and abandoned (``queued``, reached
-arq, and arq then lost the job — PRD #538).
+``dashboard_sync``. Each sweeps stuck ``queue_jobs`` rows and finalises
+nothing. Three passes cover the three ways a row goes stuck: silent
+(``in_progress`` but the worker died), orphan (``queued`` and never
+reached arq), and abandoned (``queued``, reached arq, and arq then lost
+the job — PRD #538).
 
 Per PRD #367 §"Reaper module shape", each kind still ships its own
 arq-registered function so cron staggering, logger name, log-event
@@ -49,10 +49,20 @@ async def sweep_runless_kind(
     Used by the per-kind reaper modules. Reads the configured threshold
     from ``config.<threshold_attr>`` at invocation time (so non-prod
     overrides via ``DOCVERSE_<KIND>_REAPER_THRESHOLD_SECONDS`` take
-    effect immediately), runs all three sweeps in one transaction, and
-    emits ``logger.warning`` with counts, reaped public IDs, and
-    per-row sweep/``backend_job_id`` detail when anything was reaped,
+    effect immediately), runs all three sweeps, and emits
+    ``logger.warning`` with counts, reaped public IDs, and per-row
+    sweep/``backend_job_id`` detail when anything was reaped,
     ``logger.debug`` otherwise.
+
+    The tick runs in two transactions rather than one (task #548). The
+    first carries the silent and orphan sweeps plus the abandoned
+    sweep's candidate query; the queue-backend round trips then happen
+    with no transaction open; the second applies whatever those
+    verified, re-checking each row is still ``queued``. Keeping the
+    backend outside the first transaction is what stops a stalled Redis
+    — the post-outage scenario the abandoned sweep exists for — from
+    blowing the tick past arq's job timeout and rolling back the silent
+    and orphan reaps along with it.
 
     The structlog ``event`` strings are f-string-built from
     ``kind.value`` so they match the per-kind literals the original
@@ -79,6 +89,13 @@ async def sweep_runless_kind(
         # "Reaper dependency change").
         queue_backend = factory.create_queue_backend()
 
+        # First transaction: the two backend-free sweeps, plus the
+        # abandoned sweep's candidate query. Committing here is what
+        # keeps a stalled Redis from taking this work down with it —
+        # arq's job timeout cancels the tick with a ``CancelledError``,
+        # a ``BaseException`` no ``except Exception`` soft-abort can
+        # catch, so anything still uncommitted when the backend hangs is
+        # lost and re-lost on every following tick (task #548).
         async with session.begin():
             silent = await queue_job_store.fail_silent_jobs(
                 kind, idle_after=threshold
@@ -90,9 +107,22 @@ async def sweep_runless_kind(
             # shorter orphan window: an abandoned row *did* reach arq,
             # so it deserves the same benefit of the doubt a running
             # job gets before being declared dead.
-            abandoned = await queue_job_store.fail_abandoned_jobs(
-                kind, idle_after=threshold, queue_backend=queue_backend
+            candidates = await queue_job_store.select_abandoned_jobs(
+                kind, idle_after=threshold
             )
+
+        # Backend round trips with no transaction open at all: nothing
+        # to roll back, no rows locked, and the sweeps above already
+        # durable however long arq takes to answer.
+        reaps = await queue_job_store.verify_abandoned_candidates(
+            candidates, queue_backend=queue_backend
+        )
+
+        # Second transaction, deliberately short: apply the verified
+        # reaps, re-checking each row is still ``queued`` in case a
+        # worker picked it up while the backend was being asked.
+        async with session.begin():
+            abandoned = await queue_job_store.apply_abandoned_reaps(reaps)
 
         by_sweep = (
             ("silent", silent),

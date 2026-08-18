@@ -20,6 +20,7 @@ dashboard.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -711,6 +712,96 @@ async def test_reaper_backend_unreachable_skips_only_abandoned_sweep(
             assert abandoned is not None
             assert abandoned.status == JobStatus.queued
             assert abandoned.errors is None
+
+
+@pytest.mark.asyncio
+@_reaper_param
+async def test_reaper_backend_stall_keeps_silent_and_orphan_reaps(
+    app: None,
+    db_session: AsyncSession,
+    spec: ReaperSpec,
+) -> None:
+    """A stalled backend costs the tick only its abandoned sweep.
+
+    The failure mode task #548 fixes: a hung Redis — exactly the
+    post-outage scenario the abandoned sweep exists for — used to push
+    the tick past arq's job timeout while the silent and orphan sweeps'
+    updates sat uncommitted in the same transaction. The resulting
+    ``CancelledError`` is a ``BaseException``, so the sweep's
+    ``except Exception`` soft-abort never saw it: the transaction
+    unwound and every reap that tick was lost, tick after tick.
+
+    Modelled deterministically by cancelling the reaper only once the
+    backend call is actually in flight. The silent and orphan reaps must
+    already be committed by then.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab5")
+        silent_id = await _seed_silent_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-stuck-stall",
+            started_minutes_ago=spec.well_past_minutes,
+            project_id=715,
+        )
+        orphan_id = await _seed_orphan_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            created_minutes_ago=10,
+            project_id=716,
+        )
+        abandoned_id = await _seed_abandoned_row(
+            db_session,
+            kind=spec.kind,
+            org_id=org_id,
+            backend_job_id="arq-stalled",
+            created_minutes_ago=spec.well_past_minutes,
+            project_id=717,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    reached_backend = asyncio.Event()
+
+    async def _hang(*args: Any, **kwargs: Any) -> None:
+        reached_backend.set()
+        await asyncio.Event().wait()
+
+    ctx["arq_queue"].get_job_metadata = _hang
+
+    async def _tick() -> str:
+        return await spec.reaper(ctx)
+
+    try:
+        task = asyncio.create_task(_tick())
+        await asyncio.wait_for(reached_backend.wait(), timeout=30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+
+            silent = await qj_store.get(silent_id)
+            assert silent is not None
+            assert silent.status == JobStatus.failed
+            assert silent.errors is not None
+            assert silent.errors["type"] == "SilentWorker"
+
+            orphan = await qj_store.get(orphan_id)
+            assert orphan is not None
+            assert orphan.status == JobStatus.failed
+            assert orphan.errors is not None
+            assert orphan.errors["type"] == "OrphanedQueueJob"
+
+            abandoned = await qj_store.get(abandoned_id)
+            assert abandoned is not None
+            assert abandoned.status == JobStatus.queued
 
 
 @pytest.mark.asyncio

@@ -2422,6 +2422,59 @@ async def test_fail_abandoned_jobs_aborts_when_backend_unreachable(
 
 
 @pytest.mark.asyncio
+async def test_apply_abandoned_reaps_skips_row_that_left_queued(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The write step re-checks ``status='queued'`` per row.
+
+    Splitting the sweep so the arq verification runs outside the write
+    transaction opens a TOCTOU window: a worker can pick the job up
+    between the backend saying "arq has no record" and the reaper
+    applying the reap. The write step must therefore re-check each row
+    is *still* ``queued`` and silently drop any that moved on, rather
+    than stamping ``failed`` over a job that is now running.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org_only(db_session, slug="abandoned-toctou")
+        candidate_id = await _seed_runless_row(
+            db_session,
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            status=JobStatus.queued,
+            backend_job_id="arq-raced",
+            date_created_offset=timedelta(hours=1),
+        )
+
+        candidates = await store.select_abandoned_jobs(
+            JobKind.dashboard_build, idle_after=timedelta(minutes=30)
+        )
+        assert [c.job_id for c in candidates.rows] == [candidate_id]
+
+        backend = _StubQueueBackend()
+        reaps = await store.verify_abandoned_candidates(
+            candidates, queue_backend=backend
+        )
+        assert reaps.job_ids == (candidate_id,)
+
+        # The race: a worker starts the job after arq was asked about
+        # it but before the reap lands.
+        started = await store.start_if_queued(candidate_id)
+        assert started is not None
+
+        failed = await store.apply_abandoned_reaps(reaps)
+        await db_session.commit()
+
+    assert failed == []
+
+    async with db_session.begin():
+        candidate = await store.get(candidate_id)
+        assert candidate is not None
+        assert candidate.status == JobStatus.in_progress
+        assert candidate.errors is None
+
+
+@pytest.mark.asyncio
 async def test_fail_abandoned_jobs_frees_dashboard_build_mutex(
     db_session: AsyncSession,
     store: QueueJobStore,

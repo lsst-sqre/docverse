@@ -157,6 +157,31 @@ _AGGREGATE_TRACKING_MODES = frozenset(
 )
 
 
+async def _finalise_reaped_runs(
+    *,
+    run_store: KeeperSyncRunStore,
+    run_ids: set[int | None],
+) -> list[KeeperSyncRunWithActivity]:
+    """Roll up each distinct run behind a set of reaped rows.
+
+    Shared by both of :func:`keeper_sync_reaper`'s transactions. Reaped
+    rows carry a nullable ``keeper_sync_run_id`` (tier-cron rows have
+    none), so the ``None`` member is skipped rather than filtered by the
+    callers. Returns the runs this call actually drove terminal, for the
+    caller to publish once its transaction commits.
+    """
+    completions: list[KeeperSyncRunWithActivity] = []
+    for run_id in run_ids:
+        if run_id is None:
+            continue
+        completion = await maybe_finalise_run(
+            run_store=run_store, run_id=run_id
+        )
+        if completion is not None:
+            completions.append(completion)
+    return completions
+
+
 async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     """Cron-driven backstop that finalises silently-stuck keeper-sync rows.
 
@@ -172,7 +197,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     ``keeper_sync_run_id`` so they have no run finalisation hook, but
     the same OOM / orphan windows wedge their per-subject
     :meth:`~QueueJobStore.has_active_for_subject` mutex. The reaper
-    therefore sweeps these populations in one transaction:
+    therefore sweeps these populations:
 
     1. Run-attributed silent rows
        (:meth:`QueueJobStore.fail_silent_run_children`) — followed by
@@ -213,6 +238,16 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     unreachable those passes abort for the tick (logging a warning and
     mutating nothing) while the first three proceed.
 
+    The tick therefore runs in two transactions rather than one (task
+    #548). The first carries populations 1-3 and the candidate queries
+    for 4-6; the queue-backend round trips then happen with no
+    transaction open; the second applies whatever those verified,
+    re-checking each row is still ``queued``. Keeping the backend
+    outside the first transaction is what stops a stalled Redis — the
+    post-outage scenario the abandoned passes exist for — from blowing
+    the tick past arq's job timeout and rolling back populations 1-3
+    along with it.
+
     Thresholds: the silent paths use
     ``config.keeper_sync_reaper_threshold_seconds``, which defaults to
     ``config.keeper_sync_job_timeout_seconds`` plus
@@ -247,6 +282,14 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
         queue_backend = factory.create_queue_backend()
 
         completions: list[KeeperSyncRunWithActivity] = []
+        # First transaction: the three backend-free sweeps and their run
+        # finalisations, plus the abandoned passes' candidate queries.
+        # Committing here is what keeps a stalled Redis from taking this
+        # work down with it — arq's job timeout cancels the tick with a
+        # ``CancelledError``, a ``BaseException`` no ``except Exception``
+        # soft-abort can catch, so anything still uncommitted when the
+        # backend hangs is lost and re-lost every following tick (task
+        # #548).
         async with session.begin():
             reaped = await queue_job_store.fail_silent_run_children(
                 idle_after=threshold
@@ -257,21 +300,55 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
             tier_orphans = await queue_job_store.fail_orphaned_tier_cron_jobs(
                 idle_after=_ORPHAN_IDLE_WINDOW
             )
-            tier_abandoned = (
-                await queue_job_store.fail_abandoned_tier_cron_jobs(
-                    idle_after=threshold, queue_backend=queue_backend
+            tier_candidates = (
+                await queue_job_store.select_abandoned_tier_cron_jobs(
+                    idle_after=threshold
                 )
             )
             # No ``run_id``: the reaper has no run in hand, so it sweeps
             # every run-attributed row at once and reads the runs that
             # need finalising back off the reaped rows below.
-            run_abandoned = await queue_job_store.fail_abandoned_run_children(
-                idle_after=threshold, queue_backend=queue_backend
-            )
-            discovery_abandoned = (
-                await queue_job_store.fail_abandoned_run_discovery(
-                    idle_after=threshold, queue_backend=queue_backend
+            run_candidates = (
+                await queue_job_store.select_abandoned_run_children(
+                    idle_after=threshold
                 )
+            )
+            discovery_candidates = (
+                await queue_job_store.select_abandoned_run_discovery(
+                    idle_after=threshold
+                )
+            )
+            silent_run_ids = {qj.keeper_sync_run_id for qj in reaped}
+            completions += await _finalise_reaped_runs(
+                run_store=run_store, run_ids=silent_run_ids
+            )
+
+        # Backend round trips with no transaction open at all: nothing
+        # to roll back, no rows locked, and the sweeps above already
+        # durable however long arq takes to answer.
+        tier_reaps = await queue_job_store.verify_abandoned_candidates(
+            tier_candidates, queue_backend=queue_backend
+        )
+        run_reaps = await queue_job_store.verify_abandoned_candidates(
+            run_candidates, queue_backend=queue_backend
+        )
+        discovery_reaps = await queue_job_store.verify_abandoned_candidates(
+            discovery_candidates, queue_backend=queue_backend
+        )
+
+        # Second transaction, deliberately short: apply the verified
+        # reaps (each re-checking its row is still ``queued``, in case a
+        # worker picked it up while the backend was being asked) and roll
+        # up whatever runs they left finalisable.
+        async with session.begin():
+            tier_abandoned = await queue_job_store.apply_abandoned_reaps(
+                tier_reaps
+            )
+            run_abandoned = await queue_job_store.apply_abandoned_reaps(
+                run_reaps
+            )
+            discovery_abandoned = await queue_job_store.apply_abandoned_reaps(
+                discovery_reaps
             )
             # A lost discovery means the run never fanned out, so it
             # fails outright — the terminal status
@@ -290,18 +367,18 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
                 await fail_run_for_lost_discovery(
                     run_store=run_store, run_id=run_id
                 )
-            run_ids = {
+            abandoned_run_ids = {
                 qj.keeper_sync_run_id
-                for qj in (*reaped, *run_abandoned, *discovery_abandoned)
+                for qj in (*run_abandoned, *discovery_abandoned)
             }
-            for run_id in run_ids:
-                if run_id is None:
-                    continue
-                completion = await maybe_finalise_run(
-                    run_store=run_store, run_id=run_id
-                )
-                if completion is not None:
-                    completions.append(completion)
+            # Re-entrant for a run the first transaction already tried:
+            # ``maybe_finalise_run`` returns ``None`` once the run is
+            # terminal, and a run whose abandoned child was still
+            # ``queued`` back then could not have finalised.
+            completions += await _finalise_reaped_runs(
+                run_store=run_store, run_ids=abandoned_run_ids
+            )
+        run_ids = silent_run_ids | abandoned_run_ids
 
         # Publish one keeper_sync_run_completed per run this sweep drove
         # terminal, after the finalisation transaction commits.
