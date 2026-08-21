@@ -182,6 +182,12 @@ warn_uninitialized = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+# The application lifespan, its connection pool, and the shared test
+# engine are all session-scoped fixtures, and pooled asyncpg connections
+# are bound to the loop that opened them. Both scopes therefore have to
+# be "session" so every test and fixture runs on that one loop.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 
 [tool.coverage.run]
 parallel = true
