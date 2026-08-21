@@ -53,7 +53,11 @@ from docverse_server.storage.user_info_store import StubUserInfoStore
 from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 
 from .support.arq_testing import register_queue
-from .support.database import reset_database_for_test
+from .support.database import (
+    ddl_database_url_for,
+    provision_database,
+    reset_database_for_test,
+)
 from .support.github_mock import GitHubMock, make_rsa_pem
 from .support.metrics import reset_mock_event_publishers
 
@@ -222,6 +226,22 @@ async def database_engine() -> AsyncGenerator[AsyncEngine]:
         yield engine
     finally:
         await engine.dispose()
+
+
+@pytest_asyncio.fixture(scope="session")
+async def ddl_database_url() -> str:
+    """Provision the database the schema/migration tests own.
+
+    ``tests/dbschema`` drops the schema and steps Alembic through
+    individual revisions, which the shared session-scoped engine,
+    application lifespan, and truncate-based reset cannot survive. Those
+    tests get this sibling database instead, created once per pytest
+    process with the same server-side provisioning (currently
+    ``pg_trgm``) every test database needs.
+    """
+    url = ddl_database_url_for(config.database_url)
+    await provision_database(url, config.database_password)
+    return url
 
 
 @pytest.fixture(scope="session")

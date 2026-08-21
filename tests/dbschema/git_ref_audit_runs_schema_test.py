@@ -11,26 +11,12 @@ non-terminal index on ``git_ref_audit_runs``.
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncGenerator
-
 import pytest
-import pytest_asyncio
-import structlog
-from alembic.config import Config
-from safir.database import (
-    create_database_engine,
-    drop_database,
-    initialize_database,
-    stamp_database_async,
-)
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from alembic import command
-from docverse_server.config import config
-from docverse_server.dbschema import Base
+from tests.support.migrations import alembic_downgrade, alembic_upgrade
 
 # Revision immediately before this PR's git_ref_audit_runs migration.
 PRE_AUDIT_REVISION = "y3z4a5b6c7d8"
@@ -39,48 +25,13 @@ PRE_AUDIT_REVISION = "y3z4a5b6c7d8"
 AUDIT_REVISION = "z4a5b6c7d8e9"
 
 
-@pytest_asyncio.fixture
-async def fresh_engine() -> AsyncGenerator[AsyncEngine]:
-    """Yield an engine pointing at a freshly-dropped DB."""
-    logger = structlog.get_logger("docverse")
-    engine = create_database_engine(
-        config.database_url, config.database_password
-    )
-    await drop_database(engine, Base.metadata)
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    try:
-        yield engine
-    finally:
-        await drop_database(engine, Base.metadata)
-        async with engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await initialize_database(
-            engine, logger, schema=Base.metadata, reset=True
-        )
-        await stamp_database_async(engine)
-        await engine.dispose()
-
-
-def _alembic_config() -> Config:
-    return Config("alembic.ini")
-
-
-async def _alembic_upgrade(target: str) -> None:
-    await asyncio.to_thread(command.upgrade, _alembic_config(), target)
-
-
-async def _alembic_downgrade(target: str) -> None:
-    await asyncio.to_thread(command.downgrade, _alembic_config(), target)
-
-
 @pytest.mark.asyncio
 async def test_migration_creates_table_columns_and_indexes(
     fresh_engine: AsyncEngine,
 ) -> None:
     """``git_ref_audit_runs`` exists with the expected columns and indexes."""
-    await _alembic_upgrade(PRE_AUDIT_REVISION)
-    await _alembic_upgrade(AUDIT_REVISION)
+    await alembic_upgrade(PRE_AUDIT_REVISION)
+    await alembic_upgrade(AUDIT_REVISION)
 
     async with fresh_engine.connect() as conn:
         columns = {
@@ -141,7 +92,7 @@ async def test_partial_unique_non_terminal_index_enforces_singleton(
     fresh_engine: AsyncEngine,
 ) -> None:
     """Two non-terminal rows are rejected; terminal rows do not collide."""
-    await _alembic_upgrade(AUDIT_REVISION)
+    await alembic_upgrade(AUDIT_REVISION)
     async with fresh_engine.begin() as conn:
         await conn.execute(
             text("INSERT INTO git_ref_audit_runs (status) VALUES ('pending')")
@@ -172,7 +123,7 @@ async def test_status_check_rejects_invalid_value(
     fresh_engine: AsyncEngine,
 ) -> None:
     """A status outside the allowed set fails the CHECK constraint."""
-    await _alembic_upgrade(AUDIT_REVISION)
+    await alembic_upgrade(AUDIT_REVISION)
     with pytest.raises(IntegrityError):
         async with fresh_engine.begin() as conn:
             await conn.execute(
@@ -191,8 +142,8 @@ async def test_downgrade_removes_table_and_fk_column(
     Pins that an operator can roll forward and back through this
     revision without leaving dead rows or stale FK constraints.
     """
-    await _alembic_upgrade(AUDIT_REVISION)
-    await _alembic_downgrade(PRE_AUDIT_REVISION)
+    await alembic_upgrade(AUDIT_REVISION)
+    await alembic_downgrade(PRE_AUDIT_REVISION)
 
     async with fresh_engine.connect() as conn:
         tables = {

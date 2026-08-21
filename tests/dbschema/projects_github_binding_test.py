@@ -19,25 +19,11 @@ both branches:
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncGenerator
-
 import pytest
-import pytest_asyncio
-import structlog
-from alembic.config import Config
-from safir.database import (
-    create_database_engine,
-    drop_database,
-    initialize_database,
-    stamp_database_async,
-)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from alembic import command
-from docverse_server.config import config
-from docverse_server.dbschema import Base
+from tests.support.migrations import alembic_upgrade
 
 # Revision immediately before the projects GitHub-binding migration.
 PRE_GITHUB_BINDING_REVISION = "w1x2y3z4a5b6"
@@ -47,47 +33,6 @@ PRE_GITHUB_BINDING_REVISION = "w1x2y3z4a5b6"
 # nulls redundant github.com ``source_url`` values) does not perturb the
 # rename behaviour under test here.
 GITHUB_BINDING_REVISION = "x2y3z4a5b6c7"
-
-
-@pytest_asyncio.fixture
-async def fresh_engine() -> AsyncGenerator[AsyncEngine]:
-    """Yield an engine pointing at a freshly-dropped DB.
-
-    Mirrors the fixture in ``active_uq_cleanup_test.py``: the ``app``
-    conftest fixture would jump straight to head via
-    ``initialize_database`` + ``stamp_database_async``, but this test
-    needs to step the schema forward from a known earlier revision.
-    On teardown the schema is restored to head so subsequent tests'
-    ``app`` fixtures find a clean DB.
-    """
-    logger = structlog.get_logger("docverse")
-    engine = create_database_engine(
-        config.database_url, config.database_password
-    )
-    await drop_database(engine, Base.metadata)
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    try:
-        yield engine
-    finally:
-        await drop_database(engine, Base.metadata)
-        async with engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await initialize_database(
-            engine, logger, schema=Base.metadata, reset=True
-        )
-        await stamp_database_async(engine)
-        await engine.dispose()
-
-
-def _alembic_config() -> Config:
-    return Config("alembic.ini")
-
-
-async def _alembic_upgrade(target: str) -> None:
-    # ``run_migrations_online`` calls ``asyncio.run`` internally, so the
-    # alembic command has to run on a thread that owns its own loop.
-    await asyncio.to_thread(command.upgrade, _alembic_config(), target)
 
 
 async def _seed_org(engine: AsyncEngine) -> int:
@@ -136,7 +81,7 @@ async def test_projects_github_binding_migration_happy_path(
     fresh_engine: AsyncEngine,
 ) -> None:
     """A mix of GitHub URLs all parse and the schema lands correctly."""
-    await _alembic_upgrade(PRE_GITHUB_BINDING_REVISION)
+    await alembic_upgrade(PRE_GITHUB_BINDING_REVISION)
     org_id = await _seed_org(fresh_engine)
     canonical_id = await _seed_project(
         fresh_engine,
@@ -163,7 +108,7 @@ async def test_projects_github_binding_migration_happy_path(
         doc_repo="https://github.com/example/repo.git",
     )
 
-    await _alembic_upgrade(GITHUB_BINDING_REVISION)
+    await alembic_upgrade(GITHUB_BINDING_REVISION)
 
     async with fresh_engine.connect() as conn:
         rows = (
@@ -284,7 +229,7 @@ async def test_projects_github_binding_migration_aborts_on_non_github(
     fresh_engine: AsyncEngine,
 ) -> None:
     """A non-github.com ``doc_repo`` aborts with offending project ids."""
-    await _alembic_upgrade(PRE_GITHUB_BINDING_REVISION)
+    await alembic_upgrade(PRE_GITHUB_BINDING_REVISION)
     org_id = await _seed_org(fresh_engine)
     await _seed_project(
         fresh_engine,
@@ -306,7 +251,7 @@ async def test_projects_github_binding_migration_aborts_on_non_github(
     )
 
     with pytest.raises(RuntimeError) as excinfo:
-        await _alembic_upgrade(GITHUB_BINDING_REVISION)
+        await alembic_upgrade(GITHUB_BINDING_REVISION)
 
     # The error message must surface the offending project ids so the
     # operator can address them without grepping the table by hand.

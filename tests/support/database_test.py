@@ -1,9 +1,13 @@
-"""Tests for ``tests.support.database``'s bounded per-test truncate.
+"""Tests for ``tests.support.database``'s reset and DDL-database helpers.
 
 The tests that need a specific driver error inject a canned one through
 `_TruncateFailingEngine` rather than racing PostgreSQL for it, but they
 still run the real retry loop against a real database so the blocker
 diagnostics are exercised too.
+
+The DDL-database tests all run against the ``*_ddl`` database, never the
+shared one: they drop the schema, which is the very thing that database
+exists to contain.
 """
 
 from __future__ import annotations
@@ -20,12 +24,18 @@ from asyncpg.exceptions import (
 )
 from safir.database import create_database_engine
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
 from docverse_server.config import config
+from docverse_server.dbschema import Base
 from tests.support.database import (
+    DDL_DATABASE_SUFFIX,
     TruncateLockError,
+    ddl_database,
+    invalidate_schema_ready,
     reset_database_for_test,
+    schema_is_ready,
     truncate_all_tables,
 )
 
@@ -261,4 +271,119 @@ async def test_truncate_propagates_unrelated_sqlstate() -> None:
         assert excinfo.value is error
         assert failing.attempts == 1
     finally:
+        await engine.dispose()
+
+
+class _SchemaTestError(Exception):
+    """Stands in for whatever a schema test raises when it fails."""
+
+
+async def _canonical_schema_present(engine: AsyncEngine) -> bool:
+    """Report whether the database holds a stamped ``create_all`` schema."""
+    async with engine.connect() as conn:
+        organizations = await conn.scalar(
+            text("SELECT to_regclass('organizations')")
+        )
+        stamp = await conn.scalar(
+            text("SELECT to_regclass('alembic_version')")
+        )
+        version = None
+        if stamp is not None:
+            version = await conn.scalar(
+                text("SELECT version_num FROM alembic_version")
+            )
+    return organizations is not None and version is not None
+
+
+@pytest.mark.asyncio
+async def test_ddl_database_is_a_provisioned_sibling(
+    ddl_database_url: str,
+) -> None:
+    """The schema tests get their own database, provisioned like the rest.
+
+    The name is the shared database's plus a suffix rather than a fixed
+    string, so a per-worker database keeps composing with it once xdist
+    lands. ``pg_trgm`` comes from the same `provision_database` helper
+    the per-worker databases will use, so a future extension requirement
+    lands on every test database at once.
+    """
+    shared = make_url(config.database_url)
+    ddl = make_url(ddl_database_url)
+    assert ddl.database == f"{shared.database}{DDL_DATABASE_SUFFIX}"
+    assert ddl.database != shared.database
+
+    engine = create_database_engine(ddl_database_url, config.database_password)
+    try:
+        async with engine.connect() as conn:
+            extensions = await conn.scalar(
+                text(
+                    "SELECT count(*) FROM pg_extension"
+                    " WHERE extname = 'pg_trgm'"
+                )
+            )
+    finally:
+        await engine.dispose()
+    assert extensions == 1
+
+
+@pytest.mark.asyncio
+async def test_ddl_database_invalidates_schema_ready_on_failure(
+    ddl_database_url: str,
+) -> None:
+    """A failed schema test leaves the next reset to rebuild, not truncate.
+
+    Invalidation has to happen on the way out of a *failing* test as much
+    as a passing one: a migration that blew up halfway leaves the most
+    damaged schema of all, and the tracking is what tells the next reset
+    to throw it away.
+    """
+    engine = create_database_engine(ddl_database_url, config.database_password)
+    try:
+        await reset_database_for_test(engine)
+        assert schema_is_ready(engine)
+        assert await _canonical_schema_present(engine)
+
+        with pytest.raises(_SchemaTestError):
+            async with ddl_database(
+                ddl_database_url, config.database_password
+            ):
+                raise _SchemaTestError
+
+        assert not schema_is_ready(engine)
+
+        # The failed test dropped the schema and never rebuilt it, so the
+        # next reset has to be a rebuild rather than a truncate.
+        await reset_database_for_test(engine)
+        assert await _canonical_schema_present(engine)
+    finally:
+        invalidate_schema_ready(engine)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reset_rebuilds_when_the_schema_vanished(
+    ddl_database_url: str,
+) -> None:
+    """A forgotten invalidation costs a warning, not a cascade of failures.
+
+    Truncating tables that no longer exist raises ``UndefinedTable``, and
+    on a session-scoped database every later test inherits it. Treating
+    that as "the tracking is stale" and rebuilding contains the damage to
+    the one test that dropped the schema.
+    """
+    engine = create_database_engine(ddl_database_url, config.database_password)
+    try:
+        await reset_database_for_test(engine)
+
+        # Drop the tables the way a half-finished migration would, without
+        # telling the reset helper about it.
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        assert schema_is_ready(engine)
+
+        await reset_database_for_test(engine)
+
+        assert await _canonical_schema_present(engine)
+    finally:
+        invalidate_schema_ready(engine)
         await engine.dispose()
