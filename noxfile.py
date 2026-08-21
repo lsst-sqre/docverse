@@ -50,6 +50,15 @@ XDIST_ATTACHED_WORKERS = re.compile(r"-n(?P<workers>\d+|auto|logical)")
 # starts no debugger and takes nothing away from the workers.
 SERIAL_DEBUG_OPTIONS = frozenset({"--pdb", "--trace", "-s", "--capture=no"})
 
+# The short options pytest and pytest-xdist take a value for. Short
+# options run together into one posarg -- "-xs" is "-x -s", "-xn2" is
+# "-x -n 2" -- are consumed left to right until one of these, which takes
+# whatever is left of the bundle as its value, or the next posarg when
+# nothing is. So the "s" ending "-rs" is part of -r's report characters
+# and the one ending "-ps" is a plugin name; neither is --capture=no, and
+# scanning a bundle for bare letters would read both as one.
+SHORT_VALUE_OPTIONS = frozenset("ckmnoprW")
+
 # Ceiling on the worker count detected for pytest-xdist below.
 #
 # The workers themselves run on the host, but everything a worker drives
@@ -85,6 +94,35 @@ PYTEST_VALUE_OPTIONS = frozenset(
         "--rootdir",
     }
 )
+
+
+def _expand_short_bundles(posargs: Sequence[str]) -> list[str]:
+    """Return ``posargs`` with bundled short options written out singly.
+
+    pytest honors every option in a bundle, so the reading below has to
+    see them all: ``-xs`` really does turn capturing off and ``-xn2``
+    really does ask for two workers. Each bundle is split the way
+    ``argparse`` splits it -- flag by flag until a `SHORT_VALUE_OPTIONS`
+    member, which keeps the rest of the bundle as its attached value and
+    ends it.
+
+    Long options, plain posargs, and short options that are already single
+    pass through untouched, so this only ever adds detail.
+    """
+    expanded: list[str] = []
+    for arg in posargs:
+        is_bundle = (
+            arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
+        )
+        if not is_bundle:
+            expanded.append(arg)
+            continue
+        for index, letter in enumerate(arg[1:], start=1):
+            if letter in SHORT_VALUE_OPTIONS:
+                expanded.append(f"-{letter}{arg[index + 1 :]}")
+                break
+            expanded.append(f"-{letter}")
+    return expanded
 
 
 def _default_xdist_workers() -> int:
@@ -144,10 +182,15 @@ def _xdist_args(posargs: Sequence[str]) -> list[str]:
     the debugger, crash on it, or swallow the output -- after the
     container has already started, and with nothing to say the ``-n`` came
     from here.
+
+    Both readings run over `_expand_short_bundles`, because pytest accepts
+    either request run together with other short options and honors it
+    just the same.
     """
-    if _requested_xdist_workers(posargs) is not None:
+    expanded = _expand_short_bundles(posargs)
+    if _requested_xdist_workers(expanded) is not None:
         return []
-    if _wants_single_process(posargs):
+    if _wants_single_process(expanded):
         return []
     return ["-n", str(_default_xdist_workers())]
 
@@ -186,10 +229,15 @@ def _path_selections(posargs: Sequence[str]) -> list[str]:
     names a file that exists, but not one this suite could ever collect.
     An unknown option whose value does point into ``tests/`` is still
     misread, which is what `PYTEST_VALUE_OPTIONS` remains good for.
+
+    Reading `_expand_short_bundles` rather than ``posargs`` is what lets a
+    value option reached through a bundle claim its value: the expression
+    in ``-xk tests`` belongs to the ``-k`` ending that bundle, not to this
+    session's selection.
     """
     selections: list[str] = []
     skip_value = False
-    for arg in posargs:
+    for arg in _expand_short_bundles(posargs):
         if skip_value:
             skip_value = False
         elif arg.startswith("-"):

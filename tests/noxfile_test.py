@@ -257,3 +257,63 @@ def test_pdbcls_alone_keeps_the_workers(
     posargs = ["--pdbcls=pdb:Pdb"]
 
     assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+
+
+@pytest.mark.parametrize("posargs", [["-xs"], ["-sx"], ["-xvs"]])
+def test_a_bundled_capture_flag_runs_in_one_process(
+    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+) -> None:
+    """A ``-s`` run together with other short flags still suppresses workers.
+
+    pytest honors every flag in a bundle, so ``-xs`` turns capturing off
+    exactly as a standalone ``-s`` does -- and the workers then swallow
+    the output it exists to show. This spelling is worse than the
+    standalone one, because nothing refuses the combination the way xdist
+    refuses ``--pdb``: the run passes, having printed nothing.
+    """
+    assert test_args(posargs) == [ignore_flag, "tests", *posargs]
+
+
+@pytest.mark.parametrize(
+    "posargs", [["-xn2"], ["-xn", "2"], ["-xn0"], ["-xnauto"]]
+)
+def test_a_bundled_worker_count_wins(
+    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+) -> None:
+    """A ``-n`` run together with other short options suppresses injection too.
+
+    ``-xn2`` is ``-x -n 2``, and a bundle ending in a bare ``-n`` takes the
+    next posarg as its count. Injecting on top of either would hand pytest
+    two ``-n`` values, and which one won would come down to the order the
+    session happens to concatenate them in.
+    """
+    assert test_args(posargs) == [ignore_flag, "tests", *posargs]
+
+
+@pytest.mark.parametrize("posargs", [["-rs"], ["-ps"], ["-rsx"]])
+def test_a_value_options_letters_are_not_flags(
+    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+) -> None:
+    """A bundle stops at the first short option that takes a value.
+
+    The ``s`` in ``-rs`` is one of ``-r``'s report characters and the one
+    in ``-ps`` is a plugin name -- pytest leaves capturing on for both. A
+    bundle scanned for bare letters would strip the workers from these
+    perfectly ordinary invocations.
+    """
+    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+
+
+def test_a_bundled_value_options_path_is_not_a_selection(
+    test_args: PytestArgs, ignore_flag: str
+) -> None:
+    """``-xk tests`` filters the default run; it does not name it.
+
+    ``-k``'s expression is bound to the bundle that ends in it, so reading
+    it as a selection would leave the session passing pytest no path at
+    all -- and pytest would fall back to collecting the whole rootdir,
+    dragging in ``client/tests`` alongside the suite this session runs.
+    """
+    posargs = ["-xk", "tests"]
+
+    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
