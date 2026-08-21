@@ -4,17 +4,216 @@ import json
 import os
 import re
 import subprocess
+from itertools import pairwise
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import nox
 from nox_uv import session
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from testcontainers.postgres import PostgresContainer
 
 nox.needs_version = ">=2024.4.15"
 nox.options.default_venv_backend = "uv"
 nox.options.sessions = ["lint", "typing", "test", "client_test"]
+
+TESTS_ROOT = "tests"
+"""Directory holding the server test suite."""
+
+INTEGRATION_TEST_PATH = "tests/integration"
+"""Path excluded from the ``test`` session; it needs live services."""
+
+# The attached spellings of pytest-xdist's short worker option: a count,
+# or one of the two names it derives a count from. Matching the bare "-n"
+# prefix instead would read any single-dash option starting with an "n" as
+# a worker request.
+XDIST_ATTACHED_WORKERS = re.compile(r"-n(?P<workers>\d+|auto|logical)")
+
+# Posargs that ask for something pytest-xdist workers take away. xdist
+# refuses --pdb outright ("--pdb is incompatible with distributing tests")
+# and the workers swallow the output -s exists to show, so an invocation
+# carrying one of these runs in a single process. --capture also accepts
+# its value as the following posarg, which is handled separately.
+#
+# --trace belongs here for a worse reason than --pdb does: xdist's refusal
+# reads pytest's "usepdb" option, which only --pdb sets, so --trace gets
+# no refusal at all and its workers instead die the moment pdb reads EOF
+# from a worker stdin nobody can type into. That is the
+# start-the-container-then-die failure this list exists to avoid, only
+# louder.
+#
+# --pdbcls is deliberately absent. It only names the class that --pdb,
+# --trace, or pytest.set_trace() would instantiate, so on its own it
+# starts no debugger and takes nothing away from the workers.
+SERIAL_DEBUG_OPTIONS = frozenset({"--pdb", "--trace", "-s", "--capture=no"})
+
+# Ceiling on the worker count detected for pytest-xdist below.
+#
+# The workers themselves run on the host, but everything a worker drives
+# lives in the one Docker VM the PostgreSQL container sits in: a database,
+# an application lifespan, and a connection pool apiece, all against that
+# single server. Colima's default profile gives the VM 8 CPUs, so on a
+# wider host the extra workers only queue against each other inside it.
+XDIST_WORKER_CAP = 8
+
+# Pytest options that take their value as a separate argument, skipped
+# outright so a value that does live under ``tests/`` -- ``--basetemp
+# tests/tmp``, ``--ignore tests/services`` -- is not read as a selection.
+# This list is a shortcut, not the rule: it is hand-curated and pytest and
+# its plugins keep growing options, so `_path_selections` decides on the
+# tests/-rooted check instead of on membership here.
+PYTEST_VALUE_OPTIONS = frozenset(
+    {
+        "-c",
+        "--basetemp",
+        "--config-file",
+        "--deselect",
+        "--dist",
+        "-k",
+        "-m",
+        "--ignore",
+        "--ignore-glob",
+        "--maxfail",
+        "-n",
+        "--numprocesses",
+        "-o",
+        "--override-ini",
+        "-p",
+        "--rootdir",
+    }
+)
+
+
+def _default_xdist_workers() -> int:
+    """Return the number of pytest-xdist workers to run by default.
+
+    One per usable CPU, capped at `XDIST_WORKER_CAP` because the workers
+    share the container's Docker VM. ``os.process_cpu_count`` reports the
+    CPUs this process may actually use rather than the machine's total, so
+    an affinity-restricted or cgroup-limited runner is read correctly; it
+    returns `None` when it cannot tell, which is worth one worker.
+    """
+    return min(os.process_cpu_count() or 1, XDIST_WORKER_CAP)
+
+
+def _requested_xdist_workers(posargs: Sequence[str]) -> str | None:
+    """Return the worker count ``posargs`` asks pytest-xdist for, if any.
+
+    Recognizes every spelling pytest-xdist accepts -- ``-n 4``, ``-n4``,
+    ``--numprocesses 4``, ``--numprocesses=4`` -- and returns the value as
+    written, or ``""`` for a trailing ``-n`` with no value at all.
+    Anything else, including an unrelated single-dash option that merely
+    starts with an ``n``, is not a worker request and returns `None`.
+    """
+    for index, arg in enumerate(posargs):
+        if arg in {"-n", "--numprocesses"}:
+            return posargs[index + 1] if index + 1 < len(posargs) else ""
+        if arg.startswith("--numprocesses="):
+            return arg.removeprefix("--numprocesses=")
+        attached = XDIST_ATTACHED_WORKERS.fullmatch(arg)
+        if attached is not None:
+            return attached["workers"]
+    return None
+
+
+def _wants_single_process(posargs: Sequence[str]) -> bool:
+    """Report whether ``posargs`` asks for something workers would defeat."""
+    if not SERIAL_DEBUG_OPTIONS.isdisjoint(posargs):
+        return True
+    return any(
+        arg == "--capture" and value == "no"
+        for arg, value in pairwise(posargs)
+    )
+
+
+def _xdist_args(posargs: Sequence[str]) -> list[str]:
+    """Return default pytest-xdist arguments for a pytest invocation.
+
+    The suite runs under pytest-xdist by default, one worker per usable
+    CPU up to `XDIST_WORKER_CAP`; each worker gets its own PostgreSQL
+    database via the isolation shim in ``tests/support/xdist.py``. Pass
+    your own ``-n`` in posargs (e.g. ``-n 0`` for a serial run) to
+    override.
+
+    Debugging invocations get the single process they need without asking:
+    posargs carrying ``--pdb``, ``--trace``, ``-s``, or ``--capture=no``
+    suppress the injection too, because the workers would otherwise refuse
+    the debugger, crash on it, or swallow the output -- after the
+    container has already started, and with nothing to say the ``-n`` came
+    from here.
+    """
+    if _requested_xdist_workers(posargs) is not None:
+        return []
+    if _wants_single_process(posargs):
+        return []
+    return ["-n", str(_default_xdist_workers())]
+
+
+def _test_relative_path(arg: str) -> PurePosixPath | None:
+    """Return ``arg`` as a repository-relative path under ``tests/``.
+
+    Strips any ``::`` node identifier, resolves the rest against the
+    session's working directory (nox runs sessions from the directory
+    holding this noxfile, which is what pytest resolves a relative posarg
+    against too), and returns `None` unless the result exists and lives in
+    the test suite -- ``tests`` itself included.
+    """
+    path = Path(arg.split("::", 1)[0])
+    if not path.exists():
+        return None
+    root = Path.cwd().resolve()
+    try:
+        relative = path.resolve().relative_to(root / TESTS_ROOT)
+    except (OSError, ValueError):
+        return None
+    return PurePosixPath(TESTS_ROOT, relative.as_posix())
+
+
+def _path_selections(posargs: Sequence[str]) -> list[str]:
+    """Return the posargs that select tests by path.
+
+    A posarg selects tests when it is not an option and it resolves to an
+    existing path under ``tests/``, once any ``::`` node identifier is
+    stripped. Everything else -- ``-x``, ``-k expr``, ``-n 2`` -- is a way
+    of running the selection, not a selection.
+
+    Deciding on the tests/-rooted path rather than on
+    `PYTEST_VALUE_OPTIONS` is what keeps an option this noxfile has never
+    heard of from having its value misread: ``--cov-config pyproject.toml``
+    names a file that exists, but not one this suite could ever collect.
+    An unknown option whose value does point into ``tests/`` is still
+    misread, which is what `PYTEST_VALUE_OPTIONS` remains good for.
+    """
+    selections: list[str] = []
+    skip_value = False
+    for arg in posargs:
+        if skip_value:
+            skip_value = False
+        elif arg.startswith("-"):
+            skip_value = arg in PYTEST_VALUE_OPTIONS
+        elif _test_relative_path(arg) is not None:
+            selections.append(arg)
+    return selections
+
+
+def _test_args(posargs: Sequence[str]) -> list[str]:
+    """Compose the pytest arguments for the ``test`` session.
+
+    The `INTEGRATION_TEST_PATH` ignore always applies, so an invocation
+    that only passes options (``nox -s test -- -x``) still runs the whole
+    container-backed selection. A posarg that names a path under
+    ``tests/`` *replaces* the default ``tests`` selection instead of
+    adding to it, so ``nox -s test -- tests/handlers`` runs the handlers
+    and nothing else.
+    """
+    args = [*_xdist_args(posargs), f"--ignore={INTEGRATION_TEST_PATH}"]
+    if not _path_selections(posargs):
+        args.append(TESTS_ROOT)
+    args.extend(posargs)
+    return args
 
 
 def _setup_testcontainers_env() -> None:
@@ -99,9 +298,7 @@ def test(session: nox.Session) -> None:
         url = postgres.get_connection_url(driver="asyncpg")
         session.run(
             "pytest",
-            "--ignore=tests/integration",
-            "tests/",
-            *session.posargs,
+            *_test_args(session.posargs),
             env={
                 "DOCVERSE_DATABASE_URL": url,
                 "DOCVERSE_DATABASE_PASSWORD": postgres.password,

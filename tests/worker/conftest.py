@@ -22,11 +22,26 @@ from docverse_server.config import Configuration
 from docverse_server.metrics.events import DocverseEvents
 from docverse_server.services.credential_encryptor import CredentialEncryptor
 from docverse_server.worker.main import WorkerFactoryBuilder
+from tests.support.database import ddl_database_url_for
+from tests.support.xdist import verify_worker_isolation
 
 __all__ = ["make_worker_ctx"]
 
 
 _config = Configuration()
+"""A second configuration, built the way ``worker.main.startup`` builds it.
+
+Like the application's own singleton this snapshots the environment as it
+is imported, so it too depends on ``tests/conftest.py`` having run the
+pytest-xdist shim first -- pytest loads the root conftest before this one.
+The check below fails collection rather than letting this module quietly
+reintroduce the base database an xdist worker was moved off.
+"""
+
+verify_worker_isolation(
+    database_url=_config.database_url,
+    ddl_database_url=ddl_database_url_for(_config.database_url),
+)
 
 
 def make_worker_ctx(

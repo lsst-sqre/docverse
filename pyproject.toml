@@ -44,6 +44,7 @@ dev = [
     "httpx",
     "pytest",
     "pytest-asyncio",
+    "pytest-xdist",
     "respx",
     "uv",
 ]

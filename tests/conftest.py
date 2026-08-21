@@ -2,64 +2,91 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
-from contextlib import AsyncExitStack
-from pathlib import Path
-from typing import Any
+from .support.xdist import isolate_xdist_worker, verify_worker_isolation
 
-import httpx
-import pytest
-import pytest_asyncio
-import respx
-import sentry_sdk
-import structlog
-from asgi_lifespan import LifespanManager
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
-from rubin.repertoire import DiscoveryClient, register_mock_discovery
-from safir.arq import MockArqQueue
-from safir.database import create_database_engine
-from safir.dependencies.arq import arq_dependency
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import (
+# Every import below must come after this call: docverse_server.config
+# snapshots the environment into its module-level Configuration()
+# singleton the moment it is imported, so the shim has to rewrite that
+# environment first. Each of those imports carries its own `noqa: E402`
+# rather than a file-wide one, so adding another is a deliberate act;
+# verify_worker_isolation, called after them, fails collection if one ever
+# gets ahead of the shim anyway. See tests.support.xdist.
+isolate_xdist_worker()
+
+from collections.abc import AsyncGenerator, Iterator  # noqa: E402
+from contextlib import AsyncExitStack  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+import respx  # noqa: E402
+import sentry_sdk  # noqa: E402
+import structlog  # noqa: E402
+from asgi_lifespan import LifespanManager  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from rubin.repertoire import (  # noqa: E402
+    DiscoveryClient,
+    register_mock_discovery,
+)
+from safir.arq import MockArqQueue  # noqa: E402
+from safir.database import create_database_engine  # noqa: E402
+from safir.dependencies.arq import arq_dependency  # noqa: E402
+from safir.dependencies.db_session import db_session_dependency  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
 )
 
-from docverse.models import (
+from docverse.models import (  # noqa: E402
     BuildAnnotations,
     BuildCreate,
     OrgMembershipCreate,
     OrgRole,
     PrincipalType,
 )
-from docverse_server.config import config
-from docverse_server.dependencies.context import (
+from docverse_server.config import config  # noqa: E402
+from docverse_server.dependencies.context import (  # noqa: E402
     RequestContext,
     context_dependency,
 )
-from docverse_server.domain.base32id import serialize_base32_id
-from docverse_server.main import app as docverse_app
-from docverse_server.metrics import build_event_manager
-from docverse_server.metrics.events import DocverseEvents
-from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse_server.storage.build_store import BuildStore
-from docverse_server.storage.membership_store import OrgMembershipStore
-from docverse_server.storage.organization_store import OrganizationStore
-from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.user_info_store import StubUserInfoStore
-from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.domain.base32id import serialize_base32_id  # noqa: E402
+from docverse_server.main import app as docverse_app  # noqa: E402
+from docverse_server.metrics import build_event_manager  # noqa: E402
+from docverse_server.metrics.events import DocverseEvents  # noqa: E402
+from docverse_server.services.keeper_sync_run import (  # noqa: E402
+    KEEPER_SYNC_QUEUE_NAME,
+)
+from docverse_server.storage.build_store import BuildStore  # noqa: E402
+from docverse_server.storage.membership_store import (  # noqa: E402
+    OrgMembershipStore,
+)
+from docverse_server.storage.organization_store import (  # noqa: E402
+    OrganizationStore,
+)
+from docverse_server.storage.project_store import ProjectStore  # noqa: E402
+from docverse_server.storage.user_info_store import (  # noqa: E402
+    StubUserInfoStore,
+)
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME  # noqa: E402
 
-from .support.arq_testing import register_queue
-from .support.database import (
+from .support.arq_testing import register_queue  # noqa: E402
+from .support.database import (  # noqa: E402
     ddl_database_url_for,
     provision_database,
     reset_database_for_test,
 )
-from .support.github_mock import GitHubMock, make_rsa_pem
-from .support.metrics import reset_mock_event_publishers
+from .support.github_mock import GitHubMock, make_rsa_pem  # noqa: E402
+from .support.metrics import reset_mock_event_publishers  # noqa: E402
+
+verify_worker_isolation(
+    database_url=config.database_url,
+    ddl_database_url=ddl_database_url_for(config.database_url),
+)
 
 __all__ = [
     "GitHubMock",
