@@ -20,73 +20,14 @@ DB.
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncGenerator
-
 import pytest
-import pytest_asyncio
-import structlog
-from alembic.config import Config
-from safir.database import (
-    create_database_engine,
-    drop_database,
-    initialize_database,
-    stamp_database_async,
-)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from alembic import command
-from docverse_server.config import config
-from docverse_server.dbschema import Base
+from tests.support.migrations import alembic_upgrade
 
 # Revision immediately before the two migrations under test.
 PRE_CLEANUP_REVISION = "s7t8u9v0w1x2"
-
-
-@pytest_asyncio.fixture
-async def fresh_engine() -> AsyncGenerator[AsyncEngine]:
-    """Yield an engine pointing at a freshly-dropped DB.
-
-    The ``app`` conftest fixture is intentionally not used: this test
-    needs to run alembic migrations forward over a known earlier
-    revision, not jump straight to head via ``initialize_database`` +
-    ``stamp_database_async``.
-
-    On fixture teardown the schema is restored to head with a fresh
-    ORM-driven create + stamp so subsequent tests in the suite see a
-    clean DB regardless of whether this test left partial state behind.
-    """
-    logger = structlog.get_logger("docverse")
-    engine = create_database_engine(
-        config.database_url, config.database_password
-    )
-    await drop_database(engine, Base.metadata)
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    try:
-        yield engine
-    finally:
-        # Restore a head-stamped DB so the shared test database is in
-        # a state subsequent tests' ``app`` fixtures can reset cleanly.
-        await drop_database(engine, Base.metadata)
-        async with engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await initialize_database(
-            engine, logger, schema=Base.metadata, reset=True
-        )
-        await stamp_database_async(engine)
-        await engine.dispose()
-
-
-def _alembic_config() -> Config:
-    return Config("alembic.ini")
-
-
-async def _alembic_upgrade(target: str) -> None:
-    # ``run_migrations_online`` calls ``asyncio.run`` internally, so the
-    # alembic command has to run on a thread that owns its own loop.
-    await asyncio.to_thread(command.upgrade, _alembic_config(), target)
 
 
 async def _seed_duplicates(engine: AsyncEngine) -> tuple[int, int]:
@@ -179,12 +120,12 @@ async def test_active_uq_migrations_clean_up_duplicates_and_create_indexes(
     # Bring the DB to the revision *before* the two cleanup+index
     # migrations so we can seed dirty rows the way they would have
     # accumulated under the pre-mutex code path.
-    await _alembic_upgrade(PRE_CLEANUP_REVISION)
+    await alembic_upgrade(PRE_CLEANUP_REVISION)
     org_id, project_id = await _seed_duplicates(fresh_engine)
 
     # The migration under test would raise ``UniqueViolationError`` here
     # without the embedded cleanup; this call is the regression check.
-    await _alembic_upgrade("head")
+    await alembic_upgrade("head")
 
     async with fresh_engine.connect() as conn:
         # Survivor selection — keeper_sync_project pair.
@@ -299,7 +240,7 @@ async def test_active_uq_migrations_clean_up_duplicates_and_create_indexes(
     # at head must be a no-op. Independently re-running just the
     # cleanup ``UPDATE`` against the post-cleanup state must match
     # zero rows.
-    await _alembic_upgrade("head")
+    await alembic_upgrade("head")
     async with fresh_engine.connect() as conn:
         keeper_failed = (
             await conn.execute(
@@ -329,7 +270,7 @@ async def test_active_uq_migrations_no_op_on_clean_db(
     fresh_engine: AsyncEngine,
 ) -> None:
     """A clean DB upgrades to head without touching any rows."""
-    await _alembic_upgrade("head")
+    await alembic_upgrade("head")
 
     async with fresh_engine.connect() as conn:
         failed_count = (

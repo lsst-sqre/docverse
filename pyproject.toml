@@ -44,6 +44,11 @@ dev = [
     "httpx",
     "pytest",
     "pytest-asyncio",
+    # 2.4 is the first release whose debugger detection reads
+    # sys.monitoring, which is how a debugger attaches on the Python this
+    # suite runs on; older releases fire the timeout mid-breakpoint.
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist",
     "respx",
     "uv",
 ]
@@ -182,6 +187,27 @@ warn_uninitialized = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+# The application lifespan, its connection pool, and the shared test
+# engine are all session-scoped fixtures, and pooled asyncpg connections
+# are bound to the loop that opened them. Both scopes therefore have to
+# be "session" so every test and fixture runs on that one loop.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+# Kill any test item -- fixture setup included -- that runs for five
+# minutes. The whole suite finishes in seconds, so nothing healthy comes
+# near this budget; a stuck lock or an await that never resolves would
+# otherwise hold the session-scoped application and its pool until CI
+# gave up at the job timeout, with no output naming what hung.
+#
+# The thread method kills the process the item is running in, dumping
+# every thread's stack on the way out. Serially that dump is the report,
+# ending on the frame the test hung in. Under xdist the process is one
+# worker, whose output goes down with it, and the report comes from xdist
+# instead: it names the item ("worker 'gw3' crashed while running
+# <nodeid>"), replaces the worker, and the run ends in a real failure
+# rather than a cancelled job. See tests/hang_backstop_test.py.
+timeout = 300
+timeout_method = "thread"
 
 [tool.coverage.run]
 parallel = true

@@ -6,6 +6,11 @@ real FastAPI lifespan. The validator itself is unit-tested in
 ``tests/storage/github/startup_test.py`` — this file confirms that the
 lifespan calls it and that the resulting ``context_dependency`` state
 makes the webhook endpoint behave correctly.
+
+Every test here runs the real lifespan itself, whose shutdown closes
+process-global dependencies. They therefore take the ``own_app_lifespan``
+fixture, which stops the suite's shared lifespan first so these startups
+and shutdowns cannot hollow it out for the rest of the session.
 """
 
 from __future__ import annotations
@@ -14,22 +19,14 @@ from collections.abc import AsyncGenerator
 
 import pytest
 import pytest_asyncio
-import structlog
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from safir.arq import MockArqQueue
-from safir.database import (
-    create_database_engine,
-    initialize_database,
-    stamp_database_async,
-)
 from safir.dependencies.arq import arq_dependency
-from sqlalchemy import text
 from structlog.testing import capture_logs
 
 from docverse_server.config import config
-from docverse_server.dbschema import Base
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.main import app as docverse_app
 from docverse_server.storage.user_info_store import StubUserInfoStore
@@ -63,27 +60,6 @@ async def _reset_context_dependency() -> AsyncGenerator[None]:
         context_dependency.set_github_app_validated(value=saved_validated)
 
 
-@pytest_asyncio.fixture
-async def database_initialized() -> AsyncGenerator[None]:
-    """Stamp the test database so ``is_database_current`` passes.
-
-    Mirrors the DB setup the ``app`` fixture in ``tests/conftest.py``
-    performs, but without entering the application's
-    ``LifespanManager`` — these tests run the lifespan themselves to
-    exercise the GitHub-App startup validator path.
-    """
-    logger = structlog.get_logger("docverse")
-    engine = create_database_engine(
-        config.database_url, config.database_password
-    )
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    await initialize_database(engine, logger, schema=Base.metadata, reset=True)
-    await stamp_database_async(engine)
-    await engine.dispose()
-    yield
-
-
 def _patch_github_secrets(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -103,8 +79,8 @@ def _patch_github_secrets(
 def _override_arq_and_user_info() -> None:
     """Replace process-global mocks the existing test suite assumes.
 
-    The conftest ``app`` fixture sets these inside its own
-    ``LifespanManager`` block; tests in this file run the lifespan
+    The conftest ``app`` fixture sets these on the suite's shared
+    lifespan; tests in this file borrow the process and run the lifespan
     themselves, so they must repeat the same overrides post-startup.
     """
     arq_dependency._arq_queue = MockArqQueue(
@@ -115,7 +91,7 @@ def _override_arq_and_user_info() -> None:
 
 @pytest.mark.asyncio
 async def test_lifespan_validates_github_app_when_secrets_set(
-    database_initialized: None,
+    own_app_lifespan: None,
     mock_github: GitHubMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -143,7 +119,7 @@ async def test_lifespan_validates_github_app_when_secrets_set(
 
 @pytest.mark.asyncio
 async def test_lifespan_disables_github_app_on_invalid_key(
-    database_initialized: None,
+    own_app_lifespan: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed PEM → feature disabled, ERROR log, service still starts.
@@ -189,7 +165,7 @@ async def test_lifespan_disables_github_app_on_invalid_key(
 
 @pytest.mark.asyncio
 async def test_lifespan_disables_github_app_on_unauthorized_app(
-    database_initialized: None,
+    own_app_lifespan: None,
     mock_github: GitHubMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -216,7 +192,7 @@ async def test_lifespan_disables_github_app_on_unauthorized_app(
 
 @pytest.mark.asyncio
 async def test_lifespan_skips_validation_when_secrets_unset(
-    database_initialized: None,
+    own_app_lifespan: None,
     mock_github: GitHubMock,
 ) -> None:
     """No GitHub App secrets configured → no log, no GitHub call."""

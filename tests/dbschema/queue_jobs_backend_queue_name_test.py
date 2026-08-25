@@ -11,75 +11,17 @@ itself, and pins the downgrade so a rollback is safe.
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncGenerator
-
 import pytest
-import pytest_asyncio
-import structlog
-from alembic.config import Config
-from safir.database import (
-    create_database_engine,
-    drop_database,
-    initialize_database,
-    stamp_database_async,
-)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from alembic import command
-from docverse_server.config import config
-from docverse_server.dbschema import Base
+from tests.support.migrations import alembic_downgrade, alembic_upgrade
 
 # Revision immediately before the backend_queue_name migration.
 PRE_QUEUE_NAME_REVISION = "f1a2b3c4d5e6"
 
 # The migration under test.
 QUEUE_NAME_REVISION = "a2b3c4d5e6f7"
-
-
-@pytest_asyncio.fixture
-async def fresh_engine() -> AsyncGenerator[AsyncEngine]:
-    """Yield an engine pointing at a freshly-dropped DB.
-
-    Mirrors the other ``tests/dbschema`` migration tests: the ``app``
-    conftest fixture jumps straight to head, but this test needs to step
-    the schema forward from a known earlier revision. On teardown the
-    schema is restored to head so later tests' ``app`` fixtures find a
-    clean DB.
-    """
-    logger = structlog.get_logger("docverse")
-    engine = create_database_engine(
-        config.database_url, config.database_password
-    )
-    await drop_database(engine, Base.metadata)
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    try:
-        yield engine
-    finally:
-        await drop_database(engine, Base.metadata)
-        async with engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await initialize_database(
-            engine, logger, schema=Base.metadata, reset=True
-        )
-        await stamp_database_async(engine)
-        await engine.dispose()
-
-
-def _alembic_config() -> Config:
-    return Config("alembic.ini")
-
-
-async def _alembic_upgrade(target: str) -> None:
-    # ``run_migrations_online`` calls ``asyncio.run`` internally, so the
-    # alembic command has to run on a thread that owns its own loop.
-    await asyncio.to_thread(command.upgrade, _alembic_config(), target)
-
-
-async def _alembic_downgrade(target: str) -> None:
-    await asyncio.to_thread(command.downgrade, _alembic_config(), target)
 
 
 async def _backend_queue_name_column(
@@ -107,7 +49,7 @@ async def test_migration_adds_nullable_backend_queue_name(
     fresh_engine: AsyncEngine,
 ) -> None:
     """The column arrives nullable, and rows seeded before it stay valid."""
-    await _alembic_upgrade(PRE_QUEUE_NAME_REVISION)
+    await alembic_upgrade(PRE_QUEUE_NAME_REVISION)
     assert await _backend_queue_name_column(fresh_engine) is None
 
     async with fresh_engine.begin() as conn:
@@ -133,7 +75,7 @@ async def test_migration_adds_nullable_backend_queue_name(
             {"org": org_id},
         )
 
-    await _alembic_upgrade(QUEUE_NAME_REVISION)
+    await alembic_upgrade(QUEUE_NAME_REVISION)
 
     assert await _backend_queue_name_column(fresh_engine) == (
         "character varying",
@@ -159,10 +101,10 @@ async def test_downgrade_drops_backend_queue_name(
     fresh_engine: AsyncEngine,
 ) -> None:
     """Rolling back removes the column without touching the rest."""
-    await _alembic_upgrade(QUEUE_NAME_REVISION)
+    await alembic_upgrade(QUEUE_NAME_REVISION)
     assert await _backend_queue_name_column(fresh_engine) is not None
 
-    await _alembic_downgrade(PRE_QUEUE_NAME_REVISION)
+    await alembic_downgrade(PRE_QUEUE_NAME_REVISION)
 
     assert await _backend_queue_name_column(fresh_engine) is None
     async with fresh_engine.connect() as conn:

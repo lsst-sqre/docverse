@@ -2,61 +2,95 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
-from pathlib import Path
-from typing import Any
+from .support.xdist import isolate_xdist_worker, verify_worker_isolation
 
-import httpx
-import pytest
-import pytest_asyncio
-import respx
-import sentry_sdk
-import structlog
-from asgi_lifespan import LifespanManager
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
-from rubin.repertoire import DiscoveryClient, register_mock_discovery
-from safir.arq import MockArqQueue
-from safir.database import (
-    create_database_engine,
-    initialize_database,
-    stamp_database_async,
+# Every import below must come after this call: docverse_server.config
+# snapshots the environment into its module-level Configuration()
+# singleton the moment it is imported, so the shim has to rewrite that
+# environment first. Each of those imports carries its own `noqa: E402`
+# rather than a file-wide one, so adding another is a deliberate act;
+# verify_worker_isolation, called after them, fails collection if one ever
+# gets ahead of the shim anyway. See tests.support.xdist.
+isolate_xdist_worker()
+
+from collections.abc import AsyncGenerator, Iterator  # noqa: E402
+from contextlib import AsyncExitStack  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+import respx  # noqa: E402
+import sentry_sdk  # noqa: E402
+import structlog  # noqa: E402
+from asgi_lifespan import LifespanManager  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from rubin.repertoire import (  # noqa: E402
+    DiscoveryClient,
+    register_mock_discovery,
 )
-from safir.dependencies.arq import arq_dependency
-from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from safir.arq import MockArqQueue  # noqa: E402
+from safir.database import create_database_engine  # noqa: E402
+from safir.dependencies.arq import arq_dependency  # noqa: E402
+from safir.dependencies.db_session import db_session_dependency  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+)
 
-from docverse.models import (
+from docverse.models import (  # noqa: E402
     BuildAnnotations,
     BuildCreate,
     OrgMembershipCreate,
     OrgRole,
     PrincipalType,
 )
-from docverse_server.config import config
-from docverse_server.dbschema import Base
-from docverse_server.dependencies.context import (
+from docverse_server.config import config  # noqa: E402
+from docverse_server.dependencies.context import (  # noqa: E402
     RequestContext,
     context_dependency,
 )
-from docverse_server.domain.base32id import serialize_base32_id
-from docverse_server.main import app as docverse_app
-from docverse_server.metrics import build_event_manager
-from docverse_server.metrics.events import DocverseEvents
-from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
-from docverse_server.storage.build_store import BuildStore
-from docverse_server.storage.membership_store import OrgMembershipStore
-from docverse_server.storage.organization_store import OrganizationStore
-from docverse_server.storage.project_store import ProjectStore
-from docverse_server.storage.user_info_store import StubUserInfoStore
-from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
+from docverse_server.domain.base32id import serialize_base32_id  # noqa: E402
+from docverse_server.main import app as docverse_app  # noqa: E402
+from docverse_server.metrics import build_event_manager  # noqa: E402
+from docverse_server.metrics.events import DocverseEvents  # noqa: E402
+from docverse_server.services.keeper_sync_run import (  # noqa: E402
+    KEEPER_SYNC_QUEUE_NAME,
+)
+from docverse_server.storage.build_store import BuildStore  # noqa: E402
+from docverse_server.storage.membership_store import (  # noqa: E402
+    OrgMembershipStore,
+)
+from docverse_server.storage.organization_store import (  # noqa: E402
+    OrganizationStore,
+)
+from docverse_server.storage.project_store import ProjectStore  # noqa: E402
+from docverse_server.storage.user_info_store import (  # noqa: E402
+    StubUserInfoStore,
+)
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME  # noqa: E402
 
-from .support.arq_testing import register_queue
-from .support.github_mock import GitHubMock, make_rsa_pem
+from .support.arq_testing import register_queue  # noqa: E402
+from .support.database import (  # noqa: E402
+    ddl_database_url_for,
+    provision_database,
+    reset_database_for_test,
+)
+from .support.github_mock import GitHubMock, make_rsa_pem  # noqa: E402
+from .support.metrics import reset_mock_event_publishers  # noqa: E402
+
+verify_worker_isolation(
+    database_url=config.database_url,
+    ddl_database_url=ddl_database_url_for(config.database_url),
+)
 
 __all__ = [
     "GitHubMock",
+    "SessionLifespan",
     "seed_build",
     "seed_group_member",
     "seed_member",
@@ -64,6 +98,56 @@ __all__ = [
 ]
 
 _DISCOVERY_FIXTURE = Path(__file__).parent / "data" / "discovery.json"
+
+
+class SessionLifespan:
+    """The suite's single run of the application lifespan.
+
+    Startup and shutdown are decoupled from any one ``with`` block so a
+    test that has to drive the real lifespan itself — ``tests/main_test``
+    exercises the GitHub-App startup validator that way — can borrow the
+    process first. Only one lifespan may run at a time: shutdown closes
+    process-global dependencies (``db_session_dependency``,
+    ``http_client_dependency``, the metrics manager), so a nested
+    lifespan's exit would otherwise leave the shared one hollowed out
+    for every test that follows.
+
+    Restarting is lazy, via :meth:`ensure_running` from the ``app``
+    fixture, rather than eager on the borrowing test's teardown: by then
+    the borrower may still have ``config`` monkeypatched, and startup
+    reads config to decide whether to call out to GitHub.
+    """
+
+    def __init__(self, app: FastAPI) -> None:
+        self._app = app
+        self._stack: AsyncExitStack | None = None
+
+    async def ensure_running(self) -> None:
+        """Start the application lifespan unless it is already running.
+
+        Startup is entered under its own discovery mock: the autouse
+        ``mock_discovery`` router may not be installed yet (session
+        fixtures are set up before function-scoped ones), and startup
+        would otherwise be the one place in the suite that could reach
+        the network. The `AsyncExitStack` keeps the lifespan open after
+        that mock is torn down, so per-test routers govern everything
+        the running application does afterwards.
+        """
+        if self._stack is not None:
+            return
+        stack = AsyncExitStack()
+        with respx.mock(
+            assert_all_called=False, assert_all_mocked=False
+        ) as router:
+            register_mock_discovery(router, _DISCOVERY_FIXTURE)
+            await stack.enter_async_context(LifespanManager(self._app))
+        self._stack = stack
+
+    async def stop(self) -> None:
+        """Shut the application lifespan down if it is running."""
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            await stack.aclose()
 
 
 @pytest.fixture(autouse=True)
@@ -149,39 +233,121 @@ async def mock_events() -> AsyncGenerator[DocverseEvents]:
         await manager.aclose()
 
 
-@pytest_asyncio.fixture
-async def app() -> AsyncGenerator[FastAPI]:
-    """Return a configured test application.
+@pytest_asyncio.fixture(scope="session")
+async def database_engine() -> AsyncGenerator[AsyncEngine]:
+    """Yield one engine per pytest process, with the schema built once.
 
-    Wraps the application in a lifespan manager so that startup and shutdown
-    events are sent during test execution.
+    Creating the ``pg_trgm`` extension, running ``create_all`` and
+    stamping Alembic used to happen once per *test*; it happens once per
+    session here, and :func:`~tests.support.database.reset_database_for_test`
+    truncates instead on every subsequent call. The engine is shared so
+    the per-test reset does not pay for a new connection pool either.
     """
-    logger = structlog.get_logger("docverse")
     engine = create_database_engine(
         config.database_url, config.database_password
     )
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    await initialize_database(engine, logger, schema=Base.metadata, reset=True)
-    await stamp_database_async(engine)
-    await engine.dispose()
+    await reset_database_for_test(engine)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
 
-    async with LifespanManager(docverse_app):
-        context_dependency._user_info_store = StubUserInfoStore()
-        context_dependency._superadmin_usernames = ["superadmin"]
-        # Replace the MockArqQueue with one that uses the configured
-        # queue name so ArqQueueBackend can enqueue to the right queue.
-        # Register the dedicated keeper-sync and maintenance queues too —
-        # MockArqQueue only auto-creates the slot for its
-        # ``default_queue_name``, so the ``POST /orgs/{org}/keeper-sync/
-        # runs`` enqueue and the project_github_resolve enqueue onto the
-        # maintenance pool (PRD #419) would otherwise hit ``KeyError`` on
-        # first use.
-        arq_queue = MockArqQueue(default_queue_name=config.arq_queue_name)
-        register_queue(arq_queue, KEEPER_SYNC_QUEUE_NAME)
-        register_queue(arq_queue, MAINTENANCE_QUEUE_NAME)
-        arq_dependency._arq_queue = arq_queue
-        yield docverse_app
+
+@pytest_asyncio.fixture(scope="session")
+async def ddl_database_url() -> str:
+    """Provision the database the schema/migration tests own.
+
+    ``tests/dbschema`` drops the schema and steps Alembic through
+    individual revisions, which the shared session-scoped engine,
+    application lifespan, and truncate-based reset cannot survive. Those
+    tests get this sibling database instead, created once per pytest
+    process with the same server-side provisioning (currently
+    ``pg_trgm``) every test database needs.
+    """
+    url = ddl_database_url_for(config.database_url)
+    await provision_database(url, config.database_password)
+    return url
+
+
+@pytest.fixture(scope="session")
+def db_session_factory(
+    database_engine: AsyncEngine,
+) -> async_sessionmaker[AsyncSession]:
+    """Return a session factory bound to the shared test engine."""
+    return async_sessionmaker(database_engine, expire_on_commit=False)
+
+
+@pytest_asyncio.fixture(scope="session")
+async def app_lifespan(
+    database_engine: AsyncEngine,
+) -> AsyncGenerator[SessionLifespan]:
+    """Own the suite's single run of the application lifespan.
+
+    The schema has to exist before startup, since the lifespan refuses
+    to run against a database that is not at the current Alembic
+    revision — hence the ``database_engine`` dependency. Startup itself
+    is left to the ``app`` fixture's :meth:`SessionLifespan.ensure_running`
+    so that a test which borrows the process can hand it back lazily.
+    """
+    lifespan = SessionLifespan(docverse_app)
+    try:
+        yield lifespan
+    finally:
+        await lifespan.stop()
+
+
+@pytest_asyncio.fixture
+async def own_app_lifespan(
+    app_lifespan: SessionLifespan, database_engine: AsyncEngine
+) -> None:
+    """Give this test exclusive use of the process-global lifespan state.
+
+    For tests that run the real application lifespan themselves: the
+    suite's lifespan is stopped so the test's own startup and shutdown
+    own ``db_session_dependency`` and friends outright. The database is
+    left empty and Alembic-stamped, which is what the lifespan's schema
+    check requires. The next test that asks for ``app`` restarts the
+    suite's lifespan.
+    """
+    await reset_database_for_test(database_engine)
+    await app_lifespan.stop()
+
+
+@pytest_asyncio.fixture
+async def app(
+    app_lifespan: SessionLifespan, database_engine: AsyncEngine
+) -> FastAPI:
+    """Return the running test application, reset for this test.
+
+    The lifespan itself is session-scoped, so everything a test can
+    dirty inside process-lifetime state is rebuilt here instead: the
+    database is truncated back to empty, the recorded metrics payloads
+    are dropped, and the dependency singletons that tests mutate get
+    fresh values.
+    """
+    await app_lifespan.ensure_running()
+    await reset_database_for_test(database_engine)
+    events = context_dependency._events
+    if events is not None:
+        reset_mock_event_publishers(events)
+    context_dependency._user_info_store = StubUserInfoStore()
+    context_dependency._superadmin_usernames = ["superadmin"]
+    # Replace the MockArqQueue with one that uses the configured
+    # queue name so ArqQueueBackend can enqueue to the right queue.
+    # Register the dedicated keeper-sync and maintenance queues too —
+    # MockArqQueue only auto-creates the slot for its
+    # ``default_queue_name``, so the ``POST /orgs/{org}/keeper-sync/
+    # runs`` enqueue and the project_github_resolve enqueue onto the
+    # maintenance pool (PRD #419) would otherwise hit ``KeyError`` on
+    # first use. Rebuilding it per test also keeps enqueued jobs from
+    # leaking forward, which no lifespan cycle bounds any more.
+    arq_queue = MockArqQueue(default_queue_name=config.arq_queue_name)
+    register_queue(arq_queue, KEEPER_SYNC_QUEUE_NAME)
+    register_queue(arq_queue, MAINTENANCE_QUEUE_NAME)
+    arq_dependency._arq_queue = arq_queue
+    return docverse_app
 
 
 @pytest_asyncio.fixture
@@ -197,13 +363,17 @@ async def client(app: FastAPI) -> AsyncGenerator[AsyncClient]:
 @pytest_asyncio.fixture
 async def db_session(
     app: FastAPI,
+    db_session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncGenerator[AsyncSession]:
     """Provide a database session for direct store tests.
 
-    The ``app`` parameter ensures the application lifespan (and therefore
-    the database engine initialisation) runs before this fixture.
+    The ``app`` parameter orders this fixture after the per-test
+    database reset, so the session always starts against an empty
+    schema. The session comes from the shared session-scoped engine
+    rather than the application's own pool, so a test that holds it open
+    across requests cannot starve the app of a connection.
     """
-    async for session in db_session_dependency():
+    async with db_session_factory() as session:
         yield session
 
 
