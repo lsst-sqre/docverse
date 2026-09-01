@@ -59,6 +59,27 @@ SERIAL_DEBUG_OPTIONS = frozenset({"--pdb", "--trace", "-s", "--capture=no"})
 # scanning a bundle for bare letters would read both as one.
 SHORT_VALUE_OPTIONS = frozenset("ckmnoprW")
 
+# The pytest-xdist scheduler the test session asks for.
+#
+# "loadgroup" behaves exactly like xdist's default "load" -- hand each
+# test to whichever worker is free next -- except that tests carrying an
+# ``xdist_group`` mark all go to one worker, as a block in collection
+# order. tests/session_lifespan_test.py needs that and nothing else
+# does: its pins come in pairs where the first test records or dirties
+# process-wide state and the second asserts what the next test in that
+# same process sees. Under "load" the halves land on different workers,
+# which are different processes with their own application lifespan and
+# database, and the second half reads an empty list instead of the first
+# half's recording -- a failure whose likelihood comes down to the
+# worker count the host happens to detect.
+XDIST_SCHEDULER = "loadgroup"
+
+# Worker counts that leave pytest running in this process. xdist reads
+# either as "do not distribute" and ignores the scheduler outright, so
+# `_xdist_args` does not ask for one. The empty string is a trailing
+# bare "-n"; pytest rejects it on its own terms and needs no help here.
+SERIAL_WORKER_COUNTS = frozenset({"0", ""})
+
 # Ceiling on the worker count detected for pytest-xdist below.
 #
 # The workers themselves run on the host, but everything a worker drives
@@ -157,6 +178,15 @@ def _requested_xdist_workers(posargs: Sequence[str]) -> str | None:
     return None
 
 
+def _requests_xdist_scheduler(posargs: Sequence[str]) -> bool:
+    """Report whether ``posargs`` names a pytest-xdist scheduler.
+
+    Both spellings xdist accepts, ``--dist loadfile`` and
+    ``--dist=loadfile``. There is no short form to expand.
+    """
+    return any(arg == "--dist" or arg.startswith("--dist=") for arg in posargs)
+
+
 def _wants_single_process(posargs: Sequence[str]) -> bool:
     """Report whether ``posargs`` asks for something workers would defeat."""
     if not SERIAL_DEBUG_OPTIONS.isdisjoint(posargs):
@@ -183,16 +213,34 @@ def _xdist_args(posargs: Sequence[str]) -> list[str]:
     container has already started, and with nothing to say the ``-n`` came
     from here.
 
-    Both readings run over `_expand_short_bundles`, because pytest accepts
-    either request run together with other short options and honors it
-    just the same.
+    The `XDIST_SCHEDULER` request rides along with the workers, and is
+    suppressed on its own terms: an invocation that names its own
+    ``--dist`` keeps it, for the same two-values reason the worker count
+    has, and one that ends up in a single process is not scheduling
+    anything. Otherwise it goes in even when the developer set the
+    worker count themselves -- ``-n 2`` is still a distributed run, and
+    the grouped pins in ``tests/session_lifespan_test.py`` still need
+    their block.
+
+    The worker-count and single-process readings both run over
+    `_expand_short_bundles`, because pytest accepts either request run
+    together with other short options and honors it just the same. The
+    scheduler has no short spelling to bundle.
     """
     expanded = _expand_short_bundles(posargs)
-    if _requested_xdist_workers(expanded) is not None:
-        return []
     if _wants_single_process(expanded):
         return []
-    return ["-n", str(_default_xdist_workers())]
+    workers = _requested_xdist_workers(expanded)
+    if workers in SERIAL_WORKER_COUNTS:
+        return []
+    scheduler = (
+        []
+        if _requests_xdist_scheduler(expanded)
+        else ["--dist", XDIST_SCHEDULER]
+    )
+    if workers is not None:
+        return scheduler
+    return ["-n", str(_default_xdist_workers()), *scheduler]
 
 
 def _test_relative_path(arg: str) -> PurePosixPath | None:
