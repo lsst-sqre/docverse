@@ -49,3 +49,17 @@ def test_content_hash_documented_as_deprecated() -> None:
     description = BuildCreate.model_fields["content_hash"].description
     assert description is not None
     assert "deprecated" in description.lower()
+
+
+def test_content_hash_flagged_deprecated_in_json_schema() -> None:
+    """The deprecation is machine-readable, not only prose.
+
+    Prose in the description tells a human; ``deprecated: true`` in the
+    JSON Schema tells a code generator, which is what actually stops the
+    field from being propagated into new client SDKs. Asserting the flag
+    on the emitted schema (rather than on the ``Field`` call) also pins
+    that it survives the ``str | None`` ``anyOf`` wrapping, which is
+    where a naively-placed extra would get buried.
+    """
+    schema = BuildCreate.model_json_schema()["properties"]["content_hash"]
+    assert schema["deprecated"] is True

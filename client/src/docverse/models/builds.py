@@ -152,6 +152,12 @@ class BuildCreate(BaseModel):
                 "abcdef0123456789"
             )
         ],
+        # Set through ``json_schema_extra`` rather than ``Field(
+        # deprecated=...)``: the latter also emits a runtime
+        # ``DeprecationWarning`` on every access, which this deprecation
+        # deliberately avoids. The flag is what client codegen reads to
+        # keep the field out of newly generated SDKs.
+        json_schema_extra={"deprecated": True},
     )
 
     annotations: BuildAnnotations | None = Field(

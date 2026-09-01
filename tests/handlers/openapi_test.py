@@ -256,9 +256,15 @@ async def test_build_content_hash_documents_identity_semantics(
 
     create = schemas["BuildCreate"]
     assert "content_hash" not in create.get("required", [])
-    create_description = create["properties"]["content_hash"]["description"]
+    create_property = create["properties"]["content_hash"]
+    create_description = create_property["description"]
     assert "deprecated" in create_description.lower()
     assert "identity" in create_description.lower()
+    # Prose announces the deprecation to a human; the ``deprecated``
+    # flag announces it to client codegen, which is what keeps the field
+    # out of newly generated SDKs. Assert it on the served spec, since
+    # that is the artifact integrators actually consume.
+    assert create_property["deprecated"] is True
 
     response_description = schemas["Build"]["properties"]["content_hash"][
         "description"
