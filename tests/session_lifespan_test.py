@@ -33,6 +33,19 @@ from docverse_server.metrics.payloads import ProjectLifecycleEvent
 from .conftest import seed_org_with_admin
 from .support.arq_testing import count_jobs_by_name
 
+pytestmark = pytest.mark.xdist_group("session_lifespan")
+"""Keep the pins below on one pytest-xdist worker, in file order.
+
+Each pin is a pair: the first test records or dirties process-wide state
+and the second asserts what the next test in that same process sees.
+Under xdist's default ``load`` scheduling the two halves land on
+different workers -- different processes, each with its own application
+lifespan and database -- so the second half reads an empty list rather
+than the first half's recording. ``loadgroup`` hands the whole group to
+one worker as a block, in collection order; the ``test`` nox session
+asks for it.
+"""
+
 _engines: list[AsyncEngine | None] = []
 """Engine the application lifespan built, recorded once per test below."""
 

@@ -1,11 +1,11 @@
 """Tests for the pytest arguments the ``test`` nox session composes.
 
-The session injects a pytest-xdist worker count that an invocation can
-turn down or take away, and it applies the ``tests/integration`` ignore on
-top of whatever posargs a developer passes -- which only stays correct
-while a path posarg *replaces* the default ``tests`` selection instead of
-adding to it. These tests load ``noxfile.py`` and pin both compositions
-down.
+The session injects a pytest-xdist worker count and the scheduler that
+keeps grouped tests together, both of which an invocation can turn down
+or take away, and it applies the ``tests/integration`` ignore on top of
+whatever posargs a developer passes -- which only stays correct while a
+path posarg *replaces* the default ``tests`` selection instead of adding
+to it. These tests load ``noxfile.py`` and pin both compositions down.
 
 Nox itself is not installed in the test environment -- it lives in the
 ``nox`` dependency group, which bootstraps the sessions from outside -- so
@@ -80,6 +80,11 @@ def ignore_flag(noxfile: Any) -> str:
     return f"--ignore={noxfile.INTEGRATION_TEST_PATH}"
 
 
+@pytest.fixture(scope="module")
+def scheduler_args(noxfile: Any) -> list[str]:
+    return ["--dist", noxfile.XDIST_SCHEDULER]
+
+
 @pytest.fixture(autouse=True)
 def _repo_root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve path posargs from the repository root.
@@ -103,10 +108,10 @@ def _four_available_cpus(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_bare_invocation_runs_the_whole_suite_under_xdist(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``nox -s test`` collects ``tests`` with workers and the ignore."""
-    assert test_args([]) == ["-n", "4", ignore_flag, "tests"]
+    assert test_args([]) == ["-n", "4", *scheduler_args, ignore_flag, "tests"]
 
 
 def test_worker_count_is_capped(
@@ -132,14 +137,21 @@ def test_undetectable_cpu_count_is_worth_one_worker(
 
 
 def test_option_posargs_keep_the_default_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """An invocation that only passes options still runs everything."""
-    assert test_args(["-x"]) == ["-n", "4", ignore_flag, "tests", "-x"]
+    assert test_args(["-x"]) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        "-x",
+    ]
 
 
 def test_a_path_posarg_replaces_the_default_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``nox -s test -- tests/handlers`` runs the handlers and nothing else.
 
@@ -149,22 +161,29 @@ def test_a_path_posarg_replaces_the_default_selection(
     assert test_args(["tests/handlers"]) == [
         "-n",
         "4",
+        *scheduler_args,
         ignore_flag,
         "tests/handlers",
     ]
 
 
 def test_a_node_id_posarg_is_a_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """A ``::``-qualified path still selects, once the node id is stripped."""
     selection = "tests/config_test.py::test_keeper_sync_timeout_defaults"
 
-    assert test_args([selection]) == ["-n", "4", ignore_flag, selection]
+    assert test_args([selection]) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        selection,
+    ]
 
 
 def test_an_option_value_that_is_a_path_is_not_a_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``--ignore tests/worker`` narrows the default run, it does not name it.
 
@@ -173,11 +192,18 @@ def test_an_option_value_that_is_a_path_is_not_a_selection(
     """
     posargs = ["--ignore", "tests/worker"]
 
-    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
 
 
 def test_a_nonexistent_path_is_not_a_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """Only a path that exists under ``tests/`` counts.
 
@@ -186,23 +212,35 @@ def test_a_nonexistent_path_is_not_a_selection(
     """
     posargs = ["tests/does_not_exist_test.py"]
 
-    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
 
 
 def test_a_path_outside_the_suite_is_not_a_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``noxfile.py`` exists, but this session could never collect it."""
     posargs = ["noxfile.py"]
 
-    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
 
 
 @pytest.mark.parametrize(
     "posargs",
     [
-        ["-n", "0"],
-        ["-n0"],
         ["-nauto"],
         ["-nlogical"],
         ["--numprocesses", "2"],
@@ -210,21 +248,69 @@ def test_a_path_outside_the_suite_is_not_a_selection(
     ],
 )
 def test_an_explicit_worker_count_wins(
-    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+    test_args: PytestArgs,
+    ignore_flag: str,
+    scheduler_args: list[str],
+    posargs: list[str],
 ) -> None:
-    """Every spelling of ``-n`` xdist accepts suppresses the injection.
+    """Every spelling of ``-n`` xdist accepts suppresses the count injection.
 
     Passing both would leave pytest with two ``-n`` values, and the
-    developer's own would not be the one that won.
+    developer's own would not be the one that won. The scheduler is a
+    separate request that nothing here conflicts with, so it still goes
+    in: a developer who turns the worker count down keeps the grouping
+    the suite's pins need, rather than trading a slow run for a flaky
+    one.
+    """
+    assert test_args(posargs) == [
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
+
+
+@pytest.mark.parametrize("posargs", [["-n", "0"], ["-n0"], ["-xn0"]])
+def test_a_serial_worker_count_drops_the_scheduler(
+    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+) -> None:
+    """``-n 0`` runs in this process, where there is nothing to schedule.
+
+    xdist reads a zero worker count as "do not distribute" and ignores
+    the scheduler outright, so asking for one would only put an
+    unexplained flag in front of a developer debugging a serial run.
     """
     assert test_args(posargs) == [ignore_flag, "tests", *posargs]
 
 
+@pytest.mark.parametrize(
+    "posargs",
+    [["--dist", "load"], ["--dist=loadfile"], ["--dist", "no"]],
+)
+def test_an_explicit_scheduler_wins(
+    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+) -> None:
+    """A named ``--dist`` suppresses the scheduler injection.
+
+    Same reason the worker count does: pytest would be handed two
+    ``--dist`` values and the developer's own would not reliably be the
+    one that won. The workers are a separate request and still go in.
+    """
+    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+
+
 def test_an_unrelated_option_is_not_a_worker_request(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``-nf`` (``--new-first``) merely starts with an ``n``."""
-    assert test_args(["-nf"]) == ["-n", "4", ignore_flag, "tests", "-nf"]
+    assert test_args(["-nf"]) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        "-nf",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -251,12 +337,19 @@ def test_a_debugger_invocation_runs_in_one_process(
 
 
 def test_pdbcls_alone_keeps_the_workers(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``--pdbcls`` names a debugger class; it does not start one."""
     posargs = ["--pdbcls=pdb:Pdb"]
 
-    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
 
 
 @pytest.mark.parametrize("posargs", [["-xs"], ["-sx"], ["-xvs"]])
@@ -274,11 +367,12 @@ def test_a_bundled_capture_flag_runs_in_one_process(
     assert test_args(posargs) == [ignore_flag, "tests", *posargs]
 
 
-@pytest.mark.parametrize(
-    "posargs", [["-xn2"], ["-xn", "2"], ["-xn0"], ["-xnauto"]]
-)
+@pytest.mark.parametrize("posargs", [["-xn2"], ["-xn", "2"], ["-xnauto"]])
 def test_a_bundled_worker_count_wins(
-    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+    test_args: PytestArgs,
+    ignore_flag: str,
+    scheduler_args: list[str],
+    posargs: list[str],
 ) -> None:
     """A ``-n`` run together with other short options suppresses injection too.
 
@@ -287,12 +381,20 @@ def test_a_bundled_worker_count_wins(
     two ``-n`` values, and which one won would come down to the order the
     session happens to concatenate them in.
     """
-    assert test_args(posargs) == [ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
 
 
 @pytest.mark.parametrize("posargs", [["-rs"], ["-ps"], ["-rsx"]])
 def test_a_value_options_letters_are_not_flags(
-    test_args: PytestArgs, ignore_flag: str, posargs: list[str]
+    test_args: PytestArgs,
+    ignore_flag: str,
+    scheduler_args: list[str],
+    posargs: list[str],
 ) -> None:
     """A bundle stops at the first short option that takes a value.
 
@@ -301,11 +403,18 @@ def test_a_value_options_letters_are_not_flags(
     bundle scanned for bare letters would strip the workers from these
     perfectly ordinary invocations.
     """
-    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]
 
 
 def test_a_bundled_value_options_path_is_not_a_selection(
-    test_args: PytestArgs, ignore_flag: str
+    test_args: PytestArgs, ignore_flag: str, scheduler_args: list[str]
 ) -> None:
     """``-xk tests`` filters the default run; it does not name it.
 
@@ -316,4 +425,11 @@ def test_a_bundled_value_options_path_is_not_a_selection(
     """
     posargs = ["-xk", "tests"]
 
-    assert test_args(posargs) == ["-n", "4", ignore_flag, "tests", *posargs]
+    assert test_args(posargs) == [
+        "-n",
+        "4",
+        *scheduler_args,
+        ignore_flag,
+        "tests",
+        *posargs,
+    ]

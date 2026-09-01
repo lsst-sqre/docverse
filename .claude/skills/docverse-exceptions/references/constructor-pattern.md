@@ -70,6 +70,5 @@ class InvalidFooStateError(DocverseSlackException):
         current_state: str | None,
         target_state: str | None,
         foo_public_id: str | None,
-    ) -> str:
-        ...
+    ) -> str: ...
 ```
