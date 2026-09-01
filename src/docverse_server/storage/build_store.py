@@ -181,11 +181,26 @@ class BuildStore:
 
         Used by the keeper-sync engine for dual-upload convergence:
         when an inbound LTD build's content hash matches a build that
-        already exists in Docverse for the same project (typically from
-        a direct Docverse upload), the sync links its state row to that
-        build instead of re-copying the same content into a fresh row.
-        Soft-deleted rows and builds that haven't reached ``completed``
-        are excluded so the linked-to row is canonical and stable.
+        already exists in Docverse for the same project, the sync links
+        its state row to that build instead of re-copying the same
+        content into a fresh row.
+
+        The match reaches across producers because both write the same
+        server-computed manifest hash (see
+        :mod:`docverse_server.domain.content_hash`): keeper-sync's
+        copier as it copies, and the build-processing worker as it
+        extracts a client-uploaded tarball. A build that arrived by
+        direct Docverse upload is therefore a real candidate here.
+        Until the worker computed that hash (DM-55762) such rows held
+        the client's gzipped-tarball digest instead, so in practice
+        only copier-produced builds could ever match.
+
+        Restricting to ``completed`` is what makes the comparison
+        sound rather than merely tidy: a row carries its true content
+        identity only once the worker stamps it at completion, and
+        before that it holds the placeholder or the deprecated
+        transport digest. Soft-deleted rows are excluded as well, so
+        the row linked to is canonical and stable.
         """
         result = await self._session.execute(
             select(SqlBuild)

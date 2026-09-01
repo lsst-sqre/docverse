@@ -9,7 +9,9 @@ state-store rows and copied object bytes.
 
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -40,6 +42,7 @@ from docverse.models import (
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
@@ -89,6 +92,7 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from docverse_server.worker.functions.build_processing import _process_build
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 from tests.support.lock_service_spy import RecordingLockService
 
@@ -386,6 +390,22 @@ def _seed_ltd(
             else _load("build.json"),
         )
     )
+
+
+def _make_client_tarball(files: dict[str, bytes]) -> bytes:
+    """Build the gzipped tarball a client upload would stage.
+
+    Members carry the ``./`` prefix that ``tar.add(source, arcname=".")``
+    produces in the client's ``docverse._tar.create_tarball``, so the
+    worker's key normalization is exercised rather than bypassed.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name=f"./{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 @pytest.mark.asyncio
@@ -1309,11 +1329,15 @@ async def test_dual_upload_convergence_links_existing_build_and_skips_copy(
 ) -> None:
     """Skip the copy and link state when content matches an existing build.
 
-    Models the dual-upload scenario from PRD #275 user story 12: a
-    project has cut over to direct Docverse uploads, so its current
-    Docverse build holds the canonical content; LTD CI is still pushing
-    the same content to LTD as well. Re-copying that content into a new
-    Docverse build row would have the two upload paths fight each other.
+    Both builds here are copier-produced: the baseline comes from a
+    first ``sync_project`` run, and the inbound one is LTD republishing
+    byte-identical content under a new build prefix. That is the
+    re-sync half of the convergence contract from PRD #275 user story
+    12 — an unchanged rebuild must not fork a second Docverse row — and
+    it pins the branch's bookkeeping rather than the agreement between
+    independent producers, which
+    ``test_client_upload_and_ltd_sync_converge_on_same_content`` covers
+    with a worker-extracted baseline.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
@@ -1554,6 +1578,143 @@ async def test_dual_upload_convergence_repoints_edition_when_pointer_differs(
         )
         assert edition_after is not None
         assert edition_after.current_build_id == matching_build_id
+
+
+@pytest.mark.asyncio
+async def test_client_upload_and_ltd_sync_converge_on_same_content(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Convergence fires between two genuinely independent producers.
+
+    The baseline build is produced by the worker extraction path — a
+    real client tarball unpacked by
+    :func:`~docverse_server.worker.functions.build_processing._process_build`,
+    which computes and stores the content identity at completion — and
+    the inbound build by keeper-sync's copier over the same files in
+    LTD's bucket. Neither producer ever sees the other's hash, so the
+    match is evidence that the two implementations agree, which is
+    exactly what PRD #569 set out to guarantee: while the client's
+    gzip-stream digest was the stored identity, a direct upload could
+    never match an inbound LTD build and every sync re-copied content
+    Docverse already held.
+    """
+    logger = structlog.get_logger("test")
+    content = {
+        "index.html": b"<html>v1</html>",
+        "assets/app.js": b"console.log(1)",
+    }
+
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        project_service = ProjectService(
+            store=ProjectStore(session=db_session, logger=logger),
+            org_store=OrganizationStore(session=db_session, logger=logger),
+            edition_store=EditionStore(session=db_session, logger=logger),
+            logger=logger,
+        )
+        # Created the way the API creates a project, and carrying the
+        # LTD product slug so the sync adopts it rather than creating a
+        # second one.
+        _, project, _ = await project_service.create(
+            org_slug="ks-svc",
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines_lsst_io",
+            ),
+        )
+
+    object_store = MockObjectStore()
+    build_store = BuildStore(session=db_session, logger=logger)
+
+    # Producer 1: the client upload path. The build is created without
+    # a content hash (the transport digest is deprecated and optional),
+    # so the row holds the placeholder until the worker hashes what it
+    # actually extracted.
+    async with db_session.begin():
+        uploaded = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(git_ref="main"),
+            uploader="ci-bot",
+        )
+        assert uploaded.content_hash == PLACEHOLDER_CONTENT_HASH
+        await build_store.transition_status(
+            build_id=uploaded.id, new_status=BuildStatus.processing
+        )
+        staged = await build_store.get_by_id(uploaded.id)
+        assert staged is not None
+
+    await object_store.upload_object(
+        key=staged.staging_key,
+        data=_make_client_tarball(content),
+        content_type="application/gzip",
+    )
+    async with db_session.begin():
+        await _process_build(
+            object_store=object_store,
+            build=staged,
+            build_store=build_store,
+            org_slug="ks-svc",
+            project_slug=project.slug,
+            logger=logger,
+        )
+
+    async with db_session.begin():
+        completed = await build_store.get_by_id(uploaded.id)
+        assert completed is not None
+        assert completed.status == BuildStatus.completed
+        assert completed.content_hash != PLACEHOLDER_CONTENT_HASH
+    keys_after_upload = set(object_store.objects.keys())
+    assert keys_after_upload
+
+    # Producer 2: keeper-sync's copier over the same files, published to
+    # LTD under its own bucket prefix.
+    _seed_ltd(mock_discovery)
+    source_objects = {
+        f"pipelines/builds/42/{name}": data for name, data in content.items()
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    main_outcome = result.edition_outcomes[0]
+    assert main_outcome.build_outcome is not None
+    # The copier's manifest hash matched the worker's, so the sync
+    # short-circuited onto the uploaded build.
+    assert main_outcome.build_outcome.content_hash == completed.content_hash
+    assert main_outcome.build_outcome.short_circuited is True
+    assert main_outcome.build_outcome.docverse_build_id == uploaded.id
+    # Nothing was copied: the destination holds only what the worker
+    # uploaded.
+    assert set(object_store.objects.keys()) == keys_after_upload
+
+    async with db_session.begin():
+        # No second build row for the same content.
+        builds = await build_store.list_by_project(project.id, limit=10)
+        assert len(builds.entries) == 1
+        assert builds.entries[0].id == uploaded.id
+
+        state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.build,
+            ltd_id=42,
+        )
+        assert state is not None
+        assert state.docverse_id == uploaded.id
+        assert state.content_hash == completed.content_hash
+
+        # The LTD edition serves the uploaded build directly.
+        edition_store = EditionStore(session=db_session, logger=logger)
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+        assert edition.current_build_id == uploaded.id
 
 
 @pytest.mark.asyncio
