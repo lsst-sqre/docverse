@@ -235,3 +235,33 @@ async def test_conflict_operations_document_conflict_response(
         "conflict operations must document a 409 ErrorModel response: "
         f"{missing}"
     )
+
+
+@pytest.mark.asyncio
+async def test_build_content_hash_documents_identity_semantics(
+    client: AsyncClient,
+) -> None:
+    """The contract documents which producer owns ``content_hash``.
+
+    The field means two different things on the two schemas: on
+    ``BuildCreate`` it is a deprecated, optional transport digest of the
+    uploaded tarball, and on ``Build`` it is the server-computed content
+    identity once the build completes. The deprecation carries no runtime
+    warning, so the OpenAPI descriptions are the whole announcement —
+    a client author reading only the spec has to be able to tell that
+    sending the field is optional and claims nothing about identity.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    schemas = spec["components"]["schemas"]
+
+    create = schemas["BuildCreate"]
+    assert "content_hash" not in create.get("required", [])
+    create_description = create["properties"]["content_hash"]["description"]
+    assert "deprecated" in create_description.lower()
+    assert "identity" in create_description.lower()
+
+    response_description = schemas["Build"]["properties"]["content_hash"][
+        "description"
+    ]
+    assert "completed" in response_description.lower()
+    assert "pending" in response_description.lower()

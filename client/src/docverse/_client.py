@@ -221,7 +221,7 @@ class DocverseClient:
         project: str,
         *,
         git_ref: str,
-        content_hash: str,
+        content_hash: str | None = None,
         alternate_name: str | None = None,
         annotations: BuildAnnotations | None = None,
     ) -> Build:
@@ -236,7 +236,12 @@ class DocverseClient:
         git_ref
             Git ref for the build.
         content_hash
-            SHA-256 hash of the tarball (``sha256:<hex>``).
+            Deprecated transport digest of the tarball
+            (``sha256:<hex>``), recorded as provenance only. The server
+            computes the build's content identity itself and overwrites
+            this value at completion, so leaving it unset is preferred;
+            when omitted the key is left out of the payload entirely
+            rather than sent as ``null``.
         alternate_name
             Optional alternate deployment name.
         annotations
@@ -247,10 +252,9 @@ class DocverseClient:
         Build
             The created build, including ``upload_url``.
         """
-        payload: dict[str, Any] = {
-            "git_ref": git_ref,
-            "content_hash": content_hash,
-        }
+        payload: dict[str, Any] = {"git_ref": git_ref}
+        if content_hash is not None:
+            payload["content_hash"] = content_hash
         if alternate_name is not None:
             payload["alternate_name"] = alternate_name
         if annotations is not None:

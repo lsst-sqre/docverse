@@ -18,6 +18,7 @@ from docverse.models import (
 )
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
@@ -82,6 +83,50 @@ async def test_create_build(
     assert build.staging_key.startswith("__staging/")
     assert build.uploader == "testuser"
     assert build.git_ref == "main"
+
+
+@pytest.mark.asyncio
+async def test_create_build_defaults_content_hash_to_placeholder(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """An omitted client digest becomes the placeholder, not NULL.
+
+    ``BuildCreate.content_hash`` is optional and deprecated, but
+    ``builds.content_hash`` is ``NOT NULL`` — so the store, which is the
+    one place a pending row is built, supplies the placeholder rather
+    than letting the insert fail. The real identity lands later, when
+    the worker transitions the build to ``completed``.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=BuildCreate(git_ref="main"),
+            uploader="testuser",
+        )
+        await db_session.commit()
+    assert build.content_hash == PLACEHOLDER_CONTENT_HASH
+
+
+@pytest.mark.asyncio
+async def test_create_build_keeps_supplied_content_hash(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A digest an old client did send is stored verbatim while pending."""
+    data = _build_data()
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=data,
+            uploader="testuser",
+        )
+        await db_session.commit()
+    assert build.content_hash == data.content_hash
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from safir.metrics import MockEventPublisher
 
 from docverse.models import BuildAnnotations
 from docverse_server.dependencies.context import context_dependency
+from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (
@@ -102,6 +103,74 @@ async def test_create_build_sets_location_header(client: AsyncClient) -> None:
     assert response.status_code == 201
     data = response.json()
     assert response.headers["Location"] == data["self_url"]
+
+
+@pytest.mark.asyncio
+async def test_create_build_stores_client_content_hash(
+    client: AsyncClient,
+) -> None:
+    """A client-supplied transport digest is stored on the pending row.
+
+    The field is deprecated but still accepted, so an old client that
+    sends its tarball digest sees it round-trip until the worker
+    overwrites it with the server-computed content identity.
+    """
+    await _setup(client)
+    await _configure_staging_store(client)
+    response = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        json={
+            "git_ref": "main",
+            "content_hash": CONTENT_HASH,
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    assert response.json()["content_hash"] == CONTENT_HASH
+
+
+@pytest.mark.asyncio
+async def test_create_build_without_content_hash(client: AsyncClient) -> None:
+    """Omitting the deprecated digest succeeds and stores the placeholder.
+
+    ``builds.content_hash`` is ``NOT NULL``, so a pending row created
+    without a client digest holds ``PLACEHOLDER_CONTENT_HASH`` until the
+    worker writes the real content identity at completion.
+    """
+    await _setup(client)
+    await _configure_staging_store(client)
+    response = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        json={"git_ref": "main"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["content_hash"] == PLACEHOLDER_CONTENT_HASH
+    assert data["status"] == "pending"
+
+    # The placeholder is persisted, not just synthesized in the response.
+    fetched = await client.get(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{data['id']}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["content_hash"] == PLACEHOLDER_CONTENT_HASH
+
+
+@pytest.mark.asyncio
+async def test_create_build_rejects_malformed_content_hash(
+    client: AsyncClient,
+) -> None:
+    """The ``sha256:`` pattern is still enforced when the field is sent."""
+    await _setup(client)
+    await _configure_staging_store(client)
+    response = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        json={"git_ref": "main", "content_hash": "not-a-digest"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

@@ -133,16 +133,26 @@ class BuildCreate(BaseModel):
         ),
     )
 
-    content_hash: Annotated[
-        str,
-        Field(
-            pattern=r"^sha256:[a-f0-9]{64}$",
-            description="SHA-256 hash of the uploaded tarball.",
-            examples=[
-                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-            ],
+    content_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        description=(
+            "Deprecated transport-integrity digest of the uploaded "
+            "tarball. Optional, and makes no claim about the build's "
+            "content identity: the server computes that itself while "
+            "processing the upload and overwrites this value when the "
+            "build completes. Supply it only as provenance for what the "
+            "client believed it sent; omitting it is preferred, and it "
+            "will be removed in a future release. When present it must "
+            "still be a 'sha256:'-prefixed hex digest."
         ),
-    ]
+        examples=[
+            (
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789"
+                "abcdef0123456789"
+            )
+        ],
+    )
 
     annotations: BuildAnnotations | None = Field(
         default=None,
@@ -183,7 +193,16 @@ class Build(BaseModel):
     )
 
     content_hash: str = Field(
-        description="SHA-256 hash of the uploaded tarball.",
+        description=(
+            "Content identity of the build. On a 'completed' build this "
+            "is the server-computed digest of the build's file manifest, "
+            "which is what lets the same content converge on one identity "
+            "however it arrived. Before completion — while the build is "
+            "'pending' or 'processing' — it holds the deprecated "
+            "client-supplied tarball digest, or a placeholder of 64 zeros "
+            "when the client supplied none, and describes nothing about "
+            "the content."
+        ),
         examples=[
             (
                 "sha256:abcdef0123456789abcdef0123456789abcdef0123456789"

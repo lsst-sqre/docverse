@@ -14,6 +14,7 @@ from docverse.models import BuildCreate, BuildStatus
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
+from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
@@ -53,6 +54,16 @@ class BuildStore:
         and ``storage_prefix``, the object-store keys are recomputed for each
         mint attempt inside :func:`insert_with_time_ordered_public_id`, which
         re-mints on the (rare) same-millisecond ``public_id`` collision.
+
+        A ``data.content_hash`` of ``None`` — the client omitted the
+        deprecated transport digest — becomes
+        :data:`~docverse_server.domain.content_hash.PLACEHOLDER_CONTENT_HASH`,
+        because the column is ``NOT NULL`` and the build's real content
+        identity is not known until the worker has hashed the extracted
+        content. The substitution lives here, at the one place a pending
+        row is constructed, rather than in a caller: a service that
+        forgot it would trip the ``NOT NULL`` constraint at flush time
+        instead of writing a well-formed placeholder.
         """
 
         def _make_row(public_id: int) -> SqlBuild:
@@ -62,7 +73,11 @@ class BuildStore:
                 project_id=project_id,
                 git_ref=data.git_ref,
                 alternate_name=data.alternate_name,
-                content_hash=data.content_hash,
+                content_hash=(
+                    data.content_hash
+                    if data.content_hash is not None
+                    else PLACEHOLDER_CONTENT_HASH
+                ),
                 status=BuildStatus.pending,
                 staging_key=f"__staging/{base32_str}.tar.gz",
                 storage_prefix=f"{project_slug}/__builds/{base32_str}/",
