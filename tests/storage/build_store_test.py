@@ -151,6 +151,114 @@ async def test_transition_processing_to_completed(
 
 
 @pytest.mark.asyncio
+async def test_transition_to_completed_writes_content_hash(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Completing a build adopts the server-computed content identity.
+
+    The build-processing worker hands the manifest hash it computed
+    during extraction to the very call that marks the build complete, so
+    no reader can observe a ``completed`` row still carrying the
+    client's tarball digest.
+    """
+    manifest_hash = "sha256:" + "b" * 64
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        assert build.content_hash != manifest_hash
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        completed = await build_store.transition_status(
+            build_id=build.id,
+            new_status=BuildStatus.completed,
+            content_hash=manifest_hash,
+        )
+        await db_session.commit()
+    assert completed.status == BuildStatus.completed
+    assert completed.content_hash == manifest_hash
+
+
+@pytest.mark.asyncio
+async def test_transition_to_completed_without_hash_keeps_stored_value(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Omitting ``content_hash`` leaves the stored hash alone.
+
+    Keeper-sync completes its builds without the argument — the copier
+    already wrote the manifest hash through ``update_content_hash``
+    while the row was pending — so the completing transition must not
+    clobber what is already there.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        completed = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+        await db_session.commit()
+    assert completed.content_hash == build.content_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target",
+    [BuildStatus.processing, BuildStatus.failed],
+)
+async def test_transition_rejects_content_hash_off_completed(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    target: BuildStatus,
+) -> None:
+    """Only the completing transition may carry a content hash.
+
+    ``completed`` is the one status at which the content is known and
+    final; accepting a hash alongside ``processing`` or ``failed`` would
+    stamp an identity onto content that is still arriving or never
+    landed at all, so the combination is refused as caller misuse.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        if target is BuildStatus.failed:
+            await build_store.transition_status(
+                build_id=build.id, new_status=BuildStatus.processing
+            )
+        with pytest.raises(ValueError, match="content_hash"):
+            await build_store.transition_status(
+                build_id=build.id,
+                new_status=target,
+                content_hash="sha256:" + "c" * 64,
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        unchanged = await build_store.get_by_id(build.id)
+        assert unchanged is not None
+        assert unchanged.content_hash == build.content_hash
+
+
+@pytest.mark.asyncio
 async def test_transition_processing_to_failed(
     db_session: AsyncSession,
     build_store: BuildStore,

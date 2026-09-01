@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import tarfile
 import time
@@ -36,6 +37,10 @@ from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.api_urls import edition_url, job_url
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.content_hash import (
+    EMPTY_MANIFEST_HASH,
+    hash_manifest_pairs,
+)
 from docverse_server.domain.queue import JobKind, JobStatus
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
@@ -277,6 +282,163 @@ async def test_build_processing_updates_edition(
             assert len(job.progress["editions_updated"]) == 1
             assert job.progress["editions_updated"][0]["slug"] == "main"
             assert job.progress["editions_updated"][0]["action"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_build_processing_stores_manifest_content_hash(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The completed row carries the server-computed manifest hash.
+
+    The client's tarball digest (``_HASH`` on the pending row) is a
+    transport check over gzip bytes and cannot match the copier's
+    per-file manifest hash, so a completed build has to be re-stamped
+    with the identity the server derives from the extracted files. The
+    tarball is written with ``./``-prefixed member names, the layout the
+    client's ``arcname="."`` produces, so this also exercises the
+    normalization end to end.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-content-hash",
+        )
+
+    files = {
+        "./index.html": b"<html>hello</html>",
+        "./_static/app.css": b"body { margin: 0; }",
+    }
+    expected_hash = hash_manifest_pairs(
+        (name, hashlib.sha256(data).hexdigest())
+        for name, data in files.items()
+    )
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball(files),
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-content-hash",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    with capture_logs() as captured:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            build_store = BuildStore(session=session, logger=_logger())
+            updated_build = await build_store.get_by_id(build.id)
+            assert updated_build is not None
+            assert updated_build.status == BuildStatus.completed
+            assert updated_build.content_hash == expected_hash
+            assert updated_build.content_hash != _HASH
+
+    # The hash is reported alongside the counts it was derived from, so
+    # a triager reading the upload log can match a build to its content
+    # without a database lookup.
+    uploads = [
+        event for event in captured if event["event"] == "Upload complete"
+    ]
+    assert len(uploads) == 1
+    assert uploads[0]["content_hash"] == expected_hash
+
+
+@pytest.mark.asyncio
+async def test_build_processing_empty_tarball_stores_empty_manifest_hash(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tarball with no files completes with ``EMPTY_MANIFEST_HASH``.
+
+    Keeper-sync's copier already reports that constant for an empty
+    source prefix, so agreeing here keeps the convergence property
+    honest for empty content instead of leaving two builds that hold
+    nothing looking like different content.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-empty-tarball",
+        )
+
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball({}),
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-empty-tarball",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            build_store = BuildStore(session=session, logger=_logger())
+            updated_build = await build_store.get_by_id(build.id)
+            assert updated_build is not None
+            assert updated_build.status == BuildStatus.completed
+            assert updated_build.object_count == 0
+            assert updated_build.content_hash == EMPTY_MANIFEST_HASH
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ updates editions that track the build's git ref.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import mimetypes
 import tarfile
@@ -30,6 +31,7 @@ from docverse.models import (
 )
 from docverse_server.domain.api_urls import edition_url, job_url
 from docverse_server.domain.build import Build
+from docverse_server.domain.content_hash import hash_manifest_pairs
 from docverse_server.domain.edition_tracking import EditionTrackingResult
 from docverse_server.exceptions import NotFoundError
 from docverse_server.factory import Factory
@@ -811,6 +813,14 @@ async def _process_build(
 ) -> tuple[int, int]:
     """Download, unpack, and upload build files.
 
+    Each extracted file is hashed as it goes by, so the build's content
+    identity is derived from the same bytes that were uploaded and
+    lands on the row in the same statement that marks it ``completed``.
+    The algorithm is shared with keeper-sync's copier
+    (:func:`~docverse_server.domain.content_hash.hash_manifest_pairs`),
+    which is what lets the same documentation arriving by either route
+    be recognized as the same content.
+
     Returns
     -------
     tuple of int, int
@@ -840,6 +850,7 @@ async def _process_build(
             return len(data)
 
     tasks: list[asyncio.Task[int]] = []
+    manifest_entries: list[tuple[str, str]] = []
     # TODO(DM-54426): All extracted files
     # held in memory before uploads begin. Streaming extraction with
     # concurrent upload would lower peak memory for large builds.
@@ -852,12 +863,18 @@ async def _process_build(
                 continue
             file_data = f.read()
             name = member.name.removeprefix("./")
+            manifest_entries.append(
+                (name, hashlib.sha256(file_data).hexdigest())
+            )
             task = asyncio.create_task(_upload_file(name, file_data))
             tasks.append(task)
 
     results = await asyncio.gather(*tasks)
     object_count = len(results)
     total_size = sum(results)
+    # Empty input yields EMPTY_MANIFEST_HASH, matching what the copier
+    # reports for an empty source prefix.
+    content_hash = hash_manifest_pairs(manifest_entries)
 
     if object_count == 0:
         logger.warning(
@@ -869,6 +886,7 @@ async def _process_build(
         "Upload complete",
         object_count=object_count,
         total_size_bytes=total_size,
+        content_hash=content_hash,
     )
 
     await build_store.update_inventory(
@@ -882,6 +900,7 @@ async def _process_build(
     await build_store.transition_status(
         build_id=build.id,
         new_status=BuildStatus.completed,
+        content_hash=content_hash,
         org_slug=org_slug,
         project_slug=project_slug,
     )

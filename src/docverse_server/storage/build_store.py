@@ -234,6 +234,7 @@ class BuildStore:
         *,
         build_id: int,
         new_status: BuildStatus,
+        content_hash: str | None = None,
         org_slug: str | None = None,
         project_slug: str | None = None,
         edition_slug: str | None = None,
@@ -244,6 +245,18 @@ class BuildStore:
         transition to ``processing`` and ``date_completed`` on transition
         to ``completed`` or ``failed``.
 
+        ``content_hash`` is the server-computed content identity (see
+        :mod:`docverse_server.domain.content_hash`) and may only
+        accompany the transition to ``completed``: that is the first
+        moment the content is both fully known and final. Writing it
+        here rather than in a follow-up update means a row can never be
+        observed as ``completed`` while still holding the pending
+        hash — the client's transport digest, or the placeholder — which
+        is what makes the content-hash lookup in
+        :meth:`get_completed_by_content_hash` trustworthy. Omit it to
+        leave whatever hash the row already carries in place, as
+        keeper-sync does after its copier has written one.
+
         ``org_slug`` / ``project_slug`` / ``edition_slug`` are optional
         API-facing identifiers carried into :class:`InvalidBuildStateError`
         so a Sentry triager sees slugs rather than internal row ids.
@@ -252,7 +265,21 @@ class BuildStore:
         ------
         InvalidBuildStateError
             If the build is not found or the transition is not valid.
+        ValueError
+            If ``content_hash`` is passed with a target other than
+            ``completed``.
         """
+        # Caller misuse rather than a state problem, so it is checked
+        # before any row is read and does not raise the Slack-routed
+        # InvalidBuildStateError: no operator action can fix it.
+        if content_hash is not None and new_status != BuildStatus.completed:
+            msg = (
+                f"content_hash may only be written on the transition to "
+                f"{BuildStatus.completed.value!r}, not "
+                f"{new_status.value!r}"
+            )
+            raise ValueError(msg)
+
         result = await self._session.execute(
             select(SqlBuild).where(SqlBuild.id == build_id)
         )
@@ -286,6 +313,9 @@ class BuildStore:
             row.date_uploaded = now
         elif new_status in (BuildStatus.completed, BuildStatus.failed):
             row.date_completed = now
+
+        if content_hash is not None:
+            row.content_hash = content_hash
 
         await self._session.flush()
         await self._session.refresh(row)
