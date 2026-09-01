@@ -41,6 +41,10 @@ from docverse.models.editions import DefaultEditionConfig
 from docverse.models.projects import parse_github_url
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
+from docverse_server.domain.content_hash import (
+    EMPTY_MANIFEST_HASH,
+    PLACEHOLDER_CONTENT_HASH,
+)
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
@@ -113,7 +117,7 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
-from .copier import EMPTY_MANIFEST_HASH, CopyResult
+from .copier import CopyResult
 from .mappers import (
     EditionKindDerivation,
     derive_edition_kind,
@@ -246,11 +250,6 @@ CopyCallable = Callable[[str, str], Awaitable[CopyResult]]
 #: LTD manifest hash via this callable, then short-circuits the upload
 #: when an existing Docverse build for the project already carries it.
 ManifestCallable = Callable[[str], Awaitable[str]]
-
-#: Placeholder hash on a freshly-created synced build row. Overwritten
-#: with the real manifest hash once the copier has run. The regex on
-#: :class:`BuildCreate.content_hash` requires ``sha256:<64 hex>``.
-_PLACEHOLDER_CONTENT_HASH = f"sha256:{'0' * 64}"
 
 #: Username recorded as the build's uploader for synced builds.
 _SYNC_UPLOADER = "keeper-sync"
@@ -2251,7 +2250,7 @@ class KeeperSyncService:
             project_slug=project.slug,
             data=BuildCreate(
                 git_ref=ltd_edition.tracked_refs[0],
-                content_hash=_PLACEHOLDER_CONTENT_HASH,
+                content_hash=PLACEHOLDER_CONTENT_HASH,
             ),
             uploader=_SYNC_UPLOADER,
         )

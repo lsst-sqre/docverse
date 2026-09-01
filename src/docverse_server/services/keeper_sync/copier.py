@@ -5,10 +5,13 @@ pool of worker tasks that write into the destination object store under
 ``dest_prefix``, so a single sync slot can never starve other work on
 the worker — and, critically, so neither the number of live tasks nor
 the number of buffered object bodies scales with the number of keys
-under the prefix. It computes a deterministic manifest hash —
-``sha256`` over a sorted ``(relative_key, sha256(data))`` table — so
+under the prefix. It computes each object's digest as it goes and hands
+the resulting manifest to
+:func:`docverse_server.domain.content_hash.hash_manifest_pairs`, so
 re-runs against unchanged input produce byte-identical hashes that
-double as the ``content_hash`` on the resulting Docverse build row.
+double as the ``content_hash`` on the resulting Docverse build row —
+and so a build synced from LTD hashes identically to the same content
+uploaded through the client.
 
 Object bodies are still buffered whole rather than streamed:
 :meth:`~docverse_server.storage.objectstore.ObjectStore.upload_object`
@@ -38,12 +41,15 @@ from dataclasses import dataclass
 
 import structlog
 
+from docverse_server.domain.content_hash import (
+    EMPTY_MANIFEST_HASH,
+    hash_manifest_pairs,
+)
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
 
 __all__ = [
     "DEFAULT_COPY_CONCURRENCY",
-    "EMPTY_MANIFEST_HASH",
     "BuildContentCopier",
     "CopyResult",
 ]
@@ -62,13 +68,6 @@ own default: a second literal in ``factory.py`` was exactly the
 duplication that made the sync worker's real memory bound impossible
 to reason about (#517).
 """
-
-#: Manifest hash of a prefix with no keys under it. Public because a
-#: caller cannot otherwise tell "hashed an empty prefix" apart from
-#: "hashed real content" by looking at the returned hash, and keeper-sync
-#: has to make exactly that distinction when deciding whether its
-#: edition-prefix fallback actually recovered anything (#516).
-EMPTY_MANIFEST_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -139,8 +138,7 @@ class BuildContentCopier:
             manifest_entries.append((relative, digest))
 
         await self._run_bounded(keys, _hash_one)
-        manifest_entries.sort(key=lambda e: e[0])
-        return _hash_manifest_pairs(manifest_entries)
+        return hash_manifest_pairs(manifest_entries)
 
     async def copy_build(
         self, *, source_prefix: str, dest_prefix: str
@@ -201,8 +199,12 @@ class BuildContentCopier:
 
         await self._run_bounded(keys, _copy_one)
 
-        manifest_entries.sort(key=lambda e: e[0])
-        manifest_hash = _hash_manifest(manifest_entries)
+        # Size is deliberately not part of a manifest line — it is
+        # derivable from the bytes already hashed — so it is dropped on
+        # the way in and kept only for the byte total reported below.
+        manifest_hash = hash_manifest_pairs(
+            (relative, digest) for relative, digest, _ in manifest_entries
+        )
         total_bytes = sum(size for _, _, size in manifest_entries)
 
         self._logger.info(
@@ -349,23 +351,3 @@ def _first_real_error(
         if not isinstance(exc, asyncio.CancelledError):
             return exc
     return group
-
-
-def _hash_manifest(entries: list[tuple[str, str, int]]) -> str:
-    r"""Compute ``sha256:`` over sorted ``relative\tdigest\n`` lines.
-
-    Size is deliberately excluded from the manifest line because it is
-    derivable from the data; including it would couple the hash to a
-    second representation of the same fact and risk drift.
-    """
-    return _hash_manifest_pairs(
-        [(relative, digest) for relative, digest, _ in entries]
-    )
-
-
-def _hash_manifest_pairs(entries: list[tuple[str, str]]) -> str:
-    r"""Compute ``sha256:`` over sorted ``relative\tdigest\n`` lines."""
-    hasher = hashlib.sha256()
-    for relative, digest in entries:
-        hasher.update(f"{relative}\t{digest}\n".encode())
-    return f"sha256:{hasher.hexdigest()}"
