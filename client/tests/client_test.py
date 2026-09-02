@@ -96,6 +96,28 @@ async def test_create_build() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_build_omits_content_hash_by_default() -> None:
+    """``content_hash`` is left out of the payload when not supplied.
+
+    The server fills a placeholder for a build whose digest it was not
+    given, so the client must omit the key rather than send ``null`` —
+    the field's ``sha256:`` pattern applies to whatever is sent.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.post("/orgs/myorg/projects/myproj/builds").mock(
+            return_value=httpx.Response(
+                201, json=_build_response(content_hash="sha256:" + "0" * 64)
+            )
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            await client.create_build("myorg", "myproj", git_ref="main")
+
+        assert route.called
+        body = json.loads(route.calls[0].request.content)
+        assert body == {"git_ref": "main"}
+
+
+@pytest.mark.asyncio
 async def test_create_build_with_annotations() -> None:
     """Annotations are included in the POST payload."""
     annotations = BuildAnnotations(

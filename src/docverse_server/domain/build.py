@@ -37,7 +37,12 @@ class Build(BaseModel):
     )
 
     content_hash: str = Field(
-        description="SHA-256 hash of the uploaded tarball."
+        description=(
+            "Content identity of the build: the manifest hash the server "
+            "computes at completion. Before then it holds the deprecated "
+            "client-supplied tarball digest or "
+            "``PLACEHOLDER_CONTENT_HASH``."
+        )
     )
 
     status: BuildStatus = Field(description="Current status of the build.")

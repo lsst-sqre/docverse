@@ -14,6 +14,7 @@ from docverse.models import BuildCreate, BuildStatus
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
+from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
@@ -53,6 +54,16 @@ class BuildStore:
         and ``storage_prefix``, the object-store keys are recomputed for each
         mint attempt inside :func:`insert_with_time_ordered_public_id`, which
         re-mints on the (rare) same-millisecond ``public_id`` collision.
+
+        A ``data.content_hash`` of ``None`` — the client omitted the
+        deprecated transport digest — becomes
+        :data:`~docverse_server.domain.content_hash.PLACEHOLDER_CONTENT_HASH`,
+        because the column is ``NOT NULL`` and the build's real content
+        identity is not known until the worker has hashed the extracted
+        content. The substitution lives here, at the one place a pending
+        row is constructed, rather than in a caller: a service that
+        forgot it would trip the ``NOT NULL`` constraint at flush time
+        instead of writing a well-formed placeholder.
         """
 
         def _make_row(public_id: int) -> SqlBuild:
@@ -62,7 +73,11 @@ class BuildStore:
                 project_id=project_id,
                 git_ref=data.git_ref,
                 alternate_name=data.alternate_name,
-                content_hash=data.content_hash,
+                content_hash=(
+                    data.content_hash
+                    if data.content_hash is not None
+                    else PLACEHOLDER_CONTENT_HASH
+                ),
                 status=BuildStatus.pending,
                 staging_key=f"__staging/{base32_str}.tar.gz",
                 storage_prefix=f"{project_slug}/__builds/{base32_str}/",
@@ -166,11 +181,26 @@ class BuildStore:
 
         Used by the keeper-sync engine for dual-upload convergence:
         when an inbound LTD build's content hash matches a build that
-        already exists in Docverse for the same project (typically from
-        a direct Docverse upload), the sync links its state row to that
-        build instead of re-copying the same content into a fresh row.
-        Soft-deleted rows and builds that haven't reached ``completed``
-        are excluded so the linked-to row is canonical and stable.
+        already exists in Docverse for the same project, the sync links
+        its state row to that build instead of re-copying the same
+        content into a fresh row.
+
+        The match reaches across producers because both write the same
+        server-computed manifest hash (see
+        :mod:`docverse_server.domain.content_hash`): keeper-sync's
+        copier as it copies, and the build-processing worker as it
+        extracts a client-uploaded tarball. A build that arrived by
+        direct Docverse upload is therefore a real candidate here.
+        Until the worker computed that hash (DM-55762) such rows held
+        the client's gzipped-tarball digest instead, so in practice
+        only copier-produced builds could ever match.
+
+        Restricting to ``completed`` is what makes the comparison
+        sound rather than merely tidy: a row carries its true content
+        identity only once the worker stamps it at completion, and
+        before that it holds the placeholder or the deprecated
+        transport digest. Soft-deleted rows are excluded as well, so
+        the row linked to is canonical and stable.
         """
         result = await self._session.execute(
             select(SqlBuild)
@@ -234,6 +264,7 @@ class BuildStore:
         *,
         build_id: int,
         new_status: BuildStatus,
+        content_hash: str | None = None,
         org_slug: str | None = None,
         project_slug: str | None = None,
         edition_slug: str | None = None,
@@ -244,6 +275,18 @@ class BuildStore:
         transition to ``processing`` and ``date_completed`` on transition
         to ``completed`` or ``failed``.
 
+        ``content_hash`` is the server-computed content identity (see
+        :mod:`docverse_server.domain.content_hash`) and may only
+        accompany the transition to ``completed``: that is the first
+        moment the content is both fully known and final. Writing it
+        here rather than in a follow-up update means a row can never be
+        observed as ``completed`` while still holding the pending
+        hash — the client's transport digest, or the placeholder — which
+        is what makes the content-hash lookup in
+        :meth:`get_completed_by_content_hash` trustworthy. Omit it to
+        leave whatever hash the row already carries in place, as
+        keeper-sync does after its copier has written one.
+
         ``org_slug`` / ``project_slug`` / ``edition_slug`` are optional
         API-facing identifiers carried into :class:`InvalidBuildStateError`
         so a Sentry triager sees slugs rather than internal row ids.
@@ -252,7 +295,21 @@ class BuildStore:
         ------
         InvalidBuildStateError
             If the build is not found or the transition is not valid.
+        ValueError
+            If ``content_hash`` is passed with a target other than
+            ``completed``.
         """
+        # Caller misuse rather than a state problem, so it is checked
+        # before any row is read and does not raise the Slack-routed
+        # InvalidBuildStateError: no operator action can fix it.
+        if content_hash is not None and new_status != BuildStatus.completed:
+            msg = (
+                f"content_hash may only be written on the transition to "
+                f"{BuildStatus.completed.value!r}, not "
+                f"{new_status.value!r}"
+            )
+            raise ValueError(msg)
+
         result = await self._session.execute(
             select(SqlBuild).where(SqlBuild.id == build_id)
         )
@@ -286,6 +343,9 @@ class BuildStore:
             row.date_uploaded = now
         elif new_status in (BuildStatus.completed, BuildStatus.failed):
             row.date_completed = now
+
+        if content_hash is not None:
+            row.content_hash = content_hash
 
         await self._session.flush()
         await self._session.refresh(row)

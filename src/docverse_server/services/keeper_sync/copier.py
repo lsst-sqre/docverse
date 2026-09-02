@@ -5,10 +5,13 @@ pool of worker tasks that write into the destination object store under
 ``dest_prefix``, so a single sync slot can never starve other work on
 the worker — and, critically, so neither the number of live tasks nor
 the number of buffered object bodies scales with the number of keys
-under the prefix. It computes a deterministic manifest hash —
-``sha256`` over a sorted ``(relative_key, sha256(data))`` table — so
+under the prefix. It computes each object's digest as it goes and hands
+the resulting manifest to
+:func:`docverse_server.domain.content_hash.hash_manifest_pairs`, so
 re-runs against unchanged input produce byte-identical hashes that
-double as the ``content_hash`` on the resulting Docverse build row.
+double as the ``content_hash`` on the resulting Docverse build row —
+and so a build synced from LTD hashes identically to the same content
+uploaded through the client.
 
 Object bodies are still buffered whole rather than streamed:
 :meth:`~docverse_server.storage.objectstore.ObjectStore.upload_object`
@@ -38,12 +41,15 @@ from dataclasses import dataclass
 
 import structlog
 
+from docverse_server.domain.content_hash import (
+    EMPTY_MANIFEST_HASH,
+    hash_manifest_pairs,
+)
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
 
 __all__ = [
     "DEFAULT_COPY_CONCURRENCY",
-    "EMPTY_MANIFEST_HASH",
     "BuildContentCopier",
     "CopyResult",
 ]
@@ -62,13 +68,6 @@ own default: a second literal in ``factory.py`` was exactly the
 duplication that made the sync worker's real memory bound impossible
 to reason about (#517).
 """
-
-#: Manifest hash of a prefix with no keys under it. Public because a
-#: caller cannot otherwise tell "hashed an empty prefix" apart from
-#: "hashed real content" by looking at the returned hash, and keeper-sync
-#: has to make exactly that distinction when deciding whether its
-#: edition-prefix fallback actually recovered anything (#516).
-EMPTY_MANIFEST_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -119,9 +118,8 @@ class BuildContentCopier:
         the same ``sha256:<hex>`` shape :meth:`copy_build` produces.
         """
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
-        keys = sorted(
-            await self._source.list_keys(prefix=normalized_source_prefix)
-        )
+        listed = await self._source.list_keys(prefix=normalized_source_prefix)
+        keys = _select_content_keys(sorted(listed), normalized_source_prefix)
         if not keys:
             return EMPTY_MANIFEST_HASH
         _reject_escaping_keys(keys, normalized_source_prefix, verb="hash")
@@ -139,8 +137,7 @@ class BuildContentCopier:
             manifest_entries.append((relative, digest))
 
         await self._run_bounded(keys, _hash_one)
-        manifest_entries.sort(key=lambda e: e[0])
-        return _hash_manifest_pairs(manifest_entries)
+        return hash_manifest_pairs(manifest_entries)
 
     async def copy_build(
         self, *, source_prefix: str, dest_prefix: str
@@ -161,9 +158,8 @@ class BuildContentCopier:
         """
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
         normalized_dest_prefix = _ensure_trailing_slash(dest_prefix)
-        keys = sorted(
-            await self._source.list_keys(prefix=normalized_source_prefix)
-        )
+        listed = await self._source.list_keys(prefix=normalized_source_prefix)
+        keys = _select_content_keys(sorted(listed), normalized_source_prefix)
         if not keys:
             self._logger.warning(
                 "Empty source prefix; nothing to copy",
@@ -201,8 +197,12 @@ class BuildContentCopier:
 
         await self._run_bounded(keys, _copy_one)
 
-        manifest_entries.sort(key=lambda e: e[0])
-        manifest_hash = _hash_manifest(manifest_entries)
+        # Size is deliberately not part of a manifest line — it is
+        # derivable from the bytes already hashed — so it is dropped on
+        # the way in and kept only for the byte total reported below.
+        manifest_hash = hash_manifest_pairs(
+            (relative, digest) for relative, digest, _ in manifest_entries
+        )
         total_bytes = sum(size for _, _, size in manifest_entries)
 
         self._logger.info(
@@ -296,6 +296,62 @@ def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
 
 
+def _select_content_keys(keys: Sequence[str], prefix: str) -> list[str]:
+    """Drop the S3 directory markers from a listing under ``prefix``.
+
+    LTD's uploader writes a zero-byte object for the build prefix and
+    for every directory beneath it — ``<prefix>_static``,
+    ``<prefix>_sources``, ``<prefix>_images``, … — alongside the real
+    files. They hold no bytes Docverse serves, and the client's tarball
+    of the same tree cannot contain them at all (a directory and a file
+    cannot share a name, and the worker's extraction loop skips
+    non-file members anyway), so hashing them made a keeper-synced
+    build and a byte-identical client upload disagree on their content
+    identity and defeated dual-upload convergence for every build with
+    a subdirectory (#576).
+
+    A key is dropped when it is the prefix itself, when it ends in
+    ``/``, or when some other listed key lives under it — the last rule
+    being what catches LTD's slash-less markers.
+    :meth:`~docverse_server.storage.ltd.LtdSourceProtocol.list_keys`
+    reports names and nothing else, so the test is deliberately
+    key-shaped: adding sizes to that protocol to recognize markers by
+    their zero length would ripple through every implementation and
+    fake, and would still mistake a legitimately empty file for a
+    marker. The rule's one blind spot follows from being key-shaped: a
+    slash-less marker with nothing listed under it is, by name alone,
+    an ordinary empty file. LTD only writes a marker for a directory it
+    uploaded files into, so that listing does not arise in the bucket.
+
+    Filtering runs ahead of both callers' empty-prefix checks, so a
+    prefix holding nothing but markers collapses into the empty branch —
+    which is what makes ``_resolve_build_source``'s ``AccessDenied``
+    fallback (#516) re-raise the denial on a marker-only edition prefix
+    rather than importing a build with no content in it.
+
+    Returns the surviving keys in the order given, so a sorted listing
+    stays sorted.
+    """
+    # The set of keys that some other key lives under, built by walking
+    # each key's ancestors once rather than testing every key against
+    # every other one: a build prefix can hold thousands of keys.
+    directory_keys: set[str] = set()
+    for key in keys:
+        ancestor = key
+        while "/" in ancestor:
+            ancestor = ancestor.rsplit("/", 1)[0]
+            directory_keys.add(ancestor)
+
+    prefix_keys = {prefix, prefix.removesuffix("/")}
+    return [
+        key
+        for key in keys
+        if key not in prefix_keys
+        and not key.endswith("/")
+        and key not in directory_keys
+    ]
+
+
 def _reject_escaping_keys(
     keys: Sequence[str], source_prefix: str, *, verb: str
 ) -> None:
@@ -349,23 +405,3 @@ def _first_real_error(
         if not isinstance(exc, asyncio.CancelledError):
             return exc
     return group
-
-
-def _hash_manifest(entries: list[tuple[str, str, int]]) -> str:
-    r"""Compute ``sha256:`` over sorted ``relative\tdigest\n`` lines.
-
-    Size is deliberately excluded from the manifest line because it is
-    derivable from the data; including it would couple the hash to a
-    second representation of the same fact and risk drift.
-    """
-    return _hash_manifest_pairs(
-        [(relative, digest) for relative, digest, _ in entries]
-    )
-
-
-def _hash_manifest_pairs(entries: list[tuple[str, str]]) -> str:
-    r"""Compute ``sha256:`` over sorted ``relative\tdigest\n`` lines."""
-    hasher = hashlib.sha256()
-    for relative, digest in entries:
-        hasher.update(f"{relative}\t{digest}\n".encode())
-    return f"sha256:{hasher.hexdigest()}"
