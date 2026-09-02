@@ -166,10 +166,13 @@ async def build_processing(
                 session=session,
                 ctx=ctx,
                 payload=payload,
+                factory=factory,
                 build_store=build_store,
                 queue_job_store=queue_job_store,
                 build=build,
                 build_id=build_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
                 logger=logger,
             )
             if stale_guard is _StaleGuardOutcome.not_stale:
@@ -268,10 +271,13 @@ async def _guard_stale_build(
     session: AsyncSession,
     ctx: dict[str, Any],
     payload: dict[str, Any],
+    factory: Factory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     build: Build,
     build_id: int,
+    org_slug: str,
+    project_slug: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> _StaleGuardOutcome:
     """Skip and mark stale if a newer build exists for ``(project, git_ref)``.
@@ -298,9 +304,12 @@ async def _guard_stale_build(
             session=session,
             ctx=ctx,
             payload=payload,
+            factory=factory,
             queue_job_store=queue_job_store,
             build_id=build_id,
             latest_build_id=latest_build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
             logger=logger,
         )
     return _StaleGuardOutcome.not_stale
@@ -430,24 +439,35 @@ async def _mark_stale_skipped(
     session: AsyncSession,
     ctx: dict[str, Any],
     payload: dict[str, Any],
+    factory: Factory,
     queue_job_store: QueueJobStore,
     build_id: int,
     latest_build_id: int,
+    org_slug: str,
+    project_slug: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> _StaleGuardOutcome:
-    """Mark a superseded build's QueueJob complete with a stale-skip flag.
+    """Retire a superseded build and complete its QueueJob as stale.
 
     Operators identify these runs by ``progress["stale_skipped"]`` plus
     the dedicated log line; the QueueJob status stays ``completed``
     because nothing was wrong with the build itself — a newer build
     for the same ``(project, git_ref)`` simply took over.
 
+    The build itself is transitioned to ``superseded`` in the *same*
+    ``session.begin()`` block that completes the job, so the two commit
+    or roll back together. Skipping the build without retiring it is
+    what stranded rows in ``processing`` forever (#575): with no worker
+    on the build and no job left to run, ``processing`` was a lie no
+    later path would correct.
+
     The pickup guard runs before any of that, and a row it refuses
     (task #551) short-circuits to ``late_delivery`` with nothing written
     and nothing logged as skipped: the row is terminal or in another
-    worker's hands, so this delivery has no stale skip to record. A
-    delivery with no ``queue_jobs`` row at all still counts as a
-    recorded skip — there is simply no bookkeeping to do.
+    worker's hands, so this delivery has neither a stale skip to record
+    nor any business retiring the build. A delivery with no
+    ``queue_jobs`` row at all still counts as a recorded skip — the
+    build is still superseded, there is simply no job bookkeeping to do.
     """
     async with session.begin():
         pickup = await _start_queue_job(ctx, payload, queue_job_store)
@@ -457,6 +477,12 @@ async def _mark_stale_skipped(
             "Stale build skipped",
             build_id=build_id,
             latest_build_id=latest_build_id,
+        )
+        build_service = factory.create_build_service()
+        await build_service.supersede(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
         )
         if pickup.queue_job_id is not None:
             queue_job_id = pickup.queue_job_id

@@ -100,6 +100,11 @@ class BuildStatus(StrEnum):
       updating tracking editions.
     - ``completed`` — processing finished successfully.
     - ``failed`` — processing failed; see the build's job for errors.
+    - ``superseded`` — a newer build for the same ``(project, git_ref)``
+      took over before this one was processed. Nothing was wrong with
+      the build; it will never be published.
+    - ``cancelled`` — the build was deleted before processing finished.
+      It will never be published.
     """
 
     pending = "pending"
@@ -107,6 +112,8 @@ class BuildStatus(StrEnum):
     processing = "processing"
     completed = "completed"
     failed = "failed"
+    superseded = "superseded"
+    cancelled = "cancelled"
 
 
 class BuildCreate(BaseModel):

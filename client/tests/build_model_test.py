@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.models import BuildCreate
+from docverse.models import Build, BuildCreate, BuildStatus
 
 
 def test_content_hash_is_optional() -> None:
@@ -63,3 +63,34 @@ def test_content_hash_flagged_deprecated_in_json_schema() -> None:
     """
     schema = BuildCreate.model_json_schema()["properties"]["content_hash"]
     assert schema["deprecated"] is True
+
+
+def test_terminal_statuses_include_superseded_and_cancelled() -> None:
+    """``BuildStatus`` carries the two never-published terminal values.
+
+    A build that a newer build for the same ref took over, and a build
+    deleted before processing finished, are both terminal outcomes the
+    API reports — and both are distinct from ``failed``, which means
+    something went wrong. Clients filtering builds by status need the
+    values to exist in the enum before they can ask for them.
+    """
+    assert BuildStatus.superseded == "superseded"
+    assert BuildStatus.cancelled == "cancelled"
+
+
+def test_build_model_validates_new_terminal_statuses() -> None:
+    """``Build.model_validate`` accepts a payload in either new status."""
+    for status in (BuildStatus.superseded, BuildStatus.cancelled):
+        build = Build.model_validate(
+            {
+                "id": "1x7r-9fd4-hw1b-51",
+                "project_url": ("https://example.com/orgs/o/projects/p"),
+                "self_url": "https://example.com/orgs/o/projects/p/builds/b",
+                "git_ref": "main",
+                "status": status.value,
+                "content_hash": "sha256:" + "a" * 64,
+                "uploader": "someone",
+                "date_created": "2026-09-02T00:00:00Z",
+            }
+        )
+        assert build.status is status

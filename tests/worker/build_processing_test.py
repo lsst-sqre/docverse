@@ -1147,12 +1147,15 @@ async def test_build_processing_skips_stale_build(
             assert edition is not None
             assert edition.current_build_id is None
 
-            # The older build's status was not transitioned by the
-            # stale-skip path; it stays in ``processing``.
+            # The stale-skip path transitions the build in the same
+            # transaction that completes its queue job, so the row lands
+            # on the terminal ``superseded`` rather than being stranded
+            # in ``processing`` with no worker on it (#575).
             build_store = BuildStore(session=session, logger=_logger())
             refreshed_older = await build_store.get_by_id(older_build.id)
             assert refreshed_older is not None
-            assert refreshed_older.status == BuildStatus.processing
+            assert refreshed_older.status == BuildStatus.superseded
+            assert refreshed_older.date_completed is not None
 
 
 @pytest.mark.asyncio

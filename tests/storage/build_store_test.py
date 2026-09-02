@@ -349,6 +349,122 @@ async def test_invalid_transition_raises(
 
 
 @pytest.mark.asyncio
+async def test_transition_pending_to_cancelled(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A build deleted before it was ever uploaded can be cancelled.
+
+    ``cancelled`` is terminal, so it gets ``date_completed`` exactly as
+    ``completed`` and ``failed`` do: the row stops being something a
+    worker might still be holding.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        cancelled = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.cancelled
+        )
+        await db_session.commit()
+    assert cancelled.status == BuildStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_transition_processing_to_superseded(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The stale-skip path's transition, with its completion stamp."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        superseded = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.superseded
+        )
+        await db_session.commit()
+    assert superseded.status == BuildStatus.superseded
+    assert superseded.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_transition_processing_to_cancelled(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A build deleted mid-processing lands on ``cancelled``."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        cancelled = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.cancelled
+        )
+        await db_session.commit()
+    assert cancelled.status == BuildStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal", [BuildStatus.superseded, BuildStatus.cancelled]
+)
+async def test_new_terminal_statuses_reject_further_transitions(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    terminal: BuildStatus,
+) -> None:
+    """Neither new status is a waypoint: nothing follows it.
+
+    This is what lets a caller read ``superseded``/``cancelled`` as
+    "this build will never be published" without also checking whether
+    some later path might still revive the row.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=terminal
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        for target in BuildStatus:
+            with pytest.raises(InvalidBuildStateError):
+                await build_store.transition_status(
+                    build_id=build.id, new_status=target
+                )
+
+
+@pytest.mark.asyncio
 async def test_list_by_project(
     db_session: AsyncSession,
     build_store: BuildStore,

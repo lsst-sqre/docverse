@@ -231,6 +231,74 @@ class BuildService:
         )
         return build
 
+    async def supersede(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build:
+        """Mark a build superseded by a newer build for the same ref.
+
+        Terminal and blameless: nothing was wrong with the build, a
+        newer live build for the same ``(project, git_ref)`` simply took
+        over before this one was processed. The ``build_processing``
+        stale-skip path calls this in the same transaction that
+        completes the build's queue job, so a skipped build never stays
+        stranded in ``processing`` with no worker on it.
+        """
+        build = await self._store.transition_status(
+            build_id=build_id,
+            new_status=BuildStatus.superseded,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        self._logger.info(
+            "Build superseded",
+            build=serialize_base32_id(build.public_id),
+        )
+        return build
+
+    async def cancel(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build:
+        """Mark a build cancelled because it was deleted before publishing.
+
+        Two paths cancel a build — the DELETE handler, and the worker's
+        guard against processing a build that was deleted out from under
+        it — and either can run second. A build that is *already*
+        ``cancelled`` is therefore returned unchanged rather than raising
+        :exc:`~docverse_server.exceptions.InvalidBuildStateError`: the
+        caller asked for a state the row is already in, so there is
+        nothing to report. The no-op is scoped to ``cancelled`` alone;
+        deleting a ``completed`` or ``failed`` build still raises,
+        because those rows keep the status they earned.
+
+        Raises
+        ------
+        InvalidBuildStateError
+            If the build is not found, or is in a terminal status other
+            than ``cancelled``.
+        """
+        existing = await self._store.get_by_id(build_id)
+        if existing is not None and existing.status == BuildStatus.cancelled:
+            return existing
+        build = await self._store.transition_status(
+            build_id=build_id,
+            new_status=BuildStatus.cancelled,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        self._logger.info(
+            "Build cancelled",
+            build=serialize_base32_id(build.public_id),
+        )
+        return build
+
     async def soft_delete(
         self,
         *,

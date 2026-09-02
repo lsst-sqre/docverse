@@ -21,11 +21,34 @@ from docverse_server.storage._public_id import (
 )
 from docverse_server.storage.pagination import BuildDateCreatedCursor
 
-# Valid status transitions
+# Valid status transitions. Every status absent from this mapping is
+# terminal — ``completed``, ``failed``, ``superseded`` and ``cancelled``
+# all reject any further transition, which is what lets a reader treat
+# them as final answers about the build.
 _VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
-    BuildStatus.pending: {BuildStatus.processing, BuildStatus.failed},
-    BuildStatus.processing: {BuildStatus.completed, BuildStatus.failed},
+    BuildStatus.pending: {
+        BuildStatus.processing,
+        BuildStatus.failed,
+        BuildStatus.cancelled,
+    },
+    BuildStatus.processing: {
+        BuildStatus.completed,
+        BuildStatus.failed,
+        BuildStatus.superseded,
+        BuildStatus.cancelled,
+    },
 }
+
+# Statuses whose entry stamps ``date_completed``: the build is finished
+# with, whether or not it was ever published.
+_TERMINAL_STATUSES: frozenset[BuildStatus] = frozenset(
+    {
+        BuildStatus.completed,
+        BuildStatus.failed,
+        BuildStatus.superseded,
+        BuildStatus.cancelled,
+    }
+)
 
 
 class BuildStore:
@@ -272,8 +295,12 @@ class BuildStore:
         """Transition a build to a new status.
 
         Validates the transition is allowed. Sets ``date_uploaded`` on
-        transition to ``processing`` and ``date_completed`` on transition
-        to ``completed`` or ``failed``.
+        transition to ``processing`` and ``date_completed`` on entry to
+        any terminal status — ``completed``, ``failed``, ``superseded``
+        or ``cancelled``. The two never-published terminals are stamped
+        for the same reason the other two are: the row is finished with,
+        and a reader asking "when did a worker stop holding this?" needs
+        an answer whether or not the build was published.
 
         ``content_hash`` is the server-computed content identity (see
         :mod:`docverse_server.domain.content_hash`) and may only
@@ -341,7 +368,7 @@ class BuildStore:
 
         if new_status == BuildStatus.processing:
             row.date_uploaded = now
-        elif new_status in (BuildStatus.completed, BuildStatus.failed):
+        elif new_status in _TERMINAL_STATUSES:
             row.date_completed = now
 
         if content_hash is not None:

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import pytest
+import structlog
 from httpx import AsyncClient
+from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 
-from docverse.models import BuildAnnotations
+from docverse.models import BuildAnnotations, BuildStatus
 from docverse_server.dependencies.context import context_dependency
+from docverse_server.domain.base32id import validate_base32_id
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.organization_store import OrganizationStore
+from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_build, seed_org_with_admin
 
 CONTENT_HASH = (
@@ -28,6 +34,45 @@ async def _setup(client: AsyncClient) -> None:
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
+
+
+async def _transition_build(
+    org_slug: str,
+    project_slug: str,
+    build_id: str,
+    status: BuildStatus,
+) -> None:
+    """Step a seeded build from ``pending`` to a terminal status.
+
+    Goes through the store rather than the API because no endpoint hands
+    a build to ``superseded`` — only the worker's stale-skip path does,
+    and this test is about the read side.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            build_store = BuildStore(session=session, logger=logger)
+            build = await build_store.get_by_public_id(
+                project_id=project.id,
+                public_id=validate_base32_id(build_id),
+            )
+            assert build is not None
+            await build_store.transition_status(
+                build_id=build.id, new_status=BuildStatus.processing
+            )
+            await build_store.transition_status(
+                build_id=build.id, new_status=status
+            )
+            await session.commit()
+        return
 
 
 @pytest.mark.asyncio
@@ -211,6 +256,35 @@ async def test_list_builds(client: AsyncClient) -> None:
     assert len(response.json()) >= 1
     assert "Link" in response.headers
     assert "X-Total-Count" in response.headers
+
+
+@pytest.mark.asyncio
+async def test_list_builds_filters_by_superseded_status(
+    client: AsyncClient,
+) -> None:
+    """``?status=superseded`` is accepted and selects only those builds.
+
+    The filter is typed as ``BuildStatus``, so widening the enum is what
+    opens the query up — an operator chasing a ref that never published
+    can now ask for exactly the builds a newer build took over, without
+    them being lumped in with ``failed``.
+    """
+    await _setup(client)
+    superseded_id = await seed_build("build-org", "build-proj")
+    pending_id = await seed_build("build-org", "build-proj")
+    await _transition_build(
+        "build-org", "build-proj", superseded_id, BuildStatus.superseded
+    )
+
+    response = await client.get(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        params={"status": "superseded"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    ids = [build["id"] for build in response.json()]
+    assert ids == [superseded_id]
+    assert pending_id not in ids
 
 
 @pytest.mark.asyncio
