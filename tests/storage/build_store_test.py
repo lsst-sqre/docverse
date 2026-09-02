@@ -4,20 +4,29 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
     BuildCreate,
     BuildStatus,
+    JobKind,
+    JobStatus,
     OrganizationCreate,
     ProjectCreate,
 )
 from docverse_server.dbschema.build import SqlBuild
-from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage.build_store import BuildStore
@@ -783,3 +792,167 @@ async def test_create_retries_on_public_id_collision(
         )
     assert total == 2
     assert preserved == "pre-existing"
+
+
+async def _create_processing_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    git_ref: str,
+    uploaded_hours_ago: float,
+) -> Build:
+    """Create a ``processing`` build whose ``date_uploaded`` is back-dated.
+
+    ``transition_status`` always stamps ``date_uploaded`` with the
+    current time, so the age the stranded sweep filters on is written
+    afterwards by direct UPDATE.
+    """
+    build = await build_store.create(
+        project_id=project_id,
+        project_slug="build-proj",
+        data=BuildCreate(git_ref=git_ref, content_hash="sha256:" + "a" * 64),
+        uploader="testuser",
+    )
+    await build_store.transition_status(
+        build_id=build.id, new_status=BuildStatus.processing
+    )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(
+            date_uploaded=(
+                datetime.now(tz=UTC) - timedelta(hours=uploaded_hours_ago)
+            )
+        )
+    )
+    return build
+
+
+async def _seed_queue_job(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    build_id: int,
+    status: JobStatus,
+) -> None:
+    """Attach one ``build_processing`` queue job row to a build."""
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        kind=JobKind.build_processing.value,
+        status=status.value,
+        org_id=org_id,
+        build_id=build_id,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+
+@pytest.mark.asyncio
+async def test_fail_stranded_processing(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Only threshold-old ``processing`` rows with no live job are swept.
+
+    The invariant ``processing`` is supposed to carry is "a worker is
+    on it". A row that no ``queued``/``in_progress`` queue job vouches
+    for any more has lost its worker, so the reaper's sweep retires it
+    to ``failed``. Rows a live job still covers, rows younger than the
+    cutoff, soft-deleted rows and rows that never left ``pending`` are
+    none of the sweep's business.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        stranded = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="stranded",
+            uploaded_hours_ago=24,
+        )
+        # A terminal job is no vouch either: the silent sweep failing a
+        # job is exactly how a build becomes strandable.
+        job_failed = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="job-failed",
+            uploaded_hours_ago=24,
+        )
+        await _seed_queue_job(
+            db_session,
+            org_id=org_id,
+            build_id=job_failed.id,
+            status=JobStatus.failed,
+        )
+        in_progress = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="in-progress",
+            uploaded_hours_ago=24,
+        )
+        await _seed_queue_job(
+            db_session,
+            org_id=org_id,
+            build_id=in_progress.id,
+            status=JobStatus.in_progress,
+        )
+        queued = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="queued",
+            uploaded_hours_ago=24,
+        )
+        await _seed_queue_job(
+            db_session,
+            org_id=org_id,
+            build_id=queued.id,
+            status=JobStatus.queued,
+        )
+        fresh = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="fresh",
+            uploaded_hours_ago=0,
+        )
+        deleted = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="deleted",
+            uploaded_hours_ago=24,
+        )
+        assert await build_store.soft_delete(build_id=deleted.id) is True
+        pending = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=BuildCreate(
+                git_ref="pending", content_hash="sha256:" + "b" * 64
+            ),
+            uploader="testuser",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        reaped = await build_store.fail_stranded_processing(
+            older_than=datetime.now(tz=UTC) - timedelta(hours=8)
+        )
+        await db_session.commit()
+
+    assert {build.id for build in reaped} == {stranded.id, job_failed.id}
+    assert all(build.status == BuildStatus.failed for build in reaped)
+    assert all(build.date_completed is not None for build in reaped)
+
+    async with db_session.begin():
+        for spared in (in_progress, queued, fresh, deleted):
+            row = await build_store.get_by_id(spared.id)
+            assert row is not None
+            assert row.status == BuildStatus.processing
+            assert row.date_completed is None
+        pending_row = await build_store.get_by_id(pending.id)
+        assert pending_row is not None
+        assert pending_row.status == BuildStatus.pending

@@ -10,8 +10,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from docverse.models import BuildCreate, BuildStatus
+from docverse.models import BuildCreate, BuildStatus, JobStatus
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
@@ -390,6 +391,70 @@ class BuildStore:
         await self._session.flush()
         await self._session.refresh(row)
         return Build.model_validate(row)
+
+    async def fail_stranded_processing(
+        self, *, older_than: datetime
+    ) -> list[Build]:
+        """Fail ``processing`` builds no live queue job is working on.
+
+        ``processing`` is supposed to mean "a worker is on it". A row
+        left in that status with no ``queued`` or ``in_progress``
+        ``queue_jobs`` row naming it has lost its worker and will never
+        move on its own, so the ``build_processing`` reaper retires it
+        here. Selects rows that are ``processing``, not soft-deleted,
+        and whose ``date_uploaded`` is strictly before ``older_than``
+        (the reaper's threshold cutoff), then transitions each to
+        ``failed`` — which stamps ``date_completed`` like any other
+        terminal entry.
+
+        Always ``failed``, never ``superseded``: the sweep deliberately
+        does not read ``queue_jobs.progress`` to reconstruct why the
+        build stopped. A row it can see is one today's code stranded
+        without recording an outcome, and guessing at intent from a job
+        that may not even exist any more would make the status less
+        trustworthy, not more. Operators re-upload; the reaper only
+        clears the false "in flight" reading.
+
+        The liveness test is deliberately not scoped to
+        ``kind='build_processing'``: any live job naming the build is
+        reason enough to leave it alone.
+
+        Parameters
+        ----------
+        older_than
+            Cutoff for ``date_uploaded``. Rows uploaded at or after
+            this instant are still within the reaper's patience window
+            and are left alone, as are rows with no ``date_uploaded``
+            at all (the ``NULL`` comparison is never true).
+
+        Returns
+        -------
+        list of Build
+            The builds this sweep transitioned to ``failed``, in id
+            order. Empty when nothing was stranded.
+        """
+        live_job = select(SqlQueueJob.id).where(
+            SqlQueueJob.build_id == SqlBuild.id,
+            SqlQueueJob.status.in_(
+                (JobStatus.queued.value, JobStatus.in_progress.value)
+            ),
+        )
+        result = await self._session.execute(
+            select(SqlBuild.id)
+            .where(
+                SqlBuild.status == BuildStatus.processing,
+                SqlBuild.date_deleted.is_(None),
+                SqlBuild.date_uploaded < older_than,
+                ~live_job.exists(),
+            )
+            .order_by(SqlBuild.id)
+        )
+        return [
+            await self.transition_status(
+                build_id=build_id, new_status=BuildStatus.failed
+            )
+            for build_id in result.scalars().all()
+        ]
 
     async def update_inventory(
         self,
