@@ -244,18 +244,31 @@ class BuildStore:
     async def get_latest_build_id_for_ref(
         self, *, project_id: int, git_ref: str
     ) -> int | None:
-        """Return the max build id for a ``(project_id, git_ref)`` pair.
+        """Return the max live build id for a ``(project_id, git_ref)`` pair.
 
         Used by the ``build_processing`` stale-build guard: a job whose
-        build id is less than the latest known id for the same ref has
-        been superseded and must skip its expensive work. Includes
-        soft-deleted rows so a deletion mid-processing cannot make a
-        superseded build look current.
+        build id is less than the latest live id for the same ref has
+        been superseded and must skip its expensive work. Soft-deleted
+        rows are excluded, so "latest" means the latest build that can
+        still be published.
+
+        Counting deleted rows (the original f9ab830 rule) was meant to
+        stop a deletion mid-processing from making a superseded build
+        look current, but it stranded the ref instead: deleting a newer
+        build that had never been processed left the older one skipping
+        against a tombstone, with no live build for the ref at all and
+        nothing left to publish it (#575). A deleted build's own job is
+        stopped at its source instead: ``build_processing``'s
+        deleted-self guard (PRD #577) reads ``date_deleted`` before
+        asking for the latest id and cancels the build rather than
+        running it, so nothing processes "against" a deletion and this
+        lookup has no reason to keep counting tombstones.
         """
         result = await self._session.execute(
             select(func.max(SqlBuild.id)).where(
                 SqlBuild.project_id == project_id,
                 SqlBuild.git_ref == git_ref,
+                SqlBuild.date_deleted.is_(None),
             )
         )
         return result.scalar_one_or_none()

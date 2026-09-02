@@ -613,11 +613,13 @@ async def test_get_latest_build_id_for_ref(
     db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
-    """Returns the max build id for a (project, git_ref) pair.
+    """Returns the max *live* build id for a (project, git_ref) pair.
 
     A second build on the same ref supersedes the first; a build on a
     different ref does not influence the answer; an unknown ref or
-    project returns ``None``.
+    project returns ``None``. Soft-deleted rows do not count: deleting
+    the newest build hands the ref back to the newest live one, and a
+    ref whose only build is deleted has no latest id at all.
     """
     async with db_session.begin():
         _, project_id = await _create_org_and_project(db_session)
@@ -672,6 +674,26 @@ async def test_get_latest_build_id_for_ref(
             project_id=project_id + 9999, git_ref="main"
         )
         assert missing_project is None
+
+    async with db_session.begin():
+        assert await build_store.soft_delete(build_id=second_main.id) is True
+        assert await build_store.soft_delete(build_id=other_ref.id) is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        # A tombstone is not a supersession marker (#575): with the
+        # newest row deleted, the newest live build owns the ref again
+        # instead of being stranded behind a build nobody will publish.
+        after_delete = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="main"
+        )
+        assert after_delete == first_main.id
+
+        # A ref whose only build is deleted has no latest build at all.
+        emptied_ref = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="release/v1"
+        )
+        assert emptied_ref is None
 
 
 @pytest.mark.asyncio

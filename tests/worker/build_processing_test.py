@@ -1159,6 +1159,107 @@ async def test_build_processing_skips_stale_build(
 
 
 @pytest.mark.asyncio
+async def test_build_processing_deleted_superseder_publishes(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A soft-deleted newer build no longer orphans its ref (#575).
+
+    The reproduction from #575: build A is created, build B is created
+    for the same ``(project, git_ref)``, B is deleted before either is
+    processed, and only then is A uploaded and signalled. While the
+    supersession lookup counted deleted rows, A saw B's higher id, skipped
+    itself, and the ref was left with no live build at all — nothing would
+    ever publish it. With the lookup restricted to live rows, A observes
+    itself as the latest build for the ref and processes normally.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build_a = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        build_store = BuildStore(session=db_session, logger=logger)
+        build_b = await build_store.create(
+            project_id=project.id,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+            project_slug=project.slug,
+        )
+        # B is the newer build by id — the supersession marker that used
+        # to strand A — and is deleted before anything processes it.
+        assert build_b.id > build_a.id
+        assert await build_store.soft_delete(build_id=build_b.id) is True
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build_a.id,
+            backend_job_id="test-arq-deleted-superseder",
+        )
+
+    page = b"<html>hello</html>"
+    tarball = _make_tarball({"index.html": page})
+    await mock_store.upload_object(
+        key=build_a.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-deleted-superseder",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build_a.id,
+        "build_public_id": serialize_base32_id(build_a.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    # The build's files really landed in the serving store: the skip
+    # path would have left the mock store holding only the staged
+    # tarball it was primed with.
+    assert f"{build_a.storage_prefix}index.html" in mock_store.objects
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            build_store = BuildStore(session=session, logger=_logger())
+            processed = await build_store.get_by_id(build_a.id)
+            assert processed is not None
+            assert processed.status == BuildStatus.completed
+            assert processed.object_count == 1
+            # A real manifest hash, not the client's transport digest.
+            expected_hash = hash_manifest_pairs(
+                [("index.html", hashlib.sha256(page).hexdigest())]
+            )
+            assert processed.content_hash == expected_hash
+
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.current_build_id == build_a.id
+
+
+@pytest.mark.asyncio
 async def test_build_processing_stale_reaped_build_reports_no_success(
     app: None,
     db_session: AsyncSession,
