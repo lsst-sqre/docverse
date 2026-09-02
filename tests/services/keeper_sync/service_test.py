@@ -1599,6 +1599,12 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
     gzip-stream digest was the stored identity, a direct upload could
     never match an inbound LTD build and every sync re-copied content
     Docverse already held.
+
+    The LTD side carries the zero-byte directory markers LTD's uploader
+    writes alongside a build's real files, because that — not a flat
+    listing — is the layout of every Sphinx build in the bucket. Hashing
+    them left the two producers permanently apart for any build with a
+    subdirectory (#576).
     """
     logger = structlog.get_logger("test")
     content = {
@@ -1676,6 +1682,15 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
     source_objects = {
         f"pipelines/builds/42/{name}": data for name, data in content.items()
     }
+    # LTD's uploader writes a zero-byte "directory marker" object for
+    # the build prefix and for every subdirectory under it, so this is
+    # the layout every real synced build actually presents. A tarball
+    # built from a directory cannot carry them — a file and a directory
+    # cannot share a name — so hashing them is what kept the two
+    # producers from ever converging on a build with subdirectories
+    # (#576).
+    source_objects["pipelines/builds/42/"] = b""
+    source_objects["pipelines/builds/42/assets"] = b""
     service = _build_service(
         db_session, http_client, object_store, source_objects
     )

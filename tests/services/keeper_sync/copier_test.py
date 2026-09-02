@@ -15,6 +15,7 @@ import pytest
 import structlog
 from botocore.exceptions import ClientError
 
+from docverse_server.domain.content_hash import EMPTY_MANIFEST_HASH
 from docverse_server.services.keeper_sync.copier import BuildContentCopier
 from docverse_server.storage.ltd import (
     LtdSourceAccessDeniedError,
@@ -528,3 +529,149 @@ async def test_uncaused_leaf_error_does_not_render_the_group() -> None:
     assert "Simulated download failure" in rendered
     assert "unhandled errors in a TaskGroup" not in rendered
     assert "During handling of the above exception" not in rendered
+
+
+# LTD's uploader writes a zero-byte object for every directory in a
+# build ("directory markers"): the prefix itself plus one per
+# subdirectory. They carry no content Docverse serves, and a client
+# tarball of the same tree cannot contain them at all — a directory and
+# a file cannot share a name — so the copier has to drop them for the
+# two producers to agree on a content identity (#576).
+_MARKER_KEYS = {
+    "src/builds/1/": b"",
+    "src/builds/1/_static": b"",
+    "src/builds/1/_static/css": b"",
+}
+
+_MARKER_ONLY_KEYS = {
+    # A prefix whose content is gone but whose markers remain. Every key
+    # here is recognizable as a marker on its own terms: the two
+    # slash-terminated ones by shape, the slash-less one because another
+    # listed key lives under it. A slash-less marker with *nothing*
+    # under it is, by key alone, an ordinary empty file — but LTD only
+    # writes a marker for a directory it uploaded files into, so that
+    # listing does not occur in the wild.
+    "src/builds/1/": b"",
+    "src/builds/1/_static": b"",
+    "src/builds/1/_static/css": b"",
+    "src/builds/1/_static/css/": b"",
+}
+
+_MARKER_FREE_OBJECTS = {
+    "src/builds/1/index.html": b"<html>1</html>",
+    "src/builds/1/_static/app.js": b"console.log(1)",
+    "src/builds/1/_static/css/site.css": b"body{}",
+}
+
+
+@pytest.mark.asyncio
+async def test_directory_markers_do_not_change_the_manifest_hash() -> None:
+    """A marker-bearing prefix hashes like the same prefix without them."""
+    with_markers = await BuildContentCopier(
+        source=_FakeSource({**_MARKER_FREE_OBJECTS, **_MARKER_KEYS}),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+    without_markers = await BuildContentCopier(
+        source=_FakeSource(dict(_MARKER_FREE_OBJECTS)),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+
+    assert with_markers == without_markers
+    assert with_markers == _expected_manifest_hash(
+        [
+            (key.removeprefix("src/builds/1/"), data)
+            for key, data in _MARKER_FREE_OBJECTS.items()
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_directory_markers_are_not_copied_to_the_destination() -> None:
+    """No marker lands in the destination, and neither do its counts."""
+    dest = MockObjectStore()
+    result = await BuildContentCopier(
+        source=_FakeSource({**_MARKER_FREE_OBJECTS, **_MARKER_KEYS}),
+        destination=dest,
+        logger=_logger(),
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    assert set(dest.objects) == {
+        "dst/index.html",
+        "dst/_static/app.js",
+        "dst/_static/css/site.css",
+    }
+    assert result.object_count == len(_MARKER_FREE_OBJECTS)
+    assert result.total_size_bytes == sum(
+        len(v) for v in _MARKER_FREE_OBJECTS.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_marker_bearing_copy_matches_marker_free_copy() -> None:
+    """The copied content hash is unaffected by markers in the listing."""
+    with_markers = await BuildContentCopier(
+        source=_FakeSource({**_MARKER_FREE_OBJECTS, **_MARKER_KEYS}),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+    without_markers = await BuildContentCopier(
+        source=_FakeSource(dict(_MARKER_FREE_OBJECTS)),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    assert with_markers == without_markers
+
+
+@pytest.mark.asyncio
+async def test_manifest_hash_matches_copy_build_hash_with_markers() -> None:
+    """Hash and copy filter identically, so ``source_mutated`` stays off."""
+    objects = {**_MARKER_FREE_OBJECTS, **_MARKER_KEYS}
+    copied = await BuildContentCopier(
+        source=_FakeSource(dict(objects)),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+    hashed = await BuildContentCopier(
+        source=_FakeSource(dict(objects)),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+
+    assert copied.content_hash == hashed
+
+
+@pytest.mark.asyncio
+async def test_marker_only_prefix_copies_as_an_empty_prefix() -> None:
+    """A prefix holding only markers is indistinguishable from empty."""
+    dest = MockObjectStore()
+    result = await BuildContentCopier(
+        source=_FakeSource(dict(_MARKER_ONLY_KEYS)),
+        destination=dest,
+        logger=_logger(),
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    assert result.object_count == 0
+    assert result.total_size_bytes == 0
+    assert result.content_hash == EMPTY_MANIFEST_HASH
+    assert dest.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_marker_only_prefix_hashes_as_an_empty_prefix() -> None:
+    """The hash path collapses a marker-only prefix the same way.
+
+    Load-bearing for the #516 ``AccessDenied`` fallback: an edition
+    prefix that holds nothing but markers now reads as "nothing
+    recovered", so ``_resolve_build_source`` re-raises the denial
+    instead of importing a zero-object build.
+    """
+    hashed = await BuildContentCopier(
+        source=_FakeSource(dict(_MARKER_ONLY_KEYS)),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+
+    assert hashed == EMPTY_MANIFEST_HASH

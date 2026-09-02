@@ -118,9 +118,8 @@ class BuildContentCopier:
         the same ``sha256:<hex>`` shape :meth:`copy_build` produces.
         """
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
-        keys = sorted(
-            await self._source.list_keys(prefix=normalized_source_prefix)
-        )
+        listed = await self._source.list_keys(prefix=normalized_source_prefix)
+        keys = _select_content_keys(sorted(listed), normalized_source_prefix)
         if not keys:
             return EMPTY_MANIFEST_HASH
         _reject_escaping_keys(keys, normalized_source_prefix, verb="hash")
@@ -159,9 +158,8 @@ class BuildContentCopier:
         """
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
         normalized_dest_prefix = _ensure_trailing_slash(dest_prefix)
-        keys = sorted(
-            await self._source.list_keys(prefix=normalized_source_prefix)
-        )
+        listed = await self._source.list_keys(prefix=normalized_source_prefix)
+        keys = _select_content_keys(sorted(listed), normalized_source_prefix)
         if not keys:
             self._logger.warning(
                 "Empty source prefix; nothing to copy",
@@ -296,6 +294,62 @@ class _ConcurrencyTracker:
 
 def _ensure_trailing_slash(prefix: str) -> str:
     return prefix if prefix.endswith("/") else f"{prefix}/"
+
+
+def _select_content_keys(keys: Sequence[str], prefix: str) -> list[str]:
+    """Drop the S3 directory markers from a listing under ``prefix``.
+
+    LTD's uploader writes a zero-byte object for the build prefix and
+    for every directory beneath it — ``<prefix>_static``,
+    ``<prefix>_sources``, ``<prefix>_images``, … — alongside the real
+    files. They hold no bytes Docverse serves, and the client's tarball
+    of the same tree cannot contain them at all (a directory and a file
+    cannot share a name, and the worker's extraction loop skips
+    non-file members anyway), so hashing them made a keeper-synced
+    build and a byte-identical client upload disagree on their content
+    identity and defeated dual-upload convergence for every build with
+    a subdirectory (#576).
+
+    A key is dropped when it is the prefix itself, when it ends in
+    ``/``, or when some other listed key lives under it — the last rule
+    being what catches LTD's slash-less markers.
+    :meth:`~docverse_server.storage.ltd.LtdSourceProtocol.list_keys`
+    reports names and nothing else, so the test is deliberately
+    key-shaped: adding sizes to that protocol to recognize markers by
+    their zero length would ripple through every implementation and
+    fake, and would still mistake a legitimately empty file for a
+    marker. The rule's one blind spot follows from being key-shaped: a
+    slash-less marker with nothing listed under it is, by name alone,
+    an ordinary empty file. LTD only writes a marker for a directory it
+    uploaded files into, so that listing does not arise in the bucket.
+
+    Filtering runs ahead of both callers' empty-prefix checks, so a
+    prefix holding nothing but markers collapses into the empty branch —
+    which is what makes ``_resolve_build_source``'s ``AccessDenied``
+    fallback (#516) re-raise the denial on a marker-only edition prefix
+    rather than importing a build with no content in it.
+
+    Returns the surviving keys in the order given, so a sorted listing
+    stays sorted.
+    """
+    # The set of keys that some other key lives under, built by walking
+    # each key's ancestors once rather than testing every key against
+    # every other one: a build prefix can hold thousands of keys.
+    directory_keys: set[str] = set()
+    for key in keys:
+        ancestor = key
+        while "/" in ancestor:
+            ancestor = ancestor.rsplit("/", 1)[0]
+            directory_keys.add(ancestor)
+
+    prefix_keys = {prefix, prefix.removesuffix("/")}
+    return [
+        key
+        for key in keys
+        if key not in prefix_keys
+        and not key.endswith("/")
+        and key not in directory_keys
+    ]
 
 
 def _reject_escaping_keys(
