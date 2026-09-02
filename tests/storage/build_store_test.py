@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 import structlog
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
@@ -956,3 +957,77 @@ async def test_fail_stranded_processing(
         pending_row = await build_store.get_by_id(pending.id)
         assert pending_row is not None
         assert pending_row.status == BuildStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    build_store: BuildStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate retired after the select is skipped, not raised over.
+
+    The sweep picks its candidates in one statement and then transitions
+    them one at a time, so a DELETE-cancel committing in that window
+    leaves a row whose transition is no longer legal. The sweep shares
+    the reaper's first transaction with the silent and orphan queue-job
+    sweeps, so letting ``InvalidBuildStateError`` escape would roll all
+    three back and fail the whole tick over one build somebody else had
+    already retired.
+
+    The race is driven for real: the first row's transition cancels the
+    second on an independently-committed session, so the second
+    iteration hits the genuine exception rather than a stubbed one.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _create_org_and_project(db_session)
+        first = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="first",
+            uploaded_hours_ago=24,
+        )
+        second = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="second",
+            uploaded_hours_ago=24,
+        )
+        await db_session.commit()
+
+    original = BuildStore.transition_status
+    raced = False
+
+    async def racing_transition(self: BuildStore, **kwargs: Any) -> Build:
+        nonlocal raced
+        if not raced:
+            raced = True
+            async with db_session_factory() as other, other.begin():
+                other_store = BuildStore(
+                    session=other, logger=structlog.get_logger("docverse")
+                )
+                await other_store.transition_status(
+                    build_id=second.id, new_status=BuildStatus.cancelled
+                )
+        return await original(self, **kwargs)
+
+    monkeypatch.setattr(BuildStore, "transition_status", racing_transition)
+
+    async with db_session.begin():
+        reaped = await build_store.fail_stranded_processing(
+            older_than=datetime.now(tz=UTC) - timedelta(hours=8)
+        )
+        await db_session.commit()
+
+    assert raced is True
+    assert [build.id for build in reaped] == [first.id]
+    assert reaped[0].status == BuildStatus.failed
+
+    async with db_session.begin():
+        row = await build_store.get_by_id(second.id)
+        assert row is not None
+        # The cancel that won the race stands; the sweep left it alone.
+        assert row.status == BuildStatus.cancelled

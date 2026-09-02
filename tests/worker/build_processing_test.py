@@ -1450,6 +1450,268 @@ async def test_build_processing_deleted_build_already_cancelled(
             assert refreshed.status == BuildStatus.cancelled
 
 
+async def _cancel_and_soft_delete(build_id: int) -> None:
+    """Cancel and soft-delete a build on its own committed session.
+
+    The state a DELETE leaves behind — ``BuildService.soft_delete``
+    cancels an unfinished row before stamping ``date_deleted`` —
+    committed independently of whatever transaction the caller is
+    inside, which is what makes it visible to a worker mid-run.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = BuildStore(session=session, logger=_logger())
+            await store.transition_status(
+                build_id=build_id, new_status=BuildStatus.cancelled
+            )
+            assert await store.soft_delete(build_id=build_id) is True
+        break
+
+
+class _DeletingMockObjectStore(MockObjectStore):
+    """``MockObjectStore`` that deletes the build during the first upload.
+
+    Stands in for a DELETE landing while the worker is streaming files
+    out. The handler does not take the BUILD_PROCESSING lock, so nothing
+    stops it; the worker keeps uploading and only finds out when it goes
+    to write the terminal transition. Interception starts at
+    :meth:`arm`, so the test can stage its own tarball through the same
+    store first.
+
+    With ``fail_after`` the armed upload also raises once the delete has
+    committed, driving the worker's error path over an already-terminal
+    row.
+    """
+
+    def __init__(self, build_id: int, *, fail_after: bool = False) -> None:
+        super().__init__()
+        self._build_id = build_id
+        self._fail_after = fail_after
+        self._armed = False
+
+    def arm(self) -> None:
+        """Delete the build on the next upload."""
+        self._armed = True
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> None:
+        if not self._armed:
+            await super().upload_object(
+                key=key, data=data, content_type=content_type
+            )
+            return
+        self._armed = False
+        await _cancel_and_soft_delete(self._build_id)
+        await super().upload_object(
+            key=key, data=data, content_type=content_type
+        )
+        if self._fail_after:
+            msg = "Object store went away"
+            raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_build_processing_build_deleted_mid_upload(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DELETE landing mid-upload retires the job instead of stranding it.
+
+    The deleted-self guard only runs before the uploads start, so a
+    DELETE that lands after it leaves the worker holding a row that is
+    already ``cancelled``. Completing it would both publish a build the
+    operator asked us to drop and raise ``InvalidBuildStateError`` inside
+    the transaction that still has to close the queue job out, leaving
+    the job ``in_progress`` until the silent reaper (#575). Instead the
+    worker re-reads the row before writing anything terminal, skips the
+    completion and edition tracking, and completes the job carrying
+    ``deleted_skipped``.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        # Pre-create the edition with no current_build so we can assert
+        # the pointer was never moved onto the cancelled build.
+        edition_store = EditionStore(session=db_session, logger=logger)
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Main",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-deleted-mid-upload",
+        )
+
+    mock_store = _DeletingMockObjectStore(build.id)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-deleted-mid-upload",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    # The same metric shape as the pre-work deleted skip: deliberate,
+    # not a failure.
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].success is True
+    assert publisher.published[0].stale_skipped is True
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-deleted-mid-upload"
+            )
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("deleted_skipped") is True
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            # The DELETE's status stands, and the inventory a completion
+            # would have written never landed.
+            assert refreshed.status == BuildStatus.cancelled
+            assert refreshed.date_deleted is not None
+            assert refreshed.object_count is None
+
+            # The edition pointer was never moved onto the dead build.
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.current_build_id is None
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_failure_after_delete_still_fails_job(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upload error over an already-cancelled row still closes the job.
+
+    The residual race the mid-upload guard cannot close: the DELETE
+    commits and *then* the upload blows up, so the error path runs
+    against a row that has already gone terminal. Failing the build
+    there is not a legal transition, and letting that raise would abort
+    the same transaction that marks the queue job failed — stranding the
+    job ``in_progress``. The worker leaves the ``cancelled`` status
+    alone and fails the job regardless.
+    """
+    logger = _logger()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-deleted-then-failed",
+        )
+
+    mock_store = _DeletingMockObjectStore(build.id, fail_after=True)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-deleted-then-failed",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-deleted-then-failed"
+            )
+            assert job is not None
+            # The job is closed out rather than left in_progress for the
+            # silent reaper to find eight hours later.
+            assert job.status == JobStatus.failed
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.cancelled
+        break
+
+
 @pytest.mark.asyncio
 async def test_build_processing_deleted_reaped_build_reports_no_success(
     app: None,

@@ -19,11 +19,14 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
 
-# Statuses a DELETE cancels on its way out. Everything else is already
-# terminal and keeps the status it earned; only these two would
-# otherwise leave a deleted build claiming to be waiting for, or held
-# by, a worker.
-_CANCELLABLE_STATUSES: frozenset[BuildStatus] = frozenset(
+# The two statuses a build can still leave under its own power: it is
+# waiting for a worker, or a worker has it. Everything else is terminal
+# and keeps the status it earned, which is why the retirement helpers
+# below (:meth:`BuildService.cancel_if_unfinished` and
+# :meth:`BuildService.fail_if_unfinished`) test membership here before
+# writing. Only these two would otherwise leave a retired build claiming
+# to be waiting for, or held by, a worker.
+_UNFINISHED_STATUSES: frozenset[BuildStatus] = frozenset(
     {BuildStatus.pending, BuildStatus.processing}
 )
 
@@ -307,6 +310,81 @@ class BuildService:
         )
         return build
 
+    async def cancel_if_unfinished(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build | None:
+        """Cancel a build unless it already finished.
+
+        The retirement half of a soft-delete, for the callers that hold
+        an internal build id and must not disturb a build that already
+        reached ``completed``, ``failed`` or ``superseded``: the DELETE
+        handler by way of :meth:`soft_delete`, and the lifecycle
+        reaper's build-history-orphan rule, which matches never-finished
+        builds by design (it falls back to ``date_created`` when there
+        is no ``date_completed``).
+
+        The status is re-read here rather than trusted from the caller's
+        snapshot, because a lifecycle tick evaluates rules against rows
+        it loaded earlier in the run.
+
+        Returns
+        -------
+        Build or None
+            The cancelled build, or ``None`` when the row had already
+            finished (or vanished) and was left as it stands.
+        """
+        existing = await self._store.get_by_id(build_id)
+        if existing is None or existing.status not in _UNFINISHED_STATUSES:
+            return None
+        return await self.cancel(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+
+    async def fail_if_unfinished(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build | None:
+        """Fail a build unless it already finished.
+
+        The worker's error path calls this rather than :meth:`fail`,
+        because the row it is failing may have gone terminal underneath
+        it: a DELETE cancels a ``processing`` build without taking the
+        BUILD_PROCESSING lock, and the stranded-build sweep fails one.
+        Letting :exc:`InvalidBuildStateError` escape there would abort
+        the very transaction that has to mark the queue job failed,
+        leaving the job stranded ``in_progress`` — the state this whole
+        change set exists to remove.
+
+        Returns
+        -------
+        Build or None
+            The failed build, or ``None`` when the row had already
+            reached a terminal status (or vanished) and keeps the status
+            it earned.
+        """
+        existing = await self._store.get_by_id(build_id)
+        if existing is None or existing.status not in _UNFINISHED_STATUSES:
+            self._logger.info(
+                "Build already terminal; leaving its status as it stands",
+                build_id=build_id,
+                status=existing.status.value if existing is not None else None,
+            )
+            return None
+        return await self.fail(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+
     async def soft_delete(
         self,
         *,
@@ -319,10 +397,15 @@ class BuildService:
         A ``pending`` or ``processing`` build is transitioned to
         ``cancelled`` in the same transaction that stamps
         ``date_deleted``, so no reader ever sees a deleted build still
-        claiming a worker is on it — the invariant the supersession
-        lookup and the stranded-build reaper both depend on. A build
-        that already reached ``completed``, ``failed`` or ``superseded``
-        keeps the status it earned and only gains ``date_deleted``.
+        claiming a worker is on it. A build that already reached
+        ``completed``, ``failed`` or ``superseded`` keeps the status it
+        earned and only gains ``date_deleted``.
+
+        Every path that soft-deletes a build goes through the same
+        retirement step — this method for a DELETE, and
+        :meth:`cancel_if_unfinished` directly for the lifecycle
+        reaper — so the "deleted implies finished" reading holds however
+        the row was deleted.
 
         The worker's deleted-self guard cancels too, and either side may
         run second; :meth:`cancel` is idempotent for exactly that
@@ -340,14 +423,12 @@ class BuildService:
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
-        status = build.status
-        if status in _CANCELLABLE_STATUSES:
-            cancelled = await self.cancel(
-                build_id=build.id,
-                org_slug=org_slug,
-                project_slug=project_slug,
-            )
-            status = cancelled.status
+        cancelled = await self.cancel_if_unfinished(
+            build_id=build.id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        status = cancelled.status if cancelled is not None else build.status
         deleted = await self._store.soft_delete(build_id=build.id)
         if not deleted:
             msg = f"Build {build_id!r} not found"

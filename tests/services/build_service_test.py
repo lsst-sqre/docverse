@@ -231,3 +231,102 @@ async def test_soft_delete_keeps_terminal_status(
         assert deleted is not None
         assert deleted.status == status
         assert deleted.date_deleted is not None
+
+
+@pytest.mark.parametrize(
+    "status", [BuildStatus.pending, BuildStatus.processing]
+)
+@pytest.mark.asyncio
+async def test_cancel_if_unfinished_cancels_live_build(
+    app: None,
+    db_session: AsyncSession,
+    status: BuildStatus,
+) -> None:
+    """An unfinished build is cancelled, whichever live status it is in."""
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=status)
+        service = _build_service(db_session)
+        cancelled = await service.cancel_if_unfinished(build_id=build.id)
+        await db_session.commit()
+
+    assert cancelled is not None
+    assert cancelled.status == BuildStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        BuildStatus.completed,
+        BuildStatus.failed,
+        BuildStatus.superseded,
+        BuildStatus.cancelled,
+    ],
+)
+@pytest.mark.asyncio
+async def test_cancel_if_unfinished_leaves_terminal_build(
+    app: None,
+    db_session: AsyncSession,
+    status: BuildStatus,
+) -> None:
+    """A finished build is left alone rather than raising.
+
+    The lifecycle reaper calls this against rows it loaded earlier in
+    its run, so the status it believes a build has may already be out of
+    date. Unlike :meth:`BuildService.cancel`, which is the DELETE
+    handler's deliberate "this build must end up cancelled", this is a
+    best-effort retirement and reports the no-op with ``None``.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=status)
+        service = _build_service(db_session)
+        assert await service.cancel_if_unfinished(build_id=build.id) is None
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        row = await store.get_by_id(build.id)
+        assert row is not None
+        assert row.status == status
+
+
+@pytest.mark.asyncio
+async def test_fail_if_unfinished_fails_live_build(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A build a worker gave up on still lands on ``failed``."""
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        service = _build_service(db_session)
+        failed = await service.fail_if_unfinished(build_id=build.id)
+        await db_session.commit()
+
+    assert failed is not None
+    assert failed.status == BuildStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_fail_if_unfinished_leaves_cancelled_build(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A build cancelled out from under the worker keeps that status.
+
+    The worker's error path runs in the same transaction that has to
+    mark the queue job failed. Raising ``InvalidBuildStateError`` over a
+    row a DELETE already cancelled would abort that transaction and
+    strand the job ``in_progress`` — the failure mode PRD #577 exists to
+    remove — so the retirement is skipped instead.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        service = _build_service(db_session)
+        await service.cancel(build_id=build.id)
+        assert await service.fail_if_unfinished(build_id=build.id) is None
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        row = await store.get_by_id(build.id)
+        assert row is not None
+        assert row.status == BuildStatus.cancelled

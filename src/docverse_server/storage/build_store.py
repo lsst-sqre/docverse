@@ -427,6 +427,15 @@ class BuildStore:
             and are left alone, as are rows with no ``date_uploaded``
             at all (the ``NULL`` comparison is never true).
 
+        A row whose status changes between the candidate select and its
+        transition — a DELETE-cancel committing in that window, say — is
+        skipped rather than allowed to raise. The sweep shares the
+        reaper's first transaction with the silent and orphan queue-job
+        sweeps, so an :exc:`InvalidBuildStateError` escaping here would
+        roll all three back and fail the whole tick over one build that
+        somebody else had already retired. The skip is the right answer
+        on its own terms too: the row is no longer stranded.
+
         Returns
         -------
         list of Build
@@ -449,12 +458,21 @@ class BuildStore:
             )
             .order_by(SqlBuild.id)
         )
-        return [
-            await self.transition_status(
-                build_id=build_id, new_status=BuildStatus.failed
-            )
-            for build_id in result.scalars().all()
-        ]
+        failed: list[Build] = []
+        for build_id in result.scalars().all():
+            try:
+                failed.append(
+                    await self.transition_status(
+                        build_id=build_id, new_status=BuildStatus.failed
+                    )
+                )
+            except InvalidBuildStateError:
+                self._logger.info(
+                    "Stranded build changed status during the sweep; "
+                    "leaving it alone",
+                    build_id=build_id,
+                )
+        return failed
 
     async def update_inventory(
         self,

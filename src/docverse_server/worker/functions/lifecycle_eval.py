@@ -48,6 +48,7 @@ from docverse_server.metrics import (
     LifecycleActionTrigger,
     LifecycleReapAction,
 )
+from docverse_server.services.build import BuildService
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -252,11 +253,13 @@ async def _evaluate_org(
 
     async with session.begin():
         edition_service = factory.create_edition_service()
+        build_service = factory.create_build_service()
         build_store = factory.create_build_store()
         publishing_service = factory.create_edition_publishing_service()
         for project, rule_set, decision in decisions:
             editions_deleted = await _apply_decision(
                 edition_service=edition_service,
+                build_service=build_service,
                 build_store=build_store,
                 publishing_service=publishing_service,
                 project=project,
@@ -375,6 +378,7 @@ def _index_builds_by_id(
 async def _apply_decision(
     *,
     edition_service: EditionService,
+    build_service: BuildService,
     build_store: BuildStore,
     publishing_service: EditionPublishingService,
     project: Project,
@@ -388,6 +392,10 @@ async def _apply_decision(
     logger: structlog.stdlib.BoundLogger,
 ) -> int:
     """Soft-delete every entity the decision matched and emit one log per row.
+
+    A matched build that has not finished is cancelled on its way out,
+    the same retirement a DELETE performs, so a reaped row never stays
+    deleted while still claiming to be waiting for or held by a worker.
 
     The structured log line is the v1 audit trail (persistent
     ``delete_reason`` columns are deferred to DM-54914 per the PRD).
@@ -460,6 +468,18 @@ async def _apply_decision(
             continue
         rule_type = decision.build_matches[build_id]
         rule = rules_by_type.get(rule_type)
+        # Retire before deleting, exactly as a DELETE does. The
+        # build-history-orphan rule matches never-finished builds on
+        # purpose (it falls back to ``date_created`` when there is no
+        # ``date_completed``), so without this a reaped ``pending`` or
+        # ``processing`` build would be left deleted while still
+        # claiming a worker is on it — and the stranded-build sweep,
+        # which only looks at live rows, would never come back for it.
+        await build_service.cancel_if_unfinished(
+            build_id=build.id,
+            org_slug=org_slug,
+            project_slug=project.slug,
+        )
         deleted = await build_store.soft_delete(build_id=build.id)
         if not deleted:
             continue

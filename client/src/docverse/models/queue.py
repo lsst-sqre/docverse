@@ -156,9 +156,10 @@ class BuildProcessingProgress(BaseModel):
     deleted_skipped: bool | None = Field(
         default=None,
         description=(
-            "``True`` when the build was deleted before the worker picked"
-            " its job up, so nothing was uploaded and the build was"
-            " cancelled instead of published."
+            "``True`` when the build was deleted before it could be"
+            " published, so it was cancelled instead. Set whether the"
+            " delete landed before the worker picked the job up or while"
+            " the worker was still uploading."
         ),
     )
 

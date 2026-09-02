@@ -91,7 +91,12 @@ class _StaleGuardOutcome(Enum):
     """
 
     deleted_skipped = auto()
-    """The build was soft-deleted before its job ran, and was cancelled.
+    """The build was soft-deleted, and was cancelled instead of published.
+
+    Covers both moments a DELETE can land: before the job ran, where
+    :func:`_mark_deleted_skipped` retires the build itself, and midway
+    through the uploads, where the DELETE has already cancelled the row
+    and :func:`_complete_cancelled_build` only closes the job out.
 
     Recorded like a stale skip — the job completes, carrying
     ``deleted_skipped`` instead of ``stale_skipped`` — because the two
@@ -425,7 +430,7 @@ async def _process_build_locked(
     # Phase 2: Upload files and mark build complete
     try:
         async with object_store, session.begin():
-            object_count, total_size_bytes = await _process_build(
+            upload = await _process_build(
                 object_store=object_store,
                 build=build,
                 build_store=build_store,
@@ -434,12 +439,20 @@ async def _process_build_locked(
                 logger=logger,
             )
     except Exception as exc:
-        # Phase 3a: Mark build and queue job as failed
+        # Phase 3a: Mark build and queue job as failed.
+        #
+        # ``fail_if_unfinished`` rather than ``fail``: the row may have
+        # gone terminal underneath this worker (a DELETE-cancel racing
+        # the guard below, or the stranded sweep), and an
+        # InvalidBuildStateError raised here would abort the same
+        # transaction that has to fail the queue job — stranding the job
+        # ``in_progress`` until the silent reaper, which is exactly the
+        # failure mode this change set removes.
         sentry_sdk.capture_exception(exc)
         logger.exception("Build processing failed")
         async with session.begin():
             build_service = factory.create_build_service()
-            await build_service.fail(
+            await build_service.fail_if_unfinished(
                 build_id=build_id,
                 org_slug=org_slug,
                 project_slug=project_slug,
@@ -455,6 +468,17 @@ async def _process_build_locked(
             stale_skipped=False,
         )
     else:
+        # The build was deleted while its files were uploading, so it is
+        # already ``cancelled`` and must not be published.
+        if upload is None:
+            return await _complete_cancelled_build(
+                session=session,
+                queue_job_store=queue_job_store,
+                queue_job_id=queue_job_id,
+                build_id=build_id,
+                logger=logger,
+            )
+        object_count, total_size_bytes = upload
         editions_updated, editions_skipped = await _finalize_success(
             session=session,
             factory=factory,
@@ -600,6 +624,48 @@ async def _mark_deleted_skipped(
             )
             await queue_job_store.complete(queue_job_id)
     return _StaleGuardOutcome.deleted_skipped
+
+
+async def _complete_cancelled_build(
+    *,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    queue_job_id: int | None,
+    build_id: int,
+    logger: structlog.stdlib.BoundLogger,
+) -> tuple[str, _BuildProcessedOutcome | None]:
+    """Close out a build cancelled while its files were uploading.
+
+    The late sibling of :func:`_mark_deleted_skipped`. That guard runs
+    before any work and can still retire the build itself; here the
+    DELETE cancelled the row on its way out
+    (:meth:`BuildService.soft_delete`) while this worker was mid-upload,
+    so all that is left is bookkeeping: record the skip on the queue job
+    and complete it. The build keeps the ``cancelled`` status the DELETE
+    gave it, edition tracking never runs, and nothing is published.
+
+    The uploaded objects are left where they landed. They belong to a
+    soft-deleted build, so they are the storage purge's business, not
+    this worker's — and the alternative, deleting them from under a
+    build that a subsequent restore might want, is worse.
+
+    Reports the same ``deleted_skipped`` progress key and stale-skipped
+    metric shape as the pre-work guard: to an operator this is the same
+    event, a build deliberately retired rather than one that failed.
+    """
+    logger.info("Build cancelled during processing", build_id=build_id)
+    if queue_job_id is not None:
+        async with session.begin():
+            await queue_job_store.update_phase(
+                queue_job_id,
+                "complete",
+                progress={
+                    "message": "Build was deleted while it was processing",
+                    "deleted_skipped": True,
+                },
+            )
+            await queue_job_store.complete(queue_job_id)
+    return _stale_guard_result(_StaleGuardOutcome.deleted_skipped)
 
 
 async def _resolve_queue_job_id(
@@ -936,7 +1002,7 @@ async def _process_build(
     org_slug: str,
     project_slug: str,
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[int, int]:
+) -> tuple[int, int] | None:
     """Download, unpack, and upload build files.
 
     Each extracted file is hashed as it goes by, so the build's content
@@ -949,8 +1015,11 @@ async def _process_build(
 
     Returns
     -------
-    tuple of int, int
-        The number of objects uploaded and the total size in bytes.
+    tuple of int, int or None
+        The number of objects uploaded and the total size in bytes, or
+        ``None`` when the build was cancelled while those uploads were
+        in flight and must not be completed (see
+        :func:`_complete_cancelled_build`).
     """
     logger.info(
         "Downloading staging tarball",
@@ -1014,6 +1083,22 @@ async def _process_build(
         total_size_bytes=total_size,
         content_hash=content_hash,
     )
+
+    # A DELETE cancels a ``processing`` build without taking the
+    # BUILD_PROCESSING lock, so the row can go terminal at any point
+    # during the download and uploads above. Re-read it before writing
+    # anything terminal of our own: completing a cancelled build would
+    # publish work an operator asked us to drop, and the transition
+    # would raise InvalidBuildStateError inside the transaction that
+    # still has to close out the queue job (#575).
+    current = await build_store.get_by_id(build.id)
+    if current is not None and current.status == BuildStatus.cancelled:
+        logger.info(
+            "Build cancelled during processing; skipping completion",
+            object_count=object_count,
+            total_size_bytes=total_size,
+        )
+        return None
 
     await build_store.update_inventory(
         build_id=build.id,
