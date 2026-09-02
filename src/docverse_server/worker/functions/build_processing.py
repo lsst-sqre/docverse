@@ -67,10 +67,19 @@ class _BuildProcessedOutcome:
 
 
 class _StaleGuardOutcome(Enum):
-    """How the stale-build guard resolved one ``build_processing`` job."""
+    """How the pickup guards resolved one ``build_processing`` job.
+
+    Two reasons stop a build before any work happens — it was
+    superseded, or it was deleted — and both leave the same trace for
+    the caller: ``"completed"`` plus a
+    ``build_processed(success=True, stale_skipped=True)`` metric (see
+    :func:`_stale_guard_result`). They stay separate members because the
+    bookkeeping they write differs: distinct progress keys, distinct log
+    lines, and a different terminal status on the build itself.
+    """
 
     not_stale = auto()
-    """This build is the newest for its ``(project, git_ref)``: run it."""
+    """This build is live and the newest for its ``(project, git_ref)``."""
 
     stale_skipped = auto()
     """Superseded by a newer build, and the skip was recorded.
@@ -79,6 +88,17 @@ class _StaleGuardOutcome(Enum):
     and marked ``completed`` with ``stale_skipped``, and a delivery with
     no ``queue_jobs`` row at all. The build really is superseded either
     way, so the run reports a stale-skipped success.
+    """
+
+    deleted_skipped = auto()
+    """The build was soft-deleted before its job ran, and was cancelled.
+
+    Recorded like a stale skip — the job completes, carrying
+    ``deleted_skipped`` instead of ``stale_skipped`` — because the two
+    are the same kind of event to an operator: a build that will never
+    be published, retired deliberately rather than in error. The metric
+    reuses ``stale_skipped=True`` so ``BuildProcessedEvent`` needs no
+    new field for a distinction nobody queries on.
     """
 
     late_delivery = auto()
@@ -219,13 +239,16 @@ async def build_processing(
 def _stale_guard_result(
     guard: _StaleGuardOutcome,
 ) -> tuple[str, _BuildProcessedOutcome | None]:
-    """Map a terminal stale-guard verdict to (arq result, metrics).
+    """Map a terminal guard verdict to (arq result, metrics).
 
-    A recorded stale skip is a success the operator should see in
-    ``build_processed``. A late delivery is not: the row is terminal or
-    owned by another worker, so it reports ``"skipped"`` and no metric —
-    the same "a skipped queue job produces no outcome" rule
-    :func:`_process_build_locked` follows for the non-stale path.
+    A recorded skip — stale or deleted — is a success the operator
+    should see in ``build_processed``; both report the same
+    ``stale_skipped=True`` shape, since the event distinguishes "did no
+    work on purpose" from "failed", not the two reasons for it. A late
+    delivery is neither: the row is terminal or owned by another worker,
+    so it reports ``"skipped"`` and no metric — the same "a skipped
+    queue job produces no outcome" rule :func:`_process_build_locked`
+    follows for the non-stale path.
     """
     if guard is _StaleGuardOutcome.late_delivery:
         return "skipped", None
@@ -280,20 +303,44 @@ async def _guard_stale_build(
     project_slug: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> _StaleGuardOutcome:
-    """Skip and mark stale if a newer build exists for ``(project, git_ref)``.
+    """Skip a build that was deleted, or superseded for its git ref.
 
     Runs *inside* the BUILD_PROCESSING lock so two concurrent supersession
     checks cannot race: only the newest build for ``(project, git_ref)``
     does any work; any older build observes a higher latest id and skips.
+
+    The build is re-read here rather than reused from the pre-lock read,
+    because the whole point of the deletion check is to see writes that
+    landed after it. ``date_deleted`` is checked *before* the latest-live
+    lookup: a deleted build must be cancelled on its own account, and
+    asking whether it is the newest live build for its ref is both
+    pointless (it has just been excluded from that lookup) and
+    misleading (it would report itself superseded by whatever is live).
 
     Returns the verdict the caller turns into an arq result and metrics
     (see :func:`_stale_guard_result`); ``not_stale`` means this build
     should be processed.
     """
     async with session.begin():
-        latest_build_id = await build_store.get_latest_build_id_for_ref(
-            project_id=build.project_id,
-            git_ref=build.git_ref,
+        current = await build_store.get_by_id(build_id)
+        deleted = current is not None and current.date_deleted is not None
+        latest_build_id: int | None = None
+        if not deleted:
+            latest_build_id = await build_store.get_latest_build_id_for_ref(
+                project_id=build.project_id,
+                git_ref=build.git_ref,
+            )
+    if deleted:
+        return await _mark_deleted_skipped(
+            session=session,
+            ctx=ctx,
+            payload=payload,
+            factory=factory,
+            queue_job_store=queue_job_store,
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            logger=logger,
         )
     # A newer build landing between this read and _mark_stale_skipped
     # is benign: the BUILD_PROCESSING lock serializes supersession
@@ -500,6 +547,59 @@ async def _mark_stale_skipped(
             )
             await queue_job_store.complete(queue_job_id)
     return _StaleGuardOutcome.stale_skipped
+
+
+async def _mark_deleted_skipped(
+    *,
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    factory: Factory,
+    queue_job_store: QueueJobStore,
+    build_id: int,
+    org_slug: str,
+    project_slug: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> _StaleGuardOutcome:
+    """Retire a build deleted before processing and complete its QueueJob.
+
+    Mirrors :func:`_mark_stale_skipped` — same pickup guard, same
+    completed job, same single ``session.begin()`` block so the job
+    completion and the build transition commit or roll back together —
+    and differs only in what it records: ``progress["deleted_skipped"]``
+    and a transition to ``cancelled`` rather than ``superseded``.
+
+    The cancel is idempotent. ``BuildService.soft_delete`` cancels a
+    non-terminal build as it deletes it, so the common ordering leaves
+    this guard re-asserting a status the row already has; a row deleted
+    before that behaviour existed (or by a DELETE that raced this
+    worker's pre-lock read) is still ``processing`` and is the case that
+    needs the transition. Either way the build must not be published,
+    and nothing is downloaded, unpacked, uploaded or tracked.
+    """
+    async with session.begin():
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
+        if pickup.skipped:
+            return _StaleGuardOutcome.late_delivery
+        logger.info("Deleted build skipped", build_id=build_id)
+        build_service = factory.create_build_service()
+        await build_service.cancel(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        if pickup.queue_job_id is not None:
+            queue_job_id = pickup.queue_job_id
+            await queue_job_store.update_phase(
+                queue_job_id,
+                "complete",
+                progress={
+                    "message": "Build was deleted before processing",
+                    "deleted_skipped": True,
+                },
+            )
+            await queue_job_store.complete(queue_job_id)
+    return _StaleGuardOutcome.deleted_skipped
 
 
 async def _resolve_queue_job_id(

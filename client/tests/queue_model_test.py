@@ -80,13 +80,14 @@ def test_publish_job_ref_has_typed_job_url() -> None:
     assert ref.model_dump(exclude_none=True)["job_url"] == url
 
 
-_SIX_BUILD_KEYS = (
+_BUILD_KEYS = (
     "object_count",
     "total_size_bytes",
     "editions_updated",
     "editions_skipped",
     "publish_jobs",
     "edition_tracking_error",
+    "deleted_skipped",
 )
 
 
@@ -94,7 +95,7 @@ def test_non_build_progress_omits_null_build_fields() -> None:
     """A non-build progress serializes to only its real keys + extras.
 
     Validating a non-build job's progress into ``BuildProcessingProgress``
-    leaves the six build-specific typed fields ``None``; serialization must
+    leaves every build-specific typed field ``None``; serialization must
     drop them rather than leak them as ``null``.
     """
     progress = BuildProcessingProgress.model_validate(
@@ -111,8 +112,8 @@ def test_non_build_progress_omits_null_build_fields() -> None:
     assert dumped["message"] == "Discovery complete"
     assert dumped["in_scope_count"] == 5
     assert dumped["enqueued_count"] == 4
-    # None of the six build-specific typed fields leak as ``null``.
-    for key in _SIX_BUILD_KEYS:
+    # None of the build-specific typed fields leak as ``null``.
+    for key in _BUILD_KEYS:
         assert key not in dumped
 
 
@@ -130,6 +131,27 @@ def test_build_progress_keeps_set_fields_drops_unset() -> None:
     assert dumped["publish_jobs"][0]["edition_slug"] == "main"
     # ``edition_tracking_error`` was never set → omitted, not serialized null.
     assert "edition_tracking_error" not in dumped
+
+
+def test_deleted_skip_progress_is_typed() -> None:
+    """The deleted-self skip's progress round-trips as a typed field.
+
+    ``build_processing`` writes ``deleted_skipped`` when it retires a
+    build that was deleted before its job ran. Extras would round-trip
+    it anyway; declaring it keeps the flag in the generated OpenAPI so
+    a client can discover why a job completed without uploading.
+    """
+    progress = BuildProcessingProgress.model_validate(
+        {
+            "message": "Build was deleted before processing",
+            "deleted_skipped": True,
+        }
+    )
+
+    assert progress.deleted_skipped is True
+    assert "deleted_skipped" in BuildProcessingProgress.model_fields
+    dumped = progress.model_dump(mode="json")
+    assert dumped["deleted_skipped"] is True
 
 
 def test_build_processing_progress_allows_extra_keys() -> None:

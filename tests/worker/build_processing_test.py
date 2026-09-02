@@ -1260,6 +1260,294 @@ async def test_build_processing_deleted_superseder_publishes(
 
 
 @pytest.mark.asyncio
+async def test_build_processing_skips_deleted_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build deleted before its job ran is cancelled, not processed.
+
+    The build was uploaded and signalled ``uploaded``, then deleted
+    before the worker picked the job up. Inside the BUILD_PROCESSING
+    lock the guard re-reads the row, sees ``date_deleted``, and retires
+    the build instead of running it: nothing is downloaded, unpacked or
+    uploaded, the queue job completes carrying ``deleted_skipped``, and
+    the build lands on the terminal ``cancelled`` rather than being
+    stranded in ``processing`` with no worker on it (#575).
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        # Pre-create the edition with no current_build so we can later
+        # assert the pointer was never moved by the deleted dispatch.
+        edition_store = EditionStore(session=db_session, logger=logger)
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Main",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        # Delete the row at the store level so it is still ``processing``:
+        # the shape a DELETE that raced the worker leaves behind, and the
+        # shape rows deleted before #580 already have.
+        build_store = BuildStore(session=db_session, logger=logger)
+        assert await build_store.soft_delete(build_id=build.id) is True
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-deleted",
+        )
+
+    # Intentionally do NOT stage a tarball: the deleted-self guard must
+    # short-circuit before any download or upload is attempted.
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-deleted",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    # The deleted skip reuses the stale-skip metric shape: the run did
+    # no work, but it ended deliberately rather than in error.
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].success is True
+    assert publisher.published[0].stale_skipped is True
+
+    # No uploads or downloads occurred — the mock store stayed empty.
+    assert mock_store.objects == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id("test-arq-deleted")
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("deleted_skipped") is True
+            assert job.progress.get("stale_skipped") is None
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.cancelled
+            assert refreshed.date_completed is not None
+
+            # The pre-created edition's pointer must be untouched.
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_build_processing_deleted_build_already_cancelled(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DELETE that already cancelled the row is a no-op for the guard.
+
+    ``BuildService.soft_delete`` cancels a non-terminal build as it
+    deletes it (#580), so by the time the worker's guard runs the row is
+    usually *already* ``cancelled``. Re-cancelling a terminal row would
+    normally raise ``InvalidBuildStateError``; the guard's cancel is
+    idempotent for exactly this ordering, so the job still completes.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        # DELETE got there first: the row is cancelled *and* deleted.
+        build_store = BuildStore(session=db_session, logger=logger)
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.cancelled
+        )
+        assert await build_store.soft_delete(build_id=build.id) is True
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-deleted-cancelled",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-deleted-cancelled",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert mock_store.objects == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id("test-arq-deleted-cancelled")
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("deleted_skipped") is True
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.cancelled
+
+
+@pytest.mark.asyncio
+async def test_build_processing_deleted_reaped_build_reports_no_success(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reaped delivery for a deleted build writes nothing at all.
+
+    The pickup guard runs before the cancel, exactly as it does on the
+    stale path: a row the abandoned sweep already failed is in nobody's
+    hands, so this delivery has no build to retire and no metric to
+    emit. It reports ``"skipped"`` and leaves the build alone.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        build_store = BuildStore(session=db_session, logger=logger)
+        assert await build_store.soft_delete(build_id=build.id) is True
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        queue_job = await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-deleted-reaped",
+        )
+        # Stand in for the reaper's abandoned sweep having failed the row
+        # between enqueue and this (late) delivery.
+        await queue_job_store.fail(
+            queue_job.id,
+            errors={
+                "message": "Abandoned build_processing",
+                "type": "AbandonedQueueJob",
+            },
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-deleted-reaped",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    with capture_logs() as captured:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "skipped"
+    assert not [
+        event
+        for event in captured
+        if event["event"] == "Deleted build skipped"
+    ]
+
+    # No outcome to report: the reaped row emits no build_processed event.
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+
+    assert mock_store.objects == {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.date_started is None
+            assert job.progress is None
+
+            # The build keeps the status the reaped delivery found it in:
+            # a delivery that did nothing must not retire the row either.
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.processing
+
+
+@pytest.mark.asyncio
 async def test_build_processing_stale_reaped_build_reports_no_success(
     app: None,
     db_session: AsyncSession,
