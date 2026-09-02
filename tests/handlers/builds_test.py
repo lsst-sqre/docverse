@@ -7,10 +7,13 @@ import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
+from sqlalchemy import select
 
 from docverse.models import BuildAnnotations, BuildStatus
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import validate_base32_id
+from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
@@ -73,6 +76,37 @@ async def _transition_build(
             )
             await session.commit()
         return
+
+
+async def _read_deleted_build(
+    org_slug: str,
+    project_slug: str,
+    build_id: str,
+) -> Build:
+    """Read a build row that ``BuildStore`` would hide as soft-deleted.
+
+    ``BuildStore.get_by_public_id`` filters ``date_deleted IS NULL``, so
+    checking what DELETE left behind means going to the table directly.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            result = await session.execute(
+                select(SqlBuild).where(
+                    SqlBuild.project_id == project.id,
+                    SqlBuild.public_id == validate_base32_id(build_id),
+                )
+            )
+            return Build.model_validate(result.scalar_one())
+    raise AssertionError("db_session_dependency yielded no session")
 
 
 @pytest.mark.asyncio
@@ -404,3 +438,28 @@ async def test_delete_build(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_build_cancels_pending_build(
+    client: AsyncClient,
+) -> None:
+    """DELETE on an unfinished build cancels it as well as deleting it.
+
+    The 204 contract is unchanged; what changes is the row left behind.
+    A deleted build must not stay ``pending``, because the worker's
+    supersession and reaper logic both read status as a claim about
+    whether anyone is still going to publish the build.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    response = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+    row = await _read_deleted_build("build-org", "build-proj", build_id)
+    assert row.status == BuildStatus.cancelled
+    assert row.date_deleted is not None
+    assert row.date_completed is not None

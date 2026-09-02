@@ -19,6 +19,14 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
 
+# Statuses a DELETE cancels on its way out. Everything else is already
+# terminal and keeps the status it earned; only these two would
+# otherwise leave a deleted build claiming to be waiting for, or held
+# by, a worker.
+_CANCELLABLE_STATUSES: frozenset[BuildStatus] = frozenset(
+    {BuildStatus.pending, BuildStatus.processing}
+)
+
 
 class BuildService:
     """Business logic for build management."""
@@ -306,7 +314,19 @@ class BuildService:
         project_slug: str,
         build_id: str,
     ) -> None:
-        """Soft-delete a build.
+        """Soft-delete a build, cancelling it if it has not finished.
+
+        A ``pending`` or ``processing`` build is transitioned to
+        ``cancelled`` in the same transaction that stamps
+        ``date_deleted``, so no reader ever sees a deleted build still
+        claiming a worker is on it — the invariant the supersession
+        lookup and the stranded-build reaper both depend on. A build
+        that already reached ``completed``, ``failed`` or ``superseded``
+        keeps the status it earned and only gains ``date_deleted``.
+
+        The worker's deleted-self guard cancels too, and either side may
+        run second; :meth:`cancel` is idempotent for exactly that
+        reason.
 
         Parameters
         ----------
@@ -320,6 +340,14 @@ class BuildService:
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
+        status = build.status
+        if status in _CANCELLABLE_STATUSES:
+            cancelled = await self.cancel(
+                build_id=build.id,
+                org_slug=org_slug,
+                project_slug=project_slug,
+            )
+            status = cancelled.status
         deleted = await self._store.soft_delete(build_id=build.id)
         if not deleted:
             msg = f"Build {build_id!r} not found"
@@ -329,4 +357,5 @@ class BuildService:
             build=build_id,
             org=org_slug,
             project=project_slug,
+            status=status.value,
         )

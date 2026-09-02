@@ -1,10 +1,12 @@
 """Tests for :class:`~docverse_server.services.build.BuildService`.
 
-Focused on the two terminal transitions introduced by the stranded-build
+Focused on the terminal transitions introduced by the stranded-build
 work (PRD #577 / DM-56012): ``supersede``, which the ``build_processing``
 stale-skip path uses to stop leaving skipped builds stranded in
-``processing``, and ``cancel``, which the DELETE handler and the worker's
-deleted-self guard both call — so it has to be safe to call twice.
+``processing``; ``cancel``, which the DELETE handler and the worker's
+deleted-self guard both call — so it has to be safe to call twice; and
+``soft_delete``, which cancels a build that had not finished and leaves
+an already-terminal one with the status it earned.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from docverse.models import (
     ProjectCreate,
 )
 from docverse_server.config import Configuration
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.factory import Factory
@@ -163,3 +166,68 @@ async def test_cancel_rejects_other_terminal_statuses(
         service = _build_service(db_session)
         with pytest.raises(InvalidBuildStateError):
             await service.cancel(build_id=build.id)
+
+
+@pytest.mark.parametrize(
+    "status", [BuildStatus.pending, BuildStatus.processing]
+)
+@pytest.mark.asyncio
+async def test_soft_delete_cancels_non_terminal_build(
+    app: None,
+    db_session: AsyncSession,
+    status: BuildStatus,
+) -> None:
+    """Deleting an unfinished build also cancels it.
+
+    ``processing`` has to keep meaning "a worker is on it", so a build
+    deleted before it finished must not be left claiming to be in
+    flight. The cancel and the soft-delete land in the handler's single
+    transaction, so a reader never sees a deleted row still ``pending``
+    or ``processing``.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=status)
+        service = _build_service(db_session)
+        await service.soft_delete(
+            org_slug="bs-org",
+            project_slug="bs-proj",
+            build_id=serialize_base32_id(build.public_id),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        deleted = await store.get_by_id(build.id)
+        assert deleted is not None
+        assert deleted.status == BuildStatus.cancelled
+        assert deleted.date_deleted is not None
+        assert deleted.date_completed is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [BuildStatus.completed, BuildStatus.failed, BuildStatus.superseded],
+)
+@pytest.mark.asyncio
+async def test_soft_delete_keeps_terminal_status(
+    app: None,
+    db_session: AsyncSession,
+    status: BuildStatus,
+) -> None:
+    """A finished build keeps the status it earned when it is deleted."""
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=status)
+        service = _build_service(db_session)
+        await service.soft_delete(
+            org_slug="bs-org",
+            project_slug="bs-proj",
+            build_id=serialize_base32_id(build.public_id),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        deleted = await store.get_by_id(build.id)
+        assert deleted is not None
+        assert deleted.status == status
+        assert deleted.date_deleted is not None
