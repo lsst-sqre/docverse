@@ -15,12 +15,13 @@ from typing import Any
 import httpx
 import pytest
 import respx
+import sentry_sdk
 import structlog
 from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
@@ -1473,29 +1474,36 @@ async def _cancel_and_soft_delete(build_id: int) -> None:
         break
 
 
-class _DeletingMockObjectStore(MockObjectStore):
-    """``MockObjectStore`` that deletes the build during the first upload.
+class _RetiringMockObjectStore(MockObjectStore):
+    """``MockObjectStore`` that runs a callback during the first upload.
 
-    Stands in for a DELETE landing while the worker is streaming files
-    out. The handler does not take the BUILD_PROCESSING lock, so nothing
-    stops it; the worker keeps uploading and only finds out when it goes
-    to write the terminal transition. Interception starts at
-    :meth:`arm`, so the test can stage its own tarball through the same
-    store first.
+    Stands in for anything that retires a build while the worker is
+    streaming its files out — a DELETE cancelling it, the stranded-build
+    sweep failing it, a supersession, a purge. None of them takes the
+    BUILD_PROCESSING lock, so nothing stops them; the worker keeps
+    uploading and only finds out when it goes to write the terminal
+    transition. Whatever the callback commits lands in exactly that
+    window. Interception starts at :meth:`arm`, so the test can stage
+    its own tarball through the same store first.
 
-    With ``fail_after`` the armed upload also raises once the delete has
-    committed, driving the worker's error path over an already-terminal
-    row.
+    With ``fail_after`` the armed upload also raises once the callback
+    has committed, driving the worker's error path over an
+    already-terminal row.
     """
 
-    def __init__(self, build_id: int, *, fail_after: bool = False) -> None:
+    def __init__(
+        self,
+        on_upload: Callable[[], Awaitable[None]],
+        *,
+        fail_after: bool = False,
+    ) -> None:
         super().__init__()
-        self._build_id = build_id
+        self._on_upload = on_upload
         self._fail_after = fail_after
         self._armed = False
 
     def arm(self) -> None:
-        """Delete the build on the next upload."""
+        """Run the callback on the next upload."""
         self._armed = True
 
     async def upload_object(
@@ -1507,7 +1515,7 @@ class _DeletingMockObjectStore(MockObjectStore):
             )
             return
         self._armed = False
-        await _cancel_and_soft_delete(self._build_id)
+        await self._on_upload()
         await super().upload_object(
             key=key, data=data, content_type=content_type
         )
@@ -1564,7 +1572,9 @@ async def test_build_processing_build_deleted_mid_upload(
             backend_job_id="test-arq-deleted-mid-upload",
         )
 
-    mock_store = _DeletingMockObjectStore(build.id)
+    mock_store = _RetiringMockObjectStore(
+        lambda: _cancel_and_soft_delete(build.id)
+    )
     tarball = _make_tarball({"index.html": b"<html>hello</html>"})
     await mock_store.upload_object(
         key=build.staging_key,
@@ -1632,6 +1642,435 @@ async def test_build_processing_build_deleted_mid_upload(
             )
             assert edition is not None
             assert edition.current_build_id is None
+        break
+
+
+async def _retire_build(build_id: int, status: BuildStatus) -> None:
+    """Transition a build to a terminal status on its own committed session.
+
+    Stands in for whoever else can retire a row while the worker is
+    uploading for it — the stranded-build sweep's ``failed``, or a
+    supersession. The write commits independently of the worker's
+    transaction, which is what makes it visible to the mid-upload
+    re-read.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = BuildStore(session=session, logger=_logger())
+            await store.transition_status(build_id=build_id, new_status=status)
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_build_failed_mid_upload(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build failed mid-upload is closed out quietly, not as a crash.
+
+    The stranded-build sweep retires a build left in ``processing`` to
+    ``failed``, and it can do that while a long upload is still running.
+    The row is then terminal, so completing it would raise
+    ``InvalidBuildStateError`` out of the worker's own transaction and
+    the error path would report a deliberate retirement as a crash — a
+    Sentry event and a failed queue job (review of PR #583, finding f2).
+    The mid-upload guard skips on any status but ``processing``, so this
+    closes out through the same quiet path a DELETE takes.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-failed-mid-upload",
+        )
+
+    async def _fail_build() -> None:
+        await _retire_build(build.id, BuildStatus.failed)
+
+    mock_store = _RetiringMockObjectStore(_fail_build)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-failed-mid-upload",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    # A deliberate retirement is not a crash to report.
+    assert captured == []
+
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].success is True
+    assert publisher.published[0].stale_skipped is True
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id("test-arq-failed-mid-upload")
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            # The payload names the status that was actually found.
+            assert job.progress.get("retired_status") == "failed"
+            assert "failed" in job.progress["message"]
+            # Only a DELETE reports the deleted-skip contract.
+            assert job.progress.get("deleted_skipped") is None
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            # The sweep's verdict stands, and no inventory was written.
+            assert refreshed.status == BuildStatus.failed
+            assert refreshed.object_count is None
+        break
+
+
+async def _reap_job_and_fail_build(job_id: int, build_id: int) -> None:
+    """Run both reaps of a stranded build on their own committed session.
+
+    The order the sweeps actually land in: the silent reaper fails the
+    queue job, and only then does the stranded-build sweep — which
+    matches builds with no ``queued`` or ``in_progress`` job left — fail
+    the build. The worker is mid-upload throughout, so it finds both
+    rows already terminal when it comes back.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            await qjs.fail(
+                job_id,
+                errors={
+                    "message": "Reaped by build_processing_reaper",
+                    "type": "SilentWorker",
+                },
+            )
+            store = BuildStore(session=session, logger=_logger())
+            await store.transition_status(
+                build_id=build_id, new_status=BuildStatus.failed
+            )
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_reaped_job_and_build_mid_upload(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close-out over an already-reaped queue job writes nothing.
+
+    The stranded-build sweep only fails a build once no live job is left
+    for it, so by the time it retires a build the silent reaper has
+    already failed that build's ``queue_jobs`` row. Completing the job
+    from the close-out would raise ``InvalidJobStateError`` — the second
+    half of review finding f2 — so the close-out leaves a job it no
+    longer owns exactly as the reaper left it.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        job = await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-reaped-mid-upload",
+        )
+
+    async def _reap() -> None:
+        await _reap_job_and_fail_build(job.id, build.id)
+
+    mock_store = _RetiringMockObjectStore(_reap)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-reaped-mid-upload",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    # The bug this covers surfaced as InvalidJobStateError out of the
+    # close-out, so simply returning is most of the assertion.
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert captured == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            reaped = await qjs.get_by_backend_job_id(
+                "test-arq-reaped-mid-upload"
+            )
+            assert reaped is not None
+            # The reaper's verdict, and its postmortem trail, stand.
+            assert reaped.status == JobStatus.failed
+            assert reaped.errors is not None
+            assert reaped.errors["type"] == "SilentWorker"
+            assert reaped.progress is not None
+            assert reaped.progress.get("retired_status") is None
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.failed
+            assert refreshed.object_count is None
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_build_superseded_mid_upload(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supersession landing mid-upload retires the run quietly too.
+
+    ``processing -> superseded`` is a legal transition, so a build can be
+    retired as superseded after its worker started uploading. Nothing
+    about that is a failure: the build simply will not be published, and
+    the run closes out through the same path as any other mid-upload
+    retirement, naming the status it found.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-superseded-mid-upload",
+        )
+
+    async def _supersede() -> None:
+        await _retire_build(build.id, BuildStatus.superseded)
+
+    mock_store = _RetiringMockObjectStore(_supersede)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-superseded-mid-upload",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-superseded-mid-upload"
+            )
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("retired_status") == "superseded"
+            assert "superseded" in job.progress["message"]
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.superseded
+            assert refreshed.object_count is None
+        break
+
+
+async def _drop_build_row(build_id: int) -> None:
+    """Delete a build row outright on its own committed session.
+
+    The row the worker is uploading for can also simply cease to exist —
+    a purge, or an operator clearing test data. The guard has to answer
+    "is this still mine to finish?" for a missing row too, rather than
+    read ``None.status``.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                delete(SqlBuild).where(SqlBuild.id == build_id)
+            )
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_build_row_vanished_mid_upload(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build row deleted mid-upload closes the job out, not crashes it.
+
+    ``transition_status`` on a missing row raises, and the error path
+    would then report the disappearance as a build failure. There is
+    nothing to fail: the row is gone, so the run records that it found
+    no build and completes its job.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-vanished-mid-upload",
+        )
+
+    async def _drop() -> None:
+        await _drop_build_row(build.id)
+
+    mock_store = _RetiringMockObjectStore(_drop)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-vanished-mid-upload",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-vanished-mid-upload"
+            )
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            # No status to name, and the message says so.
+            assert "retired_status" in job.progress
+            assert job.progress["retired_status"] is None
+            assert "disappeared" in job.progress["message"]
+
+            build_store = BuildStore(session=session, logger=_logger())
+            assert await build_store.get_by_id(build.id) is None
         break
 
 
@@ -1973,7 +2412,9 @@ async def test_build_processing_failure_after_delete_still_fails_job(
             backend_job_id="test-arq-deleted-then-failed",
         )
 
-    mock_store = _DeletingMockObjectStore(build.id, fail_after=True)
+    mock_store = _RetiringMockObjectStore(
+        lambda: _cancel_and_soft_delete(build.id), fail_after=True
+    )
     tarball = _make_tarball({"index.html": b"<html>hello</html>"})
     await mock_store.upload_object(
         key=build.staging_key,

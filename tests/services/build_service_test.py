@@ -422,7 +422,7 @@ async def test_cancel_if_unfinished_holds_the_row_against_a_completion(
     holds it to commit, so the worker's completion blocks rather than
     reading a stale ``processing``. When it wakes it sees ``cancelled``,
     which is what makes the worker's mid-upload re-read a real guard:
-    it takes the ``_complete_cancelled_build`` path instead of writing
+    it takes the ``_close_out_retired_build`` path instead of writing
     ``completed`` over the operator's deletion.
     """
     build = await _seed_processing_build(db_session)

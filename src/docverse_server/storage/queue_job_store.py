@@ -311,6 +311,45 @@ class QueueJobStore:
             return None
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def get_for_update(self, job_id: int) -> QueueJob | None:
+        """Fetch a QueueJob by internal id, locking the row until commit.
+
+        The read half of a read-then-write on a job's status: it returns
+        the row as it stands *and* holds it, so the status the caller
+        branches on cannot change under it before it writes. Use it
+        wherever a decision is made from a job's status and acted on in
+        the same transaction — a worker deciding whether it still owns a
+        row a reaper may have failed underneath it, say, where an
+        unlocked read would let :meth:`complete` raise
+        :exc:`~docverse_server.exceptions.InvalidJobStateError` from
+        inside the transaction that exists to close the job out. Use
+        :meth:`get` for a plain look.
+
+        ``populate_existing`` keeps the guarantee off the identity map:
+        sessions are created with ``expire_on_commit=False``, so an
+        instance this session loaded in an earlier transaction would
+        otherwise come back with its old attributes rather than the
+        locked row's — the same reason
+        :meth:`~docverse_server.storage.build_store.BuildStore.get_for_update`
+        asks for them outright.
+
+        Returns
+        -------
+        QueueJob or None
+            The locked job, or ``None`` if no such row exists (in which
+            case nothing is locked).
+        """
+        result = await self._session.execute(
+            select(SqlQueueJob)
+            .where(SqlQueueJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return QueueJob.model_validate(row, from_attributes=True)
+
     async def get_by_public_id(self, public_id: int) -> QueueJob | None:
         """Fetch a QueueJob by public Base32 id (int form)."""
         result = await self._session.execute(
