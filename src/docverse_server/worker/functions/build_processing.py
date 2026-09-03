@@ -322,6 +322,13 @@ async def _guard_stale_build(
     pointless (it has just been excluded from that lookup) and
     misleading (it would report itself superseded by whatever is live).
 
+    The re-read is deliberately unlocked. Its transaction commits before
+    either skip path runs, so a row lock taken here would be released
+    before it could protect anything; the transition each skip path
+    makes takes its own lock, and a DELETE that lands in between is seen
+    there. ``_process_build``'s guard is the one that has to be locked,
+    because its verdict and the write it gates share a transaction.
+
     Returns the verdict the caller turns into an arq result and metrics
     (see :func:`_stale_guard_result`); ``not_stale`` means this build
     should be processed.
@@ -1117,7 +1124,14 @@ async def _process_build(
     # publish work an operator asked us to drop, and the transition
     # would raise InvalidBuildStateError inside the transaction that
     # still has to close out the queue job (#575).
-    current = await build_store.get_by_id(build.id)
+    #
+    # Locked, and in the same transaction as the completion below, so
+    # the guard and the write cannot straddle a DELETE's commit: this
+    # blocks behind a cancel that is mid-flight and then sees it, and a
+    # cancel arriving after this point blocks behind the completion and
+    # stands down. Either way exactly one of the two terminal statuses
+    # survives (review of PR #583, finding f1).
+    current = await build_store.get_for_update(build_id=build.id)
     if current is not None and current.status == BuildStatus.cancelled:
         logger.info(
             "Build cancelled during processing; skipping completion",

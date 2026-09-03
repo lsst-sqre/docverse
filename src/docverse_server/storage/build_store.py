@@ -120,11 +120,77 @@ class BuildStore:
         return Build.model_validate(row)
 
     async def get_by_id(self, build_id: int) -> Build | None:
-        """Fetch a build by internal ID."""
+        """Fetch a build by internal ID.
+
+        An unlocked snapshot read. A caller that decides *what to write*
+        from what it reads — "is this build still unfinished?" — wants
+        :meth:`get_for_update` instead, so its decision and its write
+        cannot straddle somebody else's commit.
+        """
         result = await self._session.execute(
             select(SqlBuild).where(SqlBuild.id == build_id)
         )
         row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
+    async def _load_locked(self, build_id: int) -> SqlBuild | None:
+        """Read a build row under a ``SELECT ... FOR UPDATE`` row lock.
+
+        Every caller that reaches for this decides what to write from
+        what it reads, and those two statements are not otherwise
+        atomic. Under PostgreSQL's READ COMMITTED default a DELETE
+        cancelling a build and a worker completing it could each pass
+        their own status check against the same pre-race ``processing``
+        snapshot, and the second UPDATE would then land on top of the
+        first transaction's terminal status — losing it silently, and
+        leaving a row that had already been cancelled claiming to be
+        ``completed`` (review of PR #583, finding f1).
+
+        Locking the row makes the loser block until the winner commits
+        and then re-read what the winner actually wrote, so it can raise
+        or stand down on the current status rather than a stale one. The
+        lock is held to the end of the caller's transaction, which is
+        what carries the guarantee across the read/write pair.
+
+        ``populate_existing`` keeps that guarantee from resting on the
+        identity map. Sessions are created with
+        ``expire_on_commit=False``, so an instance this session loaded
+        in an earlier transaction — the worker's pre-lock metadata read,
+        say — would be returned with its old attributes rather than the
+        locked row's. In practice the stores convert every row to a
+        domain object and drop the ORM instance immediately, so the
+        identity map (which holds only weak references) is usually empty
+        by the time anyone asks again; relying on that is relying on
+        garbage-collection timing for a correctness property. This asks
+        for the locked row's values outright.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(SqlBuild.id == build_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_for_update(self, *, build_id: int) -> Build | None:
+        """Fetch a build by internal ID, locking the row until commit.
+
+        The read half of a read-then-write on a build's status: it
+        returns the row as it stands *and* holds it, so the status the
+        caller branches on cannot change under it before it writes. Use
+        it wherever a decision is made from a build's status or
+        ``date_deleted`` and acted on in the same transaction; use
+        :meth:`get_by_id` for a plain look.
+
+        Returns
+        -------
+        Build or None
+            The locked build, or ``None`` if no such row exists (in
+            which case nothing is locked).
+        """
+        row = await self._load_locked(build_id)
         if row is None:
             return None
         return Build.model_validate(row)
@@ -351,10 +417,11 @@ class BuildStore:
             )
             raise ValueError(msg)
 
-        result = await self._session.execute(
-            select(SqlBuild).where(SqlBuild.id == build_id)
-        )
-        row = result.scalar_one_or_none()
+        # Locked read: the transition check below and the write that
+        # follows it have to be one atomic step, or two transactions
+        # racing to a terminal status can both pass the check and then
+        # overwrite each other. See :meth:`_load_locked`.
+        row = await self._load_locked(build_id)
         if row is None:
             raise InvalidBuildStateError(
                 target_state=new_status.value,

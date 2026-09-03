@@ -11,10 +11,13 @@ an already-terminal one with the status it earned.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+
 import pytest
 import structlog
 from safir.arq import MockArqQueue
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
@@ -31,6 +34,7 @@ from docverse_server.services.build import BuildService
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import backend_pid, wait_until_blocked_on_lock
 
 _HASH = "sha256:" + "b" * 64
 _config = Configuration()
@@ -330,3 +334,127 @@ async def test_fail_if_unfinished_leaves_cancelled_build(
         row = await store.get_by_id(build.id)
         assert row is not None
         assert row.status == BuildStatus.cancelled
+
+
+async def _seed_processing_build(db_session: AsyncSession) -> Build:
+    """Commit one ``processing`` build for the racing tests to fight over."""
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        await db_session.commit()
+    return build
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_stands_down_for_a_concurrent_completion(
+    app: None,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A DELETE that loses the race sees ``completed`` and only deletes.
+
+    ``cancel_if_unfinished`` used to decide from an unlocked snapshot, so
+    a DELETE reaching a ``processing`` build while a worker was
+    committing its completion still believed the build was unfinished.
+    It then asked for ``processing -> cancelled`` against a row that had
+    become ``completed``, and the store — which does hold the row lock —
+    raised :exc:`InvalidBuildStateError` straight out of the DELETE
+    handler, failing a request that has a perfectly good answer (review
+    of PR #583, finding f1).
+
+    Reading the row under the same lock the write needs makes the
+    decision and the write one step: the DELETE blocks, sees the status
+    the worker committed, leaves it alone, and stamps ``date_deleted``.
+    """
+    build = await _seed_processing_build(db_session)
+
+    async with (
+        db_session_factory() as worker_session,
+        db_session_factory() as delete_session,
+        db_session_factory() as probe,
+    ):
+        delete_pid = await backend_pid(delete_session)
+        worker_store = BuildStore(session=worker_session, logger=_logger())
+        # The worker completes but has not committed, so it holds the row.
+        await worker_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+
+        async def run_delete() -> None:
+            service = _build_service(delete_session)
+            await service.soft_delete(
+                org_slug="bs-org",
+                project_slug="bs-proj",
+                build_id=serialize_base32_id(build.public_id),
+            )
+            await delete_session.commit()
+
+        deleting = asyncio.ensure_future(run_delete())
+        try:
+            await wait_until_blocked_on_lock(probe, pid=delete_pid)
+            await worker_session.commit()
+            await deleting
+        finally:
+            if not deleting.done():
+                deleting.cancel()
+                with suppress(asyncio.CancelledError):
+                    await deleting
+            await delete_session.rollback()
+
+    async with db_session_factory() as reader:
+        row = await BuildStore(session=reader, logger=_logger()).get_by_id(
+            build.id
+        )
+        assert row is not None
+        # The worker's terminal status stands; the DELETE only deleted.
+        assert row.status == BuildStatus.completed
+        assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_if_unfinished_holds_the_row_against_a_completion(
+    app: None,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The other ordering: the DELETE wins and the worker stands down.
+
+    Here the DELETE's ``cancel_if_unfinished`` gets the row first and
+    holds it to commit, so the worker's completion blocks rather than
+    reading a stale ``processing``. When it wakes it sees ``cancelled``,
+    which is what makes the worker's mid-upload re-read a real guard:
+    it takes the ``_complete_cancelled_build`` path instead of writing
+    ``completed`` over the operator's deletion.
+    """
+    build = await _seed_processing_build(db_session)
+
+    async with (
+        db_session_factory() as worker_session,
+        db_session_factory() as delete_session,
+        db_session_factory() as probe,
+    ):
+        worker_pid = await backend_pid(worker_session)
+        service = _build_service(delete_session)
+        cancelled = await service.cancel_if_unfinished(build_id=build.id)
+        assert cancelled is not None
+        assert await BuildStore(
+            session=delete_session, logger=_logger()
+        ).soft_delete(build_id=build.id)
+
+        worker_store = BuildStore(session=worker_session, logger=_logger())
+        completing = asyncio.ensure_future(
+            worker_store.get_for_update(build_id=build.id)
+        )
+        try:
+            await wait_until_blocked_on_lock(probe, pid=worker_pid)
+            await delete_session.commit()
+            observed = await completing
+        finally:
+            if not completing.done():
+                completing.cancel()
+                with suppress(asyncio.CancelledError):
+                    await completing
+            await worker_session.rollback()
+
+    assert observed is not None
+    assert observed.status == BuildStatus.cancelled
+    assert observed.date_deleted is not None

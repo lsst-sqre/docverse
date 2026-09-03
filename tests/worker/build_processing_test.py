@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import tarfile
@@ -20,7 +21,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 from docverse.models import (
@@ -69,6 +70,7 @@ from tests.support.arq_testing import (
     queue_names,
 )
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.support.rowlocks import backend_pid, wait_until_blocked_or_finished
 from tests.worker.conftest import make_worker_ctx
 
 _HASH = "sha256:" + "a" * 64
@@ -2765,3 +2767,145 @@ async def test_worker_delivery_racing_the_commit_cannot_be_reaped(
             assert job is not None
             assert job.status == JobStatus.completed
             assert job.errors is None
+
+
+@pytest.mark.asyncio
+async def test_build_processing_holds_the_build_across_its_completion(
+    app: None,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DELETE arriving after the guard waits for the completion.
+
+    The worker's mid-upload guard and the completion it protects are two
+    statements in one transaction. While the guard read was unlocked, a
+    DELETE could commit its ``cancelled`` in between: the guard saw
+    ``processing`` and let the worker through, and the completion then
+    raised ``InvalidBuildStateError`` inside the very transaction that
+    still had to close the queue job out — the #575 failure mode, from
+    the other direction (review of PR #583, finding f1).
+
+    Reading the row ``FOR UPDATE`` closes that window. The DELETE parks
+    on the lock until the worker commits, then makes its own decision on
+    what the worker actually wrote: the build keeps ``completed``, the
+    queue job is completed rather than failed, and no ``cancelled`` is
+    lost under a later ``completed``.
+
+    The DELETE is driven for real, on its own committed session, from a
+    hook between the guard and the completion — the exact window under
+    test.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-delete-after-guard",
+        )
+
+    mock_store = MockObjectStore()
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    original_update_inventory = BuildStore.update_inventory
+    parked: bool | None = None
+
+    async with (
+        db_session_factory() as delete_session,
+        db_session_factory() as probe,
+    ):
+        delete_pid = await backend_pid(delete_session)
+
+        async def run_delete() -> None:
+            store = BuildStore(session=delete_session, logger=_logger())
+            existing = await store.get_for_update(build_id=build.id)
+            assert existing is not None
+            if existing.status in (
+                BuildStatus.pending,
+                BuildStatus.processing,
+            ):
+                await store.transition_status(
+                    build_id=build.id, new_status=BuildStatus.cancelled
+                )
+            assert await store.soft_delete(build_id=build.id) is True
+            await delete_session.commit()
+
+        deleting: asyncio.Future[None] | None = None
+
+        async def racing_update_inventory(
+            self: BuildStore, **kwargs: Any
+        ) -> Any:
+            nonlocal deleting, parked
+            if deleting is None:
+                deleting = asyncio.ensure_future(run_delete())
+                parked = await wait_until_blocked_or_finished(
+                    probe, pid=delete_pid, task=deleting
+                )
+            return await original_update_inventory(self, **kwargs)
+
+        monkeypatch.setattr(
+            BuildStore, "update_inventory", racing_update_inventory
+        )
+
+        ctx = make_worker_ctx(
+            http_client=httpx.AsyncClient(),
+            job_id="test-arq-delete-after-guard",
+            events=events,
+        )
+        payload: dict[str, Any] = {
+            "org_id": org.id,
+            "org_slug": org.slug,
+            "project_slug": project.slug,
+            "build_id": build.id,
+            "build_public_id": serialize_base32_id(build.public_id),
+        }
+        try:
+            result = await build_processing(ctx, payload)
+        finally:
+            await ctx["http_client"].aclose()
+            if deleting is not None:
+                await deleting
+            await delete_session.rollback()
+
+    # The DELETE really did have to wait for the worker's lock.
+    assert parked is True
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-delete-after-guard"
+            )
+            assert job is not None
+            # Not ``failed``: nothing raised inside the completion.
+            assert job.status == JobStatus.completed
+
+            store = BuildStore(session=session, logger=_logger())
+            refreshed = await store.get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.completed
+            assert refreshed.object_count == 1
+            # The DELETE still took effect; it just did not rewrite the
+            # status the worker had already earned.
+            assert refreshed.date_deleted is not None
+        break

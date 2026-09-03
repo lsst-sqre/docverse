@@ -289,13 +289,18 @@ class BuildService:
         deleting a ``completed`` or ``failed`` build still raises,
         because those rows keep the status they earned.
 
+        The idempotency read takes the row lock the transition itself
+        needs, so "is it already cancelled?" is answered from the row as
+        it stands rather than from a snapshot a concurrent worker may
+        already have moved past.
+
         Raises
         ------
         InvalidBuildStateError
             If the build is not found, or is in a terminal status other
             than ``cancelled``.
         """
-        existing = await self._store.get_by_id(build_id)
+        existing = await self._store.get_for_update(build_id=build_id)
         if existing is not None and existing.status == BuildStatus.cancelled:
             return existing
         build = await self._store.transition_status(
@@ -329,7 +334,15 @@ class BuildService:
 
         The status is re-read here rather than trusted from the caller's
         snapshot, because a lifecycle tick evaluates rules against rows
-        it loaded earlier in the run.
+        it loaded earlier in the run. It is re-read *under the row lock*
+        because the answer decides what gets written next: a worker
+        committing a completion between an unlocked read and the cancel
+        would leave this asking for a transition the row can no longer
+        make, and :exc:`InvalidBuildStateError` would come out of a
+        DELETE that has a perfectly good answer — leave the earned
+        status alone and soft-delete. Holding the lock to the end of the
+        caller's transaction also means a worker racing the other way
+        blocks and sees ``cancelled``.
 
         Returns
         -------
@@ -337,7 +350,7 @@ class BuildService:
             The cancelled build, or ``None`` when the row had already
             finished (or vanished) and was left as it stands.
         """
-        existing = await self._store.get_by_id(build_id)
+        existing = await self._store.get_for_update(build_id=build_id)
         if existing is None or existing.status not in _UNFINISHED_STATUSES:
             return None
         return await self.cancel(
@@ -364,6 +377,12 @@ class BuildService:
         leaving the job stranded ``in_progress`` — the state this whole
         change set exists to remove.
 
+        The read is locked for the same reason
+        :meth:`cancel_if_unfinished`'s is: the status it returns decides
+        whether a write happens at all, and an unlocked one could be
+        stale by the time :meth:`fail` acted on it — which would raise
+        the very error this method exists to avoid.
+
         Returns
         -------
         Build or None
@@ -371,7 +390,7 @@ class BuildService:
             reached a terminal status (or vanished) and keeps the status
             it earned.
         """
-        existing = await self._store.get_by_id(build_id)
+        existing = await self._store.get_for_update(build_id=build_id)
         if existing is None or existing.status not in _UNFINISHED_STATUSES:
             self._logger.info(
                 "Build already terminal; leaving its status as it stands",

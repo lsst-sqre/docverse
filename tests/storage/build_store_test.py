@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,6 +34,7 @@ from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import backend_pid, wait_until_blocked_on_lock
 
 
 @pytest.fixture
@@ -1031,3 +1033,93 @@ async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
         assert row is not None
         # The cancel that won the race stands; the sweep left it alone.
         assert row.status == BuildStatus.cancelled
+
+
+async def _seed_processing_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> Build:
+    """Commit one ``processing`` build for the racing tests to fight over."""
+    async with db_session.begin():
+        _org_id, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        build = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await db_session.commit()
+    return build
+
+
+@pytest.mark.asyncio
+async def test_transition_status_cannot_overwrite_a_committed_terminal(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    build_store: BuildStore,
+) -> None:
+    """A loser of the terminal-write race raises rather than overwriting.
+
+    Two transactions reach the same ``processing`` build: a worker
+    completing it and a DELETE cancelling it. Both used to read the
+    status on their own snapshot and then write, so under PostgreSQL's
+    READ COMMITTED default each could pass ``_VALID_TRANSITIONS`` against
+    the same pre-race ``processing`` and the second UPDATE would land on
+    top of the first transaction's terminal status — losing it silently
+    (review of PR #583, finding f1).
+
+    The check and the write are one atomic step now, so the second
+    transaction blocks on the row lock, re-reads the status the winner
+    committed, and raises :exc:`InvalidBuildStateError` naming it.
+    """
+    build = await _seed_processing_build(db_session, build_store)
+    logger = structlog.get_logger("docverse")
+
+    async with (
+        db_session_factory() as worker_session,
+        db_session_factory() as delete_session,
+        db_session_factory() as probe,
+    ):
+        delete_pid = await backend_pid(delete_session)
+        worker_store = BuildStore(session=worker_session, logger=logger)
+        delete_store = BuildStore(session=delete_session, logger=logger)
+
+        # The worker completes the build but has not committed, so it
+        # holds the row and nothing else can see the new status yet.
+        await worker_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+
+        cancelling = asyncio.ensure_future(
+            delete_store.transition_status(
+                build_id=build.id, new_status=BuildStatus.cancelled
+            )
+        )
+        try:
+            await wait_until_blocked_on_lock(probe, pid=delete_pid)
+            await worker_session.commit()
+            with pytest.raises(InvalidBuildStateError) as excinfo:
+                await cancelling
+        finally:
+            if not cancelling.done():
+                cancelling.cancel()
+            # Retrieve the outcome either way, so a task that finished
+            # cannot leave an unretrieved exception behind.
+            with suppress(asyncio.CancelledError, InvalidBuildStateError):
+                await cancelling
+            await delete_session.rollback()
+
+    assert excinfo.value.current_state == BuildStatus.completed.value
+    assert excinfo.value.target_state == BuildStatus.cancelled.value
+    assert excinfo.value.build_public_id == serialize_base32_id(
+        build.public_id
+    )
+
+    async with db_session_factory() as reader:
+        row = await reader.get(SqlBuild, build.id)
+        assert row is not None
+        assert row.status == BuildStatus.completed
+        assert row.date_completed is not None
