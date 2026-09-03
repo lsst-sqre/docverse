@@ -846,7 +846,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8" },
-    { name = "httpx", specifier = ">=0.25" },
+    { name = "httpx", specifier = ">=0.26" },
     { name = "pydantic", specifier = ">=2.5" },
 ]
 
