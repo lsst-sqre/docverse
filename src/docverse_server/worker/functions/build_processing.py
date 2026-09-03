@@ -959,6 +959,21 @@ async def _track_editions(
 ) -> EditionTrackingResult | None:
     """Evaluate edition tracking rules for a completed build.
 
+    Re-reads the build before tracking it, because the row can go
+    terminal between the worker's completion write and this call: a
+    DELETE takes no BUILD_PROCESSING lock, and
+    :meth:`BuildStore.transition_status` is a plain read-then-write, so
+    either UPDATE can be the one that survives. A row that came out of
+    that race soft-deleted, or carrying any status but ``completed``, is
+    one nobody should publish — and ``get_by_id`` does not filter
+    ``date_deleted``, so tracking would otherwise move the edition
+    pointer onto it and enqueue a ``publish_edition`` job for a build
+    that will never be served.
+
+    Such a build is skipped rather than treated as an error: an empty
+    result (not ``None``) so the caller closes the queue job out
+    normally, since nothing about this run failed.
+
     Returns the tracking result, or ``None`` if tracking failed.
     """
     if queue_job_id is not None:
@@ -973,11 +988,22 @@ async def _track_editions(
 
     try:
         async with session.begin():
-            tracking_service = factory.create_edition_tracking_service()
             build = await build_store.get_by_id(build_id)
             if build is None:
                 msg = f"Build {build_id} vanished after completion"
                 raise RuntimeError(msg)
+            deleted = build.date_deleted is not None
+            if deleted or build.status is not BuildStatus.completed:
+                logger.info(
+                    "Skipping edition tracking for a retired build",
+                    build_id=build_id,
+                    build_status=build.status.value,
+                    deleted=deleted,
+                )
+                return EditionTrackingResult(
+                    derived_slug=None, suppressed=False
+                )
+            tracking_service = factory.create_edition_tracking_service()
             tracking_result = await tracking_service.track_build(build)
         logger.info(
             "Edition tracking complete",

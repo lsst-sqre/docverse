@@ -6,7 +6,9 @@ import hashlib
 import io
 import tarfile
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from types import TracebackType
 from typing import Any
 
 import httpx
@@ -32,6 +34,7 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -1627,6 +1630,312 @@ async def test_build_processing_build_deleted_mid_upload(
             )
             assert edition is not None
             assert edition.current_build_id is None
+        break
+
+
+async def _soft_delete_only(build_id: int) -> None:
+    """Stamp ``date_deleted`` on a build without touching its status.
+
+    Reproduces one half of review finding f1: the DELETE's UPDATE won the
+    row lock while the build was still ``processing``, so the worker's
+    later ``completed`` UPDATE overwrote the ``cancelled`` it had
+    written. What survives is a row that is both ``completed`` and
+    soft-deleted, which ``BuildStore.get_by_id`` happily returns.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = BuildStore(session=session, logger=_logger())
+            assert await store.soft_delete(build_id=build_id) is True
+        break
+
+
+async def _force_status(build_id: int, status: BuildStatus) -> None:
+    """Write a status straight onto a build row, bypassing the guard.
+
+    The other ordering of the same race: the DELETE read the row while it
+    was still ``processing``, validated ``processing -> cancelled``, and
+    wrote ``cancelled`` over the ``completed`` the worker had just
+    committed. ``BuildStore.transition_status`` refuses that transition
+    from ``completed``, so the test writes the row directly. Closing the
+    read-then-write window itself is the sibling f1b task; this task only
+    stops the consequence.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlBuild)
+                .where(SqlBuild.id == build_id)
+                .values(status=status)
+            )
+        break
+
+
+class _PostCompletionMockObjectStore(MockObjectStore):
+    """``MockObjectStore`` that fires a callback once the worker releases it.
+
+    ``_process_build`` runs inside ``async with object_store,
+    session.begin()``, and the inner context manager exits first, so the
+    session has already committed the build's ``completed`` transition by
+    the time this store's ``__aexit__`` runs — and ``_track_editions``
+    re-reads the build only afterwards. Awaiting the injected callback
+    here therefore lands a competing committed write in exactly the
+    window review finding f1 describes.
+    """
+
+    def __init__(self, on_release: Callable[[], Awaitable[None]]) -> None:
+        super().__init__()
+        self._on_release = on_release
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await super().__aexit__(exc_type, exc_val, exc_tb)
+        await self._on_release()
+
+
+@pytest.mark.asyncio
+async def test_build_processing_skips_tracking_for_deleted_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DELETE landing after completion keeps the edition pointer put.
+
+    ``BuildStore.transition_status`` is a plain read-then-write, so a
+    DELETE racing the worker can leave a row that is both ``completed``
+    and soft-deleted. ``_track_editions`` re-reads through
+    ``get_by_id``, which does not filter ``date_deleted``, so without a
+    guard it would move the edition onto a build the operator asked us to
+    drop and enqueue a ``publish_edition`` job for it. Tracking must skip
+    instead, while the queue job still completes normally.
+    """
+    logger = _logger()
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        # Pre-create the edition with no current_build so the assertion
+        # below distinguishes "never moved" from "moved and moved back".
+        edition_store = EditionStore(session=db_session, logger=logger)
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Main",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-deleted-after-completion",
+        )
+
+    build_id = build.id
+
+    async def _delete_after_completion() -> None:
+        await _soft_delete_only(build_id)
+
+    mock_store = _PostCompletionMockObjectStore(_delete_after_completion)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-arq-deleted-after-completion",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    with capture_logs() as captured:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    skips = [
+        event
+        for event in captured
+        if event["event"] == "Skipping edition tracking for a retired build"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["build_id"] == build.id
+    assert skips[0]["build_status"] == BuildStatus.completed.value
+    assert skips[0]["deleted"] is True
+
+    # Nothing to publish: the build will never be served.
+    assert (
+        count_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == 0
+    )
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            # The edition pointer was never moved onto the dead build.
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.current_build_id is None
+
+            # The job still closes out cleanly — the skip is not an error.
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-deleted-after-completion"
+            )
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("editions_updated") == []
+            assert job.progress.get("edition_tracking_error") is None
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_skips_tracking_for_non_completed_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status overwritten out from under the worker also stops tracking.
+
+    The mirror ordering of review finding f1: the racing DELETE's UPDATE
+    lands *after* the worker's, leaving the row ``cancelled`` with no
+    ``date_deleted`` yet visible. ``_track_editions`` must refuse to
+    publish anything but a ``completed`` build, so the status check
+    guards this case on its own.
+    """
+    logger = _logger()
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        edition_store = EditionStore(session=db_session, logger=logger)
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="main",
+                title="Main",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-cancelled-after-completion",
+        )
+
+    build_id = build.id
+
+    async def _cancel_after_completion() -> None:
+        await _force_status(build_id, BuildStatus.cancelled)
+
+    mock_store = _PostCompletionMockObjectStore(_cancel_after_completion)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-arq-cancelled-after-completion",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    with capture_logs() as captured:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+
+    skips = [
+        event
+        for event in captured
+        if event["event"] == "Skipping edition tracking for a retired build"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["build_id"] == build.id
+    assert skips[0]["build_status"] == BuildStatus.cancelled.value
+    assert skips[0]["deleted"] is False
+
+    assert (
+        count_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == 0
+    )
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_slug(
+                project_id=project.id, slug="main"
+            )
+            assert edition is not None
+            assert edition.current_build_id is None
+
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(
+                "test-arq-cancelled-after-completion"
+            )
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress.get("editions_updated") == []
+            assert job.progress.get("edition_tracking_error") is None
         break
 
 
