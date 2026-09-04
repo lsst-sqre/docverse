@@ -336,6 +336,58 @@ async def test_fail_if_unfinished_leaves_cancelled_build(
         assert row.status == BuildStatus.cancelled
 
 
+@pytest.mark.asyncio
+async def test_supersede_if_unfinished_supersedes_processing_build(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A live build a newer one took over still lands on ``superseded``."""
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        service = _build_service(db_session)
+        superseded = await service.supersede_if_unfinished(build_id=build.id)
+        await db_session.commit()
+
+    assert superseded is not None
+    assert superseded.status == BuildStatus.superseded
+    assert superseded.date_completed is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        BuildStatus.completed,
+        BuildStatus.failed,
+        BuildStatus.superseded,
+        BuildStatus.cancelled,
+    ],
+)
+@pytest.mark.asyncio
+async def test_supersede_if_unfinished_leaves_terminal_build(
+    app: None,
+    db_session: AsyncSession,
+    status: BuildStatus,
+) -> None:
+    """A finished build keeps its status instead of raising.
+
+    The ``build_processing`` stale guard reads the latest live build id
+    for the ref outside the transaction that skips this one, so a DELETE
+    or a lifecycle reap can retire the row in between. ``supersede``
+    would then ask for an edge out of a terminal status, and
+    :exc:`InvalidBuildStateError` would escape the worker (#590).
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=status)
+        service = _build_service(db_session)
+        assert await service.supersede_if_unfinished(build_id=build.id) is None
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        row = await store.get_by_id(build.id)
+        assert row is not None
+        assert row.status == status
+
+
 async def _seed_processing_build(db_session: AsyncSession) -> Build:
     """Commit one ``processing`` build for the racing tests to fight over."""
     async with db_session.begin():

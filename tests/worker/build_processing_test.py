@@ -1166,6 +1166,149 @@ async def test_build_processing_skips_stale_build(
             assert refreshed_older.date_completed is not None
 
 
+def _retire_between_guard_and_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    build_id: int,
+    status: BuildStatus,
+) -> None:
+    """Retire a build in the window the stale guard leaves open.
+
+    The guard's re-read is deliberately unlocked, and its transaction
+    commits before ``_mark_stale_skipped`` opens the one that writes the
+    skip — so anything retiring the build in between is invisible to the
+    verdict but plainly visible to the write it gates. Hooking the last
+    read of that transaction, the latest-live-id lookup, drops an
+    independently committed retirement into exactly that window.
+    """
+    original = BuildStore.get_latest_build_id_for_ref
+
+    async def patched(
+        self: BuildStore, *, project_id: int, git_ref: str
+    ) -> int | None:
+        latest = await original(self, project_id=project_id, git_ref=git_ref)
+        await _retire_build(build_id, status)
+        return latest
+
+    monkeypatch.setattr(BuildStore, "get_latest_build_id_for_ref", patched)
+
+
+@pytest.mark.parametrize(
+    ("retired_status", "expected_flags"),
+    [
+        (BuildStatus.cancelled, {"deleted_skipped": True}),
+        (BuildStatus.failed, {}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_build_processing_stale_build_retired_before_skip(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    retired_status: BuildStatus,
+    expected_flags: dict[str, Any],
+) -> None:
+    """A build retired under the stale guard closes out instead of raising.
+
+    The guard's verdict and the skip that acts on it are in different
+    transactions, so a ``DELETE`` or a lifecycle reap (``cancelled``) or
+    the stranded-build sweep (``failed``) can commit a terminal status
+    in between. The strict ``supersede`` then asked for an edge the row
+    no longer had: ``InvalidBuildStateError`` rolled back the very
+    transaction that completes the queue job, escaped as a Sentry event,
+    and arq retried — and for the lifecycle cancel, which stamps no
+    ``date_deleted``, every retry re-entered the same guard and raised
+    again until the retries ran out, leaving the job ``queued`` (#590).
+
+    Now the skip stands down: the retirement stands, the job completes
+    carrying the status that was found, and no exception escapes.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+    _manager, events = await build_event_manager(Configuration())
+    job_id = f"test-arq-stale-retired-{retired_status.value}"
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        older_build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=older_build.id,
+            backend_job_id=job_id,
+        )
+
+    _retire_between_guard_and_skip(
+        monkeypatch, build_id=older_build.id, status=retired_status
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id=job_id,
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": older_build.id,
+        "build_public_id": serialize_base32_id(older_build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    # No exception escaped, and the run still reports a deliberate skip.
+    assert result == "completed"
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].success is True
+    assert publisher.published[0].stale_skipped is True
+
+    # The guard short-circuits before any object-store interaction.
+    assert mock_store.objects == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id(job_id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            # The retired-build progress, not the stale-skip progress:
+            # the build was not superseded, so claiming it was would
+            # misreport what happened to it. ``cancelled`` keeps the
+            # ``deleted_skipped`` flag the DELETE path established;
+            # ``failed`` is told apart by ``retired_status`` alone.
+            assert job.progress.get("retired_status") == retired_status.value
+            assert {
+                key: job.progress[key]
+                for key in ("deleted_skipped", "stale_skipped")
+                if key in job.progress
+            } == expected_flags
+
+            # Whoever retired the build wins; the skip leaves it alone.
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(older_build.id)
+            assert refreshed is not None
+            assert refreshed.status == retired_status
+            assert refreshed.date_deleted is None
+        break
+
+
 @pytest.mark.asyncio
 async def test_build_processing_deleted_superseder_publishes(
     app: None,

@@ -109,6 +109,23 @@ class _StaleGuardOutcome(Enum):
     new field for a distinction nobody queries on.
     """
 
+    retired_before_skip = auto()
+    """The build was retired between the stale verdict and the skip.
+
+    The stale guard's re-read is deliberately unlocked and commits
+    before :func:`_mark_stale_skipped` opens the transaction that acts
+    on its verdict, so a DELETE, a lifecycle reap or the stranded-build
+    sweep can write a terminal status in that window. The skip stands
+    down rather than asking for an edge out of ``cancelled`` or
+    ``failed``, and closes the queue job out naming the status it found
+    (#590).
+
+    Reported like the other recorded skips — the job completes and the
+    metric carries ``stale_skipped=True`` — because the build really was
+    retired deliberately; only the *reason* differs from a supersession,
+    and the queue job's progress is where that is recorded.
+    """
+
     retired_mid_upload = auto()
     """The build stopped being ``processing`` while its files uploaded.
 
@@ -280,7 +297,8 @@ def _stale_guard_result(
 ) -> tuple[str, _BuildProcessedOutcome | None]:
     """Map a terminal guard verdict to (arq result, metrics).
 
-    A recorded skip — stale, deleted, or retired mid-upload — is a
+    A recorded skip — stale, deleted, or retired before the skip or
+    mid-upload — is a
     success the operator should see in ``build_processed``; they all
     report the same ``stale_skipped=True`` shape, since the event
     distinguishes "did no work on purpose" from "failed", not the
@@ -587,6 +605,23 @@ async def _mark_stale_skipped(
     on the build and no job left to run, ``processing`` was a lie no
     later path would correct.
 
+    The transition goes through
+    :meth:`BuildService.supersede_if_unfinished` rather than the strict
+    :meth:`~BuildService.supersede`, because the verdict this acts on
+    was reached in a *different*, deliberately unlocked transaction
+    (:func:`_guard_stale_build`) that has already committed. A DELETE, a
+    lifecycle reap or the stranded-build sweep committing in that window
+    leaves no edge out of the status it wrote, and the strict call would
+    raise :exc:`InvalidBuildStateError` out of the transaction that has
+    to complete the queue job: a Sentry event, a rolled-back job left
+    ``queued``, and — for a lifecycle cancel, which stamps no
+    ``date_deleted`` for the deleted-skip guard to catch — an arq retry
+    that re-enters here and raises all over again (#590). When it stands
+    down, the job is closed out with the retired-build progress instead,
+    naming the status that was actually found; the follow-up read is
+    safe because ``supersede_if_unfinished`` took the row lock and this
+    transaction still holds it.
+
     The pickup guard runs before any of that, and a row it refuses
     (task #551) short-circuits to ``late_delivery`` with nothing written
     and nothing logged as skipped: the row is terminal or in another
@@ -599,33 +634,48 @@ async def _mark_stale_skipped(
         pickup = await _start_queue_job(ctx, payload, queue_job_store)
         if pickup.skipped:
             return _StaleGuardOutcome.late_delivery
-        logger.info(
-            "Stale build skipped",
-            build_id=build_id,
-            latest_build_id=latest_build_id,
-        )
         build_service = factory.create_build_service()
-        await build_service.supersede(
+        superseded = await build_service.supersede_if_unfinished(
             build_id=build_id,
             org_slug=org_slug,
             project_slug=project_slug,
         )
+        if superseded is None:
+            build_store = factory.create_build_store()
+            retired = await build_store.get_by_id(build_id)
+            status = retired.status if retired is not None else None
+            logger.info(
+                "Build retired before its stale skip; closing its job out",
+                build_id=build_id,
+                latest_build_id=latest_build_id,
+                build_status=status.value if status is not None else None,
+            )
+            outcome = _StaleGuardOutcome.retired_before_skip
+            progress = _retired_build_progress(status)
+        else:
+            logger.info(
+                "Stale build skipped",
+                build_id=build_id,
+                latest_build_id=latest_build_id,
+            )
+            outcome = _StaleGuardOutcome.stale_skipped
+            progress = {
+                "message": (
+                    "Stale build skipped; superseded by "
+                    f"build id {latest_build_id}"
+                ),
+                "stale_skipped": True,
+                "latest_build_id": latest_build_id,
+            }
         if pickup.queue_job_id is not None:
             queue_job_id = pickup.queue_job_id
             await queue_job_store.update_phase(
                 queue_job_id,
                 "complete",
-                progress={
-                    "message": (
-                        "Stale build skipped; superseded by "
-                        f"build id {latest_build_id}"
-                    ),
-                    "stale_skipped": True,
-                    "latest_build_id": latest_build_id,
-                },
+                progress=progress,
             )
             await queue_job_store.complete(queue_job_id)
-    return _StaleGuardOutcome.stale_skipped
+    return outcome
 
 
 async def _mark_deleted_skipped(
@@ -682,7 +732,12 @@ async def _mark_deleted_skipped(
 
 
 def _retired_build_progress(status: BuildStatus | None) -> dict[str, Any]:
-    """Describe a mid-upload retirement for the queue job's progress.
+    """Describe a build retired underneath the worker, for its job.
+
+    Shared by the two paths that find somebody else has already written
+    a terminal status: :func:`_close_out_retired_build`, once the files
+    are uploaded, and :func:`_mark_stale_skipped`, when the retirement
+    lands between the stale verdict and the skip that acts on it.
 
     Every case names the status that was actually found, both in the
     human-readable message and in ``retired_status``, so an operator

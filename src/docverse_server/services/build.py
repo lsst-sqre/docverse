@@ -404,6 +404,62 @@ class BuildService:
             project_slug=project_slug,
         )
 
+    async def supersede_if_unfinished(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build | None:
+        """Supersede a build unless it already finished.
+
+        The stale-skip half of the same idea as
+        :meth:`cancel_if_unfinished` and :meth:`fail_if_unfinished`, for
+        the ``build_processing`` stale guard. That guard decides a build
+        is superseded from a *deliberately unlocked* re-read whose
+        transaction commits before the skip runs, so a ``DELETE`` or a
+        lifecycle reap can retire the row in the window between the two.
+        The strict :meth:`supersede` would then ask for an edge out of
+        ``cancelled``, and :exc:`InvalidBuildStateError` would roll back
+        the transaction that has to complete the queue job and escape
+        the worker as a Sentry event plus arq retries — retries that
+        re-enter the same guard and raise again, because a lifecycle
+        cancel leaves no ``date_deleted`` for the deleted-skip path to
+        catch (#590).
+
+        The read is locked for the same reason its siblings' are: the
+        status it returns decides whether a write happens at all, so it
+        has to be the status as the row stands, not a snapshot a
+        concurrent writer may already have moved past.
+
+        Only ``processing`` builds actually reach this: a build's job is
+        enqueued by :meth:`signal_upload_complete`, which transitions it
+        out of ``pending`` first. A ``pending`` build is still
+        *unfinished*, so it is passed through to :meth:`supersede`,
+        which reports the missing ``pending -> superseded`` edge rather
+        than silently leaving a live build stranded.
+
+        Returns
+        -------
+        Build or None
+            The superseded build, or ``None`` when the row had already
+            reached a terminal status (or vanished) and keeps the status
+            it earned.
+        """
+        existing = await self._store.get_for_update(build_id=build_id)
+        if existing is None or existing.status not in _UNFINISHED_STATUSES:
+            self._logger.info(
+                "Build already terminal; leaving its status as it stands",
+                build_id=build_id,
+                status=existing.status.value if existing is not None else None,
+            )
+            return None
+        return await self.supersede(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+
     async def soft_delete(
         self,
         *,
