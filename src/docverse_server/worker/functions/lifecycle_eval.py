@@ -48,6 +48,7 @@ from docverse_server.metrics import (
     LifecycleActionTrigger,
     LifecycleReapAction,
 )
+from docverse_server.services.build import BuildService
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -65,7 +66,6 @@ from docverse_server.services.lifecycle.evaluator import (
 from docverse_server.services.lifecycle_finalisation import (
     maybe_finalise_lifecycle_run,
 )
-from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.keeper_sync import TombstoneReason
 
 __all__ = ["lifecycle_eval"]
@@ -252,12 +252,12 @@ async def _evaluate_org(
 
     async with session.begin():
         edition_service = factory.create_edition_service()
-        build_store = factory.create_build_store()
+        build_service = factory.create_build_service()
         publishing_service = factory.create_edition_publishing_service()
         for project, rule_set, decision in decisions:
             editions_deleted = await _apply_decision(
                 edition_service=edition_service,
-                build_store=build_store,
+                build_service=build_service,
                 publishing_service=publishing_service,
                 project=project,
                 rule_set=rule_set,
@@ -375,7 +375,7 @@ def _index_builds_by_id(
 async def _apply_decision(
     *,
     edition_service: EditionService,
-    build_store: BuildStore,
+    build_service: BuildService,
     publishing_service: EditionPublishingService,
     project: Project,
     rule_set: LifecycleRuleSet,
@@ -388,6 +388,10 @@ async def _apply_decision(
     logger: structlog.stdlib.BoundLogger,
 ) -> int:
     """Soft-delete every entity the decision matched and emit one log per row.
+
+    A matched build that has not finished is cancelled on its way out,
+    the same retirement a DELETE performs, so a reaped row never stays
+    deleted while still claiming to be waiting for or held by a worker.
 
     The structured log line is the v1 audit trail (persistent
     ``delete_reason`` columns are deferred to DM-54914 per the PRD).
@@ -460,7 +464,15 @@ async def _apply_decision(
             continue
         rule_type = decision.build_matches[build_id]
         rule = rules_by_type.get(rule_type)
-        deleted = await build_store.soft_delete(build_id=build.id)
+        # Retire before deleting, exactly as a DELETE does — which is
+        # why this goes through the service rather than the store: the
+        # pairing lives in one place, and the reasons it has to hold are
+        # documented there.
+        deleted = await build_service.soft_delete_by_id(
+            build_id=build.id,
+            org_slug=org_slug,
+            project_slug=project.slug,
+        )
         if not deleted:
             continue
         reaps.append(

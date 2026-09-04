@@ -13,6 +13,7 @@ import io
 import mimetypes
 import tarfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
@@ -28,12 +29,15 @@ from docverse.models import (
     BuildStatus,
     EditionUpdateRef,
     PublishJobRef,
+    RetiredBuildStatus,
 )
 from docverse_server.domain.api_urls import edition_url, job_url
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import hash_manifest_pairs
 from docverse_server.domain.edition_tracking import EditionTrackingResult
-from docverse_server.exceptions import NotFoundError
+from docverse_server.domain.queue import JobStatus
+from docverse_server.exceptions import InvalidBuildStateError, NotFoundError
 from docverse_server.factory import Factory
 from docverse_server.metrics import BuildProcessedEvent
 from docverse_server.services.lock_service import LockKey
@@ -47,6 +51,24 @@ from docverse_server.storage.queue_job_store import QueueJobStore
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
+
+#: Statuses a *retirement* can leave on a build the worker is uploading
+#: for. A DELETE cancels it, the stranded-build sweep fails it, a
+#: supersession retires it — every one of them a deliberate decision by
+#: another actor that this build must not be published. Finding one of
+#: these mid-upload is the normal, quiet close-out path
+#: (:func:`_close_out_retired_build`); finding anything else that is not
+#: ``processing`` is a bug, and raises.
+#:
+#: Derived from :class:`~docverse.models.BuildStatus`'s partition — the
+#: terminal half less ``completed``, which no other actor writes onto a
+#: build this worker is uploading for — so a terminal status added to
+#: the enum is treated as the retirement it is rather than raising.
+_RETIRED_BUILD_STATUSES: frozenset[BuildStatus] = frozenset(
+    status
+    for status in BuildStatus
+    if status.is_terminal and status is not BuildStatus.completed
+)
 
 
 @dataclass(slots=True)
@@ -67,10 +89,20 @@ class _BuildProcessedOutcome:
 
 
 class _StaleGuardOutcome(Enum):
-    """How the stale-build guard resolved one ``build_processing`` job."""
+    """How the pickup guards resolved one ``build_processing`` job.
+
+    Three reasons stop a build before any work happens — it was
+    superseded, it was deleted, or its row is gone — and all of them
+    leave the same trace for the caller: ``"completed"`` plus a
+    ``build_processed(success=True, stale_skipped=True)`` metric (see
+    :func:`_stale_guard_result`). They stay separate members because the
+    bookkeeping they write differs: distinct progress keys, distinct log
+    lines, and a different terminal status on the build itself — or, for
+    a row that has vanished, none at all.
+    """
 
     not_stale = auto()
-    """This build is the newest for its ``(project, git_ref)``: run it."""
+    """This build is live and the newest for its ``(project, git_ref)``."""
 
     stale_skipped = auto()
     """Superseded by a newer build, and the skip was recorded.
@@ -79,6 +111,80 @@ class _StaleGuardOutcome(Enum):
     and marked ``completed`` with ``stale_skipped``, and a delivery with
     no ``queue_jobs`` row at all. The build really is superseded either
     way, so the run reports a stale-skipped success.
+    """
+
+    deleted_skipped = auto()
+    """The build was soft-deleted, and was cancelled instead of published.
+
+    The pre-work guard's verdict: the DELETE landed before the job ran,
+    so :func:`_mark_deleted_skipped` retires the build itself. A DELETE
+    that lands mid-upload reports :attr:`retired_mid_upload` instead —
+    by then the cancel has already been written by somebody else, and it
+    is only one of several ways the row can go terminal underneath a
+    running upload.
+
+    Recorded like a stale skip — the job completes, carrying
+    ``deleted_skipped`` instead of ``stale_skipped`` — because the two
+    are the same kind of event to an operator: a build that will never
+    be published, retired deliberately rather than in error. The metric
+    reuses ``stale_skipped=True`` so ``BuildProcessedEvent`` needs no
+    new field for a distinction nobody queries on.
+    """
+
+    vanished_before_work = auto()
+    """The build row was gone by the time the pre-work guard re-read it.
+
+    The pre-lock read that supplies the lock key found the row, and the
+    guard's re-read — which exists to see writes that landed after it —
+    did not: a purge removed it, or an operator cleared it. The whole
+    point of re-reading before any storage work is to stop here, so this
+    verdict does no download, no unpack and no upload; it closes the
+    queue job out with the same missing-row progress
+    :func:`_close_out_retired_build` writes for a row that vanishes
+    mid-upload.
+
+    It needs its own path rather than folding into
+    :attr:`deleted_skipped`, whose :func:`_mark_deleted_skipped` would
+    raise :exc:`~docverse_server.exceptions.InvalidBuildStateError` out
+    of its own cancel on a row that no longer exists.
+
+    Reported like the other recorded skips — ``completed`` plus
+    ``stale_skipped=True`` — because nothing failed: there is simply no
+    build left to process.
+    """
+
+    retired_before_skip = auto()
+    """The build was retired between the stale verdict and the skip.
+
+    The stale guard's re-read is deliberately unlocked and commits
+    before :func:`_mark_stale_skipped` opens the transaction that acts
+    on its verdict, so a DELETE, a lifecycle reap or the stranded-build
+    sweep can write a terminal status in that window. The skip stands
+    down rather than asking for an edge out of ``cancelled`` or
+    ``failed``, and closes the queue job out naming the status it found
+    (#590).
+
+    Reported like the other recorded skips — the job completes and the
+    metric carries ``stale_skipped=True`` — because the build really was
+    retired deliberately; only the *reason* differs from a supersession,
+    and the queue job's progress is where that is recorded.
+    """
+
+    retired_mid_upload = auto()
+    """The build stopped being ``processing`` while its files uploaded.
+
+    The uploads run outside the transaction that would complete the
+    build, so anyone holding a different opinion about the row can commit
+    while they are in flight: a DELETE cancels it, the stranded-build
+    sweep fails it, a supersession retires it, or a purge removes the row
+    outright. Whoever wrote that verdict wins — this delivery re-reads
+    the row before writing anything terminal, and closes its queue job
+    out quietly (:func:`_close_out_retired_build`) rather than completing
+    a build somebody already retired.
+
+    Reported like the other recorded skips: the job completes and the
+    metric carries ``stale_skipped=True``, because a deliberate
+    retirement is work deliberately not done, not a crash.
     """
 
     late_delivery = auto()
@@ -103,6 +209,29 @@ class _QueueJobPickup:
     Covers both non-``queued`` cases the guard reports — terminal because
     a reaper failed the row, or ``in_progress`` because arq re-delivered
     the job — since the body must be skipped either way.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _MidUploadRetirement:
+    """The build was no longer ``processing`` when the uploads finished.
+
+    :func:`_process_build` returns this instead of an inventory when its
+    pre-completion re-read finds somebody else has already retired the
+    row, so the caller can close the queue job out quietly and name the
+    status that was found.
+    """
+
+    status: BuildStatus | None
+    """The status the re-read found, or ``None`` when the row was gone."""
+
+    deleted: bool = False
+    """True when the re-read found ``date_deleted`` stamped on the row.
+
+    Independent of :attr:`status`, because the two are written by
+    different statements: ``BuildStore.soft_delete`` stamps the timestamp
+    and ``BuildService.soft_delete`` cancels the row alongside it, so a
+    row can be deleted while still reading ``processing``.
     """
 
 
@@ -166,10 +295,13 @@ async def build_processing(
                 session=session,
                 ctx=ctx,
                 payload=payload,
+                factory=factory,
                 build_store=build_store,
                 queue_job_store=queue_job_store,
                 build=build,
                 build_id=build_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
                 logger=logger,
             )
             if stale_guard is _StaleGuardOutcome.not_stale:
@@ -216,13 +348,18 @@ async def build_processing(
 def _stale_guard_result(
     guard: _StaleGuardOutcome,
 ) -> tuple[str, _BuildProcessedOutcome | None]:
-    """Map a terminal stale-guard verdict to (arq result, metrics).
+    """Map a terminal guard verdict to (arq result, metrics).
 
-    A recorded stale skip is a success the operator should see in
-    ``build_processed``. A late delivery is not: the row is terminal or
-    owned by another worker, so it reports ``"skipped"`` and no metric —
-    the same "a skipped queue job produces no outcome" rule
-    :func:`_process_build_locked` follows for the non-stale path.
+    A recorded skip — stale, deleted, vanished, or retired before the
+    skip or mid-upload — is a
+    success the operator should see in ``build_processed``; they all
+    report the same ``stale_skipped=True`` shape, since the event
+    distinguishes "did no work on purpose" from "failed", not the
+    reasons for it. A late
+    delivery is neither: the row is terminal or owned by another worker,
+    so it reports ``"skipped"`` and no metric — the same "a skipped
+    queue job produces no outcome" rule :func:`_process_build_locked`
+    follows for the non-stale path.
     """
     if guard is _StaleGuardOutcome.late_delivery:
         return "skipped", None
@@ -268,26 +405,77 @@ async def _guard_stale_build(
     session: AsyncSession,
     ctx: dict[str, Any],
     payload: dict[str, Any],
+    factory: Factory,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     build: Build,
     build_id: int,
+    org_slug: str,
+    project_slug: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> _StaleGuardOutcome:
-    """Skip and mark stale if a newer build exists for ``(project, git_ref)``.
+    """Skip a build that vanished, was deleted, or was superseded.
 
     Runs *inside* the BUILD_PROCESSING lock so two concurrent supersession
     checks cannot race: only the newest build for ``(project, git_ref)``
     does any work; any older build observes a higher latest id and skips.
+
+    The build is re-read here rather than reused from the pre-lock read,
+    because the whole point of the deletion check is to see writes that
+    landed after it. ``date_deleted`` is checked *before* the latest-live
+    lookup: a deleted build must be cancelled on its own account, and
+    asking whether it is the newest live build for its ref is both
+    pointless (it has just been excluded from that lookup) and
+    misleading (it would report itself superseded by whatever is live).
+
+    A row that has gone missing entirely is checked before both. The
+    pre-lock read found it, so something removed it in between, and
+    neither remaining question has an answer worth acting on: it cannot
+    be deleted, and ``get_latest_build_id_for_ref`` reports ``None`` for
+    an emptied ref, which reads as "this build is the newest live one"
+    and would send the whole tarball down before the mid-upload guard
+    finally noticed the row was gone (review of PR #583).
+
+    The re-read is deliberately unlocked. Its transaction commits before
+    either skip path runs, so a row lock taken here would be released
+    before it could protect anything; the transition each skip path
+    makes takes its own lock, and a DELETE that lands in between is seen
+    there. ``_process_build``'s guard is the one that has to be locked,
+    because its verdict and the write it gates share a transaction.
 
     Returns the verdict the caller turns into an arq result and metrics
     (see :func:`_stale_guard_result`); ``not_stale`` means this build
     should be processed.
     """
     async with session.begin():
-        latest_build_id = await build_store.get_latest_build_id_for_ref(
-            project_id=build.project_id,
-            git_ref=build.git_ref,
+        current = await build_store.get_by_id(build_id)
+        deleted = current is not None and current.date_deleted is not None
+        latest_build_id: int | None = None
+        if current is not None and not deleted:
+            latest_build_id = await build_store.get_latest_build_id_for_ref(
+                project_id=build.project_id,
+                git_ref=build.git_ref,
+            )
+    if current is None:
+        return await _mark_missing_build_skipped(
+            session=session,
+            ctx=ctx,
+            payload=payload,
+            queue_job_store=queue_job_store,
+            build_id=build_id,
+            logger=logger,
+        )
+    if deleted:
+        return await _mark_deleted_skipped(
+            session=session,
+            ctx=ctx,
+            payload=payload,
+            factory=factory,
+            queue_job_store=queue_job_store,
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            logger=logger,
         )
     # A newer build landing between this read and _mark_stale_skipped
     # is benign: the BUILD_PROCESSING lock serializes supersession
@@ -298,9 +486,12 @@ async def _guard_stale_build(
             session=session,
             ctx=ctx,
             payload=payload,
+            factory=factory,
             queue_job_store=queue_job_store,
             build_id=build_id,
             latest_build_id=latest_build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
             logger=logger,
         )
     return _StaleGuardOutcome.not_stale
@@ -368,28 +559,63 @@ async def _process_build_locked(
 
     # Phase 2: Upload files and mark build complete
     try:
-        async with object_store, session.begin():
-            object_count, total_size_bytes = await _process_build(
-                object_store=object_store,
-                build=build,
-                build_store=build_store,
-                org_slug=org_slug,
-                project_slug=project_slug,
-                logger=logger,
-            )
+        async with object_store:
+            async with session.begin():
+                upload = await _process_build(
+                    object_store=object_store,
+                    build=build,
+                    build_store=build_store,
+                    org_slug=org_slug,
+                    project_slug=project_slug,
+                    logger=logger,
+                )
+            # Outside the transaction above on purpose: the delete is a
+            # network call to the object store (botocore defaults to 60 s
+            # connect and read timeouts), and inside that block it would
+            # be made while still holding the ``builds`` row lock the
+            # completion took. Every ``SELECT ... FOR UPDATE`` reader
+            # PRD #577 added — a DELETE request, the stranded-build
+            # sweep, a racing worker's mid-upload guard — would park
+            # behind a call that has nothing to do with the row. The
+            # tarball is dead weight the moment the build is completed,
+            # so dropping it is bookkeeping the commit does not need.
+            if not isinstance(upload, _MidUploadRetirement):
+                await _delete_staging_tarball(
+                    object_store=object_store, build=build, logger=logger
+                )
     except Exception as exc:
-        # Phase 3a: Mark build and queue job as failed
+        # Phase 3a: Mark queue job and build as failed.
+        #
+        # Both writes are idempotent, because either row may have gone
+        # terminal underneath this worker while the files were
+        # uploading: a DELETE cancels the build, the silent reaper fails
+        # an idle job, and the stranded sweep fails the build behind it.
+        # A strict ``fail`` on either one would raise from inside the
+        # ``except`` handler, and that second exception would mask the
+        # upload error, roll back the very transaction that has to close
+        # the run out, and leave the run stranded — exactly the failure
+        # mode this change set removes. ``exc`` stays the exception that
+        # is captured and logged.
+        #
+        # The queue job goes first so this path takes ``queue_jobs``
+        # before ``builds``, matching the reaper (which fails jobs in
+        # ``fail_silent_jobs`` before locking builds in
+        # ``fail_stranded_processing``) and the sibling worker paths
+        # (``_mark_stale_skipped``, ``_mark_deleted_skipped``,
+        # ``_close_out_retired_build``). Taking the two in the opposite
+        # order is a lock-order inversion PostgreSQL resolves by
+        # aborting one side.
         sentry_sdk.capture_exception(exc)
         logger.exception("Build processing failed")
         async with session.begin():
+            if queue_job_id is not None:
+                await queue_job_store.fail_if_active(queue_job_id)
             build_service = factory.create_build_service()
-            await build_service.fail(
+            await build_service.fail_if_unfinished(
                 build_id=build_id,
                 org_slug=org_slug,
                 project_slug=project_slug,
             )
-            if queue_job_id is not None:
-                await queue_job_store.fail(queue_job_id)
         return "failed", _BuildProcessedOutcome(
             success=False,
             object_count=None,
@@ -399,6 +625,19 @@ async def _process_build_locked(
             stale_skipped=False,
         )
     else:
+        # Something retired the build while its files were uploading, so
+        # it is already terminal (or gone) and must not be completed.
+        if isinstance(upload, _MidUploadRetirement):
+            return await _close_out_retired_build(
+                session=session,
+                queue_job_store=queue_job_store,
+                queue_job_id=queue_job_id,
+                build_id=build_id,
+                status=upload.status,
+                deleted=upload.deleted,
+                logger=logger,
+            )
+        object_count, total_size_bytes = upload
         editions_updated, editions_skipped = await _finalize_success(
             session=session,
             factory=factory,
@@ -425,55 +664,427 @@ async def _process_build_locked(
         )
 
 
-async def _mark_stale_skipped(
+async def _delete_staging_tarball(
+    *,
+    object_store: ObjectStore,
+    build: Build,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Drop the staging tarball of a build that has just been completed.
+
+    Called by :func:`_process_build_locked` after the transaction that
+    completed the build has committed, so the object store call is not
+    made under the ``builds`` row lock.
+
+    A failure is logged and swallowed. The build is complete and its
+    content is published-ready either way; failing the job over an
+    undeleted tarball would turn a finished build into an arq retry that
+    re-uploads the whole tree, and the leftover object is reclaimed by
+    the same ``purgatory_cleanup`` sweep (DM-54691) that reclaims the
+    rest of a retired build's storage.
+    """
+    try:
+        await object_store.delete_object(key=build.staging_key)
+    except Exception:
+        logger.warning(
+            "Failed to delete staging tarball",
+            staging_key=build.staging_key,
+            exc_info=True,
+        )
+    else:
+        logger.info("Deleted staging tarball", staging_key=build.staging_key)
+
+
+@dataclass(frozen=True, slots=True)
+class _SkipRecord:
+    """What one pre-work skip has to write on the build's queue job."""
+
+    outcome: _StaleGuardOutcome
+    """The verdict the caller turns into an arq result and metrics."""
+
+    progress: dict[str, Any]
+    """The ``complete`` phase progress payload for the queue job."""
+
+
+async def _record_skip(
     *,
     session: AsyncSession,
     ctx: dict[str, Any],
     payload: dict[str, Any],
     queue_job_store: QueueJobStore,
+    retire: Callable[[], Awaitable[_SkipRecord]],
+) -> _StaleGuardOutcome:
+    """Retire a build the pre-work guards refused and complete its job.
+
+    The shared body of :func:`_mark_stale_skipped`,
+    :func:`_mark_deleted_skipped` and :func:`_mark_missing_build_skipped`
+    — three verdicts that differ only in what ``retire`` writes on the
+    build and records for the job, and agree on everything around it.
+
+    ``retire`` runs in the *same* ``session.begin()`` block that
+    completes the queue job, so the build's terminal status and the
+    job's completion commit or roll back together. Skipping a build
+    without retiring it is what stranded rows in ``processing`` forever
+    (#575): with no worker on the build and no job left to run,
+    ``processing`` was a lie no later path would correct.
+
+    The pickup guard runs before any of that, and a row it refuses
+    (task #551) short-circuits to ``late_delivery`` with nothing written
+    and nothing logged as skipped: the row is terminal or in another
+    worker's hands, so this delivery has neither a skip to record nor
+    any business retiring the build. A delivery with no ``queue_jobs``
+    row at all still counts as a recorded skip — the build is retired
+    either way, there is simply no job bookkeeping to do.
+
+    Parameters
+    ----------
+    retire
+        Writes the build's terminal status (where there is a build left
+        to write one on) and reports what the job should record.
+    """
+    async with session.begin():
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
+        if pickup.skipped:
+            return _StaleGuardOutcome.late_delivery
+        record = await retire()
+        if pickup.queue_job_id is not None:
+            queue_job_id = pickup.queue_job_id
+            await queue_job_store.update_phase(
+                queue_job_id,
+                "complete",
+                progress=record.progress,
+            )
+            await queue_job_store.complete(queue_job_id)
+    return record.outcome
+
+
+async def _mark_stale_skipped(
+    *,
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    factory: Factory,
+    queue_job_store: QueueJobStore,
     build_id: int,
     latest_build_id: int,
+    org_slug: str,
+    project_slug: str,
     logger: structlog.stdlib.BoundLogger,
 ) -> _StaleGuardOutcome:
-    """Mark a superseded build's QueueJob complete with a stale-skip flag.
+    """Retire a superseded build and complete its QueueJob as stale.
 
     Operators identify these runs by ``progress["stale_skipped"]`` plus
     the dedicated log line; the QueueJob status stays ``completed``
     because nothing was wrong with the build itself — a newer build
     for the same ``(project, git_ref)`` simply took over.
 
-    The pickup guard runs before any of that, and a row it refuses
-    (task #551) short-circuits to ``late_delivery`` with nothing written
-    and nothing logged as skipped: the row is terminal or in another
-    worker's hands, so this delivery has no stale skip to record. A
-    delivery with no ``queue_jobs`` row at all still counts as a
-    recorded skip — there is simply no bookkeeping to do.
+    The transition goes through
+    :meth:`BuildService.supersede_if_unfinished` rather than the strict
+    :meth:`~BuildService.supersede`, because the verdict this acts on
+    was reached in a *different*, deliberately unlocked transaction
+    (:func:`_guard_stale_build`) that has already committed. A DELETE, a
+    lifecycle reap or the stranded-build sweep committing in that window
+    leaves no edge out of the status it wrote, and the strict call would
+    raise :exc:`InvalidBuildStateError` out of the transaction that has
+    to complete the queue job: a Sentry event, a rolled-back job left
+    ``queued``, and — for a lifecycle cancel, which stamps no
+    ``date_deleted`` for the deleted-skip guard to catch — an arq retry
+    that re-enters here and raises all over again (#590). When it stands
+    down, the job is closed out with the retired-build progress instead,
+    naming the status that was actually found; the follow-up read is
+    safe because ``supersede_if_unfinished`` took the row lock and this
+    transaction still holds it.
     """
-    async with session.begin():
-        pickup = await _start_queue_job(ctx, payload, queue_job_store)
-        if pickup.skipped:
-            return _StaleGuardOutcome.late_delivery
+
+    async def _retire() -> _SkipRecord:
+        build_service = factory.create_build_service()
+        superseded = await build_service.supersede_if_unfinished(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        if superseded is None:
+            build_store = factory.create_build_store()
+            retired = await build_store.get_by_id(build_id)
+            status = retired.status if retired is not None else None
+            logger.info(
+                "Build retired before its stale skip; closing its job out",
+                build_id=build_id,
+                latest_build_id=latest_build_id,
+                build_status=status.value if status is not None else None,
+            )
+            return _SkipRecord(
+                outcome=_StaleGuardOutcome.retired_before_skip,
+                progress=_retired_build_progress(status),
+            )
         logger.info(
             "Stale build skipped",
             build_id=build_id,
             latest_build_id=latest_build_id,
         )
-        if pickup.queue_job_id is not None:
-            queue_job_id = pickup.queue_job_id
-            await queue_job_store.update_phase(
-                queue_job_id,
-                "complete",
-                progress={
-                    "message": (
-                        "Stale build skipped; superseded by "
-                        f"build id {latest_build_id}"
-                    ),
-                    "stale_skipped": True,
-                    "latest_build_id": latest_build_id,
-                },
-            )
-            await queue_job_store.complete(queue_job_id)
-    return _StaleGuardOutcome.stale_skipped
+        return _SkipRecord(
+            outcome=_StaleGuardOutcome.stale_skipped,
+            progress={
+                "message": (
+                    "Stale build skipped; superseded by "
+                    f"build id {latest_build_id}"
+                ),
+                "stale_skipped": True,
+                "latest_build_id": latest_build_id,
+            },
+        )
+
+    return await _record_skip(
+        session=session,
+        ctx=ctx,
+        payload=payload,
+        queue_job_store=queue_job_store,
+        retire=_retire,
+    )
+
+
+async def _mark_deleted_skipped(
+    *,
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    factory: Factory,
+    queue_job_store: QueueJobStore,
+    build_id: int,
+    org_slug: str,
+    project_slug: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> _StaleGuardOutcome:
+    """Retire a build deleted before processing and complete its QueueJob.
+
+    Differs from :func:`_mark_stale_skipped` only in what it records:
+    ``progress["deleted_skipped"]`` and a transition to ``cancelled``
+    rather than ``superseded``.
+
+    The cancel is idempotent. ``BuildService.soft_delete`` cancels a
+    non-terminal build as it deletes it, so the common ordering leaves
+    this guard re-asserting a status the row already has; a row deleted
+    before that behaviour existed (or by a DELETE that raced this
+    worker's pre-lock read) is still ``processing`` and is the case that
+    needs the transition. Either way the build must not be published,
+    and nothing is downloaded, unpacked, uploaded or tracked.
+    """
+
+    async def _retire() -> _SkipRecord:
+        logger.info("Deleted build skipped", build_id=build_id)
+        build_service = factory.create_build_service()
+        await build_service.cancel(
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        return _SkipRecord(
+            outcome=_StaleGuardOutcome.deleted_skipped,
+            progress={
+                "message": "Build was deleted before processing",
+                "deleted_skipped": True,
+            },
+        )
+
+    return await _record_skip(
+        session=session,
+        ctx=ctx,
+        payload=payload,
+        queue_job_store=queue_job_store,
+        retire=_retire,
+    )
+
+
+async def _mark_missing_build_skipped(
+    *,
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    queue_job_store: QueueJobStore,
+    build_id: int,
+    logger: structlog.stdlib.BoundLogger,
+) -> _StaleGuardOutcome:
+    """Close a job out whose build vanished before any work started.
+
+    The third sibling of :func:`_mark_stale_skipped` and
+    :func:`_mark_deleted_skipped`, and the one with no build to
+    transition — the row is gone, so there is no status to write and
+    nothing to lock. Both siblings would raise on that: ``cancel`` and
+    ``supersede`` need a row.
+
+    The job carries the same missing-row progress
+    :func:`_close_out_retired_build` writes when a row disappears
+    mid-upload, because an operator reading the two is looking at the
+    same event; only the amount of wasted work differs, and the point of
+    guarding here is that this one wastes none.
+    """
+
+    async def _retire() -> _SkipRecord:
+        logger.info(
+            "Build row disappeared before processing; closing its job out",
+            build_id=build_id,
+        )
+        return _SkipRecord(
+            outcome=_StaleGuardOutcome.vanished_before_work,
+            progress=_retired_build_progress(None),
+        )
+
+    return await _record_skip(
+        session=session,
+        ctx=ctx,
+        payload=payload,
+        queue_job_store=queue_job_store,
+        retire=_retire,
+    )
+
+
+def _retired_build_progress(
+    status: BuildStatus | None, *, deleted: bool = False
+) -> dict[str, Any]:
+    """Describe a build retired underneath the worker, for its job.
+
+    Shared by the two paths that find somebody else has already written
+    a terminal status: :func:`_close_out_retired_build`, once the files
+    are uploaded, and :func:`_mark_stale_skipped`, when the retirement
+    lands between the stale verdict and the skip that acts on it.
+
+    Every case names the status that was actually found, both in the
+    human-readable message and in ``retired_status``, so an operator
+    reading the job does not have to guess which of the several possible
+    retirements happened.
+
+    A vanished row is named too, as
+    :attr:`~docverse.models.RetiredBuildStatus.missing` rather than
+    ``None``. ``None`` made that outcome unrepresentable: it is a
+    *declared* field on
+    :class:`~docverse.models.BuildProcessingProgress`, whose
+    drop-``None`` serializer strips every key it left unset, so the
+    vanished case served the same payload as a job that was never
+    retired at all. ``missing`` is not a ``BuildStatus`` — there is no
+    row to write it to, and that enum is persisted behind the
+    ``builds_status_check`` constraint — which is why
+    ``RetiredBuildStatus`` exists alongside it.
+
+    The ``cancelled`` case keeps its original message *and* the
+    ``deleted_skipped`` flag the DELETE path established, because that
+    flag is an existing operator contract; the statuses that only became
+    reachable here (review of PR #583, finding f2) get no flag of their
+    own, since ``retired_status`` already tells them apart.
+    """
+    was_deleted = deleted or status is BuildStatus.cancelled
+    if status is None:
+        message = "Build row disappeared while it was processing"
+    elif was_deleted:
+        message = "Build was deleted while it was processing"
+    else:
+        message = f"Build was {status.value} while it was processing"
+    retired_status = (
+        RetiredBuildStatus.missing
+        if status is None
+        else RetiredBuildStatus(status.value)
+    )
+    progress: dict[str, Any] = {
+        "message": message,
+        "retired_status": retired_status.value,
+    }
+    if was_deleted:
+        progress["deleted_skipped"] = True
+    return progress
+
+
+async def _close_out_retired_build(
+    *,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    queue_job_id: int | None,
+    build_id: int,
+    status: BuildStatus | None,
+    deleted: bool = False,
+    logger: structlog.stdlib.BoundLogger,
+) -> tuple[str, _BuildProcessedOutcome | None]:
+    """Close out a build retired while its files were uploading.
+
+    The late sibling of :func:`_mark_deleted_skipped`. That guard runs
+    before any work and can still retire the build itself; by the time
+    this runs somebody else has already written the terminal status — a
+    DELETE cancelling the row on its way out
+    (:meth:`BuildService.soft_delete`), the stranded-build sweep failing
+    it, a supersession, or a purge that removed the row entirely — so
+    all that is left is bookkeeping: record the skip on the queue job
+    and complete it. The build keeps the status it was given, edition
+    tracking never runs, and nothing is published.
+
+    *Every* non-``processing`` outcome comes here rather than down the
+    error path, because none of them is a crash. Letting a retired build
+    reach the completion would raise ``InvalidBuildStateError`` from
+    inside the worker's transaction, and the error path would then
+    report a deliberate retirement as a failure: a Sentry event and a
+    ``build_processed(success=False)`` metric for a build nobody wanted
+    published (review of PR #583, finding f2). That path closes its
+    rows out idempotently now, so it would no longer *break* on a
+    retired build — it would simply be lying about one.
+
+    The commonest way to arrive here with ``failed`` is the reaper, and
+    it is worth naming because it discards real work. The stranded-build
+    sweep has no heartbeat from this worker: an upload still running
+    after ``build_processing_reaper_threshold_seconds`` (8 hours by
+    default) has its queue job reaped as silent and its build failed
+    behind it, and when the upload finally lands the row is already
+    terminal, so everything just uploaded is dropped on the floor here.
+    That is deliberate. A build that takes hours to unpack and upload is
+    a wedged worker far more often than an honest one, and the threshold
+    is where the operator says so; publishing past it — hours after the
+    job was declared dead, onto editions that have moved on since —
+    would be worse than discarding it. An upload that legitimately needs
+    longer wants the threshold raised, not this guard softened.
+
+    The uploaded objects are left where they landed: everything already
+    written under the build's ``storage_prefix``, plus the
+    ``staging_key`` tarball — a whole unpacked tree, where the pre-work
+    guard (:func:`_mark_deleted_skipped`) strands only the tarball.
+    Nothing in the tree reclaims them yet. They are orphaned until the
+    ``purgatory_cleanup`` job tracked in DM-54691 (SQR-112, "Soft delete
+    and purgatory") hard-deletes a soft-deleted build's objects once the
+    organization's ``purgatory_retention`` has elapsed; do not go
+    looking for that purge here. Deleting them from the worker instead
+    would be worse: a cancelled build is soft-deleted, not gone, and
+    stays restorable right up until that purge runs.
+
+    Reports the pickup guards' recorded-skip metric shape: to an
+    operator this is the same event, a build deliberately retired rather
+    than one that failed.
+    """
+    logger.info(
+        "Build retired during processing; closing its job out",
+        build_id=build_id,
+        build_status=status.value if status is not None else None,
+        deleted=deleted,
+    )
+    if queue_job_id is not None:
+        async with session.begin():
+            job = await queue_job_store.get_for_update(queue_job_id)
+            if job is None or job.status is not JobStatus.in_progress:
+                # Whatever retired the build usually retired this row
+                # first — the stranded sweep only fails builds whose job
+                # is no longer live, so the silent reaper got here
+                # before it. Completing a row a reaper already failed
+                # raises InvalidJobStateError out of the very
+                # transaction that exists to close the job out, so the
+                # reaper's verdict and its postmortem trail stand
+                # untouched.
+                logger.info(
+                    "Queue job already terminal; leaving it as it stands",
+                    queue_job_id=queue_job_id,
+                    job_status=job.status.value if job is not None else None,
+                )
+            else:
+                await queue_job_store.update_phase(
+                    queue_job_id,
+                    "complete",
+                    progress=_retired_build_progress(status, deleted=deleted),
+                )
+                await queue_job_store.complete(queue_job_id)
+    return _stale_guard_result(_StaleGuardOutcome.retired_mid_upload)
 
 
 async def _resolve_queue_job_id(
@@ -767,6 +1378,21 @@ async def _track_editions(
 ) -> EditionTrackingResult | None:
     """Evaluate edition tracking rules for a completed build.
 
+    Re-reads the build before tracking it, because the row can go
+    terminal between the worker's completion write and this call: a
+    DELETE takes no BUILD_PROCESSING lock, and
+    :meth:`BuildStore.transition_status` is a plain read-then-write, so
+    either UPDATE can be the one that survives. A row that came out of
+    that race soft-deleted, or carrying any status but ``completed``, is
+    one nobody should publish — and ``get_by_id`` does not filter
+    ``date_deleted``, so tracking would otherwise move the edition
+    pointer onto it and enqueue a ``publish_edition`` job for a build
+    that will never be served.
+
+    Such a build is skipped rather than treated as an error: an empty
+    result (not ``None``) so the caller closes the queue job out
+    normally, since nothing about this run failed.
+
     Returns the tracking result, or ``None`` if tracking failed.
     """
     if queue_job_id is not None:
@@ -781,11 +1407,22 @@ async def _track_editions(
 
     try:
         async with session.begin():
-            tracking_service = factory.create_edition_tracking_service()
             build = await build_store.get_by_id(build_id)
             if build is None:
                 msg = f"Build {build_id} vanished after completion"
                 raise RuntimeError(msg)
+            deleted = build.date_deleted is not None
+            if deleted or build.status is not BuildStatus.completed:
+                logger.info(
+                    "Skipping edition tracking for a retired build",
+                    build_id=build_id,
+                    build_status=build.status.value,
+                    deleted=deleted,
+                )
+                return EditionTrackingResult(
+                    derived_slug=None, suppressed=False
+                )
+            tracking_service = factory.create_edition_tracking_service()
             tracking_result = await tracking_service.track_build(build)
         logger.info(
             "Edition tracking complete",
@@ -810,7 +1447,7 @@ async def _process_build(
     org_slug: str,
     project_slug: str,
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[int, int]:
+) -> tuple[int, int] | _MidUploadRetirement:
     """Download, unpack, and upload build files.
 
     Each extracted file is hashed as it goes by, so the build's content
@@ -823,8 +1460,12 @@ async def _process_build(
 
     Returns
     -------
-    tuple of int, int
-        The number of objects uploaded and the total size in bytes.
+    tuple of int, int or _MidUploadRetirement
+        The number of objects uploaded and the total size in bytes, or
+        a :class:`_MidUploadRetirement` naming the status found when
+        somebody retired the build while those uploads were in flight,
+        so it must not be completed (see
+        :func:`_close_out_retired_build`).
     """
     logger.info(
         "Downloading staging tarball",
@@ -889,6 +1530,82 @@ async def _process_build(
         content_hash=content_hash,
     )
 
+    # Nothing that retires a ``processing`` build takes the
+    # BUILD_PROCESSING lock, so the row can go terminal at any point
+    # during the download and uploads above: a DELETE cancels it, the
+    # stranded-build sweep fails it, a supersession retires it, or a
+    # purge removes it outright. Re-read it before writing anything
+    # terminal of our own — completing a retired build would publish
+    # work somebody decided to drop, and the transition would raise
+    # InvalidBuildStateError inside the transaction that still has to
+    # close out the queue job (#575).
+    #
+    # The test is "was this retired out from under us", not "was it
+    # cancelled": ``cancelled``, ``failed`` and ``superseded`` each mean
+    # a different actor already had the last word, and treating those as
+    # crashes reports a deliberate retirement as a bug (review of PR
+    # #583, finding f2). ``date_deleted`` counts too, whatever the
+    # status column says: ``BuildStore.soft_delete`` stamps it without
+    # the cancel ``BuildService.soft_delete`` pairs with it, and
+    # ``get_for_update`` does not filter deleted rows, so a row that is
+    # deleted but still reads ``processing`` would otherwise be
+    # published and have its staging tarball — the deleted build's only
+    # route back — deleted along the way.
+    #
+    # ``failed`` here is usually the reaper's: a build whose upload runs
+    # past ``build_processing_reaper_threshold_seconds`` (8 h by
+    # default) has its queue job reaped and its build failed while this
+    # worker is still uploading, and the finished upload is then
+    # discarded here. That is the accepted trade — see
+    # :func:`_close_out_retired_build` — not a bug to work around by
+    # publishing late.
+    #
+    # Anything else — ``pending``, or a ``completed`` this worker did
+    # not write — is nobody's retirement, so it raises rather than being
+    # filed as one. A ``pending`` row closed out quietly would be worse
+    # than a Sentry event: ``fail_stranded_processing`` sweeps only
+    # ``processing``, so nothing would ever move it again.
+    #
+    # Locked, and in the same transaction as the completion below, so
+    # the guard and the write cannot straddle somebody else's commit:
+    # this blocks behind a retirement that is mid-flight and then sees
+    # it, and one arriving after this point blocks behind the completion
+    # and stands down. Either way exactly one terminal status survives
+    # (review of PR #583, finding f1).
+    current = await build_store.get_for_update(build_id=build.id)
+    deleted = current is not None and current.date_deleted is not None
+    if current is None or deleted or current.status in _RETIRED_BUILD_STATUSES:
+        logger.info(
+            "Build retired during processing; skipping completion",
+            build_status=current.status.value if current is not None else None,
+            deleted=deleted,
+            object_count=object_count,
+            total_size_bytes=total_size,
+        )
+        return _MidUploadRetirement(
+            status=current.status if current is not None else None,
+            deleted=deleted,
+        )
+    if current.status is not BuildStatus.processing:
+        # Not a retirement: nothing in the tree writes ``pending`` or
+        # ``completed`` onto a build a worker is uploading for, so this
+        # is a bug or an out-of-band enqueue. Closing it out quietly
+        # would file it as a deliberate retirement — no Sentry event,
+        # and a ``pending`` row left outside every sweep's reach, since
+        # ``fail_stranded_processing`` matches only ``processing``.
+        raise InvalidBuildStateError(
+            current_state=current.status.value,
+            target_state=BuildStatus.completed.value,
+            build_public_id=serialize_base32_id(current.public_id),
+            org_slug=org_slug,
+            project_slug=project_slug,
+            message=(
+                f"Build {serialize_base32_id(current.public_id)} was "
+                f"{current.status.value!r}, not 'processing', when its "
+                "upload finished"
+            ),
+        )
+
     await build_store.update_inventory(
         build_id=build.id,
         object_count=object_count,
@@ -904,15 +1621,5 @@ async def _process_build(
         org_slug=org_slug,
         project_slug=project_slug,
     )
-
-    try:
-        await object_store.delete_object(key=build.staging_key)
-        logger.info("Deleted staging tarball", staging_key=build.staging_key)
-    except Exception:
-        logger.warning(
-            "Failed to delete staging tarball",
-            staging_key=build.staging_key,
-            exc_info=True,
-        )
 
     return object_count, total_size

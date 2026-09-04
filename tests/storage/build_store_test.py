@@ -4,25 +4,37 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 import structlog
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
     BuildStatus,
+    JobKind,
+    JobStatus,
     OrganizationCreate,
     ProjectCreate,
 )
 from docverse_server.dbschema.build import SqlBuild
-from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
+from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.exceptions import InvalidBuildStateError
-from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.build_store import _VALID_TRANSITIONS, BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import backend_pid, wait_until_blocked_on_lock
 
 
 @pytest.fixture
@@ -349,6 +361,122 @@ async def test_invalid_transition_raises(
 
 
 @pytest.mark.asyncio
+async def test_transition_pending_to_cancelled(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A build deleted before it was ever uploaded can be cancelled.
+
+    ``cancelled`` is terminal, so it gets ``date_completed`` exactly as
+    ``completed`` and ``failed`` do: the row stops being something a
+    worker might still be holding.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        cancelled = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.cancelled
+        )
+        await db_session.commit()
+    assert cancelled.status == BuildStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_transition_processing_to_superseded(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The stale-skip path's transition, with its completion stamp."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        superseded = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.superseded
+        )
+        await db_session.commit()
+    assert superseded.status == BuildStatus.superseded
+    assert superseded.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_transition_processing_to_cancelled(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A build deleted mid-processing lands on ``cancelled``."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        cancelled = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.cancelled
+        )
+        await db_session.commit()
+    assert cancelled.status == BuildStatus.cancelled
+    assert cancelled.date_completed is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal", [BuildStatus.superseded, BuildStatus.cancelled]
+)
+async def test_new_terminal_statuses_reject_further_transitions(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    terminal: BuildStatus,
+) -> None:
+    """Neither new status is a waypoint: nothing follows it.
+
+    This is what lets a caller read ``superseded``/``cancelled`` as
+    "this build will never be published" without also checking whether
+    some later path might still revive the row.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=terminal
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        for target in BuildStatus:
+            with pytest.raises(InvalidBuildStateError):
+                await build_store.transition_status(
+                    build_id=build.id, new_status=target
+                )
+
+
+@pytest.mark.asyncio
 async def test_list_by_project(
     db_session: AsyncSession,
     build_store: BuildStore,
@@ -497,11 +625,13 @@ async def test_get_latest_build_id_for_ref(
     db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
-    """Returns the max build id for a (project, git_ref) pair.
+    """Returns the max *live* build id for a (project, git_ref) pair.
 
     A second build on the same ref supersedes the first; a build on a
     different ref does not influence the answer; an unknown ref or
-    project returns ``None``.
+    project returns ``None``. Soft-deleted rows do not count: deleting
+    the newest build hands the ref back to the newest live one, and a
+    ref whose only build is deleted has no latest id at all.
     """
     async with db_session.begin():
         _, project_id = await _create_org_and_project(db_session)
@@ -556,6 +686,26 @@ async def test_get_latest_build_id_for_ref(
             project_id=project_id + 9999, git_ref="main"
         )
         assert missing_project is None
+
+    async with db_session.begin():
+        assert await build_store.soft_delete(build_id=second_main.id) is True
+        assert await build_store.soft_delete(build_id=other_ref.id) is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        # A tombstone is not a supersession marker (#575): with the
+        # newest row deleted, the newest live build owns the ref again
+        # instead of being stranded behind a build nobody will publish.
+        after_delete = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="main"
+        )
+        assert after_delete == first_main.id
+
+        # A ref whose only build is deleted has no latest build at all.
+        emptied_ref = await build_store.get_latest_build_id_for_ref(
+            project_id=project_id, git_ref="release/v1"
+        )
+        assert emptied_ref is None
 
 
 @pytest.mark.asyncio
@@ -645,3 +795,411 @@ async def test_create_retries_on_public_id_collision(
         )
     assert total == 2
     assert preserved == "pre-existing"
+
+
+async def _create_processing_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    git_ref: str,
+    uploaded_hours_ago: float,
+) -> Build:
+    """Create a ``processing`` build whose ``date_uploaded`` is back-dated.
+
+    ``transition_status`` always stamps ``date_uploaded`` with the
+    current time, so the age the stranded sweep filters on is written
+    afterwards by direct UPDATE.
+    """
+    build = await build_store.create(
+        project_id=project_id,
+        project_slug="build-proj",
+        data=BuildCreate(git_ref=git_ref, content_hash="sha256:" + "a" * 64),
+        uploader="testuser",
+    )
+    await build_store.transition_status(
+        build_id=build.id, new_status=BuildStatus.processing
+    )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(
+            date_uploaded=(
+                datetime.now(tz=UTC) - timedelta(hours=uploaded_hours_ago)
+            )
+        )
+    )
+    return build
+
+
+async def _seed_queue_job(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    build_id: int,
+    status: JobStatus,
+) -> None:
+    """Attach one ``build_processing`` queue job row to a build."""
+    row = SqlQueueJob(
+        public_id=validate_base32_id(generate_base32_id()),
+        kind=JobKind.build_processing.value,
+        status=status.value,
+        org_id=org_id,
+        build_id=build_id,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+
+@pytest.mark.asyncio
+async def test_fail_stranded_processing(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Only threshold-old ``processing`` rows with no live job are swept.
+
+    The invariant ``processing`` is supposed to carry is "a worker is
+    on it". A row that no ``queued``/``in_progress`` queue job vouches
+    for any more has lost its worker, so the reaper's sweep retires it
+    to ``failed``. Rows a live job still covers, rows younger than the
+    cutoff, soft-deleted rows and rows that never left ``pending`` are
+    none of the sweep's business.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        stranded = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="stranded",
+            uploaded_hours_ago=24,
+        )
+        # A terminal job is no vouch either: the silent sweep failing a
+        # job is exactly how a build becomes strandable.
+        job_failed = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="job-failed",
+            uploaded_hours_ago=24,
+        )
+        await _seed_queue_job(
+            db_session,
+            org_id=org_id,
+            build_id=job_failed.id,
+            status=JobStatus.failed,
+        )
+        in_progress = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="in-progress",
+            uploaded_hours_ago=24,
+        )
+        await _seed_queue_job(
+            db_session,
+            org_id=org_id,
+            build_id=in_progress.id,
+            status=JobStatus.in_progress,
+        )
+        queued = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="queued",
+            uploaded_hours_ago=24,
+        )
+        await _seed_queue_job(
+            db_session,
+            org_id=org_id,
+            build_id=queued.id,
+            status=JobStatus.queued,
+        )
+        fresh = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="fresh",
+            uploaded_hours_ago=0,
+        )
+        deleted = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="deleted",
+            uploaded_hours_ago=24,
+        )
+        assert await build_store.soft_delete(build_id=deleted.id) is True
+        pending = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=BuildCreate(
+                git_ref="pending", content_hash="sha256:" + "b" * 64
+            ),
+            uploader="testuser",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        reaped = await build_store.fail_stranded_processing(
+            idle_after=timedelta(hours=8)
+        )
+        await db_session.commit()
+
+    assert {build.id for build in reaped} == {stranded.id, job_failed.id}
+    assert all(build.status == BuildStatus.failed for build in reaped)
+    assert all(build.date_completed is not None for build in reaped)
+
+    async with db_session.begin():
+        for spared in (in_progress, queued, fresh, deleted):
+            row = await build_store.get_by_id(spared.id)
+            assert row is not None
+            assert row.status == BuildStatus.processing
+            assert row.date_completed is None
+        pending_row = await build_store.get_by_id(pending.id)
+        assert pending_row is not None
+        assert pending_row.status == BuildStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    build_store: BuildStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate retired after the select is skipped, not raised over.
+
+    The sweep picks its candidates in one statement and then transitions
+    them one at a time, so a DELETE-cancel committing in that window
+    leaves a row whose transition is no longer legal. The sweep shares
+    the reaper's first transaction with the silent and orphan queue-job
+    sweeps, so letting ``InvalidBuildStateError`` escape would roll all
+    three back and fail the whole tick over one build somebody else had
+    already retired.
+
+    The race is driven for real: the first row's transition cancels the
+    second on an independently-committed session, so the second
+    iteration hits the genuine exception rather than a stubbed one.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _create_org_and_project(db_session)
+        first = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="first",
+            uploaded_hours_ago=24,
+        )
+        second = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="second",
+            uploaded_hours_ago=24,
+        )
+        await db_session.commit()
+
+    original = BuildStore.transition_status
+    raced = False
+
+    async def racing_transition(
+        self: BuildStore, **kwargs: Any
+    ) -> Build | None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            async with db_session_factory() as other, other.begin():
+                other_store = BuildStore(
+                    session=other, logger=structlog.get_logger("docverse")
+                )
+                await other_store.transition_status(
+                    build_id=second.id, new_status=BuildStatus.cancelled
+                )
+        # Annotated rather than returned straight through: the overloads
+        # on ``transition_status`` make a ``**kwargs`` call resolve to
+        # ``Any``, and this is the real return type of the strict form.
+        transitioned: Build | None = await original(self, **kwargs)
+        return transitioned
+
+    monkeypatch.setattr(BuildStore, "transition_status", racing_transition)
+
+    async with db_session.begin():
+        reaped = await build_store.fail_stranded_processing(
+            idle_after=timedelta(hours=8)
+        )
+        await db_session.commit()
+
+    assert raced is True
+    assert [build.id for build in reaped] == [first.id]
+    assert reaped[0].status == BuildStatus.failed
+
+    async with db_session.begin():
+        row = await build_store.get_by_id(second.id)
+        assert row is not None
+        # The cancel that won the race stands; the sweep left it alone.
+        assert row.status == BuildStatus.cancelled
+
+
+@pytest.mark.asyncio
+async def test_fail_stranded_processing_cutoff_uses_the_database_clock(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The cutoff is derived from ``now()``, not from the caller's clock.
+
+    The sweep shares the reaper's first transaction with three
+    queue-job sweeps that all take their cutoff from
+    ``select(func.now())``; a cutoff the worker computed from its own
+    ``datetime.now()`` would disagree with theirs at the boundary
+    whenever the two clocks are skewed. Pinned here by the one case
+    where the clock source is observable without skew: with
+    ``idle_after=0`` a row stamped by the sweeping transaction's own
+    ``now()`` sits exactly *at* a database-derived cutoff, and the
+    strict ``<`` spares it — while a genuinely older row in the same
+    call is still reaped, so the sweep is demonstrably live.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _create_org_and_project(db_session)
+        at_cutoff = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="at-cutoff",
+            uploaded_hours_ago=0,
+        )
+        older = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="older",
+            uploaded_hours_ago=1,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        # Stamp one row with the sweeping transaction's own clock, which
+        # is the very instant a database-derived cutoff will read.
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == at_cutoff.id)
+            .values(date_uploaded=func.now())
+        )
+        reaped = await build_store.fail_stranded_processing(
+            idle_after=timedelta(0)
+        )
+        await db_session.commit()
+
+    assert [build.id for build in reaped] == [older.id]
+
+    async with db_session.begin():
+        row = await build_store.get_by_id(at_cutoff.id)
+        assert row is not None
+        assert row.status == BuildStatus.processing
+
+
+async def _seed_processing_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> Build:
+    """Commit one ``processing`` build for the racing tests to fight over."""
+    async with db_session.begin():
+        _org_id, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        build = await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await db_session.commit()
+    return build
+
+
+@pytest.mark.asyncio
+async def test_transition_status_cannot_overwrite_a_committed_terminal(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    build_store: BuildStore,
+) -> None:
+    """A loser of the terminal-write race raises rather than overwriting.
+
+    Two transactions reach the same ``processing`` build: a worker
+    completing it and a DELETE cancelling it. Both used to read the
+    status on their own snapshot and then write, so under PostgreSQL's
+    READ COMMITTED default each could pass ``_VALID_TRANSITIONS`` against
+    the same pre-race ``processing`` and the second UPDATE would land on
+    top of the first transaction's terminal status — losing it silently
+    (review of PR #583, finding f1).
+
+    The check and the write are one atomic step now, so the second
+    transaction blocks on the row lock, re-reads the status the winner
+    committed, and raises :exc:`InvalidBuildStateError` naming it.
+    """
+    build = await _seed_processing_build(db_session, build_store)
+    logger = structlog.get_logger("docverse")
+
+    async with (
+        db_session_factory() as worker_session,
+        db_session_factory() as delete_session,
+        db_session_factory() as probe,
+    ):
+        delete_pid = await backend_pid(delete_session)
+        worker_store = BuildStore(session=worker_session, logger=logger)
+        delete_store = BuildStore(session=delete_session, logger=logger)
+
+        # The worker completes the build but has not committed, so it
+        # holds the row and nothing else can see the new status yet.
+        await worker_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+
+        cancelling = asyncio.ensure_future(
+            delete_store.transition_status(
+                build_id=build.id, new_status=BuildStatus.cancelled
+            )
+        )
+        try:
+            await wait_until_blocked_on_lock(probe, pid=delete_pid)
+            await worker_session.commit()
+            with pytest.raises(InvalidBuildStateError) as excinfo:
+                await cancelling
+        finally:
+            if not cancelling.done():
+                cancelling.cancel()
+            # Retrieve the outcome either way, so a task that finished
+            # cannot leave an unretrieved exception behind.
+            with suppress(asyncio.CancelledError, InvalidBuildStateError):
+                await cancelling
+            await delete_session.rollback()
+
+    assert excinfo.value.current_state == BuildStatus.completed.value
+    assert excinfo.value.target_state == BuildStatus.cancelled.value
+    assert excinfo.value.build_public_id == serialize_base32_id(
+        build.public_id
+    )
+
+    async with db_session_factory() as reader:
+        row = await reader.get(SqlBuild, build.id)
+        assert row is not None
+        assert row.status == BuildStatus.completed
+        assert row.date_completed is not None
+
+
+def test_transition_table_covers_exactly_the_unfinished_statuses() -> None:
+    """Every status with outbound edges is one ``BuildStatus`` calls live.
+
+    The transition table lists edges per starting status and cannot be
+    derived from the partition — the two live statuses lead to different
+    places. Its *keys*, though, are the partition, and the two drifting
+    apart is a silent bug in both directions: a terminal status that
+    grew an edge could be transitioned out of after
+    ``date_completed`` was stamped, and a live status left out of the
+    table would reject every transition, stranding the build with no
+    path forward.
+    """
+    assert set(_VALID_TRANSITIONS) == {
+        status for status in BuildStatus if status.is_unfinished
+    }

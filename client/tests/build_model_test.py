@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from docverse.models import BuildCreate
+from docverse.models import Build, BuildCreate, BuildStatus
 
 
 def test_content_hash_is_optional() -> None:
@@ -63,3 +63,70 @@ def test_content_hash_flagged_deprecated_in_json_schema() -> None:
     """
     schema = BuildCreate.model_json_schema()["properties"]["content_hash"]
     assert schema["deprecated"] is True
+
+
+def test_terminal_statuses_include_superseded_and_cancelled() -> None:
+    """``BuildStatus`` carries the two never-published terminal values.
+
+    A build that a newer build for the same ref took over, and a build
+    deleted before processing finished, are both terminal outcomes the
+    API reports — and both are distinct from ``failed``, which means
+    something went wrong. Clients filtering builds by status need the
+    values to exist in the enum before they can ask for them.
+    """
+    assert BuildStatus.superseded == "superseded"
+    assert BuildStatus.cancelled == "cancelled"
+
+
+def test_build_model_validates_new_terminal_statuses() -> None:
+    """``Build.model_validate`` accepts a payload in either new status."""
+    for status in (BuildStatus.superseded, BuildStatus.cancelled):
+        build = Build.model_validate(
+            {
+                "id": "1x7r-9fd4-hw1b-51",
+                "project_url": ("https://example.com/orgs/o/projects/p"),
+                "self_url": "https://example.com/orgs/o/projects/p/builds/b",
+                "git_ref": "main",
+                "status": status.value,
+                "content_hash": "sha256:" + "a" * 64,
+                "uploader": "someone",
+                "date_created": "2026-09-02T00:00:00Z",
+            }
+        )
+        assert build.status is status
+
+
+def test_status_partition_covers_every_member() -> None:
+    """Every status is exactly one of unfinished, terminal, or the signal.
+
+    ``is_unfinished`` and ``is_terminal`` are the single definition of
+    the partition the server's transition table, retirement helpers and
+    ``build_processing`` worker all branch on, so a status added to the
+    enum without a place in it is a bug waiting to happen: the server
+    would treat the newcomer as live *and* refuse every transition out
+    of it. ``uploaded`` is deliberately in neither half — it is a PATCH
+    signal value that is never persisted on a row.
+    """
+    for status in BuildStatus:
+        if status is BuildStatus.uploaded:
+            assert not status.is_unfinished
+            assert not status.is_terminal
+        else:
+            assert status.is_unfinished is not status.is_terminal
+
+
+def test_unfinished_statuses_are_the_ones_a_build_can_leave() -> None:
+    """Only ``pending`` and ``processing`` mean the build is still live."""
+    unfinished = {status for status in BuildStatus if status.is_unfinished}
+    assert unfinished == {BuildStatus.pending, BuildStatus.processing}
+
+
+def test_terminal_statuses_are_the_build_s_final_answer() -> None:
+    """The four never-leave statuses are the terminal half."""
+    terminal = {status for status in BuildStatus if status.is_terminal}
+    assert terminal == {
+        BuildStatus.completed,
+        BuildStatus.failed,
+        BuildStatus.superseded,
+        BuildStatus.cancelled,
+    }
