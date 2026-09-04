@@ -42,13 +42,15 @@ from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.api_urls import edition_url, job_url
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import (
     EMPTY_MANIFEST_HASH,
     hash_manifest_pairs,
 )
-from docverse_server.domain.queue import JobKind, JobStatus
+from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
+from docverse_server.services.build import BuildService
 from docverse_server.services.edition_tracking import EditionTrackingService
 from docverse_server.services.lock_service import LockClass, LockKey
 from docverse_server.storage.build_store import BuildStore
@@ -2462,6 +2464,235 @@ async def test_build_processing_failure_after_delete_still_fails_job(
             assert refreshed is not None
             assert refreshed.status == BuildStatus.cancelled
         break
+
+
+async def _reap_job_only(job_id: int) -> None:
+    """Fail a queue job on its own session, as the silent reaper does.
+
+    The silent sweep is the half of the reaper that runs first and needs
+    nothing but an idle ``in_progress`` row: it releases the
+    ``queue_jobs`` row while the worker is still mid-upload, and the
+    stranded-build sweep that would also retire the build only matches
+    once that release has committed. The window between the two is what
+    this stages.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            await qjs.fail(
+                job_id,
+                errors={
+                    "message": "Reaped by build_processing_reaper",
+                    "type": "SilentWorker",
+                },
+            )
+        break
+
+
+@pytest.mark.asyncio
+async def test_build_processing_failure_after_reap_still_closes_out(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upload error over an already-reaped job closes out cleanly.
+
+    The silent reaper fails the ``queue_jobs`` row while the worker is
+    uploading, and then the upload blows up. The strict
+    ``QueueJobStore.fail`` would raise ``InvalidJobStateError`` from
+    inside the ``except`` handler — masking the upload error, rolling
+    back the close-out, and dropping the ``build_processed`` metric —
+    so the error path fails the job idempotently instead, and leaves the
+    reaper's verdict and postmortem trail exactly as it found them.
+    """
+    logger = _logger()
+    _manager, events = await build_event_manager(Configuration())
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        job = await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-reaped-then-failed",
+        )
+
+    mock_store = _RetiringMockObjectStore(
+        lambda: _reap_job_only(job.id), fail_after=True
+    )
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-reaped-then-failed",
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+
+    # The upload error is what reaches Sentry — not an
+    # InvalidJobStateError raised while closing the run out.
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+    assert str(captured[0]) == "Object store went away"
+
+    # The close-out transaction committed rather than rolling back, so
+    # the failure metric was emitted.
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].success is False
+    assert publisher.published[0].stale_skipped is False
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=_logger())
+            reaped = await qjs.get_by_backend_job_id(
+                "test-arq-reaped-then-failed"
+            )
+            assert reaped is not None
+            # The reaper's verdict, and its postmortem trail, stand.
+            assert reaped.status == JobStatus.failed
+            assert reaped.errors is not None
+            assert reaped.errors["type"] == "SilentWorker"
+
+            build_store = BuildStore(session=session, logger=_logger())
+            refreshed = await build_store.get_by_id(build.id)
+            assert refreshed is not None
+            # The build was still live, so the worker did fail it.
+            assert refreshed.status == BuildStatus.failed
+        break
+
+
+async def _no_retirement() -> None:
+    """Retire nothing: the upload simply fails on a live build and job."""
+
+
+@pytest.mark.asyncio
+async def test_build_processing_failure_fails_the_job_before_the_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error path writes ``queue_jobs`` before it locks ``builds``.
+
+    The reaper's first transaction fails jobs in ``fail_silent_jobs`` and
+    only then takes ``builds FOR UPDATE`` in
+    ``fail_stranded_processing``, and every other worker path on this
+    branch does the same. An error path that locked the build first
+    would be a lock-order inversion against both, which PostgreSQL
+    resolves by aborting one side of the deadlock.
+    """
+    logger = _logger()
+    order: list[str] = []
+    real_fail_if_active = QueueJobStore.fail_if_active
+    real_fail_if_unfinished = BuildService.fail_if_unfinished
+
+    async def spy_fail_if_active(
+        self: QueueJobStore,
+        job_id: int,
+        *,
+        errors: dict[str, Any] | None = None,
+    ) -> QueueJob | None:
+        order.append("queue_job")
+        return await real_fail_if_active(self, job_id, errors=errors)
+
+    async def spy_fail_if_unfinished(
+        self: BuildService,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> Build | None:
+        order.append("build")
+        return await real_fail_if_unfinished(
+            self,
+            build_id=build_id,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+
+    monkeypatch.setattr(QueueJobStore, "fail_if_active", spy_fail_if_active)
+    monkeypatch.setattr(
+        BuildService, "fail_if_unfinished", spy_fail_if_unfinished
+    )
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-failure-lock-order",
+        )
+
+    mock_store = _RetiringMockObjectStore(_no_retirement, fail_after=True)
+    tarball = _make_tarball({"index.html": b"<html>hello</html>"})
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=tarball,
+        content_type="application/gzip",
+    )
+    mock_store.arm()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-arq-failure-lock-order",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+    assert order == ["queue_job", "build"]
 
 
 @pytest.mark.asyncio

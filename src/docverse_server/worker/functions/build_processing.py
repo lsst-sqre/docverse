@@ -481,26 +481,38 @@ async def _process_build_locked(
                 logger=logger,
             )
     except Exception as exc:
-        # Phase 3a: Mark build and queue job as failed.
+        # Phase 3a: Mark queue job and build as failed.
         #
-        # ``fail_if_unfinished`` rather than ``fail``: the row may have
-        # gone terminal underneath this worker (a DELETE-cancel racing
-        # the guard below, or the stranded sweep), and an
-        # InvalidBuildStateError raised here would abort the same
-        # transaction that has to fail the queue job — stranding the job
-        # ``in_progress`` until the silent reaper, which is exactly the
-        # failure mode this change set removes.
+        # Both writes are idempotent, because either row may have gone
+        # terminal underneath this worker while the files were
+        # uploading: a DELETE cancels the build, the silent reaper fails
+        # an idle job, and the stranded sweep fails the build behind it.
+        # A strict ``fail`` on either one would raise from inside the
+        # ``except`` handler, and that second exception would mask the
+        # upload error, roll back the very transaction that has to close
+        # the run out, and leave the run stranded — exactly the failure
+        # mode this change set removes. ``exc`` stays the exception that
+        # is captured and logged.
+        #
+        # The queue job goes first so this path takes ``queue_jobs``
+        # before ``builds``, matching the reaper (which fails jobs in
+        # ``fail_silent_jobs`` before locking builds in
+        # ``fail_stranded_processing``) and the sibling worker paths
+        # (``_mark_stale_skipped``, ``_mark_deleted_skipped``,
+        # ``_close_out_retired_build``). Taking the two in the opposite
+        # order is a lock-order inversion PostgreSQL resolves by
+        # aborting one side.
         sentry_sdk.capture_exception(exc)
         logger.exception("Build processing failed")
         async with session.begin():
+            if queue_job_id is not None:
+                await queue_job_store.fail_if_active(queue_job_id)
             build_service = factory.create_build_service()
             await build_service.fail_if_unfinished(
                 build_id=build_id,
                 org_slug=org_slug,
                 project_slug=project_slug,
             )
-            if queue_job_id is not None:
-                await queue_job_store.fail(queue_job_id)
         return "failed", _BuildProcessedOutcome(
             success=False,
             object_count=None,
@@ -723,10 +735,11 @@ async def _close_out_retired_build(
     error path, because none of them is a crash. Letting a retired build
     reach the completion would raise ``InvalidBuildStateError`` from
     inside the worker's transaction, and the error path would then
-    report a deliberate retirement as a failure: a Sentry event, and a
-    ``queue_job_store.fail`` that itself raises ``InvalidJobStateError``
-    when a reaper already failed the job (review of PR #583, finding
-    f2).
+    report a deliberate retirement as a failure: a Sentry event and a
+    ``build_processed(success=False)`` metric for a build nobody wanted
+    published (review of PR #583, finding f2). That path closes its
+    rows out idempotently now, so it would no longer *break* on a
+    retired build — it would simply be lying about one.
 
     The uploaded objects are left where they landed: everything already
     written under the build's ``storage_prefix``, plus the
