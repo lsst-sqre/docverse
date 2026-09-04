@@ -13,6 +13,7 @@ import io
 import mimetypes
 import tarfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
@@ -58,12 +59,15 @@ _UPLOAD_CONCURRENCY = 50
 #: these mid-upload is the normal, quiet close-out path
 #: (:func:`_close_out_retired_build`); finding anything else that is not
 #: ``processing`` is a bug, and raises.
+#:
+#: Derived from :class:`~docverse.models.BuildStatus`'s partition — the
+#: terminal half less ``completed``, which no other actor writes onto a
+#: build this worker is uploading for — so a terminal status added to
+#: the enum is treated as the retirement it is rather than raising.
 _RETIRED_BUILD_STATUSES: frozenset[BuildStatus] = frozenset(
-    {
-        BuildStatus.cancelled,
-        BuildStatus.failed,
-        BuildStatus.superseded,
-    }
+    status
+    for status in BuildStatus
+    if status.is_terminal and status is not BuildStatus.completed
 )
 
 
@@ -555,15 +559,30 @@ async def _process_build_locked(
 
     # Phase 2: Upload files and mark build complete
     try:
-        async with object_store, session.begin():
-            upload = await _process_build(
-                object_store=object_store,
-                build=build,
-                build_store=build_store,
-                org_slug=org_slug,
-                project_slug=project_slug,
-                logger=logger,
-            )
+        async with object_store:
+            async with session.begin():
+                upload = await _process_build(
+                    object_store=object_store,
+                    build=build,
+                    build_store=build_store,
+                    org_slug=org_slug,
+                    project_slug=project_slug,
+                    logger=logger,
+                )
+            # Outside the transaction above on purpose: the delete is a
+            # network call to the object store (botocore defaults to 60 s
+            # connect and read timeouts), and inside that block it would
+            # be made while still holding the ``builds`` row lock the
+            # completion took. Every ``SELECT ... FOR UPDATE`` reader
+            # PRD #577 added — a DELETE request, the stranded-build
+            # sweep, a racing worker's mid-upload guard — would park
+            # behind a call that has nothing to do with the row. The
+            # tarball is dead weight the moment the build is completed,
+            # so dropping it is bookkeeping the commit does not need.
+            if not isinstance(upload, _MidUploadRetirement):
+                await _delete_staging_tarball(
+                    object_store=object_store, build=build, logger=logger
+                )
     except Exception as exc:
         # Phase 3a: Mark queue job and build as failed.
         #
@@ -645,6 +664,100 @@ async def _process_build_locked(
         )
 
 
+async def _delete_staging_tarball(
+    *,
+    object_store: ObjectStore,
+    build: Build,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Drop the staging tarball of a build that has just been completed.
+
+    Called by :func:`_process_build_locked` after the transaction that
+    completed the build has committed, so the object store call is not
+    made under the ``builds`` row lock.
+
+    A failure is logged and swallowed. The build is complete and its
+    content is published-ready either way; failing the job over an
+    undeleted tarball would turn a finished build into an arq retry that
+    re-uploads the whole tree, and the leftover object is reclaimed by
+    the same ``purgatory_cleanup`` sweep (DM-54691) that reclaims the
+    rest of a retired build's storage.
+    """
+    try:
+        await object_store.delete_object(key=build.staging_key)
+    except Exception:
+        logger.warning(
+            "Failed to delete staging tarball",
+            staging_key=build.staging_key,
+            exc_info=True,
+        )
+    else:
+        logger.info("Deleted staging tarball", staging_key=build.staging_key)
+
+
+@dataclass(frozen=True, slots=True)
+class _SkipRecord:
+    """What one pre-work skip has to write on the build's queue job."""
+
+    outcome: _StaleGuardOutcome
+    """The verdict the caller turns into an arq result and metrics."""
+
+    progress: dict[str, Any]
+    """The ``complete`` phase progress payload for the queue job."""
+
+
+async def _record_skip(
+    *,
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    payload: dict[str, Any],
+    queue_job_store: QueueJobStore,
+    retire: Callable[[], Awaitable[_SkipRecord]],
+) -> _StaleGuardOutcome:
+    """Retire a build the pre-work guards refused and complete its job.
+
+    The shared body of :func:`_mark_stale_skipped`,
+    :func:`_mark_deleted_skipped` and :func:`_mark_missing_build_skipped`
+    — three verdicts that differ only in what ``retire`` writes on the
+    build and records for the job, and agree on everything around it.
+
+    ``retire`` runs in the *same* ``session.begin()`` block that
+    completes the queue job, so the build's terminal status and the
+    job's completion commit or roll back together. Skipping a build
+    without retiring it is what stranded rows in ``processing`` forever
+    (#575): with no worker on the build and no job left to run,
+    ``processing`` was a lie no later path would correct.
+
+    The pickup guard runs before any of that, and a row it refuses
+    (task #551) short-circuits to ``late_delivery`` with nothing written
+    and nothing logged as skipped: the row is terminal or in another
+    worker's hands, so this delivery has neither a skip to record nor
+    any business retiring the build. A delivery with no ``queue_jobs``
+    row at all still counts as a recorded skip — the build is retired
+    either way, there is simply no job bookkeeping to do.
+
+    Parameters
+    ----------
+    retire
+        Writes the build's terminal status (where there is a build left
+        to write one on) and reports what the job should record.
+    """
+    async with session.begin():
+        pickup = await _start_queue_job(ctx, payload, queue_job_store)
+        if pickup.skipped:
+            return _StaleGuardOutcome.late_delivery
+        record = await retire()
+        if pickup.queue_job_id is not None:
+            queue_job_id = pickup.queue_job_id
+            await queue_job_store.update_phase(
+                queue_job_id,
+                "complete",
+                progress=record.progress,
+            )
+            await queue_job_store.complete(queue_job_id)
+    return record.outcome
+
+
 async def _mark_stale_skipped(
     *,
     session: AsyncSession,
@@ -665,13 +778,6 @@ async def _mark_stale_skipped(
     because nothing was wrong with the build itself — a newer build
     for the same ``(project, git_ref)`` simply took over.
 
-    The build itself is transitioned to ``superseded`` in the *same*
-    ``session.begin()`` block that completes the job, so the two commit
-    or roll back together. Skipping the build without retiring it is
-    what stranded rows in ``processing`` forever (#575): with no worker
-    on the build and no job left to run, ``processing`` was a lie no
-    later path would correct.
-
     The transition goes through
     :meth:`BuildService.supersede_if_unfinished` rather than the strict
     :meth:`~BuildService.supersede`, because the verdict this acts on
@@ -688,19 +794,9 @@ async def _mark_stale_skipped(
     naming the status that was actually found; the follow-up read is
     safe because ``supersede_if_unfinished`` took the row lock and this
     transaction still holds it.
-
-    The pickup guard runs before any of that, and a row it refuses
-    (task #551) short-circuits to ``late_delivery`` with nothing written
-    and nothing logged as skipped: the row is terminal or in another
-    worker's hands, so this delivery has neither a stale skip to record
-    nor any business retiring the build. A delivery with no
-    ``queue_jobs`` row at all still counts as a recorded skip — the
-    build is still superseded, there is simply no job bookkeeping to do.
     """
-    async with session.begin():
-        pickup = await _start_queue_job(ctx, payload, queue_job_store)
-        if pickup.skipped:
-            return _StaleGuardOutcome.late_delivery
+
+    async def _retire() -> _SkipRecord:
         build_service = factory.create_build_service()
         superseded = await build_service.supersede_if_unfinished(
             build_id=build_id,
@@ -717,32 +813,34 @@ async def _mark_stale_skipped(
                 latest_build_id=latest_build_id,
                 build_status=status.value if status is not None else None,
             )
-            outcome = _StaleGuardOutcome.retired_before_skip
-            progress = _retired_build_progress(status)
-        else:
-            logger.info(
-                "Stale build skipped",
-                build_id=build_id,
-                latest_build_id=latest_build_id,
+            return _SkipRecord(
+                outcome=_StaleGuardOutcome.retired_before_skip,
+                progress=_retired_build_progress(status),
             )
-            outcome = _StaleGuardOutcome.stale_skipped
-            progress = {
+        logger.info(
+            "Stale build skipped",
+            build_id=build_id,
+            latest_build_id=latest_build_id,
+        )
+        return _SkipRecord(
+            outcome=_StaleGuardOutcome.stale_skipped,
+            progress={
                 "message": (
                     "Stale build skipped; superseded by "
                     f"build id {latest_build_id}"
                 ),
                 "stale_skipped": True,
                 "latest_build_id": latest_build_id,
-            }
-        if pickup.queue_job_id is not None:
-            queue_job_id = pickup.queue_job_id
-            await queue_job_store.update_phase(
-                queue_job_id,
-                "complete",
-                progress=progress,
-            )
-            await queue_job_store.complete(queue_job_id)
-    return outcome
+            },
+        )
+
+    return await _record_skip(
+        session=session,
+        ctx=ctx,
+        payload=payload,
+        queue_job_store=queue_job_store,
+        retire=_retire,
+    )
 
 
 async def _mark_deleted_skipped(
@@ -759,11 +857,9 @@ async def _mark_deleted_skipped(
 ) -> _StaleGuardOutcome:
     """Retire a build deleted before processing and complete its QueueJob.
 
-    Mirrors :func:`_mark_stale_skipped` — same pickup guard, same
-    completed job, same single ``session.begin()`` block so the job
-    completion and the build transition commit or roll back together —
-    and differs only in what it records: ``progress["deleted_skipped"]``
-    and a transition to ``cancelled`` rather than ``superseded``.
+    Differs from :func:`_mark_stale_skipped` only in what it records:
+    ``progress["deleted_skipped"]`` and a transition to ``cancelled``
+    rather than ``superseded``.
 
     The cancel is idempotent. ``BuildService.soft_delete`` cancels a
     non-terminal build as it deletes it, so the common ordering leaves
@@ -773,10 +869,8 @@ async def _mark_deleted_skipped(
     needs the transition. Either way the build must not be published,
     and nothing is downloaded, unpacked, uploaded or tracked.
     """
-    async with session.begin():
-        pickup = await _start_queue_job(ctx, payload, queue_job_store)
-        if pickup.skipped:
-            return _StaleGuardOutcome.late_delivery
+
+    async def _retire() -> _SkipRecord:
         logger.info("Deleted build skipped", build_id=build_id)
         build_service = factory.create_build_service()
         await build_service.cancel(
@@ -784,18 +878,21 @@ async def _mark_deleted_skipped(
             org_slug=org_slug,
             project_slug=project_slug,
         )
-        if pickup.queue_job_id is not None:
-            queue_job_id = pickup.queue_job_id
-            await queue_job_store.update_phase(
-                queue_job_id,
-                "complete",
-                progress={
-                    "message": "Build was deleted before processing",
-                    "deleted_skipped": True,
-                },
-            )
-            await queue_job_store.complete(queue_job_id)
-    return _StaleGuardOutcome.deleted_skipped
+        return _SkipRecord(
+            outcome=_StaleGuardOutcome.deleted_skipped,
+            progress={
+                "message": "Build was deleted before processing",
+                "deleted_skipped": True,
+            },
+        )
+
+    return await _record_skip(
+        session=session,
+        ctx=ctx,
+        payload=payload,
+        queue_job_store=queue_job_store,
+        retire=_retire,
+    )
 
 
 async def _mark_missing_build_skipped(
@@ -810,10 +907,10 @@ async def _mark_missing_build_skipped(
     """Close a job out whose build vanished before any work started.
 
     The third sibling of :func:`_mark_stale_skipped` and
-    :func:`_mark_deleted_skipped`: same pickup guard, same completed
-    job. It differs in having no build to transition — the row is gone,
-    so there is no status to write and nothing to lock. Both siblings
-    would raise on that: ``cancel`` and ``supersede`` need a row.
+    :func:`_mark_deleted_skipped`, and the one with no build to
+    transition — the row is gone, so there is no status to write and
+    nothing to lock. Both siblings would raise on that: ``cancel`` and
+    ``supersede`` need a row.
 
     The job carries the same missing-row progress
     :func:`_close_out_retired_build` writes when a row disappears
@@ -821,23 +918,24 @@ async def _mark_missing_build_skipped(
     same event; only the amount of wasted work differs, and the point of
     guarding here is that this one wastes none.
     """
-    async with session.begin():
-        pickup = await _start_queue_job(ctx, payload, queue_job_store)
-        if pickup.skipped:
-            return _StaleGuardOutcome.late_delivery
+
+    async def _retire() -> _SkipRecord:
         logger.info(
             "Build row disappeared before processing; closing its job out",
             build_id=build_id,
         )
-        if pickup.queue_job_id is not None:
-            queue_job_id = pickup.queue_job_id
-            await queue_job_store.update_phase(
-                queue_job_id,
-                "complete",
-                progress=_retired_build_progress(None),
-            )
-            await queue_job_store.complete(queue_job_id)
-    return _StaleGuardOutcome.vanished_before_work
+        return _SkipRecord(
+            outcome=_StaleGuardOutcome.vanished_before_work,
+            progress=_retired_build_progress(None),
+        )
+
+    return await _record_skip(
+        session=session,
+        ctx=ctx,
+        payload=payload,
+        queue_job_store=queue_job_store,
+        retire=_retire,
+    )
 
 
 def _retired_build_progress(
@@ -1523,15 +1621,5 @@ async def _process_build(
         org_slug=org_slug,
         project_slug=project_slug,
     )
-
-    try:
-        await object_store.delete_object(key=build.staging_key)
-        logger.info("Deleted staging tarball", staging_key=build.staging_key)
-    except Exception:
-        logger.warning(
-            "Failed to delete staging tarball",
-            staging_key=build.staging_key,
-            exc_info=True,
-        )
 
     return object_count, total_size

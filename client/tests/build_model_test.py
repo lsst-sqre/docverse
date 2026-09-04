@@ -94,3 +94,39 @@ def test_build_model_validates_new_terminal_statuses() -> None:
             }
         )
         assert build.status is status
+
+
+def test_status_partition_covers_every_member() -> None:
+    """Every status is exactly one of unfinished, terminal, or the signal.
+
+    ``is_unfinished`` and ``is_terminal`` are the single definition of
+    the partition the server's transition table, retirement helpers and
+    ``build_processing`` worker all branch on, so a status added to the
+    enum without a place in it is a bug waiting to happen: the server
+    would treat the newcomer as live *and* refuse every transition out
+    of it. ``uploaded`` is deliberately in neither half — it is a PATCH
+    signal value that is never persisted on a row.
+    """
+    for status in BuildStatus:
+        if status is BuildStatus.uploaded:
+            assert not status.is_unfinished
+            assert not status.is_terminal
+        else:
+            assert status.is_unfinished is not status.is_terminal
+
+
+def test_unfinished_statuses_are_the_ones_a_build_can_leave() -> None:
+    """Only ``pending`` and ``processing`` mean the build is still live."""
+    unfinished = {status for status in BuildStatus if status.is_unfinished}
+    assert unfinished == {BuildStatus.pending, BuildStatus.processing}
+
+
+def test_terminal_statuses_are_the_build_s_final_answer() -> None:
+    """The four never-leave statuses are the terminal half."""
+    terminal = {status for status in BuildStatus if status.is_terminal}
+    assert terminal == {
+        BuildStatus.completed,
+        BuildStatus.failed,
+        BuildStatus.superseded,
+        BuildStatus.cancelled,
+    }

@@ -4289,3 +4289,158 @@ async def test_build_processing_holds_the_build_across_its_completion(
             # status the worker had already earned.
             assert refreshed.date_deleted is not None
         break
+
+
+@pytest.mark.asyncio
+async def test_staging_delete_runs_after_the_completion_commits(
+    app: None,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staging tarball is dropped outside the builds row lock.
+
+    Deleting the object inside the transaction that completes the build
+    holds the ``builds`` row lock across a network call to the object
+    store — botocore's default timeouts are 60 s apiece — and every
+    ``SELECT ... FOR UPDATE`` reader added by PRD #577 now parks behind
+    it: a DELETE request, the stranded-build sweep, a racing worker's
+    mid-upload guard. The delete is bookkeeping about an object nobody
+    reads again, so it belongs after the commit.
+
+    Asserted from a *separate* session: the completed row is only
+    visible to it once this worker's transaction has committed.
+    """
+    logger = _logger()
+    observed: list[BuildStatus | None] = []
+
+    class _ProbingObjectStore(MockObjectStore):
+        """Reads the build's committed status as the tarball is deleted."""
+
+        async def delete_object(self, *, key: str) -> None:
+            async with db_session_factory() as reader:
+                store = BuildStore(session=reader, logger=logger)
+                row = await store.get_by_id(build.id)
+                observed.append(row.status if row is not None else None)
+            await super().delete_object(key=key)
+
+    mock_store = _ProbingObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(db_session, project.id)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-staging-delete",
+        )
+
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball({"index.html": b"<html>hi</html>"}),
+        content_type="application/gzip",
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-staging-delete",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert observed == [BuildStatus.completed]
+    assert build.staging_key not in mock_store.objects
+
+
+@pytest.mark.asyncio
+async def test_failed_staging_delete_still_completes_the_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staging-delete failure is logged and does not fail the job.
+
+    The tarball is dead weight the moment the build is completed, and
+    the delete now runs after the transaction that says so has
+    committed. An object store that refuses it must not turn a finished
+    build into a failed one — nor into a retry, which would re-upload
+    the whole tree.
+    """
+    logger = _logger()
+
+    class _RefusingObjectStore(MockObjectStore):
+        async def delete_object(self, *, key: str) -> None:
+            msg = f"object store refused to delete {key}"
+            raise RuntimeError(msg)
+
+    mock_store = _RefusingObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(db_session, project.id)
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-staging-delete-fails",
+        )
+
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball({"index.html": b"<html>hi</html>"}),
+        content_type="application/gzip",
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-staging-delete-fails",
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+    with capture_logs() as logs:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert any(
+        entry["event"] == "Failed to delete staging tarball" for entry in logs
+    )
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = BuildStore(session=session, logger=logger)
+            row = await store.get_by_id(build.id)
+            assert row is not None
+            assert row.status == BuildStatus.completed
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get_by_backend_job_id("test-staging-delete-fails")
+            assert job is not None
+            assert job.status == JobStatus.completed

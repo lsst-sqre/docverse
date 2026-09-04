@@ -31,7 +31,7 @@ from docverse_server.domain.base32id import (
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.exceptions import InvalidBuildStateError
-from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.build_store import _VALID_TRANSITIONS, BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.rowlocks import backend_pid, wait_until_blocked_on_lock
@@ -1003,7 +1003,9 @@ async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
     original = BuildStore.transition_status
     raced = False
 
-    async def racing_transition(self: BuildStore, **kwargs: Any) -> Build:
+    async def racing_transition(
+        self: BuildStore, **kwargs: Any
+    ) -> Build | None:
         nonlocal raced
         if not raced:
             raced = True
@@ -1014,7 +1016,11 @@ async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
                 await other_store.transition_status(
                     build_id=second.id, new_status=BuildStatus.cancelled
                 )
-        return await original(self, **kwargs)
+        # Annotated rather than returned straight through: the overloads
+        # on ``transition_status`` make a ``**kwargs`` call resolve to
+        # ``Any``, and this is the real return type of the strict form.
+        transitioned: Build | None = await original(self, **kwargs)
+        return transitioned
 
     monkeypatch.setattr(BuildStore, "transition_status", racing_transition)
 
@@ -1180,3 +1186,20 @@ async def test_transition_status_cannot_overwrite_a_committed_terminal(
         assert row is not None
         assert row.status == BuildStatus.completed
         assert row.date_completed is not None
+
+
+def test_transition_table_covers_exactly_the_unfinished_statuses() -> None:
+    """Every status with outbound edges is one ``BuildStatus`` calls live.
+
+    The transition table lists edges per starting status and cannot be
+    derived from the partition — the two live statuses lead to different
+    places. Its *keys*, though, are the partition, and the two drifting
+    apart is a silent bug in both directions: a terminal status that
+    grew an edge could be transitioned out of after
+    ``date_completed`` was stamped, and a live status left out of the
+    table would reject every transition, stranding the build with no
+    path forward.
+    """
+    assert set(_VALID_TRANSITIONS) == {
+        status for status in BuildStatus if status.is_unfinished
+    }

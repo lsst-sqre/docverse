@@ -34,7 +34,11 @@ from docverse_server.services.build import BuildService
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from tests.support.rowlocks import backend_pid, wait_until_blocked_on_lock
+from tests.support.rowlocks import (
+    backend_pid,
+    record_statements,
+    wait_until_blocked_on_lock,
+)
 
 _HASH = "sha256:" + "b" * 64
 _config = Configuration()
@@ -510,3 +514,136 @@ async def test_cancel_if_unfinished_holds_the_row_against_a_completion(
     assert observed is not None
     assert observed.status == BuildStatus.cancelled
     assert observed.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_if_unfinished_takes_one_locked_read_and_one_write(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The retirement is a single locked read-then-write on the row.
+
+    ``cancel_if_unfinished`` used to reach the same answer through three
+    ``SELECT ... FOR UPDATE`` on the same row — its own guard read, the
+    idempotency read inside ``cancel``, and the store's own — plus a
+    ``refresh`` afterwards. Every one of those held the row for longer
+    than the decision needed, and a DELETE holds it until the request's
+    transaction commits, so the extra statements are extra time a worker
+    trying to complete the same build spends parked.
+
+    Pushing the guard down into ``BuildStore.transition_status`` as
+    ``only_from`` makes the read that decides and the write that acts one
+    statement pair, which is the smallest a locked read-then-write can
+    be.
+    """
+    build = await _seed_processing_build(db_session)
+
+    async with db_session.begin():
+        service = _build_service(db_session)
+        with record_statements(db_session) as statements:
+            cancelled = await service.cancel_if_unfinished(build_id=build.id)
+        await db_session.commit()
+
+    assert cancelled is not None
+    assert cancelled.status == BuildStatus.cancelled
+
+    locked_reads = [
+        statement
+        for statement in statements
+        if "FROM builds" in statement and "FOR UPDATE" in statement
+    ]
+    writes = [
+        statement
+        for statement in statements
+        if statement.startswith("UPDATE builds")
+    ]
+    assert len(locked_reads) == 1, statements
+    assert len(writes) == 1, statements
+    assert len(statements) == 2, statements
+
+
+@pytest.mark.asyncio
+async def test_cancel_if_unfinished_stands_down_after_one_locked_read(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Standing down costs one locked read and no write at all."""
+    build = await _seed_processing_build(db_session)
+    async with db_session.begin():
+        service = _build_service(db_session)
+        await service.cancel(build_id=build.id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        service = _build_service(db_session)
+        with record_statements(db_session) as statements:
+            stood_down = await service.cancel_if_unfinished(build_id=build.id)
+    assert stood_down is None
+
+    assert len(statements) == 1, statements
+    assert "FOR UPDATE" in statements[0]
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_by_id_cancels_and_deletes(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The internal-id entry point pairs the cancel with the delete.
+
+    ``lifecycle_eval`` reaps builds it holds internal ids for and used to
+    inline this pairing itself. Sharing the service method is what keeps
+    "deleted implies finished" true however a row was deleted.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        service = _build_service(db_session)
+        assert await service.soft_delete_by_id(build_id=build.id) is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        row = await store.get_by_id(build.id)
+        assert row is not None
+        assert row.status == BuildStatus.cancelled
+        assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_by_id_keeps_an_earned_terminal_status(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A finished build is only stamped, never re-retired."""
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.completed)
+        service = _build_service(db_session)
+        assert await service.soft_delete_by_id(build_id=build.id) is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        row = await store.get_by_id(build.id)
+        assert row is not None
+        assert row.status == BuildStatus.completed
+        assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_by_id_reports_a_row_it_did_not_delete(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A row already in purgatory is reported rather than deleted twice.
+
+    The lifecycle reaper evaluates rules against rows it loaded earlier
+    in the run, so it can match a build a DELETE has since removed; it
+    skips the row on this answer rather than logging a reap that did not
+    happen.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        service = _build_service(db_session)
+        assert await service.soft_delete_by_id(build_id=build.id) is True
+        assert await service.soft_delete_by_id(build_id=build.id) is False
+        await db_session.commit()

@@ -105,6 +105,14 @@ class BuildStatus(StrEnum):
       the build; it will never be published.
     - ``cancelled`` — the build was deleted before processing finished.
       It will never be published.
+
+    The members split into two halves plus one signal value, and
+    :attr:`is_unfinished` / :attr:`is_terminal` are the single
+    definition of that split. Server-side it decides which statuses a
+    transition may start from, which ones stamp ``date_completed``, and
+    which ones make a retirement helper stand down rather than write;
+    client-side it is what "has this build stopped moving?" means to
+    anything polling a build.
     """
 
     pending = "pending"
@@ -114,6 +122,53 @@ class BuildStatus(StrEnum):
     failed = "failed"
     superseded = "superseded"
     cancelled = "cancelled"
+
+    @property
+    def is_unfinished(self) -> bool:
+        """Whether the build can still leave this status on its own.
+
+        True for exactly the statuses that mean somebody is still going
+        to act on the build: it is waiting for a worker, or a worker has
+        it. False for :attr:`uploaded`, which is a request signal rather
+        than a state a row is ever found in.
+        """
+        return self in _UNFINISHED_BUILD_STATUSES
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether this status is the build's final answer.
+
+        A terminal build keeps the status it earned: nothing in the
+        server transitions out of one, and every entry into one stamps
+        ``date_completed``. :attr:`uploaded` is not terminal either — a
+        build is never persisted in it.
+        """
+        return self in _TERMINAL_BUILD_STATUSES
+
+
+_UNFINISHED_BUILD_STATUSES: frozenset[BuildStatus] = frozenset(
+    {BuildStatus.pending, BuildStatus.processing}
+)
+"""The only statuses a build can still leave under its own power.
+
+The one hand-maintained half of the partition; everything else is
+derived from it, so a status added to :class:`BuildStatus` lands in
+:data:`_TERMINAL_BUILD_STATUSES` unless it is listed here.
+"""
+
+_TERMINAL_BUILD_STATUSES: frozenset[BuildStatus] = (
+    frozenset(BuildStatus)
+    - _UNFINISHED_BUILD_STATUSES
+    - {BuildStatus.uploaded}
+)
+"""Statuses a build never leaves once it has them.
+
+Derived rather than listed so it cannot drift from
+:data:`_UNFINISHED_BUILD_STATUSES`. ``uploaded`` is subtracted because
+it is a PATCH signal the server turns into ``processing`` — it is never
+written to a row, so calling it terminal would be a lie the retirement
+helpers would act on.
+"""
 
 
 class BuildCreate(BaseModel):

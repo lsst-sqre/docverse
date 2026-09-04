@@ -1,4 +1,4 @@
-"""Helpers for driving row-lock races between two database sessions.
+"""Helpers for reasoning about row locks a database session takes.
 
 A test that has to prove two transactions cannot both win a
 read-then-write needs a way to say "the second session is now parked on
@@ -11,20 +11,31 @@ Scoping the poll to one PID matters. Waiting for "some backend is
 blocked" would also be satisfied before the racing session had issued
 its statement at all, which would let the race be won by default and
 quietly stop testing the thing under test.
+
+`record_statements` answers the other question a locking test asks: not
+"who blocked" but "how many locked reads did this path take". A helper
+that reads a row under ``SELECT ... FOR UPDATE`` once and writes it once
+holds the lock for the shortest window it can; one that re-reads the
+same row under the same lock three times has the same *result* and is
+only visible as extra statements.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
     "LOCK_WAIT_POLL_INTERVAL",
     "LOCK_WAIT_TIMEOUT",
     "backend_pid",
+    "record_statements",
     "wait_until_blocked_on_lock",
     "wait_until_blocked_or_finished",
 ]
@@ -159,3 +170,48 @@ async def wait_until_blocked_or_finished(
             )
             raise AssertionError(msg)
         await asyncio.sleep(LOCK_WAIT_POLL_INTERVAL)
+
+
+@contextmanager
+def record_statements(session: AsyncSession) -> Iterator[list[str]]:
+    """Collect the SQL statements issued while the block runs.
+
+    Listens on the engine behind ``session``, so a test that wants to
+    count one code path's statements must be the only thing using that
+    engine for the duration — which is the normal shape of a
+    single-session test.
+
+    Parameters
+    ----------
+    session
+        The session whose engine to listen on.
+
+    Yields
+    ------
+    list of str
+        Statement texts, whitespace-collapsed onto one line so a test
+        can match on substrings like ``"FOR UPDATE"`` without caring
+        where SQLAlchemy wrapped the SQL. The list fills as the block
+        runs and is complete when it exits.
+    """
+    engine = session.sync_session.get_bind().engine
+    statements: list[str] = []
+
+    # SQLAlchemy calls the listener with this fixed positional
+    # signature, so the argument-count and boolean-argument rules have
+    # nothing to say about it.
+    def _record(  # noqa: PLR0917
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,  # noqa: FBT001
+    ) -> None:
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import overload
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
@@ -22,10 +23,14 @@ from docverse_server.storage._public_id import (
 )
 from docverse_server.storage.pagination import BuildDateCreatedCursor
 
-# Valid status transitions. Every status absent from this mapping is
-# terminal — ``completed``, ``failed``, ``superseded`` and ``cancelled``
-# all reject any further transition, which is what lets a reader treat
-# them as final answers about the build.
+# Valid status transitions, keyed by the status a build is leaving. The
+# keys are exactly the statuses ``BuildStatus.is_unfinished`` calls live
+# — the edges themselves cannot be derived, since the two live statuses
+# lead to different places, but which statuses *have* edges is the same
+# partition the service's retirement helpers and the worker branch on
+# (pinned by ``tests/storage/build_store_test.py``). Everything absent
+# is terminal and rejects any further transition, which is what lets a
+# reader treat it as a final answer about the build.
 _VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.pending: {
         BuildStatus.processing,
@@ -39,17 +44,6 @@ _VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
         BuildStatus.cancelled,
     },
 }
-
-# Statuses whose entry stamps ``date_completed``: the build is finished
-# with, whether or not it was ever published.
-_TERMINAL_STATUSES: frozenset[BuildStatus] = frozenset(
-    {
-        BuildStatus.completed,
-        BuildStatus.failed,
-        BuildStatus.superseded,
-        BuildStatus.cancelled,
-    }
-)
 
 
 class BuildStore:
@@ -362,16 +356,43 @@ class BuildStore:
             self._session, stmt, cursor=cursor, limit=limit
         )
 
+    @overload
     async def transition_status(
         self,
         *,
         build_id: int,
         new_status: BuildStatus,
         content_hash: str | None = None,
+        only_from: None = None,
         org_slug: str | None = None,
         project_slug: str | None = None,
         edition_slug: str | None = None,
-    ) -> Build:
+    ) -> Build: ...
+
+    @overload
+    async def transition_status(
+        self,
+        *,
+        build_id: int,
+        new_status: BuildStatus,
+        content_hash: str | None = None,
+        only_from: frozenset[BuildStatus],
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
+    ) -> Build | None: ...
+
+    async def transition_status(
+        self,
+        *,
+        build_id: int,
+        new_status: BuildStatus,
+        content_hash: str | None = None,
+        only_from: frozenset[BuildStatus] | None = None,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+        edition_slug: str | None = None,
+    ) -> Build | None:
         """Transition a build to a new status.
 
         Validates the transition is allowed. Sets ``date_uploaded`` on
@@ -398,10 +419,31 @@ class BuildStore:
         API-facing identifiers carried into :class:`InvalidBuildStateError`
         so a Sentry triager sees slugs rather than internal row ids.
 
+        ``only_from`` turns the transition into a best-effort one: the
+        locked read this method already takes decides whether the write
+        happens at all, and a row outside the set — or gone — is left as
+        it stands and reported with ``None`` rather than an exception.
+        That is what the service's retirement helpers
+        (:meth:`~docverse_server.services.build.BuildService.cancel_if_unfinished`
+        and its siblings) need, and doing it here rather than in a
+        caller's own pre-read is the difference between one
+        ``SELECT ... FOR UPDATE`` on the row and two: the decision and
+        the write are the same statement pair, so the lock is held for
+        the shortest window that still makes them atomic. Omit it for
+        the strict paths, which want :exc:`InvalidBuildStateError` and a
+        Sentry event when the row is not where they think it is.
+
+        Returns
+        -------
+        Build or None
+            The transitioned build. ``None`` only when ``only_from`` was
+            given and the row was outside it, or had vanished.
+
         Raises
         ------
         InvalidBuildStateError
-            If the build is not found or the transition is not valid.
+            If the build is not found or the transition is not valid,
+            and ``only_from`` was not given.
         ValueError
             If ``content_hash`` is passed with a target other than
             ``completed``.
@@ -423,6 +465,13 @@ class BuildStore:
         # overwrite each other. See :meth:`_load_locked`.
         row = await self._load_locked(build_id)
         if row is None:
+            if only_from is not None:
+                self._logger.info(
+                    "Build row is gone; leaving its transition unwritten",
+                    build_id=build_id,
+                    target_status=new_status.value,
+                )
+                return None
             raise InvalidBuildStateError(
                 target_state=new_status.value,
                 org_slug=org_slug,
@@ -433,6 +482,16 @@ class BuildStore:
 
         current = BuildStatus(row.status)
         build_public_id = serialize_base32_id(row.public_id)
+        if only_from is not None and current not in only_from:
+            self._logger.info(
+                "Build is outside this transition's starting statuses; "
+                "leaving its status as it stands",
+                build_id=build_id,
+                build=build_public_id,
+                status=current.value,
+                target_status=new_status.value,
+            )
+            return None
         allowed = _VALID_TRANSITIONS.get(current, set())
         if new_status not in allowed:
             raise InvalidBuildStateError(
@@ -449,14 +508,19 @@ class BuildStore:
 
         if new_status == BuildStatus.processing:
             row.date_uploaded = now
-        elif new_status in _TERMINAL_STATUSES:
+        elif new_status.is_terminal:
             row.date_completed = now
 
         if content_hash is not None:
             row.content_hash = content_hash
 
+        # No ``refresh`` afterwards: ``_load_locked`` asked for the
+        # row's values outright, every column written above was written
+        # from Python, and nothing on ``builds`` has a server-side
+        # ``onupdate``, so a re-read would return exactly what is
+        # already loaded — a third statement inside the row lock for no
+        # new information.
         await self._session.flush()
-        await self._session.refresh(row)
         return Build.model_validate(row)
 
     async def fail_stranded_processing(

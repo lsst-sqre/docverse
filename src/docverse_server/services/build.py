@@ -19,15 +19,18 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
 
-# The two statuses a build can still leave under its own power: it is
+# The statuses a build can still leave under its own power: it is
 # waiting for a worker, or a worker has it. Everything else is terminal
 # and keeps the status it earned, which is why the retirement helpers
-# below (:meth:`BuildService.cancel_if_unfinished` and
-# :meth:`BuildService.fail_if_unfinished`) test membership here before
-# writing. Only these two would otherwise leave a retired build claiming
-# to be waiting for, or held by, a worker.
+# below (:meth:`BuildService.cancel_if_unfinished` and its siblings)
+# restrict their transition to these before writing. Only these would
+# otherwise leave a retired build claiming to be waiting for, or held
+# by, a worker.
+#
+# Derived from :class:`~docverse.models.BuildStatus`, which owns the one
+# definition of the partition, rather than listed again here.
 _UNFINISHED_STATUSES: frozenset[BuildStatus] = frozenset(
-    {BuildStatus.pending, BuildStatus.processing}
+    status for status in BuildStatus if status.is_unfinished
 )
 
 
@@ -315,6 +318,61 @@ class BuildService:
         )
         return build
 
+    async def _retire_if_unfinished(
+        self,
+        *,
+        build_id: int,
+        new_status: BuildStatus,
+        org_slug: str | None,
+        project_slug: str | None,
+    ) -> Build | None:
+        """Move an unfinished build to a terminal status, or stand down.
+
+        The one implementation behind :meth:`cancel_if_unfinished`,
+        :meth:`fail_if_unfinished` and :meth:`supersede_if_unfinished`.
+        All three ask the same question of the same row and differ only
+        in the status they write, so they share the read that decides
+        and the write that acts: ``only_from`` runs the guard inside
+        :meth:`BuildStore.transition_status`, under the row lock that
+        method already takes, which is one ``SELECT ... FOR UPDATE`` and
+        one ``UPDATE`` rather than a pre-read per layer.
+
+        Reading the status *under the lock* is the point, not an
+        optimisation. Every caller here decides what to write from what
+        it reads, and the two are not otherwise atomic: a worker
+        committing a completion between an unlocked read and the write
+        would leave this asking for a transition the row can no longer
+        make, and :exc:`InvalidBuildStateError` would come out of a path
+        that has a perfectly good answer — leave the earned status
+        alone. Holding the lock to the end of the caller's transaction
+        also means a writer racing the other way blocks and then sees
+        what this wrote.
+
+        The stand-down is logged by the store, which is where the status
+        that was actually found is in hand.
+
+        Returns
+        -------
+        Build or None
+            The retired build, or ``None`` when the row had already
+            reached a terminal status (or vanished) and was left as it
+            stands.
+        """
+        build = await self._store.transition_status(
+            build_id=build_id,
+            new_status=new_status,
+            only_from=_UNFINISHED_STATUSES,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+        if build is None:
+            return None
+        self._logger.info(
+            f"Build {new_status.value}",
+            build=serialize_base32_id(build.public_id),
+        )
+        return build
+
     async def cancel_if_unfinished(
         self,
         *,
@@ -327,22 +385,14 @@ class BuildService:
         The retirement half of a soft-delete, for the callers that hold
         an internal build id and must not disturb a build that already
         reached ``completed``, ``failed`` or ``superseded``: the DELETE
-        handler by way of :meth:`soft_delete`, and the lifecycle
-        reaper's build-history-orphan rule, which matches never-finished
-        builds by design (it falls back to ``date_created`` when there
-        is no ``date_completed``).
+        handler and the lifecycle reaper by way of
+        :meth:`soft_delete_by_id`, the latter's build-history-orphan
+        rule matching never-finished builds by design (it falls back to
+        ``date_created`` when there is no ``date_completed``).
 
-        The status is re-read here rather than trusted from the caller's
-        snapshot, because a lifecycle tick evaluates rules against rows
-        it loaded earlier in the run. It is re-read *under the row lock*
-        because the answer decides what gets written next: a worker
-        committing a completion between an unlocked read and the cancel
-        would leave this asking for a transition the row can no longer
-        make, and :exc:`InvalidBuildStateError` would come out of a
-        DELETE that has a perfectly good answer — leave the earned
-        status alone and soft-delete. Holding the lock to the end of the
-        caller's transaction also means a worker racing the other way
-        blocks and sees ``cancelled``.
+        The status is re-read by :meth:`_retire_if_unfinished` rather
+        than trusted from the caller's snapshot, because a lifecycle
+        tick evaluates rules against rows it loaded earlier in the run.
 
         Returns
         -------
@@ -350,11 +400,9 @@ class BuildService:
             The cancelled build, or ``None`` when the row had already
             finished (or vanished) and was left as it stands.
         """
-        existing = await self._store.get_for_update(build_id=build_id)
-        if existing is None or existing.status not in _UNFINISHED_STATUSES:
-            return None
-        return await self.cancel(
+        return await self._retire_if_unfinished(
             build_id=build_id,
+            new_status=BuildStatus.cancelled,
             org_slug=org_slug,
             project_slug=project_slug,
         )
@@ -377,12 +425,6 @@ class BuildService:
         leaving the job stranded ``in_progress`` — the state this whole
         change set exists to remove.
 
-        The read is locked for the same reason
-        :meth:`cancel_if_unfinished`'s is: the status it returns decides
-        whether a write happens at all, and an unlocked one could be
-        stale by the time :meth:`fail` acted on it — which would raise
-        the very error this method exists to avoid.
-
         Returns
         -------
         Build or None
@@ -390,16 +432,9 @@ class BuildService:
             reached a terminal status (or vanished) and keeps the status
             it earned.
         """
-        existing = await self._store.get_for_update(build_id=build_id)
-        if existing is None or existing.status not in _UNFINISHED_STATUSES:
-            self._logger.info(
-                "Build already terminal; leaving its status as it stands",
-                build_id=build_id,
-                status=existing.status.value if existing is not None else None,
-            )
-            return None
-        return await self.fail(
+        return await self._retire_if_unfinished(
             build_id=build_id,
+            new_status=BuildStatus.failed,
             org_slug=org_slug,
             project_slug=project_slug,
         )
@@ -427,17 +462,12 @@ class BuildService:
         cancel leaves no ``date_deleted`` for the deleted-skip path to
         catch (#590).
 
-        The read is locked for the same reason its siblings' are: the
-        status it returns decides whether a write happens at all, so it
-        has to be the status as the row stands, not a snapshot a
-        concurrent writer may already have moved past.
-
         Only ``processing`` builds actually reach this: a build's job is
         enqueued by :meth:`signal_upload_complete`, which transitions it
         out of ``pending`` first. A ``pending`` build is still
-        *unfinished*, so it is passed through to :meth:`supersede`,
-        which reports the missing ``pending -> superseded`` edge rather
-        than silently leaving a live build stranded.
+        *unfinished*, so it is passed through to the transition, which
+        reports the missing ``pending -> superseded`` edge rather than
+        silently leaving a live build stranded.
 
         Returns
         -------
@@ -446,19 +476,71 @@ class BuildService:
             reached a terminal status (or vanished) and keeps the status
             it earned.
         """
-        existing = await self._store.get_for_update(build_id=build_id)
-        if existing is None or existing.status not in _UNFINISHED_STATUSES:
-            self._logger.info(
-                "Build already terminal; leaving its status as it stands",
-                build_id=build_id,
-                status=existing.status.value if existing is not None else None,
-            )
-            return None
-        return await self.supersede(
+        return await self._retire_if_unfinished(
+            build_id=build_id,
+            new_status=BuildStatus.superseded,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+
+    async def soft_delete_by_id(
+        self,
+        *,
+        build_id: int,
+        org_slug: str | None = None,
+        project_slug: str | None = None,
+    ) -> bool:
+        """Soft-delete a build by internal id, retiring it on the way out.
+
+        The one place the "deleted implies finished" pairing lives. A
+        ``pending`` or ``processing`` build is transitioned to
+        ``cancelled`` in the same transaction that stamps
+        ``date_deleted``, so no reader ever sees a deleted build still
+        claiming a worker is on it; a build that already reached
+        ``completed``, ``failed`` or ``superseded`` keeps the status it
+        earned and only gains ``date_deleted``.
+
+        Both callers come through here — :meth:`soft_delete` for a
+        DELETE request, and the ``lifecycle_eval`` reaper, which holds
+        internal ids and matches never-finished builds by design (its
+        build-history-orphan rule falls back to ``date_created`` when
+        there is no ``date_completed``). Doing the pairing in one place
+        is what keeps a reaped row from being left deleted while still
+        claiming to be waiting for, or held by, a worker — the
+        stranded-build sweep only looks at live rows, so nothing would
+        come back for it.
+
+        The worker's deleted-self guard cancels too, and either side may
+        run second; the cancel stands down rather than raising when it
+        finds the row already retired.
+
+        Returns
+        -------
+        bool
+            True if this call soft-deleted the row, False if there was
+            no live row left to delete.
+        """
+        build = await self.cancel_if_unfinished(
             build_id=build_id,
             org_slug=org_slug,
             project_slug=project_slug,
         )
+        if build is None:
+            # Already terminal, or gone. It keeps the status it earned,
+            # and this read only supplies the log line below.
+            build = await self._store.get_by_id(build_id)
+        if build is None or not await self._store.soft_delete(
+            build_id=build_id
+        ):
+            return False
+        self._logger.info(
+            "Soft-deleted build",
+            build=serialize_base32_id(build.public_id),
+            org=org_slug,
+            project=project_slug,
+            status=build.status.value,
+        )
+        return True
 
     async def soft_delete(
         self,
@@ -467,24 +549,11 @@ class BuildService:
         project_slug: str,
         build_id: str,
     ) -> None:
-        """Soft-delete a build, cancelling it if it has not finished.
+        """Soft-delete a build named by its public id.
 
-        A ``pending`` or ``processing`` build is transitioned to
-        ``cancelled`` in the same transaction that stamps
-        ``date_deleted``, so no reader ever sees a deleted build still
-        claiming a worker is on it. A build that already reached
-        ``completed``, ``failed`` or ``superseded`` keeps the status it
-        earned and only gains ``date_deleted``.
-
-        Every path that soft-deletes a build goes through the same
-        retirement step — this method for a DELETE, and
-        :meth:`cancel_if_unfinished` directly for the lifecycle
-        reaper — so the "deleted implies finished" reading holds however
-        the row was deleted.
-
-        The worker's deleted-self guard cancels too, and either side may
-        run second; :meth:`cancel` is idempotent for exactly that
-        reason.
+        The DELETE handler's entry point: it resolves the API-facing
+        identifiers and then hands off to :meth:`soft_delete_by_id`,
+        which owns the retire-then-delete pairing.
 
         Parameters
         ----------
@@ -498,20 +567,10 @@ class BuildService:
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
-        cancelled = await self.cancel_if_unfinished(
+        if not await self.soft_delete_by_id(
             build_id=build.id,
             org_slug=org_slug,
             project_slug=project_slug,
-        )
-        status = cancelled.status if cancelled is not None else build.status
-        deleted = await self._store.soft_delete(build_id=build.id)
-        if not deleted:
+        ):
             msg = f"Build {build_id!r} not found"
             raise NotFoundError(msg)
-        self._logger.info(
-            "Soft-deleted build",
-            build=build_id,
-            org=org_slug,
-            project=project_slug,
-            status=status.value,
-        )
