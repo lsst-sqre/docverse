@@ -8,6 +8,7 @@ __all__ = [
     "JobKind",
     "JobStatus",
     "PublishStatus",
+    "RetiredBuildStatus",
 ]
 
 
@@ -84,3 +85,47 @@ class PublishStatus(StrEnum):
     publishing = "publishing"
     published = "published"
     failed = "failed"
+
+
+class RetiredBuildStatus(StrEnum):
+    """State a build was found in when its worker stood down.
+
+    Reported as ``BuildProcessingProgress.retired_status`` on a
+    ``build_processing`` job that completed without publishing anything
+    because somebody else retired the build underneath it — a delete, a
+    lifecycle reap, the stranded-build sweep, a supersession, or a purge
+    that removed the row outright. The value names *what the worker
+    found*, so an operator does not have to guess which of the several
+    possible retirements happened. The commonest are:
+
+    - ``cancelled`` — the build was deleted (or lifecycle-reaped) and
+      cancelled. Always accompanied by ``deleted_skipped``.
+    - ``failed`` — the stranded-build sweep or the silent-job reaper
+      failed it, usually because the upload ran past the reaper
+      threshold.
+    - ``superseded`` — a newer build for the same ``(project, git_ref)``
+      took over.
+    - ``missing`` — the row was gone by the time the worker looked.
+
+    This is :class:`~docverse.models.BuildStatus` plus ``missing``, and
+    the overlap is deliberate rather than duplication. Every
+    ``BuildStatus`` is a member because the worker reports whatever
+    status its re-read returned, and the re-read can return a *live*
+    status: ``BuildStore.soft_delete`` stamps ``date_deleted`` without
+    touching the status, so a deleted row can still read ``processing``
+    or ``completed`` and is retired just as firmly. A narrower enum
+    would reject a payload the worker really writes, turning a job
+    listing into a validation error. ``missing`` is the member with no
+    ``BuildStatus`` counterpart, and cannot become one: there is no row
+    to write it to, and ``BuildStatus`` is persisted behind the
+    ``builds_status_check`` constraint.
+    """
+
+    pending = "pending"
+    uploaded = "uploaded"
+    processing = "processing"
+    completed = "completed"
+    failed = "failed"
+    superseded = "superseded"
+    cancelled = "cancelled"
+    missing = "missing"

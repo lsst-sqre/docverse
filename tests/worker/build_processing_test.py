@@ -1740,7 +1740,7 @@ async def test_build_processing_build_row_vanished_before_work(
             assert job is not None
             assert job.status == JobStatus.completed
             assert job.progress is not None
-            assert job.progress["retired_status"] is None
+            assert job.progress["retired_status"] == "missing"
             assert "disappeared" in job.progress["message"]
 
             build_store = BuildStore(session=session, logger=_logger())
@@ -2168,7 +2168,7 @@ async def test_build_processing_reaped_job_and_build_mid_upload(
             assert reaped.errors is not None
             assert reaped.errors["type"] == "SilentWorker"
             assert reaped.progress is not None
-            assert reaped.progress.get("retired_status") is None
+            assert "retired_status" not in reaped.progress
 
             build_store = BuildStore(session=session, logger=_logger())
             refreshed = await build_store.get_by_id(build.id)
@@ -2356,9 +2356,11 @@ async def test_build_processing_build_row_vanished_mid_upload(
             assert job is not None
             assert job.status == JobStatus.completed
             assert job.progress is not None
-            # No status to name, and the message says so.
-            assert "retired_status" in job.progress
-            assert job.progress["retired_status"] is None
+            # No *build* status to name — the row is gone — so the
+            # close-out names the vanishing itself. Writing ``None``
+            # here made the outcome unrepresentable: the client model's
+            # drop-``None`` serializer stripped the key back out.
+            assert job.progress["retired_status"] == "missing"
             assert "disappeared" in job.progress["message"]
 
             build_store = BuildStore(session=session, logger=_logger())

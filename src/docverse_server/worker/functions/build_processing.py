@@ -28,6 +28,7 @@ from docverse.models import (
     BuildStatus,
     EditionUpdateRef,
     PublishJobRef,
+    RetiredBuildStatus,
 )
 from docverse_server.domain.api_urls import edition_url, job_url
 from docverse_server.domain.base32id import serialize_base32_id
@@ -854,6 +855,18 @@ def _retired_build_progress(
     reading the job does not have to guess which of the several possible
     retirements happened.
 
+    A vanished row is named too, as
+    :attr:`~docverse.models.RetiredBuildStatus.missing` rather than
+    ``None``. ``None`` made that outcome unrepresentable: it is a
+    *declared* field on
+    :class:`~docverse.models.BuildProcessingProgress`, whose
+    drop-``None`` serializer strips every key it left unset, so the
+    vanished case served the same payload as a job that was never
+    retired at all. ``missing`` is not a ``BuildStatus`` — there is no
+    row to write it to, and that enum is persisted behind the
+    ``builds_status_check`` constraint — which is why
+    ``RetiredBuildStatus`` exists alongside it.
+
     The ``cancelled`` case keeps its original message *and* the
     ``deleted_skipped`` flag the DELETE path established, because that
     flag is an existing operator contract; the statuses that only became
@@ -867,9 +880,14 @@ def _retired_build_progress(
         message = "Build was deleted while it was processing"
     else:
         message = f"Build was {status.value} while it was processing"
+    retired_status = (
+        RetiredBuildStatus.missing
+        if status is None
+        else RetiredBuildStatus(status.value)
+    )
     progress: dict[str, Any] = {
         "message": message,
-        "retired_status": status.value if status is not None else None,
+        "retired_status": retired_status.value,
     }
     if was_deleted:
         progress["deleted_skipped"] = True

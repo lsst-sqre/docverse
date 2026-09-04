@@ -6,9 +6,11 @@ from datetime import UTC, datetime
 
 from docverse.models import (
     BuildProcessingProgress,
+    BuildStatus,
     EditionUpdateRef,
     PublishJobRef,
     QueueJob,
+    RetiredBuildStatus,
 )
 from docverse.models.queue_enums import JobKind, JobStatus
 
@@ -88,6 +90,7 @@ _BUILD_KEYS = (
     "publish_jobs",
     "edition_tracking_error",
     "deleted_skipped",
+    "retired_status",
 )
 
 
@@ -152,6 +155,61 @@ def test_deleted_skip_progress_is_typed() -> None:
     assert "deleted_skipped" in BuildProcessingProgress.model_fields
     dumped = progress.model_dump(mode="json")
     assert dumped["deleted_skipped"] is True
+
+
+def test_retired_status_progress_is_typed() -> None:
+    """A mid-upload close-out's ``retired_status`` parses into the enum.
+
+    ``build_processing`` names the status it found on a build retired
+    underneath it. Extras would round-trip the key anyway; declaring it
+    puts the value in the generated OpenAPI schema as an enum a caller
+    can switch on.
+    """
+    progress = BuildProcessingProgress.model_validate(
+        {
+            "message": "Build was superseded while it was processing",
+            "retired_status": "superseded",
+        }
+    )
+
+    assert progress.retired_status is RetiredBuildStatus.superseded
+    assert "retired_status" in BuildProcessingProgress.model_fields
+    assert progress.model_dump(mode="json")["retired_status"] == "superseded"
+
+
+def test_retired_status_missing_is_representable() -> None:
+    """A vanished build row is named ``missing``, not dropped as ``None``.
+
+    ``missing`` is not a persisted build status — the row is gone — so
+    it lives only here. Writing ``None`` instead made that outcome
+    unrepresentable, because the drop-``None`` serializer stripped it.
+    """
+    progress = BuildProcessingProgress.model_validate(
+        {
+            "message": "Build row disappeared while it was processing",
+            "retired_status": "missing",
+        }
+    )
+
+    assert progress.retired_status is RetiredBuildStatus.missing
+    assert progress.model_dump(mode="json")["retired_status"] == "missing"
+
+
+def test_retired_build_status_is_build_status_plus_missing() -> None:
+    """Every ``BuildStatus`` is a member, and ``missing`` is the only extra.
+
+    The worker names whatever status its re-read found, so a narrower
+    enum would reject a payload it really writes — the API validates
+    stored ``progress`` through this model, and a rejection there turns
+    a job listing into a 500. Totality also keeps the server's
+    ``BuildStatus -> RetiredBuildStatus`` lookup from raising inside the
+    close-out that exists to stop exceptions escaping.
+    """
+    build_values = {status.value for status in BuildStatus}
+    retired_values = {status.value for status in RetiredBuildStatus}
+
+    assert build_values < retired_values
+    assert retired_values - build_values == {RetiredBuildStatus.missing.value}
 
 
 def test_build_processing_progress_allows_extra_keys() -> None:

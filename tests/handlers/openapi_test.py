@@ -271,3 +271,36 @@ async def test_build_content_hash_documents_identity_semantics(
     ]
     assert "completed" in response_description.lower()
     assert "pending" in response_description.lower()
+
+
+@pytest.mark.asyncio
+async def test_build_progress_retirement_fields_are_declared(
+    client: AsyncClient,
+) -> None:
+    """``BuildProcessingProgress`` publishes its retirement contract.
+
+    Both keys the retired-build close-out writes are declared fields,
+    not ``extra='allow'`` passengers: a caller reading the served spec
+    can discover why a ``build_processing`` job completed without
+    publishing anything, and ``retired_status`` arrives as an enum it
+    can switch on rather than a free-form string.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    schemas = spec["components"]["schemas"]
+
+    progress = schemas["BuildProcessingProgress"]["properties"]
+    assert {"deleted_skipped", "retired_status"} <= set(progress)
+
+    refs = {
+        option["$ref"]
+        for option in progress["retired_status"]["anyOf"]
+        if "$ref" in option
+    }
+    assert "#/components/schemas/RetiredBuildStatus" in refs
+
+    # ``missing`` is the whole point of declaring the field: the
+    # vanished-row outcome has no ``BuildStatus`` to name, and writing
+    # ``null`` left it unrepresentable in the payload.
+    members = set(schemas["RetiredBuildStatus"]["enum"])
+    assert "missing" in members
+    assert {"cancelled", "failed", "superseded"} <= members
