@@ -22,7 +22,7 @@ deploy.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 from docverse_server.domain.base32id import serialize_base32_id
@@ -41,19 +41,25 @@ async def _sweep_stranded_builds(
 
     The build-side counterpart to the three queue-job sweeps: a row
     whose worker is gone — because it was never transitioned, or
-    because the silent sweep just failed its job earlier in this very
-    transaction — is transitioned to ``failed`` so ``processing`` goes
-    back to meaning "a worker is on it".
+    because one of those sweeps just failed its job earlier in this
+    very transaction — is transitioned to ``failed`` so ``processing``
+    goes back to meaning "a worker is on it".
 
     Reuses the reaper's own threshold rather than a second knob: the
     build and the job it belongs to went quiet at the same moment, so
     the patience an operator configures for one is the patience they
-    mean for the other.
+    mean for the other. The threshold is handed over as the interval it
+    is, leaving the store to subtract it from the database's clock the
+    way the queue-job sweeps do — a cutoff computed here from the
+    worker's own ``datetime.now()`` would disagree with theirs at the
+    boundary whenever the two clocks are skewed.
+
+    The shared reaper calls this once per transaction, so it must be
+    idempotent: the second pass simply finds nothing left to claim
+    unless the abandoned reaps in its own transaction freed a build.
     """
     build_store = factory.create_build_store()
-    stranded = await build_store.fail_stranded_processing(
-        older_than=datetime.now(tz=UTC) - threshold
-    )
+    stranded = await build_store.fail_stranded_processing(idle_after=threshold)
     return ExtraSweepResult(
         log_key="stranded_builds",
         public_ids=[

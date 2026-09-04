@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
@@ -460,7 +460,7 @@ class BuildStore:
         return Build.model_validate(row)
 
     async def fail_stranded_processing(
-        self, *, older_than: datetime
+        self, *, idle_after: timedelta
     ) -> list[Build]:
         """Fail ``processing`` builds no live queue job is working on.
 
@@ -469,10 +469,9 @@ class BuildStore:
         ``queue_jobs`` row naming it has lost its worker and will never
         move on its own, so the ``build_processing`` reaper retires it
         here. Selects rows that are ``processing``, not soft-deleted,
-        and whose ``date_uploaded`` is strictly before ``older_than``
-        (the reaper's threshold cutoff), then transitions each to
-        ``failed`` — which stamps ``date_completed`` like any other
-        terminal entry.
+        and whose ``date_uploaded`` is strictly before
+        ``now - idle_after``, then transitions each to ``failed`` —
+        which stamps ``date_completed`` like any other terminal entry.
 
         Always ``failed``, never ``superseded``: the sweep deliberately
         does not read ``queue_jobs.progress`` to reconstruct why the
@@ -488,11 +487,17 @@ class BuildStore:
 
         Parameters
         ----------
-        older_than
-            Cutoff for ``date_uploaded``. Rows uploaded at or after
-            this instant are still within the reaper's patience window
-            and are left alone, as are rows with no ``date_uploaded``
-            at all (the ``NULL`` comparison is never true).
+        idle_after
+            How long a build may sit ``processing`` before the sweep
+            claims it. The cutoff is ``now - idle_after``, with ``now``
+            read from the database via ``func.now()`` rather than the
+            worker's clock — the three queue-job sweeps this one shares
+            a transaction with derive their cutoffs the same way, so
+            using one clock for all four keeps them from disagreeing at
+            the boundary under skew. Rows uploaded at or after the
+            cutoff are still within the reaper's patience window and are
+            left alone, as are rows with no ``date_uploaded`` at all
+            (the ``NULL`` comparison is never true).
 
         A row whose status changes between the candidate select and its
         transition — a DELETE-cancel committing in that window, say — is
@@ -509,6 +514,8 @@ class BuildStore:
             The builds this sweep transitioned to ``failed``, in id
             order. Empty when nothing was stranded.
         """
+        now = (await self._session.execute(select(func.now()))).scalar_one()
+        cutoff = now - idle_after
         live_job = select(SqlQueueJob.id).where(
             SqlQueueJob.build_id == SqlBuild.id,
             SqlQueueJob.status.in_(
@@ -520,7 +527,7 @@ class BuildStore:
             .where(
                 SqlBuild.status == BuildStatus.processing,
                 SqlBuild.date_deleted.is_(None),
-                SqlBuild.date_uploaded < older_than,
+                SqlBuild.date_uploaded < cutoff,
                 ~live_job.exists(),
             )
             .order_by(SqlBuild.id)

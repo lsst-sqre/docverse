@@ -942,7 +942,7 @@ async def test_fail_stranded_processing(
 
     async with db_session.begin():
         reaped = await build_store.fail_stranded_processing(
-            older_than=datetime.now(tz=UTC) - timedelta(hours=8)
+            idle_after=timedelta(hours=8)
         )
         await db_session.commit()
 
@@ -1020,7 +1020,7 @@ async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
 
     async with db_session.begin():
         reaped = await build_store.fail_stranded_processing(
-            older_than=datetime.now(tz=UTC) - timedelta(hours=8)
+            idle_after=timedelta(hours=8)
         )
         await db_session.commit()
 
@@ -1033,6 +1033,63 @@ async def test_fail_stranded_processing_skips_row_retired_mid_sweep(
         assert row is not None
         # The cancel that won the race stands; the sweep left it alone.
         assert row.status == BuildStatus.cancelled
+
+
+@pytest.mark.asyncio
+async def test_fail_stranded_processing_cutoff_uses_the_database_clock(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The cutoff is derived from ``now()``, not from the caller's clock.
+
+    The sweep shares the reaper's first transaction with three
+    queue-job sweeps that all take their cutoff from
+    ``select(func.now())``; a cutoff the worker computed from its own
+    ``datetime.now()`` would disagree with theirs at the boundary
+    whenever the two clocks are skewed. Pinned here by the one case
+    where the clock source is observable without skew: with
+    ``idle_after=0`` a row stamped by the sweeping transaction's own
+    ``now()`` sits exactly *at* a database-derived cutoff, and the
+    strict ``<`` spares it — while a genuinely older row in the same
+    call is still reaped, so the sweep is demonstrably live.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _create_org_and_project(db_session)
+        at_cutoff = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="at-cutoff",
+            uploaded_hours_ago=0,
+        )
+        older = await _create_processing_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="older",
+            uploaded_hours_ago=1,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        # Stamp one row with the sweeping transaction's own clock, which
+        # is the very instant a database-derived cutoff will read.
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == at_cutoff.id)
+            .values(date_uploaded=func.now())
+        )
+        reaped = await build_store.fail_stranded_processing(
+            idle_after=timedelta(0)
+        )
+        await db_session.commit()
+
+    assert [build.id for build in reaped] == [older.id]
+
+    async with db_session.begin():
+        row = await build_store.get_by_id(at_cutoff.id)
+        assert row is not None
+        assert row.status == BuildStatus.processing
 
 
 async def _seed_processing_build(

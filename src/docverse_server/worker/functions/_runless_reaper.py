@@ -20,6 +20,7 @@ in each module is a thin shim that delegates the actual sweep to
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Protocol
@@ -47,7 +48,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ExtraSweepResult:
-    """What one kind-specific extra sweep claimed during a reaper tick.
+    """What one pass of a kind-specific extra sweep claimed.
 
     The sweep reports serialized public ids rather than rows because
     the only thing the shared reaper does with them is log them, and
@@ -59,7 +60,7 @@ class ExtraSweepResult:
     ``"stranded_builds"``)."""
 
     public_ids: list[str]
-    """Base32 public ids of the rows the sweep claimed, in reap order.
+    """Base32 public ids of the rows this pass claimed, in reap order.
 
     Counted into the tick's ``reaped_count``, so a tick whose only
     finding came from this sweep still logs at ``warning``.
@@ -69,9 +70,15 @@ class ExtraSweepResult:
 class ExtraSweep(Protocol):
     """A kind-specific extra pass run by :func:`sweep_runless_kind`.
 
-    Called inside the reaper's first transaction, after the silent and
-    orphan sweeps and before the abandoned sweep's candidate query, so
-    it observes the rows those two just failed and commits with them.
+    Called **twice** per tick, once inside each of the reaper's two
+    transactions: first after the silent and orphan sweeps and before
+    the abandoned sweep's candidate query, then again right after the
+    verified abandoned reaps land. Each pass observes the queue-job
+    reaps committed with it, so a single tick covers rows freed by any
+    of the three job sweeps. Implementations must therefore be
+    idempotent — a second pass that finds nothing left returns an empty
+    result — and the reaper merges the two passes' ids into one log
+    payload.
     """
 
     async def __call__(
@@ -87,6 +94,22 @@ class ExtraSweep(Protocol):
 # long enough never to race a healthy concurrent enqueue, short enough
 # to free a wedged row on the next reaper tick.
 ORPHAN_IDLE_WINDOW = timedelta(minutes=5)
+
+
+def _merge_extra_public_ids(results: Sequence[ExtraSweepResult]) -> list[str]:
+    """Flatten the tick's extra-sweep passes into one ordered id list.
+
+    Both passes log under the same key, so the reaper reports their
+    union rather than two payloads. A row claimed by the first pass is
+    no longer claimable by the second, so duplicates are not expected —
+    but deduplicating here (order-preserving, first pass first) keeps
+    ``reaped_count`` honest if an implementation ever reports one twice.
+    """
+    return list(
+        dict.fromkeys(
+            public_id for result in results for public_id in result.public_ids
+        )
+    )
 
 
 async def sweep_runless_kind(
@@ -120,8 +143,13 @@ async def sweep_runless_kind(
     non-queue-job wreckage to clear (``build_processing`` and its
     stranded builds, PRD #577) passes a callable here, and its findings
     are counted into ``reaped_count`` and logged under the key the
-    result names. Kinds that pass nothing behave exactly as before,
-    down to the log payload's keys.
+    result names. It runs once per transaction — after the silent and
+    orphan sweeps, then again after the abandoned reaps — so a row
+    freed by *any* of the three job sweeps is claimed in the same tick
+    rather than waiting up to a full cron interval for the next one
+    (task #592). The two passes' ids are merged into a single payload
+    entry. Kinds that pass nothing behave exactly as before, down to
+    the log payload's keys.
 
     The structlog ``event`` strings are f-string-built from
     ``kind.value`` so they match the per-kind literals the original
@@ -147,6 +175,9 @@ async def sweep_runless_kind(
         # only reaper dependency beyond the store (PRD #538 §Summary,
         # "Reaper dependency change").
         queue_backend = factory.create_queue_backend()
+        # One entry per extra-sweep pass, merged into a single log
+        # payload below; empty for the kinds that pass no hook.
+        extras: list[ExtraSweepResult] = []
 
         # First transaction: the two backend-free sweeps, plus the
         # abandoned sweep's candidate query. Committing here is what
@@ -166,11 +197,10 @@ async def sweep_runless_kind(
             # sweep is likely to key off the rows they just failed —
             # ``build_processing``'s does, since a build only looks
             # stranded once the silent sweep has released its job.
-            extra = (
-                await extra_sweep(factory=factory, threshold=threshold)
-                if extra_sweep is not None
-                else None
-            )
+            if extra_sweep is not None:
+                extras.append(
+                    await extra_sweep(factory=factory, threshold=threshold)
+                )
             # Reuses the kind's silent threshold rather than the much
             # shorter orphan window: an abandoned row *did* reach arq,
             # so it deserves the same benefit of the doubt a running
@@ -191,6 +221,16 @@ async def sweep_runless_kind(
         # worker picked it up while the backend was being asked.
         async with session.begin():
             abandoned = await queue_job_store.apply_abandoned_reaps(reaps)
+            # Second pass, for the same reason the first one trails the
+            # silent and orphan sweeps: the abandoned sweep is the one
+            # that cannot run in the first transaction, so a row it
+            # frees is still vouched for when the first pass looks. Both
+            # passes committing with the job reaps they depend on is
+            # what makes a tick self-contained (task #592).
+            if extra_sweep is not None:
+                extras.append(
+                    await extra_sweep(factory=factory, threshold=threshold)
+                )
 
         by_sweep = (
             ("silent", silent),
@@ -199,11 +239,11 @@ async def sweep_runless_kind(
         )
         # An absent hook contributes no key at all, so the three kinds
         # without one log exactly the payload they logged before.
-        extra_count = len(extra.public_ids) if extra is not None else 0
-        extra_payload = (
-            {extra.log_key: extra.public_ids} if extra is not None else {}
+        extra_ids = _merge_extra_public_ids(extras)
+        extra_payload = {extras[0].log_key: extra_ids} if extras else {}
+        reaped_count = (
+            len(silent) + len(orphan) + len(abandoned) + len(extra_ids)
         )
-        reaped_count = len(silent) + len(orphan) + len(abandoned) + extra_count
         if reaped_count:
             logger.warning(
                 warning_event,

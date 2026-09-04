@@ -196,6 +196,7 @@ async def _seed_abandoned_row(
     backend_job_id: str,
     created_minutes_ago: int,
     project_id: int | None = None,
+    build_id: int | None = None,
 ) -> int:
     """Insert one abandoned row: queued, has an arq ID, past the window."""
     row = SqlQueueJob(
@@ -205,6 +206,7 @@ async def _seed_abandoned_row(
         status=JobStatus.queued.value,
         org_id=org_id,
         project_id=project_id,
+        build_id=build_id,
     )
     db_session.add(row)
     await db_session.flush()
@@ -1046,6 +1048,66 @@ async def test_build_processing_reaper_sweeps_build_its_silent_sweep_freed(
     ]
     assert len(warnings) == 1
     assert warnings[0]["silent_count"] == 1
+    assert warnings[0]["stranded_builds"] == [build_public_id]
+    assert warnings[0]["reaped_count"] == 2
+
+    assert await _read_build_status(build_id) == BuildStatus.failed
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj_store = QueueJobStore(session=session, logger=_logger())
+            qj = await qj_store.get(job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_build_processing_reaper_sweeps_build_its_abandoned_sweep_freed(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A build freed by this tick's *abandoned* sweep is swept too.
+
+    The abandoned sweep is the one pass that cannot run in the first
+    transaction — its verdict depends on a queue-backend round trip
+    taken with no transaction open — so a build whose only job is
+    ``queued`` with a ``backend_job_id`` arq has lost is still vouched
+    for when the first stranded pass looks. Running the stranded sweep
+    only once would leave that build ``processing`` beside a ``failed``
+    job until the next cron tick, up to 30 minutes later; a second pass
+    inside the reaps' own transaction retires it in the same tick, and
+    the warning names it exactly once.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="bpr-ab-freed")
+        build_id, build_public_id = await _seed_processing_build(
+            db_session, project_id=8185, uploaded_minutes_ago=600
+        )
+        job_id = await _seed_abandoned_row(
+            db_session,
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            backend_job_id="arq-lost-the-build",
+            created_minutes_ago=600,
+            project_id=8185,
+            build_id=build_id,
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            await build_processing_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    warnings = [
+        entry
+        for entry in captured
+        if entry.get("event") == "Reaped stuck build_processing queue jobs"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["abandoned_count"] == 1
     assert warnings[0]["stranded_builds"] == [build_public_id]
     assert warnings[0]["reaped_count"] == 2
 
