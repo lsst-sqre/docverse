@@ -6,22 +6,26 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from docverse.models import (
+    BuildCreate,
     EditionCreate,
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.exceptions import NotFoundError
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
+from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
@@ -871,3 +875,209 @@ async def test_clear_emits_structured_log(
     assert event["ltd_id"] == 24
     assert event["previous_reason"] == "lifecycle_delete"
     assert event["revived_docverse_row"] is False
+
+
+# ---------------------------------------------------------------------------
+# clear — project cascade revive
+# ---------------------------------------------------------------------------
+
+
+_CASCADE_HASH = "sha256:" + "d" * 64
+
+
+async def _seed_cascade_project(
+    session: AsyncSession,
+    *,
+    org_slug: str,
+    project_slug: str,
+) -> tuple[int, int, int, list[int]]:
+    """Seed an org, a project with one edition and two builds, and a state row.
+
+    Returns ``(org_id, project_id, edition_id, build_ids)``. The state
+    row is the ``project`` row the tombstone API addresses.
+    """
+    logger = structlog.get_logger("test")
+    org_store = OrganizationStore(session=session, logger=logger)
+    proj_store = ProjectStore(session=session, logger=logger)
+    edition_store = EditionStore(session=session, logger=logger)
+    build_store = BuildStore(session=session, logger=logger)
+    state_store = KeeperSyncStateStore(session=session, logger=logger)
+
+    org = await org_store.create(
+        OrganizationCreate(
+            slug=org_slug,
+            title=org_slug,
+            base_domain=f"{org_slug}.example.com",
+        )
+    )
+    project = await proj_store.create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug=project_slug,
+            title=project_slug,
+            source_url=f"https://example.com/x/{project_slug}",
+        ),
+    )
+    edition = await edition_store.create(
+        project_id=project.id,
+        data=EditionCreate(
+            slug=f"{project_slug}-ed",
+            title=f"{project_slug}-ed",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+        ),
+    )
+    build_ids = []
+    for git_ref in ("main", "feature"):
+        build = await build_store.create(
+            project_id=project.id,
+            project_slug=project_slug,
+            data=BuildCreate(git_ref=git_ref, content_hash=_CASCADE_HASH),
+            uploader="testuser",
+        )
+        build_ids.append(build.id)
+    await state_store.upsert(
+        org_id=org.id,
+        resource_type=ResourceType.project,
+        ltd_slug=project_slug,
+        docverse_id=project.id,
+    )
+    return org.id, project.id, edition.id, build_ids
+
+
+@pytest.mark.asyncio
+async def test_clear_revives_only_the_project_cascade_siblings(
+    db_session: AsyncSession,
+) -> None:
+    """Cascade siblings come back; a hand-deleted build stays in purgatory."""
+    logger = structlog.get_logger("test")
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        (
+            org_id,
+            _project_id,
+            edition_id,
+            build_ids,
+        ) = await _seed_cascade_project(
+            db_session, org_slug="ks-casc", project_slug="casc-proj"
+        )
+    cascade_build_id, hand_build_id = build_ids
+
+    # Deleted by hand in its own transaction, so ``func.now()`` differs
+    # from the timestamp the project cascade is about to stamp.
+    async with db_session.begin():
+        await build_store.soft_delete(build_id=hand_build_id)
+
+    async with db_session.begin():
+        await proj_store.soft_delete(
+            org_id=org_id,
+            slug="casc-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="casc-proj",
+            include_tombstoned=True,
+        )
+    assert state is not None
+
+    service = _build_service(db_session, logger=logger)
+    async with db_session.begin():
+        cleared = await service.clear(public_id=state.public_id, org_id=org_id)
+
+    assert cleared.revived_docverse_row is True
+    async with db_session.begin():
+        project = await proj_store.get_by_slug(org_id=org_id, slug="casc-proj")
+        edition = await edition_store.get_by_id(edition_id)
+        cascade_build = await build_store.get_by_id(cascade_build_id)
+        hand_build = await build_store.get_by_id(hand_build_id)
+    assert project is not None
+    assert edition is not None
+    assert cascade_build is not None
+    assert cascade_build.date_deleted is None
+    assert hand_build is not None
+    assert hand_build.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_clear_leaves_a_purged_cascade_sibling_deleted(
+    db_session: AsyncSession,
+) -> None:
+    """A purged build stays deleted and is named at warning level."""
+    logger = structlog.get_logger("test")
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        (
+            org_id,
+            _project_id,
+            _edition_id,
+            build_ids,
+        ) = await _seed_cascade_project(
+            db_session, org_slug="ks-purged", project_slug="purged-proj"
+        )
+    revivable_build_id, purged_build_id = build_ids
+
+    async with db_session.begin():
+        await proj_store.soft_delete(
+            org_id=org_id,
+            slug="purged-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+
+    # The sweep reclaimed one cascade sibling's objects after the
+    # project was deleted: same ``date_deleted``, but nothing left to
+    # revive it onto.
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == purged_build_id)
+            .values(date_purged=datetime.now(tz=UTC))
+        )
+        purged_public_id = (
+            await db_session.execute(
+                select(SqlBuild.public_id).where(
+                    SqlBuild.id == purged_build_id
+                )
+            )
+        ).scalar_one()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="purged-proj",
+            include_tombstoned=True,
+        )
+    assert state is not None
+
+    service = _build_service(db_session, logger=logger)
+    with capture_logs() as captured:
+        async with db_session.begin():
+            await service.clear(public_id=state.public_id, org_id=org_id)
+
+    async with db_session.begin():
+        revivable = await build_store.get_by_id(revivable_build_id)
+        purged = await build_store.get_by_id(purged_build_id)
+    assert revivable is not None
+    assert revivable.date_deleted is None
+    assert purged is not None
+    assert purged.date_deleted is not None
+
+    warnings = [
+        entry
+        for entry in captured
+        if entry.get("log_level") == "warning"
+        and serialize_base32_id(purged_public_id)
+        in entry.get("build_public_ids", [])
+    ]
+    assert warnings, "expected a warning naming the purged build"

@@ -22,9 +22,11 @@ from safir.database import CountedPaginatedList
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
 )
@@ -78,6 +80,11 @@ class ClearedTombstone:
     revive-on-clear behavior PRD #332 calls out — without it the next
     sync iteration would crash on the slug clash because the
     soft-deleted row still occupies the unique index slot.
+
+    The flag speaks only for the addressed row. Reviving a project also
+    revives the editions and builds its delete cascaded to, and how many
+    of each came back — and which purged builds could not — is reported
+    in the log, not here: no caller branches on those counts.
     """
 
     state: KeeperSyncState
@@ -289,9 +296,11 @@ class KeeperSyncTombstoneService:
         that row's ``date_deleted`` is cleared in the *same*
         transaction — otherwise the next sync iteration would crash on
         the slug clash because the soft-deleted row still occupies the
-        ``uq_editions_project_lower_slug`` index slot. Soft-delete on
-        builds is not modelled in this codebase, so the build branch
-        only clears the tombstone fields.
+        ``uq_editions_project_lower_slug`` index slot. A project revive
+        reaches further, into the editions and builds its delete
+        cascaded to; see :meth:`_revive_project`. A ``build`` state row
+        has no revive branch: builds are addressed by the admin restore
+        endpoint, not by keeper-sync recovery.
 
         Raises
         ------
@@ -338,16 +347,9 @@ class KeeperSyncTombstoneService:
                 )
                 revived = edition_revive.scalar_one_or_none() is not None
             elif state.resource_type == ResourceType.project.value:
-                project_revive = await self._session.execute(
-                    update(SqlProject)
-                    .where(
-                        SqlProject.id == state.docverse_id,
-                        SqlProject.date_deleted.is_not(None),
-                    )
-                    .values(date_deleted=None)
-                    .returning(SqlProject.id)
+                revived = await self._revive_project(
+                    org_id=org_id, project_id=state.docverse_id
                 )
-                revived = project_revive.scalar_one_or_none() is not None
 
         await self._session.flush()
 
@@ -371,6 +373,122 @@ class KeeperSyncTombstoneService:
             revived_docverse_row=revived,
         )
         return ClearedTombstone(state=cleared, revived_docverse_row=revived)
+
+    async def _revive_project(self, *, org_id: int, project_id: int) -> bool:
+        """Revive a soft-deleted project along with its cascade siblings.
+
+        ``ProjectStore.soft_delete`` stamps the project's live editions
+        and builds in the same transaction, so all three tables land on
+        one ``func.now()`` instant. Reviving the project row alone would
+        leave those siblings deleted: the project would come back
+        serving nothing, and the next keeper-sync iteration would hit
+        the very slug clash the revive exists to prevent, one level
+        down.
+
+        That shared timestamp is also how this tells a cascade sibling
+        from a row an operator deleted on its own: only rows whose
+        ``date_deleted`` equals the project's came back through this
+        delete, so an edition or build deleted by hand earlier keeps its
+        own timestamp and stays deleted. Undeleting those would silently
+        reverse a decision this tombstone never spoke to.
+
+        A build the ``purgatory_cleanup`` sweep already purged stays
+        deleted whatever its timestamp says — its tree and tarball are
+        gone, so a live row would point at nothing — and is named at
+        warning level so the operator learns what the revive could not
+        bring back. Editions have no purge of their own; they are
+        pointers, and the build they point at is checked when something
+        tries to serve it.
+
+        Returns
+        -------
+        bool
+            True when the project was soft-deleted and is now live,
+            False when it was already live (or no longer exists).
+        """
+        project_deleted = (
+            await self._session.execute(
+                select(SqlProject.date_deleted).where(
+                    SqlProject.id == project_id,
+                    SqlProject.date_deleted.is_not(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if project_deleted is None:
+            return False
+
+        # Read before the update: once ``date_deleted`` is cleared the
+        # sibling predicate can no longer find these rows.
+        purged_public_ids = (
+            (
+                await self._session.execute(
+                    select(SqlBuild.public_id).where(
+                        SqlBuild.project_id == project_id,
+                        SqlBuild.date_deleted == project_deleted,
+                        SqlBuild.date_purged.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        await self._session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project_id)
+            .values(date_deleted=None)
+        )
+        edition_ids = (
+            (
+                await self._session.execute(
+                    update(SqlEdition)
+                    .where(
+                        SqlEdition.project_id == project_id,
+                        SqlEdition.date_deleted == project_deleted,
+                    )
+                    .values(date_deleted=None)
+                    .returning(SqlEdition.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        build_ids = (
+            (
+                await self._session.execute(
+                    update(SqlBuild)
+                    .where(
+                        SqlBuild.project_id == project_id,
+                        SqlBuild.date_deleted == project_deleted,
+                        SqlBuild.date_purged.is_(None),
+                    )
+                    .values(date_deleted=None)
+                    .returning(SqlBuild.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        if purged_public_ids:
+            self._logger.warning(
+                "Left purged builds deleted while reviving their project",
+                org_id=org_id,
+                project_id=project_id,
+                build_public_ids=[
+                    serialize_base32_id(public_id)
+                    for public_id in purged_public_ids
+                ],
+            )
+        self._logger.info(
+            "Revived a project and its cascade-deleted rows",
+            org_id=org_id,
+            project_id=project_id,
+            editions_revived=len(edition_ids),
+            builds_revived=len(build_ids),
+            builds_left_purged=len(purged_public_ids),
+        )
+        return True
 
 
 def _derive_display_path(

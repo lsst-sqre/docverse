@@ -1,0 +1,3 @@
+### Bug fixes
+
+- Clearing a project's keeper-sync tombstone now revives the editions and builds that project's DELETE cascaded to, not just the project row. Cascade siblings are identified by carrying the project's exact `date_deleted`, so an edition or build an operator deleted on its own earlier keeps its own timestamp and stays deleted. A cascade sibling the `purgatory_cleanup` sweep has already purged also stays deleted — its tree and tarball are gone — and is named at warning level so the operator learns what the revive could not bring back. Previously the project came back serving nothing, and the next keeper-sync iteration hit the very edition slug clash the revive exists to prevent.
