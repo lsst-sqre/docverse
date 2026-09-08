@@ -10,9 +10,10 @@ from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import QueueJob
-from docverse_server.exceptions import NotFoundError
+from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import BuildDateCreatedCursor
 from docverse_server.storage.project_store import ProjectStore
@@ -43,6 +44,7 @@ class BuildService:
         store: BuildStore,
         org_store: OrganizationStore,
         project_store: ProjectStore,
+        edition_store: EditionStore,
         dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
         logger: structlog.stdlib.BoundLogger,
@@ -50,6 +52,7 @@ class BuildService:
         self._store = store
         self._org_store = org_store
         self._project_store = project_store
+        self._edition_store = edition_store
         self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
         self._logger = logger
@@ -555,6 +558,20 @@ class BuildService:
         identifiers and then hands off to :meth:`soft_delete_by_id`,
         which owns the retire-then-delete pairing.
 
+        A build a live edition still serves is refused rather than
+        deleted: the request would otherwise leave that edition
+        resolving to content the ``purgatory_cleanup`` sweep is
+        entitled to reclaim once the organization's retention elapses,
+        and nothing would ever re-point the edition. This is the API
+        saying out loud what the lifecycle reaper already enforces —
+        its ``build_history_orphan`` rule protects exactly the builds
+        editions point at. Roll the edition back to another build
+        first; then the DELETE succeeds.
+
+        The check runs before :meth:`soft_delete_by_id`, which cancels
+        an unfinished build on its way to stamping ``date_deleted``, so
+        a refused request leaves the row exactly as it found it.
+
         Parameters
         ----------
         build_id
@@ -562,11 +579,23 @@ class BuildService:
 
         Raises
         ------
+        ConflictError
+            If any live edition holds the build as its current build.
         NotFoundError
             If the build is not found.
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
+        serving = await self._edition_store.list_live_slugs_by_current_build(
+            build_id=build.id
+        )
+        if serving:
+            msg = (
+                f"Build {build_id!r} is the current build of edition(s) "
+                f"{', '.join(serving)}; roll them back to another build "
+                f"before deleting it"
+            )
+            raise ConflictError(msg)
         if not await self.soft_delete_by_id(
             build_id=build.id,
             org_slug=org_slug,

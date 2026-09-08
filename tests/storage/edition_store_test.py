@@ -992,6 +992,104 @@ async def test_soft_delete_edition_rollback_unwinds_both(
 
 
 @pytest.mark.asyncio
+async def test_list_live_slugs_by_current_build_names_holders(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only the editions actually pointing at the build are named.
+
+    The DELETE guard turns this list into the 409's message, so an
+    edition that merely has the build somewhere in its history — or
+    points at a different build entirely — must not appear in it.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        held = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        other = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main", content_hash="sha256:" + "c" * 64
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        for slug in ("holder-b", "holder-a", "elsewhere"):
+            edition = await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+            await edition_store.set_current_build(
+                edition_id=edition.id,
+                build_id=other.id if slug == "elsewhere" else held.id,
+            )
+        slugs = await edition_store.list_live_slugs_by_current_build(
+            build_id=held.id
+        )
+        await db_session.commit()
+
+    assert slugs == ["holder-a", "holder-b"]
+
+
+@pytest.mark.asyncio
+async def test_list_live_slugs_by_current_build_excludes_deleted(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A soft-deleted edition holding the build does not name it.
+
+    Nothing serves a deleted edition, so its pointer is not a reason to
+    keep the build's content alive — this is what lets the project
+    soft-delete cascade age a whole project's builds into purgatory.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="deleted-holder",
+                title="Deleted Holder",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="deleted-holder",
+            reason=TombstoneReason.manual_delete,
+        )
+        slugs = await edition_store.list_live_slugs_by_current_build(
+            build_id=build.id
+        )
+        await db_session.commit()
+
+    assert slugs == []
+
+
+@pytest.mark.asyncio
 async def test_find_matching_editions_git_ref(
     db_session: AsyncSession,
     edition_store: EditionStore,

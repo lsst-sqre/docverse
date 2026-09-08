@@ -358,6 +358,7 @@ class Factory:
             store=store,
             org_store=org_store,
             project_store=project_store,
+            edition_store=self.create_edition_store(),
             dispatcher=self.queue_dispatcher,
             queue_job_store=queue_job_store,
             logger=self._logger,

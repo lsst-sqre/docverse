@@ -441,6 +441,41 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = result2.one()
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def list_live_slugs_by_current_build(
+        self, *, build_id: int
+    ) -> list[str]:
+        """List the slugs of live editions currently serving a build.
+
+        The "is anything still pointing at this build?" question, asked
+        by every caller that is about to take a build's content away:
+        :meth:`docverse_server.services.build.BuildService.soft_delete`
+        turns a non-empty answer into the DELETE's 409, and the
+        ``purgatory_cleanup`` sweep skips a build whose answer is
+        non-empty rather than reclaiming objects a served edition still
+        resolves to.
+
+        Only ``date_deleted IS NULL`` editions count. A soft-deleted
+        edition is served by nothing, so its stale pointer must not
+        pin a build's content forever — which is what lets the project
+        soft-delete cascade age a whole project's builds into
+        purgatory. ``edition_build_history`` is deliberately not
+        consulted: history records where an edition *has been*, and
+        rolling back to a build is what makes it current again, so a
+        history row is not a live reference.
+
+        Returned in slug order so the 409 message and the sweep's
+        warning read the same way for the same build.
+        """
+        result = await self._session.execute(
+            select(SqlEdition.slug)
+            .where(
+                SqlEdition.current_build_id == build_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        return list(result.scalars().all())
+
     async def update_tracking(
         self,
         *,

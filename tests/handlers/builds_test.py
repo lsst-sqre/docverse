@@ -11,13 +11,23 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
-from docverse.models import BuildAnnotations, BuildStatus
+from docverse.models import (
+    BuildAnnotations,
+    BuildStatus,
+    EditionCreate,
+    EditionKind,
+    TrackingMode,
+)
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import validate_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_build, seed_org_with_admin
@@ -551,3 +561,139 @@ async def test_get_build_reports_reclaimed_content(
 
     assert response.status_code == 200
     assert datetime.fromisoformat(response.json()["date_purged"]) == purged_at
+
+
+async def _seed_edition_serving(
+    org_slug: str,
+    project_slug: str,
+    *,
+    edition_slug: str,
+    build_ids: list[str],
+) -> None:
+    """Create an edition whose history is ``build_ids``, oldest first.
+
+    The edition is left serving the last build in the list, which is
+    what a completed build normally does to it. Recording the earlier
+    ones too is what makes them rollback targets.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=logger)
+            edition = await edition_store.create(
+                project_id=project.id,
+                data=EditionCreate(
+                    slug=edition_slug,
+                    title=edition_slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                    tracking_params={"git_ref": "main"},
+                ),
+            )
+            build_store = BuildStore(session=session, logger=logger)
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            for build_id in build_ids:
+                build = await build_store.get_by_public_id(
+                    project_id=project.id,
+                    public_id=validate_base32_id(build_id),
+                )
+                assert build is not None
+                await history_store.record(
+                    edition_id=edition.id, build_id=build.id
+                )
+                await edition_store.set_current_build(
+                    edition_id=edition.id,
+                    build_id=build.id,
+                    skip_date_guard=True,
+                )
+            await session.commit()
+        return
+    raise AssertionError("db_session_dependency yielded no session")
+
+
+@pytest.mark.asyncio
+async def test_delete_build_refuses_a_build_an_edition_serves(
+    client: AsyncClient,
+) -> None:
+    """DELETE is refused while a live edition points at the build.
+
+    Obeying it would leave the edition resolving to content that the
+    purgatory sweep is entitled to reclaim once retention elapses, with
+    nothing left to re-point the edition. The 409 names the edition so
+    the operator knows what to roll back; once they have, the same
+    DELETE goes through.
+    """
+    await _setup(client)
+    older = await seed_build("build-org", "build-proj")
+    current = await seed_build("build-org", "build-proj")
+    await _seed_edition_serving(
+        "build-org",
+        "build-proj",
+        edition_slug="served",
+        build_ids=[older, current],
+    )
+
+    refused = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{current}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert refused.status_code == 409
+    detail = refused.json()["detail"][0]
+    assert detail["type"] == "conflict"
+    assert "served" in detail["msg"]
+
+    rollback = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/editions/served"
+        "/rollback",
+        json={"build": older},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback.status_code == 200
+
+    allowed = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{current}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert allowed.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_build_ignores_a_deleted_editions_pointer(
+    client: AsyncClient,
+) -> None:
+    """A soft-deleted edition's pointer does not hold the build back.
+
+    Nothing serves a deleted edition, so its stale ``current_build_id``
+    is not a reason to keep the build's content alive — otherwise
+    deleting a project would strand every one of its builds outside
+    purgatory forever.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    await _seed_edition_serving(
+        "build-org",
+        "build-proj",
+        edition_slug="retired",
+        build_ids=[build_id],
+    )
+    retired = await client.delete(
+        "/docverse/orgs/build-org/projects/build-proj/editions/retired",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert retired.status_code == 204
+
+    response = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
