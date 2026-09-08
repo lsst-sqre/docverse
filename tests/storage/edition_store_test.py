@@ -772,6 +772,113 @@ async def test_set_current_build_applies_when_newer(
 
 
 @pytest.mark.asyncio
+async def test_set_current_build_skips_deleted_build(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Skip when the incoming build has been soft-deleted.
+
+    PRD #596 "Pointer race": a DELETE that lands between a build's
+    upload and its tracking must not leave an edition pointing at
+    content the purgatory sweep is about to reclaim.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:1111" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-deleted",
+                title="Guard Deleted",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        assert await build_store.soft_delete(build_id=build.id) is True
+
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await db_session.commit()
+    assert skipped is None
+    refreshed = await edition_store.get_by_id(edition.id)
+    assert refreshed is not None
+    assert refreshed.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_skips_deleted_build_without_date_guard(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The deleted-build guard also holds under ``skip_date_guard``.
+
+    ``skip_date_guard`` waives the *ordering* comparison only — the
+    version-mode callers own that — so a soft-deleted target is still
+    refused, and the edition keeps the build it was already serving.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        live_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:2222" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        deleted_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:3333" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-deleted-nodate",
+                title="Guard Deleted No Date",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.semver_release,
+            ),
+        )
+        applied = await edition_store.set_current_build(
+            edition_id=edition.id,
+            build_id=live_build.id,
+            skip_date_guard=True,
+        )
+        assert applied is not None
+        assert await build_store.soft_delete(build_id=deleted_build.id) is True
+
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id,
+            build_id=deleted_build.id,
+            skip_date_guard=True,
+        )
+        await db_session.commit()
+    assert skipped is None
+    refreshed = await edition_store.get_by_id(edition.id)
+    assert refreshed is not None
+    assert refreshed.current_build_id == live_build.id
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_edition(
     db_session: AsyncSession,
     edition_store: EditionStore,

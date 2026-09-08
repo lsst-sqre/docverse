@@ -1440,3 +1440,87 @@ async def test_publish_edition_reaped_row_with_deleted_edition_skips(
             assert job.status == JobStatus.failed
             assert job.date_started is None
             assert job.phase is None
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_deleted_build_skips(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build deleted between tracking and publish writes no pointer.
+
+    PRD #596 "Pointer race": tracking commits the edition pointer and
+    enqueues the publish, and a DELETE can land in the window before the
+    worker picks the job up. Publishing anyway would put a KV pointer at
+    a ``storage_prefix`` the ``purgatory_cleanup`` sweep is entitled to
+    reclaim, so the re-read inside the ``EDITION_UPDATE`` lock retires
+    the job instead: ``completed`` carrying ``deleted_skipped``, with
+    nothing published and the history entry left where tracking put it.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-deleted-build-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-deleted-build",
+        )
+        build_store = BuildStore(session=db_session, logger=logger)
+        assert await build_store.soft_delete(build_id=build.id) is True
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-deleted-build",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert mock_publisher.calls == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["deleted_skipped"] is True
+            assert (
+                job.progress["message"]
+                == "Build was deleted before publishing"
+            )
+
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            assert len(entries) == 1
+            assert entries[0].id == history_entry.id
+            # Untouched: ``_mark_publishing`` never ran, so the entry
+            # still carries exactly what tracking recorded.
+            assert entries[0].publish_status == history_entry.publish_status

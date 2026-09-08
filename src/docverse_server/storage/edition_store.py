@@ -10,7 +10,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import Select, select, update
+from sqlalchemy import Select, exists, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -384,10 +384,25 @@ class EditionStore:
     ) -> Edition | None:
         """Set the current build for an edition.
 
-        Compares the incoming build's ``date_created`` against the
-        current build's ``date_created``.  If the edition already points
-        to a build that is equally new or newer, the update is skipped
-        and ``None`` is returned (stale-build guard per SQR-112).
+        Two guards can refuse the repoint, and both report the refusal
+        the same way — by returning ``None``, which every caller already
+        treats as "this build does not become current".
+
+        The **deleted-build guard** refuses a target whose
+        ``date_deleted`` is set (or that no longer exists at all). A
+        DELETE landing between a build's upload and the tracking write
+        would otherwise leave the edition serving content the
+        ``purgatory_cleanup`` sweep is entitled to reclaim once the
+        organization's retention elapses (PRD #596). It is deliberately
+        checked ahead of, and independently of, ``skip_date_guard``:
+        that flag waives an *ordering* comparison the version-mode
+        callers make for themselves, not the question of whether the
+        build still exists.
+
+        The **stale-build guard** then compares the incoming build's
+        ``date_created`` against the current build's. If the edition
+        already points to a build that is equally new or newer, the
+        update is skipped (SQR-112).
 
         Parameters
         ----------
@@ -404,8 +419,23 @@ class EditionStore:
         -------
         Edition or None
             The updated edition, or ``None`` if the update was skipped
-            because the edition already points to a newer build.
+            because the target build is soft-deleted or the edition
+            already points to a newer build.
         """
+        # Deleted-build guard: an EXISTS on the live target, so the
+        # answer comes from the same snapshot as the write that follows
+        # and a build deleted since the caller read it is caught here.
+        live_target = await self._session.execute(
+            select(
+                exists().where(
+                    SqlBuild.id == build_id,
+                    SqlBuild.date_deleted.is_(None),
+                )
+            )
+        )
+        if not live_target.scalar_one():
+            return None
+
         # Fetch edition row
         stmt = (
             select(
