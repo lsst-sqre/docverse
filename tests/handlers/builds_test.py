@@ -60,8 +60,9 @@ async def _stamp_date_purged(
     """Set ``date_purged`` on a build row directly.
 
     Nothing in the tree writes the column yet — the sweep that will is
-    DM-54691's later slice — so the read path is exercised by writing
-    the row the sweep would leave behind.
+    DM-54691's later slice — so the paths that *read* it are exercised
+    by writing the row the sweep would leave behind: the build response
+    body, and the restore endpoint's refusal.
     """
     logger = structlog.get_logger("docverse")
     async for session in db_session_dependency():
@@ -697,3 +698,171 @@ async def test_delete_build_ignores_a_deleted_editions_pointer(
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_restore_build_revives_a_deleted_build(
+    client: AsyncClient,
+) -> None:
+    """Restore returns 200 and hands back a live build.
+
+    The 200 body is the operator's confirmation that the row is back:
+    ``date_deleted`` is cleared and the build reads exactly as it did
+    before the DELETE, apart from the status the delete gave it.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    deleted = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert deleted.status_code == 204
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == build_id
+    row = await _read_deleted_build("build-org", "build-proj", build_id)
+    assert row.date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_restore_build_keeps_the_deleted_builds_status(
+    client: AsyncClient,
+) -> None:
+    """A build cancelled by its DELETE comes back cancelled.
+
+    Restoring returns the row and its content, not a re-run: the tarball
+    was never re-staged and no worker was re-queued, so reviving the
+    build as ``pending`` would advertise a build nothing is going to
+    publish and hand it to the stranded-build sweep.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == BuildStatus.cancelled.value
+
+
+@pytest.mark.asyncio
+async def test_restore_build_refuses_a_purged_build(
+    client: AsyncClient,
+) -> None:
+    """A purged build answers 409, and stays deleted.
+
+    ``date_purged`` says the sweep reclaimed the tree and the tarball,
+    so there is nothing left to restore. The refusal has to be a
+    conflict rather than a 404: the row is still readable, and telling
+    the operator it does not exist would invite them to keep retrying.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    await _stamp_date_purged(
+        "build-org",
+        "build-proj",
+        build_id,
+        datetime(2026, 9, 8, 3, 23, tzinfo=UTC),
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"][0]["type"] == "conflict"
+    row = await _read_deleted_build("build-org", "build-proj", build_id)
+    assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_restore_build_reports_a_live_build_as_not_found(
+    client: AsyncClient,
+) -> None:
+    """Restoring a build nobody deleted is a miss, not a no-op 200.
+
+    The endpoint addresses only the rows ordinary reads hide, so a live
+    build id here is a mistake worth reporting rather than a request to
+    do nothing.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_restored_build_is_listed_and_rollback_eligible(
+    client: AsyncClient,
+) -> None:
+    """A restored build is an ordinary build again, end to end.
+
+    The 200 body alone would not prove the row rejoined the live set:
+    the listing and the rollback target resolution both go through
+    ``date_deleted IS NULL`` lookups of their own. Rolling an edition
+    back onto the restored build is the strongest statement that the
+    restore actually undid the delete.
+    """
+    await _setup(client)
+    older = await seed_build("build-org", "build-proj")
+    current = await seed_build("build-org", "build-proj")
+    await _seed_edition_serving(
+        "build-org",
+        "build-proj",
+        edition_slug="served",
+        build_ids=[older, current],
+    )
+    await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{older}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    listed_while_deleted = await client.get(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert older not in [build["id"] for build in listed_while_deleted.json()]
+
+    restored = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{older}/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert restored.status_code == 200
+
+    listed = await client.get(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert older in [build["id"] for build in listed.json()]
+
+    rollback = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/editions/served"
+        "/rollback",
+        json={"build": older},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback.status_code == 200

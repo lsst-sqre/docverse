@@ -602,6 +602,144 @@ async def test_soft_delete_all_by_project_cancels_unfinished(
 
 
 @pytest.mark.asyncio
+async def test_get_deleted_by_public_id_sees_only_deleted_rows(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The deleted-aware lookup is the exact complement of the live one.
+
+    ``get_by_public_id`` filters ``date_deleted IS NULL``, which is what
+    keeps a deleted build unaddressable by an ordinary request. Restore
+    has to address precisely the rows that lookup hides, so it needs the
+    complement rather than a lookup that sees both: one that saw live
+    rows too would let a restore report success against a build nobody
+    ever deleted, and the endpoint's 404-on-a-live-build contract would
+    have nothing behind it.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        while_live = await build_store.get_deleted_by_public_id(
+            project_id=project_id, public_id=build.public_id
+        )
+        assert await build_store.soft_delete(build_id=build.id) is True
+        once_deleted = await build_store.get_deleted_by_public_id(
+            project_id=project_id, public_id=build.public_id
+        )
+        await db_session.commit()
+
+    assert while_live is None
+    assert once_deleted is not None
+    assert once_deleted.id == build.id
+    assert once_deleted.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_restore_clears_date_deleted(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A soft-deleted, unpurged build comes back as a live row.
+
+    The restored build has to be visible to the live lookup again, since
+    that is what every ordinary read — the build listing, a rollback's
+    target resolution — goes through.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.soft_delete(build_id=build.id)
+        restored = await build_store.restore(build_id=build.id)
+        live = await build_store.get_by_public_id(
+            project_id=project_id, public_id=build.public_id
+        )
+        await db_session.commit()
+
+    assert restored is not None
+    assert restored.date_deleted is None
+    assert live is not None
+    assert live.id == build.id
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_the_status_the_build_earned(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Restore un-deletes a row; it does not un-cancel it.
+
+    ``soft_delete_by_id`` cancels an unfinished build on its way out, and
+    nothing about a restore says the tarball is still on the store or
+    that a worker will pick the build up again. Reviving the row to
+    ``pending`` would put a build back in front of the stranded-build
+    sweep with no queue job behind it.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.cancelled
+        )
+        await build_store.soft_delete(build_id=build.id)
+        restored = await build_store.restore(build_id=build.id)
+        await db_session.commit()
+
+    assert restored is not None
+    assert restored.status == BuildStatus.cancelled
+
+
+@pytest.mark.asyncio
+async def test_restore_stands_down_on_a_purged_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A stamped ``date_purged`` makes the row permanently deleted.
+
+    ``date_purged`` says the object-store content is gone, so clearing
+    ``date_deleted`` would publish a build whose tree no longer exists.
+    The row stays deleted and the caller is told nothing was restored.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.soft_delete(build_id=build.id)
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == build.id)
+            .values(date_purged=func.now())
+        )
+        refused = await build_store.restore(build_id=build.id)
+        still_deleted = await build_store.get_deleted_by_public_id(
+            project_id=project_id, public_id=build.public_id
+        )
+        await db_session.commit()
+
+    assert refused is None
+    assert still_deleted is not None
+    assert still_deleted.date_deleted is not None
+
+
+@pytest.mark.asyncio
 async def test_update_content_hash_rejects_non_pending(
     db_session: AsyncSession,
     build_store: BuildStore,

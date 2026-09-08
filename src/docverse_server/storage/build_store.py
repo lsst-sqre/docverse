@@ -219,6 +219,77 @@ class BuildStore:
             return None
         return Build.model_validate(row)
 
+    async def get_deleted_by_public_id(
+        self, *, project_id: int, public_id: int
+    ) -> Build | None:
+        """Fetch a *soft-deleted* build by project_id and public_id.
+
+        The exact complement of :meth:`get_by_public_id`, which filters
+        ``date_deleted IS NULL`` and so cannot address the rows a
+        restore exists to revive. Keeping the two lookups disjoint is
+        what gives the restore endpoint its "404 on a live build"
+        contract: a lookup that saw both would let a restore report
+        success against a build nobody ever deleted.
+
+        A purged build is still returned — ``date_purged`` does not
+        clear ``date_deleted`` — so the caller can tell "no such deleted
+        build" (404) from "its content is gone" (409) rather than
+        collapsing both into a miss.
+        """
+        result = await self._session.execute(
+            select(SqlBuild).where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.public_id == public_id,
+                SqlBuild.date_deleted.is_not(None),
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
+    async def restore(self, *, build_id: int) -> Build | None:
+        """Clear ``date_deleted`` unless the build's content is gone.
+
+        The inverse of :meth:`soft_delete`, and deliberately narrower:
+        ``date_purged`` records that the ``purgatory_cleanup`` sweep
+        reclaimed the build's tree and tarball, so reviving such a row
+        would publish a build whose objects no longer exist. That row
+        stays deleted for good and this returns ``None``.
+
+        ``date_purged`` is the single authority on the answer, and it is
+        read under the row lock the write needs, so a sweep stamping the
+        column cannot land between the decision and the update: the
+        loser of that race blocks and then re-reads what the winner
+        wrote. The sweep's own :meth:`mark_purged` guard is the mirror
+        of this one, which is what makes a restore racing a reclaim come
+        out one way or the other rather than both.
+
+        Status is untouched. ``soft_delete_by_id`` cancels an unfinished
+        build on its way out, and nothing about a restore says the
+        tarball is still staged or that a worker will pick the build up
+        again; reviving the row to ``pending`` would put it back in
+        front of the stranded-build sweep with no queue job behind it.
+
+        Restoring an already-live row is a no-op that returns it, so a
+        client retrying a restore it never saw the response to gets the
+        same answer rather than a spurious refusal.
+
+        Returns
+        -------
+        Build or None
+            The live build, or ``None`` when the row has been purged or
+            no longer exists.
+        """
+        row = await self._load_locked(build_id)
+        if row is None or row.date_purged is not None:
+            return None
+        if row.date_deleted is not None:
+            row.date_deleted = None
+            await self._session.flush()
+            await self._session.refresh(row)
+        return Build.model_validate(row)
+
     async def list_all_by_project_ids(
         self, project_ids: list[int]
     ) -> list[Build]:

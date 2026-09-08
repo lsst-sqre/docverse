@@ -589,3 +589,81 @@ class BuildService:
         ):
             msg = f"Build {build_id!r} not found"
             raise NotFoundError(msg)
+
+    async def restore(
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        build_id: str,
+    ) -> Build:
+        """Bring a soft-deleted build back, unless its content is gone.
+
+        The other half of the "restorable until purged" promise that
+        ``date_deleted`` makes and the ``purgatory_cleanup`` sweep
+        eventually revokes. Until the sweep stamps ``date_purged`` the
+        build's tree is still on the object store, so clearing
+        ``date_deleted`` is all it takes to make the build a live
+        rollback target again; once the stamp is there the bytes are
+        gone and no row edit can bring them back.
+
+        Status is deliberately untouched. A build deleted while
+        ``pending`` or ``processing`` was cancelled on its way out by
+        :meth:`soft_delete_by_id`, and a restore says nothing about the
+        staged tarball or about a worker picking it up; a ``cancelled``
+        build therefore comes back ``cancelled``. What the operator gets
+        back is the row and its content, not a re-run.
+
+        The lookup is :meth:`BuildStore.get_deleted_by_public_id` rather
+        than the ordinary one, which hides deleted rows: it is what
+        makes a live build a 404 here instead of a silent no-op that
+        looks like it restored something. A purged build is *found* by
+        that lookup — purging does not clear ``date_deleted`` — which is
+        what lets this tell "no such deleted build" from "its content
+        was reclaimed" rather than collapsing both into a miss.
+
+        Parameters
+        ----------
+        build_id
+            Base32-encoded public build ID.
+
+        Returns
+        -------
+        Build
+            The restored build, with ``date_deleted`` cleared.
+
+        Raises
+        ------
+        ConflictError
+            If the build's content has already been reclaimed.
+        NotFoundError
+            If there is no soft-deleted build with that id.
+        """
+        project = await self._resolve_project(org_slug, project_slug)
+        public_id = self._validate_build_id(build_id)
+        deleted = await self._store.get_deleted_by_public_id(
+            project_id=project.id, public_id=public_id
+        )
+        if deleted is None:
+            msg = f"Build {build_id!r} not found"
+            raise NotFoundError(msg)
+        # ``restore`` is the single authority on whether the content is
+        # still there: it re-reads ``date_purged`` under the row lock,
+        # so a sweep committing between the lookup above and the write
+        # is refused here rather than silently reviving a build whose
+        # objects have just been deleted.
+        restored = await self._store.restore(build_id=deleted.id)
+        if restored is None:
+            msg = (
+                f"Build {build_id!r} has been purged; its content was "
+                f"permanently reclaimed and cannot be restored"
+            )
+            raise ConflictError(msg)
+        self._logger.info(
+            "Restored build",
+            build=build_id,
+            org=org_slug,
+            project=project_slug,
+            status=restored.status.value,
+        )
+        return restored

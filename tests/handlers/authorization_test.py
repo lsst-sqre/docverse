@@ -205,6 +205,23 @@ async def test_delete_build_as_uploader(client: AsyncClient) -> None:
     assert response.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_restore_build_as_uploader(client: AsyncClient) -> None:
+    """Restore carries the same admin-only guard as the DELETE it undoes.
+
+    Anything less would let an uploader put back a build an admin
+    deliberately removed.
+    """
+    await _setup(client)
+    build_id = await _create_build()
+    response = await client.post(
+        f"/docverse/orgs/auth-org/projects/auth-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "upload-user"},
+    )
+    assert response.status_code == 403
+
+
 # ------------------------------------------------------------------
 # Editions — admin-only for write, reader for read
 # ------------------------------------------------------------------
