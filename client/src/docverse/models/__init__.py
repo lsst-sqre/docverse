@@ -99,7 +99,7 @@ from .queue import (
     PublishJobRef,
     QueueJob,
 )
-from .queue_enums import JobKind, JobStatus, PublishStatus
+from .queue_enums import JobKind, JobStatus, PublishStatus, RetiredBuildStatus
 from .services import (
     OrganizationService,
     OrganizationServiceCreate,
@@ -186,6 +186,7 @@ __all__ = [
     "PublishStatus",
     "QueueJob",
     "RefDeletedRule",
+    "RetiredBuildStatus",
     "S3Credentials",
     "ServiceCategory",
     "ServiceConfig",

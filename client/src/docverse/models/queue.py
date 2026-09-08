@@ -22,7 +22,7 @@ from ._examples import (
     EXAMPLE_PUBLISH_JOB_URL,
     EXAMPLE_RUN_ID,
 )
-from .queue_enums import JobKind, JobStatus
+from .queue_enums import JobKind, JobStatus, RetiredBuildStatus
 
 if TYPE_CHECKING:
     from pydantic import GetJsonSchemaHandler
@@ -153,6 +153,28 @@ class BuildProcessingProgress(BaseModel):
         description="``True`` when edition tracking failed for this build.",
     )
 
+    deleted_skipped: bool | None = Field(
+        default=None,
+        description=(
+            "``True`` when the build was deleted before it could be"
+            " published, so it was cancelled instead. Set whether the"
+            " delete landed before the worker picked the job up or while"
+            " the worker was still uploading."
+        ),
+    )
+
+    retired_status: RetiredBuildStatus | None = Field(
+        default=None,
+        description=(
+            "Status the build was found in when the worker stood down,"
+            " on a job that completed without publishing because"
+            " something else retired the build first. ``missing`` means"
+            " the row was gone by the time the worker looked. ``null``"
+            " (the key omitted) on jobs that were never retired."
+        ),
+        examples=[RetiredBuildStatus.superseded],
+    )
+
     @model_serializer(mode="wrap")
     def _drop_none_keys(
         self, handler: SerializerFunctionWrapHandler
@@ -161,10 +183,10 @@ class BuildProcessingProgress(BaseModel):
 
         Every field is *declared* (and ``__get_pydantic_json_schema__``
         keeps them in the serialization-mode schema), but a non-build job
-        validated into this model leaves the six build-specific typed
+        validated into this model leaves the eight build-specific typed
         fields ``None``. Dropping them at serialization time keeps a
         non-build job's ``progress`` to its real keys (e.g. ``message`` plus
-        its ``extra='allow'`` extras) instead of leaking six ``null`` keys,
+        its ``extra='allow'`` extras) instead of leaking eight ``null`` keys,
         while a build job still emits every field it actually set.
         """
         return {k: v for k, v in handler(self).items() if v is not None}
@@ -182,7 +204,7 @@ class BuildProcessingProgress(BaseModel):
         ``{type: object, additionalProperties: true}``. FastAPI builds
         response-model schemas in serialization mode, so the generated
         OpenAPI / api-types would regress ``progress`` back to a free-form
-        object with none of the seven typed fields. Dropping the
+        object with none of the nine typed fields. Dropping the
         model-level serializer from the core schema before generating
         restores the declared fields; runtime drop-``None`` serialization
         is unaffected (it runs off the compiled serializer, not this).

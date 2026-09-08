@@ -374,6 +374,68 @@ async def test_fail_job(
 
 
 @pytest.mark.asyncio
+async def test_fail_if_active_fails_in_progress_job(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The idempotent fail still fails a row the caller genuinely owns."""
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        await store.start_if_queued(job.id)
+        failed = await store.fail_if_active(
+            job.id, errors={"message": "object store went away"}
+        )
+        await db_session.commit()
+    assert failed is not None
+    assert failed.status == JobStatus.failed
+    assert failed.date_completed is not None
+    assert failed.errors == {"message": "object store went away"}
+
+
+@pytest.mark.asyncio
+async def test_fail_if_active_leaves_a_reaped_job_alone(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A row that already went terminal keeps its verdict and its errors.
+
+    The worker's error path calls this over a row the silent reaper may
+    have failed underneath it, so the second fail has to be a no-op
+    rather than an ``InvalidJobStateError`` raised from inside the
+    transaction that exists to close the run out.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        await store.start_if_queued(job.id)
+        await store.fail(job.id, errors={"type": "SilentWorker"})
+        await db_session.commit()
+
+    async with db_session.begin():
+        result = await store.fail_if_active(
+            job.id, errors={"type": "ObjectStoreError"}
+        )
+        await db_session.commit()
+    assert result is None
+
+    async with db_session.begin():
+        reaped = await store.get(job.id)
+    assert reaped is not None
+    assert reaped.status == JobStatus.failed
+    assert reaped.errors == {"type": "SilentWorker"}
+
+
+@pytest.mark.asyncio
+async def test_fail_if_active_raises_for_missing_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A missing row is a programming error, not a race — it still raises."""
+    async with db_session.begin():
+        with pytest.raises(JobNotFoundError):
+            await store.fail_if_active(-1)
+
+
+@pytest.mark.asyncio
 async def test_cancel_queued_job(
     db_session: AsyncSession,
     store: QueueJobStore,

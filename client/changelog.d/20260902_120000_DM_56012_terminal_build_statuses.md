@@ -1,0 +1,3 @@
+### New features
+
+- `BuildStatus` gains two terminal values that a build can now be reported in: `superseded`, for a build that a newer live build for the same `(project, git_ref)` took over before it was processed, and `cancelled`, for a build deleted before processing finished. Neither means anything went wrong — that is still `failed` — but neither build will ever be published. Both are accepted by the `status` filter on `GET /orgs/{org}/projects/{project}/builds`, so `docverse` callers can list them directly. The client dist is unreleased, so there is no compatibility shim: code that exhaustively matches on `BuildStatus` needs arms for the new values.

@@ -22,6 +22,7 @@ from sqlalchemy.sql import select, update
 
 from docverse.models import (
     BuildCreate,
+    BuildStatus,
     EditionKind,
     LifecycleEvalRunStatus,
     OrganizationCreate,
@@ -1164,6 +1165,99 @@ async def test_lifecycle_eval_publishes_lifecycle_action(
         ("event-project-b", LifecycleReapAction.build_history_orphan),
     }
     await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_cancels_unfinished_reaped_build(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A reaped build that never finished is cancelled, not just deleted.
+
+    ``build_history_orphan`` matches never-finished builds on purpose —
+    it falls back to ``date_created`` when there is no
+    ``date_completed`` — so the reaper regularly deletes rows that are
+    still ``pending`` or ``processing``. Deleting one without retiring
+    it would leave it claiming to be waiting for, or held by, a worker
+    forever: the stranded-build sweep only looks at live rows, so it
+    would never come back for it. The reaper therefore runs the same
+    cancel step a DELETE does.
+    """
+    project_rules = LifecycleRuleSet(
+        root=[BuildHistoryOrphanRule(min_position=1, min_age_days=30)]
+    )
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="lce-cancel-org")
+        project_id = await _seed_project(
+            db_session,
+            org_id=org_id,
+            slug="cancel-project",
+            lifecycle_rules=project_rules,
+        )
+        current_build_id = await _seed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="cancel-project",
+            date_completed=NOW - timedelta(days=40),
+        )
+        # The orphan: old enough to match, and never finished, so it is
+        # still sitting on the status its uploader left it in.
+        orphan_build_id = await _seed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="cancel-project",
+            date_completed=NOW - timedelta(days=40),
+        )
+        build_store = BuildStore(session=db_session, logger=_logger())
+        await build_store.transition_status(
+            build_id=orphan_build_id, new_status=BuildStatus.processing
+        )
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == orphan_build_id)
+            .values(date_completed=None)
+        )
+        await _seed_edition(
+            db_session,
+            project_id=project_id,
+            slug="main",
+            kind=EditionKind.draft,
+            date_updated=NOW - timedelta(days=60),
+            current_build_id=current_build_id,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = BuildStore(session=session, logger=_logger())
+            orphan = await store.get_by_id(orphan_build_id)
+            assert orphan is not None
+            assert orphan.date_deleted is not None
+            assert orphan.status == BuildStatus.cancelled
+            assert orphan.date_completed is not None
+
+            # The edition's current build was protected by the rule and
+            # keeps the status it earned.
+            current = await store.get_by_id(current_build_id)
+            assert current is not None
+            assert current.date_deleted is None
+        break
 
 
 @pytest.mark.asyncio

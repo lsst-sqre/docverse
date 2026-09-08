@@ -88,6 +88,18 @@ _ACTIVE_JOB_UNIQUE_INDEXES = frozenset(
 )
 """Names of the ``queue_jobs`` partial unique indexes guarding active jobs."""
 
+_ACTIVE_JOB_STATUSES = frozenset(
+    {JobStatus.queued.value, JobStatus.in_progress.value}
+)
+"""Statuses in which a ``queue_jobs`` row is still live.
+
+The same ``status IN ('queued', 'in_progress')`` predicate the
+active-job mutex indexes use, as a Python set: it is the precondition
+for :meth:`QueueJobStore.fail` and :meth:`QueueJobStore.cancel`, and the
+membership test :meth:`QueueJobStore.fail_if_active` skips on. Named
+once so those three cannot drift apart.
+"""
+
 
 def _is_active_job_conflict(exc: IntegrityError) -> bool:
     """Return True when ``exc`` is an active-job mutex unique violation.
@@ -305,6 +317,45 @@ class QueueJobStore:
         """Fetch a QueueJob by internal id."""
         result = await self._session.execute(
             select(SqlQueueJob).where(SqlQueueJob.id == job_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return QueueJob.model_validate(row, from_attributes=True)
+
+    async def get_for_update(self, job_id: int) -> QueueJob | None:
+        """Fetch a QueueJob by internal id, locking the row until commit.
+
+        The read half of a read-then-write on a job's status: it returns
+        the row as it stands *and* holds it, so the status the caller
+        branches on cannot change under it before it writes. Use it
+        wherever a decision is made from a job's status and acted on in
+        the same transaction — a worker deciding whether it still owns a
+        row a reaper may have failed underneath it, say, where an
+        unlocked read would let :meth:`complete` raise
+        :exc:`~docverse_server.exceptions.InvalidJobStateError` from
+        inside the transaction that exists to close the job out. Use
+        :meth:`get` for a plain look.
+
+        ``populate_existing`` keeps the guarantee off the identity map:
+        sessions are created with ``expire_on_commit=False``, so an
+        instance this session loaded in an earlier transaction would
+        otherwise come back with its old attributes rather than the
+        locked row's — the same reason
+        :meth:`~docverse_server.storage.build_store.BuildStore.get_for_update`
+        asks for them outright.
+
+        Returns
+        -------
+        QueueJob or None
+            The locked job, or ``None`` if no such row exists (in which
+            case nothing is locked).
+        """
+        result = await self._session.execute(
+            select(SqlQueueJob)
+            .where(SqlQueueJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         row = result.scalar_one_or_none()
         if row is None:
@@ -543,14 +594,75 @@ class QueueJobStore:
             If the job is not in queued or in_progress status.
         """
         row = await self._get_row(job_id)
-        allowed = {JobStatus.queued.value, JobStatus.in_progress.value}
-        if row.status not in allowed:
+        if row.status not in _ACTIVE_JOB_STATUSES:
             raise InvalidJobStateError(
                 current_state=row.status,
                 target_state=JobStatus.failed.value,
                 job_public_id=serialize_base32_id(row.public_id),
                 job_function=row.kind,
             )
+        return await self._mark_failed(row, errors)
+
+    async def fail_if_active(
+        self,
+        job_id: int,
+        *,
+        errors: dict[str, Any] | None = None,
+    ) -> QueueJob | None:
+        """Fail a job unless it already went terminal.
+
+        The idempotent sibling of :meth:`fail`, and what a worker's
+        error path calls: the row it is failing may have gone terminal
+        underneath it — the silent reaper failing an abandoned run, a
+        cancel — and :meth:`fail`'s precondition would then raise
+        :exc:`~docverse_server.exceptions.InvalidJobStateError` from
+        inside the ``except`` handler that exists to close the run out.
+        That second exception masks the original error, rolls back the
+        close-out transaction, and leaves the job exactly as stranded as
+        the reaper found it. :meth:`fail` keeps its precondition for
+        callers that really do own the row.
+
+        Shaped after
+        :meth:`~docverse_server.services.build.BuildService.fail_if_unfinished`,
+        down to the locked read: the status decides whether a write
+        happens at all, and an unlocked one could be stale by the time
+        the write landed — which would raise the very error this method
+        exists to avoid. Locking ``queue_jobs`` first also keeps the
+        worker's error path in the same ``queue_jobs``-then-``builds``
+        lock order as every other worker path and as the reaper, so the
+        two cannot deadlock.
+
+        Returns
+        -------
+        QueueJob or None
+            The failed job, or ``None`` when the row had already reached
+            a terminal status and keeps the status it earned. The skip
+            is logged at info level with the job's public id, kind, and
+            current status.
+
+        Raises
+        ------
+        JobNotFoundError
+            If no row with ``job_id`` exists. Like
+            :meth:`start_if_queued`, a missing row is not the race this
+            guards — it means the caller was handed an id that never
+            existed — so it still raises.
+        """
+        row = await self._get_row(job_id, for_update=True)
+        if row.status not in _ACTIVE_JOB_STATUSES:
+            self._logger.info(
+                "Queue job already terminal; leaving its status as it stands",
+                queue_job_id=serialize_base32_id(row.public_id),
+                queue_job_kind=row.kind,
+                queue_job_status=row.status,
+            )
+            return None
+        return await self._mark_failed(row, errors)
+
+    async def _mark_failed(
+        self, row: SqlQueueJob, errors: dict[str, Any] | None
+    ) -> QueueJob:
+        """Apply the failed transition to a loaded, validated row."""
         row.status = JobStatus.failed.value
         row.date_completed = func.now()
         if errors is not None:
@@ -568,8 +680,7 @@ class QueueJobStore:
             If the job is not in queued or in_progress status.
         """
         row = await self._get_row(job_id)
-        allowed = {JobStatus.queued.value, JobStatus.in_progress.value}
-        if row.status not in allowed:
+        if row.status not in _ACTIVE_JOB_STATUSES:
             raise InvalidJobStateError(
                 current_state=row.status,
                 target_state=JobStatus.cancelled.value,
@@ -1721,11 +1832,25 @@ class QueueJobStore:
             await self._session.flush()
         return failed
 
-    async def _get_row(self, job_id: int) -> SqlQueueJob:
-        """Fetch a SqlQueueJob row by id, raising if not found."""
-        result = await self._session.execute(
-            select(SqlQueueJob).where(SqlQueueJob.id == job_id)
-        )
+    async def _get_row(
+        self, job_id: int, *, for_update: bool = False
+    ) -> SqlQueueJob:
+        """Fetch a SqlQueueJob row by id, raising if not found.
+
+        ``for_update`` locks the row until commit and re-reads its
+        columns off the locked row rather than the identity map, for the
+        reasons :meth:`get_for_update` spells out: sessions are created
+        with ``expire_on_commit=False``, so a row this session loaded in
+        an earlier transaction would otherwise come back carrying the
+        attributes it had then. Pass it wherever a decision is made from
+        a row's status and acted on in the same transaction.
+        """
+        stmt = select(SqlQueueJob).where(SqlQueueJob.id == job_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(
+                populate_existing=True
+            )
+        result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
             raise JobNotFoundError(
