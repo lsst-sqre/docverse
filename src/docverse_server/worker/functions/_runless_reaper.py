@@ -2,14 +2,15 @@
 
 A "run-less" reaper is the cron-driven backstop for a :class:`JobKind`
 that does not aggregate into a parent run row — currently
-``dashboard_build``, ``publish_edition``, ``build_processing``, and
-``dashboard_sync``. Each sweeps stuck ``queue_jobs`` rows and finalises
-nothing. Three passes cover the three ways a row goes stuck: silent
-(``in_progress`` but the worker died), orphan (``queued`` and never
-reached arq), and abandoned (``queued``, reached arq, and arq then lost
-the job — PRD #538). A kind may add a fourth, kind-specific pass of its
-own through the ``extra_sweep`` hook — ``build_processing`` uses it to
-retire builds its queue jobs left behind (PRD #577).
+``dashboard_build``, ``publish_edition``, ``build_processing``,
+``dashboard_sync``, and ``purgatory_cleanup``. Each sweeps stuck
+``queue_jobs`` rows and finalises nothing. Three passes cover the three
+ways a row goes stuck: silent (``in_progress`` but the worker died),
+orphan (``queued`` and never reached arq), and abandoned (``queued``,
+reached arq, and arq then lost the job — PRD #538). A kind may add a
+fourth, kind-specific pass of its own through the ``extra_sweep`` hook
+— ``build_processing`` uses it to retire builds its queue jobs left
+behind (PRD #577).
 
 Per PRD #367 §"Reaper module shape", each kind still ships its own
 arq-registered function so cron staggering, logger name, log-event

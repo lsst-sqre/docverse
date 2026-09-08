@@ -1,7 +1,8 @@
-"""Tests for the four run-less reaper cron worker functions.
+"""Tests for the five run-less reaper cron worker functions.
 
 Covers ``dashboard_build_reaper``, ``publish_edition_reaper``,
-``build_processing_reaper``, and ``dashboard_sync_reaper`` — the
+``build_processing_reaper``, ``dashboard_sync_reaper``, and
+``purgatory_cleanup_reaper`` — the
 cron-driven backstops for the case where arq itself loses a queue
 job (worker pod OOM-killed mid-job that never gets to surface a
 timeout, or dispatcher crashed between the ``queue_jobs`` SQL commit
@@ -59,6 +60,9 @@ from docverse_server.worker.functions.dashboard_sync_reaper import (
 from docverse_server.worker.functions.publish_edition_reaper import (
     publish_edition_reaper,
 )
+from docverse_server.worker.functions.purgatory_cleanup_reaper import (
+    purgatory_cleanup_reaper,
+)
 from tests.worker.conftest import make_worker_ctx
 
 
@@ -107,6 +111,14 @@ RUNLESS_REAPER_SPECS: list[ReaperSpec] = [
         well_past_minutes=480,
         slug_prefix="dsr",
     ),
+    ReaperSpec(
+        name="purgatory_cleanup",
+        reaper=purgatory_cleanup_reaper,
+        kind=JobKind.purgatory_cleanup,
+        threshold_attr="purgatory_cleanup_reaper_threshold_seconds",
+        well_past_minutes=480,
+        slug_prefix="pcr",
+    ),
 ]
 
 
@@ -131,6 +143,26 @@ async def _seed_org(db_session: AsyncSession, *, slug: str) -> int:
         )
     )
     return org.id
+
+
+async def _seed_org_per_row(
+    db_session: AsyncSession, *, slug_prefix: str, count: int
+) -> list[int]:
+    """Seed one organization per simultaneously-active queue-job row.
+
+    ``purgatory_cleanup`` carries a per-org active-job mutex
+    (``idx_queue_jobs_purgatory_cleanup_active_uq``, PRD #596), so a
+    test needing a silent, an orphan and an abandoned row alive at the
+    same instant cannot hang all three off one organization. Spreading
+    them is also the truer picture of production for every kind: a
+    reaper tick sweeps whatever is stuck across the whole install, not
+    one org's pile-up. The kinds without a mutex are indifferent to the
+    spread, so all of them use this same shape.
+    """
+    return [
+        await _seed_org(db_session, slug=f"{slug_prefix}-{index}")
+        for index in range(count)
+    ]
 
 
 async def _seed_silent_row(
@@ -423,11 +455,13 @@ async def test_reaper_warning_includes_count_and_public_ids(
     in logs without scanning the database.
     """
     async with db_session.begin():
-        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-4")
+        silent_org_id, orphan_org_id = await _seed_org_per_row(
+            db_session, slug_prefix=f"{spec.slug_prefix}-4", count=2
+        )
         silent_id = await _seed_silent_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=silent_org_id,
             backend_job_id="arq-stuck-warn",
             started_minutes_ago=spec.well_past_minutes,
             project_id=404,
@@ -435,7 +469,7 @@ async def test_reaper_warning_includes_count_and_public_ids(
         orphan_id = await _seed_orphan_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=orphan_org_id,
             created_minutes_ago=10,
             project_id=405,
         )
@@ -693,11 +727,17 @@ async def test_reaper_backend_unreachable_skips_only_abandoned_sweep(
     bullet).
     """
     async with db_session.begin():
-        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab3")
+        (
+            silent_org_id,
+            orphan_org_id,
+            abandoned_org_id,
+        ) = await _seed_org_per_row(
+            db_session, slug_prefix=f"{spec.slug_prefix}-ab3", count=3
+        )
         silent_id = await _seed_silent_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=silent_org_id,
             backend_job_id="arq-stuck-unreachable",
             started_minutes_ago=spec.well_past_minutes,
             project_id=709,
@@ -705,14 +745,14 @@ async def test_reaper_backend_unreachable_skips_only_abandoned_sweep(
         orphan_id = await _seed_orphan_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=orphan_org_id,
             created_minutes_ago=10,
             project_id=710,
         )
         abandoned_id = await _seed_abandoned_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=abandoned_org_id,
             backend_job_id="arq-unverifiable",
             created_minutes_ago=spec.well_past_minutes,
             project_id=711,
@@ -787,11 +827,17 @@ async def test_reaper_backend_stall_keeps_silent_and_orphan_reaps(
     already be committed by then.
     """
     async with db_session.begin():
-        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab5")
+        (
+            silent_org_id,
+            orphan_org_id,
+            abandoned_org_id,
+        ) = await _seed_org_per_row(
+            db_session, slug_prefix=f"{spec.slug_prefix}-ab5", count=3
+        )
         silent_id = await _seed_silent_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=silent_org_id,
             backend_job_id="arq-stuck-stall",
             started_minutes_ago=spec.well_past_minutes,
             project_id=715,
@@ -799,14 +845,14 @@ async def test_reaper_backend_stall_keeps_silent_and_orphan_reaps(
         orphan_id = await _seed_orphan_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=orphan_org_id,
             created_minutes_ago=10,
             project_id=716,
         )
         abandoned_id = await _seed_abandoned_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=abandoned_org_id,
             backend_job_id="arq-stalled",
             created_minutes_ago=spec.well_past_minutes,
             project_id=717,
@@ -870,11 +916,17 @@ async def test_reaper_warning_names_sweep_and_backend_job_id(
     missing, since that field is deliberately not on the jobs API.
     """
     async with db_session.begin():
-        org_id = await _seed_org(db_session, slug=f"{spec.slug_prefix}-ab4")
+        (
+            silent_org_id,
+            orphan_org_id,
+            abandoned_org_id,
+        ) = await _seed_org_per_row(
+            db_session, slug_prefix=f"{spec.slug_prefix}-ab4", count=3
+        )
         silent_id = await _seed_silent_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=silent_org_id,
             backend_job_id="arq-silent-ctx",
             started_minutes_ago=spec.well_past_minutes,
             project_id=712,
@@ -882,14 +934,14 @@ async def test_reaper_warning_names_sweep_and_backend_job_id(
         orphan_id = await _seed_orphan_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=orphan_org_id,
             created_minutes_ago=10,
             project_id=713,
         )
         abandoned_id = await _seed_abandoned_row(
             db_session,
             kind=spec.kind,
-            org_id=org_id,
+            org_id=abandoned_org_id,
             backend_job_id="arq-abandoned-ctx",
             created_minutes_ago=spec.well_past_minutes,
             project_id=714,
