@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
@@ -130,3 +132,49 @@ def test_terminal_statuses_are_the_build_s_final_answer() -> None:
         BuildStatus.superseded,
         BuildStatus.cancelled,
     }
+
+
+def test_build_reports_when_its_objects_were_reclaimed() -> None:
+    """``Build.date_purged`` says whether the build is still restorable.
+
+    A soft-deleted build keeps its row and its history, so
+    ``date_deleted`` alone cannot tell a caller whether the content is
+    still there. ``date_purged`` is the field that can: null means the
+    objects survive and a restore would hand back a working build, a
+    timestamp means the purgatory sweep has already reclaimed them and
+    the row is a tombstone.
+    """
+    now = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+    build = Build(
+        self_url="https://example.com/build",
+        project_url="https://example.com/project",
+        id="1txq-55pj-1x5m-16",
+        git_ref="main",
+        content_hash="sha256:" + "a" * 64,
+        status=BuildStatus.completed,
+        uploader="jdoe",
+        date_created=now,
+        date_purged=now,
+    )
+    assert build.date_purged == now
+    assert Build.model_validate_json(build.model_dump_json()) == build
+
+
+def test_build_date_purged_defaults_to_none() -> None:
+    """A build the sweep has not reached reports ``date_purged`` null.
+
+    Every build predating the purgatory sweep is in exactly that state,
+    so the field has to be omissible rather than required — an old
+    server's response must still parse.
+    """
+    build = Build(
+        self_url="https://example.com/build",
+        project_url="https://example.com/project",
+        id="1txq-55pj-1x5m-16",
+        git_ref="main",
+        content_hash="sha256:" + "a" * 64,
+        status=BuildStatus.completed,
+        uploader="jdoe",
+        date_created=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+    )
+    assert build.date_purged is None

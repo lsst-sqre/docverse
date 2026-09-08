@@ -95,3 +95,12 @@ class Build(BaseModel):
         default=None,
         description="Timestamp when the build was soft-deleted.",
     )
+
+    date_purged: datetime | None = Field(
+        default=None,
+        description=(
+            "Timestamp when the build's object-store content was "
+            "permanently reclaimed. None while the content is still "
+            "there, which is what makes a soft-deleted build restorable."
+        ),
+    )

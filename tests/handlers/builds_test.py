@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from docverse.models import BuildAnnotations, BuildStatus
 from docverse_server.dbschema.build import SqlBuild
@@ -37,6 +39,42 @@ async def _setup(client: AsyncClient) -> None:
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
+
+
+async def _stamp_date_purged(
+    org_slug: str,
+    project_slug: str,
+    build_id: str,
+    when: datetime,
+) -> None:
+    """Set ``date_purged`` on a build row directly.
+
+    Nothing in the tree writes the column yet — the sweep that will is
+    DM-54691's later slice — so the read path is exercised by writing
+    the row the sweep would leave behind.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            await session.execute(
+                update(SqlBuild)
+                .where(
+                    SqlBuild.project_id == project.id,
+                    SqlBuild.public_id == validate_base32_id(build_id),
+                )
+                .values(date_purged=when)
+            )
+            await session.commit()
+        return
+    raise AssertionError("db_session_dependency yielded no session")
 
 
 async def _transition_build(
@@ -463,3 +501,53 @@ async def test_delete_build_cancels_pending_build(
     assert row.status == BuildStatus.cancelled
     assert row.date_deleted is not None
     assert row.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_get_build_reports_content_not_yet_reclaimed(
+    client: AsyncClient,
+) -> None:
+    """A live build reports ``date_purged`` null on the wire.
+
+    Null is the answer for every build that exists today, which is what
+    makes the field readable as "the content is still there" rather than
+    "this server does not know". A caller can only trust a soft-deleted
+    build to be restorable if the field is present and null, so the
+    field has to be emitted even when nothing has ever been purged.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+
+    response = await client.get(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["date_purged"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_build_reports_reclaimed_content(
+    client: AsyncClient,
+) -> None:
+    """A stamped ``date_purged`` reaches the response body.
+
+    The stamp is written by the purgatory sweep, which does not exist
+    yet, so the test writes the column directly. What it pins is the
+    path from the column through the domain model to the wire: without
+    all three, the sweep would reclaim a build's objects and no API
+    caller would ever be able to tell.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    purged_at = datetime(2026, 9, 8, 3, 23, tzinfo=UTC)
+    await _stamp_date_purged("build-org", "build-proj", build_id, purged_at)
+
+    response = await client.get(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert datetime.fromisoformat(response.json()["date_purged"]) == purged_at

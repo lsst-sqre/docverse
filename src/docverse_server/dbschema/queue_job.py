@@ -181,6 +181,25 @@ class SqlQueueJob(Base):
                 "AND status IN ('queued', 'in_progress')"
             ),
         ),
+        # Per-org mutex for ``purgatory_cleanup`` per-org child jobs:
+        # at most one queued or in_progress row per ``org_id``. Same
+        # single-column shape as the ``lifecycle_eval_active_uq`` and
+        # ``git_ref_audit_active_uq`` mutexes above — the purgatory
+        # sweep is per-org by design, with no sub-key under ``org_id``.
+        # A second active sweep for one org would plan against the same
+        # builds and race the first one's reclaim, so this index is the
+        # backstop behind the dispatcher's ``create_unless_active``
+        # pre-check. The row still carries ``subject_label = org.slug``
+        # for operator readability, just as for the other two.
+        Index(
+            "idx_queue_jobs_purgatory_cleanup_active_uq",
+            "org_id",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'purgatory_cleanup' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
         # Per-project mutex for dashboard_build jobs: at most one
         # queued or in_progress row per (org_id, project_id). Backstops
         # the application-side ``has_active_dashboard_build`` pre-check
