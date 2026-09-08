@@ -442,8 +442,13 @@ class BuildStore:
         Raises
         ------
         InvalidBuildStateError
-            If the build is not found or the transition is not valid,
-            and ``only_from`` was not given.
+            If the transition is not valid; or, when ``only_from`` is
+            not given, if the build is not found. ``only_from`` only
+            turns the not-found and outside-the-set cases into a
+            ``None`` — a row inside the set whose edge to
+            ``new_status`` is missing still raises, which is what
+            ``supersede_if_unfinished`` relies on for
+            ``pending -> superseded``.
         ValueError
             If ``content_hash`` is passed with a target other than
             ``completed``.
