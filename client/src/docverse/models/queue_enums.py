@@ -112,8 +112,10 @@ class RetiredBuildStatus(StrEnum):
     ``BuildStatus`` is a member because the worker reports whatever
     status its re-read returned, and the re-read can return a *live*
     status: ``BuildStore.soft_delete`` stamps ``date_deleted`` without
-    touching the status, so a deleted row can still read ``processing``
-    or ``completed`` and is retired just as firmly. A narrower enum
+    touching the status, so a deleted row can still read ``completed``
+    and is retired just as firmly. (A deleted row still ``processing``
+    is cancelled by the worker on its way out and reported as
+    ``cancelled``, unless something else retires it first.) A narrower enum
     would reject a payload the worker really writes, turning a job
     listing into a validation error. ``missing`` is the member with no
     ``BuildStatus`` counterpart, and cannot become one: there is no row

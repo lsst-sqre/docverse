@@ -2609,7 +2609,7 @@ async def test_build_processing_soft_deleted_row_mid_upload_closes_out(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A soft-delete alone retires the build, even without the cancel.
+    """A soft-delete alone retires the build, and the close-out cancels it.
 
     ``BuildStore.get_for_update`` does not filter ``date_deleted``, so a
     row soft-deleted without the paired cancel — the ordering
@@ -2617,7 +2617,9 @@ async def test_build_processing_soft_deleted_row_mid_upload_closes_out(
     ``processing`` here. Publishing it would move edition pointers onto a
     build the operator deleted and would delete the staging tarball that
     is its only chance of being restored. The guard therefore tests
-    ``date_deleted`` as well as the status.
+    ``date_deleted`` as well as the status, and the close-out then
+    finishes the delete: a row left ``processing`` + ``date_deleted``
+    is the one shape no sweep reaches (review of PR #583, finding f1).
     """
     logger = _logger()
     _manager, events = await build_event_manager(Configuration())
@@ -2708,13 +2710,19 @@ async def test_build_processing_soft_deleted_row_mid_upload_closes_out(
             assert job.progress is not None
             assert job.progress.get("deleted_skipped") is True
             assert "deleted" in job.progress["message"]
+            # Names the status the close-out wrote, not the stale
+            # ``processing`` the re-read found.
+            assert job.progress["retired_status"] == "cancelled"
 
             build_store = BuildStore(session=session, logger=_logger())
             refreshed = await build_store.get_by_id(build.id)
             assert refreshed is not None
             assert refreshed.date_deleted is not None
-            # Never written ``completed``, and no inventory landed.
-            assert refreshed.status != BuildStatus.completed
+            # The close-out finishes the delete the bare soft-delete
+            # left half-done: the row is cancelled, not left
+            # ``processing`` for no sweep to reach, and no inventory
+            # landed.
+            assert refreshed.status == BuildStatus.cancelled
             assert refreshed.object_count is None
 
             # The edition pointer was never moved onto the deleted build.

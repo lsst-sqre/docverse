@@ -630,9 +630,12 @@ async def _process_build_locked(
         if isinstance(upload, _MidUploadRetirement):
             return await _close_out_retired_build(
                 session=session,
+                factory=factory,
                 queue_job_store=queue_job_store,
                 queue_job_id=queue_job_id,
                 build_id=build_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
                 status=upload.status,
                 deleted=upload.deleted,
                 logger=logger,
@@ -995,9 +998,12 @@ def _retired_build_progress(
 async def _close_out_retired_build(
     *,
     session: AsyncSession,
+    factory: Factory,
     queue_job_store: QueueJobStore,
     queue_job_id: int | None,
     build_id: int,
+    org_slug: str,
+    project_slug: str,
     status: BuildStatus | None,
     deleted: bool = False,
     logger: structlog.stdlib.BoundLogger,
@@ -1013,6 +1019,16 @@ async def _close_out_retired_build(
     all that is left is bookkeeping: record the skip on the queue job
     and complete it. The build keeps the status it was given, edition
     tracking never runs, and nothing is published.
+
+    The one exception is a row that is soft-deleted but still
+    unfinished — the bare ``BuildStore.soft_delete`` shape, with
+    ``date_deleted`` stamped and no cancel beside it. That is the state
+    no sweep reaches (``fail_stranded_processing`` filters
+    ``date_deleted IS NULL``) and the ``b3c4d5e6f7a8`` backfill exists
+    to clean up, so this path finishes the delete with
+    :meth:`BuildService.cancel_if_unfinished`, as
+    :func:`_mark_deleted_skipped` does before any work, and reports
+    ``cancelled`` as the retired status.
 
     *Every* non-``processing`` outcome comes here rather than down the
     error path, because none of them is a crash. Letting a retired build
@@ -1060,9 +1076,36 @@ async def _close_out_retired_build(
         build_status=status.value if status is not None else None,
         deleted=deleted,
     )
-    if queue_job_id is not None:
-        async with session.begin():
-            job = await queue_job_store.get_for_update(queue_job_id)
+    async with session.begin():
+        # ``queue_jobs`` first, then ``builds``: the same lock order as
+        # the reaper and every sibling worker path.
+        job = (
+            await queue_job_store.get_for_update(queue_job_id)
+            if queue_job_id is not None
+            else None
+        )
+        if deleted and status is not None and status.is_unfinished:
+            # ``BuildStore.soft_delete`` stamps ``date_deleted`` without
+            # the cancel ``BuildService.soft_delete`` pairs with it, so
+            # the row can be deleted yet still read ``processing``.
+            # Left that way it is the one shape no sweep reaches:
+            # ``fail_stranded_processing`` filters ``date_deleted IS
+            # NULL``, and the ``b3c4d5e6f7a8`` backfill exists to mop
+            # exactly this up. Finish the delete here, as the pre-work
+            # sibling :func:`_mark_deleted_skipped` does.
+            build_service = factory.create_build_service()
+            cancelled = await build_service.cancel_if_unfinished(
+                build_id=build_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
+            )
+            if cancelled is not None:
+                # Report the status this close-out wrote, not the stale
+                # one the re-read found; a stand-down means somebody
+                # else got there in the window and ``status`` is the
+                # best name this path has for it.
+                status = BuildStatus.cancelled
+        if queue_job_id is not None:
             if job is None or job.status is not JobStatus.in_progress:
                 # Whatever retired the build usually retired this row
                 # first — the stranded sweep only fails builds whose job
