@@ -1421,16 +1421,18 @@ async def _track_editions(
 ) -> EditionTrackingResult | None:
     """Evaluate edition tracking rules for a completed build.
 
-    Re-reads the build before tracking it, because the row can go
-    terminal between the worker's completion write and this call: a
-    DELETE takes no BUILD_PROCESSING lock, and
-    :meth:`BuildStore.transition_status` is a plain read-then-write, so
-    either UPDATE can be the one that survives. A row that came out of
-    that race soft-deleted, or carrying any status but ``completed``, is
-    one nobody should publish — and ``get_by_id`` does not filter
-    ``date_deleted``, so tracking would otherwise move the edition
-    pointer onto it and enqueue a ``publish_edition`` job for a build
-    that will never be served.
+    Re-reads the build before tracking it, because the completion has
+    already committed by the time this runs and a DELETE takes no
+    BUILD_PROCESSING lock, so one can land in the window between that
+    commit and this call. That is a legitimate sequence, not a race:
+    :meth:`BuildStore.transition_status` decides under the row lock it
+    writes with, so the DELETE observes ``completed``, stands down from
+    the cancel, and only soft-deletes. The row is then ``completed`` and
+    deleted at once — one nobody should publish — and ``get_by_id`` does
+    not filter ``date_deleted``, so tracking would otherwise move the
+    edition pointer onto it and enqueue a ``publish_edition`` job for a
+    build that will never be served. The status check beside it is
+    belt-and-braces for the same window.
 
     Such a build is skipped rather than treated as an error: an empty
     result (not ``None``) so the caller closes the queue job out
