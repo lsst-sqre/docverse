@@ -544,11 +544,12 @@ async def test_get_build_reports_reclaimed_content(
 ) -> None:
     """A stamped ``date_purged`` reaches the response body.
 
-    The stamp is written by the purgatory sweep, which does not exist
-    yet, so the test writes the column directly. What it pins is the
-    path from the column through the domain model to the wire: without
-    all three, the sweep would reclaim a build's objects and no API
-    caller would ever be able to tell.
+    The stamp is written by the ``purgatory_cleanup`` sweep, which this
+    handler test deliberately does not run: it writes the column
+    directly so the assertion stays about the read path. What it pins
+    is the route from the column through the domain model to the wire —
+    without all three, the sweep would reclaim a build's objects and no
+    API caller would ever be able to tell.
     """
     await _setup(client)
     build_id = await seed_build("build-org", "build-proj")

@@ -683,8 +683,10 @@ async def _delete_staging_tarball(
     content is published-ready either way; failing the job over an
     undeleted tarball would turn a finished build into an arq retry that
     re-uploads the whole tree, and the leftover object is reclaimed by
-    the same ``purgatory_cleanup`` sweep (DM-54691) that reclaims the
-    rest of a retired build's storage.
+    the nightly ``purgatory_cleanup`` sweep
+    (:mod:`docverse_server.worker.functions.purgatory_cleanup`), which
+    deletes a retired build's staging tarball along with the rest of its
+    storage once the organization's ``purgatory_retention`` has elapsed.
     """
     try:
         await object_store.delete_object(key=build.staging_key)
@@ -1057,14 +1059,15 @@ async def _close_out_retired_build(
     The uploaded objects are left where they landed: everything already
     written under the build's ``storage_prefix``, plus the
     ``staging_key`` tarball — a whole unpacked tree, where the pre-work
-    guard (:func:`_mark_deleted_skipped`) strands only the tarball.
-    Nothing in the tree reclaims them yet. They are orphaned until the
-    ``purgatory_cleanup`` job tracked in DM-54691 (SQR-112, "Soft delete
-    and purgatory") hard-deletes a soft-deleted build's objects once the
-    organization's ``purgatory_retention`` has elapsed; do not go
-    looking for that purge here. Deleting them from the worker instead
-    would be worse: a cancelled build is soft-deleted, not gone, and
-    stays restorable right up until that purge runs.
+    guard (:func:`_mark_deleted_skipped`) strands only the tarball. They
+    are not orphaned: the nightly ``purgatory_cleanup`` sweep
+    (:mod:`docverse_server.worker.functions.purgatory_cleanup`)
+    hard-deletes both once the organization's ``purgatory_retention``
+    has elapsed and stamps ``builds.date_purged`` when it has, so do not
+    reclaim them here. Deleting them from the worker instead would be
+    worse: a cancelled build is soft-deleted, not gone, and stays
+    restorable — through ``POST .../builds/{build}/restore`` — right up
+    until that sweep runs.
 
     Reports the pickup guards' recorded-skip metric shape: to an
     operator this is the same event, a build deliberately retired rather
