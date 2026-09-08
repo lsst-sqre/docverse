@@ -55,6 +55,7 @@ from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .services.project_github_binding import ProjectGitHubBindingResolver
+from .services.purgatory import PurgatoryService
 from .services.queue_dispatch import QueueDispatcher
 from .services.ref_deleted_processor import RefDeletedWebhookProcessor
 from .storage.build_store import BuildStore
@@ -361,6 +362,20 @@ class Factory:
             edition_store=self.create_edition_store(),
             dispatcher=self.queue_dispatcher,
             queue_job_store=queue_job_store,
+            logger=self._logger,
+        )
+
+    def create_purgatory_service(self) -> PurgatoryService:
+        """Create a :class:`PurgatoryService`.
+
+        Built once per ``purgatory_cleanup`` per-org job. Both of the
+        service's entry points are session-free, so the worker — not the
+        service — decides which of its calls happen inside a
+        transaction.
+        """
+        return PurgatoryService(
+            build_store=self.create_build_store(),
+            edition_store=self.create_edition_store(),
             logger=self._logger,
         )
 

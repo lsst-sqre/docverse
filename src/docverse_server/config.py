@@ -523,6 +523,90 @@ class Configuration(BaseSettings):
         ),
     )
 
+    purgatory_cleanup_enabled: bool = Field(
+        default=False,
+        title="Whether the daily purgatory_cleanup sweep reclaims objects",
+        description=(
+            "Feature flag for the ``purgatory_cleanup`` sweep (PRD"
+            " #596). When false the dispatcher cron returns ``skipped``"
+            " immediately, creating no per-org ``queue_jobs`` rows; the"
+            " cron itself stays registered so flipping the flag does"
+            " not require a worker restart. Ships false because the"
+            " sweep deletes object-store content permanently: an"
+            " environment turns it on once an operator has looked at"
+            " what the first tick would reclaim, roundtable-dev first."
+        ),
+    )
+
+    purgatory_cleanup_max_builds_per_job: int = Field(
+        500,
+        ge=1,
+        title="Builds one purgatory_cleanup job may reclaim per tick",
+        description=(
+            "Cap on the builds a single per-org ``purgatory_cleanup``"
+            " job reclaims before reporting ``capped`` and stopping."
+            " Bounds how long one organization with a large backlog can"
+            " hold a maintenance-pool slot, and keeps the job well"
+            " inside ``maintenance_job_timeout_seconds``. Nothing is"
+            " lost to the cap: the work list is ordered oldest deletion"
+            " first and the rows the cap leaves are unstamped, so the"
+            " next tick resumes where this one stopped. The floor of 1"
+            ' is deliberate — an operator reaching for "pause the'
+            ' sweep" wants ``purgatory_cleanup_enabled``, whereas a cap'
+            " of 0 would queue a job per org every night to plan an"
+            " empty work list and report success."
+        ),
+    )
+
+    purgatory_cleanup_cron_hour: int = Field(
+        3,
+        title="UTC hour for the daily purgatory_cleanup dispatcher cron",
+        description=(
+            "Hour (UTC) at which the ``purgatory_cleanup`` dispatcher"
+            " fans out one job per in-scope organization on the"
+            " maintenance pool. Paired with"
+            " ``purgatory_cleanup_cron_minute``; the 03:23 default sits"
+            " in the quiet pre-dawn UTC window ahead of the"
+            " ``inventory_census`` tick at 04:47, so an inventory"
+            " snapshot reports the bytes the sweep has already"
+            " reclaimed rather than a day-old figure."
+        ),
+    )
+
+    purgatory_cleanup_cron_minute: int = Field(
+        23,
+        title="UTC minute for the daily purgatory_cleanup dispatcher cron",
+        description=(
+            "Minute of ``purgatory_cleanup_cron_hour`` (UTC) at which"
+            " the ``purgatory_cleanup`` dispatcher runs. The default 23"
+            " is staggered off every maintenance-pool reaper minute slot"
+            " and off the ``inventory_census`` minute, so a"
+            " horizontally scaled maintenance pool never fires the"
+            " dispatcher on the same minute as another cron."
+        ),
+    )
+
+    purgatory_cleanup_reaper_threshold_seconds: int = Field(
+        21600,
+        title="Purgatory_cleanup stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing a"
+            " ``purgatory_cleanup`` per-org job (e.g. an OOM-killed"
+            " worker pod, or a dispatcher that crashed between the"
+            " ``queue_jobs`` SQL commit and ``arq_queue.enqueue``)."
+            " ``purgatory_cleanup_reaper`` fails any"
+            " ``kind='purgatory_cleanup'`` ``queue_jobs`` row that has"
+            " been ``in_progress`` longer than this without"
+            " ``date_completed``, releasing the per-org mutex"
+            " ``idx_queue_jobs_purgatory_cleanup_active_uq`` so the next"
+            " nightly tick is not skipped for that organization."
+            " Mirrors ``lifecycle_reaper_threshold_seconds`` so the"
+            " operator knob shape is identical across reapers; the"
+            " env-overridable default lets non-prod environments drive"
+            " the threshold down to seconds for fast verification."
+        ),
+    )
+
     superadmin_usernames: Annotated[
         list[str], BeforeValidator(_parse_comma_separated)
     ] = Field(

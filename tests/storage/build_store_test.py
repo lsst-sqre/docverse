@@ -22,6 +22,7 @@ from docverse.models import (
     ProjectCreate,
 )
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
@@ -737,6 +738,516 @@ async def test_restore_stands_down_on_a_purged_build(
     assert refused is None
     assert still_deleted is not None
     assert still_deleted.date_deleted is not None
+
+
+async def _org_id_of_project(db_session: AsyncSession, project_id: int) -> int:
+    """Return the ``org_id`` of a project row."""
+    result = await db_session.execute(
+        select(SqlProject.org_id).where(SqlProject.id == project_id)
+    )
+    return result.scalar_one()
+
+
+async def _create_project_in_new_org(
+    db_session: AsyncSession,
+    *,
+    org_slug: str,
+    project_slug: str,
+    purgatory_retention: int = 2592000,
+) -> int:
+    """Create a second organization with one project, returning its id."""
+    logger = structlog.get_logger("docverse")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    org = await org_store.create(
+        OrganizationCreate(
+            slug=org_slug,
+            title=org_slug,
+            base_domain=f"{org_slug}.example.com",
+            purgatory_retention=purgatory_retention,
+        )
+    )
+    project = await proj_store.create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug=project_slug,
+            title=project_slug,
+            source_url="https://example.com/example/repo",
+        ),
+    )
+    return project.id
+
+
+async def _soft_deleted_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    deleted_at: datetime,
+    project_slug: str = "build-proj",
+) -> Build:
+    """Create a build and backdate its ``date_deleted`` to a fixed instant.
+
+    The purgatory queries compare ``date_deleted`` against a retention
+    cutoff, so every test here needs deletions at chosen distances from
+    ``now`` rather than the ``func.now()`` that :meth:`soft_delete`
+    stamps. Writing the column directly is the only way to place a row
+    on either side of a boundary without sleeping.
+    """
+    build = await build_store.create(
+        project_id=project_id,
+        project_slug=project_slug,
+        data=_build_data(),
+        uploader="testuser",
+    )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(date_deleted=deleted_at)
+    )
+    return build
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_leaves_builds_inside_the_retention_window(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Only builds deleted before the cutoff are the sweep's work.
+
+    The cutoff is ``now - org.purgatory_retention``, and everything at
+    or after it is still inside the window in which a build is promised
+    to be restorable. Returning such a row would have the sweep reclaim
+    content the restore endpoint is still offering.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        expired = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=40),
+        )
+        await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=1),
+        )
+        purgeable = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=10
+        )
+        await db_session.commit()
+
+    assert [build.id for build in purgeable] == [expired.id]
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_takes_the_oldest_deletions_first(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Ordering is what makes the per-job cap resumable.
+
+    A tick that stops at the cap has to leave the remainder for the next
+    one, so the work list must be a queue with a stable front rather
+    than whatever order the planner happens to return. Oldest deletion
+    first also means the bytes that have been waiting longest — and the
+    rows furthest past the restore promise — go first.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        middle = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=60),
+        )
+        oldest = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        newest = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=40),
+        )
+        purgeable = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=10
+        )
+        await db_session.commit()
+
+    assert [build.id for build in purgeable] == [
+        oldest.id,
+        middle.id,
+        newest.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_stops_at_the_limit(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The cap bounds one job's work, and it takes it off the front.
+
+    ``purgatory_cleanup_max_builds_per_job`` exists so a single org with
+    a huge backlog cannot hold the maintenance pool for hours. The rows
+    the cap leaves behind must be the newest deletions, since those are
+    the ones the next tick can afford to wait for.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        first = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        second = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=60),
+        )
+        await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=40),
+        )
+        capped = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=2
+        )
+        await db_session.commit()
+
+    assert [build.id for build in capped] == [first.id, second.id]
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_skips_builds_already_reclaimed(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """``date_purged`` retires a row from the work list for good.
+
+    The stamp says the tree and tarball are gone, so a second pass would
+    spend a listing and a delete on an empty prefix every tick, forever.
+    It is also what makes a crashed job resumable: the rows it got
+    through do not come back.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        purged = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == purged.id)
+            .values(date_purged=func.now())
+        )
+        still_pending = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=60),
+        )
+        purgeable = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=10
+        )
+        await db_session.commit()
+
+    assert [build.id for build in purgeable] == [still_pending.id]
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_reaches_builds_of_a_deleted_project(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A deleted project's builds are the point of the cascade.
+
+    ``ProjectStore.soft_delete`` stamps ``date_deleted`` on the
+    project's builds precisely so their storage ages into purgatory. If
+    this query filtered deleted projects out, that cascade would pin the
+    bytes forever instead of releasing them, which is the leak the sweep
+    exists to close.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        orphan = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project_id)
+            .values(date_deleted=func.now())
+        )
+        purgeable = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=10
+        )
+        await db_session.commit()
+
+    assert [build.id for build in purgeable] == [orphan.id]
+
+
+@pytest.mark.asyncio
+async def test_list_purgeable_stays_inside_one_organization(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Retention is an org setting, so a work list never spans orgs.
+
+    The sweep runs one job per org against that org's own cutoff.
+    Reaching a neighbour's build would reclaim it against the wrong
+    retention — and against a job whose progress counters and metrics
+    are attributed to somebody else entirely.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        mine = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        other_project_id = await _create_project_in_new_org(
+            db_session, org_slug="other-org", project_slug="other-proj"
+        )
+        await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=other_project_id,
+            project_slug="other-proj",
+            deleted_at=now - timedelta(days=90),
+        )
+        purgeable = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=10
+        )
+        await db_session.commit()
+
+    assert [build.id for build in purgeable] == [mine.id]
+
+
+@pytest.mark.asyncio
+async def test_mark_purged_stamps_a_reclaimed_build_once(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The stamp lands, and the row leaves the work list with it.
+
+    ``mark_purged`` is what the sweep runs after the objects are gone.
+    Returning the id is the caller's proof that it stamped this run —
+    the worker counts a build as purged on that answer, so it has to be
+    the same thing the work list stops returning.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        build = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        stamped = await build_store.mark_purged(build_id=build.id)
+        remaining = await build_store.list_purgeable(
+            org_id=org_id, cutoff=now - timedelta(days=30), limit=10
+        )
+        await db_session.commit()
+
+    assert stamped == build.id
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_mark_purged_records_when_the_objects_went(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """``date_purged`` carries a real timestamp, not just a flag.
+
+    Operators read the column to answer "when did this build's content
+    go away", and the restore endpoint's 409 is only defensible if the
+    row can say when the promise expired.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        await build_store.mark_purged(build_id=build.id)
+        purged = await build_store.get_deleted_by_public_id(
+            project_id=project_id, public_id=build.public_id
+        )
+        await db_session.commit()
+
+    assert purged is not None
+    assert purged.date_purged is not None
+    assert purged.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_purged_stands_down_on_a_live_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A restore that lands between the reclaim and the stamp wins.
+
+    The guard is the mirror of ``restore``'s ``date_purged`` check: one
+    of the two writes gets there first and the other sees the row it
+    left. Zero rows here means the objects are gone from a build that is
+    live again — an error the worker has to report, not a stamp it may
+    quietly apply over somebody's restore.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        restored = await build_store.restore(build_id=build.id)
+        refused = await build_store.mark_purged(build_id=build.id)
+        await db_session.commit()
+
+    assert restored is not None
+    assert refused is None
+
+
+@pytest.mark.asyncio
+async def test_mark_purged_stands_down_on_an_already_stamped_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A second stamp is refused rather than moving the timestamp.
+
+    Two ticks can only overlap on a build if something went wrong, but
+    if they do, the recorded instant must stay the one at which the
+    content actually went — an idempotent re-stamp would quietly move
+    the audit trail forward every time.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        first = await build_store.mark_purged(build_id=build.id)
+        second = await build_store.mark_purged(build_id=build.id)
+        await db_session.commit()
+
+    assert first == build.id
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_purgeable_org_ids_read_each_organizations_own_retention(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The pre-flight cutoff is per org, not one cutoff for all of them.
+
+    ``purgatory_retention`` is an organization column, so two builds
+    deleted the same day can be out of retention in one org and well
+    inside it in another. The dispatcher creates a job per org from this
+    answer; a shared cutoff would either burn a queue slot on an org
+    whose builds are all still restorable, or skip an org whose short
+    retention has already expired.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        expired_project_id = await _create_project_in_new_org(
+            db_session,
+            org_slug="short-retention-org",
+            project_slug="short-proj",
+            purgatory_retention=int(timedelta(days=5).total_seconds()),
+        )
+        patient_project_id = await _create_project_in_new_org(
+            db_session,
+            org_slug="long-retention-org",
+            project_slug="long-proj",
+            purgatory_retention=int(timedelta(days=90).total_seconds()),
+        )
+        expired_org_id = await _org_id_of_project(
+            db_session, expired_project_id
+        )
+        patient_org_id = await _org_id_of_project(
+            db_session, patient_project_id
+        )
+        for project_id, slug in (
+            (expired_project_id, "short-proj"),
+            (patient_project_id, "long-proj"),
+        ):
+            await _soft_deleted_build(
+                db_session,
+                build_store,
+                project_id=project_id,
+                project_slug=slug,
+                deleted_at=now - timedelta(days=10),
+            )
+        in_scope = await build_store.list_org_ids_with_purgeable_builds(
+            now=now
+        )
+        await db_session.commit()
+
+    assert expired_org_id in in_scope
+    assert patient_org_id not in in_scope
+
+
+@pytest.mark.asyncio
+async def test_purgeable_org_ids_ignore_organizations_with_no_work(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """An org whose only deleted build is already reclaimed is out.
+
+    The pre-flight's whole job is keeping the dispatcher from queueing
+    per-org jobs that would plan an empty work list — the run costs a
+    ``queue_jobs`` row, a mutex slot and an operator's attention, all
+    for a no-op.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        org_id = await _org_id_of_project(db_session, project_id)
+        purged = await _soft_deleted_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            deleted_at=now - timedelta(days=90),
+        )
+        await build_store.mark_purged(build_id=purged.id)
+        in_scope = await build_store.list_org_ids_with_purgeable_builds(
+            now=now
+        )
+        await db_session.commit()
+
+    assert org_id not in in_scope
 
 
 @pytest.mark.asyncio

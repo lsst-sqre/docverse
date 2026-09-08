@@ -7,12 +7,14 @@ from typing import overload
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select, update
+from sqlalchemy import Interval, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from docverse.models import BuildCreate, BuildStatus, JobStatus
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
@@ -808,6 +810,169 @@ class BuildStore:
         row.date_deleted = func.now()
         await self._session.flush()
         return True
+
+    async def list_purgeable(
+        self, *, org_id: int, cutoff: datetime, limit: int
+    ) -> list[Build]:
+        """List an organization's builds whose objects are reclaimable.
+
+        The ``purgatory_cleanup`` sweep's work list. A build qualifies
+        when it is soft-deleted (``date_deleted IS NOT NULL``), has not
+        been reclaimed yet (``date_purged IS NULL``), and was deleted
+        strictly before ``cutoff`` — which the caller computes as
+        ``now - org.purgatory_retention``, so a build deleted exactly at
+        the boundary is still inside the window the restore endpoint
+        promises. Exactly the predicate ``idx_builds_purgatory`` is
+        partial on, plus the org scope.
+
+        Soft-deleted *projects* are deliberately not filtered out. The
+        project soft-delete cascade stamps ``date_deleted`` on every one
+        of the project's builds, and those rows are precisely how a
+        deleted project's storage ages into purgatory instead of staying
+        pinned to the store forever. The org join reaches them the same
+        way it reaches a live project's builds.
+
+        Ordered by ``date_deleted`` ascending — oldest deletion first —
+        so a capped tick reclaims the bytes that have been waiting
+        longest and the next tick resumes where this one stopped. The
+        ``id`` tiebreak keeps rows the project cascade deleted in one
+        transaction (and so sharing a timestamp to the microsecond) in a
+        stable order across ticks, which is what makes "the cap took the
+        first N" mean the same thing twice.
+
+        Parameters
+        ----------
+        org_id
+            Organization whose builds to consider. The sweep runs one
+            job per org and retention is an org-level setting, so a work
+            list never spans orgs.
+        cutoff
+            Deletion instant before which a build is out of retention.
+        limit
+            Maximum rows to return: the per-job cap.
+
+        Returns
+        -------
+        list of Build
+            Eligible builds, oldest ``date_deleted`` first.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .join(SqlProject, SqlProject.id == SqlBuild.project_id)
+            .where(
+                SqlProject.org_id == org_id,
+                SqlBuild.date_deleted.is_not(None),
+                SqlBuild.date_purged.is_(None),
+                SqlBuild.date_deleted < cutoff,
+            )
+            .order_by(SqlBuild.date_deleted, SqlBuild.id)
+            .limit(limit)
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
+
+    async def mark_purged(self, *, build_id: int) -> int | None:
+        """Record that a build's object-store content has been reclaimed.
+
+        The write that closes one build's purge, run in its own short
+        transaction after :meth:`ObjectStore.delete_prefix` and the
+        tarball delete have both returned. Nothing else on the row
+        moves: status, ``date_deleted`` and the build's
+        ``edition_build_history`` entries all stay as they were, so an
+        operator can still see what the build was and when it was
+        deleted.
+
+        Conditional on the row still being deleted and unstamped, in the
+        same statement that does the update rather than in a read the
+        caller made earlier. The window that matters is the one between
+        planning and the stamp: a restore committing in it clears
+        ``date_deleted`` on a build whose objects this job has already
+        removed. Losing that race must be visible, so this reports zero
+        rows rather than stamping ``date_purged`` on a live build — the
+        worker turns the ``None`` into an error-level log naming the
+        build, because the row is now live with nothing behind it.
+        :meth:`restore` carries the mirror of this guard, which is what
+        makes the pair resolve one way or the other rather than both.
+
+        Refusing an already-stamped row keeps the recorded instant the
+        one at which the content actually went, rather than letting a
+        second pass walk the audit trail forward.
+
+        Returns
+        -------
+        int or None
+            The build's internal id when this call stamped it, or
+            ``None`` when the row was restored, already stamped, or gone
+            — in every case, when this call did not do the stamping.
+        """
+        result = await self._session.execute(
+            update(SqlBuild)
+            .where(
+                SqlBuild.id == build_id,
+                SqlBuild.date_deleted.is_not(None),
+                SqlBuild.date_purged.is_(None),
+            )
+            .values(date_purged=func.now())
+            .returning(SqlBuild.id)
+        )
+        return result.scalar_one_or_none()
+
+    async def list_org_ids_with_purgeable_builds(
+        self, *, now: datetime
+    ) -> set[int]:
+        """Return every ``org_id`` holding a build past its retention.
+
+        The ``purgatory_cleanup`` dispatcher's pre-flight: it creates
+        one per-org job for each id in this set and nothing for the
+        rest, so an org whose deleted builds are all still inside its
+        window — or already reclaimed — costs no ``queue_jobs`` row, no
+        mutex slot, and no operator attention.
+
+        The cutoff is computed per row rather than once for the whole
+        query, because ``purgatory_retention`` lives on
+        ``organizations``: the same deletion instant can be expired for
+        an org running a one-day window and well inside the promise for
+        one running ninety. Asking the database to add each org's own
+        retention to each build's ``date_deleted`` is what keeps this
+        answer identical to the one
+        :meth:`list_purgeable` will give the per-org job when it runs
+        with that org's cutoff.
+
+        Parameters
+        ----------
+        now
+            The instant to judge retention against, passed in rather
+            than read from the database so the dispatcher's whole tick
+            — this pre-flight and the per-org cutoffs it hands the jobs
+            — shares one clock.
+
+        Returns
+        -------
+        set of int
+            Organization ids with at least one eligible build.
+        """
+        purgeable_at = SqlBuild.date_deleted + func.make_interval(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SqlOrganization.purgatory_retention,
+            type_=Interval,
+        )
+        result = await self._session.execute(
+            select(SqlProject.org_id)
+            .select_from(SqlBuild)
+            .join(SqlProject, SqlProject.id == SqlBuild.project_id)
+            .join(SqlOrganization, SqlOrganization.id == SqlProject.org_id)
+            .where(
+                SqlBuild.date_deleted.is_not(None),
+                SqlBuild.date_purged.is_(None),
+                purgeable_at < now,
+            )
+            .distinct()
+        )
+        return set(result.scalars().all())
 
     async def soft_delete_all_by_project(
         self, *, project_id: int
