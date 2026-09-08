@@ -245,6 +245,14 @@ class ResourceInventoryEvent(DocverseEventBase):
     downstream with ``last()``: soft-deleted projects/editions/builds are
     excluded and ``total_build_bytes`` is the summed footprint of exactly
     the active builds counted by ``build_count``.
+
+    The two ``purgatory_*`` gauges are the exception to that exclusion,
+    and they count the complement rather than a subset: a build is in
+    ``build_count``/``total_build_bytes`` while it is live and in
+    ``purgatory_build_count``/``purgatory_bytes`` once it is soft-deleted
+    but not yet purged, never in both. They make the reap-pending
+    footprint visible — storage the ``purgatory_cleanup`` sweep still
+    owes back to the bucket — and fall to zero as that sweep runs.
     """
 
     project_count: int | None
@@ -258,6 +266,12 @@ class ResourceInventoryEvent(DocverseEventBase):
 
     total_build_bytes: int
     """Summed ``total_size_bytes`` of the active builds in scope."""
+
+    purgatory_build_count: int
+    """Soft-deleted, not-yet-purged builds in scope."""
+
+    purgatory_bytes: int
+    """Summed ``total_size_bytes`` of the purgatory builds in scope."""
 
 
 class MembershipChangedEvent(DocverseEventBase):

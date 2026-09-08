@@ -46,6 +46,7 @@ async def _make_build(
     git_ref: str,
     total_size_bytes: int | None,
     deleted: bool = False,
+    purged: bool = False,
 ) -> None:
     """Create one build with an explicit size, optionally soft-deleted."""
     build_store = BuildStore(session=db_session, logger=_logger())
@@ -60,6 +61,8 @@ async def _make_build(
     row.total_size_bytes = total_size_bytes
     if deleted:
         row.date_deleted = func.now()
+    if purged:
+        row.date_purged = func.now()
     await db_session.flush()
 
 
@@ -219,3 +222,138 @@ async def test_aggregate_inventory_excludes_deleted_and_rolls_up(
     assert projects["p-two"].edition_count == 0
     assert projects["p-two"].build_count == 0
     assert projects["p-two"].total_build_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_aggregate_inventory_counts_purgatory_builds(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Reap-pending builds are counted apart from the live ones.
+
+    A soft-deleted build holds its storage until the ``purgatory_cleanup``
+    sweep reclaims it, so it leaves ``build_count``/``total_build_bytes``
+    and lands in the purgatory gauges instead. A build already stamped
+    ``date_purged`` owes nothing back and is in neither.
+    """
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="purgatory",
+                title="Purgatory",
+                base_domain="purgatory.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="p-one",
+                title="Project One",
+                source_url="https://example.com/example/one",
+            ),
+        )
+
+        await _make_build(
+            db_session,
+            project_id=project.id,
+            project_slug=project.slug,
+            git_ref="live",
+            total_size_bytes=100,
+        )
+        await _make_build(
+            db_session,
+            project_id=project.id,
+            project_slug=project.slug,
+            git_ref="reap-pending",
+            total_size_bytes=250,
+            deleted=True,
+        )
+        # Already reclaimed: the row survives as a tombstone but its
+        # bytes are gone from the bucket, so it counts nowhere.
+        await _make_build(
+            db_session,
+            project_id=project.id,
+            project_slug=project.slug,
+            git_ref="purged",
+            total_size_bytes=999,
+            deleted=True,
+            purged=True,
+        )
+
+    store = InventoryCensusStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        census = await store.aggregate_inventory()
+
+    (org_row,) = census.orgs
+    assert org_row.build_count == 1
+    assert org_row.total_build_bytes == 100
+    assert org_row.purgatory_build_count == 1
+    assert org_row.purgatory_bytes == 250
+
+    (project_row,) = census.projects
+    assert project_row.build_count == 1
+    assert project_row.total_build_bytes == 100
+    assert project_row.purgatory_build_count == 1
+    assert project_row.purgatory_bytes == 250
+
+
+@pytest.mark.asyncio
+async def test_aggregate_inventory_rolls_up_deleted_projects_purgatory(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A deleted project's reap-pending builds still reach the org row.
+
+    Deleting a project cascades ``date_deleted`` onto its builds, so a
+    project deletion is the largest reclaim the sweep ever has to make.
+    The project itself contributes no census row, which is why the org
+    purgatory gauges are aggregated per org rather than summed over the
+    project rows.
+    """
+    logger = _logger()
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="cascade",
+                title="Cascade",
+                base_domain="cascade.example.com",
+            )
+        )
+        p_gone = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="p-gone",
+                title="Project Gone",
+                source_url="https://example.com/example/gone",
+            ),
+        )
+        await _make_build(
+            db_session,
+            project_id=p_gone.id,
+            project_slug=p_gone.slug,
+            git_ref="cascaded",
+            total_size_bytes=750,
+            deleted=True,
+        )
+        gone_row = await db_session.get(SqlProject, p_gone.id)
+        assert gone_row is not None
+        gone_row.date_deleted = func.now()
+
+    store = InventoryCensusStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        census = await store.aggregate_inventory()
+
+    assert census.projects == []
+    (org_row,) = census.orgs
+    assert org_row.project_count == 0
+    assert org_row.build_count == 0
+    assert org_row.total_build_bytes == 0
+    assert org_row.purgatory_build_count == 1
+    assert org_row.purgatory_bytes == 750

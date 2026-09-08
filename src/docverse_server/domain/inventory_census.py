@@ -24,7 +24,8 @@ class ProjectInventoryCensus(BaseModel):
     Soft-deleted editions and builds are excluded from the counts, and a
     project only produces one of these rows when it is itself
     non-deleted, so a soft-deleted project's editions and builds never
-    appear anywhere in the census.
+    appear on a project row — its reap-pending builds still reach the
+    org roll-up, which is where the bytes a purge owes back are visible.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -45,6 +46,18 @@ class ProjectInventoryCensus(BaseModel):
             " builds; 0 when there are none or every size is unset."
         )
     )
+    purgatory_build_count: int = Field(
+        description=(
+            "Number of the project's builds that are soft-deleted but not"
+            " yet purged."
+        )
+    )
+    purgatory_bytes: int = Field(
+        description=(
+            "Summed ``total_size_bytes`` of the project's soft-deleted,"
+            " not-yet-purged builds."
+        )
+    )
 
 
 class OrgInventoryCensus(BaseModel):
@@ -52,7 +65,10 @@ class OrgInventoryCensus(BaseModel):
 
     Every organization yields exactly one of these rows, even one with no
     projects (``project_count == 0``). The edition/build counts and byte
-    sum are the roll-up of the org's non-deleted projects.
+    sum are the roll-up of the org's non-deleted projects. The purgatory
+    counters are the exception: they span every project of the org,
+    deleted or not, because deleting a project is exactly what sends its
+    builds' storage into purgatory.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -72,6 +88,19 @@ class OrgInventoryCensus(BaseModel):
         description=(
             "Summed ``total_size_bytes`` of every non-deleted build"
             " across the org's projects."
+        )
+    )
+    purgatory_build_count: int = Field(
+        description=(
+            "Number of soft-deleted, not-yet-purged builds across all of"
+            " the org's projects, including soft-deleted ones."
+        )
+    )
+    purgatory_bytes: int = Field(
+        description=(
+            "Summed ``total_size_bytes`` of every soft-deleted,"
+            " not-yet-purged build across all of the org's projects,"
+            " including soft-deleted ones."
         )
     )
 

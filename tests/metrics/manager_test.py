@@ -29,6 +29,7 @@ from docverse_server.metrics import (
     EditionPublishedEvent,
     EditionPublishTrigger,
     MetricsEditionKind,
+    ResourceInventoryEvent,
     build_event_manager,
 )
 
@@ -170,3 +171,53 @@ async def test_publish_failure_is_swallowed_when_not_raising() -> None:
         await manager.publish(payload, failing_publisher, None)
 
     assert any(record.get("log_level") == "error" for record in captured)
+
+
+@pytest.mark.asyncio
+async def test_resource_inventory_carries_purgatory_gauges() -> None:
+    """The census gauge counts reap-pending builds beside the live ones.
+
+    ``purgatory_build_count``/``purgatory_bytes`` are the bytes a purge
+    has yet to reclaim, so they are deliberately disjoint from
+    ``build_count``/``total_build_bytes`` (which count only live builds)
+    rather than a subset of them. Both are plain ``int`` gauges on the
+    org- and the project-scoped row alike.
+    """
+    fields = ResourceInventoryEvent.model_fields
+    assert fields["purgatory_build_count"].annotation is int
+    assert fields["purgatory_bytes"].annotation is int
+
+    config = Configuration()
+    manager, events = await build_event_manager(config)
+    publisher = events.resource_inventory
+    assert isinstance(publisher, MockEventPublisher)
+
+    await publisher.publish(
+        ResourceInventoryEvent(
+            organization="org",
+            project=None,
+            project_count=1,
+            edition_count=2,
+            build_count=3,
+            total_build_bytes=300,
+            purgatory_build_count=1,
+            purgatory_bytes=99,
+        )
+    )
+
+    publisher.published.assert_published_all(
+        [
+            {
+                "organization": "org",
+                "project": None,
+                "project_count": 1,
+                "edition_count": 2,
+                "build_count": 3,
+                "total_build_bytes": 300,
+                "purgatory_build_count": 1,
+                "purgatory_bytes": 99,
+            }
+        ]
+    )
+
+    await manager.aclose()
