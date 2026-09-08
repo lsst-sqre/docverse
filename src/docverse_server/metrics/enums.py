@@ -137,31 +137,48 @@ class MetricsPrincipalType(StrEnum):
 class LifecycleActionTrigger(StrEnum):
     """Which worker drove a ``lifecycle_action`` reap (SQR-112 D7).
 
-    ``lifecycle_action`` is emitted by two shared reaper workers that
-    both soft-delete resources; this enum records which one performed a
-    given reap. Each worker selects its trigger statically at the
-    emission site (``lifecycle_eval`` vs. ``git_ref_audit``).
+    ``lifecycle_action`` is emitted by every maintenance worker that
+    retires a resource; this enum records which one performed a given
+    reap. Each worker selects its trigger statically at the emission
+    site.
+
+    ``lifecycle_eval`` and ``git_ref_audit`` soft-delete rows.
+    ``purgatory_cleanup`` is the far end of that same road: it reaps a
+    build that was soft-deleted long enough ago by permanently
+    reclaiming its object-store content. Carrying both steps on one
+    event type is what lets a consumer follow a resource from the rule
+    that retired it through to the sweep that freed its bytes.
     """
 
     lifecycle_eval = "lifecycle_eval"
     git_ref_audit = "git_ref_audit"
+    purgatory_cleanup = "purgatory_cleanup"
 
 
 class LifecycleReapAction(StrEnum):
-    """The lifecycle rule that drove a reap on a ``lifecycle_action`` event.
+    """What drove a reap on a ``lifecycle_action`` event.
 
-    Mirrors the lifecycle-rule ``type`` discriminators
-    (:class:`docverse_server.domain.lifecycle.LifecycleRule`) value-for-value;
-    the emission site maps the matched rule's ``type`` to this enum so the
-    metrics Avro schema evolves independently of the rule schema. The
-    ``lifecycle_eval`` worker emits ``draft_inactivity`` (editions) and
-    ``build_history_orphan`` (builds); ``git_ref_audit`` emits only
-    ``ref_deleted``.
+    The first three members mirror the lifecycle-rule ``type``
+    discriminators
+    (:class:`docverse_server.domain.lifecycle.LifecycleRule`)
+    value-for-value; the emission site maps the matched rule's ``type``
+    to this enum so the metrics Avro schema evolves independently of the
+    rule schema. The ``lifecycle_eval`` worker emits
+    ``draft_inactivity`` (editions) and ``build_history_orphan``
+    (builds); ``git_ref_audit`` emits only ``ref_deleted``.
+
+    ``retention_expired`` is the exception, and deliberately not a rule
+    ``type``: no lifecycle rule reclaims storage. What retires a build's
+    content is the organization's ``purgatory_retention`` elapsing after
+    the row was soft-deleted, so the ``purgatory_cleanup`` sweep names
+    this member directly rather than reaching it through
+    :meth:`from_rule_type`.
     """
 
     draft_inactivity = "draft_inactivity"
     build_history_orphan = "build_history_orphan"
     ref_deleted = "ref_deleted"
+    retention_expired = "retention_expired"
 
     @classmethod
     def from_rule_type(cls, rule_type: str) -> LifecycleReapAction:
@@ -172,7 +189,7 @@ class LifecycleReapAction(StrEnum):
         on either side a reviewable change rather than a silent schema
         break. The reaper workers filter their rule sets to the kinds they
         own before evaluation, so every ``rule_type`` reaching here is one
-        of this enum's members.
+        of the three rule-mirroring members.
         """
         return cls(rule_type)
 

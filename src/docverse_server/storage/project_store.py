@@ -125,6 +125,43 @@ class ProjectStore:
         )
         return [Project.model_validate(row) for row in result.scalars().all()]
 
+    async def list_slugs_by_ids(
+        self, project_ids: list[int]
+    ) -> dict[int, str]:
+        """Map project ids to slugs, deleted projects included.
+
+        The labelling counterpart to :meth:`list_by_ids`. Callers that
+        act on a project want the live row and nothing else; callers
+        that only need to *name* one — the ``purgatory_cleanup`` sweep
+        tagging each reap with the build's project slug — need the name
+        whether or not the project still exists. The project soft-delete
+        cascade is what carries a build into purgatory in the first
+        place, so filtering deleted projects out here would blank the
+        label on the sweep's most common reap.
+
+        Passing an empty list returns ``{}`` without hitting the
+        database, which is the ordinary case: most ticks purge nothing.
+
+        Parameters
+        ----------
+        project_ids
+            Internal ids to resolve. Ids with no row are simply absent
+            from the result rather than raising.
+
+        Returns
+        -------
+        dict
+            Slug by project id, for every id that matched a row.
+        """
+        if not project_ids:
+            return {}
+        result = await self._session.execute(
+            select(SqlProject.id, SqlProject.slug).where(
+                SqlProject.id.in_(project_ids)
+            )
+        )
+        return {row.id: row.slug for row in result}
+
     async def list_org_ids_with_lifecycle_rules(self) -> set[int]:
         """Return every ``org_id`` that owns a project with lifecycle rules.
 

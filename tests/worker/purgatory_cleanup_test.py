@@ -18,6 +18,7 @@ import httpx
 import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -31,6 +32,7 @@ from docverse.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse_server.config import Configuration
 from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
@@ -39,8 +41,14 @@ from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.queue import JobStatus
 from docverse_server.factory import Factory
+from docverse_server.metrics import (
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+    build_event_manager,
+)
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import TombstoneReason
 from docverse_server.storage.objectstore import (
     MockObjectStore,
     ObjectStoreError,
@@ -106,12 +114,16 @@ async def _seed_org_and_project(
 
 
 async def _seed_live_build(
-    db_session: AsyncSession, *, project_id: int, git_ref: str
+    db_session: AsyncSession,
+    *,
+    project_id: int,
+    git_ref: str,
+    project_slug: str = _PROJECT_SLUG,
 ) -> Build:
-    """Create an ordinary, undeleted build in the seeded project."""
+    """Create an ordinary, undeleted build in one of the seeded projects."""
     return await BuildStore(session=db_session, logger=_logger()).create(
         project_id=project_id,
-        project_slug=_PROJECT_SLUG,
+        project_slug=project_slug,
         data=BuildCreate(git_ref=git_ref, content_hash=_HASH),
         uploader="testuser",
     )
@@ -817,3 +829,219 @@ async def test_purgatory_cleanup_skips_a_late_delivered_job(
     assert result == "skipped"
     assert (await _read_build(build.id)).date_purged is None
     assert f"{build.storage_prefix}page0.html" in store.objects
+
+
+async def _seed_project(
+    db_session: AsyncSession, *, org_id: int, slug: str
+) -> int:
+    """Create one more project in the seeded org."""
+    project = await ProjectStore(session=db_session, logger=_logger()).create(
+        org_id=org_id,
+        data=ProjectCreate(
+            slug=slug,
+            title=slug,
+            source_url=f"https://example.com/example/{slug}",
+        ),
+    )
+    return project.id
+
+
+@pytest.mark.asyncio
+async def test_purgatory_cleanup_publishes_its_tick_and_its_reaps(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep's only durable record is the pair of events it emits.
+
+    The job writes no run table and its ``queue_jobs`` row is itself
+    subject to retention, so the org-scoped completion event is what
+    survives to answer "did the sweep run, and what did it take back".
+    Beside it goes one ``lifecycle_action`` per purged build, carrying
+    the build's project slug — including for the second build here,
+    whose project was soft-deleted, since the project cascade is exactly
+    what carries builds into purgatory.
+
+    Seeded so that all four outcomes land in one tick: two builds
+    reclaimed, one held back by a live edition, one refused by the
+    store. ``success`` is false because a build failed, matching the
+    ``completed_with_errors`` the queue row records.
+    """
+    manager, events = await build_event_manager(Configuration())
+    store = _HookedMockObjectStore()
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(db_session)
+        gone_project_id = await _seed_project(
+            db_session, org_id=org_id, slug="gone-proj"
+        )
+        purged_first = await _seed_deleted_build(
+            db_session,
+            project_id=project_id,
+            git_ref="purged-first",
+            deleted_days_ago=40,
+            total_size_bytes=100,
+        )
+        served = await _seed_live_build(
+            db_session, project_id=project_id, git_ref="served"
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="live-edition",
+                title="Live Edition",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=served.id
+        )
+        await _backdate_deletion(
+            db_session, build_id=served.id, deleted_days_ago=35
+        )
+        purged_second = await _seed_live_build(
+            db_session,
+            project_id=gone_project_id,
+            git_ref="purged-second",
+            project_slug="gone-proj",
+        )
+        # The cascade is what puts this build in purgatory at all, and
+        # it stamps ``date_deleted`` with ``func.now()``; the backdate
+        # below is what moves it out of retention.
+        await ProjectStore(session=db_session, logger=_logger()).soft_delete(
+            org_id=org_id,
+            slug="gone-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+        await _backdate_deletion(
+            db_session,
+            build_id=purged_second.id,
+            deleted_days_ago=30,
+            total_size_bytes=200,
+        )
+        doomed = await _seed_deleted_build(
+            db_session,
+            project_id=project_id,
+            git_ref="doomed",
+            deleted_days_ago=25,
+        )
+        queue_job_id = await _seed_queue_job(db_session, org_id=org_id)
+    for build in (purged_first, served, purged_second, doomed):
+        await _stage_content(store, build=build)
+
+    async def _refuse_doomed_prefix(prefix: str) -> None:
+        if prefix == doomed.storage_prefix:
+            raise ObjectStoreError(
+                bucket="mock",
+                prefix=prefix,
+                operation="DeleteObjects",
+                failures=[f"{prefix}page0.html (AccessDenied)"],
+            )
+
+    store._on_delete_prefix = _refuse_doomed_prefix
+
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client, events=events)
+
+    result = await purgatory_cleanup(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await http_client.aclose()
+
+    assert result == "completed_with_errors"
+
+    completed = events.purgatory_cleanup_completed
+    assert isinstance(completed, MockEventPublisher)
+    assert len(completed.published) == 1
+    tick = completed.published[0]
+    assert tick.organization == _ORG_SLUG
+    assert tick.project is None
+    assert tick.success is False
+    assert tick.builds_purged == 2
+    assert tick.builds_failed == 1
+    assert tick.builds_skipped_referenced == 1
+    assert tick.objects_deleted == 4
+    assert tick.bytes_reclaimed == 300
+    assert tick.capped is False
+    assert tick.elapsed >= timedelta(0)
+
+    reaps = events.lifecycle_action
+    assert isinstance(reaps, MockEventPublisher)
+    assert len(reaps.published) == 2
+    for reap in reaps.published:
+        assert reap.organization == _ORG_SLUG
+        assert reap.trigger is LifecycleActionTrigger.purgatory_cleanup
+        assert reap.action is LifecycleReapAction.retention_expired
+        assert reap.success is True
+    assert [reap.project for reap in reaps.published] == [
+        _PROJECT_SLUG,
+        "gone-proj",
+    ]
+
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_purgatory_cleanup_publishes_no_reap_for_a_lost_stamp(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reap the database did not record is not a reap.
+
+    The one build here is restored between its content going and its
+    ``date_purged`` stamp, so ``mark_purged`` matches zero rows. The
+    sweep counts that as a failure — content gone, row live — and the
+    reap must not be published: a ``lifecycle_action`` claims the build
+    was retired, and a consumer reading one for a row that is live again
+    would be reading a lie. The tick itself is still reported, because
+    the tick did happen.
+    """
+    manager, events = await build_event_manager(Configuration())
+    store = _HookedMockObjectStore()
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(db_session)
+        raced = await _seed_deleted_build(
+            db_session,
+            project_id=project_id,
+            git_ref="raced",
+            deleted_days_ago=30,
+        )
+        queue_job_id = await _seed_queue_job(db_session, org_id=org_id)
+    await _stage_content(store, build=raced)
+
+    async def _restore_after_the_tree_is_gone(key: str) -> None:
+        if key == raced.staging_key:
+            await _restore_build(raced.id)
+
+    store._on_delete_object = _restore_after_the_tree_is_gone
+
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client, events=events)
+
+    result = await purgatory_cleanup(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await http_client.aclose()
+
+    assert result == "completed_with_errors"
+
+    reaps = events.lifecycle_action
+    assert isinstance(reaps, MockEventPublisher)
+    assert reaps.published == []
+
+    completed = events.purgatory_cleanup_completed
+    assert isinstance(completed, MockEventPublisher)
+    assert len(completed.published) == 1
+    assert completed.published[0].builds_purged == 0
+    assert completed.published[0].builds_failed == 1
+    assert completed.published[0].success is False
+
+    await manager.aclose()

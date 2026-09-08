@@ -1213,3 +1213,57 @@ async def test_list_github_bound_by_org_excludes_deleted(
         result = await store.list_github_bound_by_org(org_id)
         await db_session.commit()
     assert [p.slug for p in result] == [kept.slug]
+
+
+@pytest.mark.asyncio
+async def test_list_slugs_by_ids_includes_a_deleted_project(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A slug lookup for metrics must survive its project's deletion.
+
+    The ``purgatory_cleanup`` sweep labels each reap with the build's
+    project slug, and the builds it reaches most often belong to a
+    project that was itself deleted — the cascade is what puts them in
+    purgatory. A lookup that filtered on ``date_deleted`` would drop the
+    slug precisely on the reaps that matter, so this one deliberately
+    does not.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="slug-lookup-org")
+        live = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="still-here",
+                title="Still Here",
+                source_url="https://example.com/example/live",
+            ),
+        )
+        gone = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="deleted-project",
+                title="Deleted Project",
+                source_url="https://example.com/example/gone",
+            ),
+        )
+        await store.soft_delete(
+            org_id=org_id,
+            slug="deleted-project",
+            reason=TombstoneReason.manual_delete,
+        )
+        slugs = await store.list_slugs_by_ids([live.id, gone.id])
+        await db_session.commit()
+
+    assert slugs == {live.id: "still-here", gone.id: "deleted-project"}
+
+
+@pytest.mark.asyncio
+async def test_list_slugs_by_ids_is_empty_for_no_ids(
+    db_session: AsyncSession,
+    store: ProjectStore,
+) -> None:
+    """No ids means no query: the sweep often purges nothing at all."""
+    async with db_session.begin():
+        assert await store.list_slugs_by_ids([]) == {}

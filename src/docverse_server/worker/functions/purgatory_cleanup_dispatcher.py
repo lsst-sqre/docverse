@@ -35,10 +35,11 @@ On each firing the dispatcher:
    is the first backstop and the reaper the second.
 
 Unlike ``lifecycle_eval`` and ``git_ref_audit`` there is no run table:
-the record of a tick is the log line this function emits and, once the
-metrics slice lands, the per-org ``purgatory_cleanup_completed`` event.
-That is deliberate — the sweep has no cross-org rollup to finalise, and
-each per-org job's ``queue_jobs`` row already carries its own outcome.
+the record of a tick is the log line this function emits plus the
+per-org ``purgatory_cleanup_completed`` event each fanned-out job
+publishes. That is deliberate — the sweep has no cross-org rollup to
+finalise, and each per-org job's ``queue_jobs`` row already carries its
+own outcome.
 """
 
 from __future__ import annotations

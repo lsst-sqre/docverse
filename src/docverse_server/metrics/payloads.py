@@ -36,6 +36,7 @@ __all__ = [
     "LifecycleActionEvent",
     "MembershipChangedEvent",
     "ProjectLifecycleEvent",
+    "PurgatoryCleanupCompletedEvent",
     "ResourceInventoryEvent",
 ]
 
@@ -211,28 +212,89 @@ class KeeperSyncRunCompletedEvent(DocverseEventBase):
 
 
 class LifecycleActionEvent(DocverseEventBase):
-    """A lifecycle reaper soft-deleted a resource.
+    """A maintenance worker retired a resource.
 
-    Emitted once per reap/deletion by the ``lifecycle_eval`` and
-    ``git_ref_audit`` workers (SQR-112 D7), published after the per-org
-    soft-delete transaction commits. ``action`` records which lifecycle
-    rule drove the reap and ``trigger`` records which worker performed it;
-    both are dedicated metrics enums mapped at the emission site. The
-    event is project-scoped — every reaped row belongs to a known project,
-    so ``project`` is always set. ``success`` is ``True`` because the
-    event is only published once the reap's atomic commit succeeds; it is
-    carried for schema uniformity with the other flow events (SQR-112 D3)
-    and leaves room for a future soft-failure reap path.
+    Emitted once per reap by the ``lifecycle_eval``, ``git_ref_audit``
+    and ``purgatory_cleanup`` workers (SQR-112 D7). ``action`` records
+    what drove the reap and ``trigger`` records which worker performed
+    it; both are dedicated metrics enums selected at the emission site.
+
+    The first two workers soft-delete rows; ``purgatory_cleanup`` reaps
+    the other end of the same lifecycle, permanently reclaiming a
+    long-deleted build's object-store content. One event type spans both
+    so a consumer can follow a resource from the rule that retired it
+    through to the sweep that freed its bytes, rather than joining two
+    schemas to answer that.
+
+    The event is project-scoped — every reaped row belongs to a known
+    project, so ``project`` is always set, including when that project
+    has itself been soft-deleted (the cascade is exactly how a deleted
+    project's builds reach the sweep). ``success`` is ``True`` because a
+    reap is published only once its commit is durable: the soft-delete
+    transaction for the reapers, the ``date_purged`` stamp for the
+    sweep. It is carried for schema uniformity with the other flow
+    events (SQR-112 D3) and leaves room for a future soft-failure reap
+    path.
     """
 
     action: LifecycleReapAction
-    """Which lifecycle rule drove the reap."""
+    """What drove the reap: a lifecycle rule, or retention elapsing."""
 
     trigger: LifecycleActionTrigger
-    """Which worker performed the reap (lifecycle_eval vs. git_ref_audit)."""
+    """Which worker performed the reap."""
 
     success: bool
     """Whether the reap committed successfully (always ``True`` today)."""
+
+
+class PurgatoryCleanupCompletedEvent(DocverseEventBase):
+    """One organization's ``purgatory_cleanup`` tick finished.
+
+    Emitted by the per-org sweep once, after its final commit. The job
+    keeps no run table — the only other trace a tick leaves is its
+    ``queue_jobs`` row, which retention will eventually take — so this
+    event is the durable record that the sweep ran and what it took
+    back. Retention is an organization setting and one tick spans every
+    project in the org, so the event is org-scoped and ``project`` is
+    always ``None``; the per-build detail arrives as one
+    ``lifecycle_action`` per purged build, which is project-scoped.
+
+    The counters are per-tick deltas, not gauges: summing
+    ``bytes_reclaimed`` over a window is how much storage the sweep gave
+    back in that window. The standing footprint it has yet to reclaim is
+    the ``resource_inventory`` gauge's ``purgatory_bytes``, and the two
+    are meant to be read against each other.
+
+    A tick that could not run at all — the organization vanished, no
+    staging store is configured, its credential will not decrypt —
+    publishes nothing and fails its queue row instead. Reporting it here
+    would put a tick that reclaimed nothing *because it never started*
+    next to one that reclaimed nothing because there was nothing to do.
+    """
+
+    success: bool
+    """Whether every build the tick attempted was reclaimed."""
+
+    builds_purged: int
+    """Builds whose content went and whose row the tick stamped."""
+
+    builds_failed: int
+    """Builds the tick attempted and could not complete."""
+
+    builds_skipped_referenced: int
+    """Builds held back because a live edition still serves them."""
+
+    objects_deleted: int
+    """Objects removed from under the purged builds' prefixes."""
+
+    bytes_reclaimed: int
+    """Summed ``total_size_bytes`` of the builds this tick purged."""
+
+    capped: bool
+    """Whether the per-job cap, not the backlog, ended the work list."""
+
+    elapsed: timedelta
+    """Wall-clock time the sweep spent on this organization."""
 
 
 class ResourceInventoryEvent(DocverseEventBase):

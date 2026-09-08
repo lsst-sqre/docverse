@@ -43,13 +43,21 @@ so the job ends ``completed`` or ``completed_with_errors``, never
 ``failed``. Only a failure that makes the whole tick impossible (the org
 vanished, no staging store is configured, its credential will not
 decrypt) fails the queue-job row and re-raises.
+
+The same asymmetry shapes when the tick's metrics go out. Everything is
+published after the final commit, never during the loop: the tally rides
+on ``date_purged`` stamps that have already committed, so a crash
+mid-loop publishes nothing at all rather than events for reclamations
+the database never recorded. A tick that could not run publishes nothing
+either — its record is the ``failed`` queue-job row.
 """
 
 from __future__ import annotations
 
+import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -60,6 +68,12 @@ from docverse_server.config import config
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.exceptions import NotFoundError
 from docverse_server.factory import Factory
+from docverse_server.metrics import (
+    LifecycleActionEvent,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+    PurgatoryCleanupCompletedEvent,
+)
 from docverse_server.services.purgatory import PurgatoryPlan
 from docverse_server.storage.objectstore import ObjectStore
 
@@ -71,12 +85,11 @@ class PurgatoryCleanupOutcome:
     """What one organization's sweep did, as the job reports it.
 
     Accumulated across the reclamation loop and then rendered two ways:
-    into the ``queue_jobs`` row's ``progress`` JSONB, and — once the
-    metrics slice lands — into the org-scoped
-    ``purgatory_cleanup_completed`` event that is the durable record of
-    a run. Keeping one tally behind both means the number an operator
-    reads off the job row and the number Sasquatch charts can never
-    diverge.
+    into the ``queue_jobs`` row's ``progress`` JSONB, and into the
+    org-scoped ``purgatory_cleanup_completed`` event that is the durable
+    record of a run. Keeping one tally behind both means the number an
+    operator reads off the job row and the number Sasquatch charts show
+    can never diverge.
     """
 
     builds_purged: int = 0
@@ -107,6 +120,22 @@ class PurgatoryCleanupOutcome:
     dominant reason: a build the plan offered but a restore reclaimed
     first appears here too, because what an operator wants from this
     list is "what did the sweep leave behind", not "why".
+    """
+
+    purged_project_slugs: list[str] = field(default_factory=list)
+    """Owning project of each purged build, one entry per build.
+
+    The ``lifecycle_action`` events are project-scoped while the tick's
+    completion event is org-scoped, so this is the only per-build
+    dimension the tally has to carry. Appended only once a build's
+    ``mark_purged`` has committed, which is what keeps a reap from being
+    published for a reclamation the database never recorded. Duplicated
+    when several purged builds share a project — one reap is one build,
+    not one project.
+
+    Deliberately absent from :meth:`as_progress`: the queue row already
+    names what the tick left behind, and repeating the projects it got
+    through would grow unboundedly with the cap.
     """
 
     @property
@@ -156,6 +185,7 @@ async def purgatory_cleanup(
     logger = structlog.get_logger(
         "docverse_server.worker.purgatory_cleanup"
     ).bind(org=org_slug)
+    started = time.monotonic()
 
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -173,7 +203,7 @@ async def purgatory_cleanup(
 
         limit = config.purgatory_cleanup_max_builds_per_job
         try:
-            plan, object_store = await _prepare(
+            plan, project_slugs, object_store = await _prepare(
                 session=session,
                 factory=factory,
                 org_id=org_id,
@@ -184,6 +214,7 @@ async def purgatory_cleanup(
                     session=session,
                     factory=factory,
                     plan=plan,
+                    project_slugs=project_slugs,
                     object_store=object_store,
                     limit=limit,
                     logger=logger,
@@ -208,11 +239,13 @@ async def purgatory_cleanup(
                 queue_job_id, has_errors=outcome.has_errors
             )
         logger.info("Purgatory cleanup completed for org", **progress)
-        # Metrics seam: the org-scoped ``purgatory_cleanup_completed``
-        # event and the per-build ``lifecycle_action`` events are the
-        # next-but-one slice of PRD #596. They publish from ``outcome``
-        # here, after the final commit, exactly as ``git_ref_audit``
-        # publishes its reaps once their transaction is durable.
+        # Published from the same tally the queue row just recorded, and
+        # only now that every stamp behind it is durable. Best-effort:
+        # production runs raise_on_error=False so a metrics outage can
+        # never fail a sweep (no defensive try/except).
+        await _publish_sweep_events(
+            ctx=ctx, org_slug=org_slug, outcome=outcome, started=started
+        )
         return "completed_with_errors" if outcome.has_errors else "completed"
 
     msg = "No database session available"
@@ -225,21 +258,36 @@ async def _prepare(
     factory: Factory,
     org_id: int,
     limit: int,
-) -> tuple[PurgatoryPlan, ObjectStore]:
+) -> tuple[PurgatoryPlan, dict[int, str], ObjectStore]:
     """Build the tick's work list and resolve the org's staging store.
 
-    Both in one short read transaction that closes before any object is
-    touched: the plan is a handful of indexed reads and resolving the
-    store is a service lookup plus a credential decrypt, whereas the
-    work the plan describes is minutes of network calls.
+    All of it in one short read transaction that closes before any
+    object is touched: the plan is a handful of indexed reads, the slug
+    lookup one more, and resolving the store is a service lookup plus a
+    credential decrypt, whereas the work the plan describes is minutes
+    of network calls.
 
     The store is the org's ``resolved_staging_store_label`` — where
     ``build_processing`` wrote both the unpacked tree and the staged
     tarball. An org with no such label has nowhere the sweep could
     look, so the job fails rather than reporting a clean tick that
     reclaimed nothing.
+
+    The slug map is read here, with the plan, rather than per build
+    later: it is the project dimension of the reap events, and reading
+    it now costs one query on ids the plan already has. It covers the
+    held-back builds too, which is one query fewer than partitioning it
+    and costs nothing on a plan bounded by the cap.
+
+    Returns
+    -------
+    tuple
+        The plan, the slug of every project the plan touches by id
+        (deleted projects included — the cascade is what puts most
+        builds in purgatory), and the opened staging store.
     """
     org_store = factory.create_org_store()
+    project_store = factory.create_project_store()
     purgatory_service = factory.create_purgatory_service()
     now = datetime.now(tz=UTC)
     async with session.begin():
@@ -252,10 +300,15 @@ async def _prepare(
             msg = f"No object store service configured for org {org_id}"
             raise RuntimeError(msg)
         plan = await purgatory_service.plan(org=org, now=now, limit=limit)
+        project_ids = {build.project_id for build in plan.purgeable}
+        project_ids |= {held.build.project_id for held in plan.referenced}
+        project_slugs = await project_store.list_slugs_by_ids(
+            sorted(project_ids)
+        )
         object_store = await factory.create_objectstore_for_org(
             org_id=org_id, service_label=service_label
         )
-    return plan, object_store
+    return plan, project_slugs, object_store
 
 
 async def _reclaim_plan(
@@ -263,6 +316,7 @@ async def _reclaim_plan(
     session: AsyncSession,
     factory: Factory,
     plan: PurgatoryPlan,
+    project_slugs: dict[int, str],
     object_store: ObjectStore,
     limit: int,
     logger: structlog.stdlib.BoundLogger,
@@ -295,6 +349,10 @@ async def _reclaim_plan(
     for build in plan.purgeable:
         public_id = serialize_base32_id(build.public_id)
         try:
+            # Resolved before anything is deleted so a build whose
+            # project somehow went missing fails with its content
+            # intact, rather than after an unrecoverable delete.
+            project_slug = project_slugs[build.project_id]
             # Re-read under a fresh transaction rather than trusting the
             # plan: an admin restore may have committed since, and this
             # is the last moment at which the objects are still there to
@@ -331,6 +389,7 @@ async def _reclaim_plan(
             outcome.builds_purged += 1
             outcome.objects_deleted += reclaimed.objects_deleted
             outcome.bytes_reclaimed += reclaimed.bytes_reclaimed
+            outcome.purged_project_slugs.append(project_slug)
             logger.info(
                 "Reclaimed a build past its retention",
                 build=public_id,
@@ -345,3 +404,55 @@ async def _reclaim_plan(
                 build=public_id,
             )
     return outcome
+
+
+async def _publish_sweep_events(
+    *,
+    ctx: dict[str, Any],
+    org_slug: str,
+    outcome: PurgatoryCleanupOutcome,
+    started: float,
+) -> None:
+    """Emit the tick's completion gauge and one reap per purged build.
+
+    Called once, after the queue row's terminal transition has
+    committed, so every event here stands on a durable write. ``success``
+    answers the same question the queue row's ``completed`` vs.
+    ``completed_with_errors`` does — whether every build the tick
+    attempted came through — rather than whether the tick ran, which is
+    implied by the event existing at all.
+
+    The reaps are the per-build half: ``retention_expired`` is what
+    retired each one, and the trigger names this sweep so a consumer can
+    tell the storage reclamation apart from the soft-deletes
+    ``lifecycle_eval`` and ``git_ref_audit`` publish on the same event
+    type. Skips silently when the process has no event manager (tests
+    that do not assert on metrics).
+    """
+    events = ctx.get("events")
+    if events is None:
+        return
+    await events.purgatory_cleanup_completed.publish(
+        PurgatoryCleanupCompletedEvent(
+            organization=org_slug,
+            project=None,
+            success=not outcome.has_errors,
+            builds_purged=outcome.builds_purged,
+            builds_failed=outcome.builds_failed,
+            builds_skipped_referenced=outcome.builds_skipped_referenced,
+            objects_deleted=outcome.objects_deleted,
+            bytes_reclaimed=outcome.bytes_reclaimed,
+            capped=outcome.capped,
+            elapsed=timedelta(seconds=time.monotonic() - started),
+        )
+    )
+    for project_slug in outcome.purged_project_slugs:
+        await events.lifecycle_action.publish(
+            LifecycleActionEvent(
+                organization=org_slug,
+                project=project_slug,
+                action=LifecycleReapAction.retention_expired,
+                trigger=LifecycleActionTrigger.purgatory_cleanup,
+                success=True,
+            )
+        )
