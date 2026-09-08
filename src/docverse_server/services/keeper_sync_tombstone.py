@@ -392,11 +392,26 @@ class KeeperSyncTombstoneService:
         own timestamp and stays deleted. Undeleting those would silently
         reverse a decision this tombstone never spoke to.
 
+        The editions' ``keeper_sync_state`` tombstones are cleared with
+        them. The cascade goes through
+        :meth:`~docverse_server.storage.edition_store.EditionStore.soft_delete_all_by_project`,
+        which stamps every edition's state row exactly as a per-edition
+        delete would, and a tombstoned state row makes
+        :meth:`~docverse_server.services.keeper_sync.service.KeeperSyncService.sync_edition`
+        short-circuit forever. Reviving the rows without clearing those
+        stamps would bring an LTD-imported project back live but
+        permanently unsynced, and leave the operator looking at N
+        edition tombstones they never created. The same shared instant
+        that identifies a cascade sibling identifies its tombstone, so
+        an edition an operator tombstoned by hand earlier keeps it.
+
         A build the ``purgatory_cleanup`` sweep already purged stays
         deleted whatever its timestamp says — its tree and tarball are
         gone, so a live row would point at nothing — and is named at
-        warning level so the operator learns what the revive could not
-        bring back. Editions have no purge of their own; they are
+        warning level, together with any revived edition still pointing
+        at it, so the operator learns both what the revive could not
+        bring back and which editions need rolling back before they
+        serve 404s. Editions have no purge of their own; they are
         pointers, and the build they point at is checked when something
         tries to serve it.
 
@@ -419,19 +434,17 @@ class KeeperSyncTombstoneService:
 
         # Read before the update: once ``date_deleted`` is cleared the
         # sibling predicate can no longer find these rows.
-        purged_public_ids = (
-            (
-                await self._session.execute(
-                    select(SqlBuild.public_id).where(
-                        SqlBuild.project_id == project_id,
-                        SqlBuild.date_deleted == project_deleted,
-                        SqlBuild.date_purged.is_not(None),
-                    )
+        purged_rows = (
+            await self._session.execute(
+                select(SqlBuild.id, SqlBuild.public_id).where(
+                    SqlBuild.project_id == project_id,
+                    SqlBuild.date_deleted == project_deleted,
+                    SqlBuild.date_purged.is_not(None),
                 )
             )
-            .scalars()
-            .all()
-        )
+        ).all()
+        purged_ids = [row.id for row in purged_rows]
+        purged_public_ids = [row.public_id for row in purged_rows]
 
         await self._session.execute(
             update(SqlProject)
@@ -453,6 +466,28 @@ class KeeperSyncTombstoneService:
             .scalars()
             .all()
         )
+        if edition_ids:
+            # The mirror of the single-edition clear branch above: the
+            # cascade stamped ``date_tombstoned`` with the same
+            # transaction-stable ``func.now()`` as the project's
+            # ``date_deleted``, so this equality reaches exactly the
+            # tombstones this delete wrote and leaves a hand-tombstoned
+            # edition's own stamp alone.
+            await self._session.execute(
+                update(SqlKeeperSyncState)
+                .where(
+                    SqlKeeperSyncState.org_id == org_id,
+                    SqlKeeperSyncState.resource_type
+                    == ResourceType.edition.value,
+                    SqlKeeperSyncState.docverse_id.in_(edition_ids),
+                    SqlKeeperSyncState.date_tombstoned == project_deleted,
+                )
+                .values(
+                    date_tombstoned=None,
+                    tombstone_reason=None,
+                    tombstone_note=None,
+                )
+            )
         build_ids = (
             (
                 await self._session.execute(
@@ -470,7 +505,27 @@ class KeeperSyncTombstoneService:
             .all()
         )
 
-        if purged_public_ids:
+        if purged_ids:
+            # Named the way the sweep names the editions pinning a
+            # build: these come back live with a CDN pointer at a tree
+            # that is gone, so every URL under them 404s until an
+            # operator rolls them back.
+            dangling_slugs: list[str] = []
+            if edition_ids:
+                dangling_slugs = list(
+                    (
+                        await self._session.execute(
+                            select(SqlEdition.slug)
+                            .where(
+                                SqlEdition.id.in_(edition_ids),
+                                SqlEdition.current_build_id.in_(purged_ids),
+                            )
+                            .order_by(SqlEdition.slug)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
             self._logger.warning(
                 "Left purged builds deleted while reviving their project",
                 org_id=org_id,
@@ -479,6 +534,7 @@ class KeeperSyncTombstoneService:
                     serialize_base32_id(public_id)
                     for public_id in purged_public_ids
                 ],
+                edition_slugs=dangling_slugs,
             )
         self._logger.info(
             "Revived a project and its cascade-deleted rows",
