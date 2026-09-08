@@ -10,7 +10,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import Select, exists, select, update
+from sqlalchemy import Select, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -393,11 +393,14 @@ class EditionStore:
         DELETE landing between a build's upload and the tracking write
         would otherwise leave the edition serving content the
         ``purgatory_cleanup`` sweep is entitled to reclaim once the
-        organization's retention elapses (PRD #596). It is deliberately
-        checked ahead of, and independently of, ``skip_date_guard``:
-        that flag waives an *ordering* comparison the version-mode
-        callers make for themselves, not the question of whether the
-        build still exists.
+        organization's retention elapses (PRD #596). It reads the
+        target under a shared row lock so a DELETE running concurrently
+        is decided one way or the other rather than both sides passing
+        an unlocked check; see the comment on the query. It is
+        deliberately checked ahead of, and independently of,
+        ``skip_date_guard``: that flag waives an *ordering* comparison
+        the version-mode callers make for themselves, not the question
+        of whether the build still exists.
 
         The **stale-build guard** then compares the incoming build's
         ``date_created`` against the current build's. If the edition
@@ -422,18 +425,28 @@ class EditionStore:
             because the target build is soft-deleted or the edition
             already points to a newer build.
         """
-        # Deleted-build guard: an EXISTS on the live target, so the
-        # answer comes from the same snapshot as the write that follows
-        # and a build deleted since the caller read it is caught here.
-        live_target = await self._session.execute(
-            select(
-                exists().where(
-                    SqlBuild.id == build_id,
-                    SqlBuild.date_deleted.is_(None),
-                )
+        # Deleted-build guard: a *locking* read of the target, so the
+        # answer cannot go stale between here and the write. ``FOR
+        # SHARE`` conflicts with the ``FOR UPDATE`` that
+        # :meth:`docverse_server.services.build.BuildService.soft_delete`
+        # takes before it asks what points at the build, so a rollback
+        # racing a DELETE blocks and then re-reads ``date_deleted`` as
+        # the DELETE left it rather than both passing their checks
+        # under READ COMMITTED and committing a live edition onto a
+        # soft-deleted build. Shared rather than exclusive because this
+        # only needs the row to hold still, and concurrent repoints of
+        # different editions onto the same build must not serialize.
+        # Lock ordering matches every other build/edition writer —
+        # build row first, edition row second — so this cannot deadlock
+        # against the DELETE, which never locks editions at all.
+        target = (
+            await self._session.execute(
+                select(SqlBuild.date_deleted)
+                .where(SqlBuild.id == build_id)
+                .with_for_update(read=True)
             )
-        )
-        if not live_target.scalar_one():
+        ).one_or_none()
+        if target is None or target.date_deleted is not None:
             return None
 
         # Fetch edition row

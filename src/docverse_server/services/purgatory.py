@@ -104,13 +104,16 @@ class PurgatoryService:
         reclaiming it would 404 a URL somebody is using, however long
         ago the row was deleted.
 
-        The 409 on DELETE stops new references arising, and the project
-        soft-delete cascade deletes a project's editions alongside its
-        builds so they stop counting. What is left for this check are
-        the rows that predate those guards, and the narrow window in
-        which a rollback repoints an edition at an already-deleted
-        build. Held-back builds keep ``date_purged`` null, so a later
-        tick re-examines them once the edition moves on.
+        The 409 on DELETE stops new references arising — it and the
+        repoint guard serialize on the build row, so a rollback racing
+        a delete cannot slip a live edition onto a deleted build — and
+        the project soft-delete cascade deletes a project's editions
+        alongside its builds so they stop counting. What is left for
+        this check are the rows that predate those guards, plus
+        anything a future path leaves pointing at a deleted build:
+        reclaiming a build's tree is irreversible, so the sweep asks
+        rather than trusts. Held-back builds keep ``date_purged`` null,
+        so a later tick re-examines them once the edition moves on.
 
         The reference question is asked per build rather than in one
         batch: it is the same query the DELETE guard runs on the request

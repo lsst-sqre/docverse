@@ -10,7 +10,7 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from safir.database import create_database_engine
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -28,6 +28,7 @@ from docverse.models import (
 from docverse_server.config import config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.domain.edition import Edition
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -2520,3 +2521,118 @@ async def test_get_git_ref_tracking_edition_returns_non_default_on_main(
         await db_session.commit()
     assert found is not None
     assert found.slug == "stable"
+
+
+async def _wait_until_a_backend_blocks(
+    maker: async_sessionmaker[AsyncSession], *, timeout: float = 10.0
+) -> None:
+    """Block until some backend in this database waits on a lock.
+
+    The synchronisation point for the race below: it lets the deleting
+    transaction know the repointing one has actually reached its
+    ``FOR SHARE`` and is queued behind the row lock, rather than
+    guessing with a sleep. Each poll runs in its own short transaction
+    because a backend's ``pg_stat_activity`` snapshot is taken once per
+    transaction and would otherwise never change.
+
+    Test databases are per-xdist-worker (``docverse_gw0`` and friends)
+    and tests within a worker run serially, so the only backends this
+    can see are this test's own.
+    """
+    query = text(
+        "SELECT count(*) FROM pg_stat_activity"
+        " WHERE datname = current_database()"
+        " AND cardinality(pg_blocking_pids(pid)) > 0"
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with maker() as session:
+            blocked = (await session.execute(query)).scalar_one()
+        if blocked:
+            return
+        if loop.time() >= deadline:
+            msg = "no backend ever blocked on the build row lock"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_waits_for_an_in_flight_delete(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A repoint racing a DELETE is decided by it, not lost to it.
+
+    ``editions.current_build_id`` carries no foreign key, so two
+    unlocked checks under READ COMMITTED would each see what they
+    wanted — the DELETE seeing no edition serving the build, the
+    repoint seeing a live build — and both commit, leaving a live
+    edition on a soft-deleted build. The guard's ``FOR SHARE`` read
+    conflicts with the ``FOR UPDATE`` the DELETE takes first, so the
+    repoint waits and then answers on what the DELETE committed.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:4444" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-race",
+                title="Guard Race",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+    build_id = build.id
+    edition_id = edition.id
+
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        build_locked = asyncio.Event()
+
+        async def delete_build() -> None:
+            async with maker() as session:
+                store = BuildStore(session=session, logger=logger)
+                async with session.begin():
+                    locked = await store.get_for_update(build_id=build_id)
+                    assert locked is not None
+                    build_locked.set()
+                    await _wait_until_a_backend_blocks(maker)
+                    assert await store.soft_delete(build_id=build_id) is True
+                    await session.commit()
+
+        async def repoint() -> Edition | None:
+            await build_locked.wait()
+            async with maker() as session:
+                store = EditionStore(session=session, logger=logger)
+                async with session.begin():
+                    updated = await store.set_current_build(
+                        edition_id=edition_id, build_id=build_id
+                    )
+                    await session.commit()
+                return updated
+
+        _, updated = await asyncio.gather(delete_build(), repoint())
+    finally:
+        await engine.dispose()
+
+    assert updated is None
+    refreshed = await edition_store.get_by_id(edition_id)
+    assert refreshed is not None
+    assert refreshed.current_build_id is None

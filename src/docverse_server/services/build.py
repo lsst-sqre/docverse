@@ -556,7 +556,11 @@ class BuildService:
 
         The check runs before :meth:`soft_delete_by_id`, which cancels
         an unfinished build on its way to stamping ``date_deleted``, so
-        a refused request leaves the row exactly as it found it.
+        a refused request leaves the row exactly as it found it. It
+        also runs *under the build's row lock*, taken here rather than
+        left to :meth:`soft_delete_by_id`, so a rollback repointing an
+        edition onto this build cannot land in the window between the
+        check and the delete; see the comment on the lock.
 
         Parameters
         ----------
@@ -572,6 +576,20 @@ class BuildService:
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
+        # Lock the build before asking what still points at it. The
+        # 409 check and the delete are otherwise two unlocked reads
+        # that a concurrent rollback can slip between: ``editions
+        # .current_build_id`` carries no foreign key, so under READ
+        # COMMITTED both sides could pass their own check and commit,
+        # leaving a live edition serving a soft-deleted build — exactly
+        # what this refusal exists to prevent.
+        # ``EditionStore.set_current_build`` takes ``FOR SHARE`` on the
+        # same row, so one of the two blocks and then decides on what
+        # the other committed.
+        locked = await self._store.get_for_update(build_id=build.id)
+        if locked is None or locked.date_deleted is not None:
+            msg = f"Build {build_id!r} not found"
+            raise NotFoundError(msg)
         serving = await self._edition_store.list_live_slugs_by_current_build(
             build_id=build.id
         )
