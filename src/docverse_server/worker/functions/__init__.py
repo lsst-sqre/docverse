@@ -24,6 +24,8 @@ from .ping import ping
 from .project_github_resolve import project_github_resolve
 from .publish_edition import publish_edition
 from .publish_edition_reaper import publish_edition_reaper
+from .purgatory_cleanup import purgatory_cleanup
+from .purgatory_cleanup_dispatcher import purgatory_cleanup_dispatcher
 
 __all__ = [
     "build_processing",
@@ -48,4 +50,6 @@ __all__ = [
     "project_github_resolve",
     "publish_edition",
     "publish_edition_reaper",
+    "purgatory_cleanup",
+    "purgatory_cleanup_dispatcher",
 ]

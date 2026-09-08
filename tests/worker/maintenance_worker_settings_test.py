@@ -24,6 +24,8 @@ from docverse_server.worker.functions import (
     lifecycle_reaper,
     project_github_resolve,
     publish_edition_reaper,
+    purgatory_cleanup,
+    purgatory_cleanup_dispatcher,
 )
 from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
@@ -583,3 +585,81 @@ def test_keeper_sync_worker_does_not_register_lifecycle_functions() -> None:
     assert lifecycle_eval not in sync_underlying
     assert lifecycle_eval_dispatcher not in sync_underlying
     assert lifecycle_reaper not in sync_underlying
+
+
+def test_purgatory_cleanup_functions_registered_single_attempt() -> None:
+    """Dispatcher and per-org sweep carry the pool timeout, one attempt.
+
+    The sweep deletes object-store content, so a retry would re-run a
+    partly-finished reclamation: harmless on the store (both deletes are
+    idempotent) but it would double-count the tally and republish the
+    completion event. ``max_tries=1`` leaves recovery to the next
+    nightly tick, which resumes from the oldest unstamped build.
+    """
+    dispatcher = _function_by_coroutine(purgatory_cleanup_dispatcher)
+    per_org = _function_by_coroutine(purgatory_cleanup)
+    expected_timeout = float(_config.maintenance_job_timeout_seconds)
+    assert dispatcher.timeout_s == expected_timeout
+    assert per_org.timeout_s == expected_timeout
+    assert dispatcher.max_tries == 1
+    assert per_org.max_tries == 1
+
+
+def test_purgatory_cleanup_dispatcher_runs_daily_at_configured_time() -> None:
+    """The sweep's dispatcher cron fires once a day at the config hour.
+
+    Sourced from ``purgatory_cleanup_cron_hour`` /
+    ``purgatory_cleanup_cron_minute`` so an operator can move the sweep
+    without a code change. The 03:23 UTC default sits in the quiet
+    pre-dawn window ahead of the ``inventory_census`` tick, so the
+    census reports a footprint the sweep has already reclaimed rather
+    than a day-old figure.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    sweep_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is purgatory_cleanup_dispatcher
+    ]
+    assert len(sweep_crons) == 1
+    assert sweep_crons[0].hour == {_config.purgatory_cleanup_cron_hour}
+    assert sweep_crons[0].minute == {_config.purgatory_cleanup_cron_minute}
+
+
+def test_purgatory_cleanup_cron_minute_does_not_collide() -> None:
+    """The sweep's minute is staggered off every other maintenance cron.
+
+    On a horizontally scaled maintenance pool a shared firing minute
+    would make the sweep's fan-out race the reapers and the census for
+    the same Postgres connection-pool slots. Pins the invariant so a
+    future config-default tweak cannot silently re-collide the schedule.
+    """
+    reaper_minutes = {0, 30, 3, 18, 33, 48, 6, 36, 12, 42, 24, 54}
+    assert _config.purgatory_cleanup_cron_minute not in reaper_minutes
+    assert (
+        _config.purgatory_cleanup_cron_minute
+        != _config.inventory_census_cron_minute
+    )
+
+
+def test_default_worker_does_not_register_purgatory_cleanup() -> None:
+    """The default queue stays free of the purgatory sweep.
+
+    The sweep lives exclusively on the maintenance pool so a long
+    reclamation run never contends with the publishing flow.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert purgatory_cleanup not in default_underlying
+    assert purgatory_cleanup_dispatcher not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert purgatory_cleanup_dispatcher not in coroutines
