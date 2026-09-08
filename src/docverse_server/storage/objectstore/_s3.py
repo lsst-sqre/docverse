@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Self
 
@@ -17,6 +18,8 @@ from .._http_retry import (
     RETRYABLE_TRANSPORT_ERRORS,
     retry_request,
 )
+from ._exceptions import ObjectStoreError
+from ._protocol import require_nonblank_prefix
 
 __all__ = ["S3ObjectStore"]
 
@@ -24,6 +27,13 @@ __all__ = ["S3ObjectStore"]
 #: one, so this only has to outlive a single PUT rather than the whole
 #: retry sequence.
 _UPLOAD_URL_EXPIRES_SECONDS = 900
+
+#: Keys carried by one ``DeleteObjects`` request. This is the API's own
+#: hard limit — S3 rejects a larger batch outright, and R2 implements
+#: the same bound — so it is a fact about the protocol rather than a
+#: tunable, and a prefix delete simply issues as many requests as the
+#: listing needs.
+_DELETE_BATCH_SIZE = 1000
 
 
 class S3ObjectStore:
@@ -178,6 +188,103 @@ class S3ObjectStore:
         """Delete an object from S3."""
         client = self._get_client()
         await client.delete_object(Bucket=self._bucket, Key=key)
+
+    async def delete_prefix(self, *, prefix: str) -> int:
+        """Delete every object under ``prefix``, in bulk batches.
+
+        Pages ``list_objects_v2`` and feeds the keys into
+        ``DeleteObjects`` requests of at most
+        :data:`_DELETE_BATCH_SIZE`. Batches are filled from the key
+        stream rather than flushed per page, because the store does not
+        choose the page size and an undersized batch is a wasted round
+        trip: a build tree of a few thousand small files is the common
+        case, and one-request-per-key would be thousands.
+
+        Retries are botocore's: this path goes through the aiobotocore
+        client, whose standard retry mode already covers the transient
+        5xx and throttling responses, exactly as it does for
+        :meth:`list_objects` and :meth:`delete_object`. The
+        ``_http_retry`` helper this module also uses is httpx-specific
+        and drives the presigned PUT path — the one request this store
+        issues outside aiobotocore — so it has nothing to wrap here.
+
+        Returns
+        -------
+        int
+            Number of objects deleted, which is every key the listing
+            found: a batch that reports any per-key failure raises
+            instead of counting.
+
+        Raises
+        ------
+        ValueError
+            If ``prefix`` is empty or contains only whitespace.
+        ObjectStoreError
+            If any batch's response carries an ``Errors`` entry. The
+            raise abandons the remaining batches: the caller's whole
+            reason for asking is to learn whether the subtree is gone,
+            and it is not.
+        """
+        require_nonblank_prefix(prefix)
+        client = self._get_client()
+        paginator = client.get_paginator("list_objects_v2")
+        deleted = 0
+        batch: list[str] = []
+        async for page in paginator.paginate(
+            Bucket=self._bucket, Prefix=prefix
+        ):
+            for obj in page.get("Contents", []):
+                batch.append(obj["Key"])
+                if len(batch) == _DELETE_BATCH_SIZE:
+                    await self._delete_batch(prefix=prefix, keys=batch)
+                    deleted += len(batch)
+                    batch = []
+        if batch:
+            await self._delete_batch(prefix=prefix, keys=batch)
+            deleted += len(batch)
+        return deleted
+
+    async def _delete_batch(self, *, prefix: str, keys: Sequence[str]) -> None:
+        """Delete one batch of keys, raising on any per-key failure.
+
+        Runs in quiet mode, so a clean response says nothing at all and
+        the caller counts the batch it sent. That is the honest count:
+        S3 reports a key that was already gone as deleted, so "keys the
+        listing found and the store did not object to" is the most any
+        bulk delete can promise.
+
+        Parameters
+        ----------
+        prefix
+            Prefix being swept, carried only so a failure names it.
+        keys
+            At most :data:`_DELETE_BATCH_SIZE` keys to delete.
+
+        Raises
+        ------
+        ObjectStoreError
+            If the response carries an ``Errors`` entry.
+        """
+        client = self._get_client()
+        response = await client.delete_objects(
+            Bucket=self._bucket,
+            Delete={
+                "Objects": [{"Key": key} for key in keys],
+                "Quiet": True,
+            },
+        )
+        errors = response.get("Errors") or []
+        if not errors:
+            return
+        raise ObjectStoreError(
+            bucket=self._bucket,
+            prefix=prefix,
+            operation="DeleteObjects",
+            failures=[
+                f"{error.get('Key', '?')} ({error.get('Code', 'Unknown')})"
+                for error in errors
+            ],
+        )
 
     async def list_objects(self, *, prefix: str) -> list[str]:
         """List objects with the given prefix."""

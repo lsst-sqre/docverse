@@ -78,3 +78,44 @@ async def test_presigned_download_url() -> None:
         key="staging/build.tar.gz",
     )
     assert "staging/build.tar.gz" in url
+
+
+@pytest.mark.asyncio
+async def test_delete_prefix_removes_only_matching_keys() -> None:
+    """The tree under the prefix goes; everything else stays."""
+    store = MockObjectStore()
+    for key in ("builds/01/index.html", "builds/01/a/b.css", "builds/02/x"):
+        await store.upload_object(
+            key=key, data=b"x", content_type="text/plain"
+        )
+
+    deleted = await store.delete_prefix(prefix="builds/01/")
+
+    assert deleted == 2
+    assert sorted(store.objects) == ["builds/02/x"]
+
+
+@pytest.mark.asyncio
+async def test_delete_prefix_returns_zero_for_empty_prefix() -> None:
+    """A prefix holding nothing is a no-op, not an error."""
+    store = MockObjectStore()
+    await store.upload_object(
+        key="builds/02/x", data=b"x", content_type="text/plain"
+    )
+
+    assert await store.delete_prefix(prefix="builds/01/") == 0
+    assert sorted(store.objects) == ["builds/02/x"]
+
+
+@pytest.mark.asyncio
+async def test_delete_prefix_refuses_a_blank_prefix() -> None:
+    """An empty prefix would mean the whole bucket, so it is refused."""
+    store = MockObjectStore()
+    await store.upload_object(
+        key="builds/02/x", data=b"x", content_type="text/plain"
+    )
+
+    with pytest.raises(ValueError, match="empty prefix"):
+        await store.delete_prefix(prefix="")
+
+    assert sorted(store.objects) == ["builds/02/x"]
