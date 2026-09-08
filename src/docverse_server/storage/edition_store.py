@@ -630,6 +630,70 @@ class EditionStore:
         await self._session.flush()
         return True
 
+    async def soft_delete_all_by_project(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        reason: TombstoneReason,
+    ) -> list[int]:
+        """Soft-delete every live edition of a project, tombstoning each.
+
+        The bulk arm of :meth:`soft_delete`, called by
+        :meth:`docverse_server.storage.project_store.ProjectStore.soft_delete`
+        so a deleted project's editions stop being live references to
+        its builds — which is what lets the ``purgatory_cleanup`` sweep
+        age those builds out instead of skipping them forever (see
+        :meth:`list_live_slugs_by_current_build`).
+
+        Going through here rather than a bare ``UPDATE editions`` in the
+        project store is what keeps the chokepoint honest: the
+        ``keeper_sync_state`` tombstone fields are stamped for the
+        cascade exactly as they are for a per-edition delete, with the
+        caller's :class:`~docverse_server.storage.keeper_sync.TombstoneReason`,
+        so a re-import cannot resurrect an edition whose project was
+        deleted. Both statements run in the caller's transaction, so
+        ``func.now()`` is the same instant on every row it touches and
+        on the project row the caller is stamping.
+
+        An edition already soft-deleted by hand is excluded by the
+        ``date_deleted IS NULL`` predicate and keeps its earlier
+        timestamp and its own tombstone reason.
+
+        Returns
+        -------
+        list of int
+            The internal ids of the editions this call soft-deleted, in
+            no particular order. Empty when the project had no live
+            editions, in which case no tombstone statement is issued.
+        """
+        result = await self._session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .values(date_deleted=func.now())
+            .returning(SqlEdition.id)
+        )
+        edition_ids = [row[0] for row in result.all()]
+        if not edition_ids:
+            return []
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id.in_(edition_ids),
+            )
+            .values(
+                date_tombstoned=func.now(),
+                tombstone_reason=reason.value,
+                tombstone_note=None,
+            )
+        )
+        return edition_ids
+
     async def list_draft_editions_by_git_ref(
         self, *, project_id: int, git_ref: str
     ) -> list[Edition]:

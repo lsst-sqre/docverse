@@ -247,13 +247,20 @@ class ProjectService:
     async def soft_delete(
         self, *, org_slug: str, slug: str
     ) -> tuple[Organization, list[str]]:
-        """Soft-delete a project.
+        """Soft-delete a project and everything under it.
 
         Returns the resolved :class:`Organization` and the slug list of
         the project's non-deleted editions captured before the soft-
         delete. The handler keys the post-commit CDN unpublish on
         ``org.id`` (no slug re-resolution) and iterates the slug list
         without needing an additional ``EditionStore`` read pass.
+
+        The slug list is read *before*
+        :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
+        because that call cascades: the project's live editions and
+        builds are stamped with the project's own ``date_deleted`` in
+        the same transaction, so reading them afterwards would find
+        none and the CDN pointers would be left resolving.
 
         Raises
         ------

@@ -547,6 +547,61 @@ async def test_soft_delete_build(
 
 
 @pytest.mark.asyncio
+async def test_soft_delete_all_by_project_cancels_unfinished(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The bulk variant retires the unfinished builds it deletes.
+
+    Mirrors ``BuildService.soft_delete_by_id``'s pairing: a ``pending``
+    or ``processing`` row is cancelled on its way out, while one that
+    already earned a terminal status keeps it.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        pending = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        finished = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=finished.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=finished.id, new_status=BuildStatus.completed
+        )
+        deleted_ids = await build_store.soft_delete_all_by_project(
+            project_id=project_id
+        )
+        await db_session.commit()
+
+    assert set(deleted_ids) == {pending.id, finished.id}
+
+    async with db_session.begin():
+        rows = (
+            (
+                await db_session.execute(
+                    select(SqlBuild).where(SqlBuild.project_id == project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {row.id: row for row in rows}
+        await db_session.commit()
+    assert by_id[pending.id].status == BuildStatus.cancelled
+    assert by_id[pending.id].date_completed is not None
+    assert by_id[finished.id].status == BuildStatus.completed
+
+
+@pytest.mark.asyncio
 async def test_update_content_hash_rejects_non_pending(
     db_session: AsyncSession,
     build_store: BuildStore,

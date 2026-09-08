@@ -11,13 +11,20 @@ from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
-from docverse.models import EditionKind
+from docverse.models import BuildStatus, EditionKind
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.dependencies.context import context_dependency
+from docverse_server.domain.base32id import (
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
 from docverse_server.metrics import LifecycleAction
+from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.editionpublisher import (
     EditionPublisher,
     MockEditionPublisher,
@@ -28,7 +35,7 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from tests.conftest import seed_org_with_admin
+from tests.conftest import seed_build, seed_org_with_admin
 
 
 async def _setup(client: AsyncClient) -> None:
@@ -377,6 +384,162 @@ async def test_delete_project_writes_manual_delete_tombstone(
     assert state is not None
     assert state.date_tombstoned is not None
     assert state.tombstone_reason == "manual_delete"
+
+
+@pytest.mark.asyncio
+async def test_delete_project_cascades_to_editions_and_builds(
+    client: AsyncClient,
+) -> None:
+    """DELETE project stamps its editions and builds with one timestamp.
+
+    Three builds, one still ``pending``, and three live editions
+    (``__main`` plus two drafts). After the DELETE every one of those
+    rows carries the project's own ``date_deleted``, the ``pending``
+    build reads ``cancelled``, and each edition's ``keeper_sync_state``
+    row is tombstoned — so a deleted project's storage ages into
+    purgatory instead of being pinned by its own editions.
+    """
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "cascade-proj",
+            "title": "Cascade Project",
+            "source_url": "https://example.com/example/cascade",
+        },
+        headers=headers,
+    )
+    for slug in ("draft-a", "draft-b"):
+        await client.post(
+            "/docverse/orgs/proj-org/projects/cascade-proj/editions",
+            json={
+                "slug": slug,
+                "title": slug,
+                "kind": "draft",
+                "tracking_mode": "git_ref",
+            },
+            headers=headers,
+        )
+    finished_ids = [
+        await seed_build("proj-org", "cascade-proj", git_ref=f"v{index}")
+        for index in (1, 2)
+    ]
+    pending_id = await seed_build(
+        "proj-org", "cascade-proj", git_ref="pending-ref"
+    )
+
+    logger = structlog.get_logger("test")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug("proj-org")
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug="cascade-proj"
+            )
+            assert project is not None
+            project_id = project.id
+            build_store = BuildStore(session=session, logger=logger)
+            state_store = KeeperSyncStateStore(session=session, logger=logger)
+            editions = (
+                (
+                    await session.execute(
+                        select(SqlEdition).where(
+                            SqlEdition.project_id == project.id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for index, edition in enumerate(editions):
+                await state_store.upsert(
+                    org_id=org.id,
+                    resource_type=ResourceType.edition,
+                    ltd_id=7100 + index,
+                    ltd_slug=edition.slug,
+                    docverse_id=edition.id,
+                )
+            edition_ids = [edition.id for edition in editions]
+            for build_id in finished_ids:
+                build = await build_store.get_by_public_id(
+                    project_id=project.id,
+                    public_id=validate_base32_id(build_id),
+                )
+                assert build is not None
+                await build_store.transition_status(
+                    build_id=build.id, new_status=BuildStatus.processing
+                )
+                await build_store.transition_status(
+                    build_id=build.id, new_status=BuildStatus.completed
+                )
+            await session.commit()
+
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/cascade-proj",
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_deleted = (
+                await session.execute(
+                    select(SqlProject.date_deleted).where(
+                        SqlProject.slug == "cascade-proj"
+                    )
+                )
+            ).scalar_one()
+            edition_stamps = (
+                (
+                    await session.execute(
+                        select(SqlEdition.date_deleted).where(
+                            SqlEdition.project_id == project_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            builds = (
+                (
+                    await session.execute(
+                        select(SqlBuild).where(
+                            SqlBuild.project_id == project_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug("proj-org")
+            assert org is not None
+            state_store = KeeperSyncStateStore(session=session, logger=logger)
+            states = await state_store.list_for_org(
+                org_id=org.id,
+                resource_type=ResourceType.edition,
+                docverse_ids=edition_ids,
+                include_tombstoned=True,
+            )
+            await session.commit()
+
+    assert project_deleted is not None
+    assert len(edition_stamps) == 3
+    assert set(edition_stamps) == {project_deleted}
+    assert len(builds) == 3
+    assert {build.date_deleted for build in builds} == {project_deleted}
+    by_public_id = {
+        serialize_base32_id(build.public_id): build for build in builds
+    }
+    assert by_public_id[pending_id].status == BuildStatus.cancelled
+    for build_id in finished_ids:
+        assert by_public_id[build_id].status == BuildStatus.completed
+    assert len(states) == 3
+    assert all(state.date_tombstoned is not None for state in states)
+    assert {state.tombstone_reason for state in states} == {"manual_delete"}
 
 
 async def _enable_cdn(org_slug: str) -> None:

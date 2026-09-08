@@ -994,6 +994,57 @@ async def test_soft_delete_edition_no_state_row_is_tombstone_noop(
 
 
 @pytest.mark.asyncio
+async def test_soft_delete_all_by_project_stamps_every_tombstone(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The bulk variant tombstones every live edition it deletes."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        editions = []
+        for index, slug in enumerate(("bulk-a", "bulk-b")):
+            edition = await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+            await state_store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=5100 + index,
+                ltd_slug=slug,
+                docverse_id=edition.id,
+            )
+            editions.append(edition)
+        deleted_ids = await edition_store.soft_delete_all_by_project(
+            org_id=org_id,
+            project_id=project_id,
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    assert set(deleted_ids) == {edition.id for edition in editions}
+
+    async with db_session.begin():
+        rows = await state_store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            docverse_ids=[edition.id for edition in editions],
+            include_tombstoned=True,
+        )
+        await db_session.commit()
+    assert len(rows) == 2
+    assert all(row.date_tombstoned is not None for row in rows)
+    assert {row.tombstone_reason for row in rows} == {"manual_delete"}
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_edition_records_reason_as_passed(
     db_session: AsyncSession,
     edition_store: EditionStore,

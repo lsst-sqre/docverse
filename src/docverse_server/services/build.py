@@ -12,27 +12,13 @@ from docverse_server.domain.project import Project
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.services.queue_dispatch import QueueDispatcher
-from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.build_store import UNFINISHED_STATUSES, BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import BuildDateCreatedCursor
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
-
-# The statuses a build can still leave under its own power: it is
-# waiting for a worker, or a worker has it. Everything else is terminal
-# and keeps the status it earned, which is why the retirement helpers
-# below (:meth:`BuildService.cancel_if_unfinished` and its siblings)
-# restrict their transition to these before writing. Only these would
-# otherwise leave a retired build claiming to be waiting for, or held
-# by, a worker.
-#
-# Derived from :class:`~docverse.models.BuildStatus`, which owns the one
-# definition of the partition, rather than listed again here.
-_UNFINISHED_STATUSES: frozenset[BuildStatus] = frozenset(
-    status for status in BuildStatus if status.is_unfinished
-)
 
 
 class BuildService:
@@ -364,7 +350,7 @@ class BuildService:
         build = await self._store.transition_status(
             build_id=build_id,
             new_status=new_status,
-            only_from=_UNFINISHED_STATUSES,
+            only_from=UNFINISHED_STATUSES,
             org_slug=org_slug,
             project_slug=project_slug,
         )

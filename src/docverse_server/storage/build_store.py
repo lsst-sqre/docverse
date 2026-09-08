@@ -7,7 +7,7 @@ from typing import overload
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -31,6 +31,20 @@ from docverse_server.storage.pagination import BuildDateCreatedCursor
 # (pinned by ``tests/storage/build_store_test.py``). Everything absent
 # is terminal and rejects any further transition, which is what lets a
 # reader treat it as a final answer about the build.
+# The statuses a build can still leave under its own power: it is
+# waiting for a worker, or a worker has it. Everything else is terminal
+# and keeps the status it earned, which is why every path that retires a
+# build — :meth:`BuildService.cancel_if_unfinished` and its siblings
+# one-row-at-a-time, :meth:`BuildStore.soft_delete_all_by_project` in
+# bulk — restricts its write to these. Only these would otherwise leave
+# a retired build claiming to be waiting for, or held by, a worker.
+#
+# Derived from :class:`~docverse.models.BuildStatus`, which owns the one
+# definition of the partition, rather than listed again here.
+UNFINISHED_STATUSES: frozenset[BuildStatus] = frozenset(
+    status for status in BuildStatus if status.is_unfinished
+)
+
 _VALID_TRANSITIONS: dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.pending: {
         BuildStatus.processing,
@@ -723,3 +737,61 @@ class BuildStore:
         row.date_deleted = func.now()
         await self._session.flush()
         return True
+
+    async def soft_delete_all_by_project(
+        self, *, project_id: int
+    ) -> list[int]:
+        """Soft-delete every live build of a project, retiring them.
+
+        The bulk arm of :meth:`soft_delete`, called by
+        :meth:`docverse_server.storage.project_store.ProjectStore.soft_delete`
+        so a deleted project's build content ages into purgatory instead
+        of being pinned to the store forever.
+
+        Keeps the "deleted implies finished" pairing
+        :meth:`docverse_server.services.build.BuildService.soft_delete_by_id`
+        owns for a single build: the ``pending`` and ``processing`` rows
+        are cancelled — stamping ``date_completed`` exactly as
+        :meth:`transition_status` does on entry to a terminal status —
+        before the same call stamps ``date_deleted`` on every live row,
+        so no reader ever sees a deleted build still claiming a worker
+        is on it. A build that already reached ``completed``, ``failed``
+        or ``superseded`` keeps the status it earned.
+
+        Two statements rather than one so the cancel is scoped to the
+        unfinished rows while the delete covers all of them; both run in
+        the caller's transaction, so ``func.now()`` is the same instant
+        on every row it touches and on the project row the caller is
+        stamping. A build already soft-deleted by hand is excluded by
+        the ``date_deleted IS NULL`` predicate and keeps its earlier
+        timestamp, which is what lets the tombstone revive tell a
+        cascade sibling from an individually deleted row.
+
+        Returns
+        -------
+        list of int
+            The internal ids of the builds this call soft-deleted, in no
+            particular order. Empty when the project had no live builds.
+        """
+        await self._session.execute(
+            update(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.date_deleted.is_(None),
+                SqlBuild.status.in_(UNFINISHED_STATUSES),
+            )
+            .values(
+                status=BuildStatus.cancelled,
+                date_completed=func.now(),
+            )
+        )
+        result = await self._session.execute(
+            update(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.date_deleted.is_(None),
+            )
+            .values(date_deleted=func.now())
+            .returning(SqlBuild.id)
+        )
+        return [row[0] for row in result.all()]
