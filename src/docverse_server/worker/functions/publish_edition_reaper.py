@@ -6,12 +6,17 @@ this is the run-less variant: ``publish_edition`` does not aggregate
 into a parent run row, so the reaper only sweeps stuck ``queue_jobs``
 rows and finalises nothing.
 
-Without reconciliation a wedged ``publish_edition`` leaves an edition
-in ``publishing`` status that never reaches the CDN — invisible to
-operators today but corrosive: the CDN silently stays behind the
-edition's intended target build. Reaping flips the wedged row to
-``failed`` so the publish state can be retried on the next operator
-action.
+A wedged ``publish_edition`` leaves an edition in ``publishing`` that
+never reaches the CDN — invisible to operators but corrosive: the CDN
+silently stays behind the edition's intended target build. Reaping
+flips the wedged ``queue_jobs`` row to ``failed`` and stops there. It
+deliberately leaves the edition and its ``edition_build_history`` pair
+in ``publishing``, because a ``publishing`` pair with no live job is
+precisely the drift signal ``edition_reconcile`` (PRD #612) plans
+against: the reconciliation loop re-drives that pair onto the CDN on
+its next half-hourly tick, so the reap is what *hands the pair over*
+rather than what repairs it. Marking the pair ``failed`` here would
+hide it from the loop that exists to recover it.
 """
 
 from __future__ import annotations

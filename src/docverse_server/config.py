@@ -420,9 +420,17 @@ class Configuration(BaseSettings):
             " ``arq_queue.enqueue``). ``publish_edition_reaper`` fails"
             " any ``kind='publish_edition'`` ``queue_jobs`` row that"
             " has been ``in_progress`` longer than this without"
-            " ``date_completed`` so an edition does not sit in"
-            " ``publishing`` indefinitely and the CDN does not silently"
-            " stay behind. Defaults to 4 hours — long enough for the"
+            " ``date_completed``, and that is the whole of what it does"
+            " — the reap closes out the queue row, releasing whatever"
+            " was counting it as live work, but it never touches the"
+            " edition or its ``edition_build_history`` pair, which stay"
+            " in ``publishing``. That is deliberate: a ``publishing``"
+            " pair with no live job is exactly the drift signal"
+            " ``edition_reconcile`` (PRD #612) reads to re-drive the"
+            " publish onto the CDN on its next half-hourly tick, so"
+            " marking the pair ``failed`` here would hide the pair from"
+            " the loop that repairs it. Defaults to 4 hours — long"
+            " enough for the"
             " CDN-publish retry loop to legitimately complete, short"
             " enough that wedged rows clear the same day. Mirrors"
             " ``lifecycle_reaper_threshold_seconds`` so the operator"
@@ -598,6 +606,35 @@ class Configuration(BaseSettings):
             ' deliberate: an operator reaching for "stop reconciling"'
             " wants the dispatcher's feature flag, whereas a cap of 0"
             " would run a job per org that plans work and applies none."
+        ),
+    )
+
+    edition_reconcile_reaper_threshold_seconds: int = Field(
+        3600,
+        title="Edition_reconcile stuck-run reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing an"
+            " ``edition_reconcile`` per-org job (e.g. an OOM-killed"
+            " worker pod, or a dispatcher that crashed between the"
+            " ``queue_jobs`` SQL commit and ``arq_queue.enqueue``)."
+            " ``edition_reconcile_reaper`` fails any"
+            " ``kind='edition_reconcile'`` ``queue_jobs`` row that has"
+            " been ``in_progress`` longer than this without"
+            " ``date_completed``, releasing the per-org mutex"
+            " ``idx_queue_jobs_edition_reconcile_active_uq`` so the next"
+            " half-hourly tick is not skipped for that organization."
+            " One hour rather than the six its maintenance-pool siblings"
+            " use, because this is the one backstop whose loop ticks"
+            " twice an hour: at a sibling-sized threshold a single"
+            " wedged row would cost an organization twelve consecutive"
+            " reconciliation passes, and a pass is bounded work — one"
+            " plan, at most ``edition_reconcile_max_actions_per_job``"
+            " enqueues — with no honest reason to run for an hour."
+            " Otherwise mirrors ``lifecycle_reaper_threshold_seconds``"
+            " so the operator knob shape is identical across reapers;"
+            " the env-overridable default lets non-prod environments"
+            " drive the threshold down to seconds for fast"
+            " verification."
         ),
     )
 

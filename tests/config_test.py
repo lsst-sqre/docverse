@@ -275,6 +275,7 @@ def test_edition_reconcile_defaults() -> None:
     config = Configuration()
     assert config.edition_reconcile_enabled is True
     assert config.edition_reconcile_max_actions_per_job == 100
+    assert config.edition_reconcile_reaper_threshold_seconds == 3600
 
 
 def test_edition_reconcile_env_var_overrides(
@@ -288,9 +289,13 @@ def test_edition_reconcile_env_var_overrides(
     """
     monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_ENABLED", "false")
     monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "7")
+    monkeypatch.setenv(
+        "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "45"
+    )
     config = Configuration()
     assert config.edition_reconcile_enabled is False
     assert config.edition_reconcile_max_actions_per_job == 7
+    assert config.edition_reconcile_reaper_threshold_seconds == 45
 
 
 def test_edition_reconcile_cap_refuses_zero(
@@ -306,3 +311,43 @@ def test_edition_reconcile_cap_refuses_zero(
     monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "0")
     with pytest.raises(ValidationError):
         Configuration()
+
+
+def test_edition_reconcile_reaper_threshold_is_tighter_than_siblings() -> None:
+    """The reconcile reaper's window is sized to its own cadence.
+
+    Every other maintenance-pool reaper backstops a daily or
+    operator-triggered job and can afford a six-hour window. This one
+    backstops a loop that ticks twice an hour, and the wedged row holds
+    the per-org mutex, so a sibling-sized threshold would cost an
+    organization twelve consecutive reconciliation passes before the
+    backstop fired.
+    """
+    config = Configuration()
+    assert config.edition_reconcile_reaper_threshold_seconds < (
+        config.purgatory_cleanup_reaper_threshold_seconds
+    )
+    assert config.edition_reconcile_reaper_threshold_seconds < (
+        config.publish_edition_reaper_threshold_seconds
+    )
+
+
+def test_publish_edition_reaper_description_points_at_reconcile() -> None:
+    """The publish reaper's knob no longer overstates what a reap does.
+
+    Reaping a ``publish_edition`` row only fails the ``queue_jobs`` row:
+    the edition and its ``edition_build_history`` pair stay in
+    ``publishing``, which is exactly the signal ``edition_reconcile``
+    (PRD #612) reads to re-drive the pair. The old wording promised the
+    opposite — that the reap kept an edition out of ``publishing`` — so
+    an operator reading it would have expected the pair to self-clear
+    and would not have known to look at the reconciler. Pinned as a test
+    because the description is the operator-facing documentation of the
+    knob, published straight into the settings reference.
+    """
+    description = Configuration.model_fields[
+        "publish_edition_reaper_threshold_seconds"
+    ].description
+    assert description is not None
+    assert "edition_reconcile" in description
+    assert "does not sit in" not in description
