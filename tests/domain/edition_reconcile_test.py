@@ -553,3 +553,55 @@ def test_unpublishes_count_against_the_same_cap() -> None:
     assert [action.edition_id for action in plan.republish] == [1]
     assert [action.edition_id for action in plan.unpublish] == [2]
     assert plan.capped == 1
+
+
+def test_plan_counts_the_pointers_the_edge_answered_with() -> None:
+    """``pointers_read`` is how many keys the edge actually serves.
+
+    ``editions_scanned`` already says how many keys the tick asked
+    about, so the number worth carrying alongside ``cdn_checked`` is how
+    many came back with something. Here two of the three editions are
+    published at the edge and the third's key is gone, which is exactly
+    the case where "we read the edge" and "the edge has these editions"
+    have to be separable numbers.
+    """
+    served = _edition(edition_id=1, slug="main")
+    also_served = _edition(edition_id=2, slug="v1")
+    forgotten = _edition(edition_id=3, slug="v2")
+    editions = [served, also_served, forgotten]
+    history = {
+        (edition.edition_id, 5000): _history(
+            edition=edition, status=PublishStatus.published
+        )
+        for edition in editions
+    }
+
+    plan = _plan(
+        editions,
+        history=history,
+        pointers=_pointers(
+            (served, _pointer()),
+            (also_served, _pointer()),
+            (forgotten, None),
+        ),
+    )
+
+    assert plan.editions_scanned == 3
+    assert plan.cdn_checked is True
+    assert plan.pointers_read == 2
+
+
+def test_plan_reads_no_pointers_without_a_cdn() -> None:
+    """An org whose edge was never read reports zero pointers read.
+
+    The companion to ``cdn_checked is False``: a tick that looked at
+    nothing must not report a pointer count that could be mistaken for
+    an edge serving nothing.
+    """
+    edition = _edition()
+    history = _history(edition=edition, status=PublishStatus.published)
+
+    plan = _plan([edition], history={(edition.edition_id, 5000): history})
+
+    assert plan.cdn_checked is False
+    assert plan.pointers_read == 0

@@ -18,6 +18,7 @@ from .payloads import (
     DashboardBuiltEvent,
     EditionLifecycleEvent,
     EditionPublishedEvent,
+    EditionReconcileCompletedEvent,
     KeeperSyncRunCompletedEvent,
     LifecycleActionEvent,
     MembershipChangedEvent,
@@ -42,6 +43,7 @@ class DocverseEvents(EventMaker):
     build_processed: EventPublisher[BuildProcessedEvent]
     dashboard_built: EventPublisher[DashboardBuiltEvent]
     edition_published: EventPublisher[EditionPublishedEvent]
+    edition_reconcile_completed: EventPublisher[EditionReconcileCompletedEvent]
     project_lifecycle: EventPublisher[ProjectLifecycleEvent]
     edition_lifecycle: EventPublisher[EditionLifecycleEvent]
     membership_changed: EventPublisher[MembershipChangedEvent]
@@ -90,4 +92,7 @@ class DocverseEvents(EventMaker):
         )
         self.purgatory_cleanup_completed = await manager.create_publisher(
             "purgatory_cleanup_completed", PurgatoryCleanupCompletedEvent
+        )
+        self.edition_reconcile_completed = await manager.create_publisher(
+            "edition_reconcile_completed", EditionReconcileCompletedEvent
         )

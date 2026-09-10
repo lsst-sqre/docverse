@@ -110,6 +110,16 @@ class EditionReconcileOutcome:
     editions_scanned: int = 0
     """Editions the tick considered, every bucket included."""
 
+    pointers_read: int = 0
+    """Keys the org's edge answered this tick's read-back with.
+
+    Read against :attr:`cdn_checked` and :attr:`editions_scanned`: the
+    first says the edge was asked at all, the second how many keys went
+    out, and this one how many came back with something. A tick where
+    the three diverge sharply is an org whose edge has lost keys
+    wholesale, which no single edition's bucket would show.
+    """
+
     republished: int = 0
     """Publishes this tick put back on the queue."""
 
@@ -158,6 +168,21 @@ class EditionReconcileOutcome:
     "nothing was looked at".
     """
 
+    republished_editions: list[str] = field(default_factory=list)
+    """``project/edition`` of every publish this tick re-drove.
+
+    The identity a drifted edition actually has: ``editions`` carries no
+    public id — an edition is addressed by its slug within its project
+    everywhere in the tree, and that pair *is* its CDN key — so the
+    base32 rendering the reaper log payloads use has nothing here to
+    render. Sorted at the log call rather than here, because the order
+    an action was applied in is the order the per-action ``info`` lines
+    are already in and only the summary wants them collated.
+    """
+
+    unpublished_editions: list[str] = field(default_factory=list)
+    """``project/edition`` of every stranded key this tick deleted."""
+
     failed_editions: list[str] = field(default_factory=list)
     """``project/edition`` of every action counted under failure."""
 
@@ -180,6 +205,7 @@ class EditionReconcileOutcome:
         """Render the tally as the ``queue_jobs.progress`` JSONB body."""
         return {
             "editions_scanned": self.editions_scanned,
+            "pointers_read": self.pointers_read,
             "republished": self.republished,
             "republish_failed": self.republish_failed,
             "unpublished": self.unpublished,
@@ -195,6 +221,24 @@ class EditionReconcileOutcome:
             "capped": self.capped,
             "cdn_checked": self.cdn_checked,
             "failed_editions": list(self.failed_editions),
+        }
+
+    def as_log_payload(self) -> dict[str, Any]:
+        """Render the tally as the drift warning's structured payload.
+
+        The counters of :meth:`as_progress` plus the editions behind the
+        two action counts. They are deliberately not on the queue row:
+        the row is what an operator reaches for *later*, and by then the
+        re-driven publishes have their own ``queue_jobs`` rows and the
+        deleted keys are gone, so repeating a capped tick's whole work
+        list there would grow the JSONB without adding an answer. The
+        log line is read at the moment of the repair, which is the one
+        moment the names are the only record.
+        """
+        return {
+            **self.as_progress(),
+            "republished_editions": sorted(self.republished_editions),
+            "unpublished_editions": sorted(self.unpublished_editions),
         }
 
 
@@ -250,6 +294,7 @@ class EditionReconcileService:
         plan = await self._plan(org, limit=limit)
         outcome = EditionReconcileOutcome(
             editions_scanned=plan.editions_scanned,
+            pointers_read=plan.pointers_read,
             in_flight_skipped=plan.in_flight_skipped,
             grace_skipped=plan.grace_skipped,
             failed_left_alone=plan.failed_left_alone,
@@ -366,6 +411,7 @@ class EditionReconcileService:
             )
             return
         outcome.republished += 1
+        outcome.republished_editions.append(label)
         self._logger.info(
             "Re-drove a drifted edition publish",
             project=action.project_slug,
@@ -416,6 +462,7 @@ class EditionReconcileService:
             )
             return
         outcome.unpublished += 1
+        outcome.unpublished_editions.append(label)
         self._logger.info(
             "Removed a stranded edition pointer",
             project=action.project_slug,

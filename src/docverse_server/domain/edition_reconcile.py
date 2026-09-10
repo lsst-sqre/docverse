@@ -226,6 +226,17 @@ class EditionReconcilePlan:
     the same value, and the second is a whole org's worth of drift.
     """
 
+    pointers_read: int = 0
+    """Keys the edge answered this tick's read-back with.
+
+    Counted over the values that came back, not the keys that went out:
+    :attr:`editions_scanned` already says how many keys the tick built,
+    so the number worth carrying beside :attr:`cdn_checked` is how many
+    of them the edge actually serves something for. Always ``0`` when
+    the edge was not read, which is what keeps "no CDN" from reading as
+    "a CDN serving nothing".
+    """
+
     in_flight_skipped: int = 0
     """Pairs a live ``publish_edition`` job still holds."""
 
@@ -524,6 +535,11 @@ def plan_edition_reconcile(
         editions_scanned=len(editions),
         capped=max(len(actions) - limit, 0),
         cdn_checked=cdn_checked,
+        pointers_read=(
+            0
+            if pointers is None
+            else sum(1 for pointer in pointers.values() if pointer is not None)
+        ),
         in_flight_skipped=skips[_Skip.in_flight_skipped],
         grace_skipped=skips[_Skip.grace_skipped],
         failed_left_alone=skips[_Skip.failed_left_alone],

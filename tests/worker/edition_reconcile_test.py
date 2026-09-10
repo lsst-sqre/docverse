@@ -28,8 +28,11 @@ import pytest
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
+from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
     BuildCreate,
@@ -53,6 +56,7 @@ from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.domain.queue import JobStatus
 from docverse_server.factory import Factory
+from docverse_server.metrics import build_event_manager
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -64,6 +68,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.edition_reconcile import (
+    RECONCILED_DRIFT_MESSAGE,
     edition_reconcile,
 )
 from tests.support.arq_testing import get_jobs_by_name
@@ -84,10 +89,19 @@ def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
 
 
-def _payload(*, org_id: int, queue_job_id: int) -> dict[str, Any]:
+def _payload(
+    *, org_id: int, queue_job_id: int, org_slug: str = _ORG_SLUG
+) -> dict[str, Any]:
+    """Build the payload the dispatcher would have enqueued.
+
+    ``org_slug`` defaults to the single-org fixture's slug; the tests
+    that seed a CDN organization pass their own, because the slug is a
+    dimension of the tick's metrics event and its Sentry tag rather than
+    decoration on a log line.
+    """
     return {
         "org_id": org_id,
-        "org_slug": _ORG_SLUG,
+        "org_slug": org_slug,
         "queue_job_id": queue_job_id,
     }
 
@@ -824,3 +838,426 @@ async def test_edition_reconcile_survives_one_failing_unpublish(
     assert row_job.progress["unpublished"] == 1
     assert row_job.progress["unpublish_failed"] == 1
     assert row_job.progress["failed_editions"] == [f"{project_slug}/first"]
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_reports_what_the_edge_answered_with(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tick records how many keys the edge actually served.
+
+    ``cdn_checked`` says the read-back happened; on its own it cannot
+    say whether the edge answered for the whole org or for none of it.
+    Seeded with one converged edition and one whose key is gone, so the
+    two numbers have to differ: two editions scanned, one pointer read.
+    """
+    org_slug = "recon-cdn-counted"
+    project_slug = "cdn-counted-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("kept", "lost"),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    publisher.remove_pointer(project_slug=project_slug, edition_slug="lost")
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    await edition_reconcile(
+        ctx,
+        _payload(
+            org_id=org_id,
+            queue_job_id=queue_job_id,
+            org_slug=org_slug,
+        ),
+    )
+    await ctx["http_client"].aclose()
+
+    row = await _read_queue_job(queue_job_id)
+    assert row.progress is not None
+    assert row.progress["editions_scanned"] == 2
+    assert row.progress["cdn_checked"] is True
+    assert row.progress["pointers_read"] == 1
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_names_every_edition_it_repaired(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tick that repaired something says which editions, at warning.
+
+    The counts alone tell an operator that an org is drifting and
+    nothing about where; the loop has already repaired the drift by the
+    time anyone reads the line, so naming the editions is the only way
+    back to what went wrong. Both action buckets are exercised at once
+    because they are separate lists: an edition that came back and one
+    whose key went away are opposite repairs.
+    """
+    org_slug = "recon-cdn-named"
+    project_slug = "cdn-named-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("alpha", "beta"),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+        await _tombstone(db_session, editions[1], org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    publisher.remove_pointer(project_slug=project_slug, edition_slug="alpha")
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    with capture_logs() as logs:
+        result = await edition_reconcile(
+            ctx,
+            _payload(
+                org_id=org_id,
+                queue_job_id=queue_job_id,
+                org_slug=org_slug,
+            ),
+        )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    drift = [
+        entry
+        for entry in logs
+        if entry["event"] == "Reconciled drifted editions"
+    ]
+    assert len(drift) == 1
+    assert drift[0]["log_level"] == "warning"
+    assert drift[0]["republished"] == 1
+    assert drift[0]["unpublished"] == 1
+    assert drift[0]["republished_editions"] == [f"{project_slug}/alpha"]
+    assert drift[0]["unpublished_editions"] == [f"{project_slug}/beta"]
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_keeps_a_clean_tick_at_debug(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A converged org's tick must not page anyone.
+
+    The loop runs twice an hour against every org, so the steady state
+    is nearly every line it will ever emit. Logging that at warning
+    would bury the ticks that actually repaired something.
+    """
+    org_slug = "recon-cdn-quiet"
+    project_slug = "cdn-quiet-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("main",),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    with capture_logs() as logs:
+        await edition_reconcile(
+            ctx,
+            _payload(
+                org_id=org_id,
+                queue_job_id=queue_job_id,
+                org_slug=org_slug,
+            ),
+        )
+    await ctx["http_client"].aclose()
+
+    quiet = [
+        entry
+        for entry in logs
+        if entry["event"] == "No edition drift to reconcile"
+    ]
+    assert len(quiet) == 1
+    assert quiet[0]["log_level"] == "debug"
+    assert quiet[0]["healthy"] == 1
+    assert [
+        entry
+        for entry in logs
+        if entry["event"] == "Reconciled drifted editions"
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_publishes_a_drifted_orgs_tally(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tick's durable record is the event it publishes.
+
+    The ``queue_jobs`` row is subject to retention and the warning log
+    to whatever the cluster keeps, so the org-scoped completion event is
+    what survives to answer "how much of this environment's publish
+    traffic is the system healing itself". Seeded so both action buckets
+    and a skip bucket land in one tick, which is what makes the event's
+    numbers worth charting rather than just a boolean.
+    """
+    org_slug = "recon-cdn-metrics"
+    project_slug = "cdn-metrics-proj"
+    manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("alpha", "beta", "gamma"),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+        await _tombstone(db_session, editions[1], org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    publisher.remove_pointer(project_slug=project_slug, edition_slug="alpha")
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+    result = await edition_reconcile(
+        ctx,
+        _payload(
+            org_id=org_id,
+            queue_job_id=queue_job_id,
+            org_slug=org_slug,
+        ),
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    completed = events.edition_reconcile_completed
+    assert isinstance(completed, MockEventPublisher)
+    assert len(completed.published) == 1
+    tick = completed.published[0]
+    assert tick.organization == org_slug
+    # One tick spans every project in the org, so it is org-scoped.
+    assert tick.project is None
+    assert tick.editions_scanned == 3
+    # ``alpha``'s key was removed, so only ``beta`` and ``gamma`` answer.
+    assert tick.pointers_read == 2
+    assert tick.republished == 1
+    assert tick.unpublished == 1
+    assert tick.in_flight_skipped == 0
+    assert tick.failed_left_alone == 0
+    assert tick.unexpected_pointers == 0
+    assert tick.capped == 0
+    assert tick.cdn_checked is True
+    assert tick.elapsed >= timedelta(0)
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_publishes_a_clean_orgs_zero_tally(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A converged org still publishes, with every action count zero.
+
+    Silence would be ambiguous in exactly the wrong direction: a tick
+    that found nothing and a tick that never ran look identical if the
+    clean case publishes nothing, and the loop's whole value is the
+    claim that it is running.
+    """
+    org_slug = "recon-cdn-zero"
+    project_slug = "cdn-zero-proj"
+    manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("main",),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+    await edition_reconcile(
+        ctx,
+        _payload(
+            org_id=org_id,
+            queue_job_id=queue_job_id,
+            org_slug=org_slug,
+        ),
+    )
+    await ctx["http_client"].aclose()
+
+    completed = events.edition_reconcile_completed
+    assert isinstance(completed, MockEventPublisher)
+    assert len(completed.published) == 1
+    tick = completed.published[0]
+    assert tick.editions_scanned == 1
+    assert tick.pointers_read == 1
+    assert tick.republished == 0
+    assert tick.unpublished == 0
+    assert tick.capped == 0
+    assert tick.cdn_checked is True
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_pages_once_for_a_drifted_org(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drift the loop repaired still owes an operator one Sentry message.
+
+    The repair is not the end of the story: something else lost a
+    publish or a delete, and the loop can say that an organization is
+    drifting but never why. One message per org tick, not one per
+    edition — a badly drifted org would otherwise open a hundred issues
+    for a single cause.
+    """
+    org_slug = "recon-cdn-paged"
+    project_slug = "cdn-paged-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("alpha", "beta"),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    for item in editions:
+        publisher.remove_pointer(
+            project_slug=project_slug, edition_slug=item.slug
+        )
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        captured = capture_events_fixture(monkeypatch)()
+        await edition_reconcile(
+            ctx,
+            _payload(
+                org_id=org_id,
+                queue_job_id=queue_job_id,
+                org_slug=org_slug,
+            ),
+        )
+    await ctx["http_client"].aclose()
+
+    assert len(captured.errors) == 1
+    event = captured.errors[0]
+    assert event["level"] == "warning"
+    assert event["message"] == RECONCILED_DRIFT_MESSAGE
+    assert event["tags"]["organization"] == org_slug
+    context = event["contexts"]["edition_reconcile"]
+    assert context["republished"] == 2
+    assert context["unpublished"] == 0
+    assert context["editions_scanned"] == 2
+    assert context["republished_editions"] == [
+        f"{project_slug}/alpha",
+        f"{project_slug}/beta",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_pages_nobody_for_a_clean_org(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A converged tick is the steady state and must reach nobody.
+
+    Every org is reconciled twice an hour, so a message on the clean
+    path would be thousands of Sentry events a day saying nothing was
+    wrong — and the drifted ones would be unfindable among them.
+    """
+    org_slug = "recon-cdn-unpaged"
+    project_slug = "cdn-unpaged-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("main",),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        captured = capture_events_fixture(monkeypatch)()
+        await edition_reconcile(
+            ctx,
+            _payload(
+                org_id=org_id,
+                queue_job_id=queue_job_id,
+                org_slug=org_slug,
+            ),
+        )
+    await ctx["http_client"].aclose()
+
+    assert captured.errors == []
