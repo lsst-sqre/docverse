@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from types import TracebackType
@@ -44,6 +45,7 @@ from docverse_server.domain.build import Build
 from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
@@ -118,6 +120,12 @@ class _FailingPublisher:
         edition_slug: str,
     ) -> None:
         _ = (project_slug, edition_slug)
+        raise self._exc
+
+    async def get_pointers(
+        self, keys: Sequence[str]
+    ) -> Mapping[str, EditionPointer | None]:
+        _ = keys
         raise self._exc
 
 

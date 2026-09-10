@@ -13,6 +13,7 @@ from docverse.models.queue_enums import PublishStatus
 
 from .base32id import serialize_base32_id
 from .edition_build_history import EditionBuildHistory
+from .edition_pointer import EditionPointer
 
 __all__ = [
     "EditionReconcilePlan",
@@ -279,7 +280,7 @@ def plan_edition_reconcile(
     editions: Sequence[ReconcileEdition],
     history_pairs: Mapping[tuple[int, int], EditionBuildHistory],
     live_publish_pairs: AbstractSet[tuple[int, int]],
-    pointers: Mapping[str, object],
+    pointers: Mapping[str, EditionPointer | None],
     now: datetime,
     grace: timedelta,
     limit: int,
@@ -305,10 +306,13 @@ def plan_edition_reconcile(
         Pairs a ``publish_edition`` job is genuinely working on right
         now (``in_progress``, or ``queued`` with a backend job id).
     pointers
-        What the CDN actually serves, keyed by ``{project}/{edition}``.
-        Accepted now and unused: the pointer rules arrive with task
-        #616, and taking the argument from the start means that task
-        adds rules to this function rather than reshaping its callers.
+        What the CDN actually serves, keyed as
+        `~docverse_server.domain.edition_pointer.edition_pointer_key`
+        builds the key, with ``None`` for an edition the edge publishes
+        nothing for. Accepted now and unused: the pointer rules arrive
+        with task #616, and taking the argument from the start means
+        that task adds rules to this function rather than reshaping its
+        callers.
     now
         The tick's clock.
     grace
