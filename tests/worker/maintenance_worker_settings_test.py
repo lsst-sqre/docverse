@@ -24,6 +24,9 @@ from docverse_server.worker.functions import (
     lifecycle_reaper,
     project_github_resolve,
     publish_edition_reaper,
+    purgatory_cleanup,
+    purgatory_cleanup_dispatcher,
+    purgatory_cleanup_reaper,
 )
 from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
@@ -60,6 +63,28 @@ def _function_by_coroutine(coro: object) -> Function:
             return entry
     msg = f"No registered Function wraps {coro!r}"
     raise AssertionError(msg)
+
+
+def _other_maintenance_cron_minutes(coro: object) -> set[int]:
+    """Every minute some *other* maintenance-pool cron fires on.
+
+    Derived from the registered ``cron_jobs`` rather than a
+    hand-maintained literal, so a cron added to the pool participates
+    in the stagger checks the moment it is registered instead of
+    quietly falling outside them. On a horizontally scaled pool a
+    shared firing minute makes two crons race for the same Postgres
+    connection-pool slots, which is the contention every stagger
+    comment in ``worker/main.py`` exists to avoid.
+    """
+    minutes: set[int] = set()
+    for job in getattr(MaintenanceWorkerSettings, "cron_jobs", []):
+        if not isinstance(job, CronJob) or _underlying(job.coroutine) is coro:
+            continue
+        slot = job.minute
+        if slot is None:
+            continue
+        minutes |= {slot} if isinstance(slot, int) else set(slot)
+    return minutes
 
 
 def test_maintenance_worker_settings_uses_dedicated_queue() -> None:
@@ -159,7 +184,7 @@ def test_inventory_census_runs_daily_at_configured_time() -> None:
 
 
 def test_inventory_census_cron_minute_does_not_collide_with_reapers() -> None:
-    """The census minute is staggered off every maintenance-pool reaper.
+    """The census minute is staggered off every other maintenance cron.
 
     On a horizontally scaled maintenance pool a shared firing minute
     would make the census race the reapers for the same Postgres
@@ -167,8 +192,9 @@ def test_inventory_census_cron_minute_does_not_collide_with_reapers() -> None:
     its own minute. Pins the invariant so a future config-default tweak
     cannot silently re-collide the schedule.
     """
-    reaper_minutes = {0, 30, 3, 18, 33, 48, 6, 36, 12, 42, 24, 54}
-    assert _config.inventory_census_cron_minute not in reaper_minutes
+    assert _config.inventory_census_cron_minute not in (
+        _other_maintenance_cron_minutes(inventory_census)
+    )
 
 
 def test_default_worker_does_not_register_inventory_census() -> None:
@@ -583,3 +609,158 @@ def test_keeper_sync_worker_does_not_register_lifecycle_functions() -> None:
     assert lifecycle_eval not in sync_underlying
     assert lifecycle_eval_dispatcher not in sync_underlying
     assert lifecycle_reaper not in sync_underlying
+
+
+def test_purgatory_cleanup_functions_registered_single_attempt() -> None:
+    """Dispatcher and per-org sweep carry the pool timeout, one attempt.
+
+    The sweep deletes object-store content, so a retry would re-run a
+    partly-finished reclamation: harmless on the store (both deletes are
+    idempotent) but it would double-count the tally and republish the
+    completion event. ``max_tries=1`` leaves recovery to the next
+    nightly tick, which resumes from the oldest unstamped build.
+    """
+    dispatcher = _function_by_coroutine(purgatory_cleanup_dispatcher)
+    per_org = _function_by_coroutine(purgatory_cleanup)
+    expected_timeout = float(_config.maintenance_job_timeout_seconds)
+    assert dispatcher.timeout_s == expected_timeout
+    assert per_org.timeout_s == expected_timeout
+    assert dispatcher.max_tries == 1
+    assert per_org.max_tries == 1
+
+
+def test_purgatory_cleanup_dispatcher_runs_daily_at_configured_time() -> None:
+    """The sweep's dispatcher cron fires once a day at the config hour.
+
+    Sourced from ``purgatory_cleanup_cron_hour`` /
+    ``purgatory_cleanup_cron_minute`` so an operator can move the sweep
+    without a code change. The 03:23 UTC default sits in the quiet
+    pre-dawn window ahead of the ``inventory_census`` tick, so the
+    census reports a footprint the sweep has already reclaimed rather
+    than a day-old figure.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    sweep_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is purgatory_cleanup_dispatcher
+    ]
+    assert len(sweep_crons) == 1
+    assert sweep_crons[0].hour == {_config.purgatory_cleanup_cron_hour}
+    assert sweep_crons[0].minute == {_config.purgatory_cleanup_cron_minute}
+
+
+def test_purgatory_cleanup_cron_minute_does_not_collide() -> None:
+    """The sweep's minute is staggered off every other maintenance cron.
+
+    On a horizontally scaled maintenance pool a shared firing minute
+    would make the sweep's fan-out race the reapers and the census for
+    the same Postgres connection-pool slots. Pins the invariant so a
+    future config-default tweak cannot silently re-collide the schedule.
+    """
+    assert _config.purgatory_cleanup_cron_minute not in (
+        _other_maintenance_cron_minutes(purgatory_cleanup_dispatcher)
+    )
+
+
+def test_purgatory_cleanup_reaper_registered_as_plain_coroutine() -> None:
+    """``purgatory_cleanup_reaper`` is on the maintenance pool, unwrapped.
+
+    Registered plainly, like the four other run-less reapers and unlike
+    the sweep it backstops: it is a cron-only backstop with no per-job
+    timeout budget of its own, so it inherits arq's defaults rather than
+    the pool's ``maintenance_job_timeout_seconds`` wrapper.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in MaintenanceWorkerSettings.functions
+    }
+    assert purgatory_cleanup_reaper in underlying
+    assert not any(
+        isinstance(entry, Function)
+        and _underlying(entry.coroutine) is purgatory_cleanup_reaper
+        for entry in MaintenanceWorkerSettings.functions
+    )
+
+
+def test_purgatory_cleanup_reaper_runs_every_thirty_minutes() -> None:
+    """The purgatory_cleanup reaper fires twice an hour on its own slot.
+
+    A wedged ``purgatory_cleanup`` row is invisible to operators — it
+    has no user-facing surface — so the 30-minute cadence its run-less
+    siblings use is enough; the tighter ``dashboard_build`` schedule
+    exists only because that kind's wedge shows up as a 409. What the
+    row does cost is a whole organization's nightly sweep, since the
+    per-org mutex counts it as live work, so the reaper is what keeps
+    an org's expired builds from sitting on the store indefinitely.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is purgatory_cleanup_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {21, 51}
+
+
+def test_purgatory_cleanup_reaper_slot_collides_with_nothing() -> None:
+    """The ``{21, 51}`` pair is free of every other maintenance cron.
+
+    The pool's stagger is the whole point of the odd minute slots: the
+    lifecycle reaper holds ``{0, 30}`` and the four other run-less
+    reapers ``{3, 18, 33, 48}``, ``{6, 36}``, ``{12, 42}`` and
+    ``{24, 54}``, with the census, the audit and the sweep's own
+    dispatcher on daily minutes of their own. This asserts the new pair
+    against whatever is actually registered, so adding a sixth reaper on
+    a taken minute fails here rather than in production.
+    """
+    assert {21, 51}.isdisjoint(
+        _other_maintenance_cron_minutes(purgatory_cleanup_reaper)
+    )
+
+
+def test_default_worker_does_not_register_purgatory_cleanup_reaper() -> None:
+    """The default queue stays free of the purgatory_cleanup reaper.
+
+    The reaper lives exclusively on the maintenance pool so cron-driven
+    maintenance work never contends with the publishing flow, exactly
+    like the four run-less reapers registered alongside it.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert purgatory_cleanup_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert purgatory_cleanup_reaper not in coroutines
+
+
+def test_default_worker_does_not_register_purgatory_cleanup() -> None:
+    """The default queue stays free of the purgatory sweep.
+
+    The sweep lives exclusively on the maintenance pool so a long
+    reclamation run never contends with the publishing flow.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert purgatory_cleanup not in default_underlying
+    assert purgatory_cleanup_dispatcher not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert purgatory_cleanup_dispatcher not in coroutines

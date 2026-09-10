@@ -308,6 +308,7 @@ class Build(_BuildBase):
             date_created=domain.date_created,
             date_uploaded=domain.date_uploaded,
             date_completed=domain.date_completed,
+            date_purged=domain.date_purged,
         )
 
 

@@ -17,10 +17,14 @@ from docverse.models import (
     ProjectCreate,
     TrackingMode,
 )
-from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.base32id import (
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
+from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
@@ -29,7 +33,7 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
-from tests.conftest import seed_member, seed_org_with_admin
+from tests.conftest import seed_build, seed_member, seed_org_with_admin
 
 _ADMIN = "admin-user"
 _ORG = "ks-tomb-handler"
@@ -543,3 +547,115 @@ async def test_delete_tombstone_404_when_not_tombstoned(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_tombstone_revives_project_cascade_siblings(
+    client: AsyncClient,
+) -> None:
+    """Reviving a project brings back the rows its DELETE cascaded to.
+
+    A build deleted by hand before the project was deleted carries its
+    own ``date_deleted`` and is not a cascade sibling, so the revive
+    leaves it in purgatory — undeleting it would silently reverse a
+    decision this tombstone never spoke to.
+    """
+    await _setup(client)
+    org_id = await _get_org_id()
+    headers = {"X-Auth-Request-User": _ADMIN}
+    await client.post(
+        f"/docverse/orgs/{_ORG}/projects",
+        json={
+            "slug": "casc-proj",
+            "title": "Cascade Project",
+            "source_url": "https://example.com/x/casc-proj",
+        },
+        headers=headers,
+    )
+    await client.post(
+        f"/docverse/orgs/{_ORG}/projects/casc-proj/editions",
+        json={
+            "slug": "casc-ed",
+            "title": "casc-ed",
+            "kind": "draft",
+            "tracking_mode": "git_ref",
+        },
+        headers=headers,
+    )
+    cascade_build = await seed_build(_ORG, "casc-proj", git_ref="keep-me")
+    hand_build = await seed_build(_ORG, "casc-proj", git_ref="drop-me")
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            proj_store = ProjectStore(session=session, logger=_logger())
+            project = await proj_store.get_by_slug(
+                org_id=org_id, slug="casc-proj"
+            )
+            assert project is not None
+            project_id = project.id
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            await state_store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="casc-proj",
+                docverse_id=project_id,
+            )
+            await session.commit()
+
+    response = await client.delete(
+        f"/docverse/orgs/{_ORG}/projects/casc-proj/builds/{hand_build}",
+        headers=headers,
+    )
+    assert response.status_code == 204
+    response = await client.delete(
+        f"/docverse/orgs/{_ORG}/projects/casc-proj",
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="casc-proj",
+                include_tombstoned=True,
+            )
+    assert state is not None
+    assert state.date_tombstoned is not None
+    tombstone_id = serialize_base32_id(state.public_id)
+
+    response = await client.delete(
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}",
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            proj_store = ProjectStore(session=session, logger=_logger())
+            edition_store = EditionStore(session=session, logger=_logger())
+            build_store = BuildStore(session=session, logger=_logger())
+            revived_project = await proj_store.get_by_slug(
+                org_id=org_id, slug="casc-proj"
+            )
+            revived_edition = await edition_store.get_by_slug(
+                project_id=project_id, slug="casc-ed"
+            )
+            revived_build = await build_store.get_by_public_id(
+                project_id=project_id,
+                public_id=validate_base32_id(cascade_build),
+            )
+            still_deleted = await build_store.get_deleted_by_public_id(
+                project_id=project_id,
+                public_id=validate_base32_id(hand_build),
+            )
+    assert revived_project is not None
+    assert revived_edition is not None
+    assert revived_build is not None
+    assert still_deleted is not None

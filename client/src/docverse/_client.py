@@ -265,6 +265,41 @@ class DocverseClient:
         _raise_for_status(response)
         return Build.model_validate(response.json())
 
+    async def restore_build(self, org: str, project: str, build: str) -> Build:
+        """Restore a soft-deleted build.
+
+        Undoes a ``DELETE`` while the build's object-store content is
+        still there. The build's status is not changed: one deleted
+        before it finished was cancelled on the way out and comes back
+        ``cancelled``, because a restore returns the row and its
+        content, not a re-run.
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        project
+            Project slug.
+        build
+            Base32 build ID, as carried by ``Build.id``.
+
+        Returns
+        -------
+        Build
+            The restored build.
+
+        Raises
+        ------
+        DocverseClientError
+            With ``status_code`` 409 if the build has been purged — its
+            content permanently reclaimed, which no restore can undo —
+            or 404 if there is no soft-deleted build with that ID.
+        """
+        url = f"/orgs/{org}/projects/{project}/builds/{build}/restore"
+        response = await self._client.post(url)
+        _raise_for_status(response)
+        return Build.model_validate(response.json())
+
     async def upload_tarball(
         self, upload_url: str, tarball_path: Path
     ) -> None:

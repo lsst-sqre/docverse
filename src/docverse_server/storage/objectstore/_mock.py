@@ -9,6 +9,8 @@ from urllib.parse import quote
 
 import structlog
 
+from ._protocol import require_nonblank_prefix
+
 __all__ = ["MockObjectStore"]
 
 _DEFAULT_BASE_URL = "https://mock-s3.example.com"
@@ -83,6 +85,21 @@ class MockObjectStore:
     async def delete_object(self, *, key: str) -> None:
         """Delete an object from the in-memory store."""
         self._objects.pop(key, None)
+
+    async def delete_prefix(self, *, prefix: str) -> int:
+        """Delete every in-memory object under a prefix.
+
+        Mirrors :meth:`S3ObjectStore.delete_prefix`'s semantics over the
+        backing dict: exactly the matching keys go, the count comes
+        back, and a prefix that matches nothing returns 0. There is no
+        partial-failure path to model, so this never raises
+        ``ObjectStoreError``.
+        """
+        require_nonblank_prefix(prefix)
+        keys = [key for key in self._objects if key.startswith(prefix)]
+        for key in keys:
+            del self._objects[key]
+        return len(keys)
 
     async def list_objects(self, *, prefix: str) -> list[str]:
         """List objects matching a prefix."""

@@ -6,14 +6,25 @@ import asyncio
 
 import pytest
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
+    BuildCreate,
+    BuildStatus,
+    EditionCreate,
+    EditionKind,
     OrganizationCreate,
     ProjectCreate,
     ProjectGitHubBindingCreate,
     ProjectUpdate,
+    TrackingMode,
 )
+from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
@@ -503,6 +514,258 @@ async def test_soft_delete_project_no_state_row_is_tombstone_noop(
     assert state is None
 
 
+_CASCADE_HASH = "sha256:" + "c" * 64
+
+
+async def _seed_cascade_project(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    *,
+    org_id: int,
+    slug: str,
+) -> tuple[int, list[int], list[int]]:
+    """Create a project with two editions and two builds.
+
+    Returns the project id plus the edition and build ids, so a test
+    can read the rows back and compare timestamps.
+    """
+    logger = structlog.get_logger("docverse")
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    project = await store.create(
+        org_id=org_id,
+        data=ProjectCreate(
+            slug=slug,
+            title=slug,
+            source_url="https://example.com/example/repo",
+        ),
+    )
+    edition_ids = []
+    for edition_slug in (f"{slug}-a", f"{slug}-b"):
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=edition_slug,
+                title=edition_slug,
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        edition_ids.append(edition.id)
+    build_ids = []
+    for git_ref in ("main", "feature"):
+        build = await build_store.create(
+            project_id=project.id,
+            project_slug=slug,
+            data=BuildCreate(git_ref=git_ref, content_hash=_CASCADE_HASH),
+            uploader="testuser",
+        )
+        build_ids.append(build.id)
+    return project.id, edition_ids, build_ids
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_cascades_with_one_shared_timestamp(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Project, editions and builds are stamped in one flush.
+
+    ``func.now()`` is transaction-stable in PostgreSQL, so a single
+    shared timestamp across all three tables is the observable proof
+    that the cascade never opened a second transaction — and it is what
+    the tombstone revive keys on to tell cascade siblings apart from
+    rows deleted individually.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="cascade-org")
+        project_id, edition_ids, build_ids = await _seed_cascade_project(
+            db_session, store, org_id=org_id, slug="cascade-proj"
+        )
+        deleted = await store.soft_delete(
+            org_id=org_id,
+            slug="cascade-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+        assert deleted is True
+        await db_session.commit()
+
+    async with db_session.begin():
+        project_deleted = (
+            await db_session.execute(
+                select(SqlProject.date_deleted).where(
+                    SqlProject.id == project_id
+                )
+            )
+        ).scalar_one()
+        edition_stamps = (
+            (
+                await db_session.execute(
+                    select(SqlEdition.date_deleted).where(
+                        SqlEdition.id.in_(edition_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        build_stamps = (
+            (
+                await db_session.execute(
+                    select(SqlBuild.date_deleted).where(
+                        SqlBuild.id.in_(build_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await db_session.commit()
+    assert project_deleted is not None
+    assert list(edition_stamps) == [project_deleted, project_deleted]
+    assert list(build_stamps) == [project_deleted, project_deleted]
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_leaves_other_projects_untouched(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The cascade is scoped to the deleted project's own rows."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="cascade-scope-org")
+        _, kept_editions, kept_builds = await _seed_cascade_project(
+            db_session, store, org_id=org_id, slug="kept-proj"
+        )
+        await _seed_cascade_project(
+            db_session, store, org_id=org_id, slug="gone-proj"
+        )
+        await store.soft_delete(
+            org_id=org_id,
+            slug="gone-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_stamps = (
+            (
+                await db_session.execute(
+                    select(SqlEdition.date_deleted).where(
+                        SqlEdition.id.in_(kept_editions)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        build_rows = (
+            (
+                await db_session.execute(
+                    select(SqlBuild).where(SqlBuild.id.in_(kept_builds))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await db_session.commit()
+    assert list(edition_stamps) == [None, None]
+    assert [row.date_deleted for row in build_rows] == [None, None]
+    assert {row.status for row in build_rows} == {BuildStatus.pending}
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_keeps_an_earlier_deletion_timestamp(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Rows deleted before the project keep their own timestamps.
+
+    The cascade's ``date_deleted IS NULL`` predicate is what makes an
+    individually deleted edition or build distinguishable from a
+    cascade sibling later on.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="cascade-earlier-org")
+        project_id, edition_ids, build_ids = await _seed_cascade_project(
+            db_session, store, org_id=org_id, slug="earlier-proj"
+        )
+        edition_store = EditionStore(session=db_session, logger=logger)
+        build_store = BuildStore(session=db_session, logger=logger)
+        assert await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="earlier-proj-a",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        assert await build_store.soft_delete(build_id=build_ids[0])
+        await db_session.commit()
+
+    async with db_session.begin():
+        early_edition = (
+            await db_session.execute(
+                select(SqlEdition.date_deleted).where(
+                    SqlEdition.id == edition_ids[0]
+                )
+            )
+        ).scalar_one()
+        early_build = (
+            await db_session.execute(
+                select(SqlBuild.date_deleted).where(
+                    SqlBuild.id == build_ids[0]
+                )
+            )
+        ).scalar_one()
+        await db_session.commit()
+
+    async with db_session.begin():
+        await store.soft_delete(
+            org_id=org_id,
+            slug="earlier-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        project_deleted = (
+            await db_session.execute(
+                select(SqlProject.date_deleted).where(
+                    SqlProject.id == project_id
+                )
+            )
+        ).scalar_one()
+        edition_after = (
+            await db_session.execute(
+                select(SqlEdition.date_deleted).where(
+                    SqlEdition.id == edition_ids[0]
+                )
+            )
+        ).scalar_one()
+        build_after = (
+            await db_session.execute(
+                select(SqlBuild.date_deleted).where(
+                    SqlBuild.id == build_ids[0]
+                )
+            )
+        ).scalar_one()
+        sibling_build = (
+            await db_session.execute(
+                select(SqlBuild.date_deleted).where(
+                    SqlBuild.id == build_ids[1]
+                )
+            )
+        ).scalar_one()
+        await db_session.commit()
+    assert edition_after == early_edition
+    assert build_after == early_build
+    assert edition_after != project_deleted
+    assert sibling_build == project_deleted
+
+
 # ── list_by_github_repo ───────────────────────────────────────────────────
 
 
@@ -950,3 +1213,57 @@ async def test_list_github_bound_by_org_excludes_deleted(
         result = await store.list_github_bound_by_org(org_id)
         await db_session.commit()
     assert [p.slug for p in result] == [kept.slug]
+
+
+@pytest.mark.asyncio
+async def test_list_slugs_by_ids_includes_a_deleted_project(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A slug lookup for metrics must survive its project's deletion.
+
+    The ``purgatory_cleanup`` sweep labels each reap with the build's
+    project slug, and the builds it reaches most often belong to a
+    project that was itself deleted — the cascade is what puts them in
+    purgatory. A lookup that filtered on ``date_deleted`` would drop the
+    slug precisely on the reaps that matter, so this one deliberately
+    does not.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="slug-lookup-org")
+        live = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="still-here",
+                title="Still Here",
+                source_url="https://example.com/example/live",
+            ),
+        )
+        gone = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="deleted-project",
+                title="Deleted Project",
+                source_url="https://example.com/example/gone",
+            ),
+        )
+        await store.soft_delete(
+            org_id=org_id,
+            slug="deleted-project",
+            reason=TombstoneReason.manual_delete,
+        )
+        slugs = await store.list_slugs_by_ids([live.id, gone.id])
+        await db_session.commit()
+
+    assert slugs == {live.id: "still-here", gone.id: "deleted-project"}
+
+
+@pytest.mark.asyncio
+async def test_list_slugs_by_ids_is_empty_for_no_ids(
+    db_session: AsyncSession,
+    store: ProjectStore,
+) -> None:
+    """No ids means no query: the sweep often purges nothing at all."""
+    async with db_session.begin():
+        assert await store.list_slugs_by_ids([]) == {}

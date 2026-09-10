@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from docverse.models import BuildAnnotations, BuildStatus
+from docverse.models import (
+    BuildAnnotations,
+    BuildStatus,
+    EditionCreate,
+    EditionKind,
+    TrackingMode,
+)
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import validate_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.conftest import seed_build, seed_org_with_admin
@@ -37,6 +49,43 @@ async def _setup(client: AsyncClient) -> None:
         },
         headers={"X-Auth-Request-User": "testuser"},
     )
+
+
+async def _stamp_date_purged(
+    org_slug: str,
+    project_slug: str,
+    build_id: str,
+    when: datetime,
+) -> None:
+    """Set ``date_purged`` on a build row directly.
+
+    Nothing in the tree writes the column yet — the sweep that will is
+    DM-54691's later slice — so the paths that *read* it are exercised
+    by writing the row the sweep would leave behind: the build response
+    body, and the restore endpoint's refusal.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            await session.execute(
+                update(SqlBuild)
+                .where(
+                    SqlBuild.project_id == project.id,
+                    SqlBuild.public_id == validate_base32_id(build_id),
+                )
+                .values(date_purged=when)
+            )
+            await session.commit()
+        return
+    raise AssertionError("db_session_dependency yielded no session")
 
 
 async def _transition_build(
@@ -463,3 +512,358 @@ async def test_delete_build_cancels_pending_build(
     assert row.status == BuildStatus.cancelled
     assert row.date_deleted is not None
     assert row.date_completed is not None
+
+
+@pytest.mark.asyncio
+async def test_get_build_reports_content_not_yet_reclaimed(
+    client: AsyncClient,
+) -> None:
+    """A live build reports ``date_purged`` null on the wire.
+
+    Null is the answer for every build that exists today, which is what
+    makes the field readable as "the content is still there" rather than
+    "this server does not know". A caller can only trust a soft-deleted
+    build to be restorable if the field is present and null, so the
+    field has to be emitted even when nothing has ever been purged.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+
+    response = await client.get(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["date_purged"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_build_reports_reclaimed_content(
+    client: AsyncClient,
+) -> None:
+    """A stamped ``date_purged`` reaches the response body.
+
+    The stamp is written by the ``purgatory_cleanup`` sweep, which this
+    handler test deliberately does not run: it writes the column
+    directly so the assertion stays about the read path. What it pins
+    is the route from the column through the domain model to the wire —
+    without all three, the sweep would reclaim a build's objects and no
+    API caller would ever be able to tell.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    purged_at = datetime(2026, 9, 8, 3, 23, tzinfo=UTC)
+    await _stamp_date_purged("build-org", "build-proj", build_id, purged_at)
+
+    response = await client.get(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert datetime.fromisoformat(response.json()["date_purged"]) == purged_at
+
+
+async def _seed_edition_serving(
+    org_slug: str,
+    project_slug: str,
+    *,
+    edition_slug: str,
+    build_ids: list[str],
+) -> None:
+    """Create an edition whose history is ``build_ids``, oldest first.
+
+    The edition is left serving the last build in the list, which is
+    what a completed build normally does to it. Recording the earlier
+    ones too is what makes them rollback targets.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            org_store = OrganizationStore(session=session, logger=logger)
+            org = await org_store.get_by_slug(org_slug)
+            assert org is not None
+            project_store = ProjectStore(session=session, logger=logger)
+            project = await project_store.get_by_slug(
+                org_id=org.id, slug=project_slug
+            )
+            assert project is not None
+            edition_store = EditionStore(session=session, logger=logger)
+            edition = await edition_store.create(
+                project_id=project.id,
+                data=EditionCreate(
+                    slug=edition_slug,
+                    title=edition_slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                    tracking_params={"git_ref": "main"},
+                ),
+            )
+            build_store = BuildStore(session=session, logger=logger)
+            history_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            for build_id in build_ids:
+                build = await build_store.get_by_public_id(
+                    project_id=project.id,
+                    public_id=validate_base32_id(build_id),
+                )
+                assert build is not None
+                await history_store.record(
+                    edition_id=edition.id, build_id=build.id
+                )
+                await edition_store.set_current_build(
+                    edition_id=edition.id,
+                    build_id=build.id,
+                    skip_date_guard=True,
+                )
+            await session.commit()
+        return
+    raise AssertionError("db_session_dependency yielded no session")
+
+
+@pytest.mark.asyncio
+async def test_delete_build_refuses_a_build_an_edition_serves(
+    client: AsyncClient,
+) -> None:
+    """DELETE is refused while a live edition points at the build.
+
+    Obeying it would leave the edition resolving to content that the
+    purgatory sweep is entitled to reclaim once retention elapses, with
+    nothing left to re-point the edition. The 409 names the edition so
+    the operator knows what to roll back; once they have, the same
+    DELETE goes through.
+    """
+    await _setup(client)
+    older = await seed_build("build-org", "build-proj")
+    current = await seed_build("build-org", "build-proj")
+    await _seed_edition_serving(
+        "build-org",
+        "build-proj",
+        edition_slug="served",
+        build_ids=[older, current],
+    )
+
+    refused = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{current}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert refused.status_code == 409
+    detail = refused.json()["detail"][0]
+    assert detail["type"] == "conflict"
+    assert "served" in detail["msg"]
+
+    rollback = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/editions/served"
+        "/rollback",
+        json={"build": older},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback.status_code == 200
+
+    allowed = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{current}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert allowed.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_build_ignores_a_deleted_editions_pointer(
+    client: AsyncClient,
+) -> None:
+    """A soft-deleted edition's pointer does not hold the build back.
+
+    Nothing serves a deleted edition, so its stale ``current_build_id``
+    is not a reason to keep the build's content alive — otherwise
+    deleting a project would strand every one of its builds outside
+    purgatory forever.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    await _seed_edition_serving(
+        "build-org",
+        "build-proj",
+        edition_slug="retired",
+        build_ids=[build_id],
+    )
+    retired = await client.delete(
+        "/docverse/orgs/build-org/projects/build-proj/editions/retired",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert retired.status_code == 204
+
+    response = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_restore_build_revives_a_deleted_build(
+    client: AsyncClient,
+) -> None:
+    """Restore returns 200 and hands back a live build.
+
+    The 200 body is the operator's confirmation that the row is back:
+    ``date_deleted`` is cleared and the build reads exactly as it did
+    before the DELETE, apart from the status the delete gave it.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    deleted = await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert deleted.status_code == 204
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == build_id
+    row = await _read_deleted_build("build-org", "build-proj", build_id)
+    assert row.date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_restore_build_keeps_the_deleted_builds_status(
+    client: AsyncClient,
+) -> None:
+    """A build cancelled by its DELETE comes back cancelled.
+
+    Restoring returns the row and its content, not a re-run: the tarball
+    was never re-staged and no worker was re-queued, so reviving the
+    build as ``pending`` would advertise a build nothing is going to
+    publish and hand it to the stranded-build sweep.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == BuildStatus.cancelled.value
+
+
+@pytest.mark.asyncio
+async def test_restore_build_refuses_a_purged_build(
+    client: AsyncClient,
+) -> None:
+    """A purged build answers 409, and stays deleted.
+
+    ``date_purged`` says the sweep reclaimed the tree and the tarball,
+    so there is nothing left to restore. The refusal has to be a
+    conflict rather than a 404: the row is still readable, and telling
+    the operator it does not exist would invite them to keep retrying.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+    await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    await _stamp_date_purged(
+        "build-org",
+        "build-proj",
+        build_id,
+        datetime(2026, 9, 8, 3, 23, tzinfo=UTC),
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"][0]["type"] == "conflict"
+    row = await _read_deleted_build("build-org", "build-proj", build_id)
+    assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_restore_build_reports_a_live_build_as_not_found(
+    client: AsyncClient,
+) -> None:
+    """Restoring a build nobody deleted is a miss, not a no-op 200.
+
+    The endpoint addresses only the rows ordinary reads hide, so a live
+    build id here is a mistake worth reporting rather than a request to
+    do nothing.
+    """
+    await _setup(client)
+    build_id = await seed_build("build-org", "build-proj")
+
+    response = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{build_id}"
+        "/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_restored_build_is_listed_and_rollback_eligible(
+    client: AsyncClient,
+) -> None:
+    """A restored build is an ordinary build again, end to end.
+
+    The 200 body alone would not prove the row rejoined the live set:
+    the listing and the rollback target resolution both go through
+    ``date_deleted IS NULL`` lookups of their own. Rolling an edition
+    back onto the restored build is the strongest statement that the
+    restore actually undid the delete.
+    """
+    await _setup(client)
+    older = await seed_build("build-org", "build-proj")
+    current = await seed_build("build-org", "build-proj")
+    await _seed_edition_serving(
+        "build-org",
+        "build-proj",
+        edition_slug="served",
+        build_ids=[older, current],
+    )
+    await client.delete(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{older}",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    listed_while_deleted = await client.get(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert older not in [build["id"] for build in listed_while_deleted.json()]
+
+    restored = await client.post(
+        f"/docverse/orgs/build-org/projects/build-proj/builds/{older}/restore",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert restored.status_code == 200
+
+    listed = await client.get(
+        "/docverse/orgs/build-org/projects/build-proj/builds",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert older in [build["id"] for build in listed.json()]
+
+    rollback = await client.post(
+        "/docverse/orgs/build-org/projects/build-proj/editions/served"
+        "/rollback",
+        json={"build": older},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback.status_code == 200

@@ -24,6 +24,7 @@ from docverse_server.handlers.params import (
     OrgSlugParam,
     ProjectSlugParam,
 )
+from docverse_server.handlers.responses import error_responses
 from docverse_server.metrics import BuildUploadedEvent
 from docverse_server.storage.pagination import (
     BUILD_CURSOR_TYPE,
@@ -254,6 +255,7 @@ async def patch_build(
 @router.delete(
     "/orgs/{org}/projects/{project}/builds/{build}",
     status_code=status.HTTP_204_NO_CONTENT,
+    responses=error_responses(status.HTTP_409_CONFLICT),
     summary="Delete a build",
     name="delete_build",
 )
@@ -273,3 +275,42 @@ async def delete_build(
             build_id=build_id,
         )
         await context.session.commit()
+
+
+@router.post(
+    "/orgs/{org}/projects/{project}/builds/{build}/restore",
+    response_model=Build,
+    responses=error_responses(status.HTTP_409_CONFLICT),
+    summary="Restore a soft-deleted build",
+    name="post_build_restore",
+)
+async def post_build_restore(
+    *,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    build_id: BuildIdParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> Build:
+    """Undo a ``DELETE`` while the build's content is still on the store.
+
+    The surface behind the "restorable until purged" promise
+    ``date_deleted`` makes: it clears the stamp and the build is an
+    ordinary, listable, roll-back-able build again. Admin-only, like
+    the ``DELETE`` it reverses.
+
+    A build whose ``date_purged`` is set answers 409 rather than 200 —
+    the ``purgatory_cleanup`` sweep has reclaimed its tree and tarball,
+    and no row edit brings those back. A build that was never deleted
+    answers 404, since this endpoint addresses only the rows ordinary
+    reads hide.
+    """
+    async with context.session.begin():
+        service = context.factory.create_build_service()
+        build = await service.restore(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            build_id=build_id,
+        )
+        await context.session.commit()
+    return Build.from_domain(build, context.request, org_slug, project_slug)

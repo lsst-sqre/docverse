@@ -225,6 +225,8 @@ async def test_conflict_operations_document_conflict_response(
         "admin_post_organization",
         "post_member",
         "post_dashboard_rebuild",
+        "delete_build",
+        "post_build_restore",
     ]
     missing = [
         op_id

@@ -69,8 +69,11 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     Returns
     -------
     str
-        ``"completed"`` on success or ``"failed"`` if the publish
-        attempt raised.
+        ``"completed"`` on success — and equally when the build was
+        deleted before the job ran, which is a skip rather than a
+        failure (see :func:`_skip_deleted_build`) — ``"failed"`` if the
+        publish attempt raised, or ``"skipped"`` for a row the
+        late-delivery guard refuses.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.publish_edition"
@@ -132,13 +135,32 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 resources = await _load_resources(
                     factory=factory, payload=payload
                 )
-                await _mark_publishing(
+                # Deleted-build guard, read under EDITION_UPDATE so it
+                # cannot straddle a DELETE. Tracking committed this
+                # edition's pointer and enqueued the publish; a DELETE
+                # landing in the window before arq delivered the job
+                # leaves a build the ``purgatory_cleanup`` sweep may
+                # reclaim, and a KV pointer written now would outlive
+                # the objects it names (PRD #596).
+                build_deleted = resources.build.date_deleted is not None
+                if not build_deleted:
+                    await _mark_publishing(
+                        queue_job_store=queue_job_store,
+                        edition_store=edition_store,
+                        history_store=history_store,
+                        resources=resources,
+                        queue_job_id=queue_job_id,
+                    )
+            if build_deleted:
+                await _skip_deleted_build(
+                    ctx=ctx,
+                    session=session,
+                    factory=factory,
                     queue_job_store=queue_job_store,
-                    edition_store=edition_store,
-                    history_store=history_store,
-                    resources=resources,
                     queue_job_id=queue_job_id,
+                    logger=logger,
                 )
+                return "completed"
 
             publishing_service = factory.create_edition_publishing_service()
             try:
@@ -241,6 +263,56 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _skip_deleted_build(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    factory: Factory,
+    queue_job_store: QueueJobStore,
+    queue_job_id: int,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Retire a publish whose build was deleted before it ran.
+
+    The publish-side twin of ``build_processing``'s
+    ``_mark_deleted_skipped``, and it records the same thing:
+    ``progress["deleted_skipped"]`` on a job that completes rather than
+    fails. A deleted build is not an error — an operator asked for it —
+    so the job must not land in Sentry or wait for a reaper; it simply
+    has nothing left to publish.
+
+    Nothing else is touched. The edition and its ``edition_build_history``
+    entry keep the ``pending`` status tracking left them at, because
+    they record an intent that was never carried out, and no
+    ``EditionPublishedEvent`` is emitted for a publish that did not
+    happen. The keeper-sync roll-up still runs: this job is terminal, so
+    a run that was waiting on it must be allowed to finalise exactly as
+    the success and failure paths allow it to.
+    """
+    logger.info("Deleted build skipped before publishing")
+    completion: KeeperSyncRunWithActivity | None = None
+    async with session.begin():
+        await queue_job_store.update_phase(
+            queue_job_id,
+            "complete",
+            progress={
+                "message": "Build was deleted before publishing",
+                "deleted_skipped": True,
+            },
+        )
+        await queue_job_store.complete(queue_job_id)
+        completion = await _maybe_finalise_keeper_sync_run(
+            factory=factory, queue_job_id=queue_job_id
+        )
+    await publish_run_completed(
+        events=ctx.get("events"),
+        session=session,
+        org_store=factory.create_org_store(),
+        completion=completion,
+        logger=logger,
+    )
 
 
 async def _load_resources(

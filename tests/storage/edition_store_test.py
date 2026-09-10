@@ -10,7 +10,7 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from safir.database import create_database_engine
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -28,6 +28,7 @@ from docverse.models import (
 from docverse_server.config import config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.domain.edition import Edition
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -772,6 +773,113 @@ async def test_set_current_build_applies_when_newer(
 
 
 @pytest.mark.asyncio
+async def test_set_current_build_skips_deleted_build(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Skip when the incoming build has been soft-deleted.
+
+    PRD #596 "Pointer race": a DELETE that lands between a build's
+    upload and its tracking must not leave an edition pointing at
+    content the purgatory sweep is about to reclaim.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:1111" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-deleted",
+                title="Guard Deleted",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        assert await build_store.soft_delete(build_id=build.id) is True
+
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await db_session.commit()
+    assert skipped is None
+    refreshed = await edition_store.get_by_id(edition.id)
+    assert refreshed is not None
+    assert refreshed.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_skips_deleted_build_without_date_guard(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The deleted-build guard also holds under ``skip_date_guard``.
+
+    ``skip_date_guard`` waives the *ordering* comparison only — the
+    version-mode callers own that — so a soft-deleted target is still
+    refused, and the edition keeps the build it was already serving.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        live_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:2222" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        deleted_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:3333" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-deleted-nodate",
+                title="Guard Deleted No Date",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.semver_release,
+            ),
+        )
+        applied = await edition_store.set_current_build(
+            edition_id=edition.id,
+            build_id=live_build.id,
+            skip_date_guard=True,
+        )
+        assert applied is not None
+        assert await build_store.soft_delete(build_id=deleted_build.id) is True
+
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id,
+            build_id=deleted_build.id,
+            skip_date_guard=True,
+        )
+        await db_session.commit()
+    assert skipped is None
+    refreshed = await edition_store.get_by_id(edition.id)
+    assert refreshed is not None
+    assert refreshed.current_build_id == live_build.id
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_edition(
     db_session: AsyncSession,
     edition_store: EditionStore,
@@ -887,6 +995,57 @@ async def test_soft_delete_edition_no_state_row_is_tombstone_noop(
 
 
 @pytest.mark.asyncio
+async def test_soft_delete_all_by_project_stamps_every_tombstone(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The bulk variant tombstones every live edition it deletes."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        editions = []
+        for index, slug in enumerate(("bulk-a", "bulk-b")):
+            edition = await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+            await state_store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=5100 + index,
+                ltd_slug=slug,
+                docverse_id=edition.id,
+            )
+            editions.append(edition)
+        deleted_ids = await edition_store.soft_delete_all_by_project(
+            org_id=org_id,
+            project_id=project_id,
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    assert set(deleted_ids) == {edition.id for edition in editions}
+
+    async with db_session.begin():
+        rows = await state_store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            docverse_ids=[edition.id for edition in editions],
+            include_tombstoned=True,
+        )
+        await db_session.commit()
+    assert len(rows) == 2
+    assert all(row.date_tombstoned is not None for row in rows)
+    assert {row.tombstone_reason for row in rows} == {"manual_delete"}
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_edition_records_reason_as_passed(
     db_session: AsyncSession,
     edition_store: EditionStore,
@@ -989,6 +1148,104 @@ async def test_soft_delete_edition_rollback_unwinds_both(
     assert state is not None
     assert state.date_tombstoned is None
     assert state.tombstone_reason is None
+
+
+@pytest.mark.asyncio
+async def test_list_live_slugs_by_current_build_names_holders(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only the editions actually pointing at the build are named.
+
+    The DELETE guard turns this list into the 409's message, so an
+    edition that merely has the build somewhere in its history — or
+    points at a different build entirely — must not appear in it.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        held = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        other = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main", content_hash="sha256:" + "c" * 64
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        for slug in ("holder-b", "holder-a", "elsewhere"):
+            edition = await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+            await edition_store.set_current_build(
+                edition_id=edition.id,
+                build_id=other.id if slug == "elsewhere" else held.id,
+            )
+        slugs = await edition_store.list_live_slugs_by_current_build(
+            build_id=held.id
+        )
+        await db_session.commit()
+
+    assert slugs == ["holder-a", "holder-b"]
+
+
+@pytest.mark.asyncio
+async def test_list_live_slugs_by_current_build_excludes_deleted(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A soft-deleted edition holding the build does not name it.
+
+    Nothing serves a deleted edition, so its pointer is not a reason to
+    keep the build's content alive — this is what lets the project
+    soft-delete cascade age a whole project's builds into purgatory.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="deleted-holder",
+                title="Deleted Holder",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="deleted-holder",
+            reason=TombstoneReason.manual_delete,
+        )
+        slugs = await edition_store.list_live_slugs_by_current_build(
+            build_id=build.id
+        )
+        await db_session.commit()
+
+    assert slugs == []
 
 
 @pytest.mark.asyncio
@@ -2264,3 +2521,118 @@ async def test_get_git_ref_tracking_edition_returns_non_default_on_main(
         await db_session.commit()
     assert found is not None
     assert found.slug == "stable"
+
+
+async def _wait_until_a_backend_blocks(
+    maker: async_sessionmaker[AsyncSession], *, timeout: float = 10.0
+) -> None:
+    """Block until some backend in this database waits on a lock.
+
+    The synchronisation point for the race below: it lets the deleting
+    transaction know the repointing one has actually reached its
+    ``FOR SHARE`` and is queued behind the row lock, rather than
+    guessing with a sleep. Each poll runs in its own short transaction
+    because a backend's ``pg_stat_activity`` snapshot is taken once per
+    transaction and would otherwise never change.
+
+    Test databases are per-xdist-worker (``docverse_gw0`` and friends)
+    and tests within a worker run serially, so the only backends this
+    can see are this test's own.
+    """
+    query = text(
+        "SELECT count(*) FROM pg_stat_activity"
+        " WHERE datname = current_database()"
+        " AND cardinality(pg_blocking_pids(pid)) > 0"
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with maker() as session:
+            blocked = (await session.execute(query)).scalar_one()
+        if blocked:
+            return
+        if loop.time() >= deadline:
+            msg = "no backend ever blocked on the build row lock"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_waits_for_an_in_flight_delete(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A repoint racing a DELETE is decided by it, not lost to it.
+
+    ``editions.current_build_id`` carries no foreign key, so two
+    unlocked checks under READ COMMITTED would each see what they
+    wanted — the DELETE seeing no edition serving the build, the
+    repoint seeing a live build — and both commit, leaving a live
+    edition on a soft-deleted build. The guard's ``FOR SHARE`` read
+    conflicts with the ``FOR UPDATE`` the DELETE takes first, so the
+    repoint waits and then answers on what the DELETE committed.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:4444" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="guard-race",
+                title="Guard Race",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+    build_id = build.id
+    edition_id = edition.id
+
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        build_locked = asyncio.Event()
+
+        async def delete_build() -> None:
+            async with maker() as session:
+                store = BuildStore(session=session, logger=logger)
+                async with session.begin():
+                    locked = await store.get_for_update(build_id=build_id)
+                    assert locked is not None
+                    build_locked.set()
+                    await _wait_until_a_backend_blocks(maker)
+                    assert await store.soft_delete(build_id=build_id) is True
+                    await session.commit()
+
+        async def repoint() -> Edition | None:
+            await build_locked.wait()
+            async with maker() as session:
+                store = EditionStore(session=session, logger=logger)
+                async with session.begin():
+                    updated = await store.set_current_build(
+                        edition_id=edition_id, build_id=build_id
+                    )
+                    await session.commit()
+                return updated
+
+        _, updated = await asyncio.gather(delete_build(), repoint())
+    finally:
+        await engine.dispose()
+
+    assert updated is None
+    refreshed = await edition_store.get_by_id(edition_id)
+    assert refreshed is not None
+    assert refreshed.current_build_id is None

@@ -33,6 +33,7 @@ from docverse_server.exceptions import (
 )
 from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
 from docverse_server.storage.ltd import LtdSourceAccessDeniedError
+from docverse_server.storage.objectstore import ObjectStoreError
 
 
 def _make_invalid_slug() -> InvalidSlugError:
@@ -99,6 +100,15 @@ def _make_ltd_source_access_denied() -> LtdSourceAccessDeniedError:
     )
 
 
+def _make_object_store_error() -> ObjectStoreError:
+    return ObjectStoreError(
+        bucket="docs",
+        prefix="orgs/rubin/projects/docs/builds/01ABCDEF/",
+        operation="DeleteObjects",
+        failures=["builds/01ABCDEF/index.html (AccessDenied)"],
+    )
+
+
 _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("InvalidJobStateError", _make_invalid_job_state),
     ("InvalidBuildStateError", _make_invalid_build_state),
@@ -111,6 +121,7 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ),
     ("CloudflareCachePurgeError", _make_cloudflare_cache_purge),
     ("LtdSourceAccessDeniedError", _make_ltd_source_access_denied),
+    ("ObjectStoreError", _make_object_store_error),
 ]
 
 

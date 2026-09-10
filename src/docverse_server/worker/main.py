@@ -68,6 +68,9 @@ from .functions import (
     project_github_resolve,
     publish_edition,
     publish_edition_reaper,
+    purgatory_cleanup,
+    purgatory_cleanup_dispatcher,
+    purgatory_cleanup_reaper,
 )
 from .queues import KEEPER_SYNC_QUEUE_NAME, MAINTENANCE_QUEUE_NAME
 
@@ -125,7 +128,7 @@ DB_POOL_HEADROOM = 5
 """Spare connections above the per-job budget, used as ``max_overflow``.
 
 Cron-driven work runs *alongside* the ``max_jobs`` budget rather than
-inside it: the tier polls, the five reaper backstops, and the
+inside it: the tier polls, the reaper backstops, and the
 queue-stats gauge all open sessions of their own. This surge allowance
 keeps them off the critical path of the concurrent jobs, and gives a
 job whose session and lock connections briefly overlap a third slot to
@@ -638,15 +641,18 @@ class MaintenanceWorkerSettings:
     periodic work rather than lifecycle evaluation alone; this class
     is the binding.
 
-    Both the hourly ``lifecycle_eval`` (dispatcher + per-org worker)
-    and the daily ``git_ref_audit`` (discovery + per-org worker) live
-    on this single pool: PRD #346 explicitly says the audit "shares
-    the same fan-out, per-org mutex, and reaper patterns as
-    lifecycle_eval and never competes with build processing or
-    keeper-sync for worker capacity", and the audit's daily cadence
-    is light enough that adding a fourth pool would be over-segmented.
+    Three dispatcher/per-org pairs live on this single pool: the
+    hourly ``lifecycle_eval``, the daily ``git_ref_audit``, and the
+    daily ``purgatory_cleanup`` sweep (PRD #596). PRD #346 explicitly
+    says the audit "shares the same fan-out, per-org mutex, and reaper
+    patterns as lifecycle_eval and never competes with build processing
+    or keeper-sync for worker capacity", and the same reasoning admits
+    the sweep: it is nightly, per-org, mutex-guarded, and its long
+    object-store reclamation runs are exactly the work that must not
+    contend with publishing. Their daily cadences are light enough that
+    a further pool would be over-segmented.
 
-    All four functions are wrapped with :func:`arq.func` so the
+    Every one of those functions is wrapped with :func:`arq.func` so the
     dedicated queue inherits a per-job ``timeout`` (sourced from
     ``Config.maintenance_job_timeout_seconds``) and a
     single-attempt policy. A failure must surface promptly so the
@@ -665,9 +671,14 @@ class MaintenanceWorkerSettings:
     ``publish_edition_reaper``, ``build_processing_reaper``, and
     ``dashboard_sync_reaper`` run here (PRD #367) so reaper sweeps
     never compete with build processing or user-triggered dashboard
-    rebuilds for worker capacity. The maintenance name reflects that
-    the pool is the shared home for this non-publishing periodic work,
-    no longer scoped to lifecycle evaluation alone.
+    rebuilds for worker capacity. ``purgatory_cleanup_reaper`` joins
+    them on the same run-less shim (PRD #596), backstopping a kind this
+    pool also runs: a ``purgatory_cleanup`` row left stuck holds that
+    organization's per-org mutex, so every following nightly tick skips
+    the org and its expired builds keep their object-store content. The
+    maintenance name reflects that the pool is the shared home for this
+    non-publishing periodic work, no longer scoped to lifecycle
+    evaluation alone.
 
     The opportunistic ``project_github_resolve`` job (PRD #346) also
     runs here: PRD #419 moves it off the default publishing pool because
@@ -722,11 +733,32 @@ class MaintenanceWorkerSettings:
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
+        # The daily ``purgatory_cleanup`` sweep (PRD #596), dispatcher
+        # and per-org body. Wrapped like the other dispatchers with the
+        # maintenance per-job ``timeout`` — the cap keeps one org's run
+        # well inside it, and the timeout is the first backstop if a
+        # store hangs — and with ``max_tries=1`` because the sweep
+        # deletes object-store content: a retry would re-run a partly
+        # finished reclamation, double-counting the tally and
+        # republishing the completion event for no gain. Recovery is
+        # the next nightly tick, which resumes from the oldest
+        # unstamped build.
+        func(
+            instrument_arq_task(purgatory_cleanup_dispatcher),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
+        func(
+            instrument_arq_task(purgatory_cleanup),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
         instrument_arq_task(lifecycle_reaper),
         instrument_arq_task(dashboard_build_reaper),
         instrument_arq_task(publish_edition_reaper),
         instrument_arq_task(build_processing_reaper),
         instrument_arq_task(dashboard_sync_reaper),
+        instrument_arq_task(purgatory_cleanup_reaper),
         # ``project_github_resolve`` is the opportunistic GitHub-id
         # resolve (PRD #346). PRD #419 moves it off the default
         # publishing pool onto this maintenance pool: its work is not
@@ -768,6 +800,23 @@ class MaintenanceWorkerSettings:
             instrument_arq_task(inventory_census),
             hour={config.inventory_census_cron_hour},
             minute={config.inventory_census_cron_minute},
+        ),
+        # Daily ``purgatory_cleanup`` dispatcher tick (PRD #596) at the
+        # config-driven UTC ``purgatory_cleanup_cron_hour`` /
+        # ``purgatory_cleanup_cron_minute`` (03:23 by default). The hour
+        # sits in the same quiet pre-dawn UTC window and deliberately
+        # ahead of the ``inventory_census`` tick, so the census reports
+        # a reap-pending footprint the sweep has already reclaimed
+        # rather than a day-old figure. The minute is staggered off
+        # every maintenance-pool reaper slot, off the census minute, and
+        # off the five-minute queue-stats cadence so the sweep's fan-out
+        # never co-fires with another cron on a horizontally scaled pool
+        # — the same contention-avoidance precedent as
+        # ``git_ref_audit_discovery`` at minute 17 and the census at 47.
+        cron(
+            instrument_arq_task(purgatory_cleanup_dispatcher),
+            hour={config.purgatory_cleanup_cron_hour},
+            minute={config.purgatory_cleanup_cron_minute},
         ),
         cron(
             instrument_arq_task(lifecycle_reaper),
@@ -827,6 +876,26 @@ class MaintenanceWorkerSettings:
         cron(
             instrument_arq_task(dashboard_sync_reaper),
             minute={24, 54},
+        ),
+        # ``purgatory_cleanup_reaper`` runs on the same 30-minute
+        # cadence as its run-less siblings, on the last free pair of
+        # offset minutes: ``{0, 30}`` is the lifecycle reaper's,
+        # ``{3, 18, 33, 48}`` the dashboard_build reaper's, and
+        # ``{6, 36}``, ``{12, 42}`` and ``{24, 54}`` belong to the
+        # publish_edition, build_processing and dashboard_sync reapers
+        # — so nothing on this pool queries ``queue_jobs`` at the same
+        # instant on a horizontally scaled deployment, the same
+        # precedent that puts ``git_ref_audit_discovery`` on minute 17.
+        # A wedged ``purgatory_cleanup`` row is invisible to operators,
+        # so the tighter dashboard_build cadence is not warranted; what
+        # it does hold hostage is the per-org mutex, and with it that
+        # organization's whole nightly sweep, which is why the backstop
+        # runs twice an hour rather than once a day alongside the
+        # dispatcher it covers. The 6-hour threshold gives a genuine
+        # multi-hundred-build reclamation room to finish.
+        cron(
+            instrument_arq_task(purgatory_cleanup_reaper),
+            minute={21, 51},
         ),
         # Generic arq-queue metrics (SQR-112): per-pool ``arq_queue_stats``
         # gauge for the maintenance queue. Queue-depth stats only touch

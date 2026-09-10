@@ -25,6 +25,7 @@ product.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from docverse_server.config import (
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
@@ -199,3 +200,61 @@ def test_other_reaper_thresholds_unchanged() -> None:
     assert config.publish_edition_reaper_threshold_seconds == 14400
     assert config.build_processing_reaper_threshold_seconds == 28800
     assert config.dashboard_sync_reaper_threshold_seconds == 21600
+
+
+def test_purgatory_cleanup_defaults() -> None:
+    """The sweep ships off, capped, and on its own cron slot.
+
+    ``purgatory_cleanup_enabled`` defaults false because the job deletes
+    object-store content permanently: it goes on per environment, after
+    the operator has looked at what the first tick would reclaim, rather
+    than the moment the image lands. The rest of the defaults are the
+    shape every maintenance job has — a per-job cap, a daily UTC slot
+    staggered off the other crons, and a reaper threshold matching its
+    siblings'.
+    """
+    config = Configuration()
+    assert config.purgatory_cleanup_enabled is False
+    assert config.purgatory_cleanup_max_builds_per_job == 500
+    assert config.purgatory_cleanup_cron_hour == 3
+    assert config.purgatory_cleanup_cron_minute == 23
+    assert config.purgatory_cleanup_reaper_threshold_seconds == 21600
+
+
+def test_purgatory_cleanup_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every knob is env-overridable under the ``DOCVERSE_`` prefix.
+
+    Phalanx sets all five from the chart's ``config.maintenance``
+    values, and roundtable-dev needs to drive the cron and the cap to
+    something a person can watch inside one sitting.
+    """
+    monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_ENABLED", "true")
+    monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_MAX_BUILDS_PER_JOB", "5")
+    monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_CRON_HOUR", "11")
+    monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_CRON_MINUTE", "7")
+    monkeypatch.setenv(
+        "DOCVERSE_PURGATORY_CLEANUP_REAPER_THRESHOLD_SECONDS", "60"
+    )
+    config = Configuration()
+    assert config.purgatory_cleanup_enabled is True
+    assert config.purgatory_cleanup_max_builds_per_job == 5
+    assert config.purgatory_cleanup_cron_hour == 11
+    assert config.purgatory_cleanup_cron_minute == 7
+    assert config.purgatory_cleanup_reaper_threshold_seconds == 60
+
+
+def test_purgatory_cleanup_cap_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap of zero would leave the job queued and doing nothing.
+
+    An operator reaching for "pause the sweep" wants the feature flag;
+    a cap of 0 would instead run a job per org every night that plans
+    an empty work list and completes, which looks like success while
+    the backlog grows.
+    """
+    monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_MAX_BUILDS_PER_JOB", "0")
+    with pytest.raises(ValidationError):
+        Configuration()

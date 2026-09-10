@@ -2696,7 +2696,8 @@ async def test_build_processing_soft_deleted_row_mid_upload_closes_out(
     assert publisher.published[0].stale_skipped is True
 
     # The tarball is the deleted build's only route back, so it is left
-    # where it is for the purgatory purge (DM-54691) to reclaim.
+    # where it is for the nightly purgatory_cleanup sweep to reclaim,
+    # once the org's purgatory_retention has elapsed.
     assert build.staging_key in mock_store.objects
 
     async for session in db_session_dependency():

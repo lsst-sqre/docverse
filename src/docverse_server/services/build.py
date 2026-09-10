@@ -10,28 +10,15 @@ from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import QueueJob
-from docverse_server.exceptions import NotFoundError
+from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.services.queue_dispatch import QueueDispatcher
-from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.build_store import UNFINISHED_STATUSES, BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import BuildDateCreatedCursor
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
-
-# The statuses a build can still leave under its own power: it is
-# waiting for a worker, or a worker has it. Everything else is terminal
-# and keeps the status it earned, which is why the retirement helpers
-# below (:meth:`BuildService.cancel_if_unfinished` and its siblings)
-# restrict their transition to these before writing. Only these would
-# otherwise leave a retired build claiming to be waiting for, or held
-# by, a worker.
-#
-# Derived from :class:`~docverse.models.BuildStatus`, which owns the one
-# definition of the partition, rather than listed again here.
-_UNFINISHED_STATUSES: frozenset[BuildStatus] = frozenset(
-    status for status in BuildStatus if status.is_unfinished
-)
 
 
 class BuildService:
@@ -43,6 +30,7 @@ class BuildService:
         store: BuildStore,
         org_store: OrganizationStore,
         project_store: ProjectStore,
+        edition_store: EditionStore,
         dispatcher: QueueDispatcher,
         queue_job_store: QueueJobStore,
         logger: structlog.stdlib.BoundLogger,
@@ -50,6 +38,7 @@ class BuildService:
         self._store = store
         self._org_store = org_store
         self._project_store = project_store
+        self._edition_store = edition_store
         self._dispatcher = dispatcher
         self._queue_job_store = queue_job_store
         self._logger = logger
@@ -361,7 +350,7 @@ class BuildService:
         build = await self._store.transition_status(
             build_id=build_id,
             new_status=new_status,
-            only_from=_UNFINISHED_STATUSES,
+            only_from=UNFINISHED_STATUSES,
             org_slug=org_slug,
             project_slug=project_slug,
         )
@@ -555,6 +544,24 @@ class BuildService:
         identifiers and then hands off to :meth:`soft_delete_by_id`,
         which owns the retire-then-delete pairing.
 
+        A build a live edition still serves is refused rather than
+        deleted: the request would otherwise leave that edition
+        resolving to content the ``purgatory_cleanup`` sweep is
+        entitled to reclaim once the organization's retention elapses,
+        and nothing would ever re-point the edition. This is the API
+        saying out loud what the lifecycle reaper already enforces —
+        its ``build_history_orphan`` rule protects exactly the builds
+        editions point at. Roll the edition back to another build
+        first; then the DELETE succeeds.
+
+        The check runs before :meth:`soft_delete_by_id`, which cancels
+        an unfinished build on its way to stamping ``date_deleted``, so
+        a refused request leaves the row exactly as it found it. It
+        also runs *under the build's row lock*, taken here rather than
+        left to :meth:`soft_delete_by_id`, so a rollback repointing an
+        edition onto this build cannot land in the window between the
+        check and the delete; see the comment on the lock.
+
         Parameters
         ----------
         build_id
@@ -562,11 +569,37 @@ class BuildService:
 
         Raises
         ------
+        ConflictError
+            If any live edition holds the build as its current build.
         NotFoundError
             If the build is not found.
         """
         project = await self._resolve_project(org_slug, project_slug)
         build = await self._resolve_build(project.id, build_id)
+        # Lock the build before asking what still points at it. The
+        # 409 check and the delete are otherwise two unlocked reads
+        # that a concurrent rollback can slip between: ``editions
+        # .current_build_id`` carries no foreign key, so under READ
+        # COMMITTED both sides could pass their own check and commit,
+        # leaving a live edition serving a soft-deleted build — exactly
+        # what this refusal exists to prevent.
+        # ``EditionStore.set_current_build`` takes ``FOR SHARE`` on the
+        # same row, so one of the two blocks and then decides on what
+        # the other committed.
+        locked = await self._store.get_for_update(build_id=build.id)
+        if locked is None or locked.date_deleted is not None:
+            msg = f"Build {build_id!r} not found"
+            raise NotFoundError(msg)
+        serving = await self._edition_store.list_live_slugs_by_current_build(
+            build_id=build.id
+        )
+        if serving:
+            msg = (
+                f"Build {build_id!r} is the current build of edition(s) "
+                f"{', '.join(serving)}; roll them back to another build "
+                f"before deleting it"
+            )
+            raise ConflictError(msg)
         if not await self.soft_delete_by_id(
             build_id=build.id,
             org_slug=org_slug,
@@ -574,3 +607,81 @@ class BuildService:
         ):
             msg = f"Build {build_id!r} not found"
             raise NotFoundError(msg)
+
+    async def restore(
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        build_id: str,
+    ) -> Build:
+        """Bring a soft-deleted build back, unless its content is gone.
+
+        The other half of the "restorable until purged" promise that
+        ``date_deleted`` makes and the ``purgatory_cleanup`` sweep
+        eventually revokes. Until the sweep stamps ``date_purged`` the
+        build's tree is still on the object store, so clearing
+        ``date_deleted`` is all it takes to make the build a live
+        rollback target again; once the stamp is there the bytes are
+        gone and no row edit can bring them back.
+
+        Status is deliberately untouched. A build deleted while
+        ``pending`` or ``processing`` was cancelled on its way out by
+        :meth:`soft_delete_by_id`, and a restore says nothing about the
+        staged tarball or about a worker picking it up; a ``cancelled``
+        build therefore comes back ``cancelled``. What the operator gets
+        back is the row and its content, not a re-run.
+
+        The lookup is :meth:`BuildStore.get_deleted_by_public_id` rather
+        than the ordinary one, which hides deleted rows: it is what
+        makes a live build a 404 here instead of a silent no-op that
+        looks like it restored something. A purged build is *found* by
+        that lookup — purging does not clear ``date_deleted`` — which is
+        what lets this tell "no such deleted build" from "its content
+        was reclaimed" rather than collapsing both into a miss.
+
+        Parameters
+        ----------
+        build_id
+            Base32-encoded public build ID.
+
+        Returns
+        -------
+        Build
+            The restored build, with ``date_deleted`` cleared.
+
+        Raises
+        ------
+        ConflictError
+            If the build's content has already been reclaimed.
+        NotFoundError
+            If there is no soft-deleted build with that id.
+        """
+        project = await self._resolve_project(org_slug, project_slug)
+        public_id = self._validate_build_id(build_id)
+        deleted = await self._store.get_deleted_by_public_id(
+            project_id=project.id, public_id=public_id
+        )
+        if deleted is None:
+            msg = f"Build {build_id!r} not found"
+            raise NotFoundError(msg)
+        # ``restore`` is the single authority on whether the content is
+        # still there: it re-reads ``date_purged`` under the row lock,
+        # so a sweep committing between the lookup above and the write
+        # is refused here rather than silently reviving a build whose
+        # objects have just been deleted.
+        restored = await self._store.restore(build_id=deleted.id)
+        if restored is None:
+            msg = (
+                f"Build {build_id!r} has been purged; its content was "
+                f"permanently reclaimed and cannot be restored"
+            )
+            raise ConflictError(msg)
+        self._logger.info(
+            "Restored build",
+            build=build_id,
+            org=org_slug,
+            project=project_slug,
+            status=restored.status.value,
+        )
+        return restored

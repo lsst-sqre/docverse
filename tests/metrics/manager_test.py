@@ -29,6 +29,8 @@ from docverse_server.metrics import (
     EditionPublishedEvent,
     EditionPublishTrigger,
     MetricsEditionKind,
+    PurgatoryCleanupCompletedEvent,
+    ResourceInventoryEvent,
     build_event_manager,
 )
 
@@ -52,6 +54,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.keeper_sync_run_completed, MockEventPublisher)
     assert isinstance(events.lifecycle_action, MockEventPublisher)
     assert isinstance(events.resource_inventory, MockEventPublisher)
+    assert isinstance(events.purgatory_cleanup_completed, MockEventPublisher)
 
     await manager.aclose()
 
@@ -170,3 +173,103 @@ async def test_publish_failure_is_swallowed_when_not_raising() -> None:
         await manager.publish(payload, failing_publisher, None)
 
     assert any(record.get("log_level") == "error" for record in captured)
+
+
+@pytest.mark.asyncio
+async def test_resource_inventory_carries_purgatory_gauges() -> None:
+    """The census gauge counts reap-pending builds beside the live ones.
+
+    ``purgatory_build_count``/``purgatory_bytes`` are the bytes a purge
+    has yet to reclaim, so they are deliberately disjoint from
+    ``build_count``/``total_build_bytes`` (which count only live builds)
+    rather than a subset of them. Both are plain ``int`` gauges on the
+    org- and the project-scoped row alike.
+    """
+    fields = ResourceInventoryEvent.model_fields
+    assert fields["purgatory_build_count"].annotation is int
+    assert fields["purgatory_bytes"].annotation is int
+
+    config = Configuration()
+    manager, events = await build_event_manager(config)
+    publisher = events.resource_inventory
+    assert isinstance(publisher, MockEventPublisher)
+
+    await publisher.publish(
+        ResourceInventoryEvent(
+            organization="org",
+            project=None,
+            project_count=1,
+            edition_count=2,
+            build_count=3,
+            total_build_bytes=300,
+            purgatory_build_count=1,
+            purgatory_bytes=99,
+        )
+    )
+
+    publisher.published.assert_published_all(
+        [
+            {
+                "organization": "org",
+                "project": None,
+                "project_count": 1,
+                "edition_count": 2,
+                "build_count": 3,
+                "total_build_bytes": 300,
+                "purgatory_build_count": 1,
+                "purgatory_bytes": 99,
+            }
+        ]
+    )
+
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_purgatory_cleanup_completed_is_the_record_of_a_sweep() -> None:
+    """One org-scoped event carries everything a sweep tick did.
+
+    The ``purgatory_cleanup`` job writes no run table, so this event —
+    published once after the tick's final commit — is the only durable,
+    queryable record that the sweep ran and what it reclaimed. It is
+    org-scoped because retention is an org setting and one tick spans
+    every project in the org, so ``project`` is always ``None``.
+    ``success`` reports whether every build the tick attempted came
+    through, which is the same question the queue row answers with
+    ``completed`` vs. ``completed_with_errors``.
+    """
+    config = Configuration()
+    manager, events = await build_event_manager(config)
+    publisher = events.purgatory_cleanup_completed
+    assert isinstance(publisher, MockEventPublisher)
+
+    await publisher.publish(
+        PurgatoryCleanupCompletedEvent(
+            organization="org",
+            project=None,
+            success=False,
+            builds_purged=2,
+            builds_failed=1,
+            builds_skipped_referenced=1,
+            objects_deleted=17,
+            bytes_reclaimed=4096,
+            capped=True,
+            elapsed=timedelta(seconds=42),
+        )
+    )
+
+    published = publisher.published
+    assert len(published) == 1
+    event = published[0]
+    assert event.organization == "org"
+    assert event.project is None
+    assert event.success is False
+    assert event.builds_purged == 2
+    assert event.builds_failed == 1
+    assert event.builds_skipped_referenced == 1
+    assert event.objects_deleted == 17
+    assert event.bytes_reclaimed == 4096
+    assert event.capped is True
+    assert event.elapsed == timedelta(seconds=42)
+
+    await manager.aclose()

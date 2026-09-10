@@ -384,10 +384,28 @@ class EditionStore:
     ) -> Edition | None:
         """Set the current build for an edition.
 
-        Compares the incoming build's ``date_created`` against the
-        current build's ``date_created``.  If the edition already points
-        to a build that is equally new or newer, the update is skipped
-        and ``None`` is returned (stale-build guard per SQR-112).
+        Two guards can refuse the repoint, and both report the refusal
+        the same way — by returning ``None``, which every caller already
+        treats as "this build does not become current".
+
+        The **deleted-build guard** refuses a target whose
+        ``date_deleted`` is set (or that no longer exists at all). A
+        DELETE landing between a build's upload and the tracking write
+        would otherwise leave the edition serving content the
+        ``purgatory_cleanup`` sweep is entitled to reclaim once the
+        organization's retention elapses (PRD #596). It reads the
+        target under a shared row lock so a DELETE running concurrently
+        is decided one way or the other rather than both sides passing
+        an unlocked check; see the comment on the query. It is
+        deliberately checked ahead of, and independently of,
+        ``skip_date_guard``: that flag waives an *ordering* comparison
+        the version-mode callers make for themselves, not the question
+        of whether the build still exists.
+
+        The **stale-build guard** then compares the incoming build's
+        ``date_created`` against the current build's. If the edition
+        already points to a build that is equally new or newer, the
+        update is skipped (SQR-112).
 
         Parameters
         ----------
@@ -404,8 +422,33 @@ class EditionStore:
         -------
         Edition or None
             The updated edition, or ``None`` if the update was skipped
-            because the edition already points to a newer build.
+            because the target build is soft-deleted or the edition
+            already points to a newer build.
         """
+        # Deleted-build guard: a *locking* read of the target, so the
+        # answer cannot go stale between here and the write. ``FOR
+        # SHARE`` conflicts with the ``FOR UPDATE`` that
+        # :meth:`docverse_server.services.build.BuildService.soft_delete`
+        # takes before it asks what points at the build, so a rollback
+        # racing a DELETE blocks and then re-reads ``date_deleted`` as
+        # the DELETE left it rather than both passing their checks
+        # under READ COMMITTED and committing a live edition onto a
+        # soft-deleted build. Shared rather than exclusive because this
+        # only needs the row to hold still, and concurrent repoints of
+        # different editions onto the same build must not serialize.
+        # Lock ordering matches every other build/edition writer —
+        # build row first, edition row second — so this cannot deadlock
+        # against the DELETE, which never locks editions at all.
+        target = (
+            await self._session.execute(
+                select(SqlBuild.date_deleted)
+                .where(SqlBuild.id == build_id)
+                .with_for_update(read=True)
+            )
+        ).one_or_none()
+        if target is None or target.date_deleted is not None:
+            return None
+
         # Fetch edition row
         stmt = (
             select(
@@ -440,6 +483,41 @@ class EditionStore:
         result2 = await self._session.execute(stmt2)
         edition_row, build_public_id, build_git_ref = result2.one()
         return self._validate(edition_row, build_public_id, build_git_ref)
+
+    async def list_live_slugs_by_current_build(
+        self, *, build_id: int
+    ) -> list[str]:
+        """List the slugs of live editions currently serving a build.
+
+        The "is anything still pointing at this build?" question, asked
+        by every caller that is about to take a build's content away:
+        :meth:`docverse_server.services.build.BuildService.soft_delete`
+        turns a non-empty answer into the DELETE's 409, and the
+        ``purgatory_cleanup`` sweep skips a build whose answer is
+        non-empty rather than reclaiming objects a served edition still
+        resolves to.
+
+        Only ``date_deleted IS NULL`` editions count. A soft-deleted
+        edition is served by nothing, so its stale pointer must not
+        pin a build's content forever — which is what lets the project
+        soft-delete cascade age a whole project's builds into
+        purgatory. ``edition_build_history`` is deliberately not
+        consulted: history records where an edition *has been*, and
+        rolling back to a build is what makes it current again, so a
+        history row is not a live reference.
+
+        Returned in slug order so the 409 message and the sweep's
+        warning read the same way for the same build.
+        """
+        result = await self._session.execute(
+            select(SqlEdition.slug)
+            .where(
+                SqlEdition.current_build_id == build_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        return list(result.scalars().all())
 
     async def update_tracking(
         self,
@@ -564,6 +642,70 @@ class EditionStore:
         )
         await self._session.flush()
         return True
+
+    async def soft_delete_all_by_project(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        reason: TombstoneReason,
+    ) -> list[int]:
+        """Soft-delete every live edition of a project, tombstoning each.
+
+        The bulk arm of :meth:`soft_delete`, called by
+        :meth:`docverse_server.storage.project_store.ProjectStore.soft_delete`
+        so a deleted project's editions stop being live references to
+        its builds — which is what lets the ``purgatory_cleanup`` sweep
+        age those builds out instead of skipping them forever (see
+        :meth:`list_live_slugs_by_current_build`).
+
+        Going through here rather than a bare ``UPDATE editions`` in the
+        project store is what keeps the chokepoint honest: the
+        ``keeper_sync_state`` tombstone fields are stamped for the
+        cascade exactly as they are for a per-edition delete, with the
+        caller's :class:`~docverse_server.storage.keeper_sync.TombstoneReason`,
+        so a re-import cannot resurrect an edition whose project was
+        deleted. Both statements run in the caller's transaction, so
+        ``func.now()`` is the same instant on every row it touches and
+        on the project row the caller is stamping.
+
+        An edition already soft-deleted by hand is excluded by the
+        ``date_deleted IS NULL`` predicate and keeps its earlier
+        timestamp and its own tombstone reason.
+
+        Returns
+        -------
+        list of int
+            The internal ids of the editions this call soft-deleted, in
+            no particular order. Empty when the project had no live
+            editions, in which case no tombstone statement is issued.
+        """
+        result = await self._session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .values(date_deleted=func.now())
+            .returning(SqlEdition.id)
+        )
+        edition_ids = [row[0] for row in result.all()]
+        if not edition_ids:
+            return []
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id.in_(edition_ids),
+            )
+            .values(
+                date_tombstoned=func.now(),
+                tombstone_reason=reason.value,
+                tombstone_note=None,
+            )
+        )
+        return edition_ids
 
     async def list_draft_editions_by_git_ref(
         self, *, project_id: int, git_ref: str

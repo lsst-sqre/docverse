@@ -224,7 +224,13 @@ class EditionService:
             skip_date_guard=True,
         )
         if updated_edition is None:
-            msg = "set_current_build returned None with skip_date_guard=True"
+            # ``skip_date_guard`` waives the ordering guard, so the only
+            # way back is the deleted-build guard: the build this read
+            # as live was soft-deleted between that read and this write.
+            msg = (
+                f"Build {build_public_id!r} was deleted while repointing "
+                f"edition {edition.slug!r}"
+            )
             raise RuntimeError(msg)
 
         new_history_entry = await self._history_store.record(
@@ -382,7 +388,13 @@ class EditionService:
             skip_date_guard=True,
         )
         if updated_edition is None:
-            msg = "set_current_build returned None with skip_date_guard=True"
+            # ``skip_date_guard`` waives the ordering guard, so the only
+            # way back is the deleted-build guard: the build this read
+            # as live was soft-deleted between that read and this write.
+            msg = (
+                f"Build {build_public_id!r} was deleted while repointing "
+                f"edition {edition.slug!r}"
+            )
             raise RuntimeError(msg)
 
         new_history_entry = await self._history_store.record(

@@ -332,6 +332,18 @@ class Build(BaseModel):
         description="Timestamp when processing completed or failed.",
     )
 
+    date_purged: datetime | None = Field(
+        default=None,
+        description=(
+            "Timestamp when the build's object-store content was "
+            "permanently reclaimed by the purgatory sweep. Null while the "
+            "content is still there, including for every build that has "
+            "never been deleted, which is also what makes a soft-deleted "
+            "build restorable. Once set, the row is a tombstone: the "
+            "build's files are gone and cannot be brought back."
+        ),
+    )
+
 
 class BuildUpdate(BaseModel):
     """Request model for updating a build (PATCH).

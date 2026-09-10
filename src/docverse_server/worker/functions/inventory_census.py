@@ -5,10 +5,13 @@ firing takes one read-only snapshot of every org's and non-deleted
 project's active resource counts (via :class:`InventoryCensusService`,
 which runs grouped aggregates with no advisory locks) and publishes one
 org-scoped ``resource_inventory`` event per org plus one project-scoped
-event per project. The counts are self-contained absolute gauges queried
-downstream with ``last()``; the publish is best-effort — production runs
-``raise_on_error=False`` so a metrics-backend outage can never fail the
-job, and there is no defensive try/except at the call site.
+event per project. Each row also carries the reap-pending footprint: the
+builds that are soft-deleted but whose storage the ``purgatory_cleanup``
+sweep has not reclaimed yet. The counts are self-contained absolute
+gauges queried downstream with ``last()``; the publish is best-effort —
+production runs ``raise_on_error=False`` so a metrics-backend outage can
+never fail the job, and there is no defensive try/except at the call
+site.
 """
 
 from __future__ import annotations
@@ -66,6 +69,8 @@ async def _publish_resource_inventory(
                 edition_count=org.edition_count,
                 build_count=org.build_count,
                 total_build_bytes=org.total_build_bytes,
+                purgatory_build_count=org.purgatory_build_count,
+                purgatory_bytes=org.purgatory_bytes,
             )
         )
     for project in census.projects:
@@ -77,5 +82,7 @@ async def _publish_resource_inventory(
                 edition_count=project.edition_count,
                 build_count=project.build_count,
                 total_build_bytes=project.total_build_bytes,
+                purgatory_build_count=project.purgatory_build_count,
+                purgatory_bytes=project.purgatory_bytes,
             )
         )

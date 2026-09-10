@@ -18,6 +18,8 @@ from docverse.models import ProjectCreate, ProjectUpdate
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.project import Project
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse_server.storage.pagination import ProjectSearchCursor
 
@@ -35,6 +37,14 @@ class ProjectStore:
     ) -> None:
         self._session = session
         self._logger = logger
+        # Owned rather than injected so every existing construction site
+        # — the factory, the workers, the tests — keeps working while
+        # :meth:`soft_delete` still cascades through the edition and
+        # build chokepoints instead of writing their tables itself. Both
+        # share this store's session, so the cascade stays one
+        # transaction; neither imports this module, so there is no cycle.
+        self._edition_store = EditionStore(session=session, logger=logger)
+        self._build_store = BuildStore(session=session, logger=logger)
 
     async def create(
         self,
@@ -114,6 +124,43 @@ class ProjectStore:
             )
         )
         return [Project.model_validate(row) for row in result.scalars().all()]
+
+    async def list_slugs_by_ids(
+        self, project_ids: list[int]
+    ) -> dict[int, str]:
+        """Map project ids to slugs, deleted projects included.
+
+        The labelling counterpart to :meth:`list_by_ids`. Callers that
+        act on a project want the live row and nothing else; callers
+        that only need to *name* one — the ``purgatory_cleanup`` sweep
+        tagging each reap with the build's project slug — need the name
+        whether or not the project still exists. The project soft-delete
+        cascade is what carries a build into purgatory in the first
+        place, so filtering deleted projects out here would blank the
+        label on the sweep's most common reap.
+
+        Passing an empty list returns ``{}`` without hitting the
+        database, which is the ordinary case: most ticks purge nothing.
+
+        Parameters
+        ----------
+        project_ids
+            Internal ids to resolve. Ids with no row are simply absent
+            from the result rather than raising.
+
+        Returns
+        -------
+        dict
+            Slug by project id, for every id that matched a row.
+        """
+        if not project_ids:
+            return {}
+        result = await self._session.execute(
+            select(SqlProject.id, SqlProject.slug).where(
+                SqlProject.id.in_(project_ids)
+            )
+        )
+        return {row.id: row.slug for row in result}
 
     async def list_org_ids_with_lifecycle_rules(self) -> set[int]:
         """Return every ``org_id`` that owns a project with lifecycle rules.
@@ -630,7 +677,7 @@ class ProjectStore:
     async def soft_delete(
         self, *, org_id: int, slug: str, reason: TombstoneReason
     ) -> bool:
-        """Soft-delete a project and stamp the keeper-sync tombstone.
+        """Soft-delete a project, cascading to its editions and builds.
 
         The physical chokepoint for centralized project soft-delete
         (PRD #332): in the same flush that stamps ``date_deleted``,
@@ -640,6 +687,29 @@ class ProjectStore:
         The tombstone write is a no-op when no state row exists for
         this project (e.g. a manually-created project never imported
         from LTD).
+
+        The project's live editions and builds are stamped in the same
+        transaction, each through its own store's bulk chokepoint
+        (:meth:`~docverse_server.storage.edition_store.EditionStore.soft_delete_all_by_project`
+        and
+        :meth:`~docverse_server.storage.build_store.BuildStore.soft_delete_all_by_project`),
+        so the editions carry the same tombstone reason a per-edition
+        delete would write and an unfinished build is cancelled on its
+        way out. ``func.now()`` is transaction-stable in PostgreSQL, so
+        all three tables land on one timestamp — which is what the
+        keeper-sync tombstone revive keys on to tell a cascade sibling
+        from a row an operator deleted on its own earlier.
+
+        Without the cascade a deleted project's builds would sit in the
+        object store forever: the ``purgatory_cleanup`` sweep skips a
+        build any live edition still points at, and the project's own
+        editions stayed live. Rows already soft-deleted keep their
+        earlier timestamps.
+
+        The handler's post-commit CDN unpublish is unaffected: it
+        iterates the edition slugs
+        :meth:`~docverse_server.services.project.ProjectService.soft_delete`
+        captured before this call.
 
         Returns
         -------
@@ -670,5 +740,18 @@ class ProjectStore:
                 tombstone_note=None,
             )
         )
+        edition_ids = await self._edition_store.soft_delete_all_by_project(
+            org_id=org_id, project_id=row.id, reason=reason
+        )
+        build_ids = await self._build_store.soft_delete_all_by_project(
+            project_id=row.id
+        )
         await self._session.flush()
+        self._logger.info(
+            "Cascaded project soft-delete to its editions and builds",
+            project_id=row.id,
+            org_id=org_id,
+            editions_deleted=len(edition_ids),
+            builds_deleted=len(build_ids),
+        )
         return True

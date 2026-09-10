@@ -372,3 +372,55 @@ async def test_http_error() -> None:
                 )
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_restore_build() -> None:
+    """POST to the restore sub-resource returns the revived build.
+
+    The restored build keeps whatever status the delete left it with —
+    the server does not re-run it — so the round-trip has to carry the
+    status through rather than assume the build is live again.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.post(
+            f"/orgs/myorg/projects/myproj/builds/{BUILD_ID}/restore"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=_build_response(
+                    status="cancelled",
+                    upload_url=None,
+                    date_purged=None,
+                ),
+            )
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            build = await client.restore_build("myorg", "myproj", BUILD_ID)
+
+        assert route.called
+        assert route.calls[0].request.headers["Authorization"] == (
+            f"Bearer {TOKEN}"
+        )
+        assert build.id == BUILD_ID
+        assert build.status == BuildStatus.cancelled
+        assert build.date_purged is None
+
+
+@pytest.mark.asyncio
+async def test_restore_build_raises_on_purged_build() -> None:
+    """A 409 becomes a client error rather than a silent miss.
+
+    The server answers 409 when the build's content has already been
+    reclaimed. Swallowing that would tell an operator their restore
+    worked when the files are gone for good.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        router.post(
+            f"/orgs/myorg/projects/myproj/builds/{BUILD_ID}/restore"
+        ).mock(return_value=httpx.Response(409, text="already purged"))
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            with pytest.raises(DocverseClientError) as excinfo:
+                await client.restore_build("myorg", "myproj", BUILD_ID)
+
+    assert excinfo.value.status_code == 409

@@ -17,21 +17,31 @@ from contextlib import suppress
 import pytest
 import structlog
 from safir.arq import MockArqQueue
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
     BuildStatus,
+    EditionCreate,
+    EditionKind,
     OrganizationCreate,
     ProjectCreate,
+    TrackingMode,
 )
 from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
-from docverse_server.exceptions import InvalidBuildStateError
+from docverse_server.exceptions import (
+    ConflictError,
+    InvalidBuildStateError,
+    NotFoundError,
+)
 from docverse_server.factory import Factory
 from docverse_server.services.build import BuildService
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.rowlocks import (
@@ -647,3 +657,164 @@ async def test_soft_delete_by_id_reports_a_row_it_did_not_delete(
         assert await service.soft_delete_by_id(build_id=build.id) is True
         assert await service.soft_delete_by_id(build_id=build.id) is False
         await db_session.commit()
+
+
+async def _point_edition_at(
+    db_session: AsyncSession,
+    *,
+    build: Build,
+    slug: str,
+) -> int:
+    """Create an edition in ``bs-proj`` serving ``build``."""
+    logger = _logger()
+    edition_store = EditionStore(session=db_session, logger=logger)
+    edition = await edition_store.create(
+        project_id=build.project_id,
+        data=EditionCreate(
+            slug=slug,
+            title=slug,
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+        ),
+    )
+    await edition_store.set_current_build(
+        edition_id=edition.id, build_id=build.id
+    )
+    return edition.id
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_refuses_a_build_a_live_edition_serves(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Deleting the build an edition serves is refused, not obeyed.
+
+    Nothing would have re-pointed the edition, so the DELETE used to
+    leave a live edition resolving to content the purgatory sweep is
+    entitled to reclaim. The message names every holder so the operator
+    knows what to roll back before retrying.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.completed)
+        await _point_edition_at(db_session, build=build, slug="serving-b")
+        await _point_edition_at(db_session, build=build, slug="serving-a")
+        service = _build_service(db_session)
+        with pytest.raises(ConflictError) as excinfo:
+            await service.soft_delete(
+                org_slug="bs-org",
+                project_slug="bs-proj",
+                build_id=serialize_base32_id(build.public_id),
+            )
+
+    assert "serving-a" in str(excinfo.value)
+    assert "serving-b" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_leaves_the_refused_build_live(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The refusal happens before anything is written.
+
+    ``soft_delete_by_id`` cancels on its way to stamping
+    ``date_deleted``, so a guard that ran after it would leave a
+    ``completed`` build cancelled by a request that returned 409.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.pending)
+        await _point_edition_at(db_session, build=build, slug="serving")
+        service = _build_service(db_session)
+        with pytest.raises(ConflictError):
+            await service.soft_delete(
+                org_slug="bs-org",
+                project_slug="bs-proj",
+                build_id=serialize_base32_id(build.public_id),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        store = BuildStore(session=db_session, logger=_logger())
+        row = await store.get_by_id(build.id)
+        assert row is not None
+        assert row.status == BuildStatus.pending
+        assert row.date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_restore_revives_a_soft_deleted_build(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A deleted, unpurged build comes back live with its status intact.
+
+    The status is the point of the assertion: ``soft_delete_by_id``
+    cancelled this build on its way out, and restoring the row must not
+    pretend a worker is going to pick it up again.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.processing)
+        service = _build_service(db_session)
+        assert await service.soft_delete_by_id(build_id=build.id) is True
+        restored = await service.restore(
+            org_slug="bs-org",
+            project_slug="bs-proj",
+            build_id=serialize_base32_id(build.public_id),
+        )
+        await db_session.commit()
+
+    assert restored.date_deleted is None
+    assert restored.status == BuildStatus.cancelled
+
+
+@pytest.mark.asyncio
+async def test_restore_refuses_a_purged_build(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A purged build is a tombstone: the answer is conflict, not 404.
+
+    Telling the operator the build does not exist would be a lie about a
+    row they can still read, and would invite them to keep retrying. The
+    409 says the content is gone, which is a different and final answer.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.completed)
+        service = _build_service(db_session)
+        await service.soft_delete_by_id(build_id=build.id)
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == build.id)
+            .values(date_purged=func.now())
+        )
+        with pytest.raises(ConflictError) as excinfo:
+            await service.restore(
+                org_slug="bs-org",
+                project_slug="bs-proj",
+                build_id=serialize_base32_id(build.public_id),
+            )
+
+    assert "purged" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_restore_refuses_a_build_that_was_never_deleted(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A live build has nothing to restore, so it is a miss.
+
+    Restore addresses only the rows ordinary reads hide. Answering 200
+    here would make the endpoint a no-op that looks like it did
+    something, and would hide a wrong build id from the caller.
+    """
+    async with db_session.begin():
+        build = await _seed_build(db_session, status=BuildStatus.completed)
+        service = _build_service(db_session)
+        with pytest.raises(NotFoundError):
+            await service.restore(
+                org_slug="bs-org",
+                project_slug="bs-proj",
+                build_id=serialize_base32_id(build.public_id),
+            )

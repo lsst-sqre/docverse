@@ -1,0 +1,3 @@
+### Bug fixes
+
+- Deleting a project now soft-deletes its editions and builds along with it, in the same transaction and with the same `date_deleted` timestamp. Editions go through the `keeper_sync_state` tombstone chokepoint, so they carry the project's tombstone reason, and a build still `pending` or `processing` is cancelled on its way out, exactly as deleting that build on its own would do. Previously a deleted project left its editions live, and a live edition pointing at a build is what stops the purgatory sweep reclaiming that build's objects — so a deleted project's storage could never be reclaimed. Editions and builds deleted before the project keep their own earlier timestamps.

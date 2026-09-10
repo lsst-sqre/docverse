@@ -51,6 +51,7 @@ async def _make_build(
     git_ref: str,
     total_size_bytes: int,
     deleted: bool = False,
+    purged: bool = False,
 ) -> None:
     build_store = BuildStore(session=db_session, logger=_logger())
     build = await build_store.create(
@@ -64,6 +65,8 @@ async def _make_build(
     row.total_size_bytes = total_size_bytes
     if deleted:
         row.date_deleted = func.now()
+    if purged:
+        row.date_purged = func.now()
     await db_session.flush()
 
 
@@ -130,7 +133,9 @@ async def test_inventory_census_publishes_org_and_project_rows(
         assert dead_edition_row is not None
         dead_edition_row.date_deleted = func.now()
 
-        # kept: 2 active builds (10 + 20) + 1 soft-deleted build (99).
+        # kept: 2 active builds (10 + 20) + 1 soft-deleted build (99),
+        # which the sweep has yet to reclaim, + 1 already-purged build
+        # (7), whose bytes are gone from the bucket already.
         await _make_build(
             db_session,
             project_id=kept.id,
@@ -152,6 +157,15 @@ async def test_inventory_census_publishes_org_and_project_rows(
             git_ref="c",
             total_size_bytes=99,
             deleted=True,
+        )
+        await _make_build(
+            db_session,
+            project_id=kept.id,
+            project_slug=kept.slug,
+            git_ref="d",
+            total_size_bytes=7,
+            deleted=True,
+            purged=True,
         )
 
         # removed is soft-deleted but carries an active edition + build,
@@ -195,6 +209,8 @@ async def test_inventory_census_publishes_org_and_project_rows(
     assert org_event.edition_count == 2
     assert org_event.build_count == 2
     assert org_event.total_build_bytes == 30
+    assert org_event.purgatory_build_count == 1
+    assert org_event.purgatory_bytes == 99
 
     assert len(project_rows) == 1
     project_event = project_rows[0]
@@ -204,3 +220,5 @@ async def test_inventory_census_publishes_org_and_project_rows(
     assert project_event.edition_count == 2
     assert project_event.build_count == 2
     assert project_event.total_build_bytes == 30
+    assert project_event.purgatory_build_count == 1
+    assert project_event.purgatory_bytes == 99
