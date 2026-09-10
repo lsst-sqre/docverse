@@ -13,7 +13,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from docverse.models.queue_enums import PublishStatus
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.edition_pointer import (
+    EditionPointer,
+    edition_pointer_key,
+)
 from docverse_server.domain.edition_reconcile import (
     EditionReconcilePlan,
     ReconcileEdition,
@@ -31,6 +36,15 @@ SETTLED = NOW - timedelta(hours=2)
 """A timestamp comfortably outside the grace window."""
 
 LIMIT = 100
+
+PUBLIC_ID = 123456789
+"""Public id of the build every fixture edition points at."""
+
+BUILD_ID = serialize_base32_id(PUBLIC_ID)
+"""The base32 rendering a matching pointer has to carry."""
+
+PREFIX = "proj/builds/abc"
+"""``builds.storage_prefix`` a matching pointer has to carry."""
 
 
 def _edition(
@@ -52,13 +66,34 @@ def _edition(
         date_updated=date_updated,
         date_deleted=date_deleted,
         current_build_id=build_id,
-        current_build_public_id=None if build_id is None else 123456789,
-        current_build_storage_prefix=(
-            None if build_id is None else "proj/builds/abc"
-        ),
+        current_build_public_id=None if build_id is None else PUBLIC_ID,
+        current_build_storage_prefix=None if build_id is None else PREFIX,
         current_build_date_deleted=build_deleted,
         current_build_date_purged=build_purged,
     )
+
+
+def _pointer(
+    *,
+    build_id: str = BUILD_ID,
+    prefix: str = PREFIX,
+) -> EditionPointer:
+    """Build the pointer a converged edge would serve."""
+    return EditionPointer(
+        build_public_id=build_id, r2_prefix=prefix, cache_profile=None
+    )
+
+
+def _pointers(
+    *pairs: tuple[ReconcileEdition, EditionPointer | None],
+) -> dict[str, EditionPointer | None]:
+    """Build a read-back mapping keyed the way the publisher keys it."""
+    return {
+        edition_pointer_key(
+            edition.project_slug, edition.edition_slug
+        ): pointer
+        for edition, pointer in pairs
+    }
 
 
 def _history(
@@ -84,14 +119,21 @@ def _plan(
     *,
     history: dict[tuple[int, int], EditionBuildHistory] | None = None,
     live: set[tuple[int, int]] | None = None,
+    pointers: dict[str, EditionPointer | None] | None = None,
     limit: int = LIMIT,
 ) -> EditionReconcilePlan:
-    """Run the planner with the module's fixed clock and grace."""
+    """Run the planner with the module's fixed clock and grace.
+
+    ``pointers`` defaults to ``None``, the no-CDN organization: most of
+    the decision table is decided on database state alone, and passing
+    an empty mapping instead would assert the far stronger "the edge was
+    read and serves nothing for any of these editions".
+    """
     return plan_edition_reconcile(
         editions=editions,
         history_pairs=history or {},
         live_publish_pairs=live or set(),
-        pointers={},
+        pointers=pointers,
         now=NOW,
         grace=GRACE,
         limit=limit,
@@ -261,8 +303,14 @@ def test_purged_current_build_is_skipped() -> None:
     assert plan.retired_build_skipped == 1
 
 
-def test_published_pair_is_healthy() -> None:
-    """With no CDN read-back a ``published`` pair is converged."""
+def test_published_pair_on_a_no_cdn_org_is_healthy() -> None:
+    """Without an edge to read, a ``published`` pair is taken at its word.
+
+    An organization with no ``cdn_service_label`` has nothing for the
+    loop to compare the database against, so ``published`` is the whole
+    of the truth available and the tick must not manufacture drift out
+    of the pointers it could not read.
+    """
     edition = _edition()
     history = _history(edition=edition, status=PublishStatus.published)
 
@@ -270,6 +318,7 @@ def test_published_pair_is_healthy() -> None:
 
     assert plan.republish == ()
     assert plan.healthy == 1
+    assert plan.cdn_checked is False
 
 
 def test_edition_without_a_current_build_is_not_republished() -> None:
@@ -282,18 +331,22 @@ def test_edition_without_a_current_build_is_not_republished() -> None:
     assert plan.unpointed == 1
 
 
-def test_tombstoned_edition_is_not_republished() -> None:
-    """A soft-deleted edition is never re-published.
+def test_tombstoned_edition_without_a_pointer_is_only_counted() -> None:
+    """A soft-deleted edition the edge already forgot needs nothing.
 
-    Task #616 turns this bucket into an unpublish once the loop can read
-    the edge back; until then a tombstone is simply never a republish
-    candidate.
+    A tombstone is never a republish candidate, and once its key is gone
+    there is nothing left to unpublish either — the ordinary delete path
+    got there first, which is the steady state this bucket reports.
     """
     edition = _edition(date_deleted=SETTLED)
 
-    plan = _plan([edition])
+    plan = _plan(
+        [edition],
+        pointers=_pointers((edition, None)),
+    )
 
     assert plan.republish == ()
+    assert plan.unpublish == ()
     assert plan.tombstoned == 1
 
 
@@ -328,3 +381,175 @@ def test_uncapped_plan_reports_nothing_left_over() -> None:
 
     assert len(plan.republish) == 2
     assert plan.capped == 0
+
+
+def test_published_pair_with_a_missing_pointer_is_republished() -> None:
+    """A ``published`` pair the edge serves nothing for is drift.
+
+    The database's own record of the publish is not evidence that the
+    key survived: a KV write that was acknowledged and lost, or a key
+    deleted out from under the pair, leaves exactly this shape and is
+    invisible to every other check in the tree.
+    """
+    edition = _edition()
+    history = _history(edition=edition, status=PublishStatus.published)
+
+    plan = _plan(
+        [edition],
+        history={(edition.edition_id, 5000): history},
+        pointers=_pointers((edition, None)),
+    )
+
+    assert len(plan.republish) == 1
+    assert plan.republish[0].reason == ReconcileReason.pointer_missing
+    assert plan.cdn_checked is True
+
+
+def test_published_pair_with_a_stale_build_id_is_republished() -> None:
+    """A pointer naming a build the edition has moved off is drift.
+
+    The publish that should have moved the pointer never landed, so the
+    edge is still serving a superseded build. Nothing in the database
+    disagrees with itself here — only the comparison finds it.
+    """
+    edition = _edition()
+    history = _history(edition=edition, status=PublishStatus.published)
+
+    plan = _plan(
+        [edition],
+        history={(edition.edition_id, 5000): history},
+        pointers=_pointers(
+            (edition, _pointer(build_id=serialize_base32_id(999)))
+        ),
+    )
+
+    assert len(plan.republish) == 1
+    assert plan.republish[0].reason == ReconcileReason.pointer_stale
+    assert plan.republish[0].build_public_id == BUILD_ID
+
+
+def test_published_pair_with_a_stale_prefix_is_republished() -> None:
+    """The prefix is compared independently of the build id.
+
+    A content-hash migration re-homes a build's objects without minting
+    a new build, so a pointer can carry the right ``build_id`` and a
+    prefix that names objects nothing writes to any more.
+    """
+    edition = _edition()
+    history = _history(edition=edition, status=PublishStatus.published)
+
+    plan = _plan(
+        [edition],
+        history={(edition.edition_id, 5000): history},
+        pointers=_pointers((edition, _pointer(prefix="proj/builds/old"))),
+    )
+
+    assert len(plan.republish) == 1
+    assert plan.republish[0].reason == ReconcileReason.pointer_stale
+
+
+def test_published_pair_with_a_matching_pointer_is_healthy() -> None:
+    """Database and edge agreeing is the whole point of the loop."""
+    edition = _edition()
+    history = _history(edition=edition, status=PublishStatus.published)
+
+    plan = _plan(
+        [edition],
+        history={(edition.edition_id, 5000): history},
+        pointers=_pointers((edition, _pointer())),
+    )
+
+    assert plan.republish == ()
+    assert plan.healthy == 1
+    assert plan.cdn_checked is True
+
+
+def test_pointer_drift_younger_than_grace_is_skipped() -> None:
+    """A pointer read moments after its write is not yet evidence.
+
+    Workers KV is eventually consistent, so a bulk read can answer with
+    the value a just-completed publish replaced. The same window that
+    keeps the loop off an enqueue in progress keeps it off a write the
+    edge has not finished propagating.
+    """
+    edition = _edition(date_updated=NOW - timedelta(minutes=1))
+    history = _history(
+        edition=edition,
+        status=PublishStatus.published,
+        date_created=NOW - timedelta(minutes=1),
+    )
+
+    plan = _plan(
+        [edition],
+        history={(edition.edition_id, 5000): history},
+        pointers=_pointers((edition, _pointer(prefix="proj/builds/old"))),
+    )
+
+    assert plan.republish == ()
+    assert plan.grace_skipped == 1
+
+
+def test_tombstoned_edition_with_a_pointer_is_unpublished() -> None:
+    """A key that outlived its edition is deleted.
+
+    The soft-delete path removes the pointer after the tombstone
+    commits, so a pod dying between the two strands a key that keeps
+    serving a deleted edition's content indefinitely. The unique index
+    on ``(project, lower(slug))`` covers tombstones, so a stranded key
+    can never belong to a live edition of the same name.
+    """
+    edition = _edition(date_deleted=SETTLED)
+
+    plan = _plan([edition], pointers=_pointers((edition, _pointer())))
+
+    assert plan.republish == ()
+    assert len(plan.unpublish) == 1
+    action = plan.unpublish[0]
+    assert action.edition_id == edition.edition_id
+    assert action.edition_slug == edition.edition_slug
+    assert action.project_slug == edition.project_slug
+    assert plan.tombstoned == 0
+
+
+def test_unpointed_edition_with_a_pointer_is_reported_only() -> None:
+    """A key for an edition that never had a build is reported, not acted on.
+
+    Nothing in the tree should be able to produce this, which is exactly
+    why the loop refuses to guess: publishing needs a build it does not
+    have, and deleting a key it cannot explain would destroy the one
+    piece of evidence an operator has.
+    """
+    edition = _edition(build_id=None)
+
+    plan = _plan([edition], pointers=_pointers((edition, _pointer())))
+
+    assert plan.republish == ()
+    assert plan.unpublish == ()
+    assert plan.unexpected_pointers == 1
+    assert plan.unpointed == 0
+
+
+def test_unpublishes_count_against_the_same_cap() -> None:
+    """One cap covers both action kinds, cut in edition-id order.
+
+    The cap exists to bound a tick's blast radius, and an unpublish is
+    as much of a CDN write as a republish, so counting them separately
+    would let a drifted org do twice the work the operator asked for.
+    """
+    live = _edition(edition_id=1, slug="live", build_id=100)
+    dead = _edition(
+        edition_id=2, slug="dead", build_id=200, date_deleted=SETTLED
+    )
+    later = _edition(edition_id=3, slug="later", build_id=300)
+
+    plan = _plan(
+        [live, dead, later],
+        pointers=_pointers(
+            (live, None), (dead, _pointer()), (later, _pointer())
+        ),
+        limit=2,
+    )
+
+    assert [action.edition_id for action in plan.republish] == [1]
+    assert [action.edition_id for action in plan.unpublish] == [2]
+    assert plan.capped == 1

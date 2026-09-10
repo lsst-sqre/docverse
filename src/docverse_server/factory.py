@@ -380,6 +380,8 @@ class Factory:
             history_store=self.create_edition_build_history_store(),
             queue_job_store=self.create_queue_job_store(),
             queue_backend=self.create_queue_backend(),
+            publisher_provider=self.create_edition_publisher_for_org,
+            publishing_service=self.create_edition_publishing_service(),
             logger=self._logger,
         )
 

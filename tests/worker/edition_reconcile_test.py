@@ -4,14 +4,24 @@ The per-org job is where the reconciliation loop meets the rest of the
 system, so these tests are about the wiring rather than the decision
 table (which ``tests/domain/edition_reconcile_test.py`` pins case by
 case): that a lost publish really does come back onto the queue tagged
-as a repair, that the tick is idempotent once it has re-driven a pair,
-and that the ``queue_jobs`` row an operator reads says what happened.
+as a repair, that a key the edge should not still be serving is deleted
+through the same path a delete would use, that an organization with no
+CDN never reaches for one, and that the ``queue_jobs`` row an operator
+reads says what happened.
+
+The drift itself is installed with ``MockEditionPublisher``'s seeding
+methods rather than by driving a publish and breaking it afterwards: the
+loop's whole job is to find state nothing in the tree produced on
+purpose, so the fixtures have to be able to produce it the same way.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 import httpx
 import pytest
@@ -37,14 +47,19 @@ from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
 )
+from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.domain.queue import JobStatus
+from docverse_server.factory import Factory
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import MockEditionPublisher
+from docverse_server.storage.keeper_sync.state_store import TombstoneReason
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
@@ -336,3 +351,476 @@ async def test_edition_reconcile_skips_a_row_it_did_not_claim(
         )
         == []
     )
+
+
+@dataclass(frozen=True)
+class _SeededEdition:
+    """One edition of a CDN organization, as the fixtures leave it."""
+
+    edition_id: int
+    project_id: int
+    slug: str
+    build_id: int
+    build_public_id: str
+    storage_prefix: str
+
+
+async def _tombstone(
+    db_session: AsyncSession, edition: _SeededEdition, *, org_id: int
+) -> None:
+    """Soft-delete a seeded edition without unpublishing its pointer.
+
+    Exactly the state an API pod dying between the tombstone commit and
+    the post-commit unpublish leaves behind, which is the drift the
+    reconciler's unpublish leg exists to clean up.
+    """
+    deleted = await EditionStore(
+        session=db_session, logger=_logger()
+    ).soft_delete(
+        org_id=org_id,
+        project_id=edition.project_id,
+        slug=edition.slug,
+        reason=TombstoneReason.manual_delete,
+    )
+    assert deleted
+
+
+def _mock_publisher_provider(publisher: Any) -> Any:
+    """Patch the publisher provider to hand back ``publisher``."""
+
+    async def _create(
+        self: Factory, *, org_id: int, service_label: str
+    ) -> Any:
+        _ = (self, org_id, service_label)
+        return publisher
+
+    return _create
+
+
+async def _refuse_to_resolve_publisher(
+    self: Factory, *, org_id: int, service_label: str
+) -> Any:
+    """Patch the provider so resolving a publisher at all is a failure."""
+    _ = self
+    msg = f"publisher resolved for org {org_id} ({service_label})"
+    raise AssertionError(msg)
+
+
+class _FlakyUnpublisher:
+    """A publisher whose ``unpublish`` raises for one edition slug.
+
+    Stands in for the ways a single key delete can fail on its own — a
+    Cloudflare 5xx for that one call, a transient timeout — while the
+    rest of the organization's keys are perfectly deletable.
+    """
+
+    def __init__(
+        self, inner: MockEditionPublisher, *, failing_slug: str
+    ) -> None:
+        self._inner = inner
+        self._failing_slug = failing_slug
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        pass
+
+    async def publish(self, **kwargs: Any) -> None:
+        await self._inner.publish(**kwargs)
+
+    async def unpublish(self, *, project_slug: str, edition_slug: str) -> None:
+        if edition_slug == self._failing_slug:
+            msg = f"KV delete failed for {edition_slug}"
+            raise RuntimeError(msg)
+        await self._inner.unpublish(
+            project_slug=project_slug, edition_slug=edition_slug
+        )
+
+    async def get_pointers(
+        self, keys: Sequence[str]
+    ) -> Mapping[str, EditionPointer | None]:
+        return await self._inner.get_pointers(keys)
+
+
+async def _seed_cdn_org(
+    db_session: AsyncSession,
+    *,
+    org_slug: str,
+    project_slug: str,
+    edition_slugs: Sequence[str],
+) -> tuple[int, list[_SeededEdition]]:
+    """Seed an org with a CDN and fully published editions.
+
+    Every edition points at a completed build and its history pair reads
+    ``published``, which is the converged state: on its own this org has
+    nothing for the loop to do, so whatever a test then does to the
+    edge's pointers is the only drift in play.
+    """
+    logger = _logger()
+    org = await OrganizationStore(session=db_session, logger=logger).create(
+        OrganizationCreate(
+            slug=org_slug,
+            title="CDN Recon Org",
+            base_domain=f"{org_slug}.example.com",
+        )
+    )
+    await db_session.execute(
+        update(SqlOrganization)
+        .where(SqlOrganization.id == org.id)
+        .values(cdn_service_label="cdn-prod")
+    )
+    project = await ProjectStore(session=db_session, logger=logger).create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug=project_slug,
+            title="CDN Recon Project",
+            source_url="https://example.com/example/cdn-recon",
+        ),
+    )
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+    seeded: list[_SeededEdition] = []
+    for slug in edition_slugs:
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=slug,
+                title=slug.title(),
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": slug},
+            ),
+        )
+        build = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(git_ref=slug, content_hash=_HASH),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        history = await history_store.record(
+            edition_id=edition.id, build_id=build.id
+        )
+        await history_store.set_publish_status(
+            history_id=history.id, status=PublishStatus.published
+        )
+        await edition_store.set_publish_status(
+            edition_id=edition.id, status=PublishStatus.published
+        )
+        seeded.append(
+            _SeededEdition(
+                edition_id=edition.id,
+                project_id=project.id,
+                slug=slug,
+                build_id=build.id,
+                build_public_id=serialize_base32_id(build.public_id),
+                storage_prefix=build.storage_prefix,
+            )
+        )
+    settled = datetime.now(tz=UTC) - _SETTLED
+    await db_session.execute(
+        update(SqlEdition)
+        .where(SqlEdition.project_id == project.id)
+        .values(date_updated=settled)
+    )
+    await db_session.execute(
+        update(SqlEditionBuildHistory)
+        .where(
+            SqlEditionBuildHistory.edition_id.in_(
+                [item.edition_id for item in seeded]
+            )
+        )
+        .values(date_created=settled)
+    )
+    return org.id, seeded
+
+
+def _seed_pointers(
+    publisher: MockEditionPublisher,
+    *,
+    project_slug: str,
+    editions: Sequence[_SeededEdition],
+) -> None:
+    """Install the pointer a converged edge would serve for each edition."""
+    for item in editions:
+        publisher.seed_pointer(
+            project_slug=project_slug,
+            edition_slug=item.slug,
+            build_public_id=item.build_public_id,
+            object_key_prefix=item.storage_prefix,
+        )
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_republishes_a_hand_deleted_pointer(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A published edition whose key vanished is put back on the queue.
+
+    Nothing in the database is wrong here — the pair reads ``published``
+    and every other check in the tree agrees — so the only thing that
+    can find this drift is reading the edge back and disagreeing with
+    it.
+    """
+    org_slug = "recon-cdn-missing"
+    project_slug = "cdn-missing-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("main",),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    publisher.remove_pointer(
+        project_slug=project_slug, edition_slug=editions[0].slug
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    result = await edition_reconcile(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert jobs[0].kwargs["payload"]["trigger"] == "reconcile"
+    assert jobs[0].kwargs["payload"]["edition_id"] == editions[0].edition_id
+
+    row = await _read_queue_job(queue_job_id)
+    assert row.progress is not None
+    assert row.progress["republished"] == 1
+    assert row.progress["healthy"] == 0
+    assert row.progress["cdn_checked"] is True
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_leaves_a_converged_org_alone(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An org whose edge agrees with its database is reported healthy.
+
+    The steady state, and the case that decides whether the loop can be
+    left switched on: a tick that manufactured work out of a converged
+    org would republish the whole estate twice an hour.
+    """
+    org_slug = "recon-cdn-healthy"
+    project_slug = "cdn-healthy-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("main",),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    result = await edition_reconcile(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert (
+        get_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == []
+    )
+    assert publisher.unpublish_calls == []
+    row = await _read_queue_job(queue_job_id)
+    assert row.progress is not None
+    assert row.progress["healthy"] == 1
+    assert row.progress["republished"] == 0
+    assert row.progress["unpublished"] == 0
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_deletes_a_tombstoned_editions_key(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key that outlived its edition is removed from the edge.
+
+    The soft-delete path removes the pointer only after the tombstone
+    commits, so an API pod dying in between leaves a deleted edition
+    serving content forever. Nothing else re-reads that key.
+    """
+    org_slug = "recon-cdn-tombstone"
+    project_slug = "cdn-tombstone-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("doomed",),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+        await _tombstone(db_session, editions[0], org_id=org_id)
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    result = await edition_reconcile(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert [call.edition_slug for call in publisher.unpublish_calls] == [
+        "doomed"
+    ]
+    assert publisher.pointers == {}
+    assert (
+        get_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == []
+    )
+    row = await _read_queue_job(queue_job_id)
+    assert row.progress is not None
+    assert row.progress["unpublished"] == 1
+    assert row.progress["tombstoned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_never_opens_a_publisher_without_a_cdn(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An org with no ``cdn_service_label`` runs the database leg only.
+
+    It still recovers a lost enqueue — that half of the table needs no
+    edge at all — but resolving a publisher for an org that has no CDN
+    service would raise, so the tick must not even try.
+    """
+    async with db_session.begin():
+        org_id, _, _, _ = await _seed_lost_phase_b(db_session)
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _refuse_to_resolve_publisher,
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    result = await edition_reconcile(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert (
+        len(
+            get_jobs_by_name(
+                mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+            )
+        )
+        == 1
+    )
+    row = await _read_queue_job(queue_job_id)
+    assert row.progress is not None
+    assert row.progress["republished"] == 1
+    assert row.progress["cdn_checked"] is False
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_survives_one_failing_unpublish(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One key the edge refuses to delete costs that key, not the tick.
+
+    The tick is the org's only recovery path for a stranded key, so
+    letting the first failure abort it would leave every key behind it
+    serving deleted content until an operator noticed.
+    """
+    org_slug = "recon-cdn-flaky"
+    project_slug = "cdn-flaky-proj"
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("first", "second"),
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+        for item in editions:
+            await _tombstone(db_session, item, org_id=org_id)
+
+    inner = MockEditionPublisher()
+    _seed_pointers(inner, project_slug=project_slug, editions=editions)
+    publisher = _FlakyUnpublisher(inner, failing_slug="first")
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    result = await edition_reconcile(
+        ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed_with_errors"
+    assert [call.edition_slug for call in inner.unpublish_calls] == ["second"]
+    row_job = await _read_queue_job(queue_job_id)
+    assert row_job.progress is not None
+    assert row_job.progress["unpublished"] == 1
+    assert row_job.progress["unpublish_failed"] == 1
+    assert row_job.progress["failed_editions"] == [f"{project_slug}/first"]

@@ -4,27 +4,26 @@ The dispatcher (task #615) writes one ``queue_jobs`` row per
 organization with ``kind='edition_reconcile'`` and
 ``subject_label=org.slug``; this worker is the per-org body of that
 fan-out. For one org it reads every edition's recorded publish state,
-decides which pairs have drifted from what should be serving them, and
-re-drives each one by putting a ``publish_edition`` job back on the
-default queue.
+reads back what the org's CDN actually serves, and repairs each
+disagreement — a lost or stalled publish goes back on the default queue,
+a key that outlived its edition is deleted.
 
 Two properties shape the job, and both come from what it does *not* do.
 
-It never publishes anything itself. Every action is an enqueue, so the
-job's whole effect is "jobs that should already have been enqueued now
-are", and the ordinary publish path — with its edition lock, its
-deleted-build guard and its own retries — remains the only thing that
-writes to a CDN. That is why the job can run with ``max_tries=1`` and no
-compensation logic: a tick that dies halfway has enqueued a prefix of
-its plan and left the rest for the next tick, which re-plans from
-current state rather than resuming a stored one.
+It never publishes anything itself. A republish is an enqueue, so the
+ordinary publish path — with its edition lock, its deleted-build guard
+and its own retries — remains the only thing that writes a pointer. That
+is why the job can run with ``max_tries=1`` and no compensation logic: a
+tick that dies halfway has applied a prefix of its plan and left the
+rest for the next tick, which re-plans from current state rather than
+resuming a stored one.
 
 It also never *clears* a publish state. Nothing here writes ``failed``
 or rolls a pair back; the only rows it touches are the ones
 ``enqueue_publish_for_edition`` writes on its behalf. So the worst a
 buggy tick can do is enqueue a redundant publish, which the publish path
 treats as an ordinary republish of the build the edition already points
-at.
+at, or delete a key for an edition the database has already tombstoned.
 
 The transaction shape follows :mod:`purgatory_cleanup`: the
 late-delivery guard runs first and alone, the service owns its own short
@@ -48,7 +47,7 @@ __all__ = ["edition_reconcile"]
 async def edition_reconcile(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
-    """Re-drive one organization's lost and stalled edition publishes.
+    """Converge one organization's editions with what its CDN serves.
 
     Parameters
     ----------
@@ -115,10 +114,11 @@ async def edition_reconcile(
                 queue_job_id, has_errors=outcome.has_errors
             )
         # A tick that changed nothing is the steady state and must not
-        # be noise; one that re-drove a publish means something else
-        # lost work, which is worth an operator's attention even though
-        # the loop has already repaired it.
-        if outcome.republished or outcome.republish_failed:
+        # be noise; one that re-drove a publish or removed a stranded
+        # key means something else lost work, which is worth an
+        # operator's attention even though the loop has already repaired
+        # it.
+        if outcome.acted:
             logger.warning("Reconciled drifted editions", **progress)
         else:
             logger.debug("No edition drift to reconcile", **progress)

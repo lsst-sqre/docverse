@@ -32,15 +32,21 @@ from docverse.models import (
 from docverse_server.config import Configuration
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.domain.organization import Organization
+from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
+from docverse_server.services.edition_publishing import (
+    EditionPublishingService,
+)
 from docverse_server.services.edition_reconcile import (
     RECONCILE_GRACE_WINDOW,
     EditionReconcileService,
 )
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.cdncachepurger import CdnCachePurger
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.editionpublisher import EditionPublisher
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend, EnqueuedJob
@@ -53,6 +59,41 @@ _HASH = "sha256:" + "c" * 64
 
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("docverse")  # type: ignore[no-any-return]
+
+
+async def _unreachable_publisher_provider(
+    *, org_id: int, service_label: str
+) -> EditionPublisher:
+    """Fail loudly if anything asks this module for a publisher.
+
+    The organizations in this module have no ``cdn_service_label``, so
+    the read-back leg must never run. Raising is the assertion: a silent
+    stub would let the DB-only path quietly acquire a CDN dependency.
+    """
+    msg = f"publisher resolved for org {org_id} ({service_label})"
+    raise AssertionError(msg)
+
+
+async def _unreachable_purger_provider(
+    *, org_id: int, service_label: str
+) -> CdnCachePurger:
+    """Fail loudly on a purger the reconciler has no reason to reach."""
+    msg = f"purger resolved for org {org_id} ({service_label})"
+    raise AssertionError(msg)
+
+
+def _publishing_service(session: AsyncSession) -> EditionPublishingService:
+    """Build the collaborator the unpublish leg would use."""
+    logger = _logger()
+    return EditionPublishingService(
+        org_store=OrganizationStore(session=session, logger=logger),
+        edition_store=EditionStore(session=session, logger=logger),
+        history_store=EditionBuildHistoryStore(session=session, logger=logger),
+        publisher_provider=_unreachable_publisher_provider,
+        purger_provider=_unreachable_purger_provider,
+        purge_coalescer=CdnPurgeCoalescer(),
+        logger=logger,
+    )
 
 
 def test_grace_window_matches_the_orphan_sweep() -> None:
@@ -185,6 +226,8 @@ async def test_one_failed_enqueue_does_not_abort_the_organization(
             ),
             queue_job_store=QueueJobStore(session=session, logger=_logger()),
             queue_backend=queue_backend,
+            publisher_provider=_unreachable_publisher_provider,
+            publishing_service=_publishing_service(session),
             logger=_logger(),
         )
         with sentry_init_fixture() as init:

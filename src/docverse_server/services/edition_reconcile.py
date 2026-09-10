@@ -5,25 +5,40 @@ planner in :mod:`docverse_server.domain.edition_reconcile`: it reads the
 organization's state, hands it to the planner, and applies whatever the
 planner decided.
 
-Its shape follows from what "applying" means here. Every action is an
-*enqueue*, not a publish — the loop never touches a CDN itself, it puts
-a ``publish_edition`` job back on the queue and lets the ordinary
-publish path do the work. That keeps the reconciler's blast radius to
-"jobs that should already have been enqueued", and it is why a failure
-applying one action is contained rather than fatal: the remaining
-editions of an organization have nothing to do with the one whose
-enqueue raised, and abandoning them would let one bad edition strand a
-whole org's drift indefinitely.
+Its shape follows from what "applying" means here, which is different
+for the two kinds of action.
 
-The reads are deliberately three batched queries rather than a walk:
-one for the org's editions, one for their current builds' history rows,
-one for the live publish jobs. An org with thousands of editions is the
-normal case for this loop, so anything per-edition would put the tick's
-cost on the organization's size squared.
+A republish is an *enqueue*, never a publish: the loop puts a
+``publish_edition`` job back on the queue and lets the ordinary publish
+path — with its edition lock, its deleted-build guard and its own
+retries — do the work. That keeps the reconciler's blast radius to
+"jobs that should already have been enqueued".
+
+An unpublish has no such path to defer to; nothing enqueues a key
+delete, so the loop performs it, through
+:class:`~docverse_server.services.edition_publishing.EditionPublishingService`
+so that removing a pointer means exactly what it means everywhere else.
+Deleting the key of an edition the database has already tombstoned is
+the narrowest write the loop could make: the row it is reconciling is
+gone, and the only thing the key can still do is serve deleted content.
+
+Both kinds are applied one at a time with their failures contained. The
+remaining editions of an organization have nothing to do with the one
+that raised, and the tick is the org's only recovery path, so abandoning
+them would let a single bad edition strand a whole org's drift
+indefinitely.
+
+The reads are deliberately batched rather than a walk: one query for the
+org's editions, one for their current builds' history rows, one for the
+live publish jobs, and one chunked CDN read-back for every pointer. An
+org with thousands of editions is the normal case for this loop, so
+anything per-edition would put the tick's cost on the organization's
+size squared.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,13 +48,23 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.edition_pointer import (
+    EditionPointer,
+    edition_pointer_key,
+)
 from docverse_server.domain.edition_reconcile import (
     EditionReconcilePlan,
     EditionRepublish,
+    EditionUnpublish,
+    ReconcileEdition,
     plan_edition_reconcile,
 )
 from docverse_server.domain.organization import Organization
 from docverse_server.metrics import EditionPublishTrigger
+from docverse_server.services.edition_publishing import (
+    EditionPublisherProvider,
+    EditionPublishingService,
+)
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
 )
@@ -91,6 +116,12 @@ class EditionReconcileOutcome:
     republish_failed: int = 0
     """Actions the tick planned and could not enqueue."""
 
+    unpublished: int = 0
+    """Stranded CDN keys this tick deleted."""
+
+    unpublish_failed: int = 0
+    """Keys the tick planned to delete and could not."""
+
     in_flight_skipped: int = 0
     """Pairs a live ``publish_edition`` job still holds."""
 
@@ -104,10 +135,13 @@ class EditionReconcileOutcome:
     """Pointers at a soft-deleted or purged build."""
 
     tombstoned: int = 0
-    """Soft-deleted editions (task #616 turns these into unpublishes)."""
+    """Soft-deleted editions the edge already serves nothing for."""
 
     unpointed: int = 0
     """Live editions that have never had a current build."""
+
+    unexpected_pointers: int = 0
+    """Keys for editions with no build; reported, never acted on."""
 
     healthy: int = 0
     """Pairs already converged."""
@@ -115,13 +149,32 @@ class EditionReconcileOutcome:
     capped: int = 0
     """Actions the per-job cap left for the next tick."""
 
+    cdn_checked: bool = False
+    """Whether this tick read the org's edge back at all.
+
+    ``False`` for an organization with no ``cdn_service_label``, and the
+    one number an operator needs before reading the rest: without it a
+    tick reporting no drift could equally mean "nothing is wrong" or
+    "nothing was looked at".
+    """
+
     failed_editions: list[str] = field(default_factory=list)
     """``project/edition`` of every action counted under failure."""
 
     @property
     def has_errors(self) -> bool:
         """Whether the job should end ``completed_with_errors``."""
-        return self.republish_failed > 0
+        return self.republish_failed > 0 or self.unpublish_failed > 0
+
+    @property
+    def acted(self) -> bool:
+        """Whether the tick touched, or tried to touch, a CDN key."""
+        return bool(
+            self.republished
+            or self.unpublished
+            or self.republish_failed
+            or self.unpublish_failed
+        )
 
     def as_progress(self) -> dict[str, Any]:
         """Render the tally as the ``queue_jobs.progress`` JSONB body."""
@@ -129,20 +182,24 @@ class EditionReconcileOutcome:
             "editions_scanned": self.editions_scanned,
             "republished": self.republished,
             "republish_failed": self.republish_failed,
+            "unpublished": self.unpublished,
+            "unpublish_failed": self.unpublish_failed,
             "in_flight_skipped": self.in_flight_skipped,
             "grace_skipped": self.grace_skipped,
             "failed_left_alone": self.failed_left_alone,
             "retired_build_skipped": self.retired_build_skipped,
             "tombstoned": self.tombstoned,
             "unpointed": self.unpointed,
+            "unexpected_pointers": self.unexpected_pointers,
             "healthy": self.healthy,
             "capped": self.capped,
+            "cdn_checked": self.cdn_checked,
             "failed_editions": list(self.failed_editions),
         }
 
 
 class EditionReconcileService:
-    """Re-drive one organization's lost and stalled edition publishes."""
+    """Converge one organization's editions with what its CDN serves."""
 
     def __init__(
         self,
@@ -152,6 +209,8 @@ class EditionReconcileService:
         history_store: EditionBuildHistoryStore,
         queue_job_store: QueueJobStore,
         queue_backend: QueueBackend,
+        publisher_provider: EditionPublisherProvider,
+        publishing_service: EditionPublishingService,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._session = session
@@ -159,6 +218,8 @@ class EditionReconcileService:
         self._history_store = history_store
         self._queue_job_store = queue_job_store
         self._queue_backend = queue_backend
+        self._publisher_provider = publisher_provider
+        self._publishing_service = publishing_service
         self._logger = logger
 
     async def reconcile_org(
@@ -195,11 +256,15 @@ class EditionReconcileService:
             retired_build_skipped=plan.retired_build_skipped,
             tombstoned=plan.tombstoned,
             unpointed=plan.unpointed,
+            unexpected_pointers=plan.unexpected_pointers,
             healthy=plan.healthy,
             capped=plan.capped,
+            cdn_checked=plan.cdn_checked,
         )
         for action in plan.republish:
             await self._apply_republish(org, action, outcome)
+        for removal in plan.unpublish:
+            await self._apply_unpublish(org, removal, outcome)
         return outcome
 
     async def _plan(
@@ -207,11 +272,18 @@ class EditionReconcileService:
     ) -> EditionReconcilePlan:
         """Read the organization's state and run the pure planner.
 
-        The three reads share one transaction so the plan describes a
+        The database reads share one transaction so the plan describes a
         single consistent instant: a publish job finishing between the
         history read and the live-job read would otherwise look like a
         stalled pair with no job behind it, which is precisely the shape
         the loop re-drives.
+
+        The CDN read-back cannot join that instant — it is an HTTP call
+        to somebody else's system — so it runs after the transaction
+        closes rather than holding a connection open across it. The
+        resulting skew is bounded by one round trip and is covered by
+        the grace window on both sides: a pointer that moved inside it
+        belongs to a publish far younger than ``grace``.
         """
         async with self._session.begin():
             editions = (
@@ -230,11 +302,20 @@ class EditionReconcileService:
             live_pairs = await self._queue_job_store.list_live_publish_pairs(
                 org_id=org.id
             )
+            publisher = None
+            if org.cdn_service_label is not None:
+                publisher = await self._publisher_provider(
+                    org_id=org.id, service_label=org.cdn_service_label
+                )
+        pointers: Mapping[str, EditionPointer | None] | None = None
+        if publisher is not None:
+            async with publisher:
+                pointers = await publisher.get_pointers(_keys(editions))
         return plan_edition_reconcile(
             editions=editions,
             history_pairs=_latest_by_pair(history_rows),
             live_publish_pairs=live_pairs,
-            pointers={},
+            pointers=pointers,
             now=datetime.now(tz=UTC),
             grace=RECONCILE_GRACE_WINDOW,
             limit=limit,
@@ -293,6 +374,67 @@ class EditionReconcileService:
             reason=action.reason.value,
             phase="reconcile",
         )
+
+    async def _apply_unpublish(
+        self,
+        org: Organization,
+        action: EditionUnpublish,
+        outcome: EditionReconcileOutcome,
+    ) -> None:
+        """Delete one stranded key, isolating its failure.
+
+        Goes through
+        `~docverse_server.services.edition_publishing.EditionPublishingService`
+        rather than the publisher this tick already opened for the
+        read-back, so the loop removes a pointer by exactly the same
+        route the delete path does — one place decides what unpublishing
+        an edition means, and the reconciler cannot drift from it.
+
+        The call runs inside a transaction because it re-reads the
+        organization to resolve the publisher, and this service is
+        invoked with none open; the enclosing ``begin()`` also keeps
+        that read from leaving an implicit transaction behind for the
+        next action to trip over.
+        """
+        label = f"{action.project_slug}/{action.edition_slug}"
+        try:
+            async with self._session.begin():
+                await self._publishing_service.unpublish(
+                    org_id=org.id,
+                    project_slug=action.project_slug,
+                    edition_slug=action.edition_slug,
+                )
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            outcome.unpublish_failed += 1
+            outcome.failed_editions.append(label)
+            self._logger.exception(
+                "Failed to remove a stranded edition pointer",
+                project=action.project_slug,
+                edition=action.edition_slug,
+                phase="reconcile",
+            )
+            return
+        outcome.unpublished += 1
+        self._logger.info(
+            "Removed a stranded edition pointer",
+            project=action.project_slug,
+            edition=action.edition_slug,
+            phase="reconcile",
+        )
+
+
+def _keys(editions: Sequence[ReconcileEdition]) -> list[str]:
+    """Build the CDN key of every edition the tick will consider.
+
+    Tombstones included, and deliberately: a soft-deleted edition's
+    stranded key is one of the two drifts the read-back exists to find,
+    and it is the only one nothing else in the tree would ever notice.
+    """
+    return [
+        edition_pointer_key(edition.project_slug, edition.edition_slug)
+        for edition in editions
+    ]
 
 
 def _latest_by_pair(

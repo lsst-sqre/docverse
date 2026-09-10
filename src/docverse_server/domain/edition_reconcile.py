@@ -13,11 +13,12 @@ from docverse.models.queue_enums import PublishStatus
 
 from .base32id import serialize_base32_id
 from .edition_build_history import EditionBuildHistory
-from .edition_pointer import EditionPointer
+from .edition_pointer import EditionPointer, edition_pointer_key
 
 __all__ = [
     "EditionReconcilePlan",
     "EditionRepublish",
+    "EditionUnpublish",
     "ReconcileEdition",
     "ReconcileReason",
     "plan_edition_reconcile",
@@ -134,6 +135,26 @@ class ReconcileReason(StrEnum):
     reaper failed without ever clearing the pair.
     """
 
+    pointer_missing = "pointer_missing"
+    """The pair reads ``published`` and the edge serves nothing.
+
+    A key that was written and lost, or removed by something other than
+    an unpublish. Distinguished from :attr:`pointer_stale` because the
+    two accuse different things: a run of these says keys are
+    disappearing, which is an edge-side or operational problem no
+    amount of re-publishing will explain.
+    """
+
+    pointer_stale = "pointer_stale"
+    """The edge serves a pointer that names the wrong content.
+
+    Either its ``build_id`` is not the edition's current build or its
+    ``r2_prefix`` is not that build's ``storage_prefix``. Unlike
+    :attr:`pointer_missing` the write path is evidently working; what
+    failed is a specific publish that reported success and left the
+    pointer where it was.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class EditionRepublish:
@@ -153,6 +174,21 @@ class EditionRepublish:
 
 
 @dataclass(frozen=True, slots=True)
+class EditionUnpublish:
+    """One stranded CDN key the loop will delete.
+
+    Carries no build: an unpublish is addressed by the key alone, and
+    the edition it belonged to is a tombstone whose current build is
+    beside the point.
+    """
+
+    edition_id: int
+    edition_slug: str
+    project_id: int
+    project_slug: str
+
+
+@dataclass(frozen=True, slots=True)
 class EditionReconcilePlan:
     """What one organization's reconciliation tick should do.
 
@@ -164,13 +200,31 @@ class EditionReconcilePlan:
     """
 
     republish: tuple[EditionRepublish, ...]
-    """Actions to apply, ordered by edition id and cut at the cap."""
+    """Publishes to re-drive, ordered by edition id and cut at the cap."""
+
+    unpublish: tuple[EditionUnpublish, ...]
+    """Stranded keys to delete, from the same ordered, capped work list.
+
+    Separate from :attr:`republish` because the two are applied through
+    different collaborators, but never separately *counted*: both are
+    CDN writes, so one cap covers the pair (see :attr:`capped`).
+    """
 
     editions_scanned: int
     """Editions considered, including every skipped bucket."""
 
     capped: int
-    """Actions the cap left for the next tick."""
+    """Actions of either kind the cap left for the next tick."""
+
+    cdn_checked: bool
+    """Whether this plan had the edge's own answer to compare against.
+
+    ``False`` for an organization with no ``cdn_service_label``, whose
+    editions are decided on database state alone. Recorded rather than
+    inferred from an empty pointer map because the two are worlds apart:
+    "nothing was read" and "the edge serves nothing" would otherwise be
+    the same value, and the second is a whole org's worth of drift.
+    """
 
     in_flight_skipped: int = 0
     """Pairs a live ``publish_edition`` job still holds."""
@@ -185,18 +239,21 @@ class EditionReconcilePlan:
     """Pointers at a soft-deleted or purged build."""
 
     tombstoned: int = 0
-    """Soft-deleted editions (task #616 turns these into unpublishes)."""
+    """Soft-deleted editions the edge already serves nothing for."""
 
     unpointed: int = 0
     """Live editions that have never had a current build."""
 
+    unexpected_pointers: int = 0
+    """Keys for editions with no build to publish; reported, not acted on."""
+
     healthy: int = 0
-    """Pairs already reading ``published``."""
+    """Pairs already reading ``published`` and agreeing with the edge."""
 
     @property
     def has_actions(self) -> bool:
         """Whether this tick will change anything."""
-        return bool(self.republish)
+        return bool(self.republish or self.unpublish)
 
 
 class _Skip(StrEnum):
@@ -210,6 +267,7 @@ class _Skip(StrEnum):
 
     tombstoned = "tombstoned"
     unpointed = "unpointed"
+    unexpected_pointers = "unexpected_pointers"
     retired_build_skipped = "retired_build_skipped"
     in_flight_skipped = "in_flight_skipped"
     failed_left_alone = "failed_left_alone"
@@ -217,14 +275,83 @@ class _Skip(StrEnum):
     grace_skipped = "grace_skipped"
 
 
+def _pointer_verdict(
+    pointer: EditionPointer | None,
+    *,
+    build_public_id: str,
+    storage_prefix: str | None,
+) -> ReconcileReason | None:
+    """Compare a ``published`` pair against what the edge answers with.
+
+    Returns the reason the pointer is wrong, or ``None`` if the edge
+    already agrees with the database. Called only for pairs the database
+    calls ``published``: an unfinished publish is drift on the database's
+    own evidence, and whatever the edge happens to serve meanwhile
+    changes neither the decision nor the reason recorded for it.
+
+    The build id and the prefix are checked independently because they
+    fail independently: a re-homed build keeps its id and changes its
+    prefix, and a pointer that was never moved does the reverse.
+    """
+    if pointer is None:
+        return ReconcileReason.pointer_missing
+    if (
+        pointer.build_public_id != build_public_id
+        or pointer.r2_prefix != storage_prefix
+    ):
+        return ReconcileReason.pointer_stale
+    return None
+
+
+def _republish_reason(
+    *,
+    history: EditionBuildHistory | None,
+    pointer: EditionPointer | None,
+    cdn_checked: bool,
+    build_public_id: str,
+    storage_prefix: str | None,
+) -> ReconcileReason | _Skip:
+    """Read one live, publishable edition's recorded publish state.
+
+    Split out of :func:`_classify_edition` because the two halves ask
+    different questions: that one decides whether an edition is a
+    candidate at all (tombstoned, unpointed, retired, already being
+    worked on), while this one decides what the pair's own record — and,
+    where there is one to read, the edge — says about the publish that
+    should have happened.
+
+    Returns the reason to re-drive the pair, or the bucket it belongs in
+    instead.
+    """
+    if history is None or history.publish_status is None:
+        # ``enqueue_publish_for_edition`` is the only writer of this
+        # column, so an absent row and a NULL status say the same thing.
+        return ReconcileReason.lost_enqueue
+    status = history.publish_status
+    if status is PublishStatus.failed:
+        return _Skip.failed_left_alone
+    if status is not PublishStatus.published:
+        return ReconcileReason.stalled_publish
+    if not cdn_checked:
+        return _Skip.healthy
+    verdict = _pointer_verdict(
+        pointer,
+        build_public_id=build_public_id,
+        storage_prefix=storage_prefix,
+    )
+    return _Skip.healthy if verdict is None else verdict
+
+
 def _classify_edition(
     edition: ReconcileEdition,
     *,
     history: EditionBuildHistory | None,
     live: bool,
+    pointer: EditionPointer | None,
+    cdn_checked: bool,
     now: datetime,
     grace: timedelta,
-) -> EditionRepublish | _Skip:
+) -> EditionRepublish | EditionUnpublish | _Skip:
     """Apply the decision table to one edition.
 
     Returns the action to take, or the bucket that explains why there is
@@ -234,29 +361,45 @@ def _classify_edition(
     leave the pair looking stalled), and the grace window is consulted
     *last*, so an edition that was never a candidate is not counted as
     one the window held back.
+
+    ``pointer`` is always ``None`` when ``cdn_checked`` is ``False``, so
+    the pointer rules below need no second guard: an organization with
+    no CDN simply never reaches a branch that a pointer could satisfy.
     """
     if edition.date_deleted is not None:
-        # Task #616 turns a tombstone with a live pointer into an
-        # unpublish; with no read-back there is nothing to decide.
+        if pointer is not None:
+            return EditionUnpublish(
+                edition_id=edition.edition_id,
+                edition_slug=edition.edition_slug,
+                project_id=edition.project_id,
+                project_slug=edition.project_slug,
+            )
         return _Skip.tombstoned
     build_id = edition.current_build_id
     public_id = edition.current_build_public_id
     if build_id is None or public_id is None:
+        # A key for an edition with no build to publish is reported and
+        # left alone: the loop cannot republish (there is nothing to
+        # point at) and must not delete (the key is the only surviving
+        # evidence of whatever wrote it).
+        if pointer is not None:
+            return _Skip.unexpected_pointers
         return _Skip.unpointed
     if edition.current_build_retired:
         return _Skip.retired_build_skipped
     if live:
         return _Skip.in_flight_skipped
 
-    if history is not None and history.publish_status is not None:
-        status = history.publish_status
-        if status is PublishStatus.failed:
-            return _Skip.failed_left_alone
-        if status is PublishStatus.published:
-            return _Skip.healthy
-        reason = ReconcileReason.stalled_publish
-    else:
-        reason = ReconcileReason.lost_enqueue
+    build_public_id = serialize_base32_id(public_id)
+    reason = _republish_reason(
+        history=history,
+        pointer=pointer,
+        cdn_checked=cdn_checked,
+        build_public_id=build_public_id,
+        storage_prefix=edition.current_build_storage_prefix,
+    )
+    if isinstance(reason, _Skip):
+        return reason
 
     settled_at = edition.date_updated
     if history is not None:
@@ -270,7 +413,7 @@ def _classify_edition(
         project_id=edition.project_id,
         project_slug=edition.project_slug,
         build_id=build_id,
-        build_public_id=serialize_base32_id(public_id),
+        build_public_id=build_public_id,
         reason=reason,
     )
 
@@ -280,7 +423,7 @@ def plan_edition_reconcile(
     editions: Sequence[ReconcileEdition],
     history_pairs: Mapping[tuple[int, int], EditionBuildHistory],
     live_publish_pairs: AbstractSet[tuple[int, int]],
-    pointers: Mapping[str, EditionPointer | None],
+    pointers: Mapping[str, EditionPointer | None] | None,
     now: datetime,
     grace: timedelta,
     limit: int,
@@ -309,10 +452,12 @@ def plan_edition_reconcile(
         What the CDN actually serves, keyed as
         `~docverse_server.domain.edition_pointer.edition_pointer_key`
         builds the key, with ``None`` for an edition the edge publishes
-        nothing for. Accepted now and unused: the pointer rules arrive
-        with task #616, and taking the argument from the start means
-        that task adds rules to this function rather than reshaping its
-        callers.
+        nothing for. Pass ``None`` for the whole mapping when the edge
+        was not read at all — an organization with no
+        ``cdn_service_label`` — which is a different claim from an empty
+        mapping and decides the table differently: unread means a
+        ``published`` pair is taken at its word, while read-and-empty
+        means every one of them has lost its key.
     now
         The tick's clock.
     grace
@@ -337,33 +482,54 @@ def plan_edition_reconcile(
     list. A capped organization therefore re-attempts the same pairs
     every tick until they converge, instead of sampling a rotating
     window that could starve its tail indefinitely.
+
+    Republishes and unpublishes share that one work list, and are split
+    apart only once the cap has already been applied. Capping them
+    separately would let a badly drifted organization do twice the CDN
+    writes the operator's ``limit`` asked for.
     """
-    actions: list[EditionRepublish] = []
+    actions: list[EditionRepublish | EditionUnpublish] = []
     skips: Counter[_Skip] = Counter()
+    cdn_checked = pointers is not None
 
     for edition in sorted(editions, key=lambda e: e.edition_id):
         pair = (edition.edition_id, edition.current_build_id or 0)
+        key = edition_pointer_key(edition.project_slug, edition.edition_slug)
         outcome = _classify_edition(
             edition,
             history=history_pairs.get(pair),
             live=pair in live_publish_pairs,
+            pointer=None if pointers is None else pointers.get(key),
+            cdn_checked=cdn_checked,
             now=now,
             grace=grace,
         )
-        if isinstance(outcome, EditionRepublish):
-            actions.append(outcome)
-        else:
+        if isinstance(outcome, _Skip):
             skips[outcome] += 1
+        else:
+            actions.append(outcome)
 
+    applied = actions[:limit]
     return EditionReconcilePlan(
-        republish=tuple(actions[:limit]),
+        republish=tuple(
+            action
+            for action in applied
+            if isinstance(action, EditionRepublish)
+        ),
+        unpublish=tuple(
+            action
+            for action in applied
+            if isinstance(action, EditionUnpublish)
+        ),
         editions_scanned=len(editions),
         capped=max(len(actions) - limit, 0),
+        cdn_checked=cdn_checked,
         in_flight_skipped=skips[_Skip.in_flight_skipped],
         grace_skipped=skips[_Skip.grace_skipped],
         failed_left_alone=skips[_Skip.failed_left_alone],
         retired_build_skipped=skips[_Skip.retired_build_skipped],
         tombstoned=skips[_Skip.tombstoned],
         unpointed=skips[_Skip.unpointed],
+        unexpected_pointers=skips[_Skip.unexpected_pointers],
         healthy=skips[_Skip.healthy],
     )

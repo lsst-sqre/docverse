@@ -844,10 +844,10 @@ def test_default_worker_does_not_register_edition_reconcile() -> None:
     """The default queue stays free of the reconciliation loop.
 
     The loop lives exclusively on the maintenance pool: its per-org pass
-    reads every edition an org owns and, once task #616 lands, calls the
-    CDN, so it must not contend with the publishing flow it exists to
-    re-drive. What it enqueues *onto* the default pool is an ordinary
-    ``publish_edition`` job, which is the only coupling between them.
+    reads every edition an org owns and calls the CDN, so it must not
+    contend with the publishing flow it exists to re-drive. What it
+    enqueues *onto* the default pool is an ordinary ``publish_edition``
+    job, which is the only coupling between them.
     """
     default_underlying = {
         _underlying(entry.coroutine if isinstance(entry, Function) else entry)
