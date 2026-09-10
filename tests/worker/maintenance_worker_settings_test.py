@@ -19,6 +19,7 @@ from docverse_server.worker.functions import (
     dashboard_build_reaper,
     dashboard_sync_reaper,
     edition_reconcile,
+    edition_reconcile_dispatcher,
     inventory_census,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
@@ -779,3 +780,86 @@ def test_edition_reconcile_registered_single_attempt() -> None:
     per_org = _function_by_coroutine(edition_reconcile)
     assert per_org.timeout_s == float(_config.maintenance_job_timeout_seconds)
     assert per_org.max_tries == 1
+
+
+def test_edition_reconcile_dispatcher_registered_single_attempt() -> None:
+    """The dispatcher carries the pool timeout and one attempt.
+
+    Same shape as the sweep's dispatcher, for a different reason: a
+    retried fan-out would find every org's mutex held by the rows its
+    first attempt committed, so each retry would step over the whole
+    estate and report a tick that reconciled nothing. Recovery is the
+    next half-hourly tick, which is at most 30 minutes away.
+    """
+    dispatcher = _function_by_coroutine(edition_reconcile_dispatcher)
+    assert dispatcher.timeout_s == float(
+        _config.maintenance_job_timeout_seconds
+    )
+    assert dispatcher.max_tries == 1
+
+
+def test_edition_reconcile_dispatcher_runs_every_thirty_minutes() -> None:
+    """The reconcile dispatcher fires twice an hour, unconditionally.
+
+    Half-hourly rather than daily because the drift it repairs is
+    user-visible — an edition serving nothing, or serving a build two
+    releases old — so the worst-case time-to-repair is what the cadence
+    buys. The cron is registered whether or not
+    ``edition_reconcile_enabled`` is set: the flag is read inside the
+    function body, so flipping it in Phalanx takes effect on the next
+    tick instead of requiring a worker restart.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    dispatcher_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is edition_reconcile_dispatcher
+    ]
+    assert len(dispatcher_crons) == 1
+    assert dispatcher_crons[0].minute == {9, 39}
+    assert dispatcher_crons[0].hour is None
+
+
+def test_edition_reconcile_dispatcher_slot_collides_with_nothing() -> None:
+    """The ``{9, 39}`` pair is free of every other maintenance cron.
+
+    The pool's minute slots are allocated exhaustively — the lifecycle
+    reaper holds ``{0, 30}``, the dashboard_build reaper
+    ``{3, 18, 33, 48}``, and ``{6, 36}``, ``{12, 42}``, ``{21, 51}`` and
+    ``{24, 54}`` belong to the publish_edition, build_processing,
+    purgatory_cleanup and dashboard_sync reapers, with the census, the
+    audit and the sweep's dispatcher on daily minutes of their own. This
+    asserts the new pair against whatever is actually registered, so a
+    later cron landing on minute 9 fails here rather than in production,
+    where the two would race for the same Postgres connection-pool slots
+    on a horizontally scaled pool.
+    """
+    assert {9, 39}.isdisjoint(
+        _other_maintenance_cron_minutes(edition_reconcile_dispatcher)
+    )
+
+
+def test_default_worker_does_not_register_edition_reconcile() -> None:
+    """The default queue stays free of the reconciliation loop.
+
+    The loop lives exclusively on the maintenance pool: its per-org pass
+    reads every edition an org owns and, once task #616 lands, calls the
+    CDN, so it must not contend with the publishing flow it exists to
+    re-drive. What it enqueues *onto* the default pool is an ordinary
+    ``publish_edition`` job, which is the only coupling between them.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert edition_reconcile not in default_underlying
+    assert edition_reconcile_dispatcher not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert edition_reconcile_dispatcher not in coroutines

@@ -558,6 +558,27 @@ class Configuration(BaseSettings):
         ),
     )
 
+    edition_reconcile_enabled: bool = Field(
+        default=True,
+        title="Whether the edition_reconcile loop re-drives drifted editions",
+        description=(
+            "Feature flag for the ``edition_reconcile`` loop (PRD"
+            " #612). When false the dispatcher cron returns ``skipped``"
+            " immediately, creating no per-org ``queue_jobs`` rows; the"
+            " cron itself stays registered so flipping the flag does not"
+            " require a worker restart. Unlike"
+            " ``purgatory_cleanup_enabled`` this ships **true**: the"
+            " loop's only action is to enqueue a publish of the build an"
+            " edition already points at, so a wrong tick republishes"
+            " something that was already correct rather than destroying"
+            " anything, and an environment running with it off keeps"
+            " exactly the drift the loop exists to repair. The knob is"
+            " there for the opposite case — an org drifted badly enough"
+            " that an operator wants the repair load off the publishing"
+            " queue while they look at it."
+        ),
+    )
+
     edition_reconcile_max_actions_per_job: int = Field(
         100,
         ge=1,

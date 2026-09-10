@@ -53,6 +53,7 @@ from .functions import (
     dashboard_sync,
     dashboard_sync_reaper,
     edition_reconcile,
+    edition_reconcile_dispatcher,
     git_ref_audit,
     git_ref_audit_discovery,
     inventory_census,
@@ -642,16 +643,18 @@ class MaintenanceWorkerSettings:
     periodic work rather than lifecycle evaluation alone; this class
     is the binding.
 
-    Three dispatcher/per-org pairs live on this single pool: the
-    hourly ``lifecycle_eval``, the daily ``git_ref_audit``, and the
-    daily ``purgatory_cleanup`` sweep (PRD #596). PRD #346 explicitly
-    says the audit "shares the same fan-out, per-org mutex, and reaper
-    patterns as lifecycle_eval and never competes with build processing
-    or keeper-sync for worker capacity", and the same reasoning admits
-    the sweep: it is nightly, per-org, mutex-guarded, and its long
+    Four dispatcher/per-org pairs live on this single pool: the hourly
+    ``lifecycle_eval``, the daily ``git_ref_audit``, the daily
+    ``purgatory_cleanup`` sweep (PRD #596), and the half-hourly
+    ``edition_reconcile`` loop (PRD #612). PRD #346 explicitly says the
+    audit "shares the same fan-out, per-org mutex, and reaper patterns
+    as lifecycle_eval and never competes with build processing or
+    keeper-sync for worker capacity", and the same reasoning admits the
+    other two: both are per-org and mutex-guarded, the sweep's long
     object-store reclamation runs are exactly the work that must not
-    contend with publishing. Their daily cadences are light enough that
-    a further pool would be over-segmented.
+    contend with publishing, and the reconciler must not contend with
+    the publishing flow it exists to re-drive. Their cadences are light
+    enough that a further pool would be over-segmented.
 
     Every one of those functions is wrapped with :func:`arq.func` so the
     dedicated queue inherits a per-job ``timeout`` (sourced from
@@ -754,15 +757,25 @@ class MaintenanceWorkerSettings:
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
-        # The ``edition_reconcile`` per-org pass (PRD #612). Its
-        # dispatcher and reaper land with tasks #615 and #617; this
-        # registration is what lets the job run at all, and what an
-        # operator uses to re-drive one org by hand in the meantime.
-        # ``max_tries=1`` because the plan lives in the database, not in
-        # the job: a retry would re-plan the org and re-enqueue every
-        # action the first attempt already applied. Recovery is the next
-        # tick, which re-plans from current state and finds those pairs
-        # holding live publish jobs.
+        # The ``edition_reconcile`` loop (PRD #612), dispatcher and
+        # per-org body; its reaper lands with task #617. Both carry the
+        # maintenance per-job ``timeout`` and ``max_tries=1``.
+        #
+        # For the per-org pass that is because the plan lives in the
+        # database, not in the job: a retry would re-plan the org and
+        # re-enqueue every action the first attempt already applied.
+        # For the dispatcher it is because a retried fan-out would find
+        # every org's mutex held by the rows its own first attempt
+        # committed, so each retry would step over the whole estate and
+        # report a tick that reconciled nothing. Either way recovery is
+        # the next tick, at most 30 minutes away, which re-plans from
+        # current state and finds the already-driven pairs holding live
+        # publish jobs.
+        func(
+            instrument_arq_task(edition_reconcile_dispatcher),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
         func(
             instrument_arq_task(edition_reconcile),
             timeout=config.maintenance_job_timeout_seconds,
@@ -833,6 +846,25 @@ class MaintenanceWorkerSettings:
             hour={config.purgatory_cleanup_cron_hour},
             minute={config.purgatory_cleanup_cron_minute},
         ),
+        # ``edition_reconcile_dispatcher`` (PRD #612) fans out one
+        # reconciliation pass per org twice an hour. Half-hourly rather
+        # than daily like the purgatory sweep because the drift it
+        # repairs is user-visible — an edition serving nothing, or
+        # serving a build two releases old — so worst-case
+        # time-to-repair is what the cadence buys; and unconditionally
+        # rather than behind a pre-flight because drift is by definition
+        # state nobody has compared against the edge yet, so a query
+        # naming the drifted orgs would have to do the per-org job's own
+        # work. The ``{9, 39}`` slot is one of the two minute pairs left
+        # free by the reapers below (``{15, 45}`` is task #617's, for
+        # this loop's own reaper), keeping the fan-out off every other
+        # cron's minute on a horizontally scaled pool — the same
+        # contention-avoidance precedent as
+        # ``git_ref_audit_discovery`` at minute 17.
+        cron(
+            instrument_arq_task(edition_reconcile_dispatcher),
+            minute={9, 39},
+        ),
         cron(
             instrument_arq_task(lifecycle_reaper),
             minute={0, 30},
@@ -893,14 +925,18 @@ class MaintenanceWorkerSettings:
             minute={24, 54},
         ),
         # ``purgatory_cleanup_reaper`` runs on the same 30-minute
-        # cadence as its run-less siblings, on the last free pair of
-        # offset minutes: ``{0, 30}`` is the lifecycle reaper's,
-        # ``{3, 18, 33, 48}`` the dashboard_build reaper's, and
-        # ``{6, 36}``, ``{12, 42}`` and ``{24, 54}`` belong to the
-        # publish_edition, build_processing and dashboard_sync reapers
-        # — so nothing on this pool queries ``queue_jobs`` at the same
-        # instant on a horizontally scaled deployment, the same
-        # precedent that puts ``git_ref_audit_discovery`` on minute 17.
+        # cadence as its run-less siblings, on its own pair of offset
+        # minutes. The pool's whole minute allocation, so a new cron can
+        # be placed without re-deriving it: ``{0, 30}`` the lifecycle
+        # reaper, ``{3, 18, 33, 48}`` the dashboard_build reaper,
+        # ``{6, 36}`` publish_edition, ``{9, 39}`` the
+        # edition_reconcile dispatcher, ``{12, 42}`` build_processing,
+        # ``{15, 45}`` reserved for the edition_reconcile reaper (task
+        # #617), ``{21, 51}`` here, ``{24, 54}`` dashboard_sync, plus
+        # the three daily ticks at 05:17, 04:47 and 03:23 — so nothing
+        # on this pool queries ``queue_jobs`` at the same instant on a
+        # horizontally scaled deployment, the same precedent that puts
+        # ``git_ref_audit_discovery`` on minute 17.
         # A wedged ``purgatory_cleanup`` row is invisible to operators,
         # so the tighter dashboard_build cadence is not warranted; what
         # it does hold hostage is the per-org mutex, and with it that

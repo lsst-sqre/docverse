@@ -258,3 +258,51 @@ def test_purgatory_cleanup_cap_refuses_zero(
     monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_MAX_BUILDS_PER_JOB", "0")
     with pytest.raises(ValidationError):
         Configuration()
+
+
+def test_edition_reconcile_defaults() -> None:
+    """The reconciler ships on and capped, unlike the purgatory sweep.
+
+    The two flags look alike and default opposite ways on purpose.
+    ``purgatory_cleanup_enabled`` is off because that sweep deletes
+    object-store content permanently, so an operator has to opt each
+    environment in. Reconciliation only ever *enqueues* a publish of the
+    build an edition already points at, so the worst a wrong tick can do
+    is republish something that was already correct — leaving it off
+    would mean every environment silently keeps the drift the loop
+    exists to repair.
+    """
+    config = Configuration()
+    assert config.edition_reconcile_enabled is True
+    assert config.edition_reconcile_max_actions_per_job == 100
+
+
+def test_edition_reconcile_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both knobs are env-overridable under the ``DOCVERSE_`` prefix.
+
+    Phalanx sets them from the chart's ``config.maintenance`` values, and
+    an operator watching a badly drifted org needs to be able to pull the
+    flag without a redeploy of a new image.
+    """
+    monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_ENABLED", "false")
+    monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "7")
+    config = Configuration()
+    assert config.edition_reconcile_enabled is False
+    assert config.edition_reconcile_max_actions_per_job == 7
+
+
+def test_edition_reconcile_cap_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap of zero would plan repairs every tick and apply none.
+
+    An operator reaching for "stop reconciling" wants
+    ``edition_reconcile_enabled``; a cap of 0 would instead run a job per
+    org that reads every edition, reports the drift it found, and fixes
+    none of it — a tick that looks healthy while nothing converges.
+    """
+    monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "0")
+    with pytest.raises(ValidationError):
+        Configuration()
