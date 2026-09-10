@@ -26,7 +26,9 @@ from docverse.models.queue_enums import PublishStatus
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition_reconcile import ReconcileEdition
 from docverse_server.domain.version import (
     EupsDailyVersion,
     EupsMajorVersion,
@@ -518,6 +520,67 @@ class EditionStore:
             .order_by(SqlEdition.slug)
         )
         return list(result.scalars().all())
+
+    async def list_org_editions_for_reconcile(
+        self, *, org_id: int
+    ) -> list[ReconcileEdition]:
+        """List every edition an organization owns, tombstones included.
+
+        The edition reconciler's one read of the org (PRD #612). It is
+        the only listing on this store that crosses project boundaries
+        and the only one that keeps soft-deleted rows, and both are
+        load-bearing: the loop is dispatched per org, and a tombstoned
+        edition whose CDN key outlived its delete is one of the drifts
+        it repairs. Projects are joined rather than filtered on for the
+        same reason — a deleted project's editions are tombstoned by the
+        cascade, so excluding them here would hide exactly the keys most
+        likely to be stranded.
+
+        The build join is an outer join on ``current_build_id`` and
+        carries the retirement stamps as well as the public id and
+        prefix, so the planner can refuse to re-drive a publish at
+        content the purgatory sweep has reclaimed without a second
+        query per edition.
+
+        Ordered by edition id so the plan's cap truncates the same way
+        on every tick and a capped org resumes deterministically.
+        """
+        stmt = (
+            select(
+                SqlEdition.id,
+                SqlEdition.slug,
+                SqlEdition.project_id,
+                SqlProject.slug.label("project_slug"),
+                SqlEdition.date_updated,
+                SqlEdition.date_deleted,
+                SqlEdition.current_build_id,
+                SqlBuild.public_id.label("current_build_public_id"),
+                SqlBuild.storage_prefix.label("current_build_prefix"),
+                SqlBuild.date_deleted.label("current_build_date_deleted"),
+                SqlBuild.date_purged.label("current_build_date_purged"),
+            )
+            .join(SqlProject, SqlEdition.project_id == SqlProject.id)
+            .outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+            .where(SqlProject.org_id == org_id)
+            .order_by(SqlEdition.id)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            ReconcileEdition(
+                edition_id=row.id,
+                edition_slug=row.slug,
+                project_id=row.project_id,
+                project_slug=row.project_slug,
+                date_updated=row.date_updated,
+                date_deleted=row.date_deleted,
+                current_build_id=row.current_build_id,
+                current_build_public_id=row.current_build_public_id,
+                current_build_storage_prefix=row.current_build_prefix,
+                current_build_date_deleted=row.current_build_date_deleted,
+                current_build_date_purged=row.current_build_date_purged,
+            )
+            for row in result.all()
+        ]
 
     async def update_tracking(
         self,

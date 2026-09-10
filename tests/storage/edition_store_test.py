@@ -2636,3 +2636,172 @@ async def test_set_current_build_waits_for_an_in_flight_delete(
     refreshed = await edition_store.get_by_id(edition_id)
     assert refreshed is not None
     assert refreshed.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_list_org_editions_for_reconcile_includes_tombstones(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The reconciler's accessor reads every edition an org owns.
+
+    Three things make this accessor different from every other listing
+    on the store, and all three are what the reconciler needs: it is
+    org-scoped rather than project-scoped, it keeps soft-deleted
+    editions (a tombstone whose CDN pointer outlived it is exactly the
+    drift the loop unpublishes), and it carries the current build's
+    retirement stamps so a pointer at reclaimed content is never
+    re-driven.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        project_store = ProjectStore(session=db_session, logger=logger)
+        project = await project_store.get_by_id(project_id)
+        assert project is not None
+
+        live_build = await build_store.create(
+            project_id=project_id,
+            project_slug=project.slug,
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+        )
+        purged_build = await build_store.create(
+            project_id=project_id,
+            project_slug=project.slug,
+            data=BuildCreate(git_ref="old", content_hash=_HASH),
+            uploader="testuser",
+        )
+
+        published = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="published",
+                title="Published",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        await edition_store.set_current_build(
+            edition_id=published.id, build_id=live_build.id
+        )
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="pointerless",
+                title="Pointerless",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "wip"},
+            ),
+        )
+        tombstoned = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="tombstoned",
+                title="Tombstoned",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "old"},
+            ),
+        )
+        await edition_store.set_current_build(
+            edition_id=tombstoned.id, build_id=purged_build.id
+        )
+        await build_store.soft_delete(build_id=purged_build.id)
+        await build_store.mark_purged(build_id=purged_build.id)
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="tombstoned",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        rows = await edition_store.list_org_editions_for_reconcile(
+            org_id=org_id
+        )
+
+    by_slug = {row.edition_slug: row for row in rows}
+    assert set(by_slug) == {"published", "pointerless", "tombstoned"}
+    assert [row.edition_id for row in rows] == sorted(
+        row.edition_id for row in rows
+    )
+
+    live = by_slug["published"]
+    assert live.project_id == project_id
+    assert live.project_slug == project.slug
+    assert live.date_deleted is None
+    assert live.current_build_id == live_build.id
+    assert live.current_build_public_id == live_build.public_id
+    assert live.current_build_storage_prefix is not None
+    assert live.current_build_date_deleted is None
+    assert live.current_build_date_purged is None
+
+    empty = by_slug["pointerless"]
+    assert empty.current_build_id is None
+    assert empty.current_build_public_id is None
+    assert empty.current_build_storage_prefix is None
+
+    dead = by_slug["tombstoned"]
+    assert dead.date_deleted is not None
+    assert dead.current_build_id == purged_build.id
+    assert dead.current_build_date_deleted is not None
+    assert dead.current_build_date_purged is not None
+
+
+@pytest.mark.asyncio
+async def test_list_org_editions_for_reconcile_is_org_scoped(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Another organization's editions never enter one org's tick."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="mine",
+                title="Mine",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        org_store = OrganizationStore(session=db_session, logger=logger)
+        project_store = ProjectStore(session=db_session, logger=logger)
+        other_org = await org_store.create(
+            OrganizationCreate(
+                slug="other-ed-org",
+                title="Other Ed Org",
+                base_domain="other-ed.example.com",
+            )
+        )
+        other_project = await project_store.create(
+            org_id=other_org.id,
+            data=ProjectCreate(
+                slug="other-ed-proj",
+                title="Other Ed Project",
+                source_url="https://example.com/example/other",
+            ),
+        )
+        await edition_store.create(
+            project_id=other_project.id,
+            data=EditionCreate(
+                slug="theirs",
+                title="Theirs",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        rows = await edition_store.list_org_editions_for_reconcile(
+            org_id=org_id
+        )
+
+    assert [row.edition_slug for row in rows] == ["mine"]

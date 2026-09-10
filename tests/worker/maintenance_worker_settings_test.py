@@ -18,6 +18,7 @@ from docverse_server.worker.functions import (
     build_processing_reaper,
     dashboard_build_reaper,
     dashboard_sync_reaper,
+    edition_reconcile,
     inventory_census,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
@@ -764,3 +765,17 @@ def test_default_worker_does_not_register_purgatory_cleanup() -> None:
         if isinstance(job, CronJob)
     }
     assert purgatory_cleanup_dispatcher not in coroutines
+
+
+def test_edition_reconcile_registered_single_attempt() -> None:
+    """The per-org reconciler carries the pool timeout, one attempt.
+
+    A retry would re-plan the org from scratch and re-enqueue every
+    action the first attempt already applied, because the plan lives in
+    the database rather than in the job. ``max_tries=1`` leaves recovery
+    to the next tick, which re-plans from current state and finds the
+    already-enqueued pairs holding live publish jobs.
+    """
+    per_org = _function_by_coroutine(edition_reconcile)
+    assert per_org.timeout_s == float(_config.maintenance_job_timeout_seconds)
+    assert per_org.max_tries == 1

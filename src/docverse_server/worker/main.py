@@ -52,6 +52,7 @@ from .functions import (
     dashboard_build_reaper,
     dashboard_sync,
     dashboard_sync_reaper,
+    edition_reconcile,
     git_ref_audit,
     git_ref_audit_discovery,
     inventory_census,
@@ -750,6 +751,20 @@ class MaintenanceWorkerSettings:
         ),
         func(
             instrument_arq_task(purgatory_cleanup),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
+        # The ``edition_reconcile`` per-org pass (PRD #612). Its
+        # dispatcher and reaper land with tasks #615 and #617; this
+        # registration is what lets the job run at all, and what an
+        # operator uses to re-drive one org by hand in the meantime.
+        # ``max_tries=1`` because the plan lives in the database, not in
+        # the job: a retry would re-plan the org and re-enqueue every
+        # action the first attempt already applied. Recovery is the next
+        # tick, which re-plans from current state and finds those pairs
+        # holding live publish jobs.
+        func(
+            instrument_arq_task(edition_reconcile),
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),

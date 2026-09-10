@@ -18,10 +18,13 @@ recoverable rows behind rather than silently dropping the publish.
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.metrics import EditionPublishTrigger
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -71,6 +74,7 @@ async def enqueue_publish_for_edition(
     build_id: int,
     build_public_id: str,
     keeper_sync_run_id: int | None = None,
+    trigger_override: EditionPublishTrigger | None = None,
 ) -> PublishEnqueueResult:
     """Drive one ``(edition, build)`` pair through the publish path.
 
@@ -100,7 +104,17 @@ async def enqueue_publish_for_edition(
     split: a Phase B failure leaves the DB rows in a single recoverable
     shape (edition + history pending, child ``QueueJob`` queued without
     a ``backend_job_id``) that a future reconciliation pass can observe
-    and resolve, instead of silently dropping the publish.
+    and resolve, instead of silently dropping the publish. That pass is
+    the ``edition_reconcile`` loop (PRD #612), and ``trigger_override``
+    is how it labels what it re-drives.
+
+    ``trigger_override`` rides in the payload under the key ``trigger``,
+    which ``publish_edition`` already consults when classifying the
+    ``EditionPublishedEvent`` for a job with no ``keeper_sync_run_id``.
+    It is omitted from the payload entirely when ``None`` so the
+    ordinary fan-out keeps sending exactly the payload it always sent
+    and falls through to the ``build`` default; spelling the default out
+    would put a value in the payload that no caller chose.
     """
     async with session.begin():
         await edition_store.set_publish_status(
@@ -127,19 +141,19 @@ async def enqueue_publish_for_edition(
         child_job_id = child_job.id
         child_public_id = serialize_base32_id(child_job.public_id)
 
-    enqueued = await queue_backend.enqueue(
-        "publish_edition",
-        {
-            "org_id": org_id,
-            "project_slug": project_slug,
-            "edition_id": edition_id,
-            "edition_slug": edition_slug,
-            "build_id": build_id,
-            "build_public_id": build_public_id,
-            "queue_job_id": child_job_id,
-            "queue_job_public_id": child_public_id,
-        },
-    )
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "project_slug": project_slug,
+        "edition_id": edition_id,
+        "edition_slug": edition_slug,
+        "build_id": build_id,
+        "build_public_id": build_public_id,
+        "queue_job_id": child_job_id,
+        "queue_job_public_id": child_public_id,
+    }
+    if trigger_override is not None:
+        payload["trigger"] = trigger_override.value
+    enqueued = await queue_backend.enqueue("publish_edition", payload)
     async with session.begin():
         await queue_job_store.set_backend_job_id(
             child_job_id, enqueued.id, queue_name=enqueued.queue_name

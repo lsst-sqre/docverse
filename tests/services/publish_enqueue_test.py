@@ -39,6 +39,7 @@ from docverse_server.domain.base32id import (
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
+from docverse_server.metrics import EditionPublishTrigger
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
 )
@@ -51,6 +52,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from tests.support.arq_testing import get_jobs_by_name
 
 _HASH = "sha256:" + "a" * 64
 _config = Configuration()
@@ -279,3 +281,113 @@ async def test_enqueue_publish_for_edition_reuses_existing_history(
 
             entries = await history_store.list_by_edition(edition_id)
             assert len(entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_carries_trigger_override(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A caller's trigger reaches the arq payload as ``trigger``.
+
+    ``publish_edition`` classifies the ``EditionPublishedEvent``'s
+    trigger from the payload key ``trigger`` when the job carries no
+    ``keeper_sync_run_id``. The reconciliation loop (PRD #612) re-drives
+    publishes that some *other* flow originally lost, so without this
+    they would all be attributed to the ordinary build fan-out and the
+    metrics could never separate a first publish from a repair.
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    async for session in db_session_dependency():
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+            trigger_override=EditionPublishTrigger.reconcile,
+        )
+
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert jobs[0].kwargs["payload"]["trigger"] == "reconcile"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_omits_absent_trigger(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Without an override the payload carries no ``trigger`` key.
+
+    ``build`` is ``publish_edition``'s default classification, so the
+    ordinary fan-out must keep sending the payload it always sent
+    rather than spelling the default out.
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    async for session in db_session_dependency():
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+        )
+
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert "trigger" not in jobs[0].kwargs["payload"]

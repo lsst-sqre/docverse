@@ -558,6 +558,28 @@ class Configuration(BaseSettings):
         ),
     )
 
+    edition_reconcile_max_actions_per_job: int = Field(
+        100,
+        ge=1,
+        title="Actions one edition_reconcile job may apply per tick",
+        description=(
+            "Cap on the publishes a single per-org ``edition_reconcile``"
+            " job re-drives before reporting ``capped`` and stopping."
+            " Every action is a ``publish_edition`` enqueue onto the"
+            " default pool, so the cap is really a bound on how much"
+            " publish load one reconciliation tick can add: an"
+            " organization that has drifted badly (a CDN namespace"
+            " emptied by hand, say) converges over several ticks"
+            " instead of flooding the publishing queue in one. Nothing"
+            " is lost to it — the work list is ordered by edition id,"
+            " so the next tick re-plans and resumes from the same"
+            " prefix once those pairs converge. The floor of 1 is"
+            ' deliberate: an operator reaching for "stop reconciling"'
+            " wants the dispatcher's feature flag, whereas a cap of 0"
+            " would run a job per org that plans work and applies none."
+        ),
+    )
+
     purgatory_cleanup_cron_hour: int = Field(
         3,
         title="UTC hour for the daily purgatory_cleanup dispatcher cron",

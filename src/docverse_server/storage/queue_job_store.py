@@ -9,7 +9,7 @@ from typing import Any
 import structlog
 from redis.exceptions import RedisError
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import ColumnExpressionArgument, select, update
+from sqlalchemy import ColumnExpressionArgument, and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -762,6 +762,48 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         return result.first() is not None
+
+    async def list_live_publish_pairs(
+        self, *, org_id: int
+    ) -> set[tuple[int, int]]:
+        """Return the ``(edition_id, build_id)`` pairs a publish still holds.
+
+        The edition reconciler's in-flight gate (PRD #612). It asks the
+        one question that separates "this pair is drifting" from "this
+        pair is mid-publish": is a ``publish_edition`` job for it
+        actually on a queue right now?
+
+        "Live" is deliberately narrower than "not terminal". A ``queued``
+        row whose ``backend_job_id`` is still NULL is exactly the
+        lost-Phase-B shape ``enqueue_publish_for_edition`` warns about —
+        the database rows committed, the arq enqueue never happened —
+        and it is the single commonest thing the reconciler exists to
+        re-drive. Counting it as live would make the reconciler skip
+        forever the pairs it was written to rescue. So live means
+        ``in_progress``, or ``queued`` with a backend job id written
+        back.
+
+        Rows with a NULL ``edition_id`` or ``build_id`` cannot name a
+        pair and are excluded; every ``publish_edition`` row this
+        codebase writes carries both.
+        """
+        stmt = select(SqlQueueJob.edition_id, SqlQueueJob.build_id).where(
+            SqlQueueJob.org_id == org_id,
+            SqlQueueJob.kind == JobKind.publish_edition.value,
+            SqlQueueJob.edition_id.is_not(None),
+            SqlQueueJob.build_id.is_not(None),
+            or_(
+                SqlQueueJob.status == JobStatus.in_progress.value,
+                and_(
+                    SqlQueueJob.status == JobStatus.queued.value,
+                    SqlQueueJob.backend_job_id.is_not(None),
+                ),
+            ),
+        )
+        result = await self._session.execute(stmt)
+        return {
+            (edition_id, build_id) for edition_id, build_id in result.all()
+        }
 
     async def list_by_org(
         self,

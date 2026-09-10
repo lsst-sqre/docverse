@@ -4268,4 +4268,148 @@ def test_active_job_unique_indexes_cover_every_mutex() -> None:
         "idx_queue_jobs_git_ref_audit_active_uq",
         "idx_queue_jobs_dashboard_build_active_uq",
         "idx_queue_jobs_purgatory_cleanup_active_uq",
+        "idx_queue_jobs_edition_reconcile_active_uq",
     } == _ACTIVE_JOB_UNIQUE_INDEXES
+
+
+async def _seed_reconcile_org(
+    db_session: AsyncSession,
+) -> tuple[int, int, list[int]]:
+    """Seed one org, one project and three editions for the pair query.
+
+    Returns the org id, the project id, and the three edition ids.
+    """
+    logger = structlog.get_logger("docverse")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    org = await org_store.create(
+        OrganizationCreate(
+            slug="live-pairs-org",
+            title="Live Pairs",
+            base_domain="live-pairs.example.com",
+        )
+    )
+    project = await proj_store.create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug="live-pairs-proj",
+            title="Live Pairs Project",
+            source_url="https://example.com/example/live-pairs",
+        ),
+    )
+    edition_ids = []
+    for index in range(3):
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=f"live-pairs-{index}",
+                title=f"Live Pairs {index}",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        edition_ids.append(edition.id)
+    return org.id, project.id, edition_ids
+
+
+@pytest.mark.asyncio
+async def test_list_live_publish_pairs_reports_only_live_jobs(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Only an in-flight publish counts as holding its pair.
+
+    The reconciler skips a pair whose publish is genuinely in flight,
+    and the definition of "in flight" has to be narrower than "not
+    terminal": a ``queued`` row with a NULL ``backend_job_id`` is
+    precisely the lost-Phase-B shape the reconciler exists to re-drive,
+    so it must *not* read as live.
+    """
+    async with db_session.begin():
+        org_id, project_id, edition_ids = await _seed_reconcile_org(db_session)
+        in_progress = await store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[0],
+            build_id=1001,
+        )
+        await store.set_backend_job_id(
+            in_progress.id, "arq-1", queue_name="docverse"
+        )
+        await store.start_if_queued(in_progress.id)
+        queued_with_backend = await store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[1],
+            build_id=1002,
+        )
+        await store.set_backend_job_id(
+            queued_with_backend.id, "arq-2", queue_name="docverse"
+        )
+        # Lost Phase B: committed row, never enqueued.
+        await store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[2],
+            build_id=1003,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        pairs = await store.list_live_publish_pairs(org_id=org_id)
+
+    assert pairs == {
+        (edition_ids[0], 1001),
+        (edition_ids[1], 1002),
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_live_publish_pairs_ignores_other_orgs_and_kinds(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Terminal rows, other kinds, and other orgs are all excluded."""
+    async with db_session.begin():
+        org_id, project_id, edition_ids = await _seed_reconcile_org(db_session)
+        completed = await store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[0],
+            build_id=2001,
+        )
+        await store.set_backend_job_id(
+            completed.id, "arq-3", queue_name="docverse"
+        )
+        await store.start_if_queued(completed.id)
+        await store.complete(completed.id)
+        other_kind = await store.create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            project_id=project_id,
+            edition_id=edition_ids[1],
+            build_id=2002,
+        )
+        await store.set_backend_job_id(
+            other_kind.id, "arq-4", queue_name="docverse"
+        )
+        other_org = await store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id + 9999,
+            edition_id=edition_ids[2],
+            build_id=2003,
+        )
+        await store.set_backend_job_id(
+            other_org.id, "arq-5", queue_name="docverse"
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        pairs = await store.list_live_publish_pairs(org_id=org_id)
+
+    assert pairs == set()
