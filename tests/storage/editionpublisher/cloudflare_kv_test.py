@@ -14,6 +14,7 @@ from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
 from docverse_server.storage.editionpublisher import (
     CloudflareKvEditionPublisher,
+    CloudflareKvReadError,
 )
 
 
@@ -635,3 +636,152 @@ async def test_get_pointers_raises_on_persistent_5xx() -> None:
     errors = [entry for entry in logs if entry["log_level"] == "error"]
     assert len(errors) == 1
     assert errors[0]["attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_raises_when_result_lacks_values() -> None:
+    """A 2xx whose ``result`` carries no ``values`` map is a failure.
+
+    Reading the absent map as "no key is published" is the same lie a
+    half-read view would tell: every ``published`` edition would come
+    back as ``pointer_missing`` and the tick would re-drive the whole
+    org's publishes, once every half hour, for as long as Cloudflare
+    kept answering in that shape.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "result": {}})
+
+    with capture_logs() as logs:
+        publisher, client = _make_publisher(httpx.MockTransport(handler))
+        async with client, publisher as pub:
+            with pytest.raises(CloudflareKvReadError) as excinfo:
+                await pub.get_pointers(["myproject/main", "myproject/v1"])
+
+    assert excinfo.value.key_count == 2
+    assert excinfo.value.missing_field == "result.values"
+    assert "2 keys" in str(excinfo.value)
+    assert "result.values" in str(excinfo.value)
+    errors = [entry for entry in logs if entry["log_level"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["missing_field"] == "result.values"
+    assert errors[0]["response_body"] == '{"success":true,"result":{}}'
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_raises_when_values_is_not_an_object() -> None:
+    """``result.values`` that is not a map cannot be read key by key."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"success": True, "result": {"values": []}}
+        )
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        with pytest.raises(CloudflareKvReadError) as excinfo:
+            await pub.get_pointers(["myproject/main"])
+
+    assert excinfo.value.missing_field == "result.values"
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_raises_when_body_is_not_an_object() -> None:
+    """A 2xx body that is not a JSON object is malformed, not empty."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["not", "an", "object"])
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        with pytest.raises(CloudflareKvReadError) as excinfo:
+            await pub.get_pointers(["myproject/main"])
+
+    assert excinfo.value.missing_field == "body"
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_raises_when_body_is_not_json() -> None:
+    """An HTML error page served with a 2xx is a malformed body too.
+
+    A proxy in front of Cloudflare can answer ``200 text/html``; letting
+    the ``json()`` decode error escape would route the failure as an
+    untyped ``ValueError`` with no namespace or key count attached.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>maintenance</html>")
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        with pytest.raises(CloudflareKvReadError) as excinfo:
+            await pub.get_pointers(["myproject/main"])
+
+    assert excinfo.value.missing_field == "body"
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_malformed_body_reads_no_further_chunks() -> None:
+    """The first malformed chunk takes the whole read with it."""
+    requests: list[httpx.Request] = []
+    keys = [f"myproject/e{index}" for index in range(150)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"success": True})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        with pytest.raises(CloudflareKvReadError) as excinfo:
+            await pub.get_pointers(keys)
+
+    assert len(requests) == 1
+    assert excinfo.value.key_count == 100
+    assert excinfo.value.missing_field == "result"
+
+
+def test_kv_read_error_to_sentry_keeps_the_body_out_of_the_message() -> None:
+    """The namespace and shape are tags; the body is context only.
+
+    ``str(exc)`` is copied into the failing job's ``errors['message']``,
+    becomes the Sentry issue title, and is what the Slack message
+    renders — so the unbounded response body belongs in the context a
+    triager opens, not in any of those three.
+    """
+    exc = CloudflareKvReadError(
+        namespace_id="ns-456",
+        key_count=100,
+        missing_field="result.values",
+        response_body='{"success": true, "result": {}}',
+    )
+
+    info = exc.to_sentry()
+
+    assert info.tags == {
+        "kv_namespace_id": "ns-456",
+        "kv_key_count": "100",
+        "kv_missing_field": "result.values",
+    }
+    assert info.contexts["cloudflare_kv_read"] == {
+        "namespace_id": "ns-456",
+        "key_count": 100,
+        "missing_field": "result.values",
+        "response_body": '{"success": true, "result": {}}',
+    }
+    assert '{"success": true' not in exc.message
+    assert str(exc) == exc.message
+
+
+def test_kv_read_error_truncates_a_large_body() -> None:
+    """A megabyte of HTML does not ride into the Sentry envelope."""
+    exc = CloudflareKvReadError(
+        namespace_id="ns-456",
+        key_count=1,
+        missing_field="body",
+        response_body="x" * (64 * 1024),
+    )
+
+    body = exc.to_sentry().contexts["cloudflare_kv_read"]["response_body"]
+
+    assert body is not None
+    assert len(body) < 64 * 1024

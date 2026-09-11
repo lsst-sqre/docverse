@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Literal, Self, override
 
 import httpx
 import structlog
+from safir.slack.sentry import SentryEventInfo
 
 from docverse_server.domain.cache_profile import (
     CACHE_PROFILE_LONG,
@@ -18,6 +19,7 @@ from docverse_server.domain.edition_pointer import (
     EditionPointer,
     edition_pointer_key,
 )
+from docverse_server.exceptions import DocverseSlackException
 
 from .._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
@@ -25,9 +27,33 @@ from .._http_retry import (
     retry_request,
 )
 
-__all__ = ["CloudflareKvEditionPublisher"]
+__all__ = [
+    "CloudflareKvEditionPublisher",
+    "CloudflareKvReadError",
+    "MalformedKvReadField",
+]
 
 _HTTP_NOT_FOUND = 404
+
+_MAX_BODY_BYTES = 4 * 1024
+"""Cap on the response-body bytes a malformed-read event carries.
+
+A 2xx that is not the documented shape can be anything — a proxy's HTML
+maintenance page, a full JSON payload — so the snippet Sentry keeps is
+truncated at the constructor rather than left for Sentry to cut. Four
+KiB is the same bar the LTD client sets, and is enough for the leading
+"what did Cloudflare actually say" fragment.
+"""
+
+MalformedKvReadField = Literal["body", "result", "result.values"]
+"""Which part of a ``bulk/get`` response failed to match the contract.
+
+Low cardinality by construction — there are exactly three places the
+documented ``{"result": {"values": {...}}}`` shape can break — so it is
+worth a Sentry tag: "Cloudflare stopped sending ``values``" and "a proxy
+replaced the body with HTML" are different outages with different
+owners, and the tag is what tells them apart at a glance.
+"""
 
 _BULK_GET_CHUNK_SIZE = 100
 """Keys per ``bulk/get`` request.
@@ -37,6 +63,112 @@ editions than this is ordinary, so the read-back chunks rather than
 failing — and chunking at exactly the limit keeps the number of
 round-trips (and of shared API rate-limit slots consumed) minimal.
 """
+
+
+def _truncate_body(body: str) -> str:
+    """Cap ``body`` at :data:`_MAX_BODY_BYTES` UTF-8 bytes.
+
+    Truncation is measured in bytes rather than characters so the cap
+    holds for a multi-byte body; ``errors="ignore"`` drops any trailing
+    partial code point so the result is always well-formed text.
+    """
+    encoded = body.encode("utf-8")
+    if len(encoded) <= _MAX_BODY_BYTES:
+        return body
+    return encoded[:_MAX_BODY_BYTES].decode("utf-8", errors="ignore")
+
+
+class CloudflareKvReadError(DocverseSlackException):
+    """Raised when a 2xx ``bulk/get`` body is not the documented shape.
+
+    The read-back is the reconciler's only window onto the edge, and the
+    reconciler acts on absence: a key with no pointer is exactly what
+    makes it re-drive a publish. So a body this client cannot read is not
+    "no keys are published" — it is "the question was not answered", and
+    the two must never collapse. Reading a malformed body as an empty
+    map reported every ``published`` edition as ``pointer_missing`` and
+    re-drove up to a whole org's publishes every tick, silently, for as
+    long as Cloudflare kept answering in that shape.
+
+    The override earns its keep the same way
+    :class:`~docverse_server.storage.cdncachepurger.CloudflareCachePurgeError`'s
+    does: every malformed read raises this one type from this one call
+    site, so the stack trace tells a triager nothing they do not already
+    know. What they need is which namespace answered, how much of the
+    read it took down, and *how* the body broke — a missing ``values``
+    map is a Cloudflare API change, a non-JSON body is something in
+    front of Cloudflare — which are the three tags. The body itself is
+    unbounded, so it rides in the context (truncated here, not by
+    Sentry) and stays out of ``str(exc)``, which becomes the failing
+    job's ``errors['message']``, the Sentry issue title, and the Slack
+    message.
+
+    Parameters
+    ----------
+    namespace_id
+        KV namespace the malformed answer came from.
+    key_count
+        Keys in the chunk whose read failed, so the event says how much
+        of the org's read-back this took down.
+    missing_field
+        Which part of the documented shape was absent or the wrong type.
+    response_body
+        Cloudflare's body, truncated to :data:`_MAX_BODY_BYTES`.
+    message
+        Overrides the rendered default when the caller wants its own.
+    """
+
+    def __init__(
+        self,
+        *,
+        namespace_id: str | None = None,
+        key_count: int = 0,
+        missing_field: MalformedKvReadField = "body",
+        response_body: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        if message is None:
+            message = self._format_message(
+                key_count=key_count, missing_field=missing_field
+            )
+        super().__init__(message)
+        self.namespace_id = namespace_id
+        self.key_count = key_count
+        self.missing_field = missing_field
+        self.response_body = (
+            _truncate_body(response_body)
+            if response_body is not None
+            else None
+        )
+
+    @override
+    def to_sentry(self) -> SentryEventInfo:
+        info = super().to_sentry()
+        if self.namespace_id is not None:
+            info.tags["kv_namespace_id"] = self.namespace_id
+        info.tags["kv_key_count"] = str(self.key_count)
+        info.tags["kv_missing_field"] = self.missing_field
+        context: dict[str, Any] = {
+            "namespace_id": self.namespace_id,
+            "key_count": self.key_count,
+            "missing_field": self.missing_field,
+            "response_body": self.response_body,
+        }
+        info.contexts["cloudflare_kv_read"] = context
+        return info
+
+    @staticmethod
+    def _format_message(
+        *, key_count: int, missing_field: MalformedKvReadField
+    ) -> str:
+        plural = "key" if key_count == 1 else "keys"
+        what = (
+            "the response body" if missing_field == "body" else missing_field
+        )
+        return (
+            f"Cloudflare KV bulk read of {key_count} {plural} returned a "
+            f"malformed body: {what} is missing or not a JSON object"
+        )
 
 
 def _decode_pointer(value: Any) -> EditionPointer | None:
@@ -316,6 +448,10 @@ class CloudflareKvEditionPublisher:
 
         Raises
         ------
+        CloudflareKvReadError
+            If a chunk's 2xx body is not a JSON object, carries no
+            ``result`` object, or carries no ``result.values`` object.
+            Such a body is a failed read, not an edge with no pointers.
         httpx.HTTPStatusError
             If Cloudflare answers a chunk with a non-2xx status that a
             retry cannot fix, or keeps answering with a retryable one
@@ -334,7 +470,14 @@ class CloudflareKvEditionPublisher:
         return pointers
 
     async def _read_chunk(self, chunk: Sequence[str]) -> Mapping[str, Any]:
-        """Read one chunk of keys, returning Cloudflare's value map."""
+        """Read one chunk of keys, returning Cloudflare's value map.
+
+        Raises
+        ------
+        CloudflareKvReadError
+            If the 2xx body is not the documented
+            ``{"result": {"values": {...}}}`` shape.
+        """
         url = f"{self._namespace_url}/bulk/get"
         logger = self._logger.bind(key_count=len(chunk))
 
@@ -362,7 +505,47 @@ class CloudflareKvEditionPublisher:
             )
         outcome.response.raise_for_status()
 
-        payload = outcome.response.json()
-        result = payload.get("result") if isinstance(payload, dict) else None
-        values = result.get("values") if isinstance(result, dict) else None
-        return values if isinstance(values, dict) else {}
+        # Every departure from ``{"result": {"values": {...}}}`` is a
+        # failure, never an empty map: see CloudflareKvReadError for why
+        # "the edge has no pointers" is the one answer this must not
+        # invent.
+        try:
+            payload = outcome.response.json()
+        except ValueError:
+            raise self._malformed(chunk, "body", outcome.response) from None
+        if not isinstance(payload, dict):
+            raise self._malformed(chunk, "body", outcome.response)
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise self._malformed(chunk, "result", outcome.response)
+        values = result.get("values")
+        if not isinstance(values, dict):
+            raise self._malformed(chunk, "result.values", outcome.response)
+        return values
+
+    def _malformed(
+        self,
+        chunk: Sequence[str],
+        missing_field: MalformedKvReadField,
+        response: httpx.Response,
+    ) -> CloudflareKvReadError:
+        """Log a malformed ``bulk/get`` answer and build its exception.
+
+        Logged here rather than at the raise sites so the body reaches
+        the pod logs exactly once however the shape broke, and beside
+        the ``ERROR`` a non-2xx already writes — a 200 that cannot be
+        read is the same operational event as a 500.
+        """
+        self._logger.error(
+            "Cloudflare KV bulk read returned a malformed body",
+            key_count=len(chunk),
+            missing_field=missing_field,
+            status_code=response.status_code,
+            response_body=response.text,
+        )
+        return CloudflareKvReadError(
+            namespace_id=self._namespace_id,
+            key_count=len(chunk),
+            missing_field=missing_field,
+            response_body=response.text,
+        )

@@ -202,6 +202,18 @@ planned and could not apply; the editions behind them are named in
 `failed_editions`, and the job ends `completed_with_errors`. A failure
 on one edition never aborts the rest of the org.
 
+A failed *read-back*, though, ends the whole tick: the row is `failed`
+with no `progress`, and nothing was republished. That is deliberate.
+The loop acts on absence — a key with no pointer is what makes it
+re-drive a publish — so a read it cannot trust is never reported as an
+edge with no pointers. Both ways the read can break do this: a non-2xx
+Cloudflare keeps returning raises `httpx.HTTPStatusError`, and a 2xx
+whose body is not the documented `{"result": {"values": {...}}}` shape
+raises `CloudflareKvReadError`, whose Sentry event tags the namespace,
+the chunk's key count, and which part of the shape was missing. Either
+way the next tick re-plans from current state, so a transient edge
+failure costs one pass, not a repair.
+
 ### The metrics event
 
 Every tick publishes one org-scoped `edition_reconcile_completed`
