@@ -391,24 +391,46 @@ class EditionReconcileService:
     ) -> EditionReconcilePlan:
         """Read the organization's state and run the pure planner.
 
-        The database reads share one transaction so the plan describes a
-        single consistent instant: a publish job finishing between the
-        history read and the live-job read would otherwise look like a
-        stalled pair with no job behind it, which is precisely the shape
-        the loop re-drives.
+        The reads share one transaction but **not** one snapshot: the
+        session runs at the database default of READ COMMITTED, so each
+        SELECT sees whatever had committed when it started. The order
+        the two publish-state reads are issued in is therefore
+        load-bearing, and it is live publish pairs first, history rows
+        second.
 
-        The CDN read-back cannot join that instant — it is an HTTP call
-        to somebody else's system — so it runs after the transaction
-        closes rather than holding a connection open across it. The
-        resulting skew is bounded by one round trip and is covered by
-        the grace window on both sides: a pointer that moved inside it
-        belongs to a publish far younger than ``grace``.
+        That order is the one whose skew is harmless. A publish job that
+        commits ``published`` and then completes its queue row between
+        the two reads is caught by the live read while it still holds
+        the pair, and the history row the second read then finds says
+        ``published`` — either way the pair is not a candidate. A
+        publish that *starts* in the same gap is missed by the live read
+        but shows up in history as a freshly bumped ``pending`` or
+        ``publishing`` row, which the grace window skips. Reading
+        history first inverts both: a finishing publish reads
+        ``publishing`` with no live job behind it, which is exactly the
+        ``stalled_publish`` shape, and the tick spends a redundant job
+        and a hostname purge resetting a converged pair to ``pending``.
+
+        Widening the transaction to REPEATABLE READ would buy a real
+        snapshot at the cost of serialization failures the job has no
+        retry for (``max_tries=1``), for a race the read order already
+        settles.
+
+        The CDN read-back is in neither read's snapshot — it is an HTTP
+        call to somebody else's system — so it runs after the
+        transaction closes rather than holding a connection open across
+        it. The resulting skew is bounded by one round trip and is
+        covered by the grace window on both sides: a pointer that moved
+        inside it belongs to a publish far younger than ``grace``.
         """
         async with self._session.begin():
             editions = (
                 await self._edition_store.list_org_editions_for_reconcile(
                     org_id=org.id
                 )
+            )
+            live_pairs = await self._queue_job_store.list_live_publish_pairs(
+                org_id=org.id
             )
             pairs = [
                 (edition.edition_id, edition.current_build_id)
@@ -417,9 +439,6 @@ class EditionReconcileService:
             ]
             history_rows = (
                 await self._history_store.list_by_edition_build_pairs(pairs)
-            )
-            live_pairs = await self._queue_job_store.list_live_publish_pairs(
-                org_id=org.id
             )
             publisher = None
             if org.cdn_service_label is not None:

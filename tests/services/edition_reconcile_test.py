@@ -9,7 +9,7 @@ rows out against.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -28,6 +28,7 @@ from docverse.models import (
     EditionCreate,
     EditionKind,
     JobKind,
+    JobStatus,
     OrganizationCreate,
     ProjectCreate,
     PublishStatus,
@@ -35,7 +36,11 @@ from docverse.models import (
 )
 from docverse_server.config import Configuration
 from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.edition_build_history import (
+    SqlEditionBuildHistory,
+)
 from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.edition_reconcile import EditionReconcilePlan
 from docverse_server.domain.organization import Organization
 from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
@@ -659,4 +664,229 @@ async def test_a_rival_publish_between_plan_and_apply_drops_the_republish(
     assert (
         await _publish_status(db_session, edition_id=seeded.alpha_edition_id)
         is None
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _MidFlightOrg:
+    """An org whose one edition is mid-publish when the tick starts.
+
+    Carries the rows the completion the test races in has to touch: the
+    history row a finishing publish stamps ``published`` and the
+    ``queue_jobs`` row it then completes.
+    """
+
+    org: Organization
+    edition_id: int
+    build_id: int
+    history_id: int
+    job_id: int
+
+
+async def _seed_a_publish_mid_flight(
+    db_session: AsyncSession,
+) -> _MidFlightOrg:
+    """Seed one edition whose publish is running and nearly done.
+
+    The pair reads ``publishing`` with a live ``publish_edition`` job
+    behind it, and both the edition and the history row are aged out of
+    the grace window — the shape of a publish that has been waiting on
+    the queue longer than ``RECONCILE_GRACE_WINDOW``, which is the only
+    shape in which the read order can cost anything.
+    """
+    logger = _logger()
+    org = await OrganizationStore(session=db_session, logger=logger).create(
+        OrganizationCreate(
+            slug="svc-midflight-org",
+            title="Service Midflight Org",
+            base_domain="svc-midflight.example.com",
+        )
+    )
+    project = await ProjectStore(session=db_session, logger=logger).create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug="svc-midflight-proj",
+            title="Service Midflight Project",
+            source_url="https://example.com/example/svc-midflight",
+        ),
+    )
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+    edition = await edition_store.create(
+        project_id=project.id,
+        data=EditionCreate(
+            slug="alpha",
+            title="Alpha",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "alpha"},
+        ),
+    )
+    build = await build_store.create(
+        project_id=project.id,
+        project_slug=project.slug,
+        data=BuildCreate(git_ref="alpha", content_hash=_HASH),
+        uploader="testuser",
+    )
+    await build_store.transition_status(
+        build_id=build.id, new_status=BuildStatus.processing
+    )
+    await build_store.transition_status(
+        build_id=build.id, new_status=BuildStatus.completed
+    )
+    await edition_store.set_current_build(
+        edition_id=edition.id, build_id=build.id
+    )
+    history = await history_store.record(
+        edition_id=edition.id, build_id=build.id
+    )
+    await history_store.set_publish_status(
+        history_id=history.id, status=PublishStatus.publishing
+    )
+    job = await QueueJobStore(session=db_session, logger=logger).create(
+        kind=JobKind.publish_edition,
+        org_id=org.id,
+        project_id=project.id,
+        build_id=build.id,
+        edition_id=edition.id,
+        backend_job_id="midflight-publish-job",
+        backend_queue_name=_config.arq_queue_name,
+    )
+    aged = datetime.now(tz=UTC) - timedelta(hours=1)
+    await db_session.execute(
+        update(SqlEdition)
+        .where(SqlEdition.id == edition.id)
+        .values(
+            date_updated=aged, publish_status=PublishStatus.publishing.value
+        )
+    )
+    await db_session.execute(
+        update(SqlEditionBuildHistory)
+        .where(SqlEditionBuildHistory.id == history.id)
+        .values(date_created=aged)
+    )
+    return _MidFlightOrg(
+        org=org,
+        edition_id=edition.id,
+        build_id=build.id,
+        history_id=history.id,
+        job_id=job.id,
+    )
+
+
+def _race_the_plans_first_read(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[], Awaitable[None]],
+) -> None:
+    """Commit ``mutation`` in the gap between the plan's two reads.
+
+    The plan's reads do not share a snapshot — the session runs at the
+    database default of READ COMMITTED — so whichever of the live-pairs
+    read and the history read ``_plan`` issues first, the other sees
+    anything that committed in between. Hooking the first of the two to
+    return, rather than one named method, is what makes the test a
+    statement about the *order* instead of about today's spelling of it.
+    """
+    original_pairs = QueueJobStore.list_live_publish_pairs
+    original_history = EditionBuildHistoryStore.list_by_edition_build_pairs
+    fired = False
+
+    async def _fire() -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            await mutation()
+
+    async def _pairs(
+        self: QueueJobStore, *, org_id: int
+    ) -> set[tuple[int, int]]:
+        result = await original_pairs(self, org_id=org_id)
+        await _fire()
+        return result
+
+    async def _history(
+        self: EditionBuildHistoryStore, pairs: Sequence[tuple[int, int]]
+    ) -> list[EditionBuildHistory]:
+        result = await original_history(self, pairs)
+        await _fire()
+        return result
+
+    monkeypatch.setattr(QueueJobStore, "list_live_publish_pairs", _pairs)
+    monkeypatch.setattr(
+        EditionBuildHistoryStore, "list_by_edition_build_pairs", _history
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_publish_finishing_between_the_plans_reads_is_not_re_driven(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A publish that lands mid-plan is never called a stalled publish.
+
+    A ``publish_edition`` job that was enqueued longer ago than the
+    grace window — a queue backlog, or lock contention during a
+    keeper-sync burst — commits ``published`` and then completes its
+    queue row. Reading history before live jobs would catch it at
+    exactly the wrong pair of instants: ``publishing`` with no live job,
+    which is the ``stalled_publish`` shape, and the tick would spend a
+    redundant job and a hostname purge resetting a converged pair to
+    ``pending``.
+    """
+    async with db_session.begin():
+        seeded = await _seed_a_publish_mid_flight(db_session)
+
+    async def _finish_the_publish() -> None:
+        async with db_session.begin():
+            await db_session.execute(
+                update(SqlEditionBuildHistory)
+                .where(SqlEditionBuildHistory.id == seeded.history_id)
+                .values(publish_status=PublishStatus.published.value)
+            )
+            await db_session.execute(
+                update(SqlQueueJob)
+                .where(SqlQueueJob.id == seeded.job_id)
+                .values(
+                    status=JobStatus.completed.value,
+                    date_completed=datetime.now(tz=UTC),
+                )
+            )
+
+    _race_the_plans_first_read(monkeypatch, _finish_the_publish)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq, default_queue_name=_config.arq_queue_name
+    )
+    async for session in db_session_dependency():
+        service = EditionReconcileService(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            publisher_provider=_unreachable_publisher_provider,
+            publishing_service=_publishing_service(session),
+            logger=_logger(),
+        )
+        outcome = await service.reconcile_org(seeded.org, limit=10)
+        break
+
+    assert outcome.editions_scanned == 1
+    assert outcome.republished == 0
+    assert outcome.republished_editions == []
+    assert outcome.republish_failed == 0
+    assert not outcome.has_errors
+    # The pair is held by the job the live-pairs read saw, not re-driven.
+    assert outcome.in_flight_skipped == 1
+    # Only the seeded publish row exists; the reconciler enqueued none.
+    assert (
+        await _publish_job_count(db_session, edition_id=seeded.edition_id) == 1
+    )
+    assert await _publish_status(db_session, edition_id=seeded.edition_id) == (
+        PublishStatus.publishing.value
     )
