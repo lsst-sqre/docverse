@@ -238,6 +238,42 @@ async def test_get_by_edition_and_build_found(
 
 
 @pytest.mark.asyncio
+async def test_get_by_edition_and_build_returns_most_recent_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """A duplicated pair resolves to its position-1 row.
+
+    ``record()`` appends and there is no unique constraint on
+    ``(edition_id, build_id)``, so an edition rolled back onto a build
+    it already served has two rows for the same pair. Every writer of
+    ``publish_status`` resolves the row through this lookup while the
+    reconciliation planner reads the position-ordered row, so an
+    unordered lookup lets a publish mark the stale row and leaves the
+    planner re-driving the pair on every tick.
+    """
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="dup-lookup-org"
+        )
+        older = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        newer = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        result = await history_store.get_by_edition_and_build(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        await db_session.commit()
+
+    assert older.id != newer.id
+    assert result is not None
+    assert result.position == 1
+    assert result.id == newer.id
+
+
+@pytest.mark.asyncio
 async def test_get_by_edition_and_build_not_found(
     db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,

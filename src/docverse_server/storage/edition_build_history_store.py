@@ -66,12 +66,31 @@ class EditionBuildHistoryStore:
     ) -> EditionBuildHistory | None:
         """Look up a history entry for an edition and build combination.
 
-        Returns the first match or ``None`` if the build was never
-        recorded for this edition.
+        Returns the pair's most recent row — the one with the lowest
+        ``position`` — or ``None`` if the build was never recorded for
+        this edition.
+
+        The ordering is load-bearing, not tidiness. ``record()`` appends
+        and nothing constrains ``(edition_id, build_id)`` to be unique,
+        so an edition rolled back onto a build it already served has two
+        or more rows for its current pair. Every writer of
+        ``publish_status`` resolves its row through this lookup, while
+        the reconciliation planner
+        (:func:`docverse_server.domain.edition_reconcile.plan_edition_reconcile`)
+        reads the position-ordered row from
+        :meth:`list_by_edition_build_pairs`. Handing the writers an
+        older row would put the two permanently out of step: the publish
+        would mark the stale row ``published`` while the position-1 row
+        stayed ``pending``, and every reconcile tick would re-drive a
+        publish that had already happened.
         """
-        stmt = select(SqlEditionBuildHistory).where(
-            SqlEditionBuildHistory.edition_id == edition_id,
-            SqlEditionBuildHistory.build_id == build_id,
+        stmt = (
+            select(SqlEditionBuildHistory)
+            .where(
+                SqlEditionBuildHistory.edition_id == edition_id,
+                SqlEditionBuildHistory.build_id == build_id,
+            )
+            .order_by(SqlEditionBuildHistory.position.asc())
         )
         result = await self._session.execute(stmt)
         row = result.scalars().first()

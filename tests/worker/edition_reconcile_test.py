@@ -71,6 +71,7 @@ from docverse_server.worker.functions.edition_reconcile import (
     RECONCILED_DRIFT_MESSAGE,
     edition_reconcile,
 )
+from docverse_server.worker.functions.publish_edition import publish_edition
 from tests.support.arq_testing import get_jobs_by_name
 from tests.worker.conftest import make_worker_ctx
 
@@ -688,6 +689,123 @@ async def test_edition_reconcile_leaves_a_converged_org_alone(
     assert row.progress["healthy"] == 1
     assert row.progress["republished"] == 0
     assert row.progress["unpublished"] == 0
+
+
+@pytest.mark.asyncio
+async def test_edition_reconcile_leaves_a_rolled_back_edition_alone(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An edition rolled back onto a build it already served converges.
+
+    ``EditionService.rollback`` records a second history row for a pair
+    the edition already has one for, so a rolled-back edition carries
+    two rows for its current pair. The planner reads the position-1 row,
+    so the publish the rollback enqueues has to write onto that row too.
+    When it wrote onto the older one instead, the planner saw ``pending``
+    with no live job on every single tick and re-drove a publish, a purge
+    and a Sentry warning for an edition that was already converged —
+    forever, and for exactly the editions the operations page routes
+    through rollback.
+    """
+    org_slug = "recon-cdn-rollback"
+    project_slug = "cdn-rollback-proj"
+    logger = _logger()
+    async with db_session.begin():
+        org_id, editions = await _seed_cdn_org(
+            db_session,
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slugs=("main",),
+        )
+        seeded = editions[0]
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        rollback_entry = await history_store.record(
+            edition_id=seeded.edition_id, build_id=seeded.build_id
+        )
+        await history_store.set_publish_status(
+            history_id=rollback_entry.id, status=PublishStatus.pending
+        )
+        await EditionStore(
+            session=db_session, logger=logger
+        ).set_publish_status(
+            edition_id=seeded.edition_id, status=PublishStatus.pending
+        )
+        publish_job = await QueueJobStore(
+            session=db_session, logger=logger
+        ).create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=seeded.project_id,
+            build_id=seeded.build_id,
+            edition_id=seeded.edition_id,
+            backend_job_id="test-rollback-publish-job",
+        )
+        publish_payload = {
+            "org_id": org_id,
+            "project_slug": project_slug,
+            "edition_id": seeded.edition_id,
+            "edition_slug": seeded.slug,
+            "build_id": seeded.build_id,
+            "build_public_id": seeded.build_public_id,
+            "queue_job_id": publish_job.id,
+            "queue_job_public_id": serialize_base32_id(publish_job.public_id),
+            "trigger": "rollback",
+        }
+
+    publisher = MockEditionPublisher()
+    _seed_pointers(publisher, project_slug=project_slug, editions=editions)
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_publisher_provider(publisher),
+    )
+
+    # The publish the rollback enqueued runs to completion, which is the
+    # writer whose row choice this test is really about.
+    publish_ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), job_id="test-rollback-publish-job"
+    )
+    publish_result = await publish_edition(publish_ctx, publish_payload)
+    await publish_ctx["http_client"].aclose()
+    assert publish_result == "completed"
+
+    settled = datetime.now(tz=UTC) - _SETTLED
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == seeded.edition_id)
+            .values(date_updated=settled)
+        )
+        await db_session.execute(
+            update(SqlEditionBuildHistory)
+            .where(SqlEditionBuildHistory.edition_id == seeded.edition_id)
+            .values(date_created=settled)
+        )
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    result = await edition_reconcile(
+        ctx,
+        _payload(org_id=org_id, queue_job_id=queue_job_id, org_slug=org_slug),
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert (
+        get_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == []
+    )
+    row = await _read_queue_job(queue_job_id)
+    assert row.progress is not None
+    assert row.progress["republished"] == 0
+    assert row.progress["healthy"] == 1
 
 
 @pytest.mark.asyncio

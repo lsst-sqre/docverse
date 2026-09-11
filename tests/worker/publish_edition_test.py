@@ -483,6 +483,88 @@ async def test_publish_edition_success_lifecycle(
 
 
 @pytest.mark.asyncio
+async def test_publish_edition_marks_the_most_recent_history_row(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duplicated pair's position-1 row is the one that ends published.
+
+    ``EditionService.rollback`` records a fresh history row for a pair
+    the edition already served, so the publish it enqueues runs against
+    two rows for the same ``(edition, build)``. The reconciliation
+    planner reads the position-1 row, so the publish has to mark that
+    one: marking the older row would leave the newest reading
+    ``pending`` and every reconcile tick re-driving a publish that had
+    already happened.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            older_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-rollback-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-rollback",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        # The pair as an earlier publish left it...
+        await history_store.set_publish_status(
+            history_id=older_entry.id, status=PublishStatus.published
+        )
+        # ...and the row ``rollback`` inserts when it repoints the
+        # edition back at that same build.
+        newer_entry = await history_store.record(
+            edition_id=edition.id, build_id=build.id
+        )
+        await history_store.set_publish_status(
+            history_id=newer_entry.id, status=PublishStatus.pending
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-rollback",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+        trigger=EditionPublishTrigger.rollback.value,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    async for session in db_session_dependency():
+        async with session.begin():
+            entries = await EditionBuildHistoryStore(
+                session=session, logger=logger
+            ).list_by_edition(edition.id)
+    assert [entry.position for entry in entries] == [1, 2]
+    assert entries[0].id == newer_entry.id
+    assert entries[0].publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
 async def test_publish_edition_publishes_edition_published(
     app: None,
     db_session: AsyncSession,
