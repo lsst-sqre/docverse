@@ -18,6 +18,7 @@ recoverable rows behind rather than silently dropping the publish.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,11 +76,13 @@ async def enqueue_publish_for_edition(
     build_public_id: str,
     keeper_sync_run_id: int | None = None,
     trigger_override: EditionPublishTrigger | None = None,
+    precheck: Callable[[], Awaitable[None]] | None = None,
 ) -> PublishEnqueueResult:
     """Drive one ``(edition, build)`` pair through the publish path.
 
     Phase A (single ``session.begin()`` transaction):
 
+    * Run ``precheck`` when one was supplied, before any write.
     * Set the edition's ``publish_status`` to ``pending``.
     * Look up the matching ``EditionBuildHistory`` row; if none exists
       (the keeper-sync path skips ``EditionTrackingService``, so the
@@ -128,8 +131,22 @@ async def enqueue_publish_for_edition(
     ordinary fan-out keeps sending exactly the payload it always sent
     and falls through to the ``build`` default; spelling the default out
     would put a value in the payload that no caller chose.
+
+    ``precheck`` is for a caller whose decision to enqueue was made
+    somewhere Phase A's transaction cannot see — most of all the
+    ``edition_reconcile`` loop (task #631), which picks its pairs in a
+    read transaction that has closed by the time Phase A opens and can
+    have up to a whole tick's worth of other actions in between. It runs
+    as the transaction's first statement, so a row lock it takes is held
+    across every write below and the enqueue and the condition it rests
+    on commit together. Raising from it aborts the enqueue with nothing
+    written; the exception is the caller's own and travels back to the
+    caller unchanged, because only the caller knows what a refusal there
+    means for its tally.
     """
     async with session.begin():
+        if precheck is not None:
+            await precheck()
         await edition_store.set_publish_status(
             edition_id=edition_id, status=PublishStatus.pending
         )

@@ -20,7 +20,10 @@ from pathlib import Path
 from docverse_server.config import Configuration
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
 from docverse_server.metrics import EditionReconcileCompletedEvent
-from docverse_server.services.edition_reconcile import EditionReconcileOutcome
+from docverse_server.services.edition_reconcile import (
+    EditionReconcileOutcome,
+    _ApplySkip,
+)
 from docverse_server.worker.functions.edition_reconcile import (
     RECONCILED_DRIFT_MESSAGE,
 )
@@ -71,6 +74,19 @@ def test_metrics_event_fields_documented() -> None:
     fields = set(EditionReconcileCompletedEvent.__annotations__)
     assert fields, "event declares no fields of its own"
     assert not sorted(field for field in fields if field not in page)
+
+
+def test_apply_time_skip_log_lines_documented() -> None:
+    """Both log lines the apply-time re-check emits are documented.
+
+    They are the only record that a planned repair was dropped rather
+    than applied — the counters say how many, the lines say which — so
+    an operator grepping for one has to be able to find it on the page.
+    """
+    page = _read(_RECONCILE_PAGE)
+    messages = {skip.message for skip in _ApplySkip}
+    assert messages, "the re-check reports no skips"
+    assert not sorted(message for message in messages if message not in page)
 
 
 def test_config_knobs_documented() -> None:

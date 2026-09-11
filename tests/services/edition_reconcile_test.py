@@ -9,6 +9,8 @@ rows out against.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,7 +19,7 @@ import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -25,6 +27,7 @@ from docverse.models import (
     BuildStatus,
     EditionCreate,
     EditionKind,
+    JobKind,
     OrganizationCreate,
     ProjectCreate,
     PublishStatus,
@@ -32,6 +35,8 @@ from docverse.models import (
 )
 from docverse_server.config import Configuration
 from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.edition_reconcile import EditionReconcilePlan
 from docverse_server.domain.organization import Organization
 from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.services.edition_publishing import (
@@ -366,3 +371,292 @@ async def test_plan_reads_every_history_chunk(
     assert outcome.republished == 1
     assert outcome.republished_editions == ["svc-chunk-proj/alpha"]
     assert not outcome.has_errors
+
+
+@dataclass(frozen=True, slots=True)
+class _DriftedOrg:
+    """An org seeded for the apply-time re-check tests.
+
+    Carries the ids those tests steer with: the edition whose action a
+    rival writer will invalidate, the build the plan was made against,
+    and a second completed build for the repoint to land on.
+    """
+
+    org: Organization
+    project_id: int
+    alpha_edition_id: int
+    alpha_build_id: int
+    spare_build_id: int
+
+
+async def _seed_drift_with_a_spare_build(
+    db_session: AsyncSession, *, key: str
+) -> _DriftedOrg:
+    """Seed two lost-enqueue editions plus a build nothing points at.
+
+    The same shape as :func:`_seed_two_drifted_editions` — neither
+    edition has an ``edition_build_history`` row, and both are aged out
+    of the grace window, so the tick plans a republish for each — with
+    one extra completed build in the project for a test to repoint
+    ``alpha`` onto after the plan has been made. ``beta`` is seeded
+    alongside so each test also shows that dropping one action leaves
+    the rest of the org's repairs alone.
+    """
+    logger = _logger()
+    org = await OrganizationStore(session=db_session, logger=logger).create(
+        OrganizationCreate(
+            slug=f"svc-{key}-org",
+            title=f"Service {key} Org",
+            base_domain=f"svc-{key}.example.com",
+        )
+    )
+    project = await ProjectStore(session=db_session, logger=logger).create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug=f"svc-{key}-proj",
+            title=f"Service {key} Project",
+            source_url=f"https://example.com/example/svc-{key}",
+        ),
+    )
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+
+    async def _completed_build(git_ref: str) -> int:
+        build = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(git_ref=git_ref, content_hash=_HASH),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+        return build.id
+
+    edition_ids: dict[str, int] = {}
+    build_ids: dict[str, int] = {}
+    for slug in ("alpha", "beta"):
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=slug,
+                title=slug.title(),
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": slug},
+            ),
+        )
+        build_id = await _completed_build(slug)
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build_id
+        )
+        edition_ids[slug] = edition.id
+        build_ids[slug] = build_id
+    spare_build_id = await _completed_build("alpha-next")
+    await db_session.execute(
+        update(SqlEdition)
+        .where(SqlEdition.project_id == project.id)
+        .values(date_updated=datetime.now(tz=UTC) - timedelta(hours=1))
+    )
+    return _DriftedOrg(
+        org=org,
+        project_id=project.id,
+        alpha_edition_id=edition_ids["alpha"],
+        alpha_build_id=build_ids["alpha"],
+        spare_build_id=spare_build_id,
+    )
+
+
+class _InterruptedReconcileService(EditionReconcileService):
+    """Reconciler that lets a rival writer land between plan and apply.
+
+    Both apply-time re-checks defend one window: the plan transaction
+    has closed and Phase A has not opened. Nothing the service exposes
+    reaches into that window — it is precisely where the service holds
+    nothing — so a subclass that runs the rival writer as ``_plan``
+    returns is how a test puts a writer there deterministically.
+    """
+
+    def __init__(
+        self, *, interruption: Callable[[], Awaitable[None]], **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self._interruption = interruption
+
+    async def _plan(
+        self, org: Organization, *, limit: int
+    ) -> EditionReconcilePlan:
+        plan = await super()._plan(org, limit=limit)
+        await self._interruption()
+        return plan
+
+
+def _interrupted_service(
+    session: AsyncSession,
+    *,
+    queue_backend: ArqQueueBackend,
+    interruption: Callable[[], Awaitable[None]],
+) -> _InterruptedReconcileService:
+    """Build the reconciler under test with its rival writer attached."""
+    return _InterruptedReconcileService(
+        interruption=interruption,
+        session=session,
+        edition_store=EditionStore(session=session, logger=_logger()),
+        history_store=EditionBuildHistoryStore(
+            session=session, logger=_logger()
+        ),
+        queue_job_store=QueueJobStore(session=session, logger=_logger()),
+        queue_backend=queue_backend,
+        publisher_provider=_unreachable_publisher_provider,
+        publishing_service=_publishing_service(session),
+        logger=_logger(),
+    )
+
+
+async def _publish_job_count(
+    db_session: AsyncSession, *, edition_id: int
+) -> int:
+    """Count the ``publish_edition`` queue rows written for one edition."""
+    result = await db_session.execute(
+        select(func.count())
+        .select_from(SqlQueueJob)
+        .where(
+            SqlQueueJob.kind == JobKind.publish_edition.value,
+            SqlQueueJob.edition_id == edition_id,
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def _publish_status(
+    db_session: AsyncSession, *, edition_id: int
+) -> str | None:
+    """Read an edition's ``publish_status`` column."""
+    result = await db_session.execute(
+        select(SqlEdition.publish_status).where(SqlEdition.id == edition_id)
+    )
+    return result.scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_a_repoint_between_plan_and_apply_drops_the_republish(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A superseded action is dropped rather than enqueued.
+
+    The plan captures ``(edition, build)`` and Phase A can run up to a
+    whole tick's worth of actions later. If tracking, a rollback, or
+    keeper-sync repoints the edition in that window, enqueuing the
+    planned build would put a publish of superseded content on the
+    queue — and because the edition advisory lock serializes publishes
+    by pickup order rather than enqueue order, the edge could land on
+    the old build and stay there until the next tick.
+    """
+    async with db_session.begin():
+        seeded = await _seed_drift_with_a_spare_build(
+            db_session, key="superseded"
+        )
+
+    async def _repoint() -> None:
+        async with db_session.begin():
+            await db_session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == seeded.alpha_edition_id)
+                .values(current_build_id=seeded.spare_build_id)
+            )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq, default_queue_name=_config.arq_queue_name
+    )
+    async for session in db_session_dependency():
+        service = _interrupted_service(
+            session, queue_backend=queue_backend, interruption=_repoint
+        )
+        outcome = await service.reconcile_org(seeded.org, limit=10)
+        break
+
+    assert outcome.superseded_skipped == 1
+    assert outcome.as_progress()["superseded_skipped"] == 1
+    assert outcome.republish_failed == 0
+    assert not outcome.has_errors
+    # The org's other drift is still repaired.
+    assert outcome.republished == 1
+    assert outcome.republished_editions == ["svc-superseded-proj/beta"]
+    # Phase A wrote nothing at all for the superseded pair.
+    assert (
+        await _publish_job_count(
+            db_session, edition_id=seeded.alpha_edition_id
+        )
+        == 0
+    )
+    assert (
+        await _publish_status(db_session, edition_id=seeded.alpha_edition_id)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rival_publish_between_plan_and_apply_drops_the_republish(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A pair that acquired a live publish job is not enqueued twice.
+
+    The planner's in-flight gate reads a snapshot taken in the plan
+    transaction, which closes before the read-back and every enqueue.
+    Another driver enqueuing the same pair inside that window would
+    otherwise give the pair two publish jobs, two KV writes, and two
+    ``edition_published`` events.
+    """
+    async with db_session.begin():
+        seeded = await _seed_drift_with_a_spare_build(
+            db_session, key="inflight"
+        )
+
+    async def _enqueue_a_rival_publish() -> None:
+        async with db_session.begin():
+            await QueueJobStore(session=db_session, logger=_logger()).create(
+                kind=JobKind.publish_edition,
+                org_id=seeded.org.id,
+                project_id=seeded.project_id,
+                build_id=seeded.alpha_build_id,
+                edition_id=seeded.alpha_edition_id,
+                backend_job_id="rival-publish-job",
+                backend_queue_name=_config.arq_queue_name,
+            )
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq, default_queue_name=_config.arq_queue_name
+    )
+    async for session in db_session_dependency():
+        service = _interrupted_service(
+            session,
+            queue_backend=queue_backend,
+            interruption=_enqueue_a_rival_publish,
+        )
+        outcome = await service.reconcile_org(seeded.org, limit=10)
+        break
+
+    assert outcome.in_flight_skipped == 1
+    assert outcome.as_progress()["in_flight_skipped"] == 1
+    assert outcome.republish_failed == 0
+    assert not outcome.has_errors
+    assert outcome.republished == 1
+    assert outcome.republished_editions == ["svc-inflight-proj/beta"]
+    # Only the rival's row exists; the reconciler added none.
+    assert (
+        await _publish_job_count(
+            db_session, edition_id=seeded.alpha_edition_id
+        )
+        == 1
+    )
+    assert (
+        await _publish_status(db_session, edition_id=seeded.alpha_edition_id)
+        is None
+    )

@@ -197,7 +197,19 @@ class EditionReconcileCompletedEvent(DocverseEventBase):
     """Stranded CDN keys the tick deleted."""
 
     in_flight_skipped: int
-    """Pairs a live ``publish_edition`` job still held."""
+    """Pairs a live ``publish_edition`` job still held.
+
+    Both halves of that gate: the pairs the plan's snapshot already saw
+    a job for, and the pairs that acquired one before the enqueue ran.
+    """
+
+    superseded_skipped: int
+    """Planned republishes the edition had moved off before the enqueue.
+
+    Repoints that landed after the plan was made. A steady trickle is an
+    organization whose editions move faster than one tick takes to walk
+    them — a reason to lower the per-job cap, not a failure.
+    """
 
     failed_left_alone: int
     """Pairs reading ``failed``; reported for operators, never re-driven."""

@@ -239,6 +239,7 @@ async def _publish_tick_event(
                 republished=outcome.republished,
                 unpublished=outcome.unpublished,
                 in_flight_skipped=outcome.in_flight_skipped,
+                superseded_skipped=outcome.superseded_skipped,
                 failed_left_alone=outcome.failed_left_alone,
                 unexpected_pointers=outcome.unexpected_pointers,
                 capped=outcome.capped,

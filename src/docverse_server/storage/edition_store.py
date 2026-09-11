@@ -224,6 +224,41 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def lock_current_build_id(self, *, edition_id: int) -> int | None:
+        """Read an edition's current build under an exclusive row lock.
+
+        The ``edition_reconcile`` loop's apply-time guard against acting
+        on a stale plan (task #631). The loop chooses its
+        ``(edition, build)`` pairs in a read transaction that has closed
+        long before any one of them is enqueued, so it asks this again
+        as the first statement of the enqueue's own transaction: if
+        tracking, a rollback, or keeper-sync has repointed the edition
+        meanwhile, the answer has changed and the planned action is
+        dropped.
+
+        ``FOR UPDATE`` rather than a plain read because the answer has
+        to stay true for the rest of that transaction. Every repoint on
+        this table goes through an ``UPDATE`` of this row, which blocks
+        on the lock, so the enqueue and the current build it names
+        commit together instead of a repoint slipping between the check
+        and the queue insert. The lock is taken on ``editions`` — the
+        same row, in the same order, that
+        :meth:`~docverse_server.storage.edition_build_history_store.EditionBuildHistoryStore.record`
+        locks a moment later in the same transaction — so it introduces
+        no new lock ordering.
+
+        Returns ``None`` both for an edition with no current build and
+        for an ``edition_id`` naming no row. Neither can equal the build
+        a caller planned against, which is the only question this
+        answers; the store does not own that referential check.
+        """
+        result = await self._session.execute(
+            select(SqlEdition.current_build_id)
+            .where(SqlEdition.id == edition_id)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def list_by_project_ids_and_kind(
         self, *, project_ids: list[int], kind: EditionKind
     ) -> list[Edition]:

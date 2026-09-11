@@ -14,6 +14,14 @@ path — with its edition lock, its deleted-build guard and its own
 retries — do the work. That keeps the reconciler's blast radius to
 "jobs that should already have been enqueued".
 
+Each enqueue re-tests its pair first, inside the enqueue's own
+transaction, because the plan describes an instant that has passed:
+the read transaction closed before the CDN read-back, and up to a
+whole cap's worth of other actions may have run since. An edition
+repointed in that window, or a pair another driver has meanwhile
+enqueued, is dropped rather than re-driven — see
+:meth:`EditionReconcileService._recheck_republish`.
+
 An unpublish has no such path to defer to; nothing enqueues a key
 delete, so the loop performs it, through
 :class:`~docverse_server.services.edition_publishing.EditionPublishingService`
@@ -41,6 +49,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 import sentry_sdk
@@ -97,6 +106,52 @@ enqueue the sweep would still consider in progress.
 """
 
 
+class _ApplySkip(StrEnum):
+    """Why an action the planner chose was dropped at apply time.
+
+    The apply-time half of the planner's own ``_Skip`` vocabulary, and
+    named to match it. ``in_flight`` feeds the very counter the
+    planner's ``in_flight_skipped`` bucket feeds, because a pair skipped
+    for a live publish is the same finding whichever of the two reads
+    noticed it. ``superseded`` has no plan-time sibling: the planner
+    cannot observe a repoint that happens after its own transaction
+    closed.
+    """
+
+    superseded = "superseded"
+    in_flight = "in_flight"
+
+    @property
+    def message(self) -> str:
+        """The log line this skip is reported under."""
+        if self is _ApplySkip.superseded:
+            return "Skipped a superseded edition republish"
+        return "Skipped an in-flight edition republish"
+
+
+class _StalePlanError(Exception):
+    """One planned republish no longer holds when it reaches the queue.
+
+    Raised from the re-check that
+    :func:`~docverse_server.services.publish_enqueue.enqueue_publish_for_edition`
+    runs as its Phase A transaction's first statement, so the enqueue is
+    abandoned with nothing written. Private to this module: it is a
+    decision the loop makes about its own plan, never an error anything
+    outside handles, and the helper it travels through deliberately
+    passes it back untouched.
+    """
+
+    def __init__(
+        self, skip: _ApplySkip, *, current_build_id: int | None
+    ) -> None:
+        super().__init__(f"Republish dropped at apply time: {skip.value}")
+        self.skip = skip
+        """Which of the two apply-time races dropped the action."""
+
+        self.current_build_id = current_build_id
+        """The build the edition actually pointed at under the lock."""
+
+
 @dataclass(slots=True)
 class EditionReconcileOutcome:
     """What one organization's reconciliation tick did.
@@ -133,7 +188,25 @@ class EditionReconcileOutcome:
     """Keys the tick planned to delete and could not."""
 
     in_flight_skipped: int = 0
-    """Pairs a live ``publish_edition`` job still holds."""
+    """Pairs a live ``publish_edition`` job still holds.
+
+    Counts both the pairs the planner's snapshot already saw a job for
+    and the ones that acquired one between the plan and the enqueue. The
+    two are the same finding — a publish is in progress, so the
+    reconciler stands down — and an operator reading the counter wants
+    how many pairs were mid-publish, not which of two reads noticed.
+    """
+
+    superseded_skipped: int = 0
+    """Planned republishes the edition had moved off before the enqueue.
+
+    No planner bucket corresponds: the planner cannot see this, because
+    the repoint happens after its transaction closed. Distinct from
+    :attr:`in_flight_skipped` because it accuses something different —
+    a steady trickle here is an org whose editions are re-pointed faster
+    than a tick takes to walk them, which is the read that says the
+    per-job cap wants lowering rather than that anything is broken.
+    """
 
     grace_skipped: int = 0
     """Pairs too young to tell apart from an enqueue in progress."""
@@ -211,6 +284,7 @@ class EditionReconcileOutcome:
             "unpublished": self.unpublished,
             "unpublish_failed": self.unpublish_failed,
             "in_flight_skipped": self.in_flight_skipped,
+            "superseded_skipped": self.superseded_skipped,
             "grace_skipped": self.grace_skipped,
             "failed_left_alone": self.failed_left_alone,
             "retired_build_skipped": self.retired_build_skipped,
@@ -379,8 +453,19 @@ class EditionReconcileService:
         the org's only recovery path — letting one edition abort the
         pass would strand every drift behind it until an operator
         noticed.
+
+        The action is re-tested before it is applied, in the enqueue's
+        own transaction — see :meth:`_recheck_republish`. The plan it
+        came from was made in a transaction that has since closed, and
+        up to ``limit`` other actions may have been applied since, so
+        "this pair is drifted" is a claim about a moment that has
+        passed by the time the pair reaches the queue.
         """
         label = f"{action.project_slug}/{action.edition_slug}"
+
+        async def _recheck() -> None:
+            await self._recheck_republish(org, action)
+
         try:
             await enqueue_publish_for_edition(
                 session=self._session,
@@ -396,7 +481,25 @@ class EditionReconcileService:
                 build_id=action.build_id,
                 build_public_id=action.build_public_id,
                 trigger_override=EditionPublishTrigger.reconcile,
+                precheck=_recheck,
             )
+        except _StalePlanError as stale:
+            if stale.skip is _ApplySkip.superseded:
+                outcome.superseded_skipped += 1
+            else:
+                outcome.in_flight_skipped += 1
+            self._logger.info(
+                stale.skip.message,
+                project=action.project_slug,
+                edition=action.edition_slug,
+                edition_id=action.edition_id,
+                planned_build_id=action.build_id,
+                current_build_id=stale.current_build_id,
+                build=action.build_public_id,
+                reason=action.reason.value,
+                phase="reconcile",
+            )
+            return
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
             outcome.republish_failed += 1
@@ -420,6 +523,55 @@ class EditionReconcileService:
             reason=action.reason.value,
             phase="reconcile",
         )
+
+    async def _recheck_republish(
+        self, org: Organization, action: EditionRepublish
+    ) -> None:
+        """Re-test one planned republish inside the enqueue transaction.
+
+        Runs as the first statement of
+        :func:`~docverse_server.services.publish_enqueue.enqueue_publish_for_edition`'s
+        Phase A, and raises :exc:`_StalePlanError` to abort it with
+        nothing written. Both conditions it tests are races the plan
+        cannot close on its own, because the plan's transaction commits
+        before the CDN read-back and before the first of up to ``limit``
+        enqueues:
+
+        * The edition may have been **repointed** — by tracking, by an
+          API rollback, by keeper-sync — since the pair was chosen.
+          Enqueuing the planned build then publishes superseded content,
+          and the ``EDITION_UPDATE`` advisory lock does not save it: that
+          lock serializes publish jobs by pickup order, not enqueue
+          order, so the stale job can win and leave the edge on the old
+          build until the next tick notices. The read takes a row lock,
+          so the answer holds for the rest of Phase A and a repoint
+          arriving mid-transaction waits rather than slipping past.
+        * Another driver may have **enqueued the same pair** since the
+          snapshot was read. Nothing in ``queue_jobs`` refuses a second
+          ``publish_edition`` row for a pair — the loop deliberately
+          does not add a mutex index for it — so without this the pair
+          would get two jobs, two KV writes, and two
+          ``edition_published`` events.
+
+        Order matters: an edition that has moved on is superseded
+        whatever is in flight for the build it has left, and that is the
+        more specific thing to tell an operator.
+        """
+        current_build_id = await self._edition_store.lock_current_build_id(
+            edition_id=action.edition_id
+        )
+        if current_build_id != action.build_id:
+            raise _StalePlanError(
+                _ApplySkip.superseded, current_build_id=current_build_id
+            )
+        if await self._queue_job_store.has_live_publish_job(
+            org_id=org.id,
+            edition_id=action.edition_id,
+            build_id=action.build_id,
+        ):
+            raise _StalePlanError(
+                _ApplySkip.in_flight, current_build_id=current_build_id
+            )
 
     async def _apply_unpublish(
         self,

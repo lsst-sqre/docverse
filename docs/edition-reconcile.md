@@ -68,7 +68,9 @@ The job never publishes anything itself:
   edition lock, its deleted-build guard, and its own retries — remains
   the only thing that writes a pointer. The resulting
   `edition_published` event is tagged `trigger=reconcile`, so repairs
-  are separable from ordinary publish traffic.
+  are separable from ordinary publish traffic. Each enqueue re-tests
+  the pair against current state first (see "The apply-time re-check"
+  below).
 - An **unpublish** goes through `EditionPublishingService.unpublish`,
   the same route the edition DELETE path uses, so removing a pointer
   means exactly one thing everywhere.
@@ -148,6 +150,46 @@ converge, rather than sampling a rotating window that could starve its
 tail. `capped` above zero on consecutive ticks means the org is
 drifting faster than one tick can repair.
 
+### The apply-time re-check
+
+The decision table above describes an instant that has passed by the
+time an action is applied. The plan's read transaction commits before
+the CDN read-back, and up to a whole cap's worth of other actions can
+run before any one republish reaches the queue. Two things can change
+in that window, so each republish is re-tested as the first statement
+of the transaction that enqueues it — inside
+`enqueue_publish_for_edition`'s Phase A, before it writes anything:
+
+| Re-check | Dropped when | Reported as |
+| --- | --- | --- |
+| `editions.current_build_id`, read `FOR UPDATE` | the edition no longer points at the build the plan chose | `superseded_skipped` |
+| a live `publish_edition` job for the pair (row 6's test, asked of one pair) | another driver enqueued the pair since the snapshot | `in_flight_skipped` |
+
+A dropped action writes nothing at all: the edition is not marked
+`pending`, no history row is touched, and no `queue_jobs` row is
+created. It is logged at **info** with the edition and both build ids,
+and the tick carries on with the org's remaining actions.
+
+The lock is what makes the first check hold. Every repoint on
+`editions` — tracking, an API rollback, keeper-sync — goes through an
+`UPDATE` of that row, so it waits on the lock rather than slipping
+between the check and the queue insert, and the enqueue commits
+together with the current build it names. Without it the reconciler
+could enqueue a publish of superseded content, and the `EDITION_UPDATE`
+advisory lock would not save it: that lock serializes publish jobs by
+pickup order, not enqueue order, so the stale job can win and leave the
+edge on the old build until the next tick notices.
+
+The second check is a point read, not a mutex. `queue_jobs` has no
+partial unique index for `publish_edition` and this loop deliberately
+does not add one — publish jobs for a pair are legitimately enqueued by
+several drivers, and the reconciler only needs to not be one more.
+
+`superseded_skipped` above zero is normal on a busy org and is not a
+failure: it means editions moved while the tick walked them. A steady
+trickle argues for a lower `edition_reconcile_max_actions_per_job`, so
+each tick's plan is younger when it is applied.
+
 ## Configuration
 
 | Setting | Environment variable | Default | Phalanx value |
@@ -210,6 +252,7 @@ each carries the tally as `progress`:
   "unpublished": 0,
   "unpublish_failed": 0,
   "in_flight_skipped": 0,
+  "superseded_skipped": 0,
   "grace_skipped": 1,
   "failed_left_alone": 2,
   "retired_build_skipped": 0,
@@ -253,8 +296,8 @@ event — including the ticks that found nothing, because a reconciler
 that goes quiet when it finds nothing is indistinguishable on a
 dashboard from one that stopped running. Its fields are
 `editions_scanned`, `pointers_read`, `republished`, `unpublished`,
-`in_flight_skipped`, `failed_left_alone`, `unexpected_pointers`,
-`capped`, `cdn_checked`, and `elapsed`.
+`in_flight_skipped`, `superseded_skipped`, `failed_left_alone`,
+`unexpected_pointers`, `capped`, `cdn_checked`, and `elapsed`.
 
 `project` is always null: one tick spans every project in the org. The
 project-scoped detail of a repair arrives instead as the
@@ -276,6 +319,11 @@ much of an environment's publish traffic is the system healing itself.
 - Each applied action also logs at info (`"Re-drove a drifted edition
   publish"` with its `reason`, or `"Removed a stranded edition
   pointer"`), tagged `phase="reconcile"`.
+- So does each action the apply-time re-check dropped —
+  `"Skipped a superseded edition republish"` or
+  `"Skipped an in-flight edition republish"` — both carrying
+  `edition_id`, `planned_build_id`, and the `current_build_id` read
+  under the lock.
 
 ### Sentry
 
