@@ -513,6 +513,28 @@ def test_tombstoned_edition_with_a_pointer_is_unpublished() -> None:
     assert plan.tombstoned == 0
 
 
+def test_tombstoned_edition_with_a_fieldless_pointer_is_unpublished() -> None:
+    """A key whose value is unreadable is still a key to delete.
+
+    This is what the publisher hands the planner for a KV value that is
+    not a JSON object at all — a hand edit, a legacy format, a partial
+    write — and it is the case the unpublish leg exists for: the key
+    keeps serving a deleted edition's content until something removes
+    it, and nothing else will. The planner must take the tombstone's
+    action leg on the pointer's *presence*, never on how much of it it
+    could read.
+    """
+    edition = _edition(date_deleted=SETTLED)
+    fieldless = _pointer(build_id="", prefix="")
+
+    plan = _plan([edition], pointers=_pointers((edition, fieldless)))
+
+    assert plan.republish == ()
+    assert len(plan.unpublish) == 1
+    assert plan.unpublish[0].edition_id == edition.edition_id
+    assert plan.tombstoned == 0
+
+
 def test_deleted_project_edition_with_a_pointer_is_unpublished() -> None:
     """A project's tombstone deletes its editions' keys too.
 

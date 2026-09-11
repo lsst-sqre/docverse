@@ -529,6 +529,81 @@ async def test_get_pointers_maps_null_and_absent_keys_to_none() -> None:
     assert pointers == {"myproject/nulled": None, "myproject/absent": None}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("myproject/__builds/ABC123/", id="string"),
+        pytest.param(42, id="number"),
+        pytest.param(["ABC123"], id="list"),
+        pytest.param(True, id="boolean"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_pointers_reads_a_non_object_value_as_present(
+    value: object,
+) -> None:
+    """A value that is not a JSON object is still a published key.
+
+    Only an absent key and a JSON ``null`` mean "the edge serves nothing
+    here". A hand edit, a legacy format, or a partial write can leave a
+    key whose value this client cannot read as a pointer — but the key
+    is there, and for a tombstoned edition deleting it is exactly the
+    drift the unpublish leg exists for. Reading such a value as absent
+    skipped that edition as ``tombstoned`` and left its key serving
+    deleted content on every tick.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "result": {"values": {"myproject/main": value}},
+            },
+        )
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        pointers = await pub.get_pointers(["myproject/main"])
+
+    assert pointers == {
+        "myproject/main": EditionPointer(
+            build_public_id="", r2_prefix="", cache_profile=None
+        )
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_reads_an_object_missing_every_field() -> None:
+    """An object with no fields reads as the same fieldless pointer.
+
+    The lenient field reads are what a non-object value falls through
+    to, so this pins the case they were written for: an object that has
+    lost its ``build_id`` and ``r2_prefix`` is present, unusable, and
+    decoded exactly as a non-object value is. The two shapes are the
+    same claim about the edge and must not drift apart.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "result": {"values": {"myproject/main": {}}},
+            },
+        )
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        pointers = await pub.get_pointers(["myproject/main"])
+
+    assert pointers == {
+        "myproject/main": EditionPointer(
+            build_public_id="", r2_prefix="", cache_profile=None
+        )
+    }
+
+
 @pytest.mark.asyncio
 async def test_get_pointers_reads_a_pointer_without_a_cache_profile() -> None:
     """A pointer written before the profile field is still a pointer."""

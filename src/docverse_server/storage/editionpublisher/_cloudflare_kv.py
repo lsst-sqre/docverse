@@ -187,17 +187,29 @@ def _decode_pointer(value: Any) -> EditionPointer | None:
     never match its real build, so it is republished. Rejecting the
     value outright would get the first case wrong to gain nothing in
     the second.
+
+    So a value that is not an object at all — a string, a number, a
+    list, a boolean, from a hand edit, a legacy format, or a partial
+    write — reads as a present pointer with no fields, not as an absent
+    one. It is the same claim a ``{}`` makes, and it is the truthful
+    one: the key exists, and the reconciler's unpublish leg is what
+    removes it.
     """
-    if not isinstance(value, dict):
+    if value is None:
         return None
-    raw_profile = value.get("cache_profile")
+    # Every non-object value falls through the field reads below and
+    # lands on the empty-string defaults, which is the whole point: the
+    # key's presence is what the caller asked about, and its unreadable
+    # contents can only ever fail the comparison against the database.
+    fields: Mapping[str, Any] = value if isinstance(value, dict) else {}
+    raw_profile = fields.get("cache_profile")
     profile: CacheProfile | None = None
     if raw_profile == CACHE_PROFILE_LONG:
         profile = CACHE_PROFILE_LONG
     elif raw_profile == CACHE_PROFILE_SHORT:
         profile = CACHE_PROFILE_SHORT
-    build_id = value.get("build_id")
-    r2_prefix = value.get("r2_prefix")
+    build_id = fields.get("build_id")
+    r2_prefix = fields.get("r2_prefix")
     return EditionPointer(
         build_public_id=build_id if isinstance(build_id, str) else "",
         r2_prefix=r2_prefix if isinstance(r2_prefix, str) else "",
