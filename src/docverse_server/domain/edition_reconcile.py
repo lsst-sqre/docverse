@@ -48,7 +48,9 @@ class ReconcileEdition:
     Soft-deleted editions are in scope, so :attr:`date_deleted` is a
     first-class field rather than a filter applied before the loop sees
     the row: an edition whose tombstone was committed but whose CDN key
-    outlived it is one of the drifts the loop exists to repair.
+    outlived it is one of the drifts the loop exists to repair. The
+    project's own stamp rides along for the same reason, one level up
+    — see :attr:`project_date_deleted`.
     """
 
     edition_id: int
@@ -62,6 +64,20 @@ class ReconcileEdition:
 
     project_slug: str
     """First half of the CDN key, and the publish payload's project."""
+
+    project_date_deleted: datetime | None
+    """Tombstone stamp on the owning project; ``None`` if it is live.
+
+    An edition's own :attr:`date_deleted` is not enough to tell whether
+    it is still a thing Docverse serves. The project soft-delete cascade
+    that tombstones a project's editions shipped without a backfill, so
+    a project deleted before it still owns editions reading NULL, and
+    those editions are unpublishable: ``publish_edition`` resolves the
+    project by slug through a lookup that filters tombstones, so a
+    republish raises before it can record a failure and the pair is
+    re-driven on every subsequent tick. Carrying the stamp lets the
+    planner treat the whole subtree as tombstoned instead.
+    """
 
     date_updated: datetime
     """When the edition row last changed.
@@ -88,6 +104,22 @@ class ReconcileEdition:
 
     current_build_date_purged: datetime | None
     """Reclamation stamp on the current build, if any."""
+
+    @property
+    def tombstoned(self) -> bool:
+        """Whether this edition is something Docverse still serves.
+
+        Either stamp is disqualifying: an edition under a tombstoned
+        project is as deleted as one stamped in its own right, whether
+        the cascade reached its row or the project predates the cascade.
+        The two are collapsed here rather than at the call site so no
+        future branch of the decision table can consult one and forget
+        the other.
+        """
+        return (
+            self.date_deleted is not None
+            or self.project_date_deleted is not None
+        )
 
     @property
     def current_build_retired(self) -> bool:
@@ -376,8 +408,15 @@ def _classify_edition(
     ``pointer`` is always ``None`` when ``cdn_checked`` is ``False``, so
     the pointer rules below need no second guard: an organization with
     no CDN simply never reaches a branch that a pointer could satisfy.
+
+    The tombstone leg is taken on
+    :attr:`~ReconcileEdition.tombstoned`, which covers the edition's own
+    stamp *and* its project's: a live-looking edition under a deleted
+    project cannot be republished (the publish job resolves the project
+    through a tombstone-filtering lookup and raises), so routing it
+    anywhere but here would re-drive an unsatisfiable job every tick.
     """
-    if edition.date_deleted is not None:
+    if edition.tombstoned:
         if pointer is not None:
             return EditionUnpublish(
                 edition_id=edition.edition_id,

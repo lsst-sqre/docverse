@@ -89,8 +89,8 @@ window held back.
 
 | # | Edition | Pair (`edition_build_history`) | Edge pointer | Outcome | Reported as |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `date_deleted` set | — | present | **Unpublish** — delete the key | `unpublished` |
-| 2 | `date_deleted` set | — | absent | Nothing to do | `tombstoned` |
+| 1 | `date_deleted` set, **or its project's** | — | present | **Unpublish** — delete the key | `unpublished` |
+| 2 | `date_deleted` set, **or its project's** | — | absent | Nothing to do | `tombstoned` |
 | 3 | Live, `current_build_id IS NULL` | — | present | Log only — never deleted, never published | `unexpected_pointers` |
 | 4 | Live, `current_build_id IS NULL` | — | absent | Nothing to do | `unpointed` |
 | 5 | Live, current build soft-deleted or purged | any | any | Skipped — its objects are gone or on their way out | `retired_build_skipped` |
@@ -109,6 +109,21 @@ window held back.
 `queued` **with** a `backend_job_id` written back. A `queued` row whose
 backend id is still NULL is the lost-Phase-B shape the loop exists to
 re-drive, so it deliberately does not count as live.
+
+The tombstone leg (rows 1–2) is taken on the owning project's
+`date_deleted` as readily as on the edition's own. The listing query
+deliberately does not filter deleted projects — their editions' keys are
+the most likely to be stranded — and the project soft-delete cascade
+that tombstones a project's editions shipped without a backfill, so a
+project deleted before it still owns editions reading NULL. Left in the
+live legs those editions look like the plainest drift there is and earn
+a republish nothing can satisfy: `publish_edition` resolves the project
+by slug through a lookup that filters tombstones, so the job raises
+before it can mark the pair failed, the reaper fails the row an hour
+later, and the next tick re-drives the same pair — Sentry noise and a
+burnt action-cap slot, every tick, forever. Such an edition is therefore
+unpublished if the edge still serves its key, and counted `tombstoned`
+otherwise.
 
 ### The grace window
 

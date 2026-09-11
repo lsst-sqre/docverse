@@ -10,7 +10,7 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from safir.database import create_database_engine
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -2751,6 +2751,65 @@ async def test_list_org_editions_for_reconcile_includes_tombstones(
     assert dead.current_build_id == purged_build.id
     assert dead.current_build_date_deleted is not None
     assert dead.current_build_date_purged is not None
+    assert dead.project_date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_list_org_editions_for_reconcile_marks_deleted_projects(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """An edition of a tombstoned project comes back, marked as one.
+
+    The project soft-delete cascade shipped without a backfill, so a
+    project deleted before it still owns editions whose own
+    ``date_deleted`` is NULL — reproduced here by clearing the cascade's
+    stamp back off the edition. Two things have to hold for such a row.
+    It must still be listed, since its CDN key is among the most likely
+    to be stranded and this accessor is the only thing that goes looking
+    for it. And it must carry the project's stamp, which is the only
+    evidence the planner has that re-driving its publish is futile:
+    ``publish_edition`` resolves the project through a lookup that
+    filters tombstones, so the job would raise before it could record a
+    failure and the pair would be re-driven every tick forever.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        project_store = ProjectStore(session=db_session, logger=logger)
+        project = await project_store.get_by_id(project_id)
+        assert project is not None
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="orphaned",
+                title="Orphaned",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await project_store.soft_delete(
+            org_id=org_id,
+            slug=project.slug,
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == edition.id)
+            .values(date_deleted=None)
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        rows = await edition_store.list_org_editions_for_reconcile(
+            org_id=org_id
+        )
+
+    assert [row.edition_slug for row in rows] == ["orphaned"]
+    orphan = rows[0]
+    assert orphan.date_deleted is None
+    assert orphan.project_date_deleted is not None
+    assert orphan.tombstoned is True
 
 
 @pytest.mark.asyncio

@@ -54,6 +54,7 @@ def _edition(
     build_id: int | None = 5000,
     date_updated: datetime = SETTLED,
     date_deleted: datetime | None = None,
+    project_deleted: datetime | None = None,
     build_deleted: datetime | None = None,
     build_purged: datetime | None = None,
 ) -> ReconcileEdition:
@@ -63,6 +64,7 @@ def _edition(
         edition_slug=slug,
         project_id=7,
         project_slug="proj",
+        project_date_deleted=project_deleted,
         date_updated=date_updated,
         date_deleted=date_deleted,
         current_build_id=build_id,
@@ -509,6 +511,45 @@ def test_tombstoned_edition_with_a_pointer_is_unpublished() -> None:
     assert action.edition_slug == edition.edition_slug
     assert action.project_slug == edition.project_slug
     assert plan.tombstoned == 0
+
+
+def test_deleted_project_edition_with_a_pointer_is_unpublished() -> None:
+    """A project's tombstone deletes its editions' keys too.
+
+    The cascade that tombstones a project's editions landed without a
+    backfill, so a project soft-deleted before it still owns editions
+    whose own ``date_deleted`` is NULL. Their keys are as stranded as
+    any other tombstone's — the project they belong to is gone — so the
+    planner takes the tombstone leg on the project's stamp as readily
+    as on the edition's.
+    """
+    edition = _edition(project_deleted=SETTLED)
+
+    plan = _plan([edition], pointers=_pointers((edition, _pointer())))
+
+    assert plan.republish == ()
+    assert len(plan.unpublish) == 1
+    assert plan.unpublish[0].edition_id == edition.edition_id
+    assert plan.tombstoned == 0
+
+
+def test_deleted_project_edition_without_a_pointer_is_counted() -> None:
+    """A live-looking edition under a dead project is never republished.
+
+    Without the project's stamp this edition reads as drift of the
+    plainest kind — no history row at all — and the republish it earns
+    is unsatisfiable: ``publish_edition`` resolves the project by slug
+    through a lookup that filters tombstones, so the job raises before
+    it can mark the pair failed and the next tick re-drives the same
+    pair forever.
+    """
+    edition = _edition(project_deleted=SETTLED)
+
+    plan = _plan([edition], pointers=_pointers((edition, None)))
+
+    assert plan.republish == ()
+    assert plan.unpublish == ()
+    assert plan.tombstoned == 1
 
 
 def test_unpointed_edition_with_a_pointer_is_reported_only() -> None:

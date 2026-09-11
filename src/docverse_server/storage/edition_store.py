@@ -534,7 +534,11 @@ class EditionStore:
         it repairs. Projects are joined rather than filtered on for the
         same reason — a deleted project's editions are tombstoned by the
         cascade, so excluding them here would hide exactly the keys most
-        likely to be stranded.
+        likely to be stranded. The project's own ``date_deleted`` is
+        selected alongside the edition's because the cascade shipped
+        without a backfill: a project deleted before it still owns
+        editions reading NULL, and only the project's stamp tells the
+        planner they are tombstones too.
 
         The build join is an outer join on ``current_build_id`` and
         carries the retirement stamps as well as the public id and
@@ -551,6 +555,7 @@ class EditionStore:
                 SqlEdition.slug,
                 SqlEdition.project_id,
                 SqlProject.slug.label("project_slug"),
+                SqlProject.date_deleted.label("project_date_deleted"),
                 SqlEdition.date_updated,
                 SqlEdition.date_deleted,
                 SqlEdition.current_build_id,
@@ -571,6 +576,7 @@ class EditionStore:
                 edition_slug=row.slug,
                 project_id=row.project_id,
                 project_slug=row.project_slug,
+                project_date_deleted=row.project_date_deleted,
                 date_updated=row.date_updated,
                 date_deleted=row.date_deleted,
                 current_build_id=row.current_build_id,
