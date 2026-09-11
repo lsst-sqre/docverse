@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import pytest
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +21,7 @@ from docverse.models.builds import BuildAnnotations
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
 )
+from docverse_server.storage import edition_build_history_store
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -92,6 +95,61 @@ async def _create_edition_and_builds(
         )
         build_ids.append(build.id)
     return edition.id, project.id, build_ids
+
+
+async def _seed_pointed_editions(
+    db_session: AsyncSession,
+    *,
+    count: int,
+    org_slug: str = "chunk-org",
+    project_slug: str = "chunk-proj",
+) -> list[tuple[int, int]]:
+    """Create ``count`` editions, each with its own build and history row.
+
+    Returns the ``(edition_id, build_id)`` pairs in ascending edition-id
+    order, which is the order an org-wide reconcile read builds them in.
+    """
+    logger = structlog.get_logger("docverse")
+    org = await OrganizationStore(session=db_session, logger=logger).create(
+        OrganizationCreate(
+            slug=org_slug,
+            title=f"Org {org_slug}",
+            base_domain=f"{org_slug}.example.com",
+        )
+    )
+    project = await ProjectStore(session=db_session, logger=logger).create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug=project_slug,
+            title=f"Project {project_slug}",
+            source_url="https://example.com/example/repo",
+        ),
+    )
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+
+    pairs: list[tuple[int, int]] = []
+    for i in range(count):
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=f"chunk-ed-{i}",
+                title=f"Chunk Edition {i}",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": f"v{i}"},
+            ),
+        )
+        build = await build_store.create(
+            project_id=project.id,
+            data=BuildCreate(git_ref="main", content_hash=f"sha256:{i:064x}"),
+            uploader="testuser",
+            project_slug=project_slug,
+        )
+        await history_store.record(edition_id=edition.id, build_id=build.id)
+        pairs.append((edition.id, build.id))
+    return pairs
 
 
 @pytest.mark.asyncio
@@ -350,6 +408,93 @@ async def test_list_by_edition_build_pairs_empty(
 ) -> None:
     """An empty pair list returns ``[]`` without hitting the database."""
     assert await history_store.list_by_edition_build_pairs([]) == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_chunks_wide_requests(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every pair still answers when the request outgrows one SELECT.
+
+    The pair filter binds two asyncpg parameters per pair against a
+    32,767-parameter wire ceiling, so the org-wide reconcile read on an
+    lsst-the-docs-sized organization only works if the store splits the
+    list. The constant is patched down rather than seeding the 16,384
+    editions it would otherwise take to cross it.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 2)
+    async with db_session.begin():
+        pairs = await _seed_pointed_editions(db_session, count=5)
+        rows = await history_store.list_by_edition_build_pairs(pairs)
+        await db_session.commit()
+
+    assert Counter((row.edition_id, row.build_id) for row in rows) == Counter(
+        pairs
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_chunks_keep_position_order(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pair's rows stay position-ordered inside its own chunk.
+
+    ``_latest_by_pair`` in the reconcile service keeps the first row it
+    sees for a pair, so an edition rolled back onto a build it already
+    served must hand back its position-1 row first. Chunking must not
+    reorder a pair's rows or interleave them with another chunk's.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 1)
+    async with db_session.begin():
+        pairs = await _seed_pointed_editions(
+            db_session,
+            count=3,
+            org_slug="chunk-order-org",
+            project_slug="chunk-order-proj",
+        )
+        # Roll the last edition back onto the build it already serves,
+        # giving that pair two rows, at positions 1 and 2.
+        rolled_edition_id, rolled_build_id = pairs[-1]
+        await history_store.record(
+            edition_id=rolled_edition_id, build_id=rolled_build_id
+        )
+        rows = await history_store.list_by_edition_build_pairs(pairs)
+        await db_session.commit()
+
+    rolled = [row for row in rows if row.edition_id == rolled_edition_id]
+    assert [row.position for row in rolled] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_ignores_repeated_pairs(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pair named twice is still answered once.
+
+    ``IN`` collapsed a repeated pair before the list was chunked; split
+    across two SELECTs it would be answered twice unless the store
+    de-duplicates first.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 1)
+    async with db_session.begin():
+        pairs = await _seed_pointed_editions(
+            db_session,
+            count=1,
+            org_slug="chunk-dupe-org",
+            project_slug="chunk-dupe-proj",
+        )
+        rows = await history_store.list_by_edition_build_pairs(
+            [pairs[0], pairs[0]]
+        )
+        await db_session.commit()
+
+    assert [(row.edition_id, row.build_id) for row in rows] == pairs
 
 
 @pytest.mark.asyncio

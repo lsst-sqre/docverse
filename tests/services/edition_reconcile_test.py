@@ -27,6 +27,7 @@ from docverse.models import (
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
+    PublishStatus,
     TrackingMode,
 )
 from docverse_server.config import Configuration
@@ -40,6 +41,7 @@ from docverse_server.services.edition_reconcile import (
     RECONCILE_GRACE_WINDOW,
     EditionReconcileService,
 )
+from docverse_server.storage import edition_build_history_store
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.cdncachepurger import CdnCachePurger
 from docverse_server.storage.edition_build_history_store import (
@@ -246,3 +248,121 @@ async def test_one_failed_enqueue_does_not_abort_the_organization(
     assert (
         captured.errors[0]["exception"]["values"][0]["type"] == "RuntimeError"
     )
+
+
+async def _seed_one_drifted_one_converged(
+    db_session: AsyncSession,
+) -> Organization:
+    """Seed an org whose two editions land in different history chunks.
+
+    ``alpha`` has no ``edition_build_history`` row at all — the
+    lost-enqueue shape — while ``beta``'s row already reads
+    ``published``. Both are pushed outside the grace window, so the
+    tick's verdict on each rests entirely on the history rows the store
+    hands back: a read that lost a chunk would misread ``beta`` as
+    drifted too and re-drive a publish that already happened.
+    """
+    logger = _logger()
+    org = await OrganizationStore(session=db_session, logger=logger).create(
+        OrganizationCreate(
+            slug="svc-chunk-org",
+            title="Service Chunk Org",
+            base_domain="svc-chunk.example.com",
+        )
+    )
+    project = await ProjectStore(session=db_session, logger=logger).create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug="svc-chunk-proj",
+            title="Service Chunk Project",
+            source_url="https://example.com/example/svc-chunk",
+        ),
+    )
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+    for slug in ("alpha", "beta"):
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=slug,
+                title=slug.title(),
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": slug},
+            ),
+        )
+        build = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(git_ref=slug, content_hash=_HASH),
+            uploader="testuser",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        if slug == "beta":
+            history = await history_store.record(
+                edition_id=edition.id, build_id=build.id
+            )
+            await history_store.set_publish_status(
+                history_id=history.id, status=PublishStatus.published
+            )
+    await db_session.execute(
+        update(SqlEdition).values(
+            date_updated=datetime.now(tz=UTC) - timedelta(hours=1)
+        )
+    )
+    return org
+
+
+@pytest.mark.asyncio
+async def test_plan_reads_every_history_chunk(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An org with more pairs than one chunk holds is still classified.
+
+    ``_plan`` hands the store one ``(edition_id, build_id)`` pair per
+    pointed edition, and the store answers in chunks so asyncpg's
+    32,767-parameter ceiling cannot cap how large an organization the
+    loop can reconcile. The chunk size is patched to one pair here
+    rather than seeding the ~16,384 editions it would otherwise take.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 1)
+    async with db_session.begin():
+        org = await _seed_one_drifted_one_converged(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq, default_queue_name=_config.arq_queue_name
+    )
+
+    async for session in db_session_dependency():
+        service = EditionReconcileService(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            publisher_provider=_unreachable_publisher_provider,
+            publishing_service=_publishing_service(session),
+            logger=_logger(),
+        )
+        outcome = await service.reconcile_org(org, limit=10)
+        break
+
+    assert outcome.editions_scanned == 2
+    assert outcome.healthy == 1
+    assert outcome.republished == 1
+    assert outcome.republished_editions == ["svc-chunk-proj/alpha"]
+    assert not outcome.has_errors

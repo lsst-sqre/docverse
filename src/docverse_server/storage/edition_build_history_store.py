@@ -22,6 +22,24 @@ from docverse_server.storage.pagination import (
     EditionBuildHistoryPositionCursor,
 )
 
+_PAIR_CHUNK_SIZE = 5000
+"""``(edition_id, build_id)`` pairs per ``list_by_edition_build_pairs``
+SELECT.
+
+The pair filter renders as ``tuple_(edition_id, build_id).in_(pairs)``,
+which asyncpg binds as *two* parameters per pair against a PostgreSQL
+wire protocol that caps a statement at 32,767 of them. The org-wide
+reconciliation read passes one pair per pointed edition, and an
+lsst-the-docs-sized organization has roughly 29,000 of those — so an
+unchunked query there raises ``InterfaceError`` on every tick, fails the
+``edition_reconcile`` row, and reconciles nothing while paging an
+operator twice an hour.
+
+5,000 pairs is 10,000 binds: enough headroom that a future column added
+to the filter cannot quietly reach the ceiling, while keeping even that
+organization to six round-trips.
+"""
+
 
 class EditionBuildHistoryStore:
     """Direct database operations for edition build history."""
@@ -163,46 +181,64 @@ class EditionBuildHistoryStore:
     ) -> list[EditionBuildHistory]:
         """Load history rows for specific ``(edition_id, build_id)`` pairs.
 
-        The batched form of :meth:`get_by_edition_and_build`: one
-        round-trip answers "has a publish ever been enqueued for this
+        The batched form of :meth:`get_by_edition_and_build`: a handful
+        of round-trips answer "has a publish ever been enqueued for this
         edition's *current* build?" for a whole set of editions at once.
         Used by keeper-sync's aggregate self-heal, which asks that
-        question of every ``N`` / ``N.M`` row on a project and would
-        otherwise open a transaction per aggregate. Passing an empty
-        ``pairs`` returns ``[]`` without hitting the database.
+        question of every ``N`` / ``N.M`` row on a project, and by the
+        reconciliation loop, which asks it of every pointed edition in
+        an organization; both would otherwise open a transaction per
+        row. Passing an empty ``pairs`` returns ``[]`` without hitting
+        the database.
 
         Matching is on the pair, not on the two columns independently —
         an ``edition_id IN (...) AND build_id IN (...)`` filter would
         return the cross product, reporting a history row for a pair
         that was never recorded.
 
-        Rows come back ordered by ``(edition_id, position)``, so a
+        The pair list is de-duplicated and then split into chunks of
+        `_PAIR_CHUNK_SIZE`, one SELECT each, whose results are
+        concatenated in request order. See that constant for the
+        asyncpg bind ceiling this exists to stay under. De-duplicating
+        first is what keeps the chunking invisible to callers: ``IN``
+        collapsed a repeated pair on its own, but two chunks are two
+        queries and would each answer it.
+
+        Rows for any one pair come back ordered by ``position`` — a
         caller grouping by pair and keeping the first row it sees gets
-        the edition's most recent pointer at that build. Duplicate pairs
-        need an edition to have been pointed back at a build it had
-        already left, which the aggregates this serves never do (they
-        only advance), but the order makes the pick deterministic
-        regardless.
+        the edition's most recent pointer at that build. That holds
+        across chunking because a pair belongs to exactly one chunk and
+        each chunk is ordered by ``(edition_id, position)``; only the
+        relative order of *different* pairs depends on how the list was
+        cut. Duplicate rows for a pair need an edition to have been
+        pointed back at a build it had already left, which the
+        aggregates this serves never do (they only advance), but the
+        order makes the pick deterministic regardless.
         """
         if not pairs:
             return []
-        stmt = (
-            select(SqlEditionBuildHistory)
-            .where(
-                tuple_(
+        unique_pairs = list(dict.fromkeys(pairs))
+        rows: list[EditionBuildHistory] = []
+        for start in range(0, len(unique_pairs), _PAIR_CHUNK_SIZE):
+            chunk = unique_pairs[start : start + _PAIR_CHUNK_SIZE]
+            stmt = (
+                select(SqlEditionBuildHistory)
+                .where(
+                    tuple_(
+                        SqlEditionBuildHistory.edition_id,
+                        SqlEditionBuildHistory.build_id,
+                    ).in_(chunk)
+                )
+                .order_by(
                     SqlEditionBuildHistory.edition_id,
-                    SqlEditionBuildHistory.build_id,
-                ).in_(pairs)
+                    SqlEditionBuildHistory.position.asc(),
+                )
             )
-            .order_by(
-                SqlEditionBuildHistory.edition_id,
-                SqlEditionBuildHistory.position.asc(),
+            result = await self._session.execute(stmt)
+            rows.extend(
+                EditionBuildHistory.model_validate(r) for r in result.scalars()
             )
-        )
-        result = await self._session.execute(stmt)
-        return [
-            EditionBuildHistory.model_validate(r) for r in result.scalars()
-        ]
+        return rows
 
     async def list_by_edition_with_build_info(
         self,
