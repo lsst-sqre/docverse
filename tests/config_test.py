@@ -28,6 +28,7 @@ import pytest
 from pydantic import ValidationError
 
 from docverse_server.config import (
+    EDITION_RECONCILE_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
     Configuration,
 )
@@ -193,7 +194,13 @@ def test_publish_edition_job_timeout_env_var_override(
 
 
 def test_other_reaper_thresholds_unchanged() -> None:
-    """Only keeper-sync derives; the other five reapers keep literals."""
+    """Keeper-sync and edition_reconcile derive; these five keep literals.
+
+    The two derived thresholds each back a job whose own timeout bounds
+    it (``keeper_sync_job_timeout_seconds`` and the shared
+    ``maintenance_job_timeout_seconds``). The five below backstop jobs
+    with no such pairing, so they stay flat literals.
+    """
     config = Configuration()
     assert config.lifecycle_reaper_threshold_seconds == 21600
     assert config.dashboard_build_reaper_threshold_seconds == 1800
@@ -271,11 +278,39 @@ def test_edition_reconcile_defaults() -> None:
     is republish something that was already correct — leaving it off
     would mean every environment silently keeps the drift the loop
     exists to repair.
+
+    The reaper threshold carries no literal of its own: like
+    keeper-sync's it derives from the timeout that bounds the job it
+    backstops, so it cannot be left behind when an operator moves that
+    timeout.
     """
     config = Configuration()
     assert config.edition_reconcile_enabled is True
     assert config.edition_reconcile_max_actions_per_job == 100
-    assert config.edition_reconcile_reaper_threshold_seconds == 3600
+    assert config.edition_reconcile_reaper_threshold_seconds == (
+        config.maintenance_job_timeout_seconds
+        + EDITION_RECONCILE_REAPER_MARGIN_SECONDS
+    )
+    assert config.edition_reconcile_reaper_threshold_seconds == 5400
+
+
+def test_edition_reconcile_reaper_threshold_follows_maintenance_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving the shared maintenance timeout drags the threshold with it.
+
+    ``maintenance_job_timeout_seconds`` is shared by every function on
+    the pool, so an operator raising it for one of them (the purgatory
+    sweep, say) used to leave the reconcile reaper's flat 3600 s exactly
+    at — and then below — the timeout, which let ``fail_silent_jobs``
+    reap a tick arq was still running.
+    """
+    monkeypatch.setenv("DOCVERSE_MAINTENANCE_JOB_TIMEOUT_SECONDS", "7200")
+    config = Configuration()
+    assert config.maintenance_job_timeout_seconds == 7200
+    assert config.edition_reconcile_reaper_threshold_seconds == (
+        7200 + EDITION_RECONCILE_REAPER_MARGIN_SECONDS
+    )
 
 
 def test_edition_reconcile_env_var_overrides(
@@ -289,6 +324,7 @@ def test_edition_reconcile_env_var_overrides(
     """
     monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_ENABLED", "false")
     monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "7")
+    monkeypatch.setenv("DOCVERSE_MAINTENANCE_JOB_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv(
         "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "45"
     )
@@ -296,6 +332,46 @@ def test_edition_reconcile_env_var_overrides(
     assert config.edition_reconcile_enabled is False
     assert config.edition_reconcile_max_actions_per_job == 7
     assert config.edition_reconcile_reaper_threshold_seconds == 45
+
+
+def test_edition_reconcile_reaper_threshold_override_must_clear_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override at or below the maintenance timeout is refused.
+
+    A threshold that does not strictly clear the timeout lets the reaper
+    fail a tick arq has not cancelled yet. That drops the row from
+    ``idx_queue_jobs_edition_reconcile_active_uq``, so the next
+    dispatcher tick mints a second reconciler for the same org, both
+    enqueue publishes for the unapplied tail of the first plan, and the
+    first job's later ``complete()`` raises ``InvalidJobStateError``. The
+    old flat 3600 s default sat exactly on that boundary, which is the
+    value pinned here.
+    """
+    monkeypatch.setenv(
+        "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "3600"
+    )
+    with pytest.raises(ValidationError) as excinfo:
+        Configuration()
+    message = str(excinfo.value)
+    assert "edition_reconcile_reaper_threshold_seconds" in message
+    assert "maintenance_job_timeout_seconds" in message
+
+
+def test_edition_reconcile_reaper_threshold_override_below_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor is the timeout itself, not merely a positive number.
+
+    Non-prod environments reach for seconds-long thresholds to watch the
+    reaper fire; doing that here means driving the maintenance timeout
+    down too, rather than leaving the pair inverted.
+    """
+    monkeypatch.setenv(
+        "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "45"
+    )
+    with pytest.raises(ValidationError):
+        Configuration()
 
 
 def test_edition_reconcile_cap_refuses_zero(

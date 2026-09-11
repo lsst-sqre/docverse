@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from arq.connections import RedisSettings
-from pydantic import BeforeValidator, Field, HttpUrl, SecretStr
+from pydantic import (
+    BeforeValidator,
+    Field,
+    HttpUrl,
+    SecretStr,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from safir.arq import ArqMode, build_arq_redis_settings
 from safir.logging import LogLevel, Profile
@@ -16,6 +22,7 @@ from safir.pydantic import EnvRedisDsn
 from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
 
 __all__ = [
+    "EDITION_RECONCILE_REAPER_MARGIN_SECONDS",
     "KEEPER_SYNC_REAPER_MARGIN_SECONDS",
     "Configuration",
     "config",
@@ -38,6 +45,25 @@ sized at one full ``keeper_sync_reaper`` cron gap
 """
 
 
+EDITION_RECONCILE_REAPER_MARGIN_SECONDS = 1800
+"""Grace period added to the maintenance job timeout to get the
+``edition_reconcile`` reaper threshold, in seconds.
+
+``edition_reconcile`` runs on the maintenance pool with
+``max_tries=1``, so arq has already cancelled any tick that reaches
+``maintenance_job_timeout_seconds``; a ``queue_jobs`` row still
+``in_progress`` past that point is dead. The margin only has to cover
+the finalisation window plus scheduling slop, and is sized at one full
+``edition_reconcile_reaper`` cron gap (``cron(minute={15, 45})``, so
+30 min).
+
+Reaping any earlier would fail a tick that is still running, which
+drops its row from ``idx_queue_jobs_edition_reconcile_active_uq`` and
+lets the next dispatcher tick mint a second reconciler for the same
+organization.
+"""
+
+
 def _parse_comma_separated(v: Any) -> Any:
     """Parse a comma-separated string into a list of strings."""
     if isinstance(v, str):
@@ -56,6 +82,21 @@ def _default_keeper_sync_reaper_threshold(data: dict[str, Any]) -> int:
     """
     timeout = data.get("keeper_sync_job_timeout_seconds", 3600)
     return int(timeout) + KEEPER_SYNC_REAPER_MARGIN_SECONDS
+
+
+def _default_edition_reconcile_reaper_threshold(data: dict[str, Any]) -> int:
+    """Derive the edition_reconcile reaper threshold from the pool timeout.
+
+    Pydantic passes the already-validated fields declared before
+    ``edition_reconcile_reaper_threshold_seconds``, which includes
+    ``maintenance_job_timeout_seconds``. Runs only when the env var is
+    unset, so an explicit
+    ``DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS`` still wins
+    (subject to
+    :meth:`Configuration._check_edition_reconcile_reaper_threshold`).
+    """
+    timeout = data.get("maintenance_job_timeout_seconds", 3600)
+    return int(timeout) + EDITION_RECONCILE_REAPER_MARGIN_SECONDS
 
 
 class Configuration(BaseSettings):
@@ -610,7 +651,7 @@ class Configuration(BaseSettings):
     )
 
     edition_reconcile_reaper_threshold_seconds: int = Field(
-        3600,
+        default_factory=_default_edition_reconcile_reaper_threshold,
         title="Edition_reconcile stuck-run reaper threshold, in seconds",
         description=(
             "Cron-driven backstop for arq losing an"
@@ -623,18 +664,22 @@ class Configuration(BaseSettings):
             " ``date_completed``, releasing the per-org mutex"
             " ``idx_queue_jobs_edition_reconcile_active_uq`` so the next"
             " half-hourly tick is not skipped for that organization."
-            " One hour rather than the six its maintenance-pool siblings"
-            " use, because this is the one backstop whose loop ticks"
-            " twice an hour: at a sibling-sized threshold a single"
-            " wedged row would cost an organization twelve consecutive"
-            " reconciliation passes, and a pass is bounded work — one"
-            " plan, at most ``edition_reconcile_max_actions_per_job``"
-            " enqueues — with no honest reason to run for an hour."
-            " Otherwise mirrors ``lifecycle_reaper_threshold_seconds``"
-            " so the operator knob shape is identical across reapers;"
-            " the env-overridable default lets non-prod environments"
-            " drive the threshold down to seconds for fast"
-            " verification."
+            " Like ``keeper_sync_reaper_threshold_seconds`` — and unlike"
+            " the flat literals the other maintenance-pool reapers"
+            " carry — this has no literal default: it derives to"
+            " ``maintenance_job_timeout_seconds`` +"
+            " ``EDITION_RECONCILE_REAPER_MARGIN_SECONDS`` (5400 s at the"
+            " stock 3600 s timeout). The timeout is what arq enforces on"
+            " the tick, and it is shared across the whole pool, so a"
+            " literal here would silently invert the moment an operator"
+            " raised the timeout for one of the other maintenance"
+            " functions: the reaper would fail a tick that is still"
+            " running, drop its row from the per-org unique index, and"
+            " let the next dispatcher tick mint a second reconciler for"
+            " the same organization. An explicit override wins, but it"
+            " must sit strictly above ``maintenance_job_timeout_seconds``"
+            " for the same reason; non-prod environments wanting a"
+            " seconds-long threshold drive that timeout down with it."
         ),
     )
 
@@ -697,6 +742,39 @@ class Configuration(BaseSettings):
             " organizations. Comma-separated when set via env var."
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_edition_reconcile_reaper_threshold(self) -> Configuration:
+        """Refuse a reconcile reaper threshold the job timeout can reach.
+
+        ``edition_reconcile_reaper`` exists to release the per-org mutex
+        held by a tick arq has already abandoned. A threshold at or
+        below ``maintenance_job_timeout_seconds`` instead reaps ticks
+        that are still running: the row leaves
+        ``idx_queue_jobs_edition_reconcile_active_uq``, the next
+        dispatcher tick mints a second reconciler for the same
+        organization, both enqueue publishes for the unapplied tail of
+        the first plan, and the first job's eventual ``complete()``
+        raises ``InvalidJobStateError``. The derived default clears this
+        by ``EDITION_RECONCILE_REAPER_MARGIN_SECONDS``; only an explicit
+        override can trip it.
+        """
+        if (
+            self.edition_reconcile_reaper_threshold_seconds
+            <= self.maintenance_job_timeout_seconds
+        ):
+            raise ValueError(
+                "edition_reconcile_reaper_threshold_seconds"
+                f" ({self.edition_reconcile_reaper_threshold_seconds}) must"
+                " be greater than maintenance_job_timeout_seconds"
+                f" ({self.maintenance_job_timeout_seconds}): arq has not"
+                " cancelled an edition_reconcile tick until its timeout"
+                " elapses, so reaping at or before that would fail a job"
+                " that is still running. Lower"
+                " maintenance_job_timeout_seconds alongside it to"
+                " reconcile faster in a test environment."
+            )
+        return self
 
     @property
     def arq_redis_settings(self) -> RedisSettings | None:

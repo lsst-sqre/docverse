@@ -154,7 +154,7 @@ drifting faster than one tick can repair.
 | --- | --- | --- | --- |
 | `edition_reconcile_enabled` | `DOCVERSE_EDITION_RECONCILE_ENABLED` | `true` | `maintenance.editionReconcileEnabled` |
 | `edition_reconcile_max_actions_per_job` | `DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB` | `100` | `maintenance.editionReconcileMaxActionsPerJob` |
-| `edition_reconcile_reaper_threshold_seconds` | `DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS` | `3600` | `reaperThresholds.editionReconcileSeconds` |
+| `edition_reconcile_reaper_threshold_seconds` | `DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS` | derived: `maintenance_job_timeout_seconds` + 1800 (`5400` at the stock timeout) | `reaperThresholds.editionReconcileSeconds` |
 
 Notes:
 
@@ -166,13 +166,30 @@ Notes:
   want the repair load off the publishing queue while you look at it.
   The cron stays registered either way, so flipping the flag needs no
   worker restart.
-- The reaper threshold is one hour rather than the six its
-  maintenance-pool siblings use, because this is the only loop on the
-  pool that ticks twice an hour: at a sibling-sized threshold, one
-  wedged row would cost an organization twelve consecutive passes.
+- The reaper threshold has no literal default of its own. It derives
+  from `maintenance_job_timeout_seconds` — the timeout arq actually
+  enforces on the tick — plus a 30-minute margin, which is one full
+  `edition_reconcile_reaper` cron gap. Raising the maintenance timeout
+  therefore moves the threshold with it. A flat literal would invert
+  the moment an operator raised that shared timeout for one of the
+  pool's other functions, and the reaper would then fail ticks that
+  were still running: the row would leave
+  `idx_queue_jobs_edition_reconcile_active_uq`, the next dispatcher
+  tick would mint a second reconciler for the same org, and the first
+  job's eventual completion would raise `InvalidJobStateError`.
+- An explicit `DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS`
+  wins over the derivation, but the config refuses one that is not
+  strictly greater than `maintenance_job_timeout_seconds`. The
+  resulting threshold still lands far below the six hours the
+  maintenance-pool siblings use, which matters because this is the
+  only loop on the pool that ticks twice an hour: at a sibling-sized
+  threshold, one wedged row would cost an organization twelve
+  consecutive passes.
 - To reconcile an org immediately in a test environment, drive the
   threshold and the cron cadence down there rather than reaching for a
-  manual entrypoint — there is no CLI for this loop.
+  manual entrypoint — there is no CLI for this loop. Because of the
+  floor above, driving the threshold down to seconds means driving
+  `DOCVERSE_MAINTENANCE_JOB_TIMEOUT_SECONDS` down alongside it.
 
 ## Reading an outcome
 

@@ -45,10 +45,14 @@ async def edition_reconcile_reaper(ctx: dict[str, Any]) -> str:
 
     Thin shim over
     :func:`docverse_server.worker.functions._runless_reaper.sweep_runless_kind`;
-    see that module for the shared sweep mechanics. Threshold defaults
-    to 1 h via ``config.edition_reconcile_reaper_threshold_seconds``;
-    non-prod can override with
-    ``DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS``.
+    see that module for the shared sweep mechanics. The threshold comes
+    from ``config.edition_reconcile_reaper_threshold_seconds``, which
+    derives from ``maintenance_job_timeout_seconds`` plus
+    ``EDITION_RECONCILE_REAPER_MARGIN_SECONDS`` (5400 s at the stock
+    timeout) so it can never sink to where this sweep would fail a tick
+    arq is still running. Non-prod can override with
+    ``DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS``, which must
+    stay strictly above the maintenance timeout.
     """
     return await sweep_runless_kind(
         ctx,
