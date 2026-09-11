@@ -192,7 +192,20 @@ each tick's plan is younger when it is applied.
 
 ## Configuration
 
-| Setting | Environment variable | Default | Phalanx value |
+**The Phalanx values below do not exist yet.** The `docverse` chart in
+lsst-sqre/phalanx carries none of these three keys until the companion
+chart change tracked in
+[#620](https://github.com/lsst-sqre/docverse/issues/620) merges, and
+Helm accepts an unrecognized key in a values file silently — the
+configmap simply never renders the variable, the setting stays at its
+default, and nothing warns you. Until #620 lands, the only way to
+change any of these settings is the environment variable, set on the
+deployment.
+
+<!-- Remove the paragraph above as part of #620, once the chart change
+     has merged and these values are real. -->
+
+| Setting | Environment variable | Default | Phalanx value (pending #620) |
 | --- | --- | --- | --- |
 | `edition_reconcile_enabled` | `DOCVERSE_EDITION_RECONCILE_ENABLED` | `true` | `maintenance.editionReconcileEnabled` |
 | `edition_reconcile_max_actions_per_job` | `DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB` | `100` | `maintenance.editionReconcileMaxActionsPerJob` |
