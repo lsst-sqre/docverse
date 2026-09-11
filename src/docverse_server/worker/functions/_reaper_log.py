@@ -1,7 +1,7 @@
 """Shared log-payload builders for the three reaper worker functions.
 
-``keeper_sync_reaper``, ``lifecycle_reaper``, and the four run-less
-reapers behind :mod:`._runless_reaper` all close a tick the same way:
+``keeper_sync_reaper``, ``lifecycle_reaper``, and every run-less
+reaper behind :mod:`._runless_reaper` all close a tick the same way:
 pair each sweep's name with the rows it claimed, then log one warning
 carrying per-row postmortem detail. The payload shape belongs here
 rather than pasted into each module so the three reapers cannot drift

@@ -14,3 +14,8 @@ def test_publish_status_members() -> None:
 
 def test_job_kind_publish_edition() -> None:
     assert JobKind.publish_edition == "publish_edition"
+
+
+def test_job_kind_edition_reconcile() -> None:
+    """The reconciliation loop's per-org job kind (PRD #612)."""
+    assert JobKind.edition_reconcile == "edition_reconcile"

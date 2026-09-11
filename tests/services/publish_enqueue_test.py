@@ -19,6 +19,7 @@ import pytest
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -32,13 +33,19 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.dbschema.edition import SqlEdition
+from docverse_server.dbschema.edition_build_history import (
+    SqlEditionBuildHistory,
+)
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
     serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
+from docverse_server.metrics import EditionPublishTrigger
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
 )
@@ -51,6 +58,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from tests.support.arq_testing import get_jobs_by_name
 
 _HASH = "sha256:" + "a" * 64
 _config = Configuration()
@@ -279,3 +287,257 @@ async def test_enqueue_publish_for_edition_reuses_existing_history(
 
             entries = await history_store.list_by_edition(edition_id)
             assert len(entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_carries_trigger_override(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A caller's trigger reaches the arq payload as ``trigger``.
+
+    ``publish_edition`` classifies the ``EditionPublishedEvent``'s
+    trigger from the payload key ``trigger`` when the job carries no
+    ``keeper_sync_run_id``. The reconciliation loop (PRD #612) re-drives
+    publishes that some *other* flow originally lost, so without this
+    they would all be attributed to the ordinary build fan-out and the
+    metrics could never separate a first publish from a repair.
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    async for session in db_session_dependency():
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+            trigger_override=EditionPublishTrigger.reconcile,
+        )
+
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert jobs[0].kwargs["payload"]["trigger"] == "reconcile"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_omits_absent_trigger(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Without an override the payload carries no ``trigger`` key.
+
+    ``build`` is ``publish_edition``'s default classification, so the
+    ordinary fan-out must keep sending the payload it always sent
+    rather than spelling the default out.
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    async for session in db_session_dependency():
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+        )
+
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert "trigger" not in jobs[0].kwargs["payload"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_carries_history_id(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The payload names the history row the helper set ``pending``.
+
+    Nothing else ties a ``publish_edition`` job to a row: the worker
+    would otherwise re-resolve the pair and, for a job that sat on a
+    backed-up queue while the edition was rolled away and back, pick up
+    a newer row it was never enqueued for (task #630).
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    async for session in db_session_dependency():
+        history_store = EditionBuildHistoryStore(
+            session=session, logger=_logger()
+        )
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=history_store,
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+        )
+        async with session.begin():
+            history = await history_store.get_by_edition_and_build(
+                edition_id=edition_id, build_id=build_id
+            )
+
+    assert history is not None
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert jobs[0].kwargs["payload"]["history_id"] == history.id
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_honours_a_refusing_precheck(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A raise from ``precheck`` leaves Phase A having written nothing.
+
+    The seam exists for the ``edition_reconcile`` loop, whose decision
+    to enqueue is made in a transaction that closes before Phase A opens
+    (task #631). It is only worth having if a refusal costs nothing: no
+    ``pending`` edition, no history row flipped, no child queue row, and
+    nothing on the queue. The exception travels back to the caller
+    unchanged, because only the caller knows what a refusal means.
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    class _RefusedError(Exception):
+        """The caller's own reason for standing down."""
+
+    async def _refuse() -> None:
+        raise _RefusedError
+
+    async for session in db_session_dependency():
+        with pytest.raises(_RefusedError):
+            await enqueue_publish_for_edition(
+                session=session,
+                edition_store=EditionStore(session=session, logger=_logger()),
+                history_store=EditionBuildHistoryStore(
+                    session=session, logger=_logger()
+                ),
+                queue_job_store=QueueJobStore(
+                    session=session, logger=_logger()
+                ),
+                queue_backend=queue_backend,
+                org_id=org_id,
+                project_id=project_id,
+                project_slug=project_slug,
+                edition_id=edition_id,
+                edition_slug=edition_slug,
+                build_id=build_id,
+                build_public_id=build_public_id,
+                precheck=_refuse,
+            )
+        break
+
+    assert (
+        get_jobs_by_name(
+            mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+        )
+        == []
+    )
+    jobs = await db_session.execute(
+        select(func.count())
+        .select_from(SqlQueueJob)
+        .where(SqlQueueJob.edition_id == edition_id)
+    )
+    assert jobs.scalar_one() == 0
+    status = await db_session.execute(
+        select(SqlEdition.publish_status).where(SqlEdition.id == edition_id)
+    )
+    assert status.scalar_one() is None
+    history = await db_session.execute(
+        select(func.count())
+        .select_from(SqlEditionBuildHistory)
+        .where(SqlEditionBuildHistory.edition_id == edition_id)
+    )
+    assert history.scalar_one() == 0

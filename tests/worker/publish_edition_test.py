@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from types import TracebackType
@@ -44,6 +45,7 @@ from docverse_server.domain.build import Build
 from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
@@ -118,6 +120,12 @@ class _FailingPublisher:
         edition_slug: str,
     ) -> None:
         _ = (project_slug, edition_slug)
+        raise self._exc
+
+    async def get_pointers(
+        self, keys: Sequence[str]
+    ) -> Mapping[str, EditionPointer | None]:
+        _ = keys
         raise self._exc
 
 
@@ -351,7 +359,14 @@ def _make_payload(
     build: Build,
     queue_job: QueueJob,
     trigger: str | None = None,
+    history_id: int | None = None,
 ) -> dict[str, Any]:
+    """Build a ``publish_edition`` payload.
+
+    ``history_id`` is omitted when not given, which is the shape of a
+    payload minted before the key existed — the fallback the worker
+    still has to honour for jobs queued across the deploy.
+    """
     payload: dict[str, Any] = {
         "org_id": org.id,
         "project_slug": project.slug,
@@ -362,6 +377,8 @@ def _make_payload(
         "queue_job_id": queue_job.id,
         "queue_job_public_id": serialize_base32_id(queue_job.public_id),
     }
+    if history_id is not None:
+        payload["history_id"] = history_id
     if trigger is not None:
         payload["trigger"] = trigger
     return payload
@@ -472,6 +489,88 @@ async def test_publish_edition_success_lifecycle(
             assert job.date_started is not None
             assert job.date_completed is not None
             _ = history_entry
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_marks_the_most_recent_history_row(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duplicated pair's position-1 row is the one that ends published.
+
+    ``EditionService.rollback`` records a fresh history row for a pair
+    the edition already served, so the publish it enqueues runs against
+    two rows for the same ``(edition, build)``. The reconciliation
+    planner reads the position-1 row, so the publish has to mark that
+    one: marking the older row would leave the newest reading
+    ``pending`` and every reconcile tick re-driving a publish that had
+    already happened.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            older_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-rollback-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-rollback",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        # The pair as an earlier publish left it...
+        await history_store.set_publish_status(
+            history_id=older_entry.id, status=PublishStatus.published
+        )
+        # ...and the row ``rollback`` inserts when it repoints the
+        # edition back at that same build.
+        newer_entry = await history_store.record(
+            edition_id=edition.id, build_id=build.id
+        )
+        await history_store.set_publish_status(
+            history_id=newer_entry.id, status=PublishStatus.pending
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-rollback",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+        trigger=EditionPublishTrigger.rollback.value,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    async for session in db_session_dependency():
+        async with session.begin():
+            entries = await EditionBuildHistoryStore(
+                session=session, logger=logger
+            ).list_by_edition(edition.id)
+    assert [entry.position for entry in entries] == [1, 2]
+    assert entries[0].id == newer_entry.id
+    assert entries[0].publish_status == PublishStatus.published
 
 
 @pytest.mark.asyncio
@@ -1524,3 +1623,262 @@ async def test_publish_edition_deleted_build_skips(
             # Untouched: ``_mark_publishing`` never ran, so the entry
             # still carries exactly what tracking recorded.
             assert entries[0].publish_status == history_entry.publish_status
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_skips_superseded_history_row(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late job for an older duplicate row leaves the newer one alone.
+
+    Edition E is published at build A, rolled back to B, then rolled
+    forward to A again while E's first publish job still sits on a
+    backed-up default pool. The pair now has two rows, and the newest
+    one has published. Resolving the *pair* would hand that late job the
+    newer row: it would set an already-``published`` row back to
+    ``publishing``, and write ``failed`` over it if the CDN refused —
+    after which ``_republish_reason`` answers ``failed_left_alone`` and
+    a genuine pointer loss on E is never re-driven. The job therefore
+    resolves the row it was enqueued for, sees it superseded, and
+    retires without touching a row or the edge (task #630).
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            older_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-superseded-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-superseded",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        edition_store = EditionStore(session=db_session, logger=logger)
+        # The row this job was enqueued for, as its enqueue left it.
+        await history_store.set_publish_status(
+            history_id=older_entry.id, status=PublishStatus.pending
+        )
+        # The rollback away and back, and the publish that followed it.
+        newer_entry = await history_store.record(
+            edition_id=edition.id, build_id=build.id
+        )
+        await history_store.set_publish_status(
+            history_id=newer_entry.id, status=PublishStatus.published
+        )
+        await edition_store.set_publish_status(
+            edition_id=edition.id, status=PublishStatus.published
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-superseded",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+        history_id=older_entry.id,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    # The edge is untouched: no pointer write, no unpublish.
+    assert mock_publisher.calls == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            by_id = {entry.id: entry for entry in entries}
+            assert by_id[newer_entry.id].position == 1
+            assert by_id[newer_entry.id].publish_status == (
+                PublishStatus.published
+            )
+            assert by_id[older_entry.id].publish_status == (
+                PublishStatus.pending
+            )
+
+            ed_store = EditionStore(session=session, logger=logger)
+            refreshed_ed = await ed_store.get_by_id(edition.id)
+            assert refreshed_ed is not None
+            assert refreshed_ed.publish_status == PublishStatus.published
+
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["superseded_skipped"] is True
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_skips_published_history_row(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that already reached ``published`` is never re-driven.
+
+    Every producer sets its row ``pending`` in the transaction that
+    creates the publish ``QueueJob``, so a row found terminal by the
+    time the job runs was carried there by some other writer. Publishing
+    again would walk it back through ``publishing`` for no gain and risk
+    stamping ``failed`` on a healthy edition.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-published-row-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-published-row",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        await history_store.set_publish_status(
+            history_id=history_entry.id, status=PublishStatus.published
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-published-row",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+        history_id=history_entry.id,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert mock_publisher.calls == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            assert len(entries) == 1
+            assert entries[0].publish_status == PublishStatus.published
+
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["superseded_skipped"] is True
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_legacy_payload_without_history_id(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A payload minted before ``history_id`` still publishes.
+
+    Jobs enqueued before this change and still queued at deploy time
+    name no row, so the worker falls back to the pair lookup exactly as
+    it always did.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-legacy-payload-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-legacy-payload",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-legacy-payload",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+    assert "history_id" not in payload
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert len(mock_publisher.calls) == 1
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            assert [entry.id for entry in entries] == [history_entry.id]
+            assert entries[0].publish_status == PublishStatus.published
+
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed

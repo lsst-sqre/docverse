@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import Counter
+
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
@@ -19,6 +23,7 @@ from docverse.models.builds import BuildAnnotations
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
 )
+from docverse_server.storage import edition_build_history_store
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -26,6 +31,7 @@ from docverse_server.storage.edition_build_history_store import (
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import backend_pid, wait_until_blocked_or_finished
 
 
 @pytest.fixture
@@ -92,6 +98,61 @@ async def _create_edition_and_builds(
         )
         build_ids.append(build.id)
     return edition.id, project.id, build_ids
+
+
+async def _seed_pointed_editions(
+    db_session: AsyncSession,
+    *,
+    count: int,
+    org_slug: str = "chunk-org",
+    project_slug: str = "chunk-proj",
+) -> list[tuple[int, int]]:
+    """Create ``count`` editions, each with its own build and history row.
+
+    Returns the ``(edition_id, build_id)`` pairs in ascending edition-id
+    order, which is the order an org-wide reconcile read builds them in.
+    """
+    logger = structlog.get_logger("docverse")
+    org = await OrganizationStore(session=db_session, logger=logger).create(
+        OrganizationCreate(
+            slug=org_slug,
+            title=f"Org {org_slug}",
+            base_domain=f"{org_slug}.example.com",
+        )
+    )
+    project = await ProjectStore(session=db_session, logger=logger).create(
+        org_id=org.id,
+        data=ProjectCreate(
+            slug=project_slug,
+            title=f"Project {project_slug}",
+            source_url="https://example.com/example/repo",
+        ),
+    )
+    edition_store = EditionStore(session=db_session, logger=logger)
+    build_store = BuildStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+
+    pairs: list[tuple[int, int]] = []
+    for i in range(count):
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug=f"chunk-ed-{i}",
+                title=f"Chunk Edition {i}",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": f"v{i}"},
+            ),
+        )
+        build = await build_store.create(
+            project_id=project.id,
+            data=BuildCreate(git_ref="main", content_hash=f"sha256:{i:064x}"),
+            uploader="testuser",
+            project_slug=project_slug,
+        )
+        await history_store.record(edition_id=edition.id, build_id=build.id)
+        pairs.append((edition.id, build.id))
+    return pairs
 
 
 @pytest.mark.asyncio
@@ -238,6 +299,42 @@ async def test_get_by_edition_and_build_found(
 
 
 @pytest.mark.asyncio
+async def test_get_by_edition_and_build_returns_most_recent_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """A duplicated pair resolves to its position-1 row.
+
+    ``record()`` appends and there is no unique constraint on
+    ``(edition_id, build_id)``, so an edition rolled back onto a build
+    it already served has two rows for the same pair. Every writer of
+    ``publish_status`` resolves the row through this lookup while the
+    reconciliation planner reads the position-ordered row, so an
+    unordered lookup lets a publish mark the stale row and leaves the
+    planner re-driving the pair on every tick.
+    """
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="dup-lookup-org"
+        )
+        older = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        newer = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        result = await history_store.get_by_edition_and_build(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        await db_session.commit()
+
+    assert older.id != newer.id
+    assert result is not None
+    assert result.position == 1
+    assert result.id == newer.id
+
+
+@pytest.mark.asyncio
 async def test_get_by_edition_and_build_not_found(
     db_session: AsyncSession,
     history_store: EditionBuildHistoryStore,
@@ -314,6 +411,93 @@ async def test_list_by_edition_build_pairs_empty(
 ) -> None:
     """An empty pair list returns ``[]`` without hitting the database."""
     assert await history_store.list_by_edition_build_pairs([]) == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_chunks_wide_requests(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every pair still answers when the request outgrows one SELECT.
+
+    The pair filter binds two asyncpg parameters per pair against a
+    32,767-parameter wire ceiling, so the org-wide reconcile read on an
+    lsst-the-docs-sized organization only works if the store splits the
+    list. The constant is patched down rather than seeding the 16,384
+    editions it would otherwise take to cross it.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 2)
+    async with db_session.begin():
+        pairs = await _seed_pointed_editions(db_session, count=5)
+        rows = await history_store.list_by_edition_build_pairs(pairs)
+        await db_session.commit()
+
+    assert Counter((row.edition_id, row.build_id) for row in rows) == Counter(
+        pairs
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_chunks_keep_position_order(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pair's rows stay position-ordered inside its own chunk.
+
+    ``_latest_by_pair`` in the reconcile service keeps the first row it
+    sees for a pair, so an edition rolled back onto a build it already
+    served must hand back its position-1 row first. Chunking must not
+    reorder a pair's rows or interleave them with another chunk's.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 1)
+    async with db_session.begin():
+        pairs = await _seed_pointed_editions(
+            db_session,
+            count=3,
+            org_slug="chunk-order-org",
+            project_slug="chunk-order-proj",
+        )
+        # Roll the last edition back onto the build it already serves,
+        # giving that pair two rows, at positions 1 and 2.
+        rolled_edition_id, rolled_build_id = pairs[-1]
+        await history_store.record(
+            edition_id=rolled_edition_id, build_id=rolled_build_id
+        )
+        rows = await history_store.list_by_edition_build_pairs(pairs)
+        await db_session.commit()
+
+    rolled = [row for row in rows if row.edition_id == rolled_edition_id]
+    assert [row.position for row in rolled] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_list_by_edition_build_pairs_ignores_repeated_pairs(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pair named twice is still answered once.
+
+    ``IN`` collapsed a repeated pair before the list was chunked; split
+    across two SELECTs it would be answered twice unless the store
+    de-duplicates first.
+    """
+    monkeypatch.setattr(edition_build_history_store, "_PAIR_CHUNK_SIZE", 1)
+    async with db_session.begin():
+        pairs = await _seed_pointed_editions(
+            db_session,
+            count=1,
+            org_slug="chunk-dupe-org",
+            project_slug="chunk-dupe-proj",
+        )
+        rows = await history_store.list_by_edition_build_pairs(
+            [pairs[0], pairs[0]]
+        )
+        await db_session.commit()
+
+    assert [(row.edition_id, row.build_id) for row in rows] == pairs
 
 
 @pytest.mark.asyncio
@@ -442,3 +626,171 @@ async def test_list_with_build_info_filters_deleted(
         e for e in result_all.entries if e.build_date_deleted is not None
     ]
     assert len(deleted_entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_position_tie_resolves_to_the_newest_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """Two rows at one position resolve the same way for every reader.
+
+    ``position`` is what "newest" means for an edition, and before the
+    ``uq_ebh_edition_position`` constraint a rollback racing a tracking
+    update could commit two position-1 rows for one edition. With no
+    tiebreaker the two readers that pick *one* row for a pair —
+    :meth:`~EditionBuildHistoryStore.get_by_edition_and_build`, which
+    every ``publish_status`` writer resolves through, and
+    :meth:`~EditionBuildHistoryStore.list_by_edition_build_pairs`, which
+    the reconciliation planner reads — could each pick a different one.
+    The publish would then mark its row ``published`` while the planner
+    read the other as pending with no live job, and every tick would
+    re-drive the same publish.
+
+    The tie is seeded directly, under deferred constraints and rolled
+    back rather than committed, because the constraint this test's own
+    migration adds forbids it from ever existing again. What is pinned
+    is the readers' behaviour on rows that predate it.
+    """
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="tie-org"
+        )
+        await db_session.commit()
+
+    await db_session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+    tied = [
+        SqlEditionBuildHistory(
+            edition_id=edition_id, build_id=build_ids[0], position=1
+        )
+        for _ in range(2)
+    ]
+    db_session.add_all(tied)
+    await db_session.flush()
+    tied_ids = sorted(row.id for row in tied)
+
+    lookup = await history_store.get_by_edition_and_build(
+        edition_id=edition_id, build_id=build_ids[0]
+    )
+    listed = await history_store.list_by_edition_build_pairs(
+        [(edition_id, build_ids[0])]
+    )
+    await db_session.rollback()
+
+    assert lookup is not None
+    assert lookup.id == tied_ids[-1]
+    assert [row.id for row in listed] == list(reversed(tied_ids))
+
+
+@pytest.mark.asyncio
+async def test_record_serializes_concurrent_writers(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """A second ``record()`` for one edition waits for the first.
+
+    The position bump and the position-1 insert are two statements with
+    nothing between them but READ COMMITTED. An API rollback
+    (``services/edition.py``, which holds no ``EDITION_UPDATE`` advisory
+    lock) racing a worker's tracking update would each read a history
+    the other's insert is not yet visible in, bump nothing, and commit a
+    second position-1 row — the tie that leaves the publish writers and
+    the reconciliation planner reading different rows for one pair.
+
+    ``record()`` takes the edition's row lock before the bump, so the
+    loser parks until the winner commits and then bumps a history it can
+    actually see. The race is driven for real: the winner's transaction
+    is held open while the loser's ``record()`` runs on its own
+    connection, and the assertion is that the loser's backend is parked
+    on a lock rather than through to its own insert.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=2, org_slug="race-org"
+        )
+        await db_session.commit()
+
+    async with (
+        db_session_factory() as winner,
+        db_session_factory() as loser,
+        db_session_factory() as probe,
+    ):
+        loser_pid = await backend_pid(loser)
+        loser_store = EditionBuildHistoryStore(session=loser, logger=logger)
+        winner_store = EditionBuildHistoryStore(session=winner, logger=logger)
+
+        await winner_store.record(edition_id=edition_id, build_id=build_ids[0])
+
+        async def race() -> None:
+            await loser_store.record(
+                edition_id=edition_id, build_id=build_ids[1]
+            )
+            await loser.commit()
+
+        racing = asyncio.ensure_future(race())
+        try:
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=loser_pid, task=racing
+            )
+            await winner.commit()
+        finally:
+            await racing
+
+    assert parked is True
+
+    async with db_session.begin():
+        history = await history_store.list_by_edition(edition_id)
+        await db_session.commit()
+    assert [(row.position, row.build_id) for row in history] == [
+        (1, build_ids[1]),
+        (2, build_ids[0]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_the_named_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """``get_by_id`` resolves the exact row, not the pair's newest.
+
+    A ``publish_edition`` job carries the id of the history row it was
+    enqueued for so a late delivery cannot resolve — and overwrite — a
+    newer row for the same pair (task #630). That only works if the
+    lookup is by primary key.
+    """
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="by-id-org"
+        )
+        older = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        newer = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        result = await history_store.get_by_id(older.id)
+        await db_session.commit()
+
+    assert result is not None
+    assert result.id == older.id
+    assert result.id != newer.id
+    assert result.position == 2
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_none_for_unknown_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """``get_by_id`` answers ``None`` rather than raising."""
+    async with db_session.begin():
+        await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="by-id-missing-org"
+        )
+        result = await history_store.get_by_id(987654321)
+        await db_session.commit()
+
+    assert result is None

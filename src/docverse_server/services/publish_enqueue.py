@@ -18,10 +18,14 @@ recoverable rows behind rather than silently dropping the publish.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.metrics import EditionPublishTrigger
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -71,11 +75,14 @@ async def enqueue_publish_for_edition(
     build_id: int,
     build_public_id: str,
     keeper_sync_run_id: int | None = None,
+    trigger_override: EditionPublishTrigger | None = None,
+    precheck: Callable[[], Awaitable[None]] | None = None,
 ) -> PublishEnqueueResult:
     """Drive one ``(edition, build)`` pair through the publish path.
 
     Phase A (single ``session.begin()`` transaction):
 
+    * Run ``precheck`` when one was supplied, before any write.
     * Set the edition's ``publish_status`` to ``pending``.
     * Look up the matching ``EditionBuildHistory`` row; if none exists
       (the keeper-sync path skips ``EditionTrackingService``, so the
@@ -100,9 +107,46 @@ async def enqueue_publish_for_edition(
     split: a Phase B failure leaves the DB rows in a single recoverable
     shape (edition + history pending, child ``QueueJob`` queued without
     a ``backend_job_id``) that a future reconciliation pass can observe
-    and resolve, instead of silently dropping the publish.
+    and resolve, instead of silently dropping the publish. That pass is
+    the ``edition_reconcile`` loop (PRD #612), and ``trigger_override``
+    is how it labels what it re-drives.
+
+    The payload names the history row this call set ``pending`` under
+    the key ``history_id``. Nothing else ties a ``publish_edition`` job
+    to a row, and the pair is not a stable address for one: an edition
+    rolled off a build and back onto it has two rows for that pair, so a
+    job that sat on a backed-up queue across those rollbacks would
+    re-resolve the pair and write its outcome over the *newer* row —
+    setting a row that had already published back to ``publishing``, and
+    to ``failed`` if the CDN then refused. The worker resolves the id
+    instead and skips a row that has been superseded (task #630).
+    Payloads enqueued before the key existed and still queued at deploy
+    time carry none, and the worker falls back to the pair lookup for
+    those.
+
+    ``trigger_override`` rides in the payload under the key ``trigger``,
+    which ``publish_edition`` already consults when classifying the
+    ``EditionPublishedEvent`` for a job with no ``keeper_sync_run_id``.
+    It is omitted from the payload entirely when ``None`` so the
+    ordinary fan-out keeps sending exactly the payload it always sent
+    and falls through to the ``build`` default; spelling the default out
+    would put a value in the payload that no caller chose.
+
+    ``precheck`` is for a caller whose decision to enqueue was made
+    somewhere Phase A's transaction cannot see — most of all the
+    ``edition_reconcile`` loop (task #631), which picks its pairs in a
+    read transaction that has closed by the time Phase A opens and can
+    have up to a whole tick's worth of other actions in between. It runs
+    as the transaction's first statement, so a row lock it takes is held
+    across every write below and the enqueue and the condition it rests
+    on commit together. Raising from it aborts the enqueue with nothing
+    written; the exception is the caller's own and travels back to the
+    caller unchanged, because only the caller knows what a refusal there
+    means for its tally.
     """
     async with session.begin():
+        if precheck is not None:
+            await precheck()
         await edition_store.set_publish_status(
             edition_id=edition_id, status=PublishStatus.pending
         )
@@ -126,20 +170,22 @@ async def enqueue_publish_for_edition(
         )
         child_job_id = child_job.id
         child_public_id = serialize_base32_id(child_job.public_id)
+        history_id = history.id
 
-    enqueued = await queue_backend.enqueue(
-        "publish_edition",
-        {
-            "org_id": org_id,
-            "project_slug": project_slug,
-            "edition_id": edition_id,
-            "edition_slug": edition_slug,
-            "build_id": build_id,
-            "build_public_id": build_public_id,
-            "queue_job_id": child_job_id,
-            "queue_job_public_id": child_public_id,
-        },
-    )
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "project_slug": project_slug,
+        "edition_id": edition_id,
+        "edition_slug": edition_slug,
+        "build_id": build_id,
+        "build_public_id": build_public_id,
+        "history_id": history_id,
+        "queue_job_id": child_job_id,
+        "queue_job_public_id": child_public_id,
+    }
+    if trigger_override is not None:
+        payload["trigger"] = trigger_override.value
+    enqueued = await queue_backend.enqueue("publish_edition", payload)
     async with session.begin():
         await queue_job_store.set_backend_job_id(
             child_job_id, enqueued.id, queue_name=enqueued.queue_name

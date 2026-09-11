@@ -32,6 +32,7 @@ __all__ = [
     "DocverseEventBase",
     "EditionLifecycleEvent",
     "EditionPublishedEvent",
+    "EditionReconcileCompletedEvent",
     "KeeperSyncRunCompletedEvent",
     "LifecycleActionEvent",
     "MembershipChangedEvent",
@@ -151,6 +152,79 @@ class EditionPublishedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time the worker spent on this publish."""
+
+
+class EditionReconcileCompletedEvent(DocverseEventBase):
+    """One organization's ``edition_reconcile`` tick finished.
+
+    Emitted by the per-org loop once, after its ``queue_jobs`` row's
+    terminal transition. Like the ``purgatory_cleanup`` sweep it keeps
+    no run table, so this event is the durable record that the
+    reconciler ran and what it found. The loop is dispatched per
+    organization and one tick spans every project in it, so the event is
+    org-scoped and ``project`` is always ``None``; a repair's
+    project-scoped detail arrives as the ``edition_published`` event the
+    re-driven publish itself emits, tagged ``trigger=reconcile``.
+
+    Published for **every** tick, including the ones that found nothing.
+    That is the point of it: a loop whose value is the claim "the edge
+    still agrees with the database" has to say so on the ticks where
+    nothing happened, or a silent reconciler and a dead one look the
+    same on a dashboard.
+
+    The counters are per-tick deltas over the editions this org owns.
+    ``republished`` next to ``edition_published``'s ``reconcile``
+    trigger is how much of an environment's publish traffic is the
+    system healing itself; ``capped`` above zero on consecutive ticks is
+    an organization drifting faster than one tick's cap can repair.
+    """
+
+    editions_scanned: int
+    """Editions the tick considered, every bucket included."""
+
+    pointers_read: int
+    """Keys the org's edge answered the read-back with.
+
+    Zero whenever ``cdn_checked`` is ``False``, which is the pair of
+    fields that keeps "no edge to read" apart from "an edge serving
+    nothing" — the second being a whole organization's worth of drift.
+    """
+
+    republished: int
+    """Publishes the tick put back on the queue."""
+
+    unpublished: int
+    """Stranded CDN keys the tick deleted."""
+
+    in_flight_skipped: int
+    """Pairs a live ``publish_edition`` job still held.
+
+    Both halves of that gate: the pairs the plan's snapshot already saw
+    a job for, and the pairs that acquired one before the enqueue ran.
+    """
+
+    superseded_skipped: int
+    """Planned republishes the edition had moved off before the enqueue.
+
+    Repoints that landed after the plan was made. A steady trickle is an
+    organization whose editions move faster than one tick takes to walk
+    them — a reason to lower the per-job cap, not a failure.
+    """
+
+    failed_left_alone: int
+    """Pairs reading ``failed``; reported for operators, never re-driven."""
+
+    unexpected_pointers: int
+    """Keys for editions with no build to publish; reported, not acted on."""
+
+    capped: int
+    """Actions the per-job cap left for the next tick."""
+
+    cdn_checked: bool
+    """Whether the tick read the organization's edge back at all."""
+
+    elapsed: timedelta
+    """Wall-clock time the loop spent on this organization."""
 
 
 class ProjectLifecycleEvent(DocverseEventBase):

@@ -32,6 +32,7 @@ from docverse_server.exceptions import (
     KeeperSyncSystemicFailureError,
 )
 from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
+from docverse_server.storage.editionpublisher import CloudflareKvReadError
 from docverse_server.storage.ltd import LtdSourceAccessDeniedError
 from docverse_server.storage.objectstore import ObjectStoreError
 
@@ -92,6 +93,15 @@ def _make_cloudflare_cache_purge() -> CloudflareCachePurgeError:
     )
 
 
+def _make_cloudflare_kv_read() -> CloudflareKvReadError:
+    return CloudflareKvReadError(
+        namespace_id="ns-456",
+        key_count=100,
+        missing_field="result.values",
+        response_body='{"success": true, "result": {}}',
+    )
+
+
 def _make_ltd_source_access_denied() -> LtdSourceAccessDeniedError:
     return LtdSourceAccessDeniedError(
         bucket="lsst-the-docs",
@@ -120,6 +130,7 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
         _make_keeper_sync_systemic_failure,
     ),
     ("CloudflareCachePurgeError", _make_cloudflare_cache_purge),
+    ("CloudflareKvReadError", _make_cloudflare_kv_read),
     ("LtdSourceAccessDeniedError", _make_ltd_source_access_denied),
     ("ObjectStoreError", _make_object_store_error),
 ]

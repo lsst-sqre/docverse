@@ -51,6 +51,29 @@ class _PublishResources:
     edition: Edition
     build: Build
     history_entry: EditionBuildHistory
+    history_superseded: bool
+    """Whether a newer row has taken over this job's ``(edition, build)``.
+
+    True when the row the job was enqueued for is no longer the one
+    :meth:`~docverse_server.storage.edition_build_history_store.EditionBuildHistoryStore.get_by_edition_and_build`
+    resolves the pair to — the shape an edition rolled off a build and
+    back onto it leaves behind. Always False for a payload carrying no
+    ``history_id``, which resolves the newest row by construction.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishSkip:
+    """One of :func:`_skip_reason`'s refusals, as the job records it."""
+
+    message: str
+    """Recorded as ``progress["message"]`` on the retired queue job."""
+
+    progress_flag: str
+    """The ``progress`` key set ``True`` beside the message."""
+
+    log_event: str
+    """The structlog event the retirement logs."""
 
 
 async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -64,16 +87,18 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     payload
         Job payload with ``org_id``, ``project_slug``, ``edition_id``,
         ``edition_slug``, ``build_id``, ``build_public_id``,
-        ``queue_job_id``, and ``queue_job_public_id``.
+        ``queue_job_id``, and ``queue_job_public_id``, plus the optional
+        ``history_id`` naming the ``edition_build_history`` row the job
+        was enqueued for (absent on payloads minted before that key
+        existed).
 
     Returns
     -------
     str
-        ``"completed"`` on success — and equally when the build was
-        deleted before the job ran, which is a skip rather than a
-        failure (see :func:`_skip_deleted_build`) — ``"failed"`` if the
-        publish attempt raised, or ``"skipped"`` for a row the
-        late-delivery guard refuses.
+        ``"completed"`` on success — and equally when one of
+        :func:`_skip_reason`'s guards refused the job, a skip rather
+        than a failure — ``"failed"`` if the publish attempt raised, or
+        ``"skipped"`` for a row the late-delivery guard refuses.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.publish_edition"
@@ -135,15 +160,10 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 resources = await _load_resources(
                     factory=factory, payload=payload
                 )
-                # Deleted-build guard, read under EDITION_UPDATE so it
-                # cannot straddle a DELETE. Tracking committed this
-                # edition's pointer and enqueued the publish; a DELETE
-                # landing in the window before arq delivered the job
-                # leaves a build the ``purgatory_cleanup`` sweep may
-                # reclaim, and a KV pointer written now would outlive
-                # the objects it names (PRD #596).
-                build_deleted = resources.build.date_deleted is not None
-                if not build_deleted:
+                # Both pickup guards, read under EDITION_UPDATE and
+                # ahead of every write. See :func:`_skip_reason`.
+                skip = _skip_reason(resources)
+                if skip is None:
                     await _mark_publishing(
                         queue_job_store=queue_job_store,
                         edition_store=edition_store,
@@ -151,13 +171,15 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                         resources=resources,
                         queue_job_id=queue_job_id,
                     )
-            if build_deleted:
-                await _skip_deleted_build(
+            if skip is not None:
+                await _retire_skipped_publish(
                     ctx=ctx,
                     session=session,
                     factory=factory,
                     queue_job_store=queue_job_store,
                     queue_job_id=queue_job_id,
+                    resources=resources,
+                    skip=skip,
                     logger=logger,
                 )
                 return "completed"
@@ -265,41 +287,103 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     raise RuntimeError(msg)
 
 
-async def _skip_deleted_build(
+def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
+    """Say why this job must publish nothing, or ``None`` to go ahead.
+
+    Two pickup guards, both read under ``EDITION_UPDATE`` so neither can
+    straddle a concurrent write, and both ahead of ``_mark_publishing``
+    so a refused job leaves no trace of itself on any row.
+
+    *Stale row.* Nothing but the payload's ``history_id`` ties a publish
+    job to the ``edition_build_history`` row it was enqueued for, and
+    the ``(edition, build)`` pair is not a stable address for one: an
+    edition rolled off a build and back onto it has two rows for that
+    pair. A job that sat on a backed-up default pool across those
+    rollbacks would otherwise resolve the pair to the *newer* row — the
+    one a later publish had already carried to ``published`` — set it
+    back to ``publishing``, and stamp ``failed`` on it if the CDN then
+    refused. The reconcile planner answers ``failed_left_alone`` for a
+    failed row before it ever checks the pointer, so a genuine pointer
+    loss on that edition would never be re-driven again (task #630).
+
+    A row already at ``published`` is refused for the same reason: every
+    producer sets its row ``pending`` in the transaction that creates
+    the publish ``QueueJob``, so a row found terminal here was carried
+    there by somebody else's job.
+
+    *Deleted build.* Tracking committed this edition's pointer and
+    enqueued the publish; a DELETE landing in the window before arq
+    delivered the job leaves a build the ``purgatory_cleanup`` sweep may
+    reclaim, and a KV pointer written now would outlive the objects it
+    names (PRD #596).
+    """
+    if resources.history_superseded:
+        return _PublishSkip(
+            message="Edition history row superseded before publishing",
+            progress_flag="superseded_skipped",
+            log_event="Superseded publish skipped",
+        )
+    if resources.history_entry.publish_status == PublishStatus.published:
+        return _PublishSkip(
+            message="Edition history row already published",
+            progress_flag="superseded_skipped",
+            log_event="Superseded publish skipped",
+        )
+    if resources.build.date_deleted is not None:
+        return _PublishSkip(
+            message="Build was deleted before publishing",
+            progress_flag="deleted_skipped",
+            log_event="Deleted build skipped before publishing",
+        )
+    return None
+
+
+async def _retire_skipped_publish(
     *,
     ctx: dict[str, Any],
     session: AsyncSession,
     factory: Factory,
     queue_job_store: QueueJobStore,
     queue_job_id: int,
+    resources: _PublishResources,
+    skip: _PublishSkip,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Retire a publish whose build was deleted before it ran.
+    """Retire a publish one of :func:`_skip_reason`'s guards refused.
 
     The publish-side twin of ``build_processing``'s
-    ``_mark_deleted_skipped``, and it records the same thing:
-    ``progress["deleted_skipped"]`` on a job that completes rather than
-    fails. A deleted build is not an error — an operator asked for it —
-    so the job must not land in Sentry or wait for a reaper; it simply
-    has nothing left to publish.
+    ``_mark_deleted_skipped``, and it records the same thing: a flag on
+    the ``progress`` of a job that completes rather than fails. Neither
+    refusal is an error — an operator asked for the delete, and a
+    duplicate delivery for a row another writer has already settled has
+    nothing left to do — so the job must not land in Sentry or wait for
+    ``publish_edition_reaper``.
 
-    Nothing else is touched. The edition and its ``edition_build_history``
-    entry keep the ``pending`` status tracking left them at, because
-    they record an intent that was never carried out, and no
-    ``EditionPublishedEvent`` is emitted for a publish that did not
-    happen. The keeper-sync roll-up still runs: this job is terminal, so
-    a run that was waiting on it must be allowed to finalise exactly as
-    the success and failure paths allow it to.
+    Nothing else is touched: not the history row, not the edition's
+    ``publish_status``, not the edge, and no ``EditionPublishedEvent``
+    is emitted for a publish that did not happen. A deleted build leaves
+    the row at the ``pending`` tracking set, because it records an
+    intent that was never carried out; a superseded row keeps whatever
+    the writer that overtook this job put there, which is by
+    construction newer than anything this job could say. The keeper-sync
+    roll-up still runs: this job is terminal, so a run that was waiting
+    on it must be allowed to finalise exactly as the success and failure
+    paths allow it to.
     """
-    logger.info("Deleted build skipped before publishing")
+    logger.info(
+        skip.log_event,
+        history_id=resources.history_entry.id,
+        history_publish_status=resources.history_entry.publish_status,
+        history_superseded=resources.history_superseded,
+    )
     completion: KeeperSyncRunWithActivity | None = None
     async with session.begin():
         await queue_job_store.update_phase(
             queue_job_id,
             "complete",
             progress={
-                "message": "Build was deleted before publishing",
-                "deleted_skipped": True,
+                "message": skip.message,
+                skip.progress_flag: True,
             },
         )
         await queue_job_store.complete(queue_job_id)
@@ -320,7 +404,14 @@ async def _load_resources(
     factory: Factory,
     payload: dict[str, Any],
 ) -> _PublishResources:
-    """Load project, edition, build, and history entry for the job."""
+    """Load project, edition, build, and history entry for the job.
+
+    The history entry is the row named by the payload's ``history_id``
+    when it carries one, and the pair's newest row otherwise. Either
+    way the pair's newest row is read as well, so
+    :func:`_skip_reason` can tell a job enqueued for a row the pair has
+    since moved past from one whose row is still current.
+    """
     project_store = factory.create_project_store()
     edition_store = factory.create_edition_store()
     build_store = factory.create_build_store()
@@ -349,17 +440,36 @@ async def _load_resources(
     if build is None:
         msg = f"Build {payload['build_id']} not found"
         raise NotFoundError(msg)
-    history_entry = await history_store.get_by_edition_and_build(
+    newest_entry = await history_store.get_by_edition_and_build(
         edition_id=edition.id, build_id=build.id
     )
-    if history_entry is None:
+    if newest_entry is None:
         msg = (
             f"EditionBuildHistory not found for edition "
             f"{edition.id} and build {build.id}"
         )
         raise NotFoundError(msg)
+    history_id: int | None = payload.get("history_id")
+    if history_id is None:
+        history_entry = newest_entry
+    else:
+        resolved = await history_store.get_by_id(history_id)
+        if resolved is None:
+            msg = f"EditionBuildHistory {history_id} not found"
+            raise NotFoundError(msg)
+        if resolved.edition_id != edition.id or resolved.build_id != build.id:
+            msg = (
+                f"EditionBuildHistory {history_id} belongs to edition "
+                f"{resolved.edition_id} and build {resolved.build_id}, "
+                f"not edition {edition.id} and build {build.id}"
+            )
+            raise NotFoundError(msg)
+        history_entry = resolved
     return _PublishResources(
-        edition=edition, build=build, history_entry=history_entry
+        edition=edition,
+        build=build,
+        history_entry=history_entry,
+        history_superseded=history_entry.id != newest_entry.id,
     )
 
 
