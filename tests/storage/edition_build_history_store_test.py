@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 
 import pytest
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
@@ -29,6 +31,7 @@ from docverse_server.storage.edition_build_history_store import (
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import backend_pid, wait_until_blocked_or_finished
 
 
 @pytest.fixture
@@ -623,3 +626,124 @@ async def test_list_with_build_info_filters_deleted(
         e for e in result_all.entries if e.build_date_deleted is not None
     ]
     assert len(deleted_entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_position_tie_resolves_to_the_newest_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """Two rows at one position resolve the same way for every reader.
+
+    ``position`` is what "newest" means for an edition, and before the
+    ``uq_ebh_edition_position`` constraint a rollback racing a tracking
+    update could commit two position-1 rows for one edition. With no
+    tiebreaker the two readers that pick *one* row for a pair —
+    :meth:`~EditionBuildHistoryStore.get_by_edition_and_build`, which
+    every ``publish_status`` writer resolves through, and
+    :meth:`~EditionBuildHistoryStore.list_by_edition_build_pairs`, which
+    the reconciliation planner reads — could each pick a different one.
+    The publish would then mark its row ``published`` while the planner
+    read the other as pending with no live job, and every tick would
+    re-drive the same publish.
+
+    The tie is seeded directly, under deferred constraints and rolled
+    back rather than committed, because the constraint this test's own
+    migration adds forbids it from ever existing again. What is pinned
+    is the readers' behaviour on rows that predate it.
+    """
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="tie-org"
+        )
+        await db_session.commit()
+
+    await db_session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+    tied = [
+        SqlEditionBuildHistory(
+            edition_id=edition_id, build_id=build_ids[0], position=1
+        )
+        for _ in range(2)
+    ]
+    db_session.add_all(tied)
+    await db_session.flush()
+    tied_ids = sorted(row.id for row in tied)
+
+    lookup = await history_store.get_by_edition_and_build(
+        edition_id=edition_id, build_id=build_ids[0]
+    )
+    listed = await history_store.list_by_edition_build_pairs(
+        [(edition_id, build_ids[0])]
+    )
+    await db_session.rollback()
+
+    assert lookup is not None
+    assert lookup.id == tied_ids[-1]
+    assert [row.id for row in listed] == list(reversed(tied_ids))
+
+
+@pytest.mark.asyncio
+async def test_record_serializes_concurrent_writers(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """A second ``record()`` for one edition waits for the first.
+
+    The position bump and the position-1 insert are two statements with
+    nothing between them but READ COMMITTED. An API rollback
+    (``services/edition.py``, which holds no ``EDITION_UPDATE`` advisory
+    lock) racing a worker's tracking update would each read a history
+    the other's insert is not yet visible in, bump nothing, and commit a
+    second position-1 row — the tie that leaves the publish writers and
+    the reconciliation planner reading different rows for one pair.
+
+    ``record()`` takes the edition's row lock before the bump, so the
+    loser parks until the winner commits and then bumps a history it can
+    actually see. The race is driven for real: the winner's transaction
+    is held open while the loser's ``record()`` runs on its own
+    connection, and the assertion is that the loser's backend is parked
+    on a lock rather than through to its own insert.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=2, org_slug="race-org"
+        )
+        await db_session.commit()
+
+    async with (
+        db_session_factory() as winner,
+        db_session_factory() as loser,
+        db_session_factory() as probe,
+    ):
+        loser_pid = await backend_pid(loser)
+        loser_store = EditionBuildHistoryStore(session=loser, logger=logger)
+        winner_store = EditionBuildHistoryStore(session=winner, logger=logger)
+
+        await winner_store.record(edition_id=edition_id, build_id=build_ids[0])
+
+        async def race() -> None:
+            await loser_store.record(
+                edition_id=edition_id, build_id=build_ids[1]
+            )
+            await loser.commit()
+
+        racing = asyncio.ensure_future(race())
+        try:
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=loser_pid, task=racing
+            )
+            await winner.commit()
+        finally:
+            await racing
+
+    assert parked is True
+
+    async with db_session.begin():
+        history = await history_store.list_by_edition(edition_id)
+        await db_session.commit()
+    assert [(row.position, row.build_id) for row in history] == [
+        (1, build_ids[1]),
+        (2, build_ids[0]),
+    ]

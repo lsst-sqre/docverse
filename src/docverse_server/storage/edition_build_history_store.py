@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
 )
@@ -59,7 +60,34 @@ class EditionBuildHistoryStore:
 
         Shifts all existing positions for this edition up by one and
         inserts the new entry at position 1 (most recent).
+
+        The edition's own row is taken ``FOR UPDATE`` first, so two
+        writers for one edition run this one after the other. The bump
+        and the insert are separate statements, and under READ COMMITTED
+        an unserialized pair of callers — an API rollback in
+        :class:`~docverse_server.services.edition.EditionService`, which
+        takes no ``EDITION_UPDATE`` advisory lock, racing a worker's
+        tracking update — would each bump a history the other's insert is
+        not yet visible in and both commit a row at position 1.
+        ``uq_ebh_edition_position`` refuses that outright; the lock is
+        what turns the refusal into a wait, so the loser bumps the
+        winner's row and lands at position 1 itself rather than raising
+        an ``IntegrityError`` at some caller that has no way to retry.
+
+        The lock is released when the caller's transaction ends, per the
+        handler-owns-the-transaction rule, and is taken on ``editions``
+        *after* any ``builds`` lock the caller already holds — the
+        build-then-edition order every other writer on this pair uses.
+        An ``edition_id`` naming no row locks nothing: the store does not
+        own that referential check, and the constraint still backstops
+        the position.
         """
+        await self._session.execute(
+            select(SqlEdition.id)
+            .where(SqlEdition.id == edition_id)
+            .with_for_update()
+        )
+
         # Shift existing positions up
         stmt = (
             update(SqlEditionBuildHistory)
@@ -101,6 +129,14 @@ class EditionBuildHistoryStore:
         would mark the stale row ``published`` while the position-1 row
         stayed ``pending``, and every reconcile tick would re-drive a
         publish that had already happened.
+
+        ``id DESC`` breaks a tie on ``position``.
+        ``uq_ebh_edition_position`` forbids one being written, but rows
+        that predate the constraint outlive it, and a tie resolved one
+        way here and the other way in
+        :meth:`list_by_edition_build_pairs` is exactly the split this
+        ordering exists to prevent. Newest row wins, which is what
+        position 1 already means.
         """
         stmt = (
             select(SqlEditionBuildHistory)
@@ -108,7 +144,10 @@ class EditionBuildHistoryStore:
                 SqlEditionBuildHistory.edition_id == edition_id,
                 SqlEditionBuildHistory.build_id == build_id,
             )
-            .order_by(SqlEditionBuildHistory.position.asc())
+            .order_by(
+                SqlEditionBuildHistory.position.asc(),
+                SqlEditionBuildHistory.id.desc(),
+            )
         )
         result = await self._session.execute(stmt)
         row = result.scalars().first()
@@ -142,7 +181,10 @@ class EditionBuildHistoryStore:
         stmt = (
             select(SqlEditionBuildHistory)
             .where(SqlEditionBuildHistory.edition_id == edition_id)
-            .order_by(SqlEditionBuildHistory.position.asc())
+            .order_by(
+                SqlEditionBuildHistory.position.asc(),
+                SqlEditionBuildHistory.id.desc(),
+            )
         )
         result = await self._session.execute(stmt)
         return [
@@ -169,6 +211,7 @@ class EditionBuildHistoryStore:
             .order_by(
                 SqlEditionBuildHistory.edition_id,
                 SqlEditionBuildHistory.position.asc(),
+                SqlEditionBuildHistory.id.desc(),
             )
         )
         result = await self._session.execute(stmt)
@@ -204,11 +247,14 @@ class EditionBuildHistoryStore:
         collapsed a repeated pair on its own, but two chunks are two
         queries and would each answer it.
 
-        Rows for any one pair come back ordered by ``position`` — a
-        caller grouping by pair and keeping the first row it sees gets
-        the edition's most recent pointer at that build. That holds
-        across chunking because a pair belongs to exactly one chunk and
-        each chunk is ordered by ``(edition_id, position)``; only the
+        Rows for any one pair come back ordered by ``position``, then
+        by ``id`` descending — a caller grouping by pair and keeping the
+        first row it sees gets the edition's most recent pointer at that
+        build, and gets the same row
+        :meth:`get_by_edition_and_build` would hand a publish writer
+        even where two rows share a position (see that method). That
+        holds across chunking because a pair belongs to exactly one
+        chunk and each chunk carries the same ordering; only the
         relative order of *different* pairs depends on how the list was
         cut. Duplicate rows for a pair need an edition to have been
         pointed back at a build it had already left, which the
@@ -232,6 +278,7 @@ class EditionBuildHistoryStore:
                 .order_by(
                     SqlEditionBuildHistory.edition_id,
                     SqlEditionBuildHistory.position.asc(),
+                    SqlEditionBuildHistory.id.desc(),
                 )
             )
             result = await self._session.execute(stmt)
@@ -266,6 +313,15 @@ class EditionBuildHistoryStore:
 
         Returns paginated results ordered by position ASC (most recent
         first).
+
+        The ordering lives in
+        :class:`~docverse_server.storage.pagination.EditionBuildHistoryPositionCursor`,
+        which keys on ``position`` alone and so carries no ``id``
+        tiebreaker. That is safe rather than an oversight:
+        ``uq_ebh_edition_position`` makes an edition's positions unique,
+        so the cursor names exactly one row, and this reader lists a
+        whole edition rather than resolving a pair to a single row — the
+        pick the tiebreaker on the other readers protects.
         """
         stmt = (
             select(
