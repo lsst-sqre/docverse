@@ -155,6 +155,30 @@ class EditionBuildHistoryStore:
             return None
         return EditionBuildHistory.model_validate(row)
 
+    async def get_by_id(self, history_id: int) -> EditionBuildHistory | None:
+        """Look up one history row by its primary key.
+
+        :meth:`get_by_edition_and_build` answers "which row does this
+        ``(edition, build)`` pair point at *now*", which is the wrong
+        question for a ``publish_edition`` job that was enqueued for one
+        specific row and then sat on a backed-up queue while the edition
+        was rolled away and back onto the same build. Such a job carries
+        its row's id and resolves it here, so a late delivery cannot
+        pick up — and overwrite — the newer row the pair has since
+        acquired.
+
+        Returns ``None`` when no row carries that id.
+        """
+        result = await self._session.execute(
+            select(SqlEditionBuildHistory).where(
+                SqlEditionBuildHistory.id == history_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return EditionBuildHistory.model_validate(row)
+
     async def set_publish_status(
         self, *, history_id: int, status: PublishStatus
     ) -> None:

@@ -108,6 +108,19 @@ async def enqueue_publish_for_edition(
     the ``edition_reconcile`` loop (PRD #612), and ``trigger_override``
     is how it labels what it re-drives.
 
+    The payload names the history row this call set ``pending`` under
+    the key ``history_id``. Nothing else ties a ``publish_edition`` job
+    to a row, and the pair is not a stable address for one: an edition
+    rolled off a build and back onto it has two rows for that pair, so a
+    job that sat on a backed-up queue across those rollbacks would
+    re-resolve the pair and write its outcome over the *newer* row —
+    setting a row that had already published back to ``publishing``, and
+    to ``failed`` if the CDN then refused. The worker resolves the id
+    instead and skips a row that has been superseded (task #630).
+    Payloads enqueued before the key existed and still queued at deploy
+    time carry none, and the worker falls back to the pair lookup for
+    those.
+
     ``trigger_override`` rides in the payload under the key ``trigger``,
     which ``publish_edition`` already consults when classifying the
     ``EditionPublishedEvent`` for a job with no ``keeper_sync_run_id``.
@@ -140,6 +153,7 @@ async def enqueue_publish_for_edition(
         )
         child_job_id = child_job.id
         child_public_id = serialize_base32_id(child_job.public_id)
+        history_id = history.id
 
     payload: dict[str, Any] = {
         "org_id": org_id,
@@ -148,6 +162,7 @@ async def enqueue_publish_for_edition(
         "edition_slug": edition_slug,
         "build_id": build_id,
         "build_public_id": build_public_id,
+        "history_id": history_id,
         "queue_job_id": child_job_id,
         "queue_job_public_id": child_public_id,
     }

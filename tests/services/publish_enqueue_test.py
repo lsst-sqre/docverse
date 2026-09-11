@@ -391,3 +391,63 @@ async def test_enqueue_publish_for_edition_omits_absent_trigger(
     )
     assert len(jobs) == 1
     assert "trigger" not in jobs[0].kwargs["payload"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_carries_history_id(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """The payload names the history row the helper set ``pending``.
+
+    Nothing else ties a ``publish_edition`` job to a row: the worker
+    would otherwise re-resolve the pair and, for a job that sat on a
+    backed-up queue while the edition was rolled away and back, pick up
+    a newer row it was never enqueued for (task #630).
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+
+    async for session in db_session_dependency():
+        history_store = EditionBuildHistoryStore(
+            session=session, logger=_logger()
+        )
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=history_store,
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+        )
+        async with session.begin():
+            history = await history_store.get_by_edition_and_build(
+                edition_id=edition_id, build_id=build_id
+            )
+
+    assert history is not None
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    assert jobs[0].kwargs["payload"]["history_id"] == history.id

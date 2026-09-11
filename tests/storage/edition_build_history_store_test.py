@@ -747,3 +747,50 @@ async def test_record_serializes_concurrent_writers(
         (1, build_ids[1]),
         (2, build_ids[0]),
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_the_named_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """``get_by_id`` resolves the exact row, not the pair's newest.
+
+    A ``publish_edition`` job carries the id of the history row it was
+    enqueued for so a late delivery cannot resolve — and overwrite — a
+    newer row for the same pair (task #630). That only works if the
+    lookup is by primary key.
+    """
+    async with db_session.begin():
+        edition_id, _, build_ids = await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="by-id-org"
+        )
+        older = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        newer = await history_store.record(
+            edition_id=edition_id, build_id=build_ids[0]
+        )
+        result = await history_store.get_by_id(older.id)
+        await db_session.commit()
+
+    assert result is not None
+    assert result.id == older.id
+    assert result.id != newer.id
+    assert result.position == 2
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_none_for_unknown_row(
+    db_session: AsyncSession,
+    history_store: EditionBuildHistoryStore,
+) -> None:
+    """``get_by_id`` answers ``None`` rather than raising."""
+    async with db_session.begin():
+        await _create_edition_and_builds(
+            db_session, n_builds=1, org_slug="by-id-missing-org"
+        )
+        result = await history_store.get_by_id(987654321)
+        await db_session.commit()
+
+    assert result is None
