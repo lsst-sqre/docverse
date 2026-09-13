@@ -160,7 +160,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 resources = await _load_resources(
                     factory=factory, payload=payload
                 )
-                # Both pickup guards, read under EDITION_UPDATE and
+                # Every pickup guard, read under EDITION_UPDATE and
                 # ahead of every write. See :func:`_skip_reason`.
                 skip = _skip_reason(resources)
                 if skip is None:
@@ -290,8 +290,8 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
     """Say why this job must publish nothing, or ``None`` to go ahead.
 
-    Two pickup guards, both read under ``EDITION_UPDATE`` so neither can
-    straddle a concurrent write, and both ahead of ``_mark_publishing``
+    Three pickup guards, all read under ``EDITION_UPDATE`` so none can
+    straddle a concurrent write, and all ahead of ``_mark_publishing``
     so a refused job leaves no trace of itself on any row.
 
     *Stale row.* Nothing but the payload's ``history_id`` ties a publish
@@ -311,6 +311,26 @@ def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
     the publish ``QueueJob``, so a row found terminal here was carried
     there by somebody else's job.
 
+    *Stale pointer.* Neither row check asks whether the edition still
+    points at the job's build, and the ``EDITION_UPDATE`` lock orders
+    publish jobs by pickup, not by enqueue. Rollbacks A → B → A queue
+    three jobs; delivered together, the last A job can publish first,
+    the B job next — its row is the newest for the pair ``(edition,
+    B)`` and still ``pending`` — and the edge then names B while
+    ``editions.current_build_id`` says A, until an ``edition_reconcile``
+    tick repairs the pointer up to a whole tick later. The job is
+    therefore refused when ``current_build_id`` is not its build: the
+    predicate ``EditionReconcileService`` applies in Phase A
+    (``_ApplySkip.superseded`` in ``services/edition_reconcile.py``)
+    before it enqueues a planned republish. Every producer repoints
+    before it enqueues — ``EditionService.rollback`` and the build
+    override through ``set_current_build``, the build fan-out only for
+    editions ``set_current_build`` accepted, keeper-sync for the
+    edition's ``current_build_id``, reconcile behind a ``FOR UPDATE``
+    re-check — so no legitimate publish trips this guard. Nothing here
+    is repaired: the pointer the job would have overwritten is the one
+    the newest job for this edition is about to publish, or has.
+
     *Deleted build.* Tracking committed this edition's pointer and
     enqueued the publish; a DELETE landing in the window before arq
     delivered the job leaves a build the ``purgatory_cleanup`` sweep may
@@ -326,6 +346,12 @@ def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
     if resources.history_entry.publish_status == PublishStatus.published:
         return _PublishSkip(
             message="Edition history row already published",
+            progress_flag="superseded_skipped",
+            log_event="Superseded publish skipped",
+        )
+    if resources.edition.current_build_id != resources.build.id:
+        return _PublishSkip(
+            message="Edition no longer points at this build",
             progress_flag="superseded_skipped",
             log_event="Superseded publish skipped",
         )
@@ -353,11 +379,12 @@ async def _retire_skipped_publish(
 
     The publish-side twin of ``build_processing``'s
     ``_mark_deleted_skipped``, and it records the same thing: a flag on
-    the ``progress`` of a job that completes rather than fails. Neither
-    refusal is an error — an operator asked for the delete, and a
-    duplicate delivery for a row another writer has already settled has
-    nothing left to do — so the job must not land in Sentry or wait for
-    ``publish_edition_reaper``.
+    the ``progress`` of a job that completes rather than fails. No
+    refusal is an error — an operator asked for the delete, a duplicate
+    delivery for a row another writer has already settled has nothing
+    left to do, and a job for a build the edition has moved off would
+    only overwrite the pointer a newer job owns — so the job must not
+    land in Sentry or wait for ``publish_edition_reaper``.
 
     Nothing else is touched: not the history row, not the edition's
     ``publish_status``, not the edge, and no ``EditionPublishedEvent``
@@ -365,7 +392,9 @@ async def _retire_skipped_publish(
     the row at the ``pending`` tracking set, because it records an
     intent that was never carried out; a superseded row keeps whatever
     the writer that overtook this job put there, which is by
-    construction newer than anything this job could say. The keeper-sync
+    construction newer than anything this job could say; a row whose
+    build the edition has left stays as its enqueue left it, for the
+    same reason. The keeper-sync
     roll-up still runs: this job is terminal, so a run that was waiting
     on it must be allowed to finalise exactly as the success and failure
     paths allow it to.
@@ -375,6 +404,7 @@ async def _retire_skipped_publish(
         history_id=resources.history_entry.id,
         history_publish_status=resources.history_entry.publish_status,
         history_superseded=resources.history_superseded,
+        current_build_id=resources.edition.current_build_id,
     )
     completion: KeeperSyncRunWithActivity | None = None
     async with session.begin():
@@ -410,7 +440,9 @@ async def _load_resources(
     when it carries one, and the pair's newest row otherwise. Either
     way the pair's newest row is read as well, so
     :func:`_skip_reason` can tell a job enqueued for a row the pair has
-    since moved past from one whose row is still current.
+    since moved past from one whose row is still current. The edition
+    is read here, under ``EDITION_UPDATE``, so its ``current_build_id``
+    is as fresh as the pointer guard in :func:`_skip_reason` needs.
     """
     project_store = factory.create_project_store()
     edition_store = factory.create_edition_store()

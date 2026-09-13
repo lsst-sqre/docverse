@@ -45,7 +45,10 @@ from docverse_server.domain.build import Build
 from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
-from docverse_server.domain.edition_pointer import EditionPointer
+from docverse_server.domain.edition_pointer import (
+    EditionPointer,
+    edition_pointer_key,
+)
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
@@ -336,6 +339,12 @@ async def _setup_publish_scenario(
     )
     refreshed_build = await build_store.get_by_id(build.id)
     assert refreshed_build is not None
+    # Every producer repoints the edition before it enqueues, so the
+    # job's build is the one the edition points at when the job runs.
+    pointed_edition = await edition_store.set_current_build(
+        edition_id=edition.id, build_id=refreshed_build.id
+    )
+    assert pointed_edition is not None
     history_entry = await history_store.record(
         edition_id=edition.id, build_id=refreshed_build.id
     )
@@ -348,7 +357,79 @@ async def _setup_publish_scenario(
         backend_job_id=backend_job_id,
         keeper_sync_run_id=keeper_sync_run_id,
     )
-    return org, project, edition, refreshed_build, history_entry, queue_job
+    return (
+        org,
+        project,
+        pointed_edition,
+        refreshed_build,
+        history_entry,
+        queue_job,
+    )
+
+
+async def _add_completed_build(
+    db_session: AsyncSession, *, project: Project, git_ref: str
+) -> Build:
+    """Create another completed build for ``project``."""
+    build_store = BuildStore(session=db_session, logger=_logger())
+    build = await build_store.create(
+        project_id=project.id,
+        data=BuildCreate(git_ref=git_ref, content_hash=_HASH),
+        uploader="testuser",
+        project_slug=project.slug,
+    )
+    for status in (BuildStatus.processing, BuildStatus.completed):
+        await build_store.transition_status(
+            build_id=build.id, new_status=status
+        )
+    refreshed = await build_store.get_by_id(build.id)
+    assert refreshed is not None
+    return refreshed
+
+
+async def _roll_edition_and_queue_publish(
+    db_session: AsyncSession,
+    *,
+    org: Organization,
+    project: Project,
+    edition: Edition,
+    build: Build,
+    backend_job_id: str,
+) -> tuple[EditionBuildHistory, QueueJob]:
+    """Repoint ``edition`` at ``build`` and queue its publish.
+
+    The rows an API rollback leaves behind before its ``publish_edition``
+    job is delivered: the pointer moved, a fresh ``pending`` history row
+    at position 1, and a queued ``QueueJob`` for the pair. The job's
+    payload is the caller's to build, with ``history_id`` naming the
+    returned row.
+    """
+    logger = _logger()
+    edition_store = EditionStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+    queue_job_store = QueueJobStore(session=db_session, logger=logger)
+    repointed = await edition_store.set_current_build(
+        edition_id=edition.id, build_id=build.id, skip_date_guard=True
+    )
+    assert repointed is not None
+    await edition_store.set_publish_status(
+        edition_id=edition.id, status=PublishStatus.pending
+    )
+    history_entry = await history_store.record(
+        edition_id=edition.id, build_id=build.id
+    )
+    await history_store.set_publish_status(
+        history_id=history_entry.id, status=PublishStatus.pending
+    )
+    queue_job = await queue_job_store.create(
+        kind=JobKind.publish_edition,
+        org_id=org.id,
+        project_id=project.id,
+        build_id=build.id,
+        edition_id=edition.id,
+        backend_job_id=backend_job_id,
+    )
+    return history_entry, queue_job
 
 
 def _make_payload(
@@ -1815,6 +1896,246 @@ async def test_publish_edition_skips_published_history_row(
 
 
 @pytest.mark.asyncio
+async def test_publish_edition_skips_build_the_edition_left(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job for a build the edition has since moved off publishes nothing.
+
+    Edition E is pointed at build A and its publish queued, then rolled
+    to build B before that job is delivered. The job's row is still the
+    newest row for the pair ``(E, A)`` and is still ``pending``, so
+    neither history-row guard refuses it — but publishing it would name
+    A at the edge while ``editions.current_build_id`` says B. The job
+    compares the pointer to its build and retires without touching a
+    row or the edge, as the reconcile loop's Phase A does for a stale
+    plan (finding 1 of the PR #621 QA).
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build_a,
+            row_a,
+            job_a,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-repointed-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-repointed-a",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        await history_store.set_publish_status(
+            history_id=row_a.id, status=PublishStatus.pending
+        )
+        build_b = await _add_completed_build(
+            db_session, project=project, git_ref="b"
+        )
+        row_b, _ = await _roll_edition_and_queue_publish(
+            db_session,
+            org=org,
+            project=project,
+            edition=edition,
+            build=build_b,
+            backend_job_id="test-publish-arq-repointed-b",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-repointed-a",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build_a,
+        queue_job=job_a,
+        history_id=row_a.id,
+    )
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    # The edge is untouched: no pointer write, no unpublish.
+    assert mock_publisher.calls == []
+    assert mock_publisher.pointers == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            ed_store = EditionStore(session=session, logger=logger)
+            refreshed_ed = await ed_store.get_by_id(edition.id)
+            assert refreshed_ed is not None
+            assert refreshed_ed.current_build_id == build_b.id
+            assert refreshed_ed.publish_status == PublishStatus.pending
+
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            by_id = {entry.id: entry for entry in entries}
+            assert by_id[row_b.id].position == 1
+            assert by_id[row_b.id].publish_status == PublishStatus.pending
+            assert by_id[row_a.id].publish_status == PublishStatus.pending
+
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(job_a.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["superseded_skipped"] is True
+            assert job.progress["message"] == (
+                "Edition no longer points at this build"
+            )
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_rollback_race_leaves_edge_on_current_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three backed-up rollback jobs delivered out of order settle on A.
+
+    The shape seen on roundtable-dev: with the default pool stopped,
+    rollbacks A → B → A queued three ``publish_edition`` jobs, and on
+    restart the ``EDITION_UPDATE`` lock serialized them by pickup order
+    — last A, then B, then first A. Without a pointer guard the B job
+    published second, because its row is the newest for ``(E, B)`` and
+    still ``pending``, and the edge named B against a database that
+    said A. With it, only the job whose build the edition points at
+    publishes; the other two retire ``superseded_skipped``.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build_a,
+            row_a_first,
+            job_a_first,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-rollback-race-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-race-a-first",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        await history_store.set_publish_status(
+            history_id=row_a_first.id, status=PublishStatus.pending
+        )
+        build_b = await _add_completed_build(
+            db_session, project=project, git_ref="b"
+        )
+        row_b, job_b = await _roll_edition_and_queue_publish(
+            db_session,
+            org=org,
+            project=project,
+            edition=edition,
+            build=build_b,
+            backend_job_id="test-publish-arq-race-b",
+        )
+        row_a_last, job_a_last = await _roll_edition_and_queue_publish(
+            db_session,
+            org=org,
+            project=project,
+            edition=edition,
+            build=build_a,
+            backend_job_id="test-publish-arq-race-a-last",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    deliveries = [
+        ("test-publish-arq-race-a-last", build_a, job_a_last, row_a_last),
+        ("test-publish-arq-race-b", build_b, job_b, row_b),
+        ("test-publish-arq-race-a-first", build_a, job_a_first, row_a_first),
+    ]
+    results = []
+    for arq_job_id, build, queue_job, row in deliveries:
+        ctx = make_worker_ctx(
+            http_client=httpx.AsyncClient(), job_id=arq_job_id
+        )
+        payload = _make_payload(
+            org=org,
+            project=project,
+            edition=edition,
+            build=build,
+            queue_job=queue_job,
+            history_id=row.id,
+        )
+        results.append(await publish_edition(ctx, payload))
+        await ctx["http_client"].aclose()
+
+    assert results == ["completed", "completed", "completed"]
+    # Exactly one publish, and the edge names A afterwards.
+    assert [call.build_public_id for call in mock_publisher.calls] == [
+        serialize_base32_id(build_a.public_id)
+    ]
+    pointer = mock_publisher.pointers[
+        edition_pointer_key(project.slug, edition.slug)
+    ]
+    assert pointer.build_public_id == serialize_base32_id(build_a.public_id)
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            ed_store = EditionStore(session=session, logger=logger)
+            refreshed_ed = await ed_store.get_by_id(edition.id)
+            assert refreshed_ed is not None
+            assert refreshed_ed.current_build_id == build_a.id
+            assert refreshed_ed.publish_status == PublishStatus.published
+
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            by_id = {entry.id: entry for entry in entries}
+            assert by_id[row_a_last.id].position == 1
+            assert by_id[row_a_last.id].publish_status == (
+                PublishStatus.published
+            )
+            assert by_id[row_b.id].publish_status == PublishStatus.pending
+            assert by_id[row_a_first.id].publish_status == (
+                PublishStatus.pending
+            )
+
+            qjs = QueueJobStore(session=session, logger=logger)
+            for skipped_job in (job_b, job_a_first):
+                job = await qjs.get(skipped_job.id)
+                assert job is not None
+                assert job.status == JobStatus.completed
+                assert job.progress is not None
+                assert job.progress["superseded_skipped"] is True
+            published_job = await qjs.get(job_a_last.id)
+            assert published_job is not None
+            assert published_job.status == JobStatus.completed
+            assert published_job.progress is not None
+            assert "superseded_skipped" not in published_job.progress
+
+
+@pytest.mark.asyncio
 async def test_publish_edition_legacy_payload_without_history_id(
     app: None,
     db_session: AsyncSession,
@@ -1882,3 +2203,99 @@ async def test_publish_edition_legacy_payload_without_history_id(
             job = await qjs.get(queue_job.id)
             assert job is not None
             assert job.status == JobStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_legacy_payload_skips_build_the_edition_left(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pointer guard covers a payload that names no history row.
+
+    A legacy payload resolves the pair's newest row, so the history-row
+    guards can never refuse it; the pointer guard still can, and must,
+    since a job queued across the deploy can be just as stale.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build_a,
+            row_a,
+            job_a,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-legacy-repointed-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-legacy-repointed-a",
+        )
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        await history_store.set_publish_status(
+            history_id=row_a.id, status=PublishStatus.pending
+        )
+        build_b = await _add_completed_build(
+            db_session, project=project, git_ref="b"
+        )
+        row_b, _ = await _roll_edition_and_queue_publish(
+            db_session,
+            org=org,
+            project=project,
+            edition=edition,
+            build=build_b,
+            backend_job_id="test-publish-arq-legacy-repointed-b",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-legacy-repointed-a",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build_a,
+        queue_job=job_a,
+    )
+    assert "history_id" not in payload
+
+    result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert mock_publisher.calls == []
+    assert mock_publisher.pointers == {}
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            ed_store = EditionStore(session=session, logger=logger)
+            refreshed_ed = await ed_store.get_by_id(edition.id)
+            assert refreshed_ed is not None
+            assert refreshed_ed.current_build_id == build_b.id
+
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            by_id = {entry.id: entry for entry in entries}
+            assert by_id[row_b.id].publish_status == PublishStatus.pending
+            assert by_id[row_a.id].publish_status == PublishStatus.pending
+
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(job_a.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["superseded_skipped"] is True

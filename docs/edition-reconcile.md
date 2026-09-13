@@ -396,13 +396,21 @@ tick sees `stalled_publish` and re-drives it normally. Rolling forward
 to a newer build works the same way, and is the better move when the
 failed build itself is the problem.
 
-A publish job left over from an *earlier* row of the pair cannot undo
-the repair. Each `publish_edition` job carries the id of the row it was
-enqueued for, so a job that sat on a backed-up queue while the edition
-was rolled away and back retires as `superseded_skipped` — completed,
-nothing published, no row and no pointer touched — rather than
-resolving the pair afresh and writing its outcome, a `failed` included,
-over the row a later publish had already carried to `published`.
+A publish job left over from before the repair cannot undo it. Each
+`publish_edition` job carries the id of the row it was enqueued for
+and, at pickup, compares its build with `editions.current_build_id`.
+A job that sat on a backed-up queue while the edition was rolled away
+and back retires as `superseded_skipped` — completed, nothing
+published, no row and no pointer touched — on either count: its row is
+no longer the pair's newest, so it must not write its outcome, a
+`failed` included, over the row a later publish already carried to
+`published`; or the edition no longer points at its build, so
+publishing would name at the edge a build the database has moved off.
+The pointer check is what keeps a backed-up queue from serving the
+wrong build: the `EDITION_UPDATE` lock hands delivered jobs to the pool
+by pickup order, not enqueue order, so without it rollbacks A → B → A
+could publish B last and leave the edge on B until the next tick
+repaired it as `pointer_stale`.
 
 ## What the loop deliberately does not do
 

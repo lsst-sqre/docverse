@@ -122,7 +122,13 @@ async def enqueue_publish_for_edition(
     instead and skips a row that has been superseded (task #630).
     Payloads enqueued before the key existed and still queued at deploy
     time carry none, and the worker falls back to the pair lookup for
-    those.
+    those. The row is not the whole story, though: the worker also
+    refuses a job whose build the edition no longer points at, whatever
+    row it names, because the ``EDITION_UPDATE`` lock orders delivered
+    jobs by pickup rather than by enqueue and a backed-up queue can
+    hand an older repoint's job in after a newer one's (task #633).
+    Every caller here repoints before it enqueues, so that guard only
+    ever trips on a job the edition has moved past.
 
     ``trigger_override`` rides in the payload under the key ``trigger``,
     which ``publish_edition`` already consults when classifying the
