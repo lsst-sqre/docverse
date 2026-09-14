@@ -1,0 +1,4 @@
+### New features
+
+- A project's `date_updated` now advances when its default `__main` edition starts serving a new build, not only when the project's own metadata changes. The touch happens inside `EditionStore.set_current_build` — the single chokepoint every repoint routes through (build tracking, keeper-sync, rollback) — in the same transaction as the repoint, so a poller watching `GET /orgs/{org}/projects` sees content changes as well as metadata edits. A repoint of any other edition, a `publish_status` flip, and a repoint the stale-build or deleted-build guard refuses all leave the project's clock alone.
+- `DEFAULT_EDITION_SLUG` moved from `docverse_server.services.project` to `docverse_server.domain.edition`, so the storage layer can recognize the default edition without importing from the service layer.

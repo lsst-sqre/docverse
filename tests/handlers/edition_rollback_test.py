@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 import structlog
 from httpx import AsyncClient
@@ -428,6 +430,48 @@ async def test_rollback_publishes_edition_lifecycle(
     assert event.project == "rb-proj"
     # __main is the project's default edition (kind=main).
     assert event.edition_kind == MetricsEditionKind.main
+
+
+@pytest.mark.asyncio
+async def test_rollback_advances_project_date_updated(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``__main`` rollback shows up on the project resource.
+
+    PRD #634: Ook polls ``GET /orgs/{org}/projects`` with
+    ``updated_since``, so a content change to the default edition has
+    to move the project's ``date_updated`` — this is the end-to-end
+    proof that ``EditionStore.set_current_build``'s project touch
+    reaches the wire.
+    """
+    await _setup(client)
+
+    before_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert before_response.status_code == 200
+    before = datetime.fromisoformat(before_response.json()["date_updated"])
+
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=2)
+        await db_session.commit()
+
+    rollback_response = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[0][1])},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback_response.status_code == 200
+
+    after_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert after_response.status_code == 200
+    after = datetime.fromisoformat(after_response.json()["date_updated"])
+    assert after > before
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.edition_reconcile import ReconcileEdition
 from docverse_server.domain.version import (
     EupsDailyVersion,
@@ -444,6 +444,13 @@ class EditionStore:
         already points to a build that is equally new or newer, the
         update is skipped (SQR-112).
 
+        A repoint that survives both guards **and** lands on the
+        project's default ``__main`` edition also stamps
+        ``projects.date_updated`` in the same transaction (PRD #634).
+        Every path that moves ``current_build_id`` — the edition
+        service, the tracking service, keeper-sync, rollback — comes
+        through here, so this is the one place that has to know.
+
         Parameters
         ----------
         edition_id
@@ -514,6 +521,36 @@ class EditionStore:
 
         row.current_build_id = build_id
         await self._session.flush()
+
+        # The project's clock follows its default edition's content
+        # (PRD #634). This is the only place ``current_build_id``
+        # changes, and we are past both guards, so a repoint of
+        # ``__main`` that actually happened is exactly the event a
+        # consumer polling the project listing with ``updated_since``
+        # needs to see. ``publish_status`` flips and every other
+        # edition-row write leave the project alone, so the clock means
+        # "the content behind this project moved", not "some row
+        # changed". ``func.now()`` is the transaction timestamp,
+        # matching the ORM ``onupdate`` that metadata edits use, so a
+        # publish and a PATCH in the same transaction agree.
+        #
+        # Lock ordering note: this takes the project row after the
+        # edition row, the reverse of the project soft-delete cascade
+        # (project, then its editions, then its builds). A DELETE of a
+        # project racing a publish to its own ``__main`` can therefore
+        # deadlock, and PostgreSQL will abort one side. Both sides are
+        # retryable and the window is one statement wide, which is
+        # cheaper than the alternative: locking the project up front
+        # would serialize concurrent repoints of *different* editions
+        # of the same project, which keeper-sync does constantly.
+        if row.slug.lower() == DEFAULT_EDITION_SLUG:
+            await self._session.execute(
+                update(SqlProject)
+                .where(SqlProject.id == row.project_id)
+                .values(date_updated=func.now())
+                .execution_options(synchronize_session=False)
+            )
+
         await self._session.refresh(row)
         # Re-query to get current_build_public_id + git_ref
         stmt2 = self._base_query().where(SqlEdition.id == edition_id)

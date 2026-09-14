@@ -45,7 +45,7 @@ from docverse_server.domain.content_hash import (
     EMPTY_MANIFEST_HASH,
     PLACEHOLDER_CONTENT_HASH,
 )
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
     resolve_edition_autocreation,
@@ -86,10 +86,7 @@ from docverse_server.services.lifecycle.evaluator import (
     resolve_rule_set,
 )
 from docverse_server.services.lock_service import LockKey, LockService
-from docverse_server.services.project import (
-    DEFAULT_EDITION_SLUG,
-    ProjectService,
-)
+from docverse_server.services.project import ProjectService
 from docverse_server.services.project_github_binding import (
     ProjectGitHubBindingResolver,
 )

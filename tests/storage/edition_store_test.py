@@ -28,7 +28,8 @@ from docverse.models import (
 from docverse_server.config import config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
-from docverse_server.domain.edition import Edition
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -877,6 +878,188 @@ async def test_set_current_build_skips_deleted_build_without_date_guard(
     refreshed = await edition_store.get_by_id(edition.id)
     assert refreshed is not None
     assert refreshed.current_build_id == live_build.id
+
+
+async def _read_project_date_updated(
+    db_session: AsyncSession, project_id: int
+) -> datetime:
+    """Read ``projects.date_updated`` straight from the database.
+
+    A column-level SELECT rather than an ORM entity load, so the
+    identity map cannot hand back a value that predates the Core
+    ``UPDATE`` that ``set_current_build`` issues.
+    """
+    return (
+        await db_session.execute(
+            select(SqlProject.date_updated).where(SqlProject.id == project_id)
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_touches_project_for_default_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Repointing ``__main`` advances the project's ``date_updated``.
+
+    PRD #634: Ook polls the project listing with ``updated_since``, so
+    the project clock has to move when its default edition starts
+    serving new content, not only when its metadata is edited.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:4444" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        before = await _read_project_date_updated(db_session, project_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        updated = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await db_session.commit()
+    assert updated is not None
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session, project_id)
+    assert after > before
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_leaves_project_for_other_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Repointing a non-default edition leaves the project clock alone.
+
+    Only ``__main`` is the project's public face, so a release or draft
+    edition picking up a build is not a change to the project.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:5555" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="not-main",
+                title="Not Main",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        before = await _read_project_date_updated(db_session, project_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        updated = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await db_session.commit()
+    assert updated is not None
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session, project_id)
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_leaves_project_when_guard_skips(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A stale-guard skip on ``__main`` leaves the project clock alone.
+
+    The project clock tracks *content*, so a repoint that never
+    happened must not look like a change to a poller.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        newer_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:6666" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        older_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:7777" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        for bid, ts in [
+            (newer_build.id, datetime(2025, 6, 1, tzinfo=UTC)),
+            (older_build.id, datetime(2025, 1, 1, tzinfo=UTC)),
+        ]:
+            row = (
+                await db_session.execute(
+                    select(SqlBuild).where(SqlBuild.id == bid)
+                )
+            ).scalar_one()
+            row.date_created = ts
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        applied = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=newer_build.id
+        )
+        await db_session.commit()
+    assert applied is not None
+
+    async with db_session.begin():
+        before = await _read_project_date_updated(db_session, project_id)
+        skipped = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=older_build.id
+        )
+        await db_session.commit()
+    assert skipped is None
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session, project_id)
+    assert after == before
 
 
 @pytest.mark.asyncio

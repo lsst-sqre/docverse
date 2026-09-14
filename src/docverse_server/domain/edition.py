@@ -12,6 +12,15 @@ from docverse.models.queue_enums import PublishStatus
 
 from .base32id import Base32Id
 
+DEFAULT_EDITION_SLUG = "__main"
+"""Slug for the default edition auto-created with every project.
+
+Lives in the domain layer because both the service that creates the
+edition and the storage layer that repoints it need to recognize it:
+``EditionStore.set_current_build`` treats a repoint of *this* edition
+as a change to the project itself.
+"""
+
 
 class Edition(BaseModel):
     """Domain representation of an edition."""

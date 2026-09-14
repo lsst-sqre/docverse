@@ -13,7 +13,7 @@ from docverse.models import (
     ProjectCreate,
     ProjectUpdate,
 )
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.exceptions import ConflictError, NotFoundError
@@ -22,9 +22,6 @@ from docverse_server.storage.keeper_sync import TombstoneReason
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import ProjectSearchCursor
 from docverse_server.storage.project_store import ProjectStore
-
-DEFAULT_EDITION_SLUG = "__main"
-"""Slug for the default edition auto-created with every project."""
 
 
 class ProjectService:
