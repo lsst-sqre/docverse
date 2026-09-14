@@ -30,6 +30,8 @@ class JobKind(StrEnum):
       repository (feeds the ``ref_deleted`` lifecycle rule).
     - ``purgatory_cleanup`` — permanently delete soft-deleted builds
       whose purgatory retention has elapsed.
+    - ``edition_reconcile`` — re-drive one organization's editions whose
+      recorded publish state has drifted from what is actually served.
     - ``credential_reencrypt`` — re-encrypt stored credentials after a
       key rotation.
     - ``keeper_sync_run_discovery`` — fan out per-project sync jobs for
@@ -45,6 +47,7 @@ class JobKind(StrEnum):
     lifecycle_eval = "lifecycle_eval"
     git_ref_audit = "git_ref_audit"
     purgatory_cleanup = "purgatory_cleanup"
+    edition_reconcile = "edition_reconcile"
     credential_reencrypt = "credential_reencrypt"
     keeper_sync_run_discovery = "keeper_sync_run_discovery"
     keeper_sync_project = "keeper_sync_project"

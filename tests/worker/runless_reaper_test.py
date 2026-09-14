@@ -1,8 +1,8 @@
-"""Tests for the five run-less reaper cron worker functions.
+"""Tests for the six run-less reaper cron worker functions.
 
 Covers ``dashboard_build_reaper``, ``publish_edition_reaper``,
-``build_processing_reaper``, ``dashboard_sync_reaper``, and
-``purgatory_cleanup_reaper`` — the
+``build_processing_reaper``, ``dashboard_sync_reaper``,
+``purgatory_cleanup_reaper``, and ``edition_reconcile_reaper`` — the
 cron-driven backstops for the case where arq itself loses a queue
 job (worker pod OOM-killed mid-job that never gets to surface a
 timeout, or dispatcher crashed between the ``queue_jobs`` SQL commit
@@ -56,6 +56,9 @@ from docverse_server.worker.functions.dashboard_build_reaper import (
 )
 from docverse_server.worker.functions.dashboard_sync_reaper import (
     dashboard_sync_reaper,
+)
+from docverse_server.worker.functions.edition_reconcile_reaper import (
+    edition_reconcile_reaper,
 )
 from docverse_server.worker.functions.publish_edition_reaper import (
     publish_edition_reaper,
@@ -118,6 +121,14 @@ RUNLESS_REAPER_SPECS: list[ReaperSpec] = [
         threshold_attr="purgatory_cleanup_reaper_threshold_seconds",
         well_past_minutes=480,
         slug_prefix="pcr",
+    ),
+    ReaperSpec(
+        name="edition_reconcile",
+        reaper=edition_reconcile_reaper,
+        kind=JobKind.edition_reconcile,
+        threshold_attr="edition_reconcile_reaper_threshold_seconds",
+        well_past_minutes=120,
+        slug_prefix="ecr",
     ),
 ]
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from types import TracebackType
 from typing import Any, Self, override
 
@@ -33,6 +33,7 @@ from docverse_server.domain.cache_profile import CacheProfile
 from docverse_server.domain.dashboard_context import MAIN_SLUG
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.sentry import initialize_sentry
 from docverse_server.services.cdn_purge_coalescer import CdnPurgeCoalescer
 from docverse_server.services.edition_publishing import (
@@ -101,6 +102,12 @@ class _FailingPublisher:
         edition_slug: str,
     ) -> None:
         _ = (project_slug, edition_slug)
+        raise self._exc
+
+    async def get_pointers(
+        self, keys: Sequence[str]
+    ) -> Mapping[str, EditionPointer | None]:
+        _ = keys
         raise self._exc
 
 

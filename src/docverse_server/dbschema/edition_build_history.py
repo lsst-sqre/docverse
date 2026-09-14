@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, String
+from sqlalchemy import DateTime, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -15,7 +15,22 @@ class SqlEditionBuildHistory(Base):
     """ORM model for the ``edition_build_history`` table.
 
     Logs every build that an edition has pointed to, enabling rollback
-    and orphan detection. Position 1 is the most recent entry.
+    and orphan detection. Position 1 is the most recent entry, and
+    ``uq_ebh_edition_position`` is what makes "most recent" name exactly
+    one row: two writers racing under READ COMMITTED could otherwise
+    each commit a position-1 row for one edition, after which the
+    publish writers and the reconciliation planner could resolve the
+    same pair to different rows.
+
+    The constraint is ``DEFERRABLE INITIALLY IMMEDIATE`` because
+    :meth:`~docverse_server.storage.edition_build_history_store.EditionBuildHistoryStore.record`
+    bumps a whole edition's positions in one ``UPDATE``. An immediate
+    unique index checks each row as it rewrites it and would reject that
+    bump as soon as it turned a 1 into a 2 the row still holding it had
+    not yet vacated; a deferred check sees the finished statement.
+    ``INITIALLY IMMEDIATE`` keeps that check at the end of every
+    statement, so no caller opts in and none is handed a violation
+    deferred to commit.
     """
 
     __tablename__ = "edition_build_history"
@@ -42,5 +57,11 @@ class SqlEditionBuildHistory(Base):
 
     __table_args__ = (
         Index("idx_ebh_edition_id", "edition_id"),
-        Index("idx_ebh_edition_position", "edition_id", "position"),
+        UniqueConstraint(
+            "edition_id",
+            "position",
+            name="uq_ebh_edition_position",
+            deferrable=True,
+            initially="IMMEDIATE",
+        ),
     )

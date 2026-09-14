@@ -9,7 +9,7 @@ from typing import Any
 import structlog
 from redis.exceptions import RedisError
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import ColumnExpressionArgument, select, update
+from sqlalchemy import ColumnExpressionArgument, and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -117,6 +117,36 @@ def _is_active_job_conflict(exc: IntegrityError) -> bool:
         return name in _ACTIVE_JOB_UNIQUE_INDEXES
     message = str(exc.orig)
     return any(index in message for index in _ACTIVE_JOB_UNIQUE_INDEXES)
+
+
+def _live_publish_job() -> ColumnExpressionArgument[bool]:
+    """Match the ``publish_edition`` rows a pair's publish still holds.
+
+    The edition reconciler's definition of "in flight", written once so
+    the snapshot :meth:`QueueJobStore.list_live_publish_pairs` plans
+    against and the point check
+    :meth:`QueueJobStore.has_live_publish_job` re-tests with cannot
+    diverge.
+
+    "Live" is deliberately narrower than "not terminal". A ``queued``
+    row whose ``backend_job_id`` is still NULL is exactly the
+    lost-Phase-B shape ``enqueue_publish_for_edition`` warns about — the
+    database rows committed, the arq enqueue never happened — and it is
+    the single commonest thing the reconciler exists to re-drive.
+    Counting it as live would make the reconciler skip forever the pairs
+    it was written to rescue. So live means ``in_progress``, or
+    ``queued`` with a backend job id written back.
+    """
+    return and_(
+        SqlQueueJob.kind == JobKind.publish_edition.value,
+        or_(
+            SqlQueueJob.status == JobStatus.in_progress.value,
+            and_(
+                SqlQueueJob.status == JobStatus.queued.value,
+                SqlQueueJob.backend_job_id.is_not(None),
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -759,6 +789,60 @@ class QueueJobStore:
             SqlQueueJob.status.in_(
                 [JobStatus.queued.value, JobStatus.in_progress.value]
             ),
+        )
+        result = await self._session.execute(stmt)
+        return result.first() is not None
+
+    async def list_live_publish_pairs(
+        self, *, org_id: int
+    ) -> set[tuple[int, int]]:
+        """Return the ``(edition_id, build_id)`` pairs a publish still holds.
+
+        The edition reconciler's in-flight gate (PRD #612). It asks the
+        one question that separates "this pair is drifting" from "this
+        pair is mid-publish": is a ``publish_edition`` job for it
+        actually on a queue right now? What counts as "live" is
+        :func:`_live_publish_job`.
+
+        Rows with a NULL ``edition_id`` or ``build_id`` cannot name a
+        pair and are excluded; every ``publish_edition`` row this
+        codebase writes carries both.
+        """
+        stmt = select(SqlQueueJob.edition_id, SqlQueueJob.build_id).where(
+            SqlQueueJob.org_id == org_id,
+            SqlQueueJob.edition_id.is_not(None),
+            SqlQueueJob.build_id.is_not(None),
+            _live_publish_job(),
+        )
+        result = await self._session.execute(stmt)
+        return {
+            (edition_id, build_id) for edition_id, build_id in result.all()
+        }
+
+    async def has_live_publish_job(
+        self, *, org_id: int, edition_id: int, build_id: int
+    ) -> bool:
+        """Return whether one pair has a live ``publish_edition`` job.
+
+        :meth:`list_live_publish_pairs` asked of a single pair, and
+        asked again: the reconciler plans against that method's snapshot
+        and re-checks with this one inside the transaction that enqueues
+        each republish (task #631). Between the two, another driver —
+        a build fan-out, a keeper-sync sweep, an API rollback — can
+        enqueue the same pair, and nothing in ``queue_jobs`` refuses a
+        second ``publish_edition`` row for it, so the pair would get two
+        jobs, two KV writes, and two ``edition_published`` events.
+
+        Shares :func:`_live_publish_job` with the snapshot deliberately.
+        A point check that drew the line anywhere else would skip pairs
+        the plan re-drove, or re-drive pairs the plan skipped, for no
+        reason an operator reading the two counters could reconstruct.
+        """
+        stmt = select(SqlQueueJob.id).where(
+            SqlQueueJob.org_id == org_id,
+            SqlQueueJob.edition_id == edition_id,
+            SqlQueueJob.build_id == build_id,
+            _live_publish_job(),
         )
         result = await self._session.execute(stmt)
         return result.first() is not None

@@ -52,6 +52,9 @@ from .functions import (
     dashboard_build_reaper,
     dashboard_sync,
     dashboard_sync_reaper,
+    edition_reconcile,
+    edition_reconcile_dispatcher,
+    edition_reconcile_reaper,
     git_ref_audit,
     git_ref_audit_discovery,
     inventory_census,
@@ -641,16 +644,18 @@ class MaintenanceWorkerSettings:
     periodic work rather than lifecycle evaluation alone; this class
     is the binding.
 
-    Three dispatcher/per-org pairs live on this single pool: the
-    hourly ``lifecycle_eval``, the daily ``git_ref_audit``, and the
-    daily ``purgatory_cleanup`` sweep (PRD #596). PRD #346 explicitly
-    says the audit "shares the same fan-out, per-org mutex, and reaper
-    patterns as lifecycle_eval and never competes with build processing
-    or keeper-sync for worker capacity", and the same reasoning admits
-    the sweep: it is nightly, per-org, mutex-guarded, and its long
+    Four dispatcher/per-org pairs live on this single pool: the hourly
+    ``lifecycle_eval``, the daily ``git_ref_audit``, the daily
+    ``purgatory_cleanup`` sweep (PRD #596), and the half-hourly
+    ``edition_reconcile`` loop (PRD #612). PRD #346 explicitly says the
+    audit "shares the same fan-out, per-org mutex, and reaper patterns
+    as lifecycle_eval and never competes with build processing or
+    keeper-sync for worker capacity", and the same reasoning admits the
+    other two: both are per-org and mutex-guarded, the sweep's long
     object-store reclamation runs are exactly the work that must not
-    contend with publishing. Their daily cadences are light enough that
-    a further pool would be over-segmented.
+    contend with publishing, and the reconciler must not contend with
+    the publishing flow it exists to re-drive. Their cadences are light
+    enough that a further pool would be over-segmented.
 
     Every one of those functions is wrapped with :func:`arq.func` so the
     dedicated queue inherits a per-job ``timeout`` (sourced from
@@ -671,12 +676,14 @@ class MaintenanceWorkerSettings:
     ``publish_edition_reaper``, ``build_processing_reaper``, and
     ``dashboard_sync_reaper`` run here (PRD #367) so reaper sweeps
     never compete with build processing or user-triggered dashboard
-    rebuilds for worker capacity. ``purgatory_cleanup_reaper`` joins
-    them on the same run-less shim (PRD #596), backstopping a kind this
-    pool also runs: a ``purgatory_cleanup`` row left stuck holds that
-    organization's per-org mutex, so every following nightly tick skips
-    the org and its expired builds keep their object-store content. The
-    maintenance name reflects that the pool is the shared home for this
+    rebuilds for worker capacity. ``purgatory_cleanup_reaper`` and
+    ``edition_reconcile_reaper`` join them on the same run-less shim
+    (PRD #596, PRD #612), backstopping two kinds this pool also runs.
+    Both wedge the same way: the stuck row holds that organization's
+    per-org mutex, so every following tick skips the org — and with it
+    the nightly reclamation of its expired builds' object-store content,
+    or the half-hourly repair of its drifted editions. The maintenance
+    name reflects that the pool is the shared home for this
     non-publishing periodic work, no longer scoped to lifecycle
     evaluation alone.
 
@@ -753,12 +760,37 @@ class MaintenanceWorkerSettings:
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
+        # The ``edition_reconcile`` loop (PRD #612), dispatcher and
+        # per-org body. Both carry the maintenance per-job ``timeout``
+        # and ``max_tries=1``.
+        #
+        # For the per-org pass that is because the plan lives in the
+        # database, not in the job: a retry would re-plan the org and
+        # re-enqueue every action the first attempt already applied.
+        # For the dispatcher it is because a retried fan-out would find
+        # every org's mutex held by the rows its own first attempt
+        # committed, so each retry would step over the whole estate and
+        # report a tick that reconciled nothing. Either way recovery is
+        # the next tick, at most 30 minutes away, which re-plans from
+        # current state and finds the already-driven pairs holding live
+        # publish jobs.
+        func(
+            instrument_arq_task(edition_reconcile_dispatcher),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
+        func(
+            instrument_arq_task(edition_reconcile),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
         instrument_arq_task(lifecycle_reaper),
         instrument_arq_task(dashboard_build_reaper),
         instrument_arq_task(publish_edition_reaper),
         instrument_arq_task(build_processing_reaper),
         instrument_arq_task(dashboard_sync_reaper),
         instrument_arq_task(purgatory_cleanup_reaper),
+        instrument_arq_task(edition_reconcile_reaper),
         # ``project_github_resolve`` is the opportunistic GitHub-id
         # resolve (PRD #346). PRD #419 moves it off the default
         # publishing pool onto this maintenance pool: its work is not
@@ -817,6 +849,25 @@ class MaintenanceWorkerSettings:
             instrument_arq_task(purgatory_cleanup_dispatcher),
             hour={config.purgatory_cleanup_cron_hour},
             minute={config.purgatory_cleanup_cron_minute},
+        ),
+        # ``edition_reconcile_dispatcher`` (PRD #612) fans out one
+        # reconciliation pass per org twice an hour. Half-hourly rather
+        # than daily like the purgatory sweep because the drift it
+        # repairs is user-visible — an edition serving nothing, or
+        # serving a build two releases old — so worst-case
+        # time-to-repair is what the cadence buys; and unconditionally
+        # rather than behind a pre-flight because drift is by definition
+        # state nobody has compared against the edge yet, so a query
+        # naming the drifted orgs would have to do the per-org job's own
+        # work. The ``{9, 39}`` slot is one of the two minute pairs left
+        # free by the reapers below (``{15, 45}`` goes to this loop's
+        # own reaper), keeping the fan-out off every other
+        # cron's minute on a horizontally scaled pool — the same
+        # contention-avoidance precedent as
+        # ``git_ref_audit_discovery`` at minute 17.
+        cron(
+            instrument_arq_task(edition_reconcile_dispatcher),
+            minute={9, 39},
         ),
         cron(
             instrument_arq_task(lifecycle_reaper),
@@ -878,14 +929,18 @@ class MaintenanceWorkerSettings:
             minute={24, 54},
         ),
         # ``purgatory_cleanup_reaper`` runs on the same 30-minute
-        # cadence as its run-less siblings, on the last free pair of
-        # offset minutes: ``{0, 30}`` is the lifecycle reaper's,
-        # ``{3, 18, 33, 48}`` the dashboard_build reaper's, and
-        # ``{6, 36}``, ``{12, 42}`` and ``{24, 54}`` belong to the
-        # publish_edition, build_processing and dashboard_sync reapers
-        # — so nothing on this pool queries ``queue_jobs`` at the same
-        # instant on a horizontally scaled deployment, the same
-        # precedent that puts ``git_ref_audit_discovery`` on minute 17.
+        # cadence as its run-less siblings, on its own pair of offset
+        # minutes. The pool's whole minute allocation, so a new cron can
+        # be placed without re-deriving it: ``{0, 30}`` the lifecycle
+        # reaper, ``{3, 18, 33, 48}`` the dashboard_build reaper,
+        # ``{6, 36}`` publish_edition, ``{9, 39}`` the
+        # edition_reconcile dispatcher, ``{12, 42}`` build_processing,
+        # ``{15, 45}`` the edition_reconcile reaper, ``{21, 51}``
+        # here, ``{24, 54}`` dashboard_sync, plus
+        # the three daily ticks at 05:17, 04:47 and 03:23 — so nothing
+        # on this pool queries ``queue_jobs`` at the same instant on a
+        # horizontally scaled deployment, the same precedent that puts
+        # ``git_ref_audit_discovery`` on minute 17.
         # A wedged ``purgatory_cleanup`` row is invisible to operators,
         # so the tighter dashboard_build cadence is not warranted; what
         # it does hold hostage is the per-org mutex, and with it that
@@ -896,6 +951,28 @@ class MaintenanceWorkerSettings:
         cron(
             instrument_arq_task(purgatory_cleanup_reaper),
             minute={21, 51},
+        ),
+        # ``edition_reconcile_reaper`` takes the last free pair,
+        # ``{15, 45}`` — six minutes behind the dispatcher it backstops
+        # so a tick's own fan-out is never what the sweep is looking at.
+        # It shares those minutes with the five-minute
+        # ``arq_queue_stats`` cron below, which is deliberate and the
+        # same overlap the lifecycle reaper already lives with on
+        # ``{0, 30}``: queue-depth stats touch only Redis and Kafka, so
+        # they never compete for the Postgres connection-pool slots the
+        # stagger exists to protect.
+        # Same 30-minute cadence as its run-less siblings, but a much
+        # tighter threshold (1 h, not 6): this is the only one of them
+        # whose loop also runs twice an hour, so a wedged row holding
+        # the per-org mutex costs that organization twelve
+        # reconciliation passes before a sibling-sized window would
+        # fire. Nothing in flight is lost to the tighter setting — the
+        # publishes a pass enqueues run on the default pool under their
+        # own queue rows, so failing the reconcile row cancels no repair
+        # already under way.
+        cron(
+            instrument_arq_task(edition_reconcile_reaper),
+            minute={15, 45},
         ),
         # Generic arq-queue metrics (SQR-112): per-pool ``arq_queue_stats``
         # gauge for the maintenance queue. Queue-depth stats only touch

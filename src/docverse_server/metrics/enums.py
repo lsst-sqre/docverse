@@ -208,6 +208,11 @@ class EditionPublishTrigger(StrEnum):
       handler enqueues a ``publish_edition`` job with no
       ``keeper_sync_run_id``, tagging its payload ``trigger=rollback``
       so it is not conflated with build fan-out).
+    - ``reconcile`` — the periodic reconciliation loop (PRD #612)
+      re-driving a publish some other flow lost. These are repairs
+      rather than new work, so charting them next to ``build`` is how
+      an operator sees how much of an environment's publish traffic is
+      the system healing itself.
 
     ``build`` is the default: a publish with neither a
     ``keeper_sync_run_id`` nor an explicit payload ``trigger`` is the
@@ -217,3 +222,4 @@ class EditionPublishTrigger(StrEnum):
     build = "build"
     keeper_sync = "keeper_sync"
     rollback = "rollback"
+    reconcile = "reconcile"

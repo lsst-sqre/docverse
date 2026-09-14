@@ -200,6 +200,26 @@ class SqlQueueJob(Base):
                 "AND status IN ('queued', 'in_progress')"
             ),
         ),
+        # Per-org mutex for ``edition_reconcile`` per-org child jobs:
+        # at most one queued or in_progress row per ``org_id``. Same
+        # single-column shape as the three per-org mutexes above — the
+        # reconciliation loop is per-org by design, with no sub-key
+        # under ``org_id``. What it protects is a *duplicated* write
+        # rather than a destructive one: two reconcilers over one org
+        # would read the same drifted editions and enqueue two
+        # ``publish_edition`` jobs for each, doubling the publish load
+        # exactly when the org is already behind. The row still carries
+        # ``subject_label = org.slug`` for operator readability, as the
+        # siblings do.
+        Index(
+            "idx_queue_jobs_edition_reconcile_active_uq",
+            "org_id",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'edition_reconcile' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
         # Per-project mutex for dashboard_build jobs: at most one
         # queued or in_progress row per (org_id, project_id). Backstops
         # the application-side ``has_active_dashboard_build`` pre-check

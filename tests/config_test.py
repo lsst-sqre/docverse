@@ -28,6 +28,7 @@ import pytest
 from pydantic import ValidationError
 
 from docverse_server.config import (
+    EDITION_RECONCILE_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
     Configuration,
 )
@@ -193,7 +194,13 @@ def test_publish_edition_job_timeout_env_var_override(
 
 
 def test_other_reaper_thresholds_unchanged() -> None:
-    """Only keeper-sync derives; the other five reapers keep literals."""
+    """Keeper-sync and edition_reconcile derive; these five keep literals.
+
+    The two derived thresholds each back a job whose own timeout bounds
+    it (``keeper_sync_job_timeout_seconds`` and the shared
+    ``maintenance_job_timeout_seconds``). The five below backstop jobs
+    with no such pairing, so they stay flat literals.
+    """
     config = Configuration()
     assert config.lifecycle_reaper_threshold_seconds == 21600
     assert config.dashboard_build_reaper_threshold_seconds == 1800
@@ -258,3 +265,165 @@ def test_purgatory_cleanup_cap_refuses_zero(
     monkeypatch.setenv("DOCVERSE_PURGATORY_CLEANUP_MAX_BUILDS_PER_JOB", "0")
     with pytest.raises(ValidationError):
         Configuration()
+
+
+def test_edition_reconcile_defaults() -> None:
+    """The reconciler ships on and capped, unlike the purgatory sweep.
+
+    The two flags look alike and default opposite ways on purpose.
+    ``purgatory_cleanup_enabled`` is off because that sweep deletes
+    object-store content permanently, so an operator has to opt each
+    environment in. Reconciliation only ever *enqueues* a publish of the
+    build an edition already points at, so the worst a wrong tick can do
+    is republish something that was already correct — leaving it off
+    would mean every environment silently keeps the drift the loop
+    exists to repair.
+
+    The reaper threshold carries no literal of its own: like
+    keeper-sync's it derives from the timeout that bounds the job it
+    backstops, so it cannot be left behind when an operator moves that
+    timeout.
+    """
+    config = Configuration()
+    assert config.edition_reconcile_enabled is True
+    assert config.edition_reconcile_max_actions_per_job == 100
+    assert config.edition_reconcile_reaper_threshold_seconds == (
+        config.maintenance_job_timeout_seconds
+        + EDITION_RECONCILE_REAPER_MARGIN_SECONDS
+    )
+    assert config.edition_reconcile_reaper_threshold_seconds == 5400
+
+
+def test_edition_reconcile_reaper_threshold_follows_maintenance_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving the shared maintenance timeout drags the threshold with it.
+
+    ``maintenance_job_timeout_seconds`` is shared by every function on
+    the pool, so an operator raising it for one of them (the purgatory
+    sweep, say) used to leave the reconcile reaper's flat 3600 s exactly
+    at — and then below — the timeout, which let ``fail_silent_jobs``
+    reap a tick arq was still running.
+    """
+    monkeypatch.setenv("DOCVERSE_MAINTENANCE_JOB_TIMEOUT_SECONDS", "7200")
+    config = Configuration()
+    assert config.maintenance_job_timeout_seconds == 7200
+    assert config.edition_reconcile_reaper_threshold_seconds == (
+        7200 + EDITION_RECONCILE_REAPER_MARGIN_SECONDS
+    )
+
+
+def test_edition_reconcile_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both knobs are env-overridable under the ``DOCVERSE_`` prefix.
+
+    Phalanx sets them from the chart's ``config.maintenance`` values, and
+    an operator watching a badly drifted org needs to be able to pull the
+    flag without a redeploy of a new image.
+    """
+    monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_ENABLED", "false")
+    monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "7")
+    monkeypatch.setenv("DOCVERSE_MAINTENANCE_JOB_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv(
+        "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "45"
+    )
+    config = Configuration()
+    assert config.edition_reconcile_enabled is False
+    assert config.edition_reconcile_max_actions_per_job == 7
+    assert config.edition_reconcile_reaper_threshold_seconds == 45
+
+
+def test_edition_reconcile_reaper_threshold_override_must_clear_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override at or below the maintenance timeout is refused.
+
+    A threshold that does not strictly clear the timeout lets the reaper
+    fail a tick arq has not cancelled yet. That drops the row from
+    ``idx_queue_jobs_edition_reconcile_active_uq``, so the next
+    dispatcher tick mints a second reconciler for the same org, both
+    enqueue publishes for the unapplied tail of the first plan, and the
+    first job's later ``complete()`` raises ``InvalidJobStateError``. The
+    old flat 3600 s default sat exactly on that boundary, which is the
+    value pinned here.
+    """
+    monkeypatch.setenv(
+        "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "3600"
+    )
+    with pytest.raises(ValidationError) as excinfo:
+        Configuration()
+    message = str(excinfo.value)
+    assert "edition_reconcile_reaper_threshold_seconds" in message
+    assert "maintenance_job_timeout_seconds" in message
+
+
+def test_edition_reconcile_reaper_threshold_override_below_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor is the timeout itself, not merely a positive number.
+
+    Non-prod environments reach for seconds-long thresholds to watch the
+    reaper fire; doing that here means driving the maintenance timeout
+    down too, rather than leaving the pair inverted.
+    """
+    monkeypatch.setenv(
+        "DOCVERSE_EDITION_RECONCILE_REAPER_THRESHOLD_SECONDS", "45"
+    )
+    with pytest.raises(ValidationError):
+        Configuration()
+
+
+def test_edition_reconcile_cap_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap of zero would plan repairs every tick and apply none.
+
+    An operator reaching for "stop reconciling" wants
+    ``edition_reconcile_enabled``; a cap of 0 would instead run a job per
+    org that reads every edition, reports the drift it found, and fixes
+    none of it — a tick that looks healthy while nothing converges.
+    """
+    monkeypatch.setenv("DOCVERSE_EDITION_RECONCILE_MAX_ACTIONS_PER_JOB", "0")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+
+def test_edition_reconcile_reaper_threshold_is_tighter_than_siblings() -> None:
+    """The reconcile reaper's window is sized to its own cadence.
+
+    Every other maintenance-pool reaper backstops a daily or
+    operator-triggered job and can afford a six-hour window. This one
+    backstops a loop that ticks twice an hour, and the wedged row holds
+    the per-org mutex, so a sibling-sized threshold would cost an
+    organization twelve consecutive reconciliation passes before the
+    backstop fired.
+    """
+    config = Configuration()
+    assert config.edition_reconcile_reaper_threshold_seconds < (
+        config.purgatory_cleanup_reaper_threshold_seconds
+    )
+    assert config.edition_reconcile_reaper_threshold_seconds < (
+        config.publish_edition_reaper_threshold_seconds
+    )
+
+
+def test_publish_edition_reaper_description_points_at_reconcile() -> None:
+    """The publish reaper's knob no longer overstates what a reap does.
+
+    Reaping a ``publish_edition`` row only fails the ``queue_jobs`` row:
+    the edition and its ``edition_build_history`` pair stay in
+    ``publishing``, which is exactly the signal ``edition_reconcile``
+    (PRD #612) reads to re-drive the pair. The old wording promised the
+    opposite — that the reap kept an edition out of ``publishing`` — so
+    an operator reading it would have expected the pair to self-clear
+    and would not have known to look at the reconciler. Pinned as a test
+    because the description is the operator-facing documentation of the
+    knob, published straight into the settings reference.
+    """
+    description = Configuration.model_fields[
+        "publish_edition_reaper_threshold_seconds"
+    ].description
+    assert description is not None
+    assert "edition_reconcile" in description
+    assert "does not sit in" not in description

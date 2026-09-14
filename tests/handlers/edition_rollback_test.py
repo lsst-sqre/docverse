@@ -381,6 +381,20 @@ async def test_rollback_enqueues_publish_edition_arq_job(
         assert child is not None
         assert child.kind == JobKind.publish_edition
 
+        # Rollback is what puts two rows on one ``(edition, build)``
+        # pair, so its payload has to name the row it just recorded:
+        # a job that resolved the pair instead could pick up whichever
+        # row a later rollback added (task #630).
+        history_store = EditionBuildHistoryStore(
+            session=db_session, logger=logger
+        )
+        recorded = await history_store.get_by_edition_and_build(
+            edition_id=payload["edition_id"], build_id=builds[0][0]
+        )
+        assert recorded is not None
+        assert recorded.position == 1
+        assert payload["history_id"] == recorded.id
+
 
 @pytest.mark.asyncio
 async def test_rollback_publishes_edition_lifecycle(

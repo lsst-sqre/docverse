@@ -8,6 +8,7 @@ same dedicated pool so the dispatcher's enqueues actually run.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from arq.cron import CronJob
@@ -18,6 +19,9 @@ from docverse_server.worker.functions import (
     build_processing_reaper,
     dashboard_build_reaper,
     dashboard_sync_reaper,
+    edition_reconcile,
+    edition_reconcile_dispatcher,
+    edition_reconcile_reaper,
     inventory_census,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
@@ -32,6 +36,7 @@ from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
     MaintenanceWorkerSettings,
     WorkerSettings,
+    publish_queue_stats_cron,
     shutdown,
     startup_maintenance,
 )
@@ -65,7 +70,9 @@ def _function_by_coroutine(coro: object) -> Function:
     raise AssertionError(msg)
 
 
-def _other_maintenance_cron_minutes(coro: object) -> set[int]:
+def _other_maintenance_cron_minutes(
+    coro: object, *, ignore: Collection[object] = ()
+) -> set[int]:
     """Every minute some *other* maintenance-pool cron fires on.
 
     Derived from the registered ``cron_jobs`` rather than a
@@ -75,10 +82,24 @@ def _other_maintenance_cron_minutes(coro: object) -> set[int]:
     shared firing minute makes two crons race for the same Postgres
     connection-pool slots, which is the contention every stagger
     comment in ``worker/main.py`` exists to avoid.
+
+    ``ignore`` drops named coroutines from the tally. Postgres
+    contention is the whole point of the stagger, so a cron that never
+    touches the database is not a collision — ``publish_queue_stats_cron``
+    reads Redis and writes Kafka on a five-minute cadence, which
+    ``worker/main.py`` says outright is free to overlap the reaper
+    slots. The lifecycle reaper's ``{0, 30}`` already sits under that
+    cadence; the slots that do not are luck, not design, so a caller
+    landing on one of the twelve five-minute minutes names it here
+    rather than being pushed onto a worse slot.
     """
+    ignored = set(ignore)
     minutes: set[int] = set()
     for job in getattr(MaintenanceWorkerSettings, "cron_jobs", []):
-        if not isinstance(job, CronJob) or _underlying(job.coroutine) is coro:
+        if not isinstance(job, CronJob):
+            continue
+        underlying = _underlying(job.coroutine)
+        if underlying is coro or underlying in ignored:
             continue
         slot = job.minute
         if slot is None:
@@ -667,7 +688,7 @@ def test_purgatory_cleanup_cron_minute_does_not_collide() -> None:
 def test_purgatory_cleanup_reaper_registered_as_plain_coroutine() -> None:
     """``purgatory_cleanup_reaper`` is on the maintenance pool, unwrapped.
 
-    Registered plainly, like the four other run-less reapers and unlike
+    Registered plainly, like the five other run-less reapers and unlike
     the sweep it backstops: it is a cron-only backstop with no per-job
     timeout budget of its own, so it inherits arq's defaults rather than
     the pool's ``maintenance_job_timeout_seconds`` wrapper.
@@ -727,7 +748,7 @@ def test_default_worker_does_not_register_purgatory_cleanup_reaper() -> None:
 
     The reaper lives exclusively on the maintenance pool so cron-driven
     maintenance work never contends with the publishing flow, exactly
-    like the four run-less reapers registered alongside it.
+    like the five run-less reapers registered alongside it.
     """
     default_underlying = {
         _underlying(entry.coroutine if isinstance(entry, Function) else entry)
@@ -764,3 +785,190 @@ def test_default_worker_does_not_register_purgatory_cleanup() -> None:
         if isinstance(job, CronJob)
     }
     assert purgatory_cleanup_dispatcher not in coroutines
+
+
+def test_edition_reconcile_registered_single_attempt() -> None:
+    """The per-org reconciler carries the pool timeout, one attempt.
+
+    A retry would re-plan the org from scratch and re-enqueue every
+    action the first attempt already applied, because the plan lives in
+    the database rather than in the job. ``max_tries=1`` leaves recovery
+    to the next tick, which re-plans from current state and finds the
+    already-enqueued pairs holding live publish jobs.
+    """
+    per_org = _function_by_coroutine(edition_reconcile)
+    assert per_org.timeout_s == float(_config.maintenance_job_timeout_seconds)
+    assert per_org.max_tries == 1
+
+
+def test_edition_reconcile_dispatcher_registered_single_attempt() -> None:
+    """The dispatcher carries the pool timeout and one attempt.
+
+    Same shape as the sweep's dispatcher, for a different reason: a
+    retried fan-out would find every org's mutex held by the rows its
+    first attempt committed, so each retry would step over the whole
+    estate and report a tick that reconciled nothing. Recovery is the
+    next half-hourly tick, which is at most 30 minutes away.
+    """
+    dispatcher = _function_by_coroutine(edition_reconcile_dispatcher)
+    assert dispatcher.timeout_s == float(
+        _config.maintenance_job_timeout_seconds
+    )
+    assert dispatcher.max_tries == 1
+
+
+def test_edition_reconcile_dispatcher_runs_every_thirty_minutes() -> None:
+    """The reconcile dispatcher fires twice an hour, unconditionally.
+
+    Half-hourly rather than daily because the drift it repairs is
+    user-visible — an edition serving nothing, or serving a build two
+    releases old — so the worst-case time-to-repair is what the cadence
+    buys. The cron is registered whether or not
+    ``edition_reconcile_enabled`` is set: the flag is read inside the
+    function body, so flipping it in Phalanx takes effect on the next
+    tick instead of requiring a worker restart.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    dispatcher_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is edition_reconcile_dispatcher
+    ]
+    assert len(dispatcher_crons) == 1
+    assert dispatcher_crons[0].minute == {9, 39}
+    assert dispatcher_crons[0].hour is None
+
+
+def test_edition_reconcile_dispatcher_slot_collides_with_nothing() -> None:
+    """The ``{9, 39}`` pair is free of every other maintenance cron.
+
+    The pool's minute slots are allocated exhaustively — the lifecycle
+    reaper holds ``{0, 30}``, the dashboard_build reaper
+    ``{3, 18, 33, 48}``, and ``{6, 36}``, ``{12, 42}``, ``{21, 51}`` and
+    ``{24, 54}`` belong to the publish_edition, build_processing,
+    purgatory_cleanup and dashboard_sync reapers, with the census, the
+    audit and the sweep's dispatcher on daily minutes of their own. This
+    asserts the new pair against whatever is actually registered, so a
+    later cron landing on minute 9 fails here rather than in production,
+    where the two would race for the same Postgres connection-pool slots
+    on a horizontally scaled pool.
+    """
+    assert {9, 39}.isdisjoint(
+        _other_maintenance_cron_minutes(edition_reconcile_dispatcher)
+    )
+
+
+def test_default_worker_does_not_register_edition_reconcile() -> None:
+    """The default queue stays free of the reconciliation loop.
+
+    The loop lives exclusively on the maintenance pool: its per-org pass
+    reads every edition an org owns and calls the CDN, so it must not
+    contend with the publishing flow it exists to re-drive. What it
+    enqueues *onto* the default pool is an ordinary ``publish_edition``
+    job, which is the only coupling between them.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert edition_reconcile not in default_underlying
+    assert edition_reconcile_dispatcher not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert edition_reconcile_dispatcher not in coroutines
+
+
+def test_edition_reconcile_reaper_registered_as_plain_coroutine() -> None:
+    """``edition_reconcile_reaper`` is on the maintenance pool, unwrapped.
+
+    Registered plainly, like the five other run-less reapers and unlike
+    the loop it backstops: it is a cron-only backstop with no per-job
+    timeout budget of its own, so it inherits arq's defaults rather than
+    the pool's ``maintenance_job_timeout_seconds`` wrapper.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in MaintenanceWorkerSettings.functions
+    }
+    assert edition_reconcile_reaper in underlying
+    assert not any(
+        isinstance(entry, Function)
+        and _underlying(entry.coroutine) is edition_reconcile_reaper
+        for entry in MaintenanceWorkerSettings.functions
+    )
+
+
+def test_edition_reconcile_reaper_runs_every_thirty_minutes() -> None:
+    """The reconcile reaper fires twice an hour on the ``{15, 45}`` slot.
+
+    Same cadence as the loop it backstops, offset six minutes behind the
+    dispatcher's ``{9, 39}`` so a tick's own fan-out is never the thing
+    the reaper is looking at. What a wedged row costs here is that
+    organization's whole reconciliation pass: the per-org mutex counts
+    it as live work, so every following tick steps over the org and its
+    drifted editions keep serving the wrong build.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is edition_reconcile_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {15, 45}
+    assert reaper_crons[0].hour is None
+
+
+def test_edition_reconcile_reaper_slot_collides_with_nothing() -> None:
+    """``{15, 45}`` is free of every database-bound maintenance cron.
+
+    This closes the pool's minute allocation: ``{0, 30}`` the lifecycle
+    reaper, ``{3, 18, 33, 48}`` dashboard_build, ``{6, 36}``
+    publish_edition, ``{9, 39}`` the reconcile dispatcher, ``{12, 42}``
+    build_processing, ``{15, 45}`` here, ``{21, 51}`` purgatory_cleanup
+    and ``{24, 54}`` dashboard_sync, with the census, the audit and the
+    sweep's dispatcher on daily minutes of their own. Asserted against
+    whatever is actually registered, so a seventh reaper landing on a
+    taken minute fails here rather than racing for the same Postgres
+    connection-pool slots in production.
+
+    The five-minute ``publish_queue_stats_cron`` is excluded because it
+    is not a competitor for those slots — it only reads Redis and writes
+    Kafka, which is why ``worker/main.py`` says it may overlap the
+    reaper minutes, and why the lifecycle reaper already shares
+    ``{0, 30}`` with it.
+    """
+    assert {15, 45}.isdisjoint(
+        _other_maintenance_cron_minutes(
+            edition_reconcile_reaper, ignore={publish_queue_stats_cron}
+        )
+    )
+
+
+def test_default_worker_does_not_register_edition_reconcile_reaper() -> None:
+    """The default queue stays free of the reconcile reaper.
+
+    The reaper lives exclusively on the maintenance pool so cron-driven
+    maintenance work never contends with the publishing flow, exactly
+    like the five run-less reapers registered alongside it.
+    """
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert edition_reconcile_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert edition_reconcile_reaper not in coroutines

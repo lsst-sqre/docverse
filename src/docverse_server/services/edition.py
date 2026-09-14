@@ -262,6 +262,10 @@ class EditionService:
                 "edition_slug": edition.slug,
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
+                # The row just recorded, so a late delivery cannot
+                # resolve the pair to a row some later repoint added
+                # (see the rollback path's note).
+                "history_id": new_history_entry.id,
             },
         )
 
@@ -426,6 +430,11 @@ class EditionService:
                 "edition_slug": edition.slug,
                 "build_id": build.id,
                 "build_public_id": serialize_base32_id(build.public_id),
+                # Name the row just recorded. Rollback is what puts two
+                # rows on one ``(edition, build)`` pair, so a worker
+                # that resolved the pair instead could pick up — and
+                # overwrite — whichever row a *later* rollback added.
+                "history_id": new_history_entry.id,
                 # Tag the publish so its edition_published metric reports
                 # trigger=rollback rather than the default build fan-out
                 # (the queue job carries no keeper_sync_run_id). SQR-112 D7.

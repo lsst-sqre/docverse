@@ -34,6 +34,7 @@ from .services.dashboard_templates import (
 )
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
+from .services.edition_reconcile import EditionReconcileService
 from .services.edition_tracking import (
     EditionTrackingDeps,
     EditionTrackingService,
@@ -362,6 +363,25 @@ class Factory:
             edition_store=self.create_edition_store(),
             dispatcher=self.queue_dispatcher,
             queue_job_store=queue_job_store,
+            logger=self._logger,
+        )
+
+    def create_edition_reconcile_service(self) -> EditionReconcileService:
+        """Create an :class:`EditionReconcileService`.
+
+        Built once per ``edition_reconcile`` per-org job. The service
+        manages its own short transactions (see
+        :meth:`EditionReconcileService.reconcile_org`), so it takes the
+        session as well as the stores.
+        """
+        return EditionReconcileService(
+            session=self._session,
+            edition_store=self.create_edition_store(),
+            history_store=self.create_edition_build_history_store(),
+            queue_job_store=self.create_queue_job_store(),
+            queue_backend=self.create_queue_backend(),
+            publisher_provider=self.create_edition_publisher_for_org,
+            publishing_service=self.create_edition_publishing_service(),
             logger=self._logger,
         )
 
