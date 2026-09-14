@@ -15,6 +15,9 @@ from datetime import timedelta
 from safir.metrics import EventPayload
 
 from .enums import (
+    ConditionalGetEndpoint,
+    ConditionalGetOutcome,
+    ConditionalGetPrecondition,
     EditionPublishTrigger,
     LifecycleAction,
     LifecycleActionTrigger,
@@ -28,6 +31,7 @@ from .enums import (
 __all__ = [
     "BuildProcessedEvent",
     "BuildUploadedEvent",
+    "ConditionalGetEvent",
     "DashboardBuiltEvent",
     "DocverseEventBase",
     "EditionLifecycleEvent",
@@ -431,3 +435,28 @@ class MembershipChangedEvent(DocverseEventBase):
 
     principal: str
     """Username or group name the membership applies to."""
+
+
+class ConditionalGetEvent(DocverseEventBase):
+    """A read endpoint evaluated a request's HTTP preconditions.
+
+    Emitted only when the request actually carried a precondition
+    header, so the event stream counts *conditional* traffic rather
+    than all traffic: the ratio of ``not_modified`` to ``modified``
+    within it is the cache hit rate, and a poller whose ratio collapses
+    is one whose validators stopped matching.
+
+    ``project`` is ``None`` for the org-scoped endpoints (the project
+    listing and the organization itself) and carries the project slug
+    for the single-project endpoint.
+    """
+
+    endpoint: ConditionalGetEndpoint
+    """Which read endpoint evaluated the preconditions."""
+
+    outcome: ConditionalGetOutcome
+    """Whether the request was answered 304 or with a full body."""
+
+    precondition: ConditionalGetPrecondition
+    """Which header decided; never ``None``, as an unconditional
+    request emits no event at all."""

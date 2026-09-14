@@ -15,6 +15,7 @@ from safir.metrics import EventManager, EventPublisher
 from .payloads import (
     BuildProcessedEvent,
     BuildUploadedEvent,
+    ConditionalGetEvent,
     DashboardBuiltEvent,
     EditionLifecycleEvent,
     EditionPublishedEvent,
@@ -51,6 +52,7 @@ class DocverseEvents(EventMaker):
     lifecycle_action: EventPublisher[LifecycleActionEvent]
     resource_inventory: EventPublisher[ResourceInventoryEvent]
     purgatory_cleanup_completed: EventPublisher[PurgatoryCleanupCompletedEvent]
+    conditional_get: EventPublisher[ConditionalGetEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -95,4 +97,7 @@ class DocverseEvents(EventMaker):
         )
         self.edition_reconcile_completed = await manager.create_publisher(
             "edition_reconcile_completed", EditionReconcileCompletedEvent
+        )
+        self.conditional_get = await manager.create_publisher(
+            "conditional_get", ConditionalGetEvent
         )

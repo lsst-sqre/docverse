@@ -15,8 +15,12 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from docverse.models import EditionKind, OrgRole, PrincipalType
+    from docverse_server.domain.conditional_get import PreconditionKind
 
 __all__ = [
+    "ConditionalGetEndpoint",
+    "ConditionalGetOutcome",
+    "ConditionalGetPrecondition",
     "EditionPublishTrigger",
     "LifecycleAction",
     "LifecycleActionTrigger",
@@ -223,3 +227,65 @@ class EditionPublishTrigger(StrEnum):
     keeper_sync = "keeper_sync"
     rollback = "rollback"
     reconcile = "reconcile"
+
+
+class ConditionalGetEndpoint(StrEnum):
+    """Which read endpoint evaluated a conditional GET.
+
+    Every conditional endpoint shares one event type rather than
+    getting its own, so a single query answers "how much traffic are
+    our validators actually saving?" across the API. The value is an
+    endpoint identity, not the route template, so a path change does
+    not break the Avro contract.
+    """
+
+    projects_list = "projects_list"
+    """``GET /orgs/{org}/projects``."""
+
+    project = "project"
+    """``GET /orgs/{org}/projects/{project}``."""
+
+    organization = "organization"
+    """``GET /orgs/{org}``."""
+
+
+class ConditionalGetOutcome(StrEnum):
+    """Whether a conditional GET was answered 304 or with a body."""
+
+    not_modified = "not_modified"
+    """The caller already held the current representation (304)."""
+
+    modified = "modified"
+    """The representation had changed, so it was sent in full (200)."""
+
+    @classmethod
+    def from_not_modified(cls, *, not_modified: bool) -> ConditionalGetOutcome:
+        """Map the domain evaluation's boolean answer."""
+        return cls.not_modified if not_modified else cls.modified
+
+
+class ConditionalGetPrecondition(StrEnum):
+    """Which request header decided a conditional GET.
+
+    Mirrors
+    :class:`~docverse_server.domain.conditional_get.PreconditionKind`
+    value-for-value; the emission site maps the domain enum to this one
+    so the published Avro schema does not move whenever the RFC
+    evaluator's internals are refactored (SQR-112 D4).
+    """
+
+    etag = "etag"
+    """``If-None-Match`` was evaluated."""
+
+    last_modified = "last_modified"
+    """``If-Modified-Since`` was evaluated."""
+
+    @classmethod
+    def from_domain(cls, kind: PreconditionKind) -> ConditionalGetPrecondition:
+        """Map the domain :class:`PreconditionKind`.
+
+        Values are identical, so this is a straight value lookup;
+        keeping it explicit makes a divergence a compile-time edit
+        rather than a silent schema break.
+        """
+        return cls(kind.value)

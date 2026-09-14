@@ -1612,3 +1612,85 @@ async def test_search_by_org_include_deleted_matches_deleted(
         "gone-live",
     ]
     assert with_flag.count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_includes_deleted_projects(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The watermark is the newest clock in the org, deleted rows too.
+
+    A soft delete is the one mutation whose row drops out of the
+    default listing, so a watermark that filtered deleted rows would
+    sit still through exactly the change a poller most needs to see.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="watermark-org")
+        for slug in ("wm-live", "wm-dead"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=f"Watermark {slug}"),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await store.soft_delete(
+            org_id=org_id,
+            slug="wm-dead",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    # Stamp the deleted row as the newest clock in the org. ``now()``
+    # is transaction-stable in PostgreSQL, so rows written in one
+    # transaction are otherwise indistinguishable.
+    newest = datetime(2026, 5, 1, tzinfo=UTC)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "wm-live")
+            .values(date_updated=datetime(2026, 4, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "wm-dead")
+            .values(date_updated=newest)
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+    db_session.expire_all()
+
+    async with db_session.begin():
+        watermark = await store.get_org_watermark(org_id)
+
+    assert watermark == newest
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_falls_back_to_org_date_created(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """An org with no projects is stamped with its own creation date.
+
+    A shared sentinel would give every empty org the same validator, so
+    a client could not tell one empty listing from another's.
+    """
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="watermark-empty-org",
+                title="Test Org",
+                base_domain="test.example.com",
+            )
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        watermark = await store.get_org_watermark(org.id)
+
+    assert watermark == org.date_created

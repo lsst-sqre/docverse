@@ -25,7 +25,12 @@ from docverse_server.domain.base32id import (
 )
 from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
-from docverse_server.metrics import LifecycleAction
+from docverse_server.metrics import (
+    ConditionalGetEndpoint,
+    ConditionalGetOutcome,
+    ConditionalGetPrecondition,
+    LifecycleAction,
+)
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.editionpublisher import (
     EditionPublisher,
@@ -1976,3 +1981,167 @@ async def test_list_projects_include_deleted_with_query(
         "sunk-live",
     ]
     assert with_flag.headers["X-Total-Count"] == "2"
+
+
+# ---------------------------------------------------------------------------
+# Conditional GET on the project listing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_projects_sends_validators(client: AsyncClient) -> None:
+    """The listing carries a weak ``ETag`` and a ``Last-Modified``."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["ETag"].startswith('W/"')
+    # The watermark is the newest project clock in the org.
+    assert response.headers["Last-Modified"] == "Sun, 01 Mar 2026 00:00:00 GMT"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_if_none_match_is_empty_304(
+    client: AsyncClient,
+) -> None:
+    """Echoing the tag back earns a bodyless 304 with both validators."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert first.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 304
+    assert second.content == b""
+    assert second.headers["ETag"] == first.headers["ETag"]
+    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_etag_changes_after_a_project_changes(
+    client: AsyncClient,
+) -> None:
+    """A moved watermark retires the tag the caller was holding."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert first.status_code == 200
+
+    patched = await client.patch(
+        "/docverse/orgs/proj-org/projects/tick-old",
+        json={"title": "Retitled"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_if_modified_since_alone_is_304(
+    client: AsyncClient,
+) -> None:
+    """A date with no tag is enough while the watermark stands still."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert first.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={
+            **headers,
+            "If-Modified-Since": first.headers["Last-Modified"],
+        },
+    )
+
+    assert second.status_code == 304
+    assert second.content == b""
+
+
+@pytest.mark.asyncio
+async def test_list_projects_pages_have_distinct_etags(
+    client: AsyncClient,
+) -> None:
+    """Each page of one listing validates as its own representation."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"limit": 1},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    next_url = PaginationLinkData.from_header(first.headers["Link"]).next_url
+    assert next_url is not None
+
+    second = await client.get(next_url, headers=headers)
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_publishes_conditional_get_event(
+    client: AsyncClient,
+) -> None:
+    """One event per precondition-bearing request, and none otherwise."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.conditional_get
+    assert isinstance(publisher, MockEventPublisher)
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert first.status_code == 200
+    # An unconditional request is not conditional traffic, so it is not
+    # counted as a cache miss either.
+    assert publisher.published == []
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+    assert second.status_code == 304
+
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "proj-org"
+    assert event.project is None
+    assert event.endpoint == ConditionalGetEndpoint.projects_list
+    assert event.outcome == ConditionalGetOutcome.not_modified
+    assert event.precondition == ConditionalGetPrecondition.etag

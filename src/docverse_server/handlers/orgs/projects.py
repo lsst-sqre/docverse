@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from pydantic import AwareDatetime
 
 from docverse.models import ProjectCreate, ProjectUpdate
@@ -17,8 +19,17 @@ from docverse_server.dependencies.context import (
     RequestContext,
     context_dependency,
 )
+from docverse_server.domain.conditional_get import (
+    datetime_to_microseconds,
+    make_weak_etag,
+)
+from docverse_server.handlers.conditional import evaluate_conditional_get
 from docverse_server.handlers.params import OrgSlugParam, ProjectSlugParam
-from docverse_server.metrics import LifecycleAction, ProjectLifecycleEvent
+from docverse_server.metrics import (
+    ConditionalGetEndpoint,
+    LifecycleAction,
+    ProjectLifecycleEvent,
+)
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -38,11 +49,50 @@ from .models import Project
 router = APIRouter()
 
 
+def _listing_etag(
+    context: RequestContext, *, org_public_id: int, watermark: datetime
+) -> str:
+    """Build the entity-tag for one page of the project listing.
+
+    The material is the endpoint's identity, the org's public id, the
+    watermark, and the request's whole query string canonicalized by
+    sorting — which is what keeps every page and every filter
+    combination on its own tag without this function having to know
+    which parameters the listing supports. A parameter added later is
+    covered the day it is added.
+
+    The watermark alone stands in for the rows: every project mutation
+    stamps that row with the transaction clock, which is later than
+    any clock already stored, so an insert, an update, or a soft delete
+    all move the maximum. A row count alongside it would discriminate
+    nothing further and would cost a query on the very path conditional
+    GET exists to make cheap.
+    """
+    return make_weak_etag(
+        (
+            ConditionalGetEndpoint.projects_list.value,
+            org_public_id,
+            datetime_to_microseconds(watermark),
+            urlencode(sorted(context.request.query_params.multi_items())),
+        )
+    )
+
+
 @router.get(
     "/orgs/{org}/projects",
     response_model=list[Project],
     summary="List projects in an organization",
     name="get_projects",
+    responses={
+        status.HTTP_304_NOT_MODIFIED: {
+            "description": (
+                "The caller's ``If-None-Match`` or ``If-Modified-Since``"
+                " already matched this page, so no body is sent. The"
+                " ``ETag`` and ``Last-Modified`` validators are repeated"
+                " so a poller can carry them into its next request."
+            )
+        }
+    },
 )
 async def get_projects(
     *,
@@ -110,9 +160,26 @@ async def get_projects(
             ),
         ),
     ] = False,
-) -> list[Project]:
+) -> list[Project] | Response:
     async with context.session.begin():
         service = context.factory.create_project_service()
+        # Evaluate the caller's preconditions before the listing query:
+        # a poller that is up to date should pay for the watermark
+        # aggregate and nothing else.
+        watermark = await service.get_org_watermark(user.org.id)
+        not_modified = await evaluate_conditional_get(
+            context,
+            endpoint=ConditionalGetEndpoint.projects_list,
+            organization=org_slug,
+            etag=_listing_etag(
+                context,
+                org_public_id=user.org.public_id,
+                watermark=watermark,
+            ),
+            last_modified=watermark,
+        )
+        if not_modified is not None:
+            return not_modified
         if q is not None:
             search_cursor = (
                 ProjectSearchCursor.from_str(cursor)

@@ -244,6 +244,16 @@ class ProjectService:
         )
         return org, result
 
+    async def get_org_watermark(self, org_id: int) -> datetime:
+        """Return the conditional-GET watermark for an org's listing.
+
+        The newest ``date_updated`` among the org's projects, deleted
+        rows included, falling back to the org's own ``date_created``
+        when it owns none. See
+        :meth:`~docverse_server.storage.project_store.ProjectStore.get_org_watermark`.
+        """
+        return await self._store.get_org_watermark(org_id)
+
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate
     ) -> tuple[Organization, Project]:

@@ -18,6 +18,7 @@ from sqlalchemy.sql import expression, func
 
 from docverse.models import ProjectCreate, ProjectUpdate
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
+from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.project import Project
 from docverse_server.storage._public_id import (
@@ -309,6 +310,60 @@ class ProjectStore:
         return await runner.query_object(
             self._session, stmt, cursor=cursor, limit=limit
         )
+
+    async def get_org_watermark(self, org_id: int) -> datetime:
+        """Return the newest ``date_updated`` among an org's projects.
+
+        This is the ``Last-Modified`` value — and the moving part of
+        the ``ETag`` — for ``GET /orgs/{org}/projects``. Soft-deleted
+        projects count: a delete is the one mutation whose row leaves
+        the default listing, so a watermark that skipped deleted rows
+        would stand still through exactly the change a poller most
+        needs to notice.
+
+        An org with no projects falls back to its own
+        ``date_created``. The alternative — a sentinel, or ``None`` for
+        the handler to paper over — would make every empty org share
+        one validator, so a caller could not tell "still empty" from
+        "empty, but a different org".
+
+        Any project mutation stamps that row's ``date_updated`` with
+        the transaction clock, which is later than every clock already
+        stored, so the maximum moves on every insert, update, and soft
+        delete. That is what lets one aggregate stand in for the whole
+        listing without a row count alongside it.
+
+        Parameters
+        ----------
+        org_id
+            Internal id of the organization.
+
+        Returns
+        -------
+        datetime
+            Timezone-aware instant, at full stored precision.
+
+        Raises
+        ------
+        NoResultFound
+            If ``org_id`` names no organization. Callers reach this
+            with an org they already resolved, so a miss is a bug
+            rather than a 404 to render.
+        """
+        stmt = (
+            select(
+                func.coalesce(
+                    func.max(SqlProject.date_updated),
+                    SqlOrganization.date_created,
+                )
+            )
+            .select_from(SqlOrganization)
+            .outerjoin(SqlProject, SqlProject.org_id == SqlOrganization.id)
+            .where(SqlOrganization.id == org_id)
+            .group_by(SqlOrganization.id, SqlOrganization.date_created)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one()
 
     async def search_by_org(
         self,
