@@ -9,7 +9,8 @@ absorb these pages unchanged. The design of the system as a whole is
 
 - [REST API conventions](api-conventions.md) — the conventions new
   endpoints follow: async-action verbs, path parameters, hypermedia
-  links, public identifiers, pagination, and the rest.
+  links, public identifiers, pagination, conditional GET, soft-deleted
+  resources, and the rest.
 
 ## Operations
 

@@ -87,6 +87,16 @@ characters plus a 2-character checksum, hyphenated every 4, e.g.
 the resource itself and `{relation}_id` when referencing another
 resource (`job_id`, `build_id`, `keeper_sync_run_id`).
 
+Resources carrying an `id` of their own: **organizations**,
+**projects**, builds, queue jobs, keeper-sync runs, and keeper-sync
+tombstones. IDs are minted in application code from a time-ordered
+sequence rather than by the database, so they sort in creation order
+and no integer row id has to reach the wire to get an ordered handle on
+a resource. For organizations and projects the ID is informational
+today — path parameters are still slugs — but it is stable for the life
+of the row, so it stays the traceable identity if a slug is ever
+renamed.
+
 Numeric IDs from *foreign* systems are allowed but must be clearly
 labelled as such in the field name and description: `ltd_id` (legacy
 LTD Keeper), `github_owner_id` / `github_repo_id` /
@@ -250,6 +260,15 @@ never offset/limit. The mechanics (see
 - **Query parameters:** `cursor` (an opaque token copied from a previous
   response — clients must not construct or parse it) and `limit` (default
   `25`, maximum `100`).
+- **Ordering:** a listing that offers more than one traversal takes an
+  `order` parameter. The project listing accepts `slug` (ascending, the
+  default), `date_created`, and `date_updated` (both newest-first). Each
+  ordering has its own cursor type, so a cursor is only valid for the
+  order that produced it.
+- **Fuzzy search:** a listing that supports one takes `q`, which
+  replaces the `order` traversal with a relevance ranking and pages
+  through the same `Link` header. The project listing's other filters
+  apply on the `q` path too.
 - **`Link` response header:** carries `rel="next"` / `rel="prev"` URLs
   (RFC 8288) that already embed the correct cursor. Clients follow these
   rather than building their own paginated URLs.
@@ -285,3 +304,144 @@ organization's team or configuration, not by user-generated content:
 
 If one of these collections ever grows unbounded, migrate it to the keyset
 pagination pattern above rather than adding offset paging.
+
+## Conditional GET: `ETag` and `Last-Modified` validators
+
+The read endpoints a consumer polls carry HTTP validators
+([RFC 7232](https://www.rfc-editor.org/rfc/rfc7232)), so a pass that
+finds nothing new is answered with an empty **`304 Not Modified`**
+rather than a full representation. Three endpoints participate, each
+with its own *watermark* — the instant it reports as `Last-Modified`
+and folds into its `ETag`:
+
+| Endpoint | Metrics `endpoint` value | Watermark |
+| --- | --- | --- |
+| `GET /orgs/{org}/projects` | `projects_list` | newest `date_updated` among the organization's projects, soft-deleted ones **included**, falling back to the organization's own `date_created` when it has none |
+| `GET /orgs/{org}/projects/{project}` | `project` | the later of the project's `date_updated` and its default `__main` edition's, because the response embeds that edition |
+| `GET /orgs/{org}` | `organization` | the organization's own `date_updated` |
+
+`GET /orgs` is **deliberately excluded.** It is filtered by the caller's
+memberships, so granting or revoking one changes what it returns
+without moving any organization's clock; a validator there would hand a
+poller a 304 over a listing that had in fact changed.
+
+**Weak ETags.** Tags are weak — `W/"<32 hex characters>"`, the leading
+half of a SHA-256 over a canonical tuple of validator material —
+because they mark *semantic* equivalence rather than byte-for-byte
+identity, so a serializer tweak that reorders JSON keys does not retire
+one. The material always opens with the endpoint's identity and the
+resource's `public_id`, so two resources can never collide on a tag,
+and then names whatever else distinguishes the representation:
+
+- The **project listing** hashes the request's whole query string,
+  canonicalized by sorting. Every page and every filter combination
+  therefore gets its own tag without the endpoint having to enumerate
+  its own parameters — a parameter added later is covered the day it is
+  added.
+- The **single project** hashes its parsed `include_deleted` flag, the
+  only parameter it takes. Hashing the *parsed* boolean means
+  `?include_deleted=false` and the omitted default — the same
+  representation — share a tag instead of churning one.
+
+**Second granularity.** An HTTP date carries whole seconds, so
+`Last-Modified` is necessarily the watermark truncated to the second,
+and the `If-Modified-Since` comparison truncates the watermark the same
+way before comparing. Comparing against the untruncated instant would
+report "modified" forever, because a client can only ever echo back the
+second it was told.
+
+**`If-None-Match` takes precedence.** Per RFC 7232 §6, when
+`If-None-Match` is present it is evaluated and `If-Modified-Since` is
+not consulted at all — *even when the tags do not match*. The date is a
+fallback for a client that holds no tag, never a second opinion. Within
+`If-None-Match`, `*` matches any current representation and tags are
+compared weakly, so `W/"x"` and `"x"` are the same tag. An
+`If-Modified-Since` that cannot be parsed is **ignored** — the request
+is answered as though it were unconditional — rather than rejected.
+
+A 304 carries no body and repeats both validators, so a poller can take
+them straight into its next request. Handlers evaluate the
+preconditions as early as the watermark allows, inside the read
+transaction, so the work the 304 skips is real: the project listing
+never runs its page query at all, and `GET /orgs/{org}` never loads its
+embedded service summaries. The single project is the exception — it
+has to read the project row and its default edition to know its own
+watermark — so there the saving is the serialized body rather than the
+queries behind it.
+
+The semantics live in `src/docverse_server/domain/conditional_get.py`
+as pure functions over plain values (no request object, no database);
+`src/docverse_server/handlers/conditional.py` is the thin glue that
+reads the two request headers, sets `ETag` and `Last-Modified` on the
+outgoing response, and hands back the ready-made 304. A new conditional
+endpoint computes its watermark and calls that helper rather than
+spelling the headers itself.
+
+**Observability.** Every evaluation is logged at debug level, and a
+`conditional_get` metrics event is published for each request that
+actually carried a precondition header — an unconditional request emits
+nothing, so the event stream counts *conditional* traffic and the ratio
+within it is the cache hit rate. Beyond the `organization` and
+`project` dimensions every Docverse event carries, it records:
+
+- `endpoint` — `projects_list`, `project`, or `organization`, an
+  endpoint identity rather than a route template, so a path change does
+  not break the Avro contract.
+- `outcome` — `not_modified` (answered 304) or `modified` (sent in
+  full).
+- `precondition` — `etag` when `If-None-Match` decided,
+  `last_modified` when the date did.
+
+## Soft-deleted resources and polling the project listing
+
+Deleting a project is a **soft** delete: the row stays, stamped with a
+`date_deleted`, and drops out of the default listing. A consumer that
+mirrors Docverse's project set therefore needs to be able to see the
+deletion itself rather than merely notice that a project stopped
+appearing, which is what the parameters below are for.
+
+**`include_deleted`** (boolean, default `false`) is accepted by both
+`GET /orgs/{org}/projects` and `GET /orgs/{org}/projects/{project}`:
+
+- On the listing it adds soft-deleted projects to the results and
+  counts them in `X-Total-Count`, on the fuzzy-search (`q`) path as
+  well as the ordered one.
+- On the single project it turns what would otherwise be a 404 into a
+  representation. Slugs are never reused after a delete — the
+  `uq_projects_org_slug` constraint ignores `date_deleted` — so the
+  widened lookup can only ever resolve the project that already owned
+  the slug.
+- It is **read-only**: `PATCH` and `DELETE` ignore it and still 404 on
+  a soft-deleted project.
+
+**`date_deleted`** is always present on the project resource — the
+deletion timestamp for a project returned behind `include_deleted`, and
+`null` for a live one. Always-present-and-nullable rather than omitted,
+so a consumer can tell a deletion from a project it simply did not
+receive this pass.
+
+**`updated_since`** (a timezone-aware ISO 8601 timestamp) keeps only
+projects whose `date_updated` is at or after the given instant. The
+bound is **inclusive**: feeding back the newest timestamp from the
+previous pass can then never skip a project written in that same
+microsecond, at the cost of re-sending the newest rows once. A naive
+timestamp names an ambiguous instant and is rejected with a **422**.
+
+What moves a project's `date_updated` is the other half of that
+contract. It advances on a metadata `PATCH`, on a GitHub-binding
+resolve, on a soft delete, **and** on a repoint of the project's
+default `__main` edition onto a new build — the last of those so that a
+consumer watching the listing sees content changes and not only
+metadata edits. That touch lives in `EditionStore.set_current_build`,
+the single chokepoint every repoint routes through (build tracking,
+keeper-sync, rollback), and runs in the same transaction as the
+repoint. A repoint of any other edition, a `publish_status` flip, and a
+repoint the stale-build or deleted-build guard refuses all leave the
+project's clock alone.
+
+Pair `updated_since` with `order=date_updated` for the "what changed?"
+traversal, and with the conditional-GET validators above so that a pass
+finding nothing new costs one watermark query and no body at all. The
+`docverse` client library packages the whole idiom as
+`DocverseClient.list_projects`, which follows the `Link` chain and
+carries the validators back for the next poll.
