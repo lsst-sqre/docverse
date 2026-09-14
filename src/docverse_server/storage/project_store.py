@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -11,7 +12,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import REAL, cast, select, update
+from sqlalchemy import REAL, ColumnElement, Row, cast, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
@@ -107,15 +108,28 @@ class ProjectStore:
             return None
         return Project.model_validate(row)
 
-    async def get_by_slug(self, *, org_id: int, slug: str) -> Project | None:
-        """Fetch a project by org_id and slug."""
-        result = await self._session.execute(
-            select(SqlProject).where(
-                SqlProject.org_id == org_id,
-                SqlProject.slug == slug,
-                SqlProject.date_deleted.is_(None),
-            )
+    async def get_by_slug(
+        self, *, org_id: int, slug: str, include_deleted: bool = False
+    ) -> Project | None:
+        """Fetch a project by org_id and slug.
+
+        Parameters
+        ----------
+        include_deleted
+            When ``True``, a soft-deleted project resolves instead of
+            reading as missing. The lookup stays unambiguous because
+            ``uq_projects_org_slug`` ignores ``date_deleted``: a slug is
+            never reused once its project is gone, so widening the
+            filter can only ever surface the one row that already owned
+            the slug.
+        """
+        stmt = select(SqlProject).where(
+            SqlProject.org_id == org_id,
+            SqlProject.slug == slug,
         )
+        if not include_deleted:
+            stmt = stmt.where(SqlProject.date_deleted.is_(None))
+        result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
             return None
@@ -266,8 +280,9 @@ class ProjectStore:
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
         updated_since: datetime | None = None,
+        include_deleted: bool = False,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
-        """List non-deleted projects for an organization with pagination.
+        """List an organization's projects with pagination.
 
         Parameters
         ----------
@@ -277,11 +292,15 @@ class ProjectStore:
             inclusive so a poller can hand back the newest timestamp it
             saw and be certain it skips nothing written in that same
             microsecond; the cost is re-seeing the boundary row.
+        include_deleted
+            When ``True``, soft-deleted projects are listed alongside
+            live ones and counted in the total. A poller that mirrors
+            the listing needs the deletion to show up as a row it can
+            act on, not as a project that silently stops appearing.
         """
-        stmt = select(SqlProject).where(
-            SqlProject.org_id == org_id,
-            SqlProject.date_deleted.is_(None),
-        )
+        stmt = select(SqlProject).where(SqlProject.org_id == org_id)
+        if not include_deleted:
+            stmt = stmt.where(SqlProject.date_deleted.is_(None))
         if updated_since is not None:
             stmt = stmt.where(SqlProject.date_updated >= updated_since)
         runner = CountedPaginatedQueryRunner(
@@ -299,13 +318,15 @@ class ProjectStore:
         limit: int,
         cursor: ProjectSearchCursor | None = None,
         updated_since: datetime | None = None,
+        include_deleted: bool = False,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
-        """Search non-deleted projects by trigram similarity on slug/title.
+        """Search an org's projects by trigram similarity on slug/title.
 
-        ``updated_since`` narrows the candidate set exactly as it does on
-        :meth:`list_by_org` — inclusive of the boundary — so a poller
-        that also filters by a search term sees the same rows the
-        unfiltered listing would have handed it.
+        ``updated_since`` and ``include_deleted`` narrow (or widen) the
+        candidate set exactly as they do on :meth:`list_by_org` — the
+        clock bound inclusive, the deleted rows counted in the total —
+        so a poller that also filters by a search term sees the same
+        rows the unfiltered listing would have handed it.
         """
         relevance = func.greatest(
             func.similarity(SqlProject.slug, query),
@@ -314,9 +335,10 @@ class ProjectStore:
 
         clauses = [
             SqlProject.org_id == org_id,
-            SqlProject.date_deleted.is_(None),
             relevance > _TRGM_SIMILARITY_THRESHOLD,
         ]
+        if not include_deleted:
+            clauses.append(SqlProject.date_deleted.is_(None))
         if updated_since is not None:
             clauses.append(SqlProject.date_updated >= updated_since)
         base_filter = expression.and_(*clauses)
@@ -329,43 +351,13 @@ class ProjectStore:
         total = count_result.scalar_one()
 
         # Build fetch query with compound keyset cursor
+        keyset, ordering = self._search_keyset(relevance, cursor)
         fetch_stmt = select(SqlProject, relevance).where(base_filter)
-
-        if cursor is None:
-            fetch_stmt = fetch_stmt.order_by(
-                relevance.desc(), SqlProject.id.desc()
-            )
-        elif not cursor.previous:
-            # Forward pagination: rows after the cursor.
-            # Cast cursor.score to REAL (float4) to match the precision of
-            # PostgreSQL's similarity() return type and avoid float8 vs float4
-            # comparison mismatches.
-            score = cast(cursor.score, REAL)
-            fetch_stmt = fetch_stmt.where(
-                expression.or_(
-                    relevance < score,
-                    expression.and_(
-                        relevance == score,
-                        SqlProject.id < cursor.id,
-                    ),
-                )
-            ).order_by(relevance.desc(), SqlProject.id.desc())
-        else:
-            # Backward pagination: rows before the cursor (reversed order)
-            score = cast(cursor.score, REAL)
-            fetch_stmt = fetch_stmt.where(
-                expression.or_(
-                    relevance > score,
-                    expression.and_(
-                        relevance == score,
-                        SqlProject.id > cursor.id,
-                    ),
-                )
-            ).order_by(relevance.asc(), SqlProject.id.asc())
-
-        fetch_stmt = fetch_stmt.limit(limit + 1)
+        if keyset is not None:
+            fetch_stmt = fetch_stmt.where(keyset)
+        fetch_stmt = fetch_stmt.order_by(*ordering).limit(limit + 1)
         result = await self._session.execute(fetch_stmt)
-        rows = result.all()
+        rows = list(result.all())
 
         has_more = len(rows) > limit
         rows = rows[:limit]
@@ -374,49 +366,93 @@ class ProjectStore:
             rows = list(reversed(rows))
 
         entries = [Project.model_validate(row.SqlProject) for row in rows]
-
-        # Build next/prev cursors
-        next_cursor: ProjectSearchCursor | None = None
-        prev_cursor: ProjectSearchCursor | None = None
-
-        if cursor is None or not cursor.previous:
-            # Forward traversal
-            if has_more and entries:
-                last = rows[-1]
-                next_cursor = ProjectSearchCursor(
-                    score=float(last.relevance),
-                    id=last.SqlProject.id,
-                    previous=False,
-                )
-            if cursor is not None and entries:
-                first = rows[0]
-                prev_cursor = ProjectSearchCursor(
-                    score=float(first.relevance),
-                    id=first.SqlProject.id,
-                    previous=True,
-                )
-        else:
-            # Backward traversal
-            if has_more and entries:
-                first = rows[0]
-                prev_cursor = ProjectSearchCursor(
-                    score=float(first.relevance),
-                    id=first.SqlProject.id,
-                    previous=True,
-                )
-            if cursor is not None and entries:
-                last = rows[-1]
-                next_cursor = ProjectSearchCursor(
-                    score=float(last.relevance),
-                    id=last.SqlProject.id,
-                    previous=False,
-                )
+        next_cursor, prev_cursor = self._search_page_cursors(
+            rows, cursor=cursor, has_more=has_more
+        )
 
         return CountedPaginatedList[Project, PaginationCursor[Project]](
             entries=entries,
             count=total,
             next_cursor=next_cursor,
             prev_cursor=prev_cursor,
+        )
+
+    @staticmethod
+    def _search_keyset(
+        relevance: ColumnElement[Any],
+        cursor: ProjectSearchCursor | None,
+    ) -> tuple[ColumnElement[bool] | None, tuple[ColumnElement[Any], ...]]:
+        """Derive the keyset predicate and ordering for a search page.
+
+        Returns ``(predicate, ordering)``; the predicate is ``None`` on
+        the first page, which has no cursor to seek past.
+
+        ``cursor.score`` is cast to REAL (float4) to match the precision
+        of PostgreSQL's ``similarity()`` return type, so a float8 literal
+        never compares unequal to the float4 value the previous page
+        actually emitted.
+        """
+        forward_order = (relevance.desc(), SqlProject.id.desc())
+        if cursor is None:
+            return None, forward_order
+        score = cast(cursor.score, REAL)
+        if not cursor.previous:
+            # Forward pagination: rows after the cursor.
+            return (
+                expression.or_(
+                    relevance < score,
+                    expression.and_(
+                        relevance == score, SqlProject.id < cursor.id
+                    ),
+                ),
+                forward_order,
+            )
+        # Backward pagination: rows before the cursor, scanned in
+        # reverse so the limit takes the ones nearest the cursor. The
+        # caller flips the page back into relevance order.
+        return (
+            expression.or_(
+                relevance > score,
+                expression.and_(relevance == score, SqlProject.id > cursor.id),
+            ),
+            (relevance.asc(), SqlProject.id.asc()),
+        )
+
+    @staticmethod
+    def _search_page_cursors(
+        rows: Sequence[Row[Any]],
+        *,
+        cursor: ProjectSearchCursor | None,
+        has_more: bool,
+    ) -> tuple[ProjectSearchCursor | None, ProjectSearchCursor | None]:
+        """Derive ``(next, prev)`` cursors for a fetched search page.
+
+        ``rows`` is the trimmed page already flipped back into relevance
+        order, so ``rows[0]`` is always the most relevant row on it and
+        ``rows[-1]`` the least. Which end anchors which cursor therefore
+        does not depend on the traversal direction — only on whether the
+        scan overran the limit (there is a further page *ahead* of the
+        direction travelled) and on whether this page had a cursor at
+        all (a page reached without one is the first page, so there is
+        nothing behind it).
+        """
+        if not rows:
+            return None, None
+        ahead = ProjectSearchCursor(
+            score=float(rows[-1].relevance),
+            id=rows[-1].SqlProject.id,
+            previous=False,
+        )
+        behind = ProjectSearchCursor(
+            score=float(rows[0].relevance),
+            id=rows[0].SqlProject.id,
+            previous=True,
+        )
+        if cursor is not None and cursor.previous:
+            return ahead, (behind if has_more else None)
+        return (
+            ahead if has_more else None,
+            behind if cursor is not None else None,
         )
 
     async def update(

@@ -1490,3 +1490,125 @@ async def test_search_by_org_honours_updated_since(
         "clock-new",
     ]
     assert result.count == 2
+
+
+# ---------------------------------------------------------------------------
+# ``include_deleted``
+# ---------------------------------------------------------------------------
+
+
+async def _seed_live_and_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+    *,
+    org_slug: str,
+) -> int:
+    """Create a live ``gone-live`` project and a deleted ``gone-dead`` one.
+
+    Both slugs share the ``gone-`` prefix so a single trigram query
+    matches the pair, which is what the search-path test needs.
+
+    Returns the org id.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug=org_slug)
+        for slug in ("gone-live", "gone-dead"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=f"Gone {slug}"),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await store.soft_delete(
+            org_id=org_id,
+            slug="gone-dead",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+    db_session.expire_all()
+    return org_id
+
+
+@pytest.mark.asyncio
+async def test_get_by_slug_include_deleted_returns_deleted_project(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """``include_deleted`` resolves a soft-deleted slug to its row.
+
+    ``uq_projects_org_slug`` ignores ``date_deleted``, so a slug is
+    never reused after a delete and the widened lookup still names
+    exactly one row.
+    """
+    org_id = await _seed_live_and_deleted(
+        db_session, store, org_store, org_slug="gone-get-org"
+    )
+
+    async with db_session.begin():
+        without_flag = await store.get_by_slug(org_id=org_id, slug="gone-dead")
+        with_flag = await store.get_by_slug(
+            org_id=org_id, slug="gone-dead", include_deleted=True
+        )
+
+    assert without_flag is None
+    assert with_flag is not None
+    assert with_flag.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_include_deleted_lists_and_counts_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The ordered listing widens to deleted rows and counts them."""
+    org_id = await _seed_live_and_deleted(
+        db_session, store, org_store, org_slug="gone-list-org"
+    )
+
+    async with db_session.begin():
+        without_flag = await store.list_by_org(
+            org_id, cursor_type=ProjectSlugCursor, limit=25
+        )
+        with_flag = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectSlugCursor,
+            limit=25,
+            include_deleted=True,
+        )
+
+    assert [p.slug for p in without_flag.entries] == ["gone-live"]
+    assert without_flag.count == 1
+    assert [p.slug for p in with_flag.entries] == ["gone-dead", "gone-live"]
+    assert with_flag.count == 2
+
+
+@pytest.mark.asyncio
+async def test_search_by_org_include_deleted_matches_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The fuzzy-search path widens the same way the listing does."""
+    org_id = await _seed_live_and_deleted(
+        db_session, store, org_store, org_slug="gone-search-org"
+    )
+
+    async with db_session.begin():
+        without_flag = await store.search_by_org(
+            org_id, query="gone", limit=25
+        )
+        with_flag = await store.search_by_org(
+            org_id, query="gone", limit=25, include_deleted=True
+        )
+
+    assert [p.slug for p in without_flag.entries] == ["gone-live"]
+    assert without_flag.count == 1
+    assert sorted(p.slug for p in with_flag.entries) == [
+        "gone-dead",
+        "gone-live",
+    ]
+    assert with_flag.count == 2

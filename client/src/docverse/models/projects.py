@@ -359,6 +359,18 @@ class Project(BaseModel):
         description="Timestamp of the most recent update."
     )
 
+    date_deleted: datetime | None = Field(
+        default=None,
+        description=(
+            "Timestamp when the project was soft-deleted, or ``null``"
+            " for a live project. A deleted project is only ever"
+            " returned when the request asked for it with"
+            " ``include_deleted=true``; the field is present either way"
+            " so a consumer mirroring the listing can tell a deletion"
+            " from a project that simply stopped appearing."
+        ),
+    )
+
 
 class ProjectUpdate(BaseModel):
     """Request model for updating a project (PATCH)."""

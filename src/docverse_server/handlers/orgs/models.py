@@ -261,6 +261,7 @@ class Project(_ProjectBase):
             default_edition=edition_response,
             date_created=domain.date_created,
             date_updated=domain.date_updated,
+            date_deleted=domain.date_deleted,
         )
 
 

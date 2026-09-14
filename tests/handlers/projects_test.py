@@ -1823,3 +1823,156 @@ async def test_list_projects_order_date_updated_paginates(
     back = await client.get(prev_url, headers=headers)
     assert back.status_code == 200
     assert [p["slug"] for p in back.json()] == ["tick-new", "tick-mid"]
+
+
+# ---------------------------------------------------------------------------
+# ``include_deleted`` and the ``date_deleted`` response field
+# ---------------------------------------------------------------------------
+
+
+async def _seed_live_and_deleted(client: AsyncClient) -> None:
+    """Create ``sunk-live`` and soft-delete ``sunk-dead``."""
+    headers = {"X-Auth-Request-User": "testuser"}
+    for slug in ("sunk-live", "sunk-dead"):
+        response = await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={"slug": slug, "title": f"Sunk {slug}"},
+            headers=headers,
+        )
+        assert response.status_code == 201
+    response = await client.delete(
+        "/docverse/orgs/proj-org/projects/sunk-dead",
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_live_project_carries_null_date_deleted(
+    client: AsyncClient,
+) -> None:
+    """``date_deleted`` is present and null on a live project."""
+    await _setup(client)
+    await _seed_live_and_deleted(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    single = await client.get(
+        "/docverse/orgs/proj-org/projects/sunk-live", headers=headers
+    )
+    listing = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+
+    assert single.status_code == 200
+    assert "date_deleted" in single.json()
+    assert single.json()["date_deleted"] is None
+    assert listing.status_code == 200
+    entry = next(p for p in listing.json() if p["slug"] == "sunk-live")
+    assert entry["date_deleted"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_project_include_deleted(client: AsyncClient) -> None:
+    """The single GET returns a deleted project only behind the flag."""
+    await _setup(client)
+    await _seed_live_and_deleted(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    without_flag = await client.get(
+        "/docverse/orgs/proj-org/projects/sunk-dead", headers=headers
+    )
+    with_flag = await client.get(
+        "/docverse/orgs/proj-org/projects/sunk-dead",
+        params={"include_deleted": "true"},
+        headers=headers,
+    )
+
+    assert without_flag.status_code == 404
+    assert with_flag.status_code == 200
+    assert with_flag.json()["slug"] == "sunk-dead"
+    assert with_flag.json()["date_deleted"] is not None
+
+
+@pytest.mark.asyncio
+async def test_write_endpoints_ignore_include_deleted(
+    client: AsyncClient,
+) -> None:
+    """PATCH and DELETE still 404 on a deleted project, flag or not.
+
+    ``include_deleted`` is a read-only affordance: a deleted project is
+    something a consumer may still want to *see*, never something an
+    operator may keep editing.
+    """
+    await _setup(client)
+    await _seed_live_and_deleted(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    params = {"include_deleted": "true"}
+
+    patched = await client.patch(
+        "/docverse/orgs/proj-org/projects/sunk-dead",
+        params=params,
+        json={"title": "Risen"},
+        headers=headers,
+    )
+    deleted = await client.delete(
+        "/docverse/orgs/proj-org/projects/sunk-dead",
+        params=params,
+        headers=headers,
+    )
+
+    assert patched.status_code == 404
+    assert deleted.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_projects_include_deleted(client: AsyncClient) -> None:
+    """The listing shows and counts deleted projects behind the flag."""
+    await _setup(client)
+    await _seed_live_and_deleted(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    without_flag = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    with_flag = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"include_deleted": "true"},
+        headers=headers,
+    )
+
+    assert without_flag.status_code == 200
+    assert "sunk-dead" not in [p["slug"] for p in without_flag.json()]
+    assert without_flag.headers["X-Total-Count"] == "1"
+    assert with_flag.status_code == 200
+    entry = next(p for p in with_flag.json() if p["slug"] == "sunk-dead")
+    assert entry["date_deleted"] is not None
+    assert with_flag.headers["X-Total-Count"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_include_deleted_with_query(
+    client: AsyncClient,
+) -> None:
+    """The ``q`` search path honours the flag the same way."""
+    await _setup(client)
+    await _seed_live_and_deleted(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    without_flag = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "sunk"},
+        headers=headers,
+    )
+    with_flag = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "sunk", "include_deleted": "true"},
+        headers=headers,
+    )
+
+    assert [p["slug"] for p in without_flag.json()] == ["sunk-live"]
+    assert without_flag.headers["X-Total-Count"] == "1"
+    assert sorted(p["slug"] for p in with_flag.json()) == [
+        "sunk-dead",
+        "sunk-live",
+    ]
+    assert with_flag.headers["X-Total-Count"] == "2"

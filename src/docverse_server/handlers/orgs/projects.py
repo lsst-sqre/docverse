@@ -96,6 +96,20 @@ async def get_projects(
             ),
         ),
     ] = None,
+    include_deleted: Annotated[
+        bool,
+        Query(
+            description=(
+                "Also return soft-deleted projects, each with its"
+                " ``date_deleted`` set, and count them in"
+                " ``X-Total-Count``. Defaults to false. Applies to the"
+                " ``q`` search path as well as the ordered listing, so"
+                " a consumer mirroring the listing sees a deletion as a"
+                " row it can act on rather than as a project that"
+                " silently stopped appearing."
+            ),
+        ),
+    ] = False,
 ) -> list[Project]:
     async with context.session.begin():
         service = context.factory.create_project_service()
@@ -111,6 +125,7 @@ async def get_projects(
                 limit=limit,
                 cursor=search_cursor,
                 updated_since=updated_since,
+                include_deleted=include_deleted,
             )
         else:
             cursor_type = PROJECT_CURSOR_TYPES[order]
@@ -123,6 +138,7 @@ async def get_projects(
                 cursor=parsed_cursor,
                 limit=limit,
                 updated_since=updated_since,
+                include_deleted=include_deleted,
             )
     link = result.link_header(context.request.url)
     if link:
@@ -198,11 +214,27 @@ async def get_project(
     project_slug: ProjectSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],
+    include_deleted: Annotated[
+        bool,
+        Query(
+            description=(
+                "Return the project even if it has been soft-deleted,"
+                " with its ``date_deleted`` set. Defaults to false, in"
+                " which case a deleted project is a 404. Slugs are never"
+                " reused after a delete, so this can only ever resolve"
+                " the project that already owned the slug. Write"
+                " endpoints ignore this and still 404 on a deleted"
+                " project."
+            ),
+        ),
+    ] = False,
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
         org, project = await service.get_by_slug(
-            org_slug=org_slug, slug=project_slug
+            org_slug=org_slug,
+            slug=project_slug,
+            include_deleted=include_deleted,
         )
         default_edition = await service.get_default_edition(project.id)
     return Project.from_domain(

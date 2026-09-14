@@ -166,9 +166,14 @@ class ProjectService:
         return org, project, default_edition
 
     async def get_by_slug(
-        self, *, org_slug: str, slug: str
+        self, *, org_slug: str, slug: str, include_deleted: bool = False
     ) -> tuple[Organization, Project]:
         """Get a project by slug within an organization.
+
+        ``include_deleted`` widens the read to a soft-deleted project so
+        a consumer mirroring the listing can still fetch the row it saw
+        go away. It is a read-only affordance: every write path resolves
+        the project without it and so keeps 404ing on a deleted one.
 
         Raises
         ------
@@ -176,7 +181,9 @@ class ProjectService:
             If the project is not found.
         """
         org = await self._resolve_org(org_slug)
-        project = await self._store.get_by_slug(org_id=org.id, slug=slug)
+        project = await self._store.get_by_slug(
+            org_id=org.id, slug=slug, include_deleted=include_deleted
+        )
         if project is None:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
@@ -197,6 +204,7 @@ class ProjectService:
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
         updated_since: datetime | None = None,
+        include_deleted: bool = False,
     ) -> tuple[
         Organization,
         CountedPaginatedList[Project, PaginationCursor[Project]],
@@ -204,9 +212,10 @@ class ProjectService:
         """List all projects for an organization.
 
         ``updated_since`` is an optional timezone-aware lower bound on
-        ``date_updated``, applied inclusively on both the ordered listing
-        and the ``query`` search path so a poller gets the same answer
-        whichever one it uses.
+        ``date_updated`` and ``include_deleted`` widens the listing to
+        soft-deleted projects. Both are applied on the ordered listing
+        and the ``query`` search path alike, so a poller gets the same
+        answer whichever one it uses.
         """
         org = await self._resolve_org(org_slug)
         if query is not None:
@@ -219,6 +228,7 @@ class ProjectService:
                 limit=limit,
                 cursor=search_cursor,
                 updated_since=updated_since,
+                include_deleted=include_deleted,
             )
             return org, result
         if cursor_type is None:
@@ -230,6 +240,7 @@ class ProjectService:
             cursor=cursor,
             limit=limit,
             updated_since=updated_since,
+            include_deleted=include_deleted,
         )
         return org, result
 
