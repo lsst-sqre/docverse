@@ -7,10 +7,16 @@ from pydantic import ValidationError
 
 from docverse.models import (
     InstallationStatus,
+    Project,
     ProjectCreate,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
     ProjectUpdate,
+)
+from docverse.models._examples import (
+    EXAMPLE_ORG_URL,
+    EXAMPLE_PROJECT_ID,
+    EXAMPLE_PROJECT_URL,
 )
 from docverse.models.projects import build_github_url, parse_github_url
 
@@ -207,3 +213,25 @@ def test_project_update_clears_github_with_non_github_source_url() -> None:
     )
     assert update.github is None
     assert update.source_url == "https://gitlab.com/lsst/mirror"
+
+
+def test_project_round_trips_public_id() -> None:
+    """The Project resource carries the Base32 ``id`` through a round-trip."""
+    project = Project.model_validate(
+        {
+            "self_url": f"{EXAMPLE_PROJECT_URL}",
+            "org_url": f"{EXAMPLE_ORG_URL}",
+            "editions_url": f"{EXAMPLE_PROJECT_URL}/editions",
+            "builds_url": f"{EXAMPLE_PROJECT_URL}/builds",
+            "dashboard_template_url": (
+                f"{EXAMPLE_PROJECT_URL}/dashboard-template"
+            ),
+            "id": EXAMPLE_PROJECT_ID,
+            "slug": "pipelines",
+            "title": "LSST Science Pipelines",
+            "date_created": "2026-05-02T09:30:00Z",
+            "date_updated": "2026-05-02T09:30:00Z",
+        }
+    )
+    assert project.id == EXAMPLE_PROJECT_ID
+    assert project.model_dump(mode="json")["id"] == EXAMPLE_PROJECT_ID

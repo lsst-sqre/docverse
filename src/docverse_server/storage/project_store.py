@@ -18,6 +18,9 @@ from docverse.models import ProjectCreate, ProjectUpdate
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.project import Project
+from docverse_server.storage._public_id import (
+    insert_with_time_ordered_public_id,
+)
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
@@ -61,21 +64,32 @@ class ProjectStore:
         from the request payload. The validator guarantees a
         GitHub-bound project sends no ``source_url``, so the column is
         persisted NULL for those rows.
+
+        The ``public_id`` is a time-ordered Crockford Base32 resource ID
+        minted at insert time and re-minted on the (rare)
+        same-millisecond collision. Unlike a build's, it is embedded in
+        no object-store key, so nothing else has to be recomputed per
+        attempt.
         """
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
             lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
-        row = SqlProject(
-            slug=data.slug,
-            title=data.title,
-            org_id=org_id,
-            source_url=data.source_url,
-            github_owner=github_owner,
-            github_repo=github_repo,
-            lifecycle_rules=lifecycle_rules,
+
+        def _make_row(public_id: int) -> SqlProject:
+            return SqlProject(
+                public_id=public_id,
+                slug=data.slug,
+                title=data.title,
+                org_id=org_id,
+                source_url=data.source_url,
+                github_owner=github_owner,
+                github_repo=github_repo,
+                lifecycle_rules=lifecycle_rules,
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
         )
-        self._session.add(row)
-        await self._session.flush()
         await self._session.refresh(row)
         return Project.model_validate(row)
 

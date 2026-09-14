@@ -145,6 +145,7 @@ class Organization(_OrganizationBase):
             keeper_sync_url=str(
                 request.url_for("get_org_keeper_sync_config", org=domain.slug)
             ),
+            id=serialize_base32_id(domain.public_id),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,
@@ -249,6 +250,7 @@ class Project(_ProjectBase):
                     project=domain.slug,
                 )
             ),
+            id=serialize_base32_id(domain.public_id),
             slug=domain.slug,
             title=domain.title,
             source_url=domain.effective_source_url,

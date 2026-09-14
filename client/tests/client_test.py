@@ -262,12 +262,14 @@ async def test_list_organizations() -> None:
     payload = [
         {
             "self_url": "/orgs/org-a",
+            "id": "1vzr-eky0-0vvf-43",
             "slug": "org-a",
             "title": "Org A",
             "role": "admin",
         },
         {
             "self_url": "/orgs/org-b",
+            "id": "1w01-nw5r-173e-35",
             "slug": "org-b",
             "title": "Org B",
             "role": "reader",

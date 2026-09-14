@@ -59,7 +59,8 @@ async def test_create_project(client: AsyncClient) -> None:
     data = response.json()
     assert data["slug"] == "my-docs"
     assert data["title"] == "My Docs"
-    assert "id" not in data
+    # ``id`` is the project's Base32 public ID, never its integer row id.
+    assert isinstance(data["id"], str)
     assert data["self_url"].endswith("/orgs/proj-org/projects/my-docs")
     assert response.headers["Location"] == data["self_url"]
 
@@ -1651,3 +1652,43 @@ async def test_patch_project_edition_autocreation(
     assert get_response.json()["edition_autocreation"] == {
         "semver_aggregates": False
     }
+
+
+@pytest.mark.asyncio
+async def test_project_responses_carry_base32_public_id(
+    client: AsyncClient,
+) -> None:
+    """Single and listing project responses expose ``id`` as Base32.
+
+    The value is the project's ``public_id``, never its integer row id,
+    per the "no database IDs on the wire" convention: it must be a
+    12+2-character hyphenated Crockford Base32 string that decodes back
+    to a positive integer.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={"slug": "pid-proj", "title": "PID Proj"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/pid-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    single = response.json()
+    project_id = single["id"]
+    assert isinstance(project_id, str)
+    assert len(project_id) == 17
+    assert project_id.count("-") == 3
+    assert validate_base32_id(project_id) > 0
+    assert serialize_base32_id(validate_base32_id(project_id)) == project_id
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    entry = next(p for p in response.json() if p["slug"] == "pid-proj")
+    assert entry["id"] == project_id

@@ -18,6 +18,7 @@ def _org(
     now = datetime.now(tz=UTC)
     return Organization(
         id=1,
+        public_id=1,
         slug="test-org",
         title="Test Org",
         base_domain=base_domain,

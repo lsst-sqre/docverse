@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ._examples import EXAMPLE_ORG_URL, EXAMPLE_PROJECT_URL
+from ._examples import EXAMPLE_ORG_URL, EXAMPLE_PROJECT_ID, EXAMPLE_PROJECT_URL
 from .editions import DefaultEditionConfig, EditionAutocreationConfig
 from .editions import Edition as EditionResponse
 from .lifecycle import LifecycleRuleSet
@@ -282,6 +282,16 @@ class Project(BaseModel):
             "URL to the project's dashboard-template binding override."
         ),
         examples=[f"{EXAMPLE_PROJECT_URL}/dashboard-template"],
+    )
+
+    id: str = Field(
+        description=(
+            "Public Crockford Base32 identifier for the project. Stable"
+            " for the life of the project, so it still identifies this"
+            " resource if the slug is ever renamed. Path parameters use"
+            " the slug, not this id."
+        ),
+        examples=[EXAMPLE_PROJECT_ID],
     )
 
     slug: str = Field(

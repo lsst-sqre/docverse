@@ -516,6 +516,7 @@ def _make_org(base_domain: str, url_scheme: UrlScheme) -> Organization:
     now = datetime.now(tz=UTC)
     return Organization.model_construct(
         id=1,
+        public_id=1,
         slug="org",
         title="Org",
         base_domain=base_domain,
@@ -538,6 +539,7 @@ def _make_project() -> Project:
     now = datetime.now(tz=UTC)
     return Project.model_construct(
         id=1,
+        public_id=1,
         slug="proj",
         title="Project",
         org_id=1,

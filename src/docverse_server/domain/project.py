@@ -20,6 +20,14 @@ class Project(BaseModel):
 
     id: int = Field(description="Unique identifier for the project.")
 
+    public_id: int = Field(
+        description=(
+            "Time-ordered Crockford Base32 identifier for the project,"
+            " stored as an integer and serialized on the wire as the"
+            " ``id`` field."
+        )
+    )
+
     slug: str = Field(description="URL-safe identifier for the project.")
 
     title: str = Field(description="Display title for the project.")

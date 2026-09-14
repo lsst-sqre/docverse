@@ -1267,3 +1267,26 @@ async def test_list_slugs_by_ids_is_empty_for_no_ids(
     """No ids means no query: the sweep often purges nothing at all."""
     async with db_session.begin():
         assert await store.list_slugs_by_ids([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_create_mints_time_ordered_public_id(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Projects created in succession sort by ``public_id`` in that order."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="pid-order-org")
+        first = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(slug="first", title="First"),
+        )
+        second = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(slug="second", title="Second"),
+        )
+        await db_session.commit()
+
+    assert first.public_id > 0
+    assert second.public_id > first.public_id

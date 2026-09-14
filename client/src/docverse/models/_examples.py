@@ -24,7 +24,9 @@ __all__ = [
     "EXAMPLE_EDITION_URL",
     "EXAMPLE_JOB_ID",
     "EXAMPLE_JOB_URL",
+    "EXAMPLE_ORG_ID",
     "EXAMPLE_ORG_URL",
+    "EXAMPLE_PROJECT_ID",
     "EXAMPLE_PROJECT_URL",
     "EXAMPLE_PUBLISH_JOB_ID",
     "EXAMPLE_PUBLISH_JOB_URL",
@@ -38,8 +40,14 @@ EXAMPLE_API_URL = "https://example.org/docverse/api"
 EXAMPLE_ORG_URL = f"{EXAMPLE_API_URL}/orgs/lsst"
 """Example organization resource URL."""
 
+EXAMPLE_ORG_ID = "1vzr-eky0-0vvf-43"
+"""Example public Base32 identifier for an organization."""
+
 EXAMPLE_PROJECT_URL = f"{EXAMPLE_ORG_URL}/projects/pipelines"
 """Example project resource URL."""
+
+EXAMPLE_PROJECT_ID = "1w01-nw5r-173e-35"
+"""Example public Base32 identifier for a project."""
 
 EXAMPLE_EDITION_URL = f"{EXAMPLE_PROJECT_URL}/editions/v1"
 """Example edition resource URL."""

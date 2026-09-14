@@ -31,6 +31,14 @@ class SqlProject(Base):
         Integer, primary_key=True, autoincrement=True
     )
 
+    # Stable time-ordered Crockford Base32 identifier exposed on the wire
+    # as ``id``. Minted in application code (never by a sequence), it
+    # survives a slug rename, so a consumer polling the project listing
+    # can keep following the same resource.
+    public_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, nullable=False, autoincrement=False
+    )
+
     slug: Mapped[str] = mapped_column(String(128), nullable=False)
 
     title: Mapped[str] = mapped_column(String(256), nullable=False)

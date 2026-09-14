@@ -1457,13 +1457,16 @@ async def test_create_retries_on_public_id_collision(
         yield from (collision_id, fresh_id)
 
     ids = _fake_ids()
-    monkeypatch.setattr(
-        "docverse_server.storage._public_id.generate_resource_id",
-        lambda: next(ids),
-    )
 
     async with db_session.begin():
         _, project_id = await _create_org_and_project(db_session)
+        # Patched only now: the org and project inserts above mint their
+        # own public IDs through the same helper, and would otherwise
+        # drain the two-value fixture before the build under test runs.
+        monkeypatch.setattr(
+            "docverse_server.storage._public_id.generate_resource_id",
+            lambda: next(ids),
+        )
         # Pre-insert a build occupying ``collision_id`` and flush it into the
         # outer transaction so the retried insert races a persistent row.
         existing = SqlBuild(

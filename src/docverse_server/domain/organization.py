@@ -23,6 +23,14 @@ class Organization(BaseModel):
 
     id: int = Field(description="Unique identifier for the organization.")
 
+    public_id: int = Field(
+        description=(
+            "Time-ordered Crockford Base32 identifier for the"
+            " organization, stored as an integer and serialized on the"
+            " wire as the ``id`` field."
+        )
+    )
+
     slug: str = Field(description="URL-safe identifier for the organization.")
 
     title: str = Field(description="Display title for the organization.")

@@ -108,12 +108,18 @@ def _canned_error(
 
 _INSERT_ORG = text(
     'INSERT INTO "organizations"'
-    " (slug, title, base_domain, url_scheme, root_path_prefix,"
+    " (public_id, slug, title, base_domain, url_scheme, root_path_prefix,"
     " purgatory_retention_seconds)"
-    " VALUES (:slug, 'Test Org', 'example.com', 'subdomain', '/', 2592000)"
+    " VALUES (:public_id, :slug, 'Test Org', 'example.com', 'subdomain',"
+    " '/', 2592000)"
     " RETURNING id"
 )
-"""Insert one organization, naming every column without a server default."""
+"""Insert one organization, naming every column without a server default.
+
+``public_id`` is minted by application code rather than a sequence, so a
+raw insert has to supply it; the values here only have to be unique
+within the test.
+"""
 
 
 @pytest.mark.asyncio
@@ -176,8 +182,12 @@ async def test_reset_database_restarts_identity_sequences() -> None:
     try:
         await reset_database_for_test(engine)
         async with engine.begin() as conn:
-            first = await conn.scalar(_INSERT_ORG, {"slug": "first"})
-            second = await conn.scalar(_INSERT_ORG, {"slug": "second"})
+            first = await conn.scalar(
+                _INSERT_ORG, {"public_id": 1, "slug": "first"}
+            )
+            second = await conn.scalar(
+                _INSERT_ORG, {"public_id": 2, "slug": "second"}
+            )
         assert second == first + 1
 
         # The second reset truncates rather than rebuilding the schema,
@@ -187,7 +197,9 @@ async def test_reset_database_restarts_identity_sequences() -> None:
             count = await conn.scalar(
                 text('SELECT count(*) FROM "organizations"')
             )
-            reused = await conn.scalar(_INSERT_ORG, {"slug": "first"})
+            reused = await conn.scalar(
+                _INSERT_ORG, {"public_id": 3, "slug": "first"}
+            )
         assert count == 0
         assert reused == first
     finally:

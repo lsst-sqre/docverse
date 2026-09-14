@@ -6,6 +6,10 @@ import pytest
 from httpx import AsyncClient
 
 from docverse.models import OrgRole
+from docverse_server.domain.base32id import (
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse_server.domain.slug import parse_slug_rewrite_rules
 from tests.conftest import seed_member, seed_org_with_admin
 
@@ -371,3 +375,26 @@ async def test_patch_organization_edition_autocreation_invalid_shape(
         headers={"X-Auth-Request-User": "admin"},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_get_organization_carries_base32_public_id(
+    client: AsyncClient,
+) -> None:
+    """``GET /orgs/{org}`` exposes ``id`` as the org's Base32 public ID.
+
+    The value is the organization's ``public_id``, never its integer row
+    id, per the "no database IDs on the wire" convention.
+    """
+    await seed_org_with_admin(client, "org-pid", "testuser")
+    response = await client.get(
+        "/docverse/orgs/org-pid",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    org_id = response.json()["id"]
+    assert isinstance(org_id, str)
+    assert len(org_id) == 17
+    assert org_id.count("-") == 3
+    assert validate_base32_id(org_id) > 0
+    assert serialize_base32_id(validate_base32_id(org_id)) == org_id

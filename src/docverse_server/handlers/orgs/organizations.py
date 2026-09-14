@@ -16,6 +16,7 @@ from docverse_server.dependencies.context import (
     RequestContext,
     context_dependency,
 )
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.organization import (
     Organization as OrganizationDomain,
 )
@@ -33,6 +34,7 @@ def _organization_summary(
     """Build an ``OrganizationSummary`` for a listing entry."""
     return OrganizationSummary(
         self_url=str(request.url_for("get_organization", org=org.slug)),
+        id=serialize_base32_id(org.public_id),
         slug=org.slug,
         title=org.title,
         role=role,
