@@ -104,6 +104,17 @@ class SqlProject(Base):
             name="ck_projects_github_owner_repo_both_or_neither",
         ),
         Index("idx_projects_org_id", "org_id"),
+        # Serves ``order=date_updated`` and the ``updated_since`` filter
+        # on the project listing: ``org_id`` is the equality prefix,
+        # ``date_updated`` the range key, and ``id`` the keyset cursor's
+        # tiebreak, so a poll on one org is an index range scan rather
+        # than a sort over the org's whole project set.
+        Index(
+            "idx_projects_org_date_updated",
+            "org_id",
+            "date_updated",
+            "id",
+        ),
         Index(
             "idx_projects_slug_trgm",
             "slug",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -195,25 +196,40 @@ class ProjectService:
         cursor_type: type[PaginationCursor[Project]] | None = None,
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
+        updated_since: datetime | None = None,
     ) -> tuple[
         Organization,
         CountedPaginatedList[Project, PaginationCursor[Project]],
     ]:
-        """List all projects for an organization."""
+        """List all projects for an organization.
+
+        ``updated_since`` is an optional timezone-aware lower bound on
+        ``date_updated``, applied inclusively on both the ordered listing
+        and the ``query`` search path so a poller gets the same answer
+        whichever one it uses.
+        """
         org = await self._resolve_org(org_slug)
         if query is not None:
             search_cursor = (
                 cursor if isinstance(cursor, ProjectSearchCursor) else None
             )
             result = await self._store.search_by_org(
-                org.id, query=query, limit=limit, cursor=search_cursor
+                org.id,
+                query=query,
+                limit=limit,
+                cursor=search_cursor,
+                updated_since=updated_since,
             )
             return org, result
         if cursor_type is None:
             msg = "cursor_type is required when query is not set"
             raise RuntimeError(msg)
         result = await self._store.list_by_org(
-            org.id, cursor_type=cursor_type, cursor=cursor, limit=limit
+            org.id,
+            cursor_type=cursor_type,
+            cursor=cursor,
+            limit=limit,
+            updated_since=updated_since,
         )
         return org, result
 

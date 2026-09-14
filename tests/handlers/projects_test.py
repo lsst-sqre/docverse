@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
+from safir.http import PaginationLinkData
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
@@ -1692,3 +1694,132 @@ async def test_project_responses_carry_base32_public_id(
     assert response.status_code == 200
     entry = next(p for p in response.json() if p["slug"] == "pid-proj")
     assert entry["id"] == project_id
+
+
+# ---------------------------------------------------------------------------
+# ``updated_since`` filter and ``order=date_updated``
+# ---------------------------------------------------------------------------
+
+# Fixed instants for the clock-filter tests, oldest to newest. Stamped
+# directly onto the rows because ``projects.date_updated`` is written by
+# the transaction clock: projects created through the API in one test
+# would otherwise be indistinguishable to a ``>=`` filter.
+H_OLD = datetime(2026, 1, 1, tzinfo=UTC)
+H_MID = datetime(2026, 2, 1, tzinfo=UTC)
+H_NEW = datetime(2026, 3, 1, tzinfo=UTC)
+
+
+async def _seed_clocked_projects(client: AsyncClient) -> None:
+    """Create three ``tick-*`` projects with pinned ``date_updated``."""
+    headers = {"X-Auth-Request-User": "testuser"}
+    for slug in ("tick-old", "tick-mid", "tick-new"):
+        response = await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={"slug": slug, "title": f"Tick {slug}"},
+            headers=headers,
+        )
+        assert response.status_code == 201
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            for slug, stamp in (
+                ("tick-old", H_OLD),
+                ("tick-mid", H_MID),
+                ("tick-new", H_NEW),
+            ):
+                await session.execute(
+                    update(SqlProject)
+                    .where(SqlProject.slug == slug)
+                    .values(date_updated=stamp)
+                    .execution_options(synchronize_session=False)
+                )
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_list_projects_updated_since(client: AsyncClient) -> None:
+    """``updated_since`` returns exactly the projects at or after it."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"updated_since": H_MID.isoformat()},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert sorted(p["slug"] for p in response.json()) == [
+        "tick-mid",
+        "tick-new",
+    ]
+    assert response.headers["X-Total-Count"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_updated_since_with_query(
+    client: AsyncClient,
+) -> None:
+    """The filter also narrows the ``q`` fuzzy-search path."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "tick", "updated_since": H_NEW.isoformat()},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert [p["slug"] for p in response.json()] == ["tick-new"]
+    assert response.headers["X-Total-Count"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_updated_since_rejects_naive(
+    client: AsyncClient,
+) -> None:
+    """A naive timestamp is a 422: the instant it names is ambiguous."""
+    await _setup(client)
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"updated_since": "2026-02-01T00:00:00"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_projects_order_date_updated_paginates(
+    client: AsyncClient,
+) -> None:
+    """``order=date_updated`` is newest-first and pages both ways."""
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"order": "date_updated", "limit": 2},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    assert [p["slug"] for p in first.json()] == ["tick-new", "tick-mid"]
+
+    next_url = PaginationLinkData.from_header(
+        first.headers.get("link")
+    ).next_url
+    assert next_url is not None
+    second = await client.get(next_url, headers=headers)
+    assert second.status_code == 200
+    assert [p["slug"] for p in second.json()] == ["tick-old"]
+
+    prev_url = PaginationLinkData.from_header(
+        second.headers.get("link")
+    ).prev_url
+    assert prev_url is not None
+    back = await client.get(prev_url, headers=headers)
+    assert back.status_code == 200
+    assert [p["slug"] for p in back.json()] == ["tick-new", "tick-mid"]

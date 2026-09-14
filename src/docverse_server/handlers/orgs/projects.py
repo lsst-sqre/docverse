@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
+from pydantic import AwareDatetime
 
 from docverse.models import ProjectCreate, ProjectUpdate
 from docverse_server.dependencies.auth import (
@@ -81,6 +82,20 @@ async def get_projects(
             ),
         ),
     ] = None,
+    updated_since: Annotated[
+        AwareDatetime | None,
+        Query(
+            description=(
+                "Only return projects whose ``date_updated`` is at or"
+                " after this instant, so a poller can ask for just what"
+                " changed since its last pass. The bound is inclusive"
+                " and must carry a timezone offset; a naive timestamp"
+                " is rejected. A project's clock advances on a metadata"
+                " edit, a GitHub-binding resolve, a deletion, and a"
+                " repoint of its default edition."
+            ),
+        ),
+    ] = None,
 ) -> list[Project]:
     async with context.session.begin():
         service = context.factory.create_project_service()
@@ -91,7 +106,11 @@ async def get_projects(
                 else None
             )
             org, result = await service.list_by_org(
-                org_slug, query=q, limit=limit, cursor=search_cursor
+                org_slug,
+                query=q,
+                limit=limit,
+                cursor=search_cursor,
+                updated_since=updated_since,
             )
         else:
             cursor_type = PROJECT_CURSOR_TYPES[order]
@@ -103,6 +122,7 @@ async def get_projects(
                 cursor_type=cursor_type,
                 cursor=parsed_cursor,
                 limit=limit,
+                updated_since=updated_since,
             )
     link = result.link_header(context.request.url)
     if link:

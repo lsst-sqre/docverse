@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -31,7 +32,10 @@ from docverse_server.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse_server.storage.organization_store import OrganizationStore
-from docverse_server.storage.pagination import ProjectSlugCursor
+from docverse_server.storage.pagination import (
+    ProjectDateUpdatedCursor,
+    ProjectSlugCursor,
+)
 from docverse_server.storage.project_store import ProjectStore
 
 
@@ -1290,3 +1294,199 @@ async def test_create_mints_time_ordered_public_id(
 
     assert first.public_id > 0
     assert second.public_id > first.public_id
+
+
+# ---------------------------------------------------------------------------
+# ``date_updated`` ordering and the ``updated_since`` filter
+# ---------------------------------------------------------------------------
+
+# Three fixed instants, oldest to newest. Pinned rather than derived from
+# ``now()`` because ``projects.date_updated`` is stamped by the
+# transaction timestamp: rows written in one transaction would otherwise
+# all share a value and there would be nothing to order or filter on.
+T_OLD = datetime(2026, 1, 1, tzinfo=UTC)
+T_MID = datetime(2026, 2, 1, tzinfo=UTC)
+T_NEW = datetime(2026, 3, 1, tzinfo=UTC)
+
+
+async def _seed_clocked_projects(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+    *,
+    org_slug: str,
+    title: str = "Clocked",
+) -> int:
+    """Create three projects stamped with `T_OLD`, `T_MID`, and `T_NEW`.
+
+    The timestamps are written with a Core ``UPDATE`` because
+    ``SqlProject.date_updated`` carries an ORM ``onupdate``, which would
+    overwrite any value an ORM flush tried to set. ``expire_all`` then
+    drops the identity map so the listing under test reads the new
+    timestamps from the database rather than the stale loaded rows.
+
+    Returns the org id.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug=org_slug)
+        for slug in ("clock-old", "clock-mid", "clock-new"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=title),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        for slug, stamp in (
+            ("clock-old", T_OLD),
+            ("clock-mid", T_MID),
+            ("clock-new", T_NEW),
+        ):
+            await db_session.execute(
+                update(SqlProject)
+                .where(
+                    SqlProject.org_id == org_id,
+                    SqlProject.slug == slug,
+                )
+                .values(date_updated=stamp)
+                .execution_options(synchronize_session=False)
+            )
+        await db_session.commit()
+    db_session.expire_all()
+    return org_id
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_date_updated_orders_newest_first(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """``ProjectDateUpdatedCursor`` sorts most-recently-touched first."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-order-org"
+    )
+
+    async with db_session.begin():
+        result = await store.list_by_org(
+            org_id, cursor_type=ProjectDateUpdatedCursor, limit=25
+        )
+
+    assert [p.slug for p in result.entries] == [
+        "clock-new",
+        "clock-mid",
+        "clock-old",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_date_updated_pages_forward(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The ``date_updated`` cursor walks forward without repeating rows."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-fwd-org"
+    )
+
+    async with db_session.begin():
+        first = await store.list_by_org(
+            org_id, cursor_type=ProjectDateUpdatedCursor, limit=2
+        )
+        assert first.next_cursor is not None
+        second = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectDateUpdatedCursor,
+            cursor=first.next_cursor,
+            limit=2,
+        )
+
+    assert [p.slug for p in first.entries] == ["clock-new", "clock-mid"]
+    assert [p.slug for p in second.entries] == ["clock-old"]
+    assert second.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_date_updated_pages_backward(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The second page's ``prev`` cursor returns the first page."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-back-org"
+    )
+
+    async with db_session.begin():
+        first = await store.list_by_org(
+            org_id, cursor_type=ProjectDateUpdatedCursor, limit=2
+        )
+        assert first.next_cursor is not None
+        second = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectDateUpdatedCursor,
+            cursor=first.next_cursor,
+            limit=2,
+        )
+        assert second.prev_cursor is not None
+        back = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectDateUpdatedCursor,
+            cursor=second.prev_cursor,
+            limit=2,
+        )
+
+    assert [p.slug for p in back.entries] == ["clock-new", "clock-mid"]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_updated_since_is_inclusive(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """``updated_since`` keeps rows whose clock equals the boundary.
+
+    The boundary is inclusive so a poller can pass back the newest
+    ``date_updated`` it saw without a "did I already have this?"
+    round-trip; re-seeing one row is cheaper than the risk of skipping
+    one written in the same microsecond.
+    """
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-since-org"
+    )
+
+    async with db_session.begin():
+        result = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectSlugCursor,
+            limit=25,
+            updated_since=T_MID,
+        )
+
+    assert [p.slug for p in result.entries] == ["clock-mid", "clock-new"]
+    assert result.count == 2
+
+
+@pytest.mark.asyncio
+async def test_search_by_org_honours_updated_since(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The fuzzy-search path applies the same inclusive clock filter."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-search-org"
+    )
+
+    async with db_session.begin():
+        result = await store.search_by_org(
+            org_id, query="clock", limit=25, updated_since=T_MID
+        )
+
+    assert sorted(p.slug for p in result.entries) == [
+        "clock-mid",
+        "clock-new",
+    ]
+    assert result.count == 2

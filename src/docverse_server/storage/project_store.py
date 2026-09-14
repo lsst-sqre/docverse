@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -264,12 +265,25 @@ class ProjectStore:
         cursor_type: type[PaginationCursor[Project]],
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
+        updated_since: datetime | None = None,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
-        """List non-deleted projects for an organization with pagination."""
+        """List non-deleted projects for an organization with pagination.
+
+        Parameters
+        ----------
+        updated_since
+            When given, keep only projects whose ``date_updated`` is at
+            or after this timezone-aware instant. The comparison is
+            inclusive so a poller can hand back the newest timestamp it
+            saw and be certain it skips nothing written in that same
+            microsecond; the cost is re-seeing the boundary row.
+        """
         stmt = select(SqlProject).where(
             SqlProject.org_id == org_id,
             SqlProject.date_deleted.is_(None),
         )
+        if updated_since is not None:
+            stmt = stmt.where(SqlProject.date_updated >= updated_since)
         runner = CountedPaginatedQueryRunner(
             entry_type=Project, cursor_type=cursor_type
         )
@@ -284,18 +298,28 @@ class ProjectStore:
         query: str,
         limit: int,
         cursor: ProjectSearchCursor | None = None,
+        updated_since: datetime | None = None,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
-        """Search non-deleted projects by trigram similarity on slug/title."""
+        """Search non-deleted projects by trigram similarity on slug/title.
+
+        ``updated_since`` narrows the candidate set exactly as it does on
+        :meth:`list_by_org` — inclusive of the boundary — so a poller
+        that also filters by a search term sees the same rows the
+        unfiltered listing would have handed it.
+        """
         relevance = func.greatest(
             func.similarity(SqlProject.slug, query),
             func.similarity(SqlProject.title, query),
         ).label("relevance")
 
-        base_filter = expression.and_(
+        clauses = [
             SqlProject.org_id == org_id,
             SqlProject.date_deleted.is_(None),
             relevance > _TRGM_SIMILARITY_THRESHOLD,
-        )
+        ]
+        if updated_since is not None:
+            clauses.append(SqlProject.date_updated >= updated_since)
+        base_filter = expression.and_(*clauses)
 
         # Count total matches (no cursor so count is stable across pages)
         count_stmt = (
