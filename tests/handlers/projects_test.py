@@ -2145,3 +2145,188 @@ async def test_list_projects_publishes_conditional_get_event(
     assert event.endpoint == ConditionalGetEndpoint.projects_list
     assert event.outcome == ConditionalGetOutcome.not_modified
     assert event.precondition == ConditionalGetPrecondition.etag
+
+
+# ---------------------------------------------------------------------------
+# Conditional GET on the single project
+# ---------------------------------------------------------------------------
+
+
+async def _seed_one_project(client: AsyncClient) -> None:
+    """Create a single ``solo`` project with its ``__main`` edition."""
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={"slug": "solo", "title": "Solo"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_get_project_sends_validators(client: AsyncClient) -> None:
+    """The single project carries a weak ``ETag`` and a ``Last-Modified``."""
+    await _setup(client)
+    await _seed_one_project(client)
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["ETag"].startswith('W/"')
+    assert response.headers["Last-Modified"].endswith("GMT")
+
+
+@pytest.mark.asyncio
+async def test_get_project_if_none_match_is_empty_304(
+    client: AsyncClient,
+) -> None:
+    """Echoing the tag back earns a bodyless 304 with both validators."""
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 304
+    assert second.content == b""
+    assert second.headers["ETag"] == first.headers["ETag"]
+    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
+
+
+@pytest.mark.asyncio
+async def test_get_project_if_modified_since_alone_is_304(
+    client: AsyncClient,
+) -> None:
+    """A date with no tag is enough while the watermark stands still."""
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={
+            **headers,
+            "If-Modified-Since": first.headers["Last-Modified"],
+        },
+    )
+
+    assert second.status_code == 304
+    assert second.content == b""
+
+
+@pytest.mark.asyncio
+async def test_get_project_etag_changes_after_project_patch(
+    client: AsyncClient,
+) -> None:
+    """A metadata edit retires the tag the caller was holding."""
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+
+    patched = await client.patch(
+        "/docverse/orgs/proj-org/projects/solo",
+        json={"title": "Retitled"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_get_project_etag_changes_after_default_edition_patch(
+    client: AsyncClient,
+) -> None:
+    """The embedded default edition is part of what the tag covers.
+
+    A ``__main`` metadata edit leaves ``projects.date_updated`` alone —
+    only a repoint touches that — so this is the test that fails if the
+    watermark stops taking the later of the two clocks.
+    """
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+    project_clock = first.json()["date_updated"]
+
+    patched = await client.patch(
+        "/docverse/orgs/proj-org/projects/solo/editions/__main",
+        json={"title": "Current"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+    # The project row itself did not move; the edition's clock did.
+    assert second.json()["date_updated"] == project_clock
+
+
+@pytest.mark.asyncio
+async def test_get_project_publishes_conditional_get_event(
+    client: AsyncClient,
+) -> None:
+    """The event names the single-project endpoint and its project."""
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.conditional_get
+    assert isinstance(publisher, MockEventPublisher)
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+    assert publisher.published == []
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+    assert second.status_code == 304
+
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "proj-org"
+    assert event.project == "solo"
+    assert event.endpoint == ConditionalGetEndpoint.project
+    assert event.outcome == ConditionalGetOutcome.not_modified
+    assert event.precondition == ConditionalGetPrecondition.etag

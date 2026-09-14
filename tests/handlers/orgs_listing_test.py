@@ -134,3 +134,26 @@ async def test_listing_entries_carry_base32_public_id(
         headers={"X-Auth-Request-User": "alice"},
     )
     assert detail.json()["id"] == org_id
+
+
+@pytest.mark.asyncio
+async def test_orgs_listing_sends_no_validators(client: AsyncClient) -> None:
+    """``GET /orgs`` is deliberately outside conditional GET.
+
+    The listing is membership-filtered, so its content changes when a
+    membership is granted or revoked — neither of which touches any
+    organization's ``date_updated``. A date watermark would therefore
+    hand a poller a 304 over a listing that had in fact changed, so the
+    endpoint carries no validators at all rather than unsound ones
+    (PRD #634 §5).
+    """
+    await seed_org_with_admin(client, "noval-org", "alice")
+
+    response = await client.get(
+        "/docverse/orgs",
+        headers={"X-Auth-Request-User": "alice"},
+    )
+
+    assert response.status_code == 200
+    assert "ETag" not in response.headers
+    assert "Last-Modified" not in response.headers

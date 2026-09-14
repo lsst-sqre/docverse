@@ -269,11 +269,47 @@ async def post_project(
     return response_model
 
 
+def _project_etag(
+    *, project_public_id: int, watermark: datetime, include_deleted: bool
+) -> str:
+    """Build the entity-tag for one project's representation.
+
+    Unlike the listing, this endpoint names its material explicitly
+    rather than hashing the request's whole query string:
+    ``include_deleted`` is the only parameter it takes, and hashing the
+    *parsed* boolean means a caller that spells it ``false`` and one
+    that omits it entirely — the same representation — share a tag
+    instead of churning one.
+
+    The flag is part of the material because it is part of the
+    request's identity here: with it a soft-deleted project is a
+    representation, without it the same URL is a 404.
+    """
+    return make_weak_etag(
+        (
+            ConditionalGetEndpoint.project.value,
+            project_public_id,
+            datetime_to_microseconds(watermark),
+            include_deleted,
+        )
+    )
+
+
 @router.get(
     "/orgs/{org}/projects/{project}",
     response_model=Project,
     summary="Get a project",
     name="get_project",
+    responses={
+        status.HTTP_304_NOT_MODIFIED: {
+            "description": (
+                "The caller's ``If-None-Match`` or ``If-Modified-Since``"
+                " already matched this project, so no body is sent. The"
+                " ``ETag`` and ``Last-Modified`` validators are repeated"
+                " so a poller can carry them into its next request."
+            )
+        }
+    },
 )
 async def get_project(
     *,
@@ -295,7 +331,7 @@ async def get_project(
             ),
         ),
     ] = False,
-) -> Project:
+) -> Project | Response:
     async with context.session.begin():
         service = context.factory.create_project_service()
         org, project = await service.get_by_slug(
@@ -304,6 +340,28 @@ async def get_project(
             include_deleted=include_deleted,
         )
         default_edition = await service.get_default_edition(project.id)
+        # The response embeds the default edition, so the project row's
+        # own clock is only half the watermark: an edition retitled or
+        # repointed changes this representation without necessarily
+        # touching the project. Taking the later of the two keeps the
+        # validator honest about everything the body actually carries.
+        watermark = project.date_updated
+        if default_edition is not None:
+            watermark = max(watermark, default_edition.date_updated)
+        not_modified = await evaluate_conditional_get(
+            context,
+            endpoint=ConditionalGetEndpoint.project,
+            organization=org_slug,
+            project=project_slug,
+            etag=_project_etag(
+                project_public_id=project.public_id,
+                watermark=watermark,
+                include_deleted=include_deleted,
+            ),
+            last_modified=watermark,
+        )
+        if not_modified is not None:
+            return not_modified
     return Project.from_domain(
         project,
         context.request,

@@ -475,6 +475,47 @@ async def test_rollback_advances_project_date_updated(
 
 
 @pytest.mark.asyncio
+async def test_rollback_retires_project_etag(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``__main`` rollback invalidates the project's conditional GET.
+
+    The companion to
+    :func:`test_rollback_advances_project_date_updated`: a poller
+    holding the project's ``ETag`` has to be told the content moved,
+    not handed a 304 (PRD #634 §5).
+    """
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    before_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj", headers=headers
+    )
+    assert before_response.status_code == 200
+    etag = before_response.headers["ETag"]
+
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=2)
+        await db_session.commit()
+
+    rollback_response = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[0][1])},
+        headers=headers,
+    )
+    assert rollback_response.status_code == 200
+
+    after_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj",
+        headers={**headers, "If-None-Match": etag},
+    )
+
+    assert after_response.status_code == 200
+    assert after_response.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
 async def test_rollback_missing_build_field(client: AsyncClient) -> None:
     """Missing 'build' field in request body returns 422."""
     await _setup(client)

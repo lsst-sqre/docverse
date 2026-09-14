@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient
+from safir.metrics import MockEventPublisher
 
 from docverse.models import OrgRole
+from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import (
     serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.slug import parse_slug_rewrite_rules
+from docverse_server.metrics import (
+    ConditionalGetEndpoint,
+    ConditionalGetOutcome,
+    ConditionalGetPrecondition,
+)
 from tests.conftest import seed_member, seed_org_with_admin
 
 
@@ -398,3 +405,104 @@ async def test_get_organization_carries_base32_public_id(
     assert org_id.count("-") == 3
     assert validate_base32_id(org_id) > 0
     assert serialize_base32_id(validate_base32_id(org_id)) == org_id
+
+
+# ---------------------------------------------------------------------------
+# Conditional GET on the organization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_organization_sends_validators(client: AsyncClient) -> None:
+    """The organization carries a weak ``ETag`` and a ``Last-Modified``."""
+    await seed_org_with_admin(client, "cg-org", "testuser")
+
+    response = await client.get(
+        "/docverse/orgs/cg-org",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["ETag"].startswith('W/"')
+    assert response.headers["Last-Modified"].endswith("GMT")
+
+
+@pytest.mark.asyncio
+async def test_get_organization_if_none_match_is_empty_304(
+    client: AsyncClient,
+) -> None:
+    """Echoing the tag back earns a bodyless 304 with both validators."""
+    await seed_org_with_admin(client, "cg-repeat-org", "testuser")
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get("/docverse/orgs/cg-repeat-org", headers=headers)
+    assert first.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/cg-repeat-org",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 304
+    assert second.content == b""
+    assert second.headers["ETag"] == first.headers["ETag"]
+    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
+
+
+@pytest.mark.asyncio
+async def test_get_organization_etag_changes_after_patch(
+    client: AsyncClient,
+) -> None:
+    """An org edit retires the tag the caller was holding."""
+    await seed_org_with_admin(client, "cg-patch-org", "testuser")
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get("/docverse/orgs/cg-patch-org", headers=headers)
+    assert first.status_code == 200
+
+    patched = await client.patch(
+        "/docverse/orgs/cg-patch-org",
+        json={"title": "Retitled Org"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/cg-patch-org",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_get_organization_publishes_conditional_get_event(
+    client: AsyncClient,
+) -> None:
+    """The event names the organization endpoint and carries no project."""
+    await seed_org_with_admin(client, "cg-event-org", "testuser")
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.conditional_get
+    assert isinstance(publisher, MockEventPublisher)
+
+    first = await client.get("/docverse/orgs/cg-event-org", headers=headers)
+    assert first.status_code == 200
+    assert publisher.published == []
+
+    second = await client.get(
+        "/docverse/orgs/cg-event-org",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+    assert second.status_code == 304
+
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == "cg-event-org"
+    assert event.project is None
+    assert event.endpoint == ConditionalGetEndpoint.organization
+    assert event.outcome == ConditionalGetOutcome.not_modified
+    assert event.precondition == ConditionalGetPrecondition.etag
