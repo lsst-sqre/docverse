@@ -2,7 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._client import DocverseClient
+from ._client import DocverseClient, ProjectList
 from ._exceptions import BuildProcessingError, DocverseClientError
 from ._tar import create_tarball
 
@@ -10,6 +10,7 @@ __all__ = [
     "BuildProcessingError",
     "DocverseClient",
     "DocverseClientError",
+    "ProjectList",
     "__version__",
     "create_tarball",
 ]

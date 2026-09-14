@@ -29,6 +29,7 @@ TOKEN = "test-token"
 # Valid Crockford Base32 IDs with checksum (base32_lib.encode(N, ...))
 BUILD_ID = "000000000195"
 JOB_ID = "000000000292"
+PROJECT_ID = "1w01-nw5r-173e-35"
 
 
 def _build_response(**overrides: Any) -> dict[str, Any]:
@@ -68,6 +69,26 @@ def _job_response(**overrides: Any) -> dict[str, Any]:
         "date_created": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
         "date_started": None,
         "date_completed": None,
+    }
+    data.update(overrides)
+    return data
+
+
+def _project_response(slug: str, **overrides: Any) -> dict[str, Any]:
+    """Return a dict matching the Project model shape."""
+    project_url = f"/orgs/myorg/projects/{slug}"
+    data: dict[str, Any] = {
+        "self_url": project_url,
+        "org_url": "/orgs/myorg",
+        "editions_url": f"{project_url}/editions",
+        "builds_url": f"{project_url}/builds",
+        "dashboard_template_url": f"{project_url}/dashboard-template",
+        "id": PROJECT_ID,
+        "slug": slug,
+        "title": slug.capitalize(),
+        "date_created": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        "date_updated": datetime(2026, 1, 2, tzinfo=UTC).isoformat(),
+        "date_deleted": None,
     }
     data.update(overrides)
     return data
@@ -426,3 +447,166 @@ async def test_restore_build_raises_on_purged_build() -> None:
                 await client.restore_build("myorg", "myproj", BUILD_ID)
 
     assert excinfo.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_list_projects_follows_next_link() -> None:
+    """Paging walks ``Link rel="next"`` to the end of the listing.
+
+    A poller asks for an organization's projects once and gets all of
+    them; the page boundary is the client's problem, not the caller's.
+    The last page's ``Link`` carries only ``rel="first"``, which is how
+    the walk knows to stop.
+    """
+    page_two_url = f"{BASE_URL}/orgs/myorg/projects?order=slug&cursor=c2"
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.get("/orgs/myorg/projects").mock(
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json=[
+                        _project_response("alpha"),
+                        _project_response("beta"),
+                    ],
+                    headers={
+                        "Link": (
+                            f'<{BASE_URL}/orgs/myorg/projects>; rel="first",'
+                            f' <{page_two_url}>; rel="next"'
+                        )
+                    },
+                ),
+                httpx.Response(
+                    200,
+                    json=[_project_response("gamma")],
+                    headers={
+                        "Link": (
+                            f'<{BASE_URL}/orgs/myorg/projects>; rel="first"'
+                        )
+                    },
+                ),
+            ]
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            result = await client.list_projects("myorg")
+
+    assert [p.slug for p in result.projects] == ["alpha", "beta", "gamma"]
+    assert len(route.calls) == 2
+    assert str(route.calls[1].request.url) == page_two_url
+    assert result.not_modified is False
+
+
+@pytest.mark.asyncio
+async def test_list_projects_forwards_query_parameters() -> None:
+    """The poll knobs reach the server as query parameters.
+
+    ``updated_since`` goes out as an ISO 8601 timestamp carrying its
+    offset, because the server rejects a naive one with a 422.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.get("/orgs/myorg/projects").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            await client.list_projects(
+                "myorg",
+                updated_since=datetime(2026, 2, 1, 12, 30, tzinfo=UTC),
+                include_deleted=True,
+                order="date_updated",
+            )
+
+    params = route.calls[0].request.url.params
+    assert params["updated_since"] == "2026-02-01T12:30:00+00:00"
+    assert params["include_deleted"] == "true"
+    assert params["order"] == "date_updated"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_sends_preconditions_on_first_page_only() -> None:
+    """Validators guard the first request and no other.
+
+    The caller's ``ETag`` describes the page it already holds, so it is
+    meaningless against the cursor URLs that follow — a 304 there would
+    silently truncate the listing. The first page's validators come
+    back on the result so the next poll can send them again.
+    """
+    page_two_url = f"{BASE_URL}/orgs/myorg/projects?order=slug&cursor=c2"
+    last_modified = "Sun, 01 Feb 2026 12:30:00 GMT"
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.get("/orgs/myorg/projects").mock(
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json=[_project_response("alpha")],
+                    headers={
+                        "ETag": 'W/"abc123"',
+                        "Last-Modified": last_modified,
+                        "Link": f'<{page_two_url}>; rel="next"',
+                    },
+                ),
+                httpx.Response(
+                    200,
+                    json=[_project_response("beta")],
+                    headers={"ETag": 'W/"def456"'},
+                ),
+            ]
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            result = await client.list_projects(
+                "myorg",
+                if_none_match='W/"stale"',
+                if_modified_since="Sat, 31 Jan 2026 00:00:00 GMT",
+            )
+
+    first, second = (call.request for call in route.calls)
+    assert first.headers["If-None-Match"] == 'W/"stale"'
+    assert first.headers["If-Modified-Since"] == (
+        "Sat, 31 Jan 2026 00:00:00 GMT"
+    )
+    assert "if-none-match" not in second.headers
+    assert "if-modified-since" not in second.headers
+    assert result.etag == 'W/"abc123"'
+    assert result.last_modified == last_modified
+
+
+@pytest.mark.asyncio
+async def test_list_projects_not_modified() -> None:
+    """A 304 on the first page ends the poll before any paging.
+
+    The listing is unchanged, so there is nothing to fetch and nothing
+    to page through; the empty ``projects`` list is explained by
+    ``not_modified`` rather than mistaken for an empty organization.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.get("/orgs/myorg/projects").mock(
+            return_value=httpx.Response(
+                304,
+                headers={
+                    "ETag": 'W/"abc123"',
+                    "Last-Modified": "Sun, 01 Feb 2026 12:30:00 GMT",
+                },
+            )
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            result = await client.list_projects(
+                "myorg", if_none_match='W/"abc123"'
+            )
+
+    assert result.not_modified is True
+    assert result.projects == []
+    assert result.etag == 'W/"abc123"'
+    assert result.last_modified == "Sun, 01 Feb 2026 12:30:00 GMT"
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_projects_raises_on_error_status() -> None:
+    """A non-2xx page is an error, not an empty listing."""
+    async with respx.mock(base_url=BASE_URL) as router:
+        router.get("/orgs/myorg/projects").mock(
+            return_value=httpx.Response(403, text="Forbidden")
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            with pytest.raises(DocverseClientError) as excinfo:
+                await client.list_projects("myorg")
+
+    assert excinfo.value.status_code == 403

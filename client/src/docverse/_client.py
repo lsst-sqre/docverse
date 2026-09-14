@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,18 +23,58 @@ from .models import (
     OrgMembership,
     OrgMembershipUpdate,
     OrgRole,
+    Project,
     QueueJob,
 )
 from .models.builds import BuildAnnotations
 from .models.queue_enums import JobStatus
 
-__all__ = ["DocverseClient"]
+__all__ = ["DocverseClient", "ProjectList"]
 
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 15.0
 _BACKOFF_FACTOR = 2.0
 _VERBOSE_BODY_MAX = 2000
 _TOKEN_SUFFIX_LEN = 4
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectList:
+    """One complete pass over an organization's project listing.
+
+    Returned by `DocverseClient.list_projects`, which walks every page
+    before handing this back, so ``projects`` is the whole listing and
+    not one page of it.
+    """
+
+    projects: list[Project] = field(default_factory=list)
+    """Every project the listing returned, in server order across pages.
+
+    Empty when ``not_modified`` is `True`.
+    """
+
+    etag: str | None = None
+    """The first page's ``ETag``, or `None` if the server sent none.
+
+    An opaque validator: pass it back verbatim as ``if_none_match`` on
+    the next poll rather than interpreting it.
+    """
+
+    last_modified: str | None = None
+    """The first page's ``Last-Modified``, or `None` if none was sent.
+
+    The raw HTTP-date string, to be passed back verbatim as
+    ``if_modified_since``; it is left unparsed so a round trip cannot
+    lose the second-granularity truncation the server applied.
+    """
+
+    not_modified: bool = False
+    """Whether the server answered the first page with a 304.
+
+    `True` means the caller's precondition matched and nothing in the
+    listing has changed, so ``projects`` is empty because there was
+    nothing to fetch — not because the organization has no projects.
+    """
 
 
 class DocverseClient:
@@ -153,6 +195,88 @@ class DocverseClient:
             OrganizationSummary.model_validate(item)
             for item in response.json()
         ]
+
+    async def list_projects(
+        self,
+        org: str,
+        *,
+        updated_since: datetime | None = None,
+        include_deleted: bool = False,
+        order: str = "slug",
+        if_none_match: str | None = None,
+        if_modified_since: str | None = None,
+    ) -> ProjectList:
+        """List every project in an organization, following pagination.
+
+        Walks the listing's ``Link rel="next"`` chain to the last page,
+        so the result holds the whole listing rather than one page.
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        updated_since
+            Only return projects whose ``date_updated`` is at or after
+            this instant. Must be timezone-aware; the server rejects a
+            naive timestamp with a 422.
+        include_deleted
+            Also return soft-deleted projects, each with its
+            ``date_deleted`` set.
+        order
+            Sort order: ``slug``, ``date_created``, or ``date_updated``.
+        if_none_match
+            An ``ETag`` from a previous call, sent as ``If-None-Match``.
+        if_modified_since
+            A ``Last-Modified`` value from a previous call, sent as
+            ``If-Modified-Since``. The server consults it only when
+            ``if_none_match`` is absent.
+
+        Returns
+        -------
+        ProjectList
+            The projects, plus the first page's validators. When the
+            server answers the first page 304, ``not_modified`` is
+            `True` and ``projects`` is empty.
+        """
+        params: dict[str, Any] = {
+            "order": order,
+            "include_deleted": include_deleted,
+        }
+        if updated_since is not None:
+            params["updated_since"] = updated_since.isoformat()
+        headers: dict[str, str] = {}
+        if if_none_match is not None:
+            headers["If-None-Match"] = if_none_match
+        if if_modified_since is not None:
+            headers["If-Modified-Since"] = if_modified_since
+
+        # The preconditions belong to the first request alone: the
+        # server validates the page the caller already holds, and the
+        # ``Link`` URLs that follow are pages it has never seen.
+        response = await self._client.get(
+            f"/orgs/{org}/projects", params=params, headers=headers
+        )
+        etag = response.headers.get("ETag")
+        last_modified = response.headers.get("Last-Modified")
+        if response.status_code == httpx.codes.NOT_MODIFIED:
+            return ProjectList(
+                etag=etag,
+                last_modified=last_modified,
+                not_modified=True,
+            )
+        _raise_for_status(response)
+        projects = [Project.model_validate(item) for item in response.json()]
+        next_url = _next_page_url(response)
+        while next_url is not None:
+            response = await self._client.get(next_url)
+            _raise_for_status(response)
+            projects.extend(
+                Project.model_validate(item) for item in response.json()
+            )
+            next_url = _next_page_url(response)
+        return ProjectList(
+            projects=projects, etag=etag, last_modified=last_modified
+        )
 
     async def update_member(
         self, org: str, member: str, *, role: OrgRole
@@ -400,6 +524,11 @@ class DocverseClient:
             jitter = random.uniform(0, delay * 0.5)  # noqa: S311
             await asyncio.sleep(delay + jitter)
             delay = min(delay * _BACKOFF_FACTOR, _BACKOFF_MAX)
+
+
+def _next_page_url(response: httpx.Response) -> str | None:
+    """Return the ``Link rel="next"`` URL, or `None` on the last page."""
+    return response.links.get("next", {}).get("url")
 
 
 def _mask_token(value: str) -> str:
