@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 import pytest
 import sentry_sdk
@@ -84,6 +86,17 @@ async def _fetch_project_github_ids(
     raise RuntimeError(msg)
 
 
+async def _fetch_project_date_updated(project_id: int) -> datetime:
+    """Return one project's ``date_updated`` clock."""
+    async for session in db_session_dependency():
+        result = await session.execute(
+            select(SqlProject.date_updated).where(SqlProject.id == project_id)
+        )
+        return result.scalar_one()
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
 def _make_ctx(
     *,
     http_client: httpx.AsyncClient,
@@ -137,6 +150,42 @@ async def test_project_github_resolve_persists_three_ids(
     assert owner_id == 111
     assert repo_id == 12345
     assert installation_id == 42
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_rerun_leaves_clock_alone(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A second resolve finding the same ids moves no project clock.
+
+    Task #651: every PATCH of a bound project enqueues this worker
+    again, so a resolve that re-reads the ids already stored used to
+    stamp ``projects.date_updated`` a second time — a phantom change
+    signal that hands every poller a full 200 with an unchanged body.
+    The rerun still reports ``completed``: the row does carry the
+    resolved ids, which is what ``skipped`` would wrongly deny.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo("acme", "templates", repo_id=12345, owner_id=111)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        first = await project_github_resolve(ctx, {"project_id": project_id})
+        assert first == "completed"
+        baseline = await _fetch_project_date_updated(project_id)
+
+        second = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert second == "completed"
+    assert await _fetch_project_date_updated(project_id) == baseline
 
 
 @pytest.mark.asyncio

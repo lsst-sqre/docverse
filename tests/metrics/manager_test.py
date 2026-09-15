@@ -25,6 +25,10 @@ from docverse_server.config import Configuration
 from docverse_server.metrics import (
     BuildProcessedEvent,
     BuildUploadedEvent,
+    ConditionalGetEndpoint,
+    ConditionalGetEvent,
+    ConditionalGetOutcome,
+    ConditionalGetPrecondition,
     DocverseEvents,
     EditionPublishedEvent,
     EditionPublishTrigger,
@@ -56,6 +60,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.lifecycle_action, MockEventPublisher)
     assert isinstance(events.resource_inventory, MockEventPublisher)
     assert isinstance(events.purgatory_cleanup_completed, MockEventPublisher)
+    assert isinstance(events.conditional_get, MockEventPublisher)
 
     await manager.aclose()
 
@@ -272,5 +277,42 @@ async def test_purgatory_cleanup_completed_is_the_record_of_a_sweep() -> None:
     assert event.bytes_reclaimed == 4096
     assert event.capped is True
     assert event.elapsed == timedelta(seconds=42)
+
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_conditional_get_records_which_header_decided() -> None:
+    """The event names the endpoint, the header, and the outcome.
+
+    Conditional GET is only worth its complexity if 304s actually
+    happen, and only the pair (``precondition``, ``outcome``) says so:
+    a poller sending ``If-None-Match`` and never getting
+    ``not_modified`` is a cache that is not working. The event is
+    org-scoped for the listing, so ``project`` is ``None``.
+    """
+    config = Configuration()
+    manager, events = await build_event_manager(config)
+    publisher = events.conditional_get
+    assert isinstance(publisher, MockEventPublisher)
+
+    await publisher.publish(
+        ConditionalGetEvent(
+            organization="org",
+            project=None,
+            endpoint=ConditionalGetEndpoint.projects_list,
+            outcome=ConditionalGetOutcome.not_modified,
+            precondition=ConditionalGetPrecondition.etag,
+        )
+    )
+
+    published = publisher.published
+    assert len(published) == 1
+    event = published[0]
+    assert event.organization == "org"
+    assert event.project is None
+    assert event.endpoint == ConditionalGetEndpoint.projects_list
+    assert event.outcome == ConditionalGetOutcome.not_modified
+    assert event.precondition == ConditionalGetPrecondition.etag
 
     await manager.aclose()

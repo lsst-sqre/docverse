@@ -14,6 +14,7 @@ from docverse_server.storage.pagination import (
     EditionDateUpdatedCursor,
     EditionSlugCursor,
     ProjectDateCreatedCursor,
+    ProjectDateUpdatedCursor,
     ProjectSearchCursor,
     ProjectSlugCursor,
 )
@@ -118,6 +119,16 @@ def test_edition_date_created_cursor_roundtrip() -> None:
     cursor = EditionDateCreatedCursor(time=t, id=10, previous=False)
     restored = EditionDateCreatedCursor.from_str(str(cursor))
     assert restored.id == 10
+    assert restored.previous is False
+
+
+def test_project_date_updated_cursor_roundtrip() -> None:
+    """ProjectDateUpdatedCursor serialization roundtrip."""
+    t = datetime(2026, 2, 1, tzinfo=UTC)
+    cursor = ProjectDateUpdatedCursor(time=t, id=7, previous=False)
+    restored = ProjectDateUpdatedCursor.from_str(str(cursor))
+    assert restored.time == t
+    assert restored.id == 7
     assert restored.previous is False
 
 

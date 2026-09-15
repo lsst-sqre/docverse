@@ -283,6 +283,27 @@ async def post_edition_rollback(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Edition:
+    """Point an edition back at a build already in its history.
+
+    Naming the build the edition **already serves** is answered with
+    ``200`` and the unchanged edition, not a ``409``: the request's
+    postcondition already holds, and an operator retrying after a
+    dropped connection — or two operators reacting to the same
+    incident — should not have to tell a conflict from a success. The
+    response is the edition as it stands, so its ``publish_status``
+    reports the real state of the publish rather than a ``pending``
+    nothing will clear.
+
+    Such a request is inert. It records no history entry, enqueues no
+    ``publish_edition`` job, and leaves the project's ``date_updated``
+    where it was, so a consumer polling ``GET /orgs/{org}/projects``
+    with ``updated_since`` or an ``ETag`` is not told to refetch a
+    project whose content did not move.
+
+    A build that is not in this edition's history is still a ``404``,
+    checked before the no-op case: an emergency ``build`` override can
+    leave an edition serving a build that rollback was never offered.
+    """
     async with context.session.begin():
         service = context.factory.create_edition_service()
         org, project, edition = await service.rollback(
@@ -334,6 +355,21 @@ async def patch_edition(
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> Edition:
+    """Update an edition's metadata, or override the build it serves.
+
+    A ``build`` in the payload is an emergency override: it points the
+    edition at that build even if the build is not in the edition's
+    history and even if it is older than the one being served.
+
+    Naming the build the edition **already serves** is answered with
+    ``200`` and the unchanged edition, on the same reasoning as
+    ``POST .../rollback``. Such a request is inert: no history entry, no
+    ``publish_edition`` job, and the project's ``date_updated`` stays
+    where it was, so a consumer polling
+    ``GET /orgs/{org}/projects`` with ``updated_since`` or an ``ETag``
+    is not told to refetch a project whose content did not move. A
+    metadata field in the same payload is still applied.
+    """
     if edition_slug.lower() == "__main" and data.kind is not None:
         msg = "Cannot change the kind of the default '__main' edition"
         raise PermissionDeniedError(msg)

@@ -147,6 +147,7 @@ async def test_null_github_source_urls_migration(
     now = datetime.now(tz=UTC)
     derived = ProjectDomain(
         id=bound.id,
+        public_id=1,
         slug="bound",
         title="Bound",
         org_id=org_id,

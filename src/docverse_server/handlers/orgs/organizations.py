@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response, status
 
 from docverse.models import OrganizationSummary, OrganizationUpdate, OrgRole
 from docverse_server.dependencies.auth import (
@@ -16,11 +16,18 @@ from docverse_server.dependencies.context import (
     RequestContext,
     context_dependency,
 )
+from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.conditional_get import (
+    datetime_to_microseconds,
+    make_weak_etag,
+)
 from docverse_server.domain.organization import (
     Organization as OrganizationDomain,
 )
 from docverse_server.exceptions import NotFoundError, PermissionDeniedError
+from docverse_server.handlers.conditional import evaluate_conditional_get
 from docverse_server.handlers.params import OrgSlugParam
+from docverse_server.metrics import ConditionalGetEndpoint
 
 from .models import Organization
 
@@ -33,6 +40,7 @@ def _organization_summary(
     """Build an ``OrganizationSummary`` for a listing entry."""
     return OrganizationSummary(
         self_url=str(request.url_for("get_organization", org=org.slug)),
+        id=serialize_base32_id(org.public_id),
         slug=org.slug,
         title=org.title,
         role=role,
@@ -95,20 +103,65 @@ async def get_organizations(
     return summaries
 
 
+def _organization_etag(org: OrganizationDomain) -> str:
+    """Build the entity-tag for one organization's representation.
+
+    The material is the endpoint's identity, the org's public id, and
+    its ``date_updated``. The endpoint takes no query parameters, so
+    unlike the project listing there is no request state to fold in:
+    one organization has exactly one representation per clock tick.
+    """
+    return make_weak_etag(
+        (
+            ConditionalGetEndpoint.organization.value,
+            org.public_id,
+            datetime_to_microseconds(org.date_updated),
+        )
+    )
+
+
 @router.get(
     "/orgs/{org}",
     response_model=Organization,
     summary="Get an organization",
     name="get_organization",
+    responses={
+        status.HTTP_304_NOT_MODIFIED: {
+            "description": (
+                "The caller's ``If-None-Match`` already matched this"
+                " organization, so no body is sent. The ``ETag`` is"
+                " repeated so a poller can carry it into its next"
+                " request."
+            )
+        }
+    },
 )
 async def get_organization(
     *,
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_reader)],
-) -> Organization:
-    # Load services to build embedded summaries for slot assignments
+) -> Organization | Response:
+    # The authorization dependency has already loaded the org row, so
+    # the watermark is in hand before this body runs and the validators
+    # cost nothing: a caller that is up to date is answered without the
+    # services query below ever being issued.
+    #
+    # The watermark is the org's own clock. The embedded service
+    # summaries are the one part of this body it does not cover — an
+    # edit to a service row that is merely *assigned* to a slot changes
+    # a summary without touching the org. Slot assignments themselves
+    # are org columns, so a re-slot does move it (PRD #634 §5).
     async with context.session.begin():
+        not_modified = await evaluate_conditional_get(
+            context,
+            endpoint=ConditionalGetEndpoint.organization,
+            organization=org_slug,
+            etag=_organization_etag(user.org),
+        )
+        if not_modified is not None:
+            return not_modified
+        # Load services to build embedded summaries for slot assignments
         infra_service = context.factory.create_infrastructure_service()
         services = await infra_service.list_by_org_id(org_id=user.org.id)
     return Organization.from_domain(

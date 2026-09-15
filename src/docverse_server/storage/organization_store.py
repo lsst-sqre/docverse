@@ -13,6 +13,9 @@ from docverse.models import (
 )
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.domain.organization import Organization
+from docverse_server.storage._public_id import (
+    insert_with_time_ordered_public_id,
+)
 
 
 class OrganizationStore:
@@ -27,7 +30,15 @@ class OrganizationStore:
         self._logger = logger
 
     async def create(self, data: OrganizationCreate) -> Organization:
-        """Insert a new organization row."""
+        """Insert a new organization row.
+
+        The ``public_id`` is a time-ordered Crockford Base32 resource ID
+        minted at insert time and re-minted on the (rare)
+        same-millisecond collision. The org slug's own unique constraint
+        is not a ``public_id`` conflict, so a duplicate slug propagates
+        as an ``IntegrityError`` for the caller to translate, exactly as
+        before.
+        """
         default_edition_config = None
         if data.default_edition_config is not None:
             default_edition_config = data.default_edition_config.model_dump(
@@ -36,19 +47,24 @@ class OrganizationStore:
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
             lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
-        row = SqlOrganization(
-            slug=data.slug,
-            title=data.title,
-            base_domain=data.base_domain,
-            url_scheme=data.url_scheme,
-            root_path_prefix=data.root_path_prefix,
-            slug_rewrite_rules=data.slug_rewrite_rules,
-            lifecycle_rules=lifecycle_rules,
-            default_edition_config=default_edition_config,
-            purgatory_retention=data.purgatory_retention,
+
+        def _make_row(public_id: int) -> SqlOrganization:
+            return SqlOrganization(
+                public_id=public_id,
+                slug=data.slug,
+                title=data.title,
+                base_domain=data.base_domain,
+                url_scheme=data.url_scheme,
+                root_path_prefix=data.root_path_prefix,
+                slug_rewrite_rules=data.slug_rewrite_rules,
+                lifecycle_rules=lifecycle_rules,
+                default_edition_config=default_edition_config,
+                purgatory_retention=data.purgatory_retention,
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
         )
-        self._session.add(row)
-        await self._session.flush()
         return Organization.model_validate(row)
 
     async def get_by_id(self, org_id: int) -> Organization | None:

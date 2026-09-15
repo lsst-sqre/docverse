@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
 from docverse.models import (
     InstallationStatus,
+    Project,
     ProjectCreate,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
     ProjectUpdate,
+)
+from docverse.models._examples import (
+    EXAMPLE_ORG_URL,
+    EXAMPLE_PROJECT_ID,
+    EXAMPLE_PROJECT_URL,
 )
 from docverse.models.projects import build_github_url, parse_github_url
 
@@ -207,3 +215,60 @@ def test_project_update_clears_github_with_non_github_source_url() -> None:
     )
     assert update.github is None
     assert update.source_url == "https://gitlab.com/lsst/mirror"
+
+
+def test_project_round_trips_public_id() -> None:
+    """The Project resource carries the Base32 ``id`` through a round-trip."""
+    project = Project.model_validate(
+        {
+            "self_url": f"{EXAMPLE_PROJECT_URL}",
+            "org_url": f"{EXAMPLE_ORG_URL}",
+            "editions_url": f"{EXAMPLE_PROJECT_URL}/editions",
+            "builds_url": f"{EXAMPLE_PROJECT_URL}/builds",
+            "dashboard_template_url": (
+                f"{EXAMPLE_PROJECT_URL}/dashboard-template"
+            ),
+            "id": EXAMPLE_PROJECT_ID,
+            "slug": "pipelines",
+            "title": "LSST Science Pipelines",
+            "date_created": "2026-05-02T09:30:00Z",
+            "date_updated": "2026-05-02T09:30:00Z",
+        }
+    )
+    assert project.id == EXAMPLE_PROJECT_ID
+    assert project.model_dump(mode="json")["id"] == EXAMPLE_PROJECT_ID
+
+
+def test_project_carries_date_deleted() -> None:
+    """A soft-deleted project parses its ``date_deleted`` tombstone.
+
+    The field is how a consumer polling with ``include_deleted=true``
+    tells a deleted project from a live one; a live project carries it
+    as ``null``.
+    """
+    payload = {
+        "self_url": f"{EXAMPLE_PROJECT_URL}",
+        "org_url": f"{EXAMPLE_ORG_URL}",
+        "editions_url": f"{EXAMPLE_PROJECT_URL}/editions",
+        "builds_url": f"{EXAMPLE_PROJECT_URL}/builds",
+        "dashboard_template_url": (
+            f"{EXAMPLE_PROJECT_URL}/dashboard-template"
+        ),
+        "id": EXAMPLE_PROJECT_ID,
+        "slug": "pipelines",
+        "title": "LSST Science Pipelines",
+        "date_created": "2026-05-02T09:30:00Z",
+        "date_updated": "2026-05-02T09:30:00Z",
+    }
+
+    live = Project.model_validate({**payload, "date_deleted": None})
+    deleted = Project.model_validate(
+        {**payload, "date_deleted": "2026-06-01T12:00:00Z"}
+    )
+
+    assert live.date_deleted is None
+    assert deleted.date_deleted == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    assert (
+        deleted.model_dump(mode="json")["date_deleted"]
+        == "2026-06-01T12:00:00Z"
+    )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, Index, Integer, String, Text
+from sqlalchemy import BigInteger, DateTime, Enum, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -22,6 +22,14 @@ class SqlOrganization(Base):
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True
+    )
+
+    # Stable time-ordered Crockford Base32 identifier exposed on the wire
+    # as ``id``. Minted in application code (never by a sequence), it
+    # survives a slug rename and gives conditional-GET responses a
+    # durable value to hash into an ETag.
+    public_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, nullable=False, autoincrement=False
     )
 
     slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)

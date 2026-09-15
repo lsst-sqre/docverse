@@ -7,11 +7,13 @@ from pydantic import ValidationError
 
 from docverse.models import (
     LifecycleRuleSet,
+    Organization,
     OrganizationCreate,
     OrganizationSummary,
     OrganizationUpdate,
     OrgRole,
 )
+from docverse.models._examples import EXAMPLE_ORG_ID
 from docverse.models.organizations import normalize_base_domain
 
 
@@ -20,15 +22,46 @@ def test_organization_summary_round_trip() -> None:
     summary = OrganizationSummary.model_validate(
         {
             "self_url": "https://example.com/docverse/orgs/lsst",
+            "id": EXAMPLE_ORG_ID,
             "slug": "lsst",
             "title": "Rubin Observatory",
             "role": "reader",
         }
     )
+    assert summary.id == EXAMPLE_ORG_ID
     assert summary.slug == "lsst"
     assert summary.title == "Rubin Observatory"
     assert summary.role is OrgRole.reader
     assert summary.self_url.endswith("/orgs/lsst")
+    assert summary.model_dump(mode="json")["id"] == EXAMPLE_ORG_ID
+
+
+def test_organization_round_trips_public_id() -> None:
+    """The full Organization resource carries the Base32 ``id``."""
+    org = Organization.model_validate(
+        {
+            "self_url": "https://example.com/docverse/orgs/lsst",
+            "dashboard_template_url": (
+                "https://example.com/docverse/orgs/lsst/dashboard-template"
+            ),
+            "keeper_sync_url": (
+                "https://example.com/docverse/orgs/lsst/keeper-sync"
+            ),
+            "id": EXAMPLE_ORG_ID,
+            "slug": "lsst",
+            "title": "Rubin Observatory",
+            "base_domain": "lsst.io",
+            "url_scheme": "subdomain",
+            "root_path_prefix": "/",
+            "slug_rewrite_rules": None,
+            "lifecycle_rules": None,
+            "purgatory_retention": 2592000,
+            "date_created": "2026-05-01T12:00:00Z",
+            "date_updated": "2026-05-01T12:00:00Z",
+        }
+    )
+    assert org.id == EXAMPLE_ORG_ID
+    assert org.model_dump(mode="json")["id"] == EXAMPLE_ORG_ID
 
 
 @pytest.mark.parametrize(

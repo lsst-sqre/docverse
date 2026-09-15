@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -13,9 +14,9 @@ from docverse.models import (
     ProjectCreate,
     ProjectUpdate,
 )
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.organization import Organization
-from docverse_server.domain.project import Project
+from docverse_server.domain.project import Project, ProjectListingWatermark
 from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import TombstoneReason
@@ -23,8 +24,29 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import ProjectSearchCursor
 from docverse_server.storage.project_store import ProjectStore
 
-DEFAULT_EDITION_SLUG = "__main"
-"""Slug for the default edition auto-created with every project."""
+__all__ = ["ProjectService", "patch_changes_github_binding"]
+
+
+def patch_changes_github_binding(data: ProjectUpdate) -> bool:
+    """Report whether a PATCH body rewrites the project's GitHub binding.
+
+    Two PATCH shapes reach the binding columns, and they are exactly the
+    branches :meth:`ProjectService._resolve_github_for_update` acts on:
+    naming ``github`` (setting it, or clearing it with ``null``), and
+    supplying a non-null ``source_url``, which the validator guarantees
+    is non-GitHub and which therefore clears the binding. Every other
+    PATCH — a retitle, new lifecycle rules, an explicit
+    ``source_url: null`` on a bound project — leaves all five
+    ``github_*`` columns exactly as they were.
+
+    The handler uses this to decide whether a PATCH is worth a
+    ``project_github_resolve`` job (task #651). Without the gate a bulk
+    retitle of 100 projects queued 100 jobs that re-read the ids they
+    had already resolved. Keeping the predicate beside
+    ``_resolve_github_for_update``, which consults it for its own
+    short-circuit, is what stops the two from drifting apart.
+    """
+    return "github" in data.model_fields_set or data.source_url is not None
 
 
 class ProjectService:
@@ -104,8 +126,12 @@ class ProjectService:
           project flips to the non-GitHub URL.
         * otherwise → no github_* / source_url overrides; the
           ``exclude_unset`` model dump in the store handles a plain
-          ``source_url: null`` clear on its own.
+          ``source_url: null`` clear on its own. This is the case
+          :func:`patch_changes_github_binding` screens out, and the
+          handler's resolve-enqueue gate reads the same answer.
         """
+        if not patch_changes_github_binding(data):
+            return {}
         cleared = {
             "github_owner": None,
             "github_repo": None,
@@ -124,9 +150,9 @@ class ProjectService:
                 "github_installation_id": None,
                 "source_url": None,
             }
-        if data.source_url is not None:
-            return cleared
-        return {}
+        # A non-null ``source_url``, guaranteed non-GitHub by the
+        # validator, so the binding goes.
+        return cleared
 
     async def create(
         self, *, org_slug: str, data: ProjectCreate
@@ -168,9 +194,14 @@ class ProjectService:
         return org, project, default_edition
 
     async def get_by_slug(
-        self, *, org_slug: str, slug: str
+        self, *, org_slug: str, slug: str, include_deleted: bool = False
     ) -> tuple[Organization, Project]:
         """Get a project by slug within an organization.
+
+        ``include_deleted`` widens the read to a soft-deleted project so
+        a consumer mirroring the listing can still fetch the row it saw
+        go away. It is a read-only affordance: every write path resolves
+        the project without it and so keeps 404ing on a deleted one.
 
         Raises
         ------
@@ -178,7 +209,9 @@ class ProjectService:
             If the project is not found.
         """
         org = await self._resolve_org(org_slug)
-        project = await self._store.get_by_slug(org_id=org.id, slug=slug)
+        project = await self._store.get_by_slug(
+            org_id=org.id, slug=slug, include_deleted=include_deleted
+        )
         if project is None:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
@@ -198,27 +231,59 @@ class ProjectService:
         cursor_type: type[PaginationCursor[Project]] | None = None,
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
+        updated_since: datetime | None = None,
+        include_deleted: bool = False,
     ) -> tuple[
         Organization,
         CountedPaginatedList[Project, PaginationCursor[Project]],
     ]:
-        """List all projects for an organization."""
+        """List all projects for an organization.
+
+        ``updated_since`` is an optional timezone-aware lower bound on
+        ``date_updated`` and ``include_deleted`` widens the listing to
+        soft-deleted projects. Both are applied on the ordered listing
+        and the ``query`` search path alike, so a poller gets the same
+        answer whichever one it uses.
+        """
         org = await self._resolve_org(org_slug)
         if query is not None:
             search_cursor = (
                 cursor if isinstance(cursor, ProjectSearchCursor) else None
             )
             result = await self._store.search_by_org(
-                org.id, query=query, limit=limit, cursor=search_cursor
+                org.id,
+                query=query,
+                limit=limit,
+                cursor=search_cursor,
+                updated_since=updated_since,
+                include_deleted=include_deleted,
             )
             return org, result
         if cursor_type is None:
             msg = "cursor_type is required when query is not set"
             raise RuntimeError(msg)
         result = await self._store.list_by_org(
-            org.id, cursor_type=cursor_type, cursor=cursor, limit=limit
+            org.id,
+            cursor_type=cursor_type,
+            cursor=cursor,
+            limit=limit,
+            updated_since=updated_since,
+            include_deleted=include_deleted,
         )
         return org, result
+
+    async def get_org_watermark(
+        self, org: Organization
+    ) -> ProjectListingWatermark:
+        """Return the conditional-GET watermark for an org's listing.
+
+        Takes the resolved organization rather than its id because the
+        caller — the listing handler — already holds it from
+        authorization, and the store's aggregate stays a single
+        joinless statement over ``projects``. See
+        :meth:`~docverse_server.storage.project_store.ProjectStore.get_org_watermark`.
+        """
+        return await self._store.get_org_watermark(org.id)
 
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate

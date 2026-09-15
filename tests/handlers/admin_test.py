@@ -27,7 +27,8 @@ async def test_create_organization(client: AsyncClient) -> None:
     assert data["url_scheme"] == "subdomain"
     assert data["root_path_prefix"] == "/"
     assert data["purgatory_retention"] == 2592000
-    assert "id" not in data
+    # ``id`` is the org's Base32 public ID, never its integer row id.
+    assert isinstance(data["id"], str)
     assert data["date_created"] is not None
     assert data["date_updated"] is not None
     assert "/admin/orgs/test-org" in data["self_url"]

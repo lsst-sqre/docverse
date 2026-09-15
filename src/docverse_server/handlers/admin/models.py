@@ -10,6 +10,7 @@ from starlette.requests import Request
 from docverse.models import Organization as _OrganizationBase
 from docverse.models import OrganizationServiceSummary
 from docverse.models._examples import EXAMPLE_API_URL, EXAMPLE_ORG_URL
+from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.organization import (
     Organization as OrganizationDomain,
 )
@@ -89,6 +90,7 @@ class AdminOrganization(_OrganizationBase):
             keeper_sync_url=str(
                 request.url_for("get_org_keeper_sync_config", org=domain.slug)
             ),
+            id=serialize_base32_id(domain.public_id),
             slug=domain.slug,
             title=domain.title,
             base_domain=domain.base_domain,

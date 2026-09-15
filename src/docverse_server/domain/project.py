@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -19,6 +20,14 @@ class Project(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int = Field(description="Unique identifier for the project.")
+
+    public_id: int = Field(
+        description=(
+            "Time-ordered Crockford Base32 identifier for the project,"
+            " stored as an integer and serialized on the wire as the"
+            " ``id`` field."
+        )
+    )
 
     slug: str = Field(description="URL-safe identifier for the project.")
 
@@ -144,3 +153,37 @@ class Project(BaseModel):
         if self.github_installation_id is not None:
             return InstallationStatus.installed
         return InstallationStatus.not_installed
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectListingWatermark:
+    """Validator material for one organization's project listing.
+
+    Conditional GET on ``GET /orgs/{org}/projects`` needs a cheap value
+    that changes whenever any row of the listing changes. The newest
+    ``date_updated`` is not that value: every row is stamped with
+    PostgreSQL's transaction *start* clock (``now()``), and commit order
+    is not start order, so a slow writer can commit after a poller has
+    read and land a ``date_updated`` below the maximum that poller
+    already stored. The maximum would not move, and the poller would
+    keep being told 304.
+
+    These two aggregates have no such hole: a row that appears or
+    disappears changes ``project_count``, and a row whose clock moves at
+    all — up or down, above or below any maximum — changes
+    ``clock_sum``. Neither names an instant, which is fine because the
+    ``ETag`` they feed is opaque and Docverse publishes no
+    ``Last-Modified``.
+    """
+
+    project_count: int
+    """How many projects the org owns, deleted rows included."""
+
+    clock_sum: int
+    """Sum of every project's ``date_updated`` in whole microseconds
+    since the POSIX epoch, or ``0`` when the org owns no projects.
+
+    A plain sum rather than a hash: it is one aggregate PostgreSQL can
+    compute over the same index scan as the other two, and any change
+    to any row's clock moves it.
+    """

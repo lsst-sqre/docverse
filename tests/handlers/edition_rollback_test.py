@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 import structlog
 from httpx import AsyncClient
@@ -13,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import BuildCreate
 from docverse.models.queue_enums import JobKind, PublishStatus
+from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import serialize_base32_id
@@ -431,6 +434,89 @@ async def test_rollback_publishes_edition_lifecycle(
 
 
 @pytest.mark.asyncio
+async def test_rollback_advances_project_date_updated(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``__main`` rollback shows up on the project resource.
+
+    PRD #634: Ook polls ``GET /orgs/{org}/projects`` with
+    ``updated_since``, so a content change to the default edition has
+    to move the project's ``date_updated`` — this is the end-to-end
+    proof that ``EditionStore.set_current_build``'s project touch
+    reaches the wire.
+    """
+    await _setup(client)
+
+    before_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert before_response.status_code == 200
+    before = datetime.fromisoformat(before_response.json()["date_updated"])
+
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=2)
+        await db_session.commit()
+
+    rollback_response = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[0][1])},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert rollback_response.status_code == 200
+
+    after_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert after_response.status_code == 200
+    after = datetime.fromisoformat(after_response.json()["date_updated"])
+    assert after > before
+
+
+@pytest.mark.asyncio
+async def test_rollback_retires_project_etag(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``__main`` rollback invalidates the project's conditional GET.
+
+    The companion to
+    :func:`test_rollback_advances_project_date_updated`: a poller
+    holding the project's ``ETag`` has to be told the content moved,
+    not handed a 304 (PRD #634 §5).
+    """
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    before_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj", headers=headers
+    )
+    assert before_response.status_code == 200
+    etag = before_response.headers["ETag"]
+
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=2)
+        await db_session.commit()
+
+    rollback_response = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[0][1])},
+        headers=headers,
+    )
+    assert rollback_response.status_code == 200
+
+    after_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj",
+        headers={**headers, "If-None-Match": etag},
+    )
+
+    assert after_response.status_code == 200
+    assert after_response.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
 async def test_rollback_missing_build_field(client: AsyncClient) -> None:
     """Missing 'build' field in request body returns 422."""
     await _setup(client)
@@ -440,3 +526,143 @@ async def test_rollback_missing_build_field(client: AsyncClient) -> None:
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 422
+
+
+async def _read_project_date_updated(db_session: AsyncSession) -> datetime:
+    """Read the test project's ``date_updated`` straight from the database.
+
+    A column-level SELECT rather than an ORM entity load, so the
+    identity map cannot hand back a value that predates the Core
+    ``UPDATE`` ``EditionStore.set_current_build`` issues.
+    """
+    return (
+        await db_session.execute(
+            select(SqlProject.date_updated).where(SqlProject.slug == "rb-proj")
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_rollback_noop_leaves_project_clock(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Rolling back to the served build leaves the project clock alone.
+
+    The project's ``date_updated`` is a poller's change signal (PRD
+    #634), so a rollback that lands ``__main`` on the build it already
+    serves must not retire every cached ``ETag`` and re-emit an
+    identical row into every ``updated_since`` window.
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    first = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert first.status_code == 200
+
+    async with db_session.begin():
+        before = await _read_project_date_updated(db_session)
+
+    second = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert second.status_code == 200
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session)
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_rollback_noop_records_no_history_or_job(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A no-op rollback records no history row and enqueues no publish.
+
+    The rollback stays a 200 carrying the unchanged edition rather than
+    a 409: asking for the build already being served is a request whose
+    postcondition already holds, and an operator retrying a rollback
+    after a dropped connection should not have to tell a conflict from
+    a success.
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    for _ in range(2):
+        response = await client.post(
+            "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+            json={"build": target_public_id},
+            headers={"X-Auth-Request-User": "testuser"},
+        )
+        assert response.status_code == 200
+
+    history_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/history",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert history_response.status_code == 200
+    # 3 seeded entries plus the one the first rollback recorded.
+    assert len(history_response.json()) == 4
+
+    async with db_session.begin():
+        result = await db_session.execute(
+            select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.publish_edition.value
+            )
+        )
+        assert len(result.scalars().all()) == 1
+
+    mock_arq = arq_dependency._arq_queue
+    assert isinstance(mock_arq, MockArqQueue)
+    assert len(get_jobs_by_name(mock_arq, "publish_edition")) == 1
+
+
+@pytest.mark.asyncio
+async def test_rollback_different_build_advances_project_clock(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A rollback that moves ``__main`` still advances the project clock.
+
+    The no-op short-circuit keys on ``current_build_id``, so a second
+    rollback naming a *different* build is a real repoint and has to
+    stay a change signal.
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    first = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[0][1])},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert first.status_code == 200
+
+    async with db_session.begin():
+        before = await _read_project_date_updated(db_session)
+
+    second = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[1][1])},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert second.status_code == 200
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session)
+    assert after > before

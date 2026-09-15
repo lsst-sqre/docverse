@@ -24,6 +24,7 @@ from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.build import Build
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.services.edition_tracking import (
@@ -35,7 +36,6 @@ from docverse_server.services.lock_service import (
     LockKey,
     LockService,
 )
-from docverse_server.services.project import DEFAULT_EDITION_SLUG
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
