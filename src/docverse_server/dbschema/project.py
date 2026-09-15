@@ -127,12 +127,17 @@ class SqlProject(Base):
             "(github_owner IS NULL) = (github_repo IS NULL)",
             name="ck_projects_github_owner_repo_both_or_neither",
         ),
-        Index("idx_projects_org_id", "org_id"),
         # Serves ``order=date_updated`` and the ``updated_since`` filter
         # on the project listing: ``org_id`` is the equality prefix,
         # ``date_updated`` the range key, and ``id`` the keyset cursor's
         # tiebreak, so a poll on one org is an index range scan rather
         # than a sort over the org's whole project set.
+        #
+        # It is also the only index an ``org_id``-only lookup needs:
+        # ``org_id`` leads it, so PostgreSQL scans this index for those
+        # too. A separate single-column ``org_id`` index would be pure
+        # write amplification now that ``date_updated`` is indexed —
+        # every clock stamp already has to touch this one.
         Index(
             "idx_projects_org_date_updated",
             "org_id",
