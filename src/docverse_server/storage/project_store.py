@@ -12,15 +12,23 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import REAL, ColumnElement, Row, cast, select, update
+from sqlalchemy import (
+    REAL,
+    ColumnElement,
+    Numeric,
+    Row,
+    cast,
+    extract,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
 from docverse.models import ProjectCreate, ProjectUpdate
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
-from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.project import Project
+from docverse_server.domain.project import Project, ProjectListingWatermark
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
 )
@@ -31,6 +39,13 @@ from docverse_server.storage.pagination import ProjectSearchCursor
 
 _TRGM_SIMILARITY_THRESHOLD = 0.1
 """Minimum trigram similarity score for fuzzy search results."""
+
+_MICROSECONDS_PER_SECOND = 1_000_000
+"""Scale factor turning ``extract(epoch ...)`` seconds into microseconds.
+
+``timestamptz`` stores microseconds, so this is the largest factor that
+still renders every stored clock as an exact integer.
+"""
 
 
 class ProjectStore:
@@ -311,59 +326,77 @@ class ProjectStore:
             self._session, stmt, cursor=cursor, limit=limit
         )
 
-    async def get_org_watermark(self, org_id: int) -> datetime:
-        """Return the newest ``date_updated`` among an org's projects.
+    async def get_org_watermark(
+        self, org_id: int, *, empty_fallback: datetime
+    ) -> ProjectListingWatermark:
+        """Return the conditional-GET aggregate over an org's projects.
 
-        This is the ``Last-Modified`` value — and the moving part of
-        the ``ETag`` — for ``GET /orgs/{org}/projects``. Soft-deleted
-        projects count: a delete is the one mutation whose row leaves
-        the default listing, so a watermark that skipped deleted rows
-        would stand still through exactly the change a poller most
+        This is what backs ``Last-Modified`` and the moving part of the
+        ``ETag`` for ``GET /orgs/{org}/projects``. Soft-deleted projects
+        count in every aggregate: a delete is the one mutation whose row
+        leaves the default listing, so a watermark that skipped deleted
+        rows would stand still through exactly the change a poller most
         needs to notice.
 
-        An org with no projects falls back to its own
-        ``date_created``. The alternative — a sentinel, or ``None`` for
-        the handler to paper over — would make every empty org share
-        one validator, so a caller could not tell "still empty" from
-        "empty, but a different org".
+        Three aggregates rather than one maximum, because the maximum is
+        not monotonic. Every mutation stamps ``date_updated`` with
+        ``now()``, which in PostgreSQL is the *transaction start* time,
+        and commit order is not start order: a writer that began before
+        a poller's read but committed after it lands a clock below the
+        maximum the poller stored. ``project_count`` catches a row that
+        appeared or disappeared and ``clock_sum`` catches a clock that
+        moved anywhere at all, so the trio changes on every insert,
+        update, and soft delete regardless of commit order. See
+        :class:`~docverse_server.domain.project.ProjectListingWatermark`.
 
-        Any project mutation stamps that row's ``date_updated`` with
-        the transaction clock, which is later than every clock already
-        stored, so the maximum moves on every insert, update, and soft
-        delete. That is what lets one aggregate stand in for the whole
-        listing without a row count alongside it.
+        The statement is one aggregate over ``projects`` with no join,
+        so PostgreSQL can answer it from the
+        ``idx_projects_org_date_updated`` index alone. The empty-org
+        fallback is supplied by the caller rather than read from
+        ``organizations`` here precisely to keep that join out.
 
         Parameters
         ----------
         org_id
             Internal id of the organization.
+        empty_fallback
+            Watermark to report when the org owns no projects —
+            the org's own ``date_created``, which the caller has
+            already loaded. A shared sentinel would make every empty
+            org answer with one validator, so a caller could not tell
+            "still empty" from "empty, but a different org".
 
         Returns
         -------
-        datetime
-            Timezone-aware instant, at full stored precision.
-
-        Raises
-        ------
-        NoResultFound
-            If ``org_id`` names no organization. Callers reach this
-            with an org they already resolved, so a miss is a bug
-            rather than a 404 to render.
+        ProjectListingWatermark
+            The newest clock at full stored precision, the row count,
+            and the sum of every row's clock in microseconds.
         """
-        stmt = (
-            select(
-                func.coalesce(
-                    func.max(SqlProject.date_updated),
-                    SqlOrganization.date_created,
-                )
-            )
-            .select_from(SqlOrganization)
-            .outerjoin(SqlProject, SqlProject.org_id == SqlOrganization.id)
-            .where(SqlOrganization.id == org_id)
-            .group_by(SqlOrganization.id, SqlOrganization.date_created)
+        stmt = select(
+            func.max(SqlProject.date_updated),
+            func.count(),
+            func.coalesce(
+                func.sum(
+                    # Cast per row so the sum is exact NUMERIC
+                    # arithmetic: a float sum of present-day
+                    # microsecond counts loses the low digits that are
+                    # the whole point, and a bigint sum overflows after
+                    # a few thousand rows.
+                    cast(
+                        extract("epoch", SqlProject.date_updated)
+                        * _MICROSECONDS_PER_SECOND,
+                        Numeric(),
+                    )
+                ),
+                0,
+            ),
+        ).where(SqlProject.org_id == org_id)
+        newest, count, clock_sum = (await self._session.execute(stmt)).one()
+        return ProjectListingWatermark(
+            date_updated=newest if newest is not None else empty_fallback,
+            project_count=count,
+            clock_sum=int(clock_sum),
         )
-        result = await self._session.execute(stmt)
-        return result.scalar_one()
 
     async def search_by_org(
         self,

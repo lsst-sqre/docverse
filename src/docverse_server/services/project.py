@@ -16,7 +16,7 @@ from docverse.models import (
 )
 from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.organization import Organization
-from docverse_server.domain.project import Project
+from docverse_server.domain.project import Project, ProjectListingWatermark
 from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import TombstoneReason
@@ -244,15 +244,20 @@ class ProjectService:
         )
         return org, result
 
-    async def get_org_watermark(self, org_id: int) -> datetime:
+    async def get_org_watermark(
+        self, org: Organization
+    ) -> ProjectListingWatermark:
         """Return the conditional-GET watermark for an org's listing.
 
-        The newest ``date_updated`` among the org's projects, deleted
-        rows included, falling back to the org's own ``date_created``
-        when it owns none. See
+        Takes the resolved organization rather than its id so the
+        store's aggregate can stay a single joinless statement over
+        ``projects``: the empty-org fallback is ``org.date_created``,
+        which the caller already holds. See
         :meth:`~docverse_server.storage.project_store.ProjectStore.get_org_watermark`.
         """
-        return await self._store.get_org_watermark(org_id)
+        return await self._store.get_org_watermark(
+            org.id, empty_fallback=org.date_created
+        )
 
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate

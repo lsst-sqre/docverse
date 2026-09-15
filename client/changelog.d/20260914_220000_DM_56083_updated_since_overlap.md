@@ -1,0 +1,3 @@
+### Other changes
+
+- `DocverseClient.list_projects` now backdates `updated_since` by an overlap window before sending it, 60 seconds by default (`DEFAULT_UPDATED_SINCE_OVERLAP`, overridable per call with the new `updated_since_overlap` keyword; `timedelta(0)` restores the old behaviour). A project's `date_updated` is stamped with PostgreSQL's transaction *start* clock and commit order is not start order, so a slow write can become visible after a poll that has already passed its timestamp; asking from slightly earlier is what keeps that row from being skipped forever. The consequence is that a filtered pass re-sends rows, so treat the listing as a set of upserts keyed on each project's `id` rather than as a stream of distinct changes.

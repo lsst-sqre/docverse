@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -13,7 +13,7 @@ import pytest
 import respx
 from pydantic import ValidationError
 
-from docverse._client import DocverseClient
+from docverse._client import DEFAULT_UPDATED_SINCE_OVERLAP, DocverseClient
 from docverse._exceptions import BuildProcessingError, DocverseClientError
 from docverse.models import (
     KeeperSyncConfigUpdate,
@@ -500,7 +500,9 @@ async def test_list_projects_forwards_query_parameters() -> None:
     """The poll knobs reach the server as query parameters.
 
     ``updated_since`` goes out as an ISO 8601 timestamp carrying its
-    offset, because the server rejects a naive one with a 422.
+    offset, because the server rejects a naive one with a 422. The
+    overlap is switched off here so the timestamp on the wire is the
+    one the caller passed; the default backdating has its own test.
     """
     async with respx.mock(base_url=BASE_URL) as router:
         route = router.get("/orgs/myorg/projects").mock(
@@ -510,6 +512,7 @@ async def test_list_projects_forwards_query_parameters() -> None:
             await client.list_projects(
                 "myorg",
                 updated_since=datetime(2026, 2, 1, 12, 30, tzinfo=UTC),
+                updated_since_overlap=timedelta(0),
                 include_deleted=True,
                 order="date_updated",
             )
@@ -518,6 +521,35 @@ async def test_list_projects_forwards_query_parameters() -> None:
     assert params["updated_since"] == "2026-02-01T12:30:00+00:00"
     assert params["include_deleted"] == "true"
     assert params["order"] == "date_updated"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_backdates_updated_since_by_the_overlap() -> None:
+    """``updated_since`` goes out backdated by the overlap window.
+
+    A project's ``date_updated`` is PostgreSQL's transaction *start*
+    clock, and commit order is not start order, so a write that began
+    before the caller's last poll can become visible after it, wearing
+    a timestamp the caller has already passed. Asking from slightly
+    earlier than the caller believes it needs is what keeps that row
+    from being skipped forever.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.get("/orgs/myorg/projects").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            await client.list_projects(
+                "myorg",
+                updated_since=datetime(2026, 2, 1, 12, 30, tzinfo=UTC),
+            )
+
+    params = route.calls[0].request.url.params
+    expected = datetime(2026, 2, 1, 12, 30, tzinfo=UTC) - (
+        DEFAULT_UPDATED_SINCE_OVERLAP
+    )
+    assert params["updated_since"] == expected.isoformat()
+    assert timedelta(seconds=60) == DEFAULT_UPDATED_SINCE_OVERLAP
 
 
 @pytest.mark.asyncio

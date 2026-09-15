@@ -337,7 +337,11 @@ and then names whatever else distinguishes the representation:
   canonicalized by sorting. Every page and every filter combination
   therefore gets its own tag without the endpoint having to enumerate
   its own parameters — a parameter added later is covered the day it is
-  added.
+  added. It also hashes all three parts of the org's listing watermark
+  — the newest `date_updated`, the project count, and the sum of every
+  project's clock — rather than the newest clock alone, for the
+  commit-order reason spelled out under [Commit-order skew and the
+  overlap window](#commit-order-skew-and-the-overlap-window).
 - The **single project** hashes its parsed `include_deleted` flag, the
   only parameter it takes. Hashing the *parsed* boolean means
   `?include_deleted=false` and the omitted default — the same
@@ -445,3 +449,37 @@ finding nothing new costs one watermark query and no body at all. The
 `docverse` client library packages the whole idiom as
 `DocverseClient.list_projects`, which follows the `Link` chain and
 carries the validators back for the next poll.
+
+### Commit-order skew and the overlap window
+
+`date_updated` is stamped with PostgreSQL's `now()`, which is the
+**transaction's start time**, not its commit time — and commit order is
+not start order. A write that began before a poller's pass can
+therefore become visible *after* that pass while wearing a timestamp
+the pass has already gone by. Two consequences, and Docverse handles
+them on opposite sides of the wire.
+
+**On the server**, the listing's ETag does not rest on
+`max(date_updated)` alone. A late commit below the maximum leaves the
+maximum where it was, so a tag built from it would keep answering 304
+about a change the poller has never seen. The validator therefore also
+covers the org's project count and the sum of every project's
+`date_updated`: a row that appears or disappears moves the count, and a
+clock that moves anywhere at all — above or below the maximum — moves
+the sum. All three are one joinless aggregate over the
+`(org_id, date_updated, id)` index, so the cheap path stays cheap.
+`Last-Modified` still carries the maximum, because that header has to
+name an instant; the ETag is opaque and can say more, which is why
+`If-None-Match` is the validator to poll with.
+
+**On the client**, `updated_since` needs an **overlap window**: ask
+from slightly earlier than the newest timestamp of the previous pass,
+so a write that took a while to commit still falls inside the filter.
+`DocverseClient.list_projects` backdates the caller's `updated_since`
+by 60 seconds by default (`DEFAULT_UPDATED_SINCE_OVERLAP`, overridable
+per call via `updated_since_overlap`; `timedelta(0)` disables it). A
+direct HTTP caller should subtract a comparable window itself. The
+price is that a filtered pass **re-sends rows** the previous pass
+already delivered — the inclusive bound re-sends the boundary row
+besides — so treat the listing as a set of upserts keyed on each
+project's `id` rather than as a stream of distinct changes.

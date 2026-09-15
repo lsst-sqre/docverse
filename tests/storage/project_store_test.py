@@ -37,6 +37,7 @@ from docverse_server.storage.pagination import (
     ProjectSlugCursor,
 )
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import record_statements
 
 
 @pytest.fixture
@@ -1719,9 +1720,11 @@ async def test_get_org_watermark_includes_deleted_projects(
     db_session.expire_all()
 
     async with db_session.begin():
-        watermark = await store.get_org_watermark(org_id)
+        watermark = await store.get_org_watermark(
+            org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
+        )
 
-    assert watermark == newest
+    assert watermark.date_updated == newest
 
 
 @pytest.mark.asyncio
@@ -1746,6 +1749,105 @@ async def test_get_org_watermark_falls_back_to_org_date_created(
         await db_session.commit()
 
     async with db_session.begin():
-        watermark = await store.get_org_watermark(org.id)
+        watermark = await store.get_org_watermark(
+            org.id, empty_fallback=org.date_created
+        )
 
-    assert watermark == org.date_created
+    assert watermark.date_updated == org.date_created
+    assert watermark.project_count == 0
+    assert watermark.clock_sum == 0
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_notices_a_clock_below_the_max(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A late commit under the maximum still moves the watermark.
+
+    ``now()`` is PostgreSQL's *transaction start* time, and commit
+    order is not start order, so a slow writer can land a
+    ``date_updated`` below the maximum a poller has already read. The
+    maximum alone would sit still through exactly that change; the
+    aggregate beside it must not.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="skew-org")
+        for slug in ("skew-old", "skew-new"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=f"Skew {slug}"),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "skew-old")
+            .values(date_updated=datetime(2026, 1, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "skew-new")
+            .values(date_updated=datetime(2026, 3, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_org_watermark(
+            org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
+        )
+
+    # The late commit: a clock that moves but stays under the maximum.
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "skew-old")
+            .values(date_updated=datetime(2026, 2, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        after = await store.get_org_watermark(
+            org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
+        )
+
+    assert after.date_updated == before.date_updated
+    assert after != before
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_runs_one_joinless_aggregate(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The watermark costs one aggregate over ``projects`` and no join.
+
+    Conditional GET exists to make a poller's empty pass cheap, so the
+    query on that path has to stay something PostgreSQL can answer from
+    ``idx_projects_org_date_updated`` alone. Joining ``organizations``
+    for the empty-org fallback would defeat that scan, which is why the
+    fallback is a parameter instead.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="joinless-org")
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(slug="joinless-one", title="Joinless"),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            await store.get_org_watermark(
+                org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
+            )
+
+    assert len(statements) == 1
+    assert "JOIN" not in statements[0].upper()
+    assert statements[0].upper().count("SELECT") == 1

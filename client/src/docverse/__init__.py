@@ -2,11 +2,12 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._client import DocverseClient, ProjectList
+from ._client import DEFAULT_UPDATED_SINCE_OVERLAP, DocverseClient, ProjectList
 from ._exceptions import BuildProcessingError, DocverseClientError
 from ._tar import create_tarball
 
 __all__ = [
+    "DEFAULT_UPDATED_SINCE_OVERLAP",
     "BuildProcessingError",
     "DocverseClient",
     "DocverseClientError",

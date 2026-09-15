@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,13 +29,29 @@ from .models import (
 from .models.builds import BuildAnnotations
 from .models.queue_enums import JobStatus
 
-__all__ = ["DocverseClient", "ProjectList"]
+__all__ = [
+    "DEFAULT_UPDATED_SINCE_OVERLAP",
+    "DocverseClient",
+    "ProjectList",
+]
 
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 15.0
 _BACKOFF_FACTOR = 2.0
 _VERBOSE_BODY_MAX = 2000
 _TOKEN_SUFFIX_LEN = 4
+
+DEFAULT_UPDATED_SINCE_OVERLAP = timedelta(seconds=60)
+"""How far `DocverseClient.list_projects` backdates ``updated_since``.
+
+A project's ``date_updated`` is stamped with PostgreSQL's transaction
+*start* clock, and commit order is not start order, so a write that
+began before a poll can become visible after it while wearing a
+timestamp that poll has already passed. Asking from a minute earlier
+than the caller believes it needs covers a write that took up to that
+long to commit; the price is re-receiving the rows in the window, which
+a caller keyed on a project's ``id`` simply overwrites.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +61,13 @@ class ProjectList:
     Returned by `DocverseClient.list_projects`, which walks every page
     before handing this back, so ``projects`` is the whole listing and
     not one page of it.
+
+    A pass filtered by ``updated_since`` re-sends rows the previous
+    pass already delivered: the request is backdated by
+    `DEFAULT_UPDATED_SINCE_OVERLAP` so a slow commit cannot slip
+    between two polls, and the inclusive bound re-sends the boundary
+    row besides. Treat the listing as a set of upserts keyed on each
+    project's ``id`` rather than as a stream of distinct changes.
     """
 
     projects: list[Project] = field(default_factory=list)
@@ -201,6 +224,7 @@ class DocverseClient:
         org: str,
         *,
         updated_since: datetime | None = None,
+        updated_since_overlap: timedelta = DEFAULT_UPDATED_SINCE_OVERLAP,
         include_deleted: bool = False,
         order: str = "slug",
         if_none_match: str | None = None,
@@ -211,14 +235,31 @@ class DocverseClient:
         Walks the listing's ``Link rel="next"`` chain to the last page,
         so the result holds the whole listing rather than one page.
 
+        A pass filtered by ``updated_since`` **re-sends rows**: the
+        bound is backdated by ``updated_since_overlap`` and is
+        inclusive besides, so a caller must be prepared to see a
+        project it has already processed. Deduplicate on the project's
+        ``id``, which is stable across a slug rename.
+
         Parameters
         ----------
         org
             Organization slug.
         updated_since
             Only return projects whose ``date_updated`` is at or after
-            this instant. Must be timezone-aware; the server rejects a
-            naive timestamp with a 422.
+            this instant, less ``updated_since_overlap``. Must be
+            timezone-aware; the server rejects a naive timestamp with a
+            422.
+        updated_since_overlap
+            How far to backdate ``updated_since`` before sending it.
+            A project's clock is PostgreSQL's transaction *start* time
+            and commit order is not start order, so a write that began
+            before the caller's last pass can become visible after it
+            while wearing a timestamp that pass has already gone by;
+            the overlap is the window of slow commits that covers.
+            Defaults to `DEFAULT_UPDATED_SINCE_OVERLAP`. Pass
+            ``timedelta(0)`` to send the caller's instant unmodified,
+            accepting that a concurrent write can be missed.
         include_deleted
             Also return soft-deleted projects, each with its
             ``date_deleted`` set.
@@ -243,7 +284,9 @@ class DocverseClient:
             "include_deleted": include_deleted,
         }
         if updated_since is not None:
-            params["updated_since"] = updated_since.isoformat()
+            params["updated_since"] = (
+                updated_since - updated_since_overlap
+            ).isoformat()
         headers: dict[str, str] = {}
         if if_none_match is not None:
             headers["If-None-Match"] = if_none_match

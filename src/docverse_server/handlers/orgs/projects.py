@@ -23,6 +23,7 @@ from docverse_server.domain.conditional_get import (
     datetime_to_microseconds,
     make_weak_etag,
 )
+from docverse_server.domain.project import ProjectListingWatermark
 from docverse_server.handlers.conditional import evaluate_conditional_get
 from docverse_server.handlers.params import OrgSlugParam, ProjectSlugParam
 from docverse_server.metrics import (
@@ -50,29 +51,35 @@ router = APIRouter()
 
 
 def _listing_etag(
-    context: RequestContext, *, org_public_id: int, watermark: datetime
+    context: RequestContext,
+    *,
+    org_public_id: int,
+    watermark: ProjectListingWatermark,
 ) -> str:
     """Build the entity-tag for one page of the project listing.
 
     The material is the endpoint's identity, the org's public id, the
-    watermark, and the request's whole query string canonicalized by
-    sorting — which is what keeps every page and every filter
-    combination on its own tag without this function having to know
-    which parameters the listing supports. A parameter added later is
-    covered the day it is added.
+    whole listing watermark, and the request's query string
+    canonicalized by sorting — which is what keeps every page and every
+    filter combination on its own tag without this function having to
+    know which parameters the listing supports. A parameter added later
+    is covered the day it is added.
 
-    The watermark alone stands in for the rows: every project mutation
-    stamps that row with the transaction clock, which is later than
-    any clock already stored, so an insert, an update, or a soft delete
-    all move the maximum. A row count alongside it would discriminate
-    nothing further and would cost a query on the very path conditional
-    GET exists to make cheap.
+    All three parts of the watermark go in, not just its newest clock.
+    A ``date_updated`` is PostgreSQL's transaction *start* time and
+    commit order is not start order, so a slow writer can land a clock
+    below the maximum a poller already holds; the row count and the sum
+    of every row's clock move when that happens and the maximum does
+    not. ``Last-Modified`` can still only carry the maximum — it has to
+    name an instant — but the tag is opaque, so it says more.
     """
     return make_weak_etag(
         (
             ConditionalGetEndpoint.projects_list.value,
             org_public_id,
-            datetime_to_microseconds(watermark),
+            datetime_to_microseconds(watermark.date_updated),
+            watermark.project_count,
+            watermark.clock_sum,
             urlencode(sorted(context.request.query_params.multi_items())),
         )
     )
@@ -166,7 +173,7 @@ async def get_projects(
         # Evaluate the caller's preconditions before the listing query:
         # a poller that is up to date should pay for the watermark
         # aggregate and nothing else.
-        watermark = await service.get_org_watermark(user.org.id)
+        watermark = await service.get_org_watermark(user.org)
         not_modified = await evaluate_conditional_get(
             context,
             endpoint=ConditionalGetEndpoint.projects_list,
@@ -176,7 +183,7 @@ async def get_projects(
                 org_public_id=user.org.public_id,
                 watermark=watermark,
             ),
-            last_modified=watermark,
+            last_modified=watermark.date_updated,
         )
         if not_modified is not None:
             return not_modified

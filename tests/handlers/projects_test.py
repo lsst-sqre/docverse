@@ -2146,6 +2146,40 @@ async def test_list_projects_etag_changes_after_a_project_changes(
 
 
 @pytest.mark.asyncio
+async def test_list_projects_etag_changes_after_a_clock_below_the_max(
+    client: AsyncClient,
+) -> None:
+    """A late commit under the maximum retires the caller's tag.
+
+    ``date_updated`` is stamped with the transaction's *start* clock
+    and commit order is not start order, so a slow writer can land a
+    clock below the maximum a poller already holds. ``Last-Modified``
+    cannot move — it names that maximum — but the tag has to, or the
+    poller keeps being told 304 about a change it has never seen.
+    """
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert first.status_code == 200
+
+    # tick-old moves within January, staying under tick-new's March.
+    await _stamp_date_updated(("tick-old", datetime(2026, 1, 15, tzinfo=UTC)))
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
+
+
+@pytest.mark.asyncio
 async def test_list_projects_if_modified_since_alone_is_304(
     client: AsyncClient,
 ) -> None:
