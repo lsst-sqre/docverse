@@ -519,9 +519,6 @@ class EditionStore:
             ):
                 return None
 
-        row.current_build_id = build_id
-        await self._session.flush()
-
         # The project's clock follows its default edition's content
         # (PRD #634). This is the only place ``current_build_id``
         # changes, and we are past both guards, so a repoint of
@@ -534,15 +531,27 @@ class EditionStore:
         # matching the ORM ``onupdate`` that metadata edits use, so a
         # publish and a PATCH in the same transaction agree.
         #
-        # Lock ordering note: this takes the project row after the
-        # edition row, the reverse of the project soft-delete cascade
-        # (project, then its editions, then its builds). A DELETE of a
-        # project racing a publish to its own ``__main`` can therefore
-        # deadlock, and PostgreSQL will abort one side. Both sides are
-        # retryable and the window is one statement wide, which is
-        # cheaper than the alternative: locking the project up front
-        # would serialize concurrent repoints of *different* editions
-        # of the same project, which keeper-sync does constantly.
+        # Lock ordering note: this runs *before* the edition-row write
+        # below, so a ``__main`` repoint takes the project row first and
+        # the edition row second — the order ``ProjectStore.soft_delete``
+        # already uses as it cascades project, then editions, then
+        # builds. With the two writes the other way round, a DELETE of a
+        # project and a publish to that project's own ``__main`` each
+        # held the row the other needed next, and nothing here recovers
+        # from the abort PostgreSQL picks: ``keeper_sync_project`` runs
+        # with ``max_tries=1`` and charges the failed edition to its
+        # systemic-abort breaker, while ``delete_project`` and the
+        # rollback handler simply 500. Only ``__main`` repoints take the
+        # project lock at all, so concurrent repoints of *different*
+        # editions of the same project — which keeper-sync does
+        # constantly — still never serialize on it.
+        #
+        # One edge of that cycle is left over: the deleted-build guard
+        # above holds ``FOR SHARE`` on the target build across this
+        # wait, and the cascade's closing ``UPDATE builds`` wants the
+        # same row exclusively. Closing it would mean locking the
+        # project before the guards run, i.e. on repoints the guards go
+        # on to refuse, and that trade is not made here.
         if row.slug.lower() == DEFAULT_EDITION_SLUG:
             await self._session.execute(
                 update(SqlProject)
@@ -550,6 +559,9 @@ class EditionStore:
                 .values(date_updated=func.now())
                 .execution_options(synchronize_session=False)
             )
+
+        row.current_build_id = build_id
+        await self._session.flush()
 
         await self._session.refresh(row)
         # Re-query to get current_build_public_id + git_ref

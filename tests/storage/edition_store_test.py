@@ -40,6 +40,7 @@ from docverse_server.storage.keeper_sync import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import EditionSlugCursor
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import record_statements
 
 _HASH = "sha256:" + "a" * 64
 
@@ -1060,6 +1061,63 @@ async def test_set_current_build_leaves_project_when_guard_skips(
     async with db_session.begin():
         after = await _read_project_date_updated(db_session, project_id)
     assert after == before
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_locks_project_before_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The ``__main`` repoint takes the project row before the edition.
+
+    ``ProjectStore.soft_delete`` stamps ``projects.date_deleted`` and
+    only then cascades into ``editions``, so a publish that locked the
+    edition first and the project second would be holding exactly the
+    lock the DELETE wants next while waiting for the one it already
+    holds. Nothing in the tree retries a deadlock, so the orders have to
+    agree: project first, edition second.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:8888" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            updated = await edition_store.set_current_build(
+                edition_id=edition.id, build_id=build.id
+            )
+        await db_session.commit()
+    assert updated is not None
+
+    writes = [s.upper() for s in statements if s.upper().startswith("UPDATE ")]
+    project_writes = [
+        i for i, s in enumerate(writes) if s.startswith("UPDATE PROJECTS")
+    ]
+    edition_writes = [
+        i for i, s in enumerate(writes) if s.startswith("UPDATE EDITIONS")
+    ]
+    assert project_writes, f"no UPDATE projects in {writes}"
+    assert edition_writes, f"no UPDATE editions in {writes}"
+    assert max(project_writes) < min(edition_writes)
 
 
 @pytest.mark.asyncio
