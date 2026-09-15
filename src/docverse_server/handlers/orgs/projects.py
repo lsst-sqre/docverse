@@ -347,12 +347,17 @@ async def get_project(
             include_deleted=include_deleted,
         )
         default_edition = await service.get_default_edition(project.id)
-        # The response embeds the default edition, so the project row's
-        # own clock is only half the watermark: an edition retitled or
-        # repointed changes this representation without necessarily
-        # touching the project. Taking the later of the two keeps the
-        # validator honest about everything the body actually carries.
-        watermark = project.date_updated
+        # Three rows feed this representation, so three clocks feed the
+        # validator and the watermark is the latest of them. The project
+        # row is the obvious one. The default edition is embedded whole,
+        # so an edition retitled or repointed rewrites the body without
+        # necessarily touching the project. And the org supplies
+        # ``base_domain``, ``url_scheme``, and ``root_path_prefix``, the
+        # three fields the embedded edition's ``published_url`` is built
+        # from — all patchable through ``PATCH /orgs/{org}``, which
+        # writes the org row and nothing else. Drop any one clock and a
+        # poller is told 304 about a body that has already changed.
+        watermark = max(project.date_updated, org.date_updated)
         if default_edition is not None:
             watermark = max(watermark, default_edition.date_updated)
         not_modified = await evaluate_conditional_get(

@@ -23,6 +23,7 @@ from docverse_server.domain.base32id import (
     serialize_base32_id,
     validate_base32_id,
 )
+from docverse_server.domain.conditional_get import parse_http_date
 from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
@@ -1734,6 +1735,20 @@ async def _stamp_date_updated(*stamps: tuple[str, datetime]) -> None:
         break
 
 
+async def _stamp_org_date_updated(slug: str, stamp: datetime) -> None:
+    """Pin an organization's ``date_updated`` to a fixed instant."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlOrganization)
+                .where(SqlOrganization.slug == slug)
+                .values(date_updated=stamp)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+        break
+
+
 async def _resolve_github_binding(
     *, slug: str, owner: str, repo: str, installation_id: int
 ) -> None:
@@ -2414,6 +2429,77 @@ async def test_get_project_etag_changes_after_default_edition_patch(
     assert second.headers["ETag"] != first.headers["ETag"]
     # The project row itself did not move; the edition's clock did.
     assert second.json()["date_updated"] == project_clock
+
+
+@pytest.mark.asyncio
+async def test_get_project_etag_changes_after_org_patch(
+    client: AsyncClient,
+) -> None:
+    """The org's URL settings are part of what the tag covers.
+
+    ``default_edition.published_url`` is derived from the org's
+    ``base_domain``, ``url_scheme``, and ``root_path_prefix``, none of
+    which touch the project or edition rows. Without the org's clock in
+    the watermark a ``PATCH /orgs/{org}`` rewrites the body while the
+    validators stand still, and a poller is told 304 about a URL it has
+    never seen.
+    """
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+    assert (
+        first.json()["default_edition"]["published_url"]
+        == "https://solo.proj-org.example.com/"
+    )
+
+    patched = await client.patch(
+        "/docverse/orgs/proj-org",
+        json={"base_domain": "docs.example.net"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+    assert (
+        second.json()["default_edition"]["published_url"]
+        == "https://solo.docs.example.net/"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_project_last_modified_covers_org_clock(
+    client: AsyncClient,
+) -> None:
+    """``Last-Modified`` never trails the org row the body draws on.
+
+    The tag alone is not enough: a poller may hold only a date, and an
+    ``If-Modified-Since`` is compared against whatever instant the
+    server named. Naming the project's clock while the org's is newer
+    stalls that poller on a date the body has already outrun.
+    """
+    await _setup(client)
+    await _seed_one_project(client)
+    org_clock = datetime(2027, 3, 4, 5, 6, 7, tzinfo=UTC)
+    await _stamp_org_date_updated("proj-org", org_clock)
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert parse_http_date(response.headers["Last-Modified"]) == org_clock
 
 
 @pytest.mark.asyncio

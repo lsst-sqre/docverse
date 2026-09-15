@@ -317,7 +317,7 @@ and folds into its `ETag`:
 | Endpoint | Metrics `endpoint` value | Watermark |
 | --- | --- | --- |
 | `GET /orgs/{org}/projects` | `projects_list` | newest `date_updated` among the organization's projects, soft-deleted ones **included**, falling back to the organization's own `date_created` when it has none |
-| `GET /orgs/{org}/projects/{project}` | `project` | the later of the project's `date_updated` and its default `__main` edition's, because the response embeds that edition |
+| `GET /orgs/{org}/projects/{project}` | `project` | the newest of three clocks — the project's `date_updated`, its default `__main` edition's (the response embeds that edition), and the organization's (the embedded edition's `published_url` is derived from the org's `base_domain`, `url_scheme`, and `root_path_prefix`) |
 | `GET /orgs/{org}` | `organization` | the organization's own `date_updated` |
 
 `GET /orgs` is **deliberately excluded.** It is filtered by the caller's
@@ -371,7 +371,8 @@ never runs its page query at all, and `GET /orgs/{org}` never loads its
 embedded service summaries. The single project is the exception — it
 has to read the project row and its default edition to know its own
 watermark — so there the saving is the serialized body rather than the
-queries behind it.
+queries behind it. Its third clock is free: authorization has already
+resolved the organization by the time the handler runs.
 
 The semantics live in `src/docverse_server/domain/conditional_get.py`
 as pure functions over plain values (no request object, no database);
