@@ -164,7 +164,10 @@ class EditionService:
         the edition at the target build (even one not in history), record
         a new history entry, mark the edition ``publish_status=pending``,
         and enqueue a ``publish_edition`` job. Unlike rollback, this path
-        bypasses the history-membership guard.
+        bypasses the history-membership guard. Naming the build the
+        edition already serves does none of those things and leaves the
+        edition alone; see :meth:`_is_noop_repoint`. A metadata field in
+        the same payload is applied either way.
 
         The override runs *before* the metadata write, which is a lock
         ordering requirement rather than a preference: it is the arm of
@@ -219,6 +222,51 @@ class EditionService:
         )
         return org, project, edition
 
+    def _is_noop_repoint(
+        self, *, edition: Edition, build_id: int, build_public_id: str
+    ) -> bool:
+        """Report whether a repoint would leave the edition where it is.
+
+        The two operator-driven repoints — the ``build`` override on
+        ``PATCH .../editions/{slug}`` and :meth:`rollback` — both waive
+        the stale-build guard, because both mean "serve this build
+        regardless of what is newer". That waiver also takes away the
+        one thing that used to stop a repoint onto the edition's
+        *current* build: ``date_created >= date_created`` holds of a
+        build compared with itself, so the guard refused it and
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
+        returned ``None`` having written nothing.
+
+        Since PRD #634 a ``__main`` repoint that passes the guards
+        stamps ``projects.date_updated``, so the waiver is no longer
+        free: naming the build the edition already serves would retire
+        every cached ``ETag`` on the project and re-emit a
+        byte-identical row into every consumer's ``updated_since``
+        window. Both callers therefore ask here first and, on ``True``,
+        skip the repoint along with the history row, the
+        ``publish_status`` flip, and the publish job — all four of which
+        announce a change that is not happening. That is also why the
+        check lives here rather than in the store: only the service can
+        skip those three side effects. (The keeper-sync aggregate path
+        makes the same comparison for its own reasons.)
+
+        The comparison is ``current_build_id``, the binding itself,
+        rather than any timestamp: it is the column the repoint would
+        write, so it answers exactly "would this write change the row?"
+        A merely *equivalent* build — same content hash, different row —
+        is a real repoint and takes the full path, because the edition's
+        binding does move.
+        """
+        if edition.current_build_id != build_id:
+            return False
+        self._logger.info(
+            "Skipped no-op edition repoint",
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            build=build_public_id,
+        )
+        return True
+
     async def _apply_build_override(
         self,
         *,
@@ -228,7 +276,12 @@ class EditionService:
         edition: Edition,
         build_public_id: str,
     ) -> Edition:
-        """Point ``edition`` at an arbitrary build (emergency override)."""
+        """Point ``edition`` at an arbitrary build (emergency override).
+
+        Naming the build the edition already serves is a no-op, not a
+        repoint: it returns the edition untouched. See
+        :meth:`_is_noop_repoint`.
+        """
         public_id = parse_base32_id(build_public_id, resource="build")
 
         build = await self._build_store.get_by_public_id(
@@ -237,6 +290,11 @@ class EditionService:
         if build is None:
             msg = f"Build {build_public_id!r} not found"
             raise NotFoundError(msg)
+
+        if self._is_noop_repoint(
+            edition=edition, build_id=build.id, build_public_id=build_public_id
+        ):
+            return edition
 
         updated_edition = await self._store.set_current_build(
             edition_id=edition.id,
@@ -365,6 +423,13 @@ class EditionService:
     ) -> tuple[Organization, Project, Edition]:
         """Roll back an edition to a previously-recorded build.
 
+        Rolling back to the build the edition already serves returns it
+        unchanged rather than repointing it; see
+        :meth:`_is_noop_repoint`. The membership guard is still checked
+        first, so a build outside this edition's history is a 404 even
+        when it happens to be the one being served — an override can
+        leave the edition on a build rollback was never offered.
+
         Parameters
         ----------
         org_slug
@@ -405,6 +470,11 @@ class EditionService:
         if history_entry is None:
             msg = "Build is not in this edition's history"
             raise NotFoundError(msg)
+
+        if self._is_noop_repoint(
+            edition=edition, build_id=build.id, build_public_id=build_public_id
+        ):
+            return org, project, edition
 
         updated_edition = await self._store.set_current_build(
             edition_id=edition.id,

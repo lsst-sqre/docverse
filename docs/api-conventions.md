@@ -466,6 +466,21 @@ trigger a resolve at all. Without that, a poller would be told to
 refetch bodies it already holds — once per webhook redelivery, and a
 second time seconds after every metadata `PATCH`.
 
+The same rule covers the two repoints an operator drives by hand. A
+`PATCH .../editions/{edition}` carrying a `build`, and a
+`POST .../editions/{edition}/rollback`, both waive the stale-build
+guard — that is what "serve this build regardless of what is newer"
+means — and the waiver is also what stopped refusing a build compared
+against itself. Naming the build the edition already serves is
+therefore answered with a **200 and the unchanged edition** rather than
+a 409: the postcondition already holds, and an operator retrying a
+rollback after a dropped connection should not have to tell a conflict
+from a success. That request is inert in every respect — no history
+entry, no `publish_edition` job, and no movement of the project's
+clock. A rollback to a build outside the edition's history is still a
+404, checked first, because an override can leave an edition on a build
+rollback was never offered.
+
 Pair `updated_since` with `order=date_updated` for the "what changed?"
 traversal, and with the `ETag` above so that a pass finding nothing new
 costs one watermark query and no body at all. The `docverse` client
