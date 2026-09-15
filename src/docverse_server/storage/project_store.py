@@ -326,54 +326,45 @@ class ProjectStore:
             self._session, stmt, cursor=cursor, limit=limit
         )
 
-    async def get_org_watermark(
-        self, org_id: int, *, empty_fallback: datetime
-    ) -> ProjectListingWatermark:
+    async def get_org_watermark(self, org_id: int) -> ProjectListingWatermark:
         """Return the conditional-GET aggregate over an org's projects.
 
-        This is what backs ``Last-Modified`` and the moving part of the
-        ``ETag`` for ``GET /orgs/{org}/projects``. Soft-deleted projects
-        count in every aggregate: a delete is the one mutation whose row
-        leaves the default listing, so a watermark that skipped deleted
-        rows would stand still through exactly the change a poller most
+        This is the moving part of the ``ETag`` for
+        ``GET /orgs/{org}/projects``. Soft-deleted projects count in
+        both aggregates: a delete is the one mutation whose row leaves
+        the default listing, so a watermark that skipped deleted rows
+        would stand still through exactly the change a poller most
         needs to notice.
 
-        Three aggregates rather than one maximum, because the maximum is
+        Two aggregates rather than one maximum, because the maximum is
         not monotonic. Every mutation stamps ``date_updated`` with
         ``now()``, which in PostgreSQL is the *transaction start* time,
         and commit order is not start order: a writer that began before
         a poller's read but committed after it lands a clock below the
         maximum the poller stored. ``project_count`` catches a row that
         appeared or disappeared and ``clock_sum`` catches a clock that
-        moved anywhere at all, so the trio changes on every insert,
+        moved anywhere at all, so the pair changes on every insert,
         update, and soft delete regardless of commit order. See
         :class:`~docverse_server.domain.project.ProjectListingWatermark`.
 
         The statement is one aggregate over ``projects`` with no join,
         so PostgreSQL can answer it from the
-        ``idx_projects_org_date_updated`` index alone. The empty-org
-        fallback is supplied by the caller rather than read from
-        ``organizations`` here precisely to keep that join out.
+        ``idx_projects_org_date_updated`` index alone. An org that owns
+        no projects reports ``(0, 0)``; the endpoint's tag also hashes
+        the org's public id, so two empty orgs still validate apart.
 
         Parameters
         ----------
         org_id
             Internal id of the organization.
-        empty_fallback
-            Watermark to report when the org owns no projects —
-            the org's own ``date_created``, which the caller has
-            already loaded. A shared sentinel would make every empty
-            org answer with one validator, so a caller could not tell
-            "still empty" from "empty, but a different org".
 
         Returns
         -------
         ProjectListingWatermark
-            The newest clock at full stored precision, the row count,
-            and the sum of every row's clock in microseconds.
+            The row count and the sum of every row's clock in
+            microseconds.
         """
         stmt = select(
-            func.max(SqlProject.date_updated),
             func.count(),
             func.coalesce(
                 func.sum(
@@ -391,11 +382,9 @@ class ProjectStore:
                 0,
             ),
         ).where(SqlProject.org_id == org_id)
-        newest, count, clock_sum = (await self._session.execute(stmt)).one()
+        count, clock_sum = (await self._session.execute(stmt)).one()
         return ProjectListingWatermark(
-            date_updated=newest if newest is not None else empty_fallback,
-            project_count=count,
-            clock_sum=int(clock_sum),
+            project_count=count, clock_sum=int(clock_sum)
         )
 
     async def search_by_org(
@@ -666,8 +655,8 @@ class ProjectStore:
         clock is a change signal for pollers such as Ook, not a "last
         operator edit" marker, and a rename changes ``source_url`` on
         the wire. Leaving the clock pinned would hide the new URL from
-        the listing's ETag, ``Last-Modified``, and ``updated_since``
-        filter alike. The stamp is explicit rather than left to the
+        the listing's ETag and its ``updated_since`` filter alike. The
+        stamp is explicit rather than left to the
         column's ``onupdate``, matching ``soft_delete`` and
         :meth:`~docverse_server.storage.edition_store.EditionStore
         .set_current_build`. The dashboard binding store's own

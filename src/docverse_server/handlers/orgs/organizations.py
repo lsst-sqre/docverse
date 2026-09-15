@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -129,10 +128,9 @@ def _organization_etag(org: OrganizationDomain) -> str:
     responses={
         status.HTTP_304_NOT_MODIFIED: {
             "description": (
-                "The caller's ``If-None-Match`` or ``If-Modified-Since``"
-                " already matched this organization, so no body is sent."
-                " The ``ETag`` and ``Last-Modified`` validators are"
-                " repeated so a poller can carry them into its next"
+                "The caller's ``If-None-Match`` already matched this"
+                " organization, so no body is sent. The ``ETag`` is"
+                " repeated so a poller can carry it into its next"
                 " request."
             )
         }
@@ -160,8 +158,6 @@ async def get_organization(
             endpoint=ConditionalGetEndpoint.organization,
             organization=org_slug,
             etag=_organization_etag(user.org),
-            last_modified=user.org.date_updated,
-            now=datetime.now(tz=UTC),
         )
         if not_modified is not None:
             return not_modified

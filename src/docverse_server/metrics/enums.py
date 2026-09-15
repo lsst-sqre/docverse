@@ -275,10 +275,13 @@ class ConditionalGetPrecondition(StrEnum):
     """
 
     etag = "etag"
-    """``If-None-Match`` was evaluated."""
+    """``If-None-Match`` was evaluated.
 
-    last_modified = "last_modified"
-    """``If-Modified-Since`` was evaluated."""
+    The only member: ``ETag`` is the sole validator Docverse publishes,
+    so no other header can decide a conditional GET. Kept as an enum
+    rather than collapsed away so a future validator is an added member
+    rather than a changed field type in the Avro schema.
+    """
 
     @classmethod
     def from_domain(cls, kind: PreconditionKind) -> ConditionalGetPrecondition:

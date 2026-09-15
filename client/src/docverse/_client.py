@@ -79,28 +79,13 @@ class ProjectList:
     etag: str | None = None
     """The first page's ``ETag``, or `None` if the server sent none.
 
-    **The validator to poll with.** Pass it back verbatim as
-    ``if_none_match`` on the next call rather than interpreting it: it
-    is opaque, and it is derived from the listing's watermark at full
-    precision, so it notices a change however soon after the last one
-    it landed.
-    """
-
-    last_modified: str | None = None
-    """The first page's ``Last-Modified``, or `None` if none was sent.
-
-    A **fallback** validator, for a caller that has no ``ETag`` to echo
-    — prefer `etag` whenever one is available. The raw HTTP-date
-    string, passed back verbatim as ``if_modified_since`` and left
-    unparsed so a round trip cannot lose the second-granularity
-    truncation the server applied.
-
-    That truncation is the reason it is second best. An HTTP date names
-    a whole second, so a write landing later in the second this value
-    names could not be told apart from the state the caller already
-    holds. The server declines a date-based 304 while that second is
-    still open (:rfc:`7232` §2.2.1), which closes the hole at the cost
-    of one redundant full response per second of write activity.
+    **The validator to poll with**, and the only one Docverse offers:
+    the listing sends no ``Last-Modified`` and ignores an
+    ``If-Modified-Since``. Pass it back verbatim as ``if_none_match``
+    on the next call rather than interpreting it — it is opaque, and it
+    is derived from the listing's watermark at full precision, so it
+    notices a change however soon after the last one it landed and
+    whichever order the two writes committed in.
     """
 
     not_modified: bool = False
@@ -240,7 +225,6 @@ class DocverseClient:
         include_deleted: bool = False,
         order: str = "slug",
         if_none_match: str | None = None,
-        if_modified_since: str | None = None,
     ) -> ProjectList:
         """List every project in an organization, following pagination.
 
@@ -279,20 +263,13 @@ class DocverseClient:
             Sort order: ``slug``, ``date_created``, or ``date_updated``.
         if_none_match
             An ``ETag`` from a previous call, sent as ``If-None-Match``
-            — the validator to poll with, for the reason given on
-            `ProjectList.etag`.
-        if_modified_since
-            A ``Last-Modified`` value from a previous call, sent as
-            ``If-Modified-Since``. A fallback for a caller that holds
-            no ``ETag``: the server consults it only when
-            ``if_none_match`` is absent, and refuses it while the
-            second it names is still open, so a poll inside that second
-            costs a full response. See `ProjectList.last_modified`.
+            — the only validator Docverse publishes, for the reason
+            given on `ProjectList.etag`.
 
         Returns
         -------
         ProjectList
-            The projects, plus the first page's validators. When the
+            The projects, plus the first page's ``ETag``. When the
             server answers the first page 304, ``not_modified`` is
             `True` and ``projects`` is empty.
         """
@@ -307,23 +284,16 @@ class DocverseClient:
         headers: dict[str, str] = {}
         if if_none_match is not None:
             headers["If-None-Match"] = if_none_match
-        if if_modified_since is not None:
-            headers["If-Modified-Since"] = if_modified_since
 
-        # The preconditions belong to the first request alone: the
+        # The precondition belongs to the first request alone: the
         # server validates the page the caller already holds, and the
         # ``Link`` URLs that follow are pages it has never seen.
         response = await self._client.get(
             f"/orgs/{org}/projects", params=params, headers=headers
         )
         etag = response.headers.get("ETag")
-        last_modified = response.headers.get("Last-Modified")
         if response.status_code == httpx.codes.NOT_MODIFIED:
-            return ProjectList(
-                etag=etag,
-                last_modified=last_modified,
-                not_modified=True,
-            )
+            return ProjectList(etag=etag, not_modified=True)
         _raise_for_status(response)
         projects = [Project.model_validate(item) for item in response.json()]
         next_url = _next_page_url(response)
@@ -334,9 +304,7 @@ class DocverseClient:
                 Project.model_validate(item) for item in response.json()
             )
             next_url = _next_page_url(response)
-        return ProjectList(
-            projects=projects, etag=etag, last_modified=last_modified
-        )
+        return ProjectList(projects=projects, etag=etag)
 
     async def update_member(
         self, org: str, member: str, *, role: OrgRole

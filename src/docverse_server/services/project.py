@@ -249,15 +249,13 @@ class ProjectService:
     ) -> ProjectListingWatermark:
         """Return the conditional-GET watermark for an org's listing.
 
-        Takes the resolved organization rather than its id so the
-        store's aggregate can stay a single joinless statement over
-        ``projects``: the empty-org fallback is ``org.date_created``,
-        which the caller already holds. See
+        Takes the resolved organization rather than its id because the
+        caller — the listing handler — already holds it from
+        authorization, and the store's aggregate stays a single
+        joinless statement over ``projects``. See
         :meth:`~docverse_server.storage.project_store.ProjectStore.get_org_watermark`.
         """
-        return await self._store.get_org_watermark(
-            org.id, empty_fallback=org.date_created
-        )
+        return await self._store.get_org_watermark(org.id)
 
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate

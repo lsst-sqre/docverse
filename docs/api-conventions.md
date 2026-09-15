@@ -305,25 +305,51 @@ organization's team or configuration, not by user-generated content:
 If one of these collections ever grows unbounded, migrate it to the keyset
 pagination pattern above rather than adding offset paging.
 
-## Conditional GET: `ETag` and `Last-Modified` validators
+## Conditional GET: the `ETag` validator
 
-The read endpoints a consumer polls carry HTTP validators
-([RFC 7232](https://www.rfc-editor.org/rfc/rfc7232)), so a pass that
+The read endpoints a consumer polls carry an HTTP validator
+([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110)), so a pass that
 finds nothing new is answered with an empty **`304 Not Modified`**
 rather than a full representation. Three endpoints participate, each
-with its own *watermark* — the instant it reports as `Last-Modified`
-and folds into its `ETag`:
+folding its own *watermark* into an `ETag`:
 
 | Endpoint | Metrics `endpoint` value | Watermark |
 | --- | --- | --- |
-| `GET /orgs/{org}/projects` | `projects_list` | newest `date_updated` among the organization's projects, soft-deleted ones **included**, falling back to the organization's own `date_created` when it has none |
-| `GET /orgs/{org}/projects/{project}` | `project` | the newest of three clocks — the project's `date_updated`, its default `__main` edition's (the response embeds that edition), and the organization's (the embedded edition's `published_url` is derived from the org's `base_domain`, `url_scheme`, and `root_path_prefix`) |
+| `GET /orgs/{org}/projects` | `projects_list` | the organization's project count and the sum of every project's `date_updated`, soft-deleted ones **included** |
+| `GET /orgs/{org}/projects/{project}` | `project` | three clocks, hashed separately — the project's `date_updated`, its default `__main` edition's (the response embeds that edition), and the organization's (the embedded edition's `published_url` is derived from the org's `base_domain`, `url_scheme`, and `root_path_prefix`) |
 | `GET /orgs/{org}` | `organization` | the organization's own `date_updated` |
 
 `GET /orgs` is **deliberately excluded.** It is filtered by the caller's
 memberships, so granting or revoking one changes what it returns
 without moving any organization's clock; a validator there would hand a
 poller a 304 over a listing that had in fact changed.
+
+**`ETag` is the only validator.** No endpoint sends `Last-Modified`,
+and an `If-Modified-Since` on any of them is **ignored** — the request
+is answered in full, exactly as an unconditional one would be. Offering
+only the entity-tag is conformant
+([RFC 9110 §13.1.3](https://www.rfc-editor.org/rfc/rfc9110#section-13.1.3)
+makes the date validator optional), and it is the only sound choice
+here, for two reasons that both come back to `date_updated` being
+PostgreSQL's *transaction start* time:
+
+- **A date has to name one instant**, which forces it to be the maximum
+  of the clocks behind the representation — and that maximum is not
+  monotonic. A writer that started early and waited on a row lock
+  commits a clock *below* a maximum a poller already holds, leaving the
+  maximum where it was. See [Commit-order skew and the overlap
+  window](#commit-order-skew-and-the-overlap-window).
+- **A date carries whole seconds.** `Last-Modified` would be the
+  watermark truncated to the second, so a write landing later in the
+  second a client was told about is indistinguishable by date from the
+  state that client already holds, and stays hidden until some
+  unrelated later-second write moves the clock again. Clock skew
+  between the app pod and Cloud SQL opens the same hole with no lock
+  wait at all.
+
+An opaque tag has neither constraint: it hashes each clock separately
+at full microsecond precision, so any one of them moving — in either
+direction — retires it.
 
 **Weak ETags.** Tags are weak — `W/"<32 hex characters>"`, the leading
 half of a SHA-256 over a canonical tuple of validator material —
@@ -337,66 +363,36 @@ and then names whatever else distinguishes the representation:
   canonicalized by sorting. Every page and every filter combination
   therefore gets its own tag without the endpoint having to enumerate
   its own parameters — a parameter added later is covered the day it is
-  added. It also hashes all three parts of the org's listing watermark
-  — the newest `date_updated`, the project count, and the sum of every
-  project's clock — rather than the newest clock alone, for the
-  commit-order reason spelled out under [Commit-order skew and the
-  overlap window](#commit-order-skew-and-the-overlap-window).
-- The **single project** hashes its parsed `include_deleted` flag, the
-  only parameter it takes. Hashing the *parsed* boolean means
-  `?include_deleted=false` and the omitted default — the same
-  representation — share a tag instead of churning one.
+  added. Beside it go the two parts of the org's listing watermark: a
+  project that appears or disappears moves the count, and a clock that
+  moves anywhere at all moves the sum.
+- The **single project** hashes its three clocks as three separate
+  parts, plus its parsed `include_deleted` flag, the only parameter it
+  takes. Hashing the *parsed* boolean means `?include_deleted=false`
+  and the omitted default — the same representation — share a tag
+  instead of churning one.
 
-**Second granularity.** An HTTP date carries whole seconds, so
-`Last-Modified` is necessarily the watermark truncated to the second,
-and the `If-Modified-Since` comparison truncates the watermark the same
-way before comparing. Comparing against the untruncated instant would
-report "modified" forever, because a client can only ever echo back the
-second it was told.
+**Comparing `If-None-Match`.** `*` matches any current representation,
+and tags are compared weakly, so `W/"x"` and `"x"` are the same tag. A
+comma inside an opaque tag does not split the list.
 
-**The open second.** That truncation has a second consequence, and it
-is why `ETag` is the validator to poll with. A write landing later in
-the same second as the watermark a client was handed is, by date alone,
-indistinguishable from the state that client already holds
-([RFC 7232 §2.2.1](https://www.rfc-editor.org/rfc/rfc7232#section-2.2.1)):
-both truncate to the same second, so the comparison says 304 and the
-change stays hidden until some unrelated later write moves the clock
-again. An `If-Modified-Since` is therefore **refused** while the
-watermark's second is still the server's current one — the request is
-answered in full — and earns a 304 only once that second has closed and
-nothing more can land inside it. The cost is at most one redundant
-response per second of write activity. Entity-tags hash the watermark
-at microsecond precision, so they are not affected and need no such
-guard; the `docverse` client's `ProjectList` gives its callers the same
-advice.
-
-**`If-None-Match` takes precedence.** Per RFC 7232 §6, when
-`If-None-Match` is present it is evaluated and `If-Modified-Since` is
-not consulted at all — *even when the tags do not match*. The date is a
-fallback for a client that holds no tag, never a second opinion. Within
-`If-None-Match`, `*` matches any current representation and tags are
-compared weakly, so `W/"x"` and `"x"` are the same tag. An
-`If-Modified-Since` that cannot be parsed is **ignored** — the request
-is answered as though it were unconditional — rather than rejected.
-
-A 304 carries no body and repeats both validators, so a poller can take
-them straight into its next request. Handlers evaluate the
-preconditions as early as the watermark allows, inside the read
-transaction, so the work the 304 skips is real: the project listing
-never runs its page query at all, and `GET /orgs/{org}` never loads its
-embedded service summaries. The single project is the exception — it
-has to read the project row and its default edition to know its own
-watermark — so there the saving is the serialized body rather than the
-queries behind it. Its third clock is free: authorization has already
-resolved the organization by the time the handler runs.
+A 304 carries no body and repeats the `ETag`, so a poller can take it
+straight into its next request. Handlers evaluate the precondition as
+early as the watermark allows, inside the read transaction, so the work
+the 304 skips is real: the project listing never runs its page query at
+all, and `GET /orgs/{org}` never loads its embedded service summaries.
+The single project is the exception — it has to read the project row
+and its default edition to know its own clocks — so there the saving is
+the serialized body rather than the queries behind it. Its third clock
+is free: authorization has already resolved the organization by the
+time the handler runs.
 
 The semantics live in `src/docverse_server/domain/conditional_get.py`
 as pure functions over plain values (no request object, no database);
 `src/docverse_server/handlers/conditional.py` is the thin glue that
-reads the two request headers, sets `ETag` and `Last-Modified` on the
-outgoing response, and hands back the ready-made 304. A new conditional
-endpoint computes its watermark and calls that helper rather than
-spelling the headers itself.
+reads `If-None-Match`, sets `ETag` on the outgoing response, and hands
+back the ready-made 304. A new conditional endpoint computes its
+watermark and calls that helper rather than spelling the header itself.
 
 **Observability.** Every evaluation is logged at debug level, and a
 `conditional_get` metrics event is published for each request that
@@ -410,8 +406,7 @@ within it is the cache hit rate. Beyond the `organization` and
   not break the Avro contract.
 - `outcome` — `not_modified` (answered 304) or `modified` (sent in
   full).
-- `precondition` — `etag` when `If-None-Match` decided,
-  `last_modified` when the date did.
+- `precondition` — `etag`, the only validator that can decide one.
 
 ## Soft-deleted resources and polling the project listing
 
@@ -461,11 +456,11 @@ repoint the stale-build or deleted-build guard refuses all leave the
 project's clock alone.
 
 Pair `updated_since` with `order=date_updated` for the "what changed?"
-traversal, and with the conditional-GET validators above so that a pass
-finding nothing new costs one watermark query and no body at all. The
-`docverse` client library packages the whole idiom as
-`DocverseClient.list_projects`, which follows the `Link` chain and
-carries the validators back for the next poll.
+traversal, and with the `ETag` above so that a pass finding nothing new
+costs one watermark query and no body at all. The `docverse` client
+library packages the whole idiom as `DocverseClient.list_projects`,
+which follows the `Link` chain and carries the tag back for the next
+poll.
 
 ### Commit-order skew and the overlap window
 
@@ -476,18 +471,17 @@ therefore become visible *after* that pass while wearing a timestamp
 the pass has already gone by. Two consequences, and Docverse handles
 them on opposite sides of the wire.
 
-**On the server**, the listing's ETag does not rest on
-`max(date_updated)` alone. A late commit below the maximum leaves the
-maximum where it was, so a tag built from it would keep answering 304
-about a change the poller has never seen. The validator therefore also
-covers the org's project count and the sum of every project's
-`date_updated`: a row that appears or disappears moves the count, and a
-clock that moves anywhere at all — above or below the maximum — moves
-the sum. All three are one joinless aggregate over the
-`(org_id, date_updated, id)` index, so the cheap path stays cheap.
-`Last-Modified` still carries the maximum, because that header has to
-name an instant; the ETag is opaque and can say more, which is why
-`If-None-Match` is the validator to poll with.
+**On the server**, no validator rests on `max(date_updated)`. A late
+commit below the maximum leaves the maximum where it was, so a
+validator built from it would keep answering 304 about a change the
+poller has never seen. The listing's tag therefore covers the org's
+project count and the sum of every project's `date_updated` instead: a
+row that appears or disappears moves the count, and a clock that moves
+anywhere at all — above or below any maximum — moves the sum. Both are
+one joinless aggregate over the `(org_id, date_updated, id)` index, so
+the cheap path stays cheap. The single project's tag hashes its three
+clocks as three separate parts for the same reason. This is also why
+there is no `Last-Modified`: a date could only ever name the maximum.
 
 **On the client**, `updated_since` needs an **overlap window**: ask
 from slightly earlier than the newest timestamp of the previous pass,

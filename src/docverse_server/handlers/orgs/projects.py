@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Annotated
 from urllib.parse import urlencode
 
@@ -65,19 +65,19 @@ def _listing_etag(
     know which parameters the listing supports. A parameter added later
     is covered the day it is added.
 
-    All three parts of the watermark go in, not just its newest clock.
-    A ``date_updated`` is PostgreSQL's transaction *start* time and
+    The watermark is a row count and a sum of clocks rather than the
+    newest ``date_updated``. That maximum is not monotonic: a
+    ``date_updated`` is PostgreSQL's transaction *start* time and
     commit order is not start order, so a slow writer can land a clock
-    below the maximum a poller already holds; the row count and the sum
-    of every row's clock move when that happens and the maximum does
-    not. ``Last-Modified`` can still only carry the maximum — it has to
-    name an instant — but the tag is opaque, so it says more.
+    below a maximum a poller already holds and leave it standing still.
+    A row appearing or disappearing moves the count, and a clock moving
+    anywhere at all moves the sum, so the pair covers every mutation
+    whatever order it commits in.
     """
     return make_weak_etag(
         (
             ConditionalGetEndpoint.projects_list.value,
             org_public_id,
-            datetime_to_microseconds(watermark.date_updated),
             watermark.project_count,
             watermark.clock_sum,
             urlencode(sorted(context.request.query_params.multi_items())),
@@ -93,10 +93,9 @@ def _listing_etag(
     responses={
         status.HTTP_304_NOT_MODIFIED: {
             "description": (
-                "The caller's ``If-None-Match`` or ``If-Modified-Since``"
-                " already matched this page, so no body is sent. The"
-                " ``ETag`` and ``Last-Modified`` validators are repeated"
-                " so a poller can carry them into its next request."
+                "The caller's ``If-None-Match`` already matched this"
+                " page, so no body is sent. The ``ETag`` is repeated so"
+                " a poller can carry it into its next request."
             )
         }
     },
@@ -183,8 +182,6 @@ async def get_projects(
                 org_public_id=user.org.public_id,
                 watermark=watermark,
             ),
-            last_modified=watermark.date_updated,
-            now=datetime.now(tz=UTC),
         )
         if not_modified is not None:
             return not_modified
@@ -278,7 +275,12 @@ async def post_project(
 
 
 def _project_etag(
-    *, project_public_id: int, watermark: datetime, include_deleted: bool
+    *,
+    project_public_id: int,
+    org_clock: datetime,
+    project_clock: datetime,
+    edition_clock: datetime | None,
+    include_deleted: bool,
 ) -> str:
     """Build the entity-tag for one project's representation.
 
@@ -292,12 +294,30 @@ def _project_etag(
     The flag is part of the material because it is part of the
     request's identity here: with it a soft-deleted project is a
     representation, without it the same URL is a 404.
+
+    The three clocks go in as three separate parts, not as their
+    maximum. ``date_updated`` is PostgreSQL's transaction *start* time
+    and commit order is not start order, so a writer that began early
+    and waited on a row lock can stamp a clock that is already below
+    one of the others. A maximum would not move, and the poller holding
+    the tag would keep being told 304; three parts retire the tag
+    whenever any one of them moves, in either direction (task #650).
+
+    A project with no default edition hashes an empty part for that
+    clock — a value no microsecond count can collide with — so
+    creating the edition retires the tag.
     """
     return make_weak_etag(
         (
             ConditionalGetEndpoint.project.value,
             project_public_id,
-            datetime_to_microseconds(watermark),
+            datetime_to_microseconds(org_clock),
+            datetime_to_microseconds(project_clock),
+            (
+                ""
+                if edition_clock is None
+                else datetime_to_microseconds(edition_clock)
+            ),
             include_deleted,
         )
     )
@@ -311,10 +331,9 @@ def _project_etag(
     responses={
         status.HTTP_304_NOT_MODIFIED: {
             "description": (
-                "The caller's ``If-None-Match`` or ``If-Modified-Since``"
-                " already matched this project, so no body is sent. The"
-                " ``ETag`` and ``Last-Modified`` validators are repeated"
-                " so a poller can carry them into its next request."
+                "The caller's ``If-None-Match`` already matched this"
+                " project, so no body is sent. The ``ETag`` is repeated"
+                " so a poller can carry it into its next request."
             )
         }
     },
@@ -349,18 +368,20 @@ async def get_project(
         )
         default_edition = await service.get_default_edition(project.id)
         # Three rows feed this representation, so three clocks feed the
-        # validator and the watermark is the latest of them. The project
-        # row is the obvious one. The default edition is embedded whole,
-        # so an edition retitled or repointed rewrites the body without
+        # validator — each as its own part of the tag. The project row
+        # is the obvious one. The default edition is embedded whole, so
+        # an edition retitled or repointed rewrites the body without
         # necessarily touching the project. And the org supplies
         # ``base_domain``, ``url_scheme``, and ``root_path_prefix``, the
         # three fields the embedded edition's ``published_url`` is built
         # from — all patchable through ``PATCH /orgs/{org}``, which
         # writes the org row and nothing else. Drop any one clock and a
         # poller is told 304 about a body that has already changed.
-        watermark = max(project.date_updated, org.date_updated)
-        if default_edition is not None:
-            watermark = max(watermark, default_edition.date_updated)
+        edition_clock = (
+            default_edition.date_updated
+            if default_edition is not None
+            else None
+        )
         not_modified = await evaluate_conditional_get(
             context,
             endpoint=ConditionalGetEndpoint.project,
@@ -368,11 +389,11 @@ async def get_project(
             project=project_slug,
             etag=_project_etag(
                 project_public_id=project.public_id,
-                watermark=watermark,
+                org_clock=org.date_updated,
+                project_clock=project.date_updated,
+                edition_clock=edition_clock,
                 include_deleted=include_deleted,
             ),
-            last_modified=watermark,
-            now=datetime.now(tz=UTC),
         )
         if not_modified is not None:
             return not_modified

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -23,10 +22,6 @@ from docverse_server.dependencies.context import context_dependency
 from docverse_server.domain.base32id import (
     serialize_base32_id,
     validate_base32_id,
-)
-from docverse_server.domain.conditional_get import (
-    format_http_date,
-    parse_http_date,
 )
 from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
@@ -1753,6 +1748,32 @@ async def _stamp_org_date_updated(slug: str, stamp: datetime) -> None:
         break
 
 
+async def _stamp_edition_date_updated(
+    project_slug: str, edition_slug: str, stamp: datetime
+) -> None:
+    """Pin one edition's ``date_updated`` to a fixed instant."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_id = (
+                await session.execute(
+                    select(SqlProject.id).where(
+                        SqlProject.slug == project_slug
+                    )
+                )
+            ).scalar_one()
+            await session.execute(
+                update(SqlEdition)
+                .where(
+                    SqlEdition.project_id == project_id,
+                    SqlEdition.slug == edition_slug,
+                )
+                .values(date_updated=stamp)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+        break
+
+
 async def _resolve_github_binding(
     *, slug: str, owner: str, repo: str, installation_id: int
 ) -> None:
@@ -2092,26 +2113,9 @@ async def test_list_projects_include_deleted_with_query(
 # ---------------------------------------------------------------------------
 
 
-async def _wait_out_the_second(http_date: str) -> None:
-    """Block until the second an HTTP date names is behind the server.
-
-    A date-only 304 is refused while the watermark's second is still
-    the current one (RFC 7232 §2.2.1), and a resource a test wrote
-    moments earlier is in exactly that state. Waiting the second out is
-    how such a test reaches the ordinary steady state a poller sees.
-    """
-    named = parse_http_date(http_date)
-    assert named is not None
-    remaining = (
-        named + timedelta(seconds=1) - datetime.now(tz=UTC)
-    ).total_seconds()
-    if remaining > 0:
-        await asyncio.sleep(remaining + 0.05)
-
-
 @pytest.mark.asyncio
 async def test_list_projects_sends_validators(client: AsyncClient) -> None:
-    """The listing carries a weak ``ETag`` and a ``Last-Modified``."""
+    """The listing carries a weak ``ETag`` and no date validator."""
     await _setup(client)
     await _seed_clocked_projects(client)
 
@@ -2122,15 +2126,14 @@ async def test_list_projects_sends_validators(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["ETag"].startswith('W/"')
-    # The watermark is the newest project clock in the org.
-    assert response.headers["Last-Modified"] == "Sun, 01 Mar 2026 00:00:00 GMT"
+    assert "Last-Modified" not in response.headers
 
 
 @pytest.mark.asyncio
 async def test_list_projects_if_none_match_is_empty_304(
     client: AsyncClient,
 ) -> None:
-    """Echoing the tag back earns a bodyless 304 with both validators."""
+    """Echoing the tag back earns a bodyless 304 repeating the tag."""
     await _setup(client)
     await _seed_clocked_projects(client)
     headers = {"X-Auth-Request-User": "testuser"}
@@ -2148,7 +2151,7 @@ async def test_list_projects_if_none_match_is_empty_304(
     assert second.status_code == 304
     assert second.content == b""
     assert second.headers["ETag"] == first.headers["ETag"]
-    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
+    assert "Last-Modified" not in second.headers
 
 
 @pytest.mark.asyncio
@@ -2189,9 +2192,10 @@ async def test_list_projects_etag_changes_after_a_clock_below_the_max(
 
     ``date_updated`` is stamped with the transaction's *start* clock
     and commit order is not start order, so a slow writer can land a
-    clock below the maximum a poller already holds. ``Last-Modified``
-    cannot move — it names that maximum — but the tag has to, or the
-    poller keeps being told 304 about a change it has never seen.
+    clock below the maximum a poller already holds. A tag built on that
+    maximum would not move, and the poller would keep being told 304
+    about a change it has never seen; the sum of every row's clock
+    moves whichever direction the write landed in.
     """
     await _setup(client)
     await _seed_clocked_projects(client)
@@ -2212,79 +2216,6 @@ async def test_list_projects_etag_changes_after_a_clock_below_the_max(
 
     assert second.status_code == 200
     assert second.headers["ETag"] != first.headers["ETag"]
-    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
-
-
-@pytest.mark.asyncio
-async def test_list_projects_if_modified_since_alone_is_304(
-    client: AsyncClient,
-) -> None:
-    """A date with no tag is enough while the watermark stands still."""
-    await _setup(client)
-    await _seed_clocked_projects(client)
-    headers = {"X-Auth-Request-User": "testuser"}
-
-    first = await client.get(
-        "/docverse/orgs/proj-org/projects", headers=headers
-    )
-    assert first.status_code == 200
-
-    second = await client.get(
-        "/docverse/orgs/proj-org/projects",
-        headers={
-            **headers,
-            "If-Modified-Since": first.headers["Last-Modified"],
-        },
-    )
-
-    assert second.status_code == 304
-    assert second.content == b""
-
-
-@pytest.mark.asyncio
-async def test_list_projects_if_modified_since_declines_an_open_second(
-    client: AsyncClient,
-) -> None:
-    """A date is refused while the watermark's second is still running.
-
-    ``Last-Modified`` carries whole seconds, so a write landing later
-    in the second a poller was told about would be invisible to the
-    date comparison (RFC 7232 §2.2.1). The listing answers 200 until
-    that second closes, and only then lets the date earn a 304.
-    """
-    await _setup(client)
-    await _seed_clocked_projects(client)
-    headers = {"X-Auth-Request-User": "testuser"}
-
-    # Put the org watermark in a second that is still open when the
-    # request lands — the shape of a write that commits between two
-    # polls. Stamped a second ahead so the boundary cannot fall
-    # between choosing the instant and the handler reading its clock.
-    watermark = datetime.now(tz=UTC).replace(microsecond=0) + timedelta(
-        seconds=1
-    )
-    await _stamp_date_updated(("tick-new", watermark))
-    http_date = format_http_date(watermark)
-
-    open_second = await client.get(
-        "/docverse/orgs/proj-org/projects",
-        headers={**headers, "If-Modified-Since": http_date},
-    )
-
-    assert open_second.status_code == 200
-    assert open_second.headers["Last-Modified"] == http_date
-
-    # Once the clock leaves that second, nothing more can land inside
-    # it and the same date becomes a sound validator.
-    await _wait_out_the_second(http_date)
-
-    closed_second = await client.get(
-        "/docverse/orgs/proj-org/projects",
-        headers={**headers, "If-Modified-Since": http_date},
-    )
-
-    assert closed_second.status_code == 304
-    assert closed_second.content == b""
 
 
 @pytest.mark.asyncio
@@ -2365,7 +2296,7 @@ async def _seed_one_project(client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_get_project_sends_validators(client: AsyncClient) -> None:
-    """The single project carries a weak ``ETag`` and a ``Last-Modified``."""
+    """The single project carries a weak ``ETag`` and nothing else."""
     await _setup(client)
     await _seed_one_project(client)
 
@@ -2376,14 +2307,14 @@ async def test_get_project_sends_validators(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["ETag"].startswith('W/"')
-    assert response.headers["Last-Modified"].endswith("GMT")
+    assert "Last-Modified" not in response.headers
 
 
 @pytest.mark.asyncio
 async def test_get_project_if_none_match_is_empty_304(
     client: AsyncClient,
 ) -> None:
-    """Echoing the tag back earns a bodyless 304 with both validators."""
+    """Echoing the tag back earns a bodyless 304 repeating the tag."""
     await _setup(client)
     await _seed_one_project(client)
     headers = {"X-Auth-Request-User": "testuser"}
@@ -2401,37 +2332,7 @@ async def test_get_project_if_none_match_is_empty_304(
     assert second.status_code == 304
     assert second.content == b""
     assert second.headers["ETag"] == first.headers["ETag"]
-    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
-
-
-@pytest.mark.asyncio
-async def test_get_project_if_modified_since_alone_is_304(
-    client: AsyncClient,
-) -> None:
-    """A date with no tag is enough while the watermark stands still."""
-    await _setup(client)
-    await _seed_one_project(client)
-    headers = {"X-Auth-Request-User": "testuser"}
-
-    first = await client.get(
-        "/docverse/orgs/proj-org/projects/solo", headers=headers
-    )
-    assert first.status_code == 200
-    # The project was written moments ago, so its second is still open
-    # and a date could not yet be trusted to reveal a write landing in
-    # it. Wait it out to reach the state an ordinary poller sees.
-    await _wait_out_the_second(first.headers["Last-Modified"])
-
-    second = await client.get(
-        "/docverse/orgs/proj-org/projects/solo",
-        headers={
-            **headers,
-            "If-Modified-Since": first.headers["Last-Modified"],
-        },
-    )
-
-    assert second.status_code == 304
-    assert second.content == b""
+    assert "Last-Modified" not in second.headers
 
 
 @pytest.mark.asyncio
@@ -2472,7 +2373,7 @@ async def test_get_project_etag_changes_after_default_edition_patch(
 
     A ``__main`` metadata edit leaves ``projects.date_updated`` alone —
     only a repoint touches that — so this is the test that fails if the
-    watermark stops taking the later of the two clocks.
+    edition's clock stops reaching the tag.
     """
     await _setup(client)
     await _seed_one_project(client)
@@ -2546,31 +2447,6 @@ async def test_get_project_etag_changes_after_org_patch(
         second.json()["default_edition"]["published_url"]
         == "https://solo.docs.example.net/"
     )
-
-
-@pytest.mark.asyncio
-async def test_get_project_last_modified_covers_org_clock(
-    client: AsyncClient,
-) -> None:
-    """``Last-Modified`` never trails the org row the body draws on.
-
-    The tag alone is not enough: a poller may hold only a date, and an
-    ``If-Modified-Since`` is compared against whatever instant the
-    server named. Naming the project's clock while the org's is newer
-    stalls that poller on a date the body has already outrun.
-    """
-    await _setup(client)
-    await _seed_one_project(client)
-    org_clock = datetime(2027, 3, 4, 5, 6, 7, tzinfo=UTC)
-    await _stamp_org_date_updated("proj-org", org_clock)
-
-    response = await client.get(
-        "/docverse/orgs/proj-org/projects/solo",
-        headers={"X-Auth-Request-User": "testuser"},
-    )
-
-    assert response.status_code == 200
-    assert parse_http_date(response.headers["Last-Modified"]) == org_clock
 
 
 @pytest.mark.asyncio
@@ -2650,3 +2526,123 @@ async def test_get_project_publishes_conditional_get_event(
     assert event.endpoint == ConditionalGetEndpoint.project
     assert event.outcome == ConditionalGetOutcome.not_modified
     assert event.precondition == ConditionalGetPrecondition.etag
+
+
+@pytest.mark.asyncio
+async def test_get_project_etag_changes_when_project_clock_drops(
+    client: AsyncClient,
+) -> None:
+    """A project clock landing below the org clock retires the tag.
+
+    ``date_updated`` is PostgreSQL's transaction *start* time and
+    commit order is not start order, so a slow writer can stamp the
+    project row with an instant that is already behind the org's clock.
+    Folding the three clocks together with ``max()`` would hide such a
+    write — the maximum stays put — so the tag hashes each clock as its
+    own part instead (task #650, finding 3).
+    """
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    # Push the org's clock far ahead of everything else, so a project
+    # write landing "late" is necessarily below it.
+    await _stamp_org_date_updated("proj-org", datetime(2027, 3, 4, tzinfo=UTC))
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+
+    await _stamp_date_updated(("solo", datetime(2026, 1, 15, tzinfo=UTC)))
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_get_project_etag_changes_when_edition_clock_drops(
+    client: AsyncClient,
+) -> None:
+    """A default-edition clock below the org clock retires the tag too.
+
+    The embedded ``__main`` edition is the third row the tag covers,
+    and it is stamped by the same transaction-start clock, so it can
+    land below the org's the same way the project row can.
+    """
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    await _stamp_org_date_updated("proj-org", datetime(2027, 3, 4, tzinfo=UTC))
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/solo", headers=headers
+    )
+    assert first.status_code == 200
+
+    await _stamp_edition_date_updated(
+        "solo", "__main", datetime(2026, 1, 15, tzinfo=UTC)
+    )
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_ignores_if_modified_since(
+    client: AsyncClient,
+) -> None:
+    """The listing has no date validator to be polled with.
+
+    ``Last-Modified`` can only name the newest clock in the listing,
+    and that maximum is not monotonic under commit-order skew, so the
+    date validator was dropped entirely (task #650). An
+    ``If-Modified-Since`` is ignored the way an unparsable one always
+    was: the listing is answered in full.
+    """
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={
+            **headers,
+            "If-Modified-Since": "Wed, 01 Jan 2031 00:00:00 GMT",
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 3
+    assert "Last-Modified" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_get_project_ignores_if_modified_since(
+    client: AsyncClient,
+) -> None:
+    """The single project has no date validator either."""
+    await _setup(client)
+    await _seed_one_project(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/solo",
+        headers={
+            **headers,
+            "If-Modified-Since": "Wed, 01 Jan 2031 00:00:00 GMT",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["slug"] == "solo"
+    assert "Last-Modified" not in response.headers

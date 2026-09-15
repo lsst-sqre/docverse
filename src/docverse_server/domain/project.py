@@ -161,25 +161,20 @@ class ProjectListingWatermark:
 
     Conditional GET on ``GET /orgs/{org}/projects`` needs a cheap value
     that changes whenever any row of the listing changes. The newest
-    ``date_updated`` alone is not that value: every row is stamped with
+    ``date_updated`` is not that value: every row is stamped with
     PostgreSQL's transaction *start* clock (``now()``), and commit order
     is not start order, so a slow writer can commit after a poller has
     read and land a ``date_updated`` below the maximum that poller
     already stored. The maximum would not move, and the poller would
     keep being told 304.
 
-    The two aggregates beside it close that hole: a row that appears or
+    These two aggregates have no such hole: a row that appears or
     disappears changes ``project_count``, and a row whose clock moves at
-    all — up or down, above or below the maximum — changes
-    ``clock_sum``. Only ``date_updated`` is reported as
-    ``Last-Modified``, because that header has to name an instant; all
-    three go into the ``ETag``, which is opaque and can therefore say
-    more.
+    all — up or down, above or below any maximum — changes
+    ``clock_sum``. Neither names an instant, which is fine because the
+    ``ETag`` they feed is opaque and Docverse publishes no
+    ``Last-Modified``.
     """
-
-    date_updated: datetime
-    """Newest ``date_updated`` among the org's projects, deleted rows
-    included, or the org's own ``date_created`` when it owns none."""
 
     project_count: int
     """How many projects the org owns, deleted rows included."""

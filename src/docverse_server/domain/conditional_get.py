@@ -1,18 +1,31 @@
-"""Conditional-GET primitives: weak ETags, HTTP dates, preconditions.
+"""Conditional-GET primitives: weak ETags and precondition evaluation.
 
-HTTP conditional requests (:rfc:`7232`) let a poller ask "has this
+HTTP conditional requests (:rfc:`9110`) let a poller ask "has this
 changed?" and be answered with an empty 304 instead of a full
 representation. Docverse uses that on the read endpoints Ook polls, so
 a pass that finds nothing new costs a watermark query rather than a
 serialized page of projects.
 
-The rules are fiddly and easy to get subtly wrong — weak comparison,
-``If-None-Match`` outranking ``If-Modified-Since``, second-granularity
-HTTP dates — so they live here as pure functions over plain values. No
-handler, no request object, no database: a caller supplies the
-validator material it computed and the two request headers, and gets
-back a decision it can act on. That keeps the semantics testable
-without a server and keeps every endpoint answering the same way.
+The entity-tag is the **only** validator Docverse offers. A
+``Last-Modified`` can only name an instant, which forces it to be the
+maximum of the clocks behind a representation truncated to the second —
+and neither the maximum nor the truncation is sound here. Every row is
+stamped with PostgreSQL's transaction *start* time, so a writer that
+waited on a lock can commit a clock below a maximum a poller already
+holds; and a write landing later in the second a client was told about
+is invisible to a comparison of truncated dates. An opaque tag has
+neither constraint: it hashes each clock separately at full precision,
+so any of them moving in either direction retires it. Offering only the
+tag is :rfc:`9110`-conformant, and it is why ``Last-Modified`` and
+``If-Modified-Since`` appear nowhere in this module.
+
+The remaining rules — weak comparison, ``*``, a comma inside an opaque
+tag — are fiddly enough to be worth isolating, so they live here as
+pure functions over plain values. No handler, no request object, no
+database: a caller supplies the validator material it computed and the
+request header, and gets back a decision it can act on. That keeps the
+semantics testable without a server and keeps every endpoint answering
+the same way.
 """
 
 from __future__ import annotations
@@ -22,7 +35,6 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from email.utils import format_datetime, parsedate_to_datetime
 from enum import StrEnum
 
 __all__ = [
@@ -31,10 +43,7 @@ __all__ = [
     "PreconditionKind",
     "datetime_to_microseconds",
     "evaluate_preconditions",
-    "format_http_date",
     "make_weak_etag",
-    "parse_http_date",
-    "truncate_to_second",
 ]
 
 ETAG_DIGEST_LENGTH = 32
@@ -65,10 +74,10 @@ def make_weak_etag(parts: Sequence[object]) -> str:
     ----------
     parts
         The values that identify this representation — typically the
-        endpoint name, the resource's public id, its watermark, and the
-        request's canonical query string. Order is significant, and
-        each part is rendered with :func:`str`, so callers must pass
-        values with a stable textual form (ints, not floats).
+        endpoint name, the resource's public id, every clock behind it,
+        and the request's canonical query string. Order is significant,
+        and each part is rendered with :func:`str`, so callers must
+        pass values with a stable textual form (ints, not floats).
 
     Returns
     -------
@@ -106,71 +115,11 @@ def datetime_to_microseconds(value: datetime) -> int:
     return (value - _POSIX_EPOCH) // timedelta(microseconds=1)
 
 
-def truncate_to_second(value: datetime) -> datetime:
-    """Drop a timestamp's sub-second precision.
-
-    HTTP dates carry whole seconds only, so a ``Last-Modified`` header
-    is necessarily a truncation of the watermark behind it. Comparing
-    an ``If-Modified-Since`` against the *untruncated* watermark would
-    therefore report "modified" forever: the client echoes back the
-    second it was told, which is always fractionally older than the
-    real instant.
-    """
-    return value.replace(microsecond=0)
-
-
-def format_http_date(value: datetime) -> str:
-    """Render an instant as an :rfc:`7231` IMF-fixdate in GMT.
-
-    Parameters
-    ----------
-    value
-        The instant to render. A naive value is read as UTC; an aware
-        one is converted to UTC first, because the fixdate form admits
-        no offset other than ``GMT``.
-
-    Returns
-    -------
-    str
-        For example ``"Mon, 14 Sep 2026 19:15:29 GMT"``, with
-        sub-second precision truncated away.
-    """
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return format_datetime(
-        truncate_to_second(value.astimezone(UTC)), usegmt=True
-    )
-
-
-def parse_http_date(value: str) -> datetime | None:
-    """Parse an HTTP-date header value, or ``None`` if it is malformed.
-
-    :rfc:`7232` says a recipient must ignore an ``If-Modified-Since``
-    it cannot parse rather than reject the request, so the failure is
-    reported as ``None`` instead of an exception — there is nothing for
-    a caller to handle beyond "carry on unconditionally".
-
-    A parsed value with no timezone is read as UTC: HTTP dates are GMT
-    by definition, and :func:`email.utils.parsedate_to_datetime` leaves
-    an obsolete ``-0000`` offset naive.
-    """
-    try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
-
-
 class PreconditionKind(StrEnum):
     """Which request header decided a conditional GET."""
 
     etag = "etag"
     """``If-None-Match`` was present and was evaluated."""
-
-    last_modified = "last_modified"
-    """``If-Modified-Since`` was present, parsable, and was evaluated."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,10 +132,11 @@ class ConditionalGetResult:
     precondition: PreconditionKind | None
     """Which header decided, or ``None`` if the request carried none.
 
-    ``None`` also covers an ``If-Modified-Since`` that could not be
-    parsed: :rfc:`7232` says to ignore one, and a header that was
-    ignored decided nothing, so the request is indistinguishable from
-    an unconditional one.
+    ``None`` also covers a request that carried only an
+    ``If-Modified-Since``. Docverse publishes no date validator, so
+    there is nothing for such a header to be compared against and it is
+    ignored — which leaves the request indistinguishable from an
+    unconditional one.
     """
 
 
@@ -194,7 +144,7 @@ _ENTITY_TAG_RE = re.compile(r'(?:W/)?"[^"]*"|\*')
 """Matches one entity-tag, or ``*``, in an ``If-None-Match`` list.
 
 Scanning for tags rather than splitting on commas keeps a comma inside
-an opaque tag — legal per :rfc:`7232` — from splitting it in two.
+an opaque tag — legal per :rfc:`9110` — from splitting it in two.
 """
 
 
@@ -208,12 +158,7 @@ def _opaque_tag(entity_tag: str) -> str:
 
 
 def evaluate_preconditions(
-    *,
-    if_none_match: str | None,
-    if_modified_since: str | None,
-    etag: str,
-    last_modified: datetime,
-    now: datetime,
+    *, if_none_match: str | None, etag: str
 ) -> ConditionalGetResult:
     """Decide whether a conditional GET may be answered with a 304.
 
@@ -221,18 +166,8 @@ def evaluate_preconditions(
     ----------
     if_none_match
         The request's ``If-None-Match`` header, or ``None``.
-    if_modified_since
-        The request's ``If-Modified-Since`` header, or ``None``.
     etag
         The entity-tag of the representation the server would send.
-    last_modified
-        The watermark behind that representation, at full precision;
-        it is truncated to the second here so the comparison matches
-        what the ``Last-Modified`` header actually told the client.
-    now
-        The server's current instant, timezone-aware. Only the
-        date-based branch consults it, to refuse a 304 whose second is
-        still open (see Notes).
 
     Returns
     -------
@@ -241,39 +176,20 @@ def evaluate_preconditions(
 
     Notes
     -----
-    :rfc:`7232` §6 fixes the precedence: when ``If-None-Match`` is
-    present it is evaluated and ``If-Modified-Since`` is not consulted
-    at all — *even when the tags do not match*. The date is a fallback
-    for clients that have no tag to echo, never a second opinion.
-
-    :rfc:`7232` §2.2.1 is why ``now`` is here. ``Last-Modified`` is the
-    watermark truncated to the second, so every write that lands later
-    in that same second is invisible to the date comparison — the
-    client echoes back the second it was told, and the truncated
-    watermark still matches it. The change would then stay hidden until
-    some unrelated later-second write moved the clock again. So while
-    the watermark's second is still the current one, the date is
-    refused as a validator and the representation is sent in full: one
-    needless body per second of write activity, in exchange for never
-    losing a change. Entity-tags hash the watermark at full precision
-    and are not affected, which is why they are the validator to prefer.
+    ``If-Modified-Since`` is deliberately not a parameter. :rfc:`9110`
+    §13.1.3 makes the date validator optional, and Docverse sends no
+    ``Last-Modified`` for one to be compared against — see this
+    module's docstring for why a date cannot express these watermarks
+    soundly. A request carrying one alone is therefore answered in full
+    and reports no deciding header, exactly as an unparsable date
+    always was.
     """
-    if if_none_match is not None:
-        return ConditionalGetResult(
-            not_modified=_if_none_match_matches(if_none_match, etag),
-            precondition=PreconditionKind.etag,
-        )
-    if if_modified_since is not None:
-        since = parse_http_date(if_modified_since)
-        if since is not None:
-            second = truncate_to_second(last_modified)
-            return ConditionalGetResult(
-                not_modified=(
-                    second <= since and second < truncate_to_second(now)
-                ),
-                precondition=PreconditionKind.last_modified,
-            )
-    return ConditionalGetResult(not_modified=False, precondition=None)
+    if if_none_match is None:
+        return ConditionalGetResult(not_modified=False, precondition=None)
+    return ConditionalGetResult(
+        not_modified=_if_none_match_matches(if_none_match, etag),
+        precondition=PreconditionKind.etag,
+    )
 
 
 def _if_none_match_matches(header: str, etag: str) -> bool:

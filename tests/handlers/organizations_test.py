@@ -414,7 +414,7 @@ async def test_get_organization_carries_base32_public_id(
 
 @pytest.mark.asyncio
 async def test_get_organization_sends_validators(client: AsyncClient) -> None:
-    """The organization carries a weak ``ETag`` and a ``Last-Modified``."""
+    """The organization carries a weak ``ETag`` and nothing else."""
     await seed_org_with_admin(client, "cg-org", "testuser")
 
     response = await client.get(
@@ -424,14 +424,14 @@ async def test_get_organization_sends_validators(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["ETag"].startswith('W/"')
-    assert response.headers["Last-Modified"].endswith("GMT")
+    assert "Last-Modified" not in response.headers
 
 
 @pytest.mark.asyncio
 async def test_get_organization_if_none_match_is_empty_304(
     client: AsyncClient,
 ) -> None:
-    """Echoing the tag back earns a bodyless 304 with both validators."""
+    """Echoing the tag back earns a bodyless 304 repeating the tag."""
     await seed_org_with_admin(client, "cg-repeat-org", "testuser")
     headers = {"X-Auth-Request-User": "testuser"}
 
@@ -446,7 +446,7 @@ async def test_get_organization_if_none_match_is_empty_304(
     assert second.status_code == 304
     assert second.content == b""
     assert second.headers["ETag"] == first.headers["ETag"]
-    assert second.headers["Last-Modified"] == first.headers["Last-Modified"]
+    assert "Last-Modified" not in second.headers
 
 
 @pytest.mark.asyncio
@@ -506,3 +506,23 @@ async def test_get_organization_publishes_conditional_get_event(
     assert event.endpoint == ConditionalGetEndpoint.organization
     assert event.outcome == ConditionalGetOutcome.not_modified
     assert event.precondition == ConditionalGetPrecondition.etag
+
+
+@pytest.mark.asyncio
+async def test_get_organization_ignores_if_modified_since(
+    client: AsyncClient,
+) -> None:
+    """The organization has no date validator either (task #650)."""
+    await seed_org_with_admin(client, "cg-ims-org", "testuser")
+
+    response = await client.get(
+        "/docverse/orgs/cg-ims-org",
+        headers={
+            "X-Auth-Request-User": "testuser",
+            "If-Modified-Since": "Wed, 01 Jan 2031 00:00:00 GMT",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["slug"] == "cg-ims-org"
+    assert "Last-Modified" not in response.headers

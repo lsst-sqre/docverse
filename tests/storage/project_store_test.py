@@ -24,6 +24,7 @@ from docverse.models import (
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.conditional_get import datetime_to_microseconds
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -201,8 +202,8 @@ async def test_rename_repo_by_repo_id_advances_date_updated(
     such as Ook rather than a "last operator edit" marker. A rename
     flips ``github_repo`` and therefore the project's
     ``source_url`` on the wire, so the clock — and with it the
-    listing's ETag, ``Last-Modified``, and ``updated_since`` filter —
-    has to move with it.
+    listing's ETag and its ``updated_since`` filter — has to move
+    with it.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -1676,7 +1677,7 @@ async def test_get_org_watermark_includes_deleted_projects(
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """The watermark is the newest clock in the org, deleted rows too.
+    """The watermark counts deleted rows and sums their clocks too.
 
     A soft delete is the one mutation whose row drops out of the
     default listing, so a watermark that filtered deleted rows would
@@ -1699,44 +1700,46 @@ async def test_get_org_watermark_includes_deleted_projects(
         )
         await db_session.commit()
 
-    # Stamp the deleted row as the newest clock in the org. ``now()``
-    # is transaction-stable in PostgreSQL, so rows written in one
-    # transaction are otherwise indistinguishable.
-    newest = datetime(2026, 5, 1, tzinfo=UTC)
+    # ``now()`` is transaction-stable in PostgreSQL, so rows written in
+    # one transaction are otherwise indistinguishable.
+    live_clock = datetime(2026, 4, 1, tzinfo=UTC)
+    dead_clock = datetime(2026, 5, 1, tzinfo=UTC)
     async with db_session.begin():
         await db_session.execute(
             update(SqlProject)
             .where(SqlProject.slug == "wm-live")
-            .values(date_updated=datetime(2026, 4, 1, tzinfo=UTC))
+            .values(date_updated=live_clock)
             .execution_options(synchronize_session=False)
         )
         await db_session.execute(
             update(SqlProject)
             .where(SqlProject.slug == "wm-dead")
-            .values(date_updated=newest)
+            .values(date_updated=dead_clock)
             .execution_options(synchronize_session=False)
         )
         await db_session.commit()
     db_session.expire_all()
 
     async with db_session.begin():
-        watermark = await store.get_org_watermark(
-            org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
-        )
+        watermark = await store.get_org_watermark(org_id)
 
-    assert watermark.date_updated == newest
+    assert watermark.project_count == 2
+    assert watermark.clock_sum == datetime_to_microseconds(
+        live_clock
+    ) + datetime_to_microseconds(dead_clock)
 
 
 @pytest.mark.asyncio
-async def test_get_org_watermark_falls_back_to_org_date_created(
+async def test_get_org_watermark_is_zero_for_an_empty_org(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """An org with no projects is stamped with its own creation date.
+    """An org with no projects aggregates to zeroes, not to ``None``.
 
-    A shared sentinel would give every empty org the same validator, so
-    a client could not tell one empty listing from another's.
+    The endpoint's tag also hashes the org's public id, so two empty
+    organizations still validate apart without the aggregate having to
+    join ``organizations`` for a per-org fallback.
     """
     async with db_session.begin():
         org = await org_store.create(
@@ -1749,11 +1752,8 @@ async def test_get_org_watermark_falls_back_to_org_date_created(
         await db_session.commit()
 
     async with db_session.begin():
-        watermark = await store.get_org_watermark(
-            org.id, empty_fallback=org.date_created
-        )
+        watermark = await store.get_org_watermark(org.id)
 
-    assert watermark.date_updated == org.date_created
     assert watermark.project_count == 0
     assert watermark.clock_sum == 0
 
@@ -1768,9 +1768,9 @@ async def test_get_org_watermark_notices_a_clock_below_the_max(
 
     ``now()`` is PostgreSQL's *transaction start* time, and commit
     order is not start order, so a slow writer can land a
-    ``date_updated`` below the maximum a poller has already read. The
-    maximum alone would sit still through exactly that change; the
-    aggregate beside it must not.
+    ``date_updated`` below the maximum a poller has already read. A
+    maximum would sit still through exactly that change; the sum of
+    every row's clock must not.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store, slug="skew-org")
@@ -1797,9 +1797,7 @@ async def test_get_org_watermark_notices_a_clock_below_the_max(
         await db_session.commit()
 
     async with db_session.begin():
-        before = await store.get_org_watermark(
-            org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
-        )
+        before = await store.get_org_watermark(org_id)
 
     # The late commit: a clock that moves but stays under the maximum.
     async with db_session.begin():
@@ -1812,11 +1810,9 @@ async def test_get_org_watermark_notices_a_clock_below_the_max(
         await db_session.commit()
 
     async with db_session.begin():
-        after = await store.get_org_watermark(
-            org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
-        )
+        after = await store.get_org_watermark(org_id)
 
-    assert after.date_updated == before.date_updated
+    assert after.project_count == before.project_count
     assert after != before
 
 
@@ -1831,8 +1827,8 @@ async def test_get_org_watermark_runs_one_joinless_aggregate(
     Conditional GET exists to make a poller's empty pass cheap, so the
     query on that path has to stay something PostgreSQL can answer from
     ``idx_projects_org_date_updated`` alone. Joining ``organizations``
-    for the empty-org fallback would defeat that scan, which is why the
-    fallback is a parameter instead.
+    for a per-org empty fallback would defeat that scan, which is why
+    an empty org simply aggregates to zeroes.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store, slug="joinless-org")
@@ -1844,9 +1840,7 @@ async def test_get_org_watermark_runs_one_joinless_aggregate(
 
     async with db_session.begin():
         with record_statements(db_session) as statements:
-            await store.get_org_watermark(
-                org_id, empty_fallback=datetime(2020, 1, 1, tzinfo=UTC)
-            )
+            await store.get_org_watermark(org_id)
 
     assert len(statements) == 1
     assert "JOIN" not in statements[0].upper()

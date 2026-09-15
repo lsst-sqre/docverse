@@ -554,15 +554,14 @@ async def test_list_projects_backdates_updated_since_by_the_overlap() -> None:
 
 @pytest.mark.asyncio
 async def test_list_projects_sends_preconditions_on_first_page_only() -> None:
-    """Validators guard the first request and no other.
+    """The validator guards the first request and no other.
 
     The caller's ``ETag`` describes the page it already holds, so it is
     meaningless against the cursor URLs that follow — a 304 there would
-    silently truncate the listing. The first page's validators come
-    back on the result so the next poll can send them again.
+    silently truncate the listing. The first page's tag comes back on
+    the result so the next poll can send it again.
     """
     page_two_url = f"{BASE_URL}/orgs/myorg/projects?order=slug&cursor=c2"
-    last_modified = "Sun, 01 Feb 2026 12:30:00 GMT"
     async with respx.mock(base_url=BASE_URL) as router:
         route = router.get("/orgs/myorg/projects").mock(
             side_effect=[
@@ -571,7 +570,6 @@ async def test_list_projects_sends_preconditions_on_first_page_only() -> None:
                     json=[_project_response("alpha")],
                     headers={
                         "ETag": 'W/"abc123"',
-                        "Last-Modified": last_modified,
                         "Link": f'<{page_two_url}>; rel="next"',
                     },
                 ),
@@ -584,20 +582,14 @@ async def test_list_projects_sends_preconditions_on_first_page_only() -> None:
         )
         async with DocverseClient(BASE_URL, TOKEN) as client:
             result = await client.list_projects(
-                "myorg",
-                if_none_match='W/"stale"',
-                if_modified_since="Sat, 31 Jan 2026 00:00:00 GMT",
+                "myorg", if_none_match='W/"stale"'
             )
 
     first, second = (call.request for call in route.calls)
     assert first.headers["If-None-Match"] == 'W/"stale"'
-    assert first.headers["If-Modified-Since"] == (
-        "Sat, 31 Jan 2026 00:00:00 GMT"
-    )
+    assert "if-modified-since" not in first.headers
     assert "if-none-match" not in second.headers
-    assert "if-modified-since" not in second.headers
     assert result.etag == 'W/"abc123"'
-    assert result.last_modified == last_modified
 
 
 @pytest.mark.asyncio
@@ -610,13 +602,7 @@ async def test_list_projects_not_modified() -> None:
     """
     async with respx.mock(base_url=BASE_URL) as router:
         route = router.get("/orgs/myorg/projects").mock(
-            return_value=httpx.Response(
-                304,
-                headers={
-                    "ETag": 'W/"abc123"',
-                    "Last-Modified": "Sun, 01 Feb 2026 12:30:00 GMT",
-                },
-            )
+            return_value=httpx.Response(304, headers={"ETag": 'W/"abc123"'})
         )
         async with DocverseClient(BASE_URL, TOKEN) as client:
             result = await client.list_projects(
@@ -626,7 +612,6 @@ async def test_list_projects_not_modified() -> None:
     assert result.not_modified is True
     assert result.projects == []
     assert result.etag == 'W/"abc123"'
-    assert result.last_modified == "Sun, 01 Feb 2026 12:30:00 GMT"
     assert len(route.calls) == 1
 
 
