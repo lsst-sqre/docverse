@@ -189,17 +189,19 @@ async def test_update_project(
 
 
 @pytest.mark.asyncio
-async def test_rename_repo_by_repo_id_preserves_date_updated(
+async def test_rename_repo_by_repo_id_advances_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """A GitHub-side repo rename must not bump ``date_updated``.
+    """A GitHub-side repo rename advances ``date_updated``.
 
-    ``date_updated`` is the operator-visible "last source-coordinate
-    edit" signal; those edits arrive through PUT/PATCH, not through a
-    GitHub-side metadata sync. The rename still flips ``github_repo``;
-    the effective source URL is derived from the binding.
+    PRD #634 turned ``date_updated`` into a change signal for pollers
+    such as Ook rather than a "last operator edit" marker. A rename
+    flips ``github_repo`` and therefore the project's
+    ``source_url`` on the wire, so the clock — and with it the
+    listing's ETag, ``Last-Modified``, and ``updated_since`` filter —
+    has to move with it.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -215,8 +217,6 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
             github_owner="acme",
             github_repo="old-repo",
         )
-        # Set github_repo_id without bumping date_updated so the baseline
-        # below is the create timestamp.
         await store.apply_installation_scope(
             installation_id=111,
             owner="acme",
@@ -231,9 +231,9 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
     assert before is not None
     baseline = before.date_updated
 
-    # Run the rename in a later transaction so a re-fired
-    # ``onupdate=func.now()`` would yield a strictly greater timestamp
-    # than the create transaction's ``now()``.
+    # Run the rename in a later transaction: ``func.now()`` is
+    # transaction-stable in PostgreSQL, so only a separate transaction
+    # yields a strictly greater timestamp than the create's.
     await asyncio.sleep(0.05)
     async with db_session.begin():
         updated_ids = await store.rename_repo_by_repo_id(
@@ -249,20 +249,20 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
     assert after.github_repo == "new-repo"
     assert after.source_url is None
     assert after.effective_source_url == "https://github.com/acme/new-repo"
-    assert after.date_updated == baseline
+    assert after.date_updated > baseline
 
 
 @pytest.mark.asyncio
-async def test_transfer_repo_by_repo_id_preserves_date_updated(
+async def test_transfer_repo_by_repo_id_advances_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """A GitHub-side repo transfer must not bump ``date_updated``.
+    """A GitHub-side repo transfer advances ``date_updated``.
 
-    The transfer still flips ``github_owner`` / ``github_owner_id`` /
-    ``github_repo``; the effective source URL is derived from the
-    binding.
+    The transfer moves the repo to a new owner namespace, so the
+    project's ``source_url`` changes on the wire and the clock a poller
+    reads has to follow it.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -308,19 +308,74 @@ async def test_transfer_repo_by_repo_id_preserves_date_updated(
     assert after.github_owner_id == 444
     assert after.source_url is None
     assert after.effective_source_url == "https://github.com/beta/repo"
-    assert after.date_updated == baseline
+    assert after.date_updated > baseline
 
 
 @pytest.mark.asyncio
-async def test_update_github_metadata_preserves_date_updated(
+async def test_apply_installation_scope_advances_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """Capturing the github_*_id columns preserves ``date_updated``.
+    """Capturing the installation scope advances ``date_updated``.
 
-    The three numeric ids are sync-bookkeeping, not an operator-visible
-    source-coordinate edit.
+    ``github_installation_id`` surfaces on the wire as the binding's
+    ``installation_status`` (and its ``app_url``), so an
+    ``installation`` webhook bringing ``owner/repo`` into scope is a
+    change a poller must be able to see.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="scope-me",
+                title="Scope Me",
+                github=ProjectGitHubBindingCreate(owner="Acme", repo="Docs"),
+            ),
+            github_owner="Acme",
+            github_repo="Docs",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        # Lower-cased payload, to keep the case-insensitive match
+        # covered alongside the clock.
+        updated_ids = await store.apply_installation_scope(
+            installation_id=11,
+            owner="acme",
+            owner_id=22,
+            repo="docs",
+            repo_id=33,
+        )
+        await db_session.commit()
+    assert updated_ids == [created.id]
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.github_installation_id == 11
+    assert after.date_updated > baseline
+
+
+@pytest.mark.asyncio
+async def test_update_github_metadata_advances_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The resolve worker's write advances ``date_updated``.
+
+    ``github_installation_id`` drives the binding's
+    ``installation_status`` on the wire, so the resolve worker landing
+    it is a change to what the project GET returns — and therefore a
+    change the project clock has to report.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -360,7 +415,7 @@ async def test_update_github_metadata_preserves_date_updated(
     assert after.github_installation_id == 10
     assert after.github_owner_id == 20
     assert after.github_repo_id == 30
-    assert after.date_updated == baseline
+    assert after.date_updated > baseline
 
 
 @pytest.mark.asyncio

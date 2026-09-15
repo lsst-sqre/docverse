@@ -629,12 +629,17 @@ class ProjectStore:
         (:attr:`docverse_server.domain.project.Project.effective_source_url`),
         so it follows automatically without a stored value to rewrite.
 
-        ``date_updated`` is explicitly preserved (pinned to its current
-        value so the column's ``onupdate=func.now()`` does not fire): a
-        GitHub-side rename is sync-bookkeeping, not an operator-visible
-        source-coordinate edit, which arrives through PUT/PATCH. This
-        mirrors the discipline of the dashboard binding store's
-        ``rename_repo_by_repo_id`` and of ``apply_installation_scope``.
+        ``date_updated`` is stamped forward (PRD #634): the project's
+        clock is a change signal for pollers such as Ook, not a "last
+        operator edit" marker, and a rename changes ``source_url`` on
+        the wire. Leaving the clock pinned would hide the new URL from
+        the listing's ETag, ``Last-Modified``, and ``updated_since``
+        filter alike. The stamp is explicit rather than left to the
+        column's ``onupdate``, matching ``soft_delete`` and
+        :meth:`~docverse_server.storage.edition_store.EditionStore
+        .set_current_build`. The dashboard binding store's own
+        ``rename_repo_by_repo_id`` keeps its clock pinned; that row
+        feeds no public listing.
 
         Returns the list of updated project ids.
         """
@@ -646,7 +651,7 @@ class ProjectStore:
             )
             .values(
                 github_repo=new_repo,
-                date_updated=SqlProject.date_updated,
+                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )
@@ -673,12 +678,11 @@ class ProjectStore:
         flip; the operator-visible source URL is derived from the
         binding, so it follows automatically.
 
-        ``date_updated`` is explicitly preserved (pinned to its current
-        value so the column's ``onupdate=func.now()`` does not fire): a
-        GitHub-side transfer is sync-bookkeeping, not an operator-
-        visible source-coordinate edit, which arrives through PUT/PATCH.
-        This mirrors the discipline of the dashboard binding store's
-        ``transfer_repo_by_repo_id`` and of ``apply_installation_scope``.
+        ``date_updated`` is stamped forward (PRD #634): a transfer
+        moves the repo into a new owner namespace, so the project's
+        ``source_url`` changes on the wire and the clock a poller such
+        as Ook watches has to advance with it. See
+        ``rename_repo_by_repo_id`` for the full rationale.
 
         Returns the list of updated project ids.
         """
@@ -692,7 +696,7 @@ class ProjectStore:
                 github_owner=new_owner,
                 github_owner_id=new_owner_id,
                 github_repo=new_repo,
-                date_updated=SqlProject.date_updated,
+                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )
@@ -720,13 +724,12 @@ class ProjectStore:
         ``Acme/Docs`` still matches a payload that delivers
         ``acme/docs``.
 
-        ``date_updated`` is explicitly preserved: this write is
-        sync-bookkeeping, not an operator-visible source-coordinate
-        edit, and bumping ``date_updated`` here would mislead any
-        consumer that reads it as ``last operator change``. Mirrors
-        the same discipline the dashboard binding store's
-        ``rename_*`` / ``mark_unreachable_by_installation_id``
-        methods already apply.
+        ``date_updated`` is stamped forward (PRD #634):
+        ``github_installation_id`` surfaces on the wire as the
+        binding's ``installation_status`` and ``app_url``, so a project
+        coming into an installation's scope is a change a poller such
+        as Ook has to be able to see. See ``rename_repo_by_repo_id``
+        for the full rationale.
 
         Returns the list of project ids that were updated, so the
         caller can log a count (``projects_updated=N``) without a
@@ -743,7 +746,7 @@ class ProjectStore:
                 github_installation_id=installation_id,
                 github_owner_id=owner_id,
                 github_repo_id=repo_id,
-                date_updated=SqlProject.date_updated,
+                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )
@@ -773,12 +776,13 @@ class ProjectStore:
         binding's columns — better to lose this update than to write
         ids that disagree with ``github_owner`` / ``github_repo``.
 
-        ``date_updated`` is explicitly preserved: capturing the three
-        opportunistic ``github_*_id`` columns is sync-bookkeeping, not
-        an operator-visible source-coordinate edit, so bumping
-        ``date_updated`` here would mislead any consumer that reads it
-        as ``last operator change``. Mirrors ``apply_installation_scope``
-        and the dashboard binding store.
+        ``date_updated`` is stamped forward (PRD #634): resolving the
+        installation flips the binding's ``installation_status`` (and
+        its ``app_url``) on the project GET, so the resolve is a change
+        the clock has to report to a poller such as Ook. The guard
+        above means a short-circuited run writes nothing and so leaves
+        the clock alone. See ``rename_repo_by_repo_id`` for the full
+        rationale.
 
         Returns ``True`` when the row was updated, ``False`` when no
         row matched (project deleted, or binding changed).
@@ -795,7 +799,7 @@ class ProjectStore:
                 github_installation_id=installation_id,
                 github_owner_id=owner_id,
                 github_repo_id=repo_id,
-                date_updated=SqlProject.date_updated,
+                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )

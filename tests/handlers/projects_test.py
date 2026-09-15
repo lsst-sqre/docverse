@@ -1714,6 +1714,57 @@ H_MID = datetime(2026, 2, 1, tzinfo=UTC)
 H_NEW = datetime(2026, 3, 1, tzinfo=UTC)
 
 
+async def _stamp_date_updated(*stamps: tuple[str, datetime]) -> None:
+    """Pin ``date_updated`` on each named project to a fixed instant.
+
+    An explicit value in ``.values()`` beats the column's ``onupdate``,
+    so this is how a test names a clock the transaction clock would
+    otherwise choose for it.
+    """
+    async for session in db_session_dependency():
+        async with session.begin():
+            for slug, stamp in stamps:
+                await session.execute(
+                    update(SqlProject)
+                    .where(SqlProject.slug == slug)
+                    .values(date_updated=stamp)
+                    .execution_options(synchronize_session=False)
+                )
+            await session.commit()
+        break
+
+
+async def _resolve_github_binding(
+    *, slug: str, owner: str, repo: str, installation_id: int
+) -> None:
+    """Land a GitHub binding the way the resolve worker does.
+
+    Stands in for ``worker.functions.project_github_resolve``, which
+    calls :meth:`~docverse_server.storage.project_store.ProjectStore
+    .update_github_metadata` after its GitHub round-trip.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_id = (
+                await session.execute(
+                    select(SqlProject.id).where(SqlProject.slug == slug)
+                )
+            ).scalar_one()
+            store = ProjectStore(session=session, logger=logger)
+            updated = await store.update_github_metadata(
+                project_id=project_id,
+                expected_owner=owner,
+                expected_repo=repo,
+                installation_id=installation_id,
+                owner_id=111,
+                repo_id=222,
+            )
+            await session.commit()
+        assert updated
+        break
+
+
 async def _seed_clocked_projects(client: AsyncClient) -> None:
     """Create three ``tick-*`` projects with pinned ``date_updated``."""
     headers = {"X-Auth-Request-User": "testuser"}
@@ -1725,20 +1776,9 @@ async def _seed_clocked_projects(client: AsyncClient) -> None:
         )
         assert response.status_code == 201
 
-    async for session in db_session_dependency():
-        async with session.begin():
-            for slug, stamp in (
-                ("tick-old", H_OLD),
-                ("tick-mid", H_MID),
-                ("tick-new", H_NEW),
-            ):
-                await session.execute(
-                    update(SqlProject)
-                    .where(SqlProject.slug == slug)
-                    .values(date_updated=stamp)
-                    .execution_options(synchronize_session=False)
-                )
-            await session.commit()
+    await _stamp_date_updated(
+        ("tick-old", H_OLD), ("tick-mid", H_MID), ("tick-new", H_NEW)
+    )
 
 
 @pytest.mark.asyncio
@@ -1778,6 +1818,51 @@ async def test_list_projects_updated_since_with_query(
     assert response.status_code == 200
     assert [p["slug"] for p in response.json()] == ["tick-new"]
     assert response.headers["X-Total-Count"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_updated_since_after_github_resolve(
+    client: AsyncClient,
+) -> None:
+    """A GitHub-binding write brings a project back into the window.
+
+    Task #644: the resolve worker's ``update_github_metadata`` used to
+    pin ``date_updated``, so a project whose ``installation_status``
+    had just flipped stayed invisible to a poller's ``updated_since``
+    pass. The clock now advances, so the next poll picks it up.
+    """
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "tick-gh",
+            "title": "Tick GH",
+            "github": {"owner": "lsst", "repo": "tick-gh"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    await _stamp_date_updated(("tick-gh", H_OLD))
+    params = {"updated_since": H_MID.isoformat()}
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    before = await client.get(
+        "/docverse/orgs/proj-org/projects", params=params, headers=headers
+    )
+    assert before.status_code == 200
+    assert [p["slug"] for p in before.json()] == []
+
+    await _resolve_github_binding(
+        slug="tick-gh", owner="lsst", repo="tick-gh", installation_id=7
+    )
+
+    after = await client.get(
+        "/docverse/orgs/proj-org/projects", params=params, headers=headers
+    )
+
+    assert after.status_code == 200
+    assert [p["slug"] for p in after.json()] == ["tick-gh"]
+    assert after.headers["X-Total-Count"] == "1"
 
 
 @pytest.mark.asyncio
@@ -2295,6 +2380,50 @@ async def test_get_project_etag_changes_after_default_edition_patch(
     assert second.headers["ETag"] != first.headers["ETag"]
     # The project row itself did not move; the edition's clock did.
     assert second.json()["date_updated"] == project_clock
+
+
+@pytest.mark.asyncio
+async def test_get_project_etag_changes_after_github_resolve(
+    client: AsyncClient,
+) -> None:
+    """The resolve worker's binding write invalidates a cached project.
+
+    Task #644: the four GitHub-binding writes used to pin
+    ``date_updated``, which froze the project's validators even though
+    ``installation_status`` had flipped on the wire. The clock now
+    advances, so a poller holding the old tag is told to refetch.
+    """
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "resolved",
+            "title": "Resolved",
+            "github": {"owner": "lsst", "repo": "resolved"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects/resolved", headers=headers
+    )
+    assert first.status_code == 200
+    assert first.json()["github"]["installation_status"] == "not_installed"
+
+    await _resolve_github_binding(
+        slug="resolved", owner="lsst", repo="resolved", installation_id=42
+    )
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects/resolved",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+
+    assert second.status_code == 200
+    assert second.headers["ETag"] != first.headers["ETag"]
+    assert second.json()["github"]["installation_status"] == "installed"
 
 
 @pytest.mark.asyncio
