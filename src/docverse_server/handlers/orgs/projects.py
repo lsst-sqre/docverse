@@ -34,6 +34,7 @@ from docverse_server.metrics import (
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse_server.services.project import patch_changes_github_binding
 from docverse_server.services.project_github_resolve_enqueue import (
     try_enqueue_project_github_resolve_by_id,
 )
@@ -442,12 +443,18 @@ async def patch_project(
         org_slug=org_slug,
         project_slug=project_slug,
     )
-    await try_enqueue_project_github_resolve_by_id(
-        factory=context.factory,
-        session=context.session,
-        logger=context.logger,
-        project_id=project.id,
-    )
+    # Only a PATCH that actually rewrote the binding is worth a
+    # resolve (task #651). A retitle leaves all five ``github_*``
+    # columns alone, so the worker would re-read the ids it already
+    # resolved — a maintenance-queue job per edit, and one more write
+    # to a row whose representation did not change.
+    if patch_changes_github_binding(data):
+        await try_enqueue_project_github_resolve_by_id(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            project_id=project.id,
+        )
     return Project.from_domain(
         project,
         context.request,

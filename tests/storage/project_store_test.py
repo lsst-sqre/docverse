@@ -255,6 +255,61 @@ async def test_rename_repo_by_repo_id_advances_date_updated(
 
 
 @pytest.mark.asyncio
+async def test_rename_repo_by_repo_id_noop_pins_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A rename to the name already stored moves no clock.
+
+    Task #651: a redelivered ``repository.renamed`` (or one whose
+    payload has already been applied) writes the name the row holds, so
+    nothing changes on the wire and no ETag should be retired.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="rename-noop",
+                title="Rename Noop",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="same-repo"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="same-repo",
+        )
+        await store.apply_installation_scope(
+            installation_id=111,
+            owner="acme",
+            owner_id=222,
+            repo="same-repo",
+            repo_id=333,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.rename_repo_by_repo_id(
+            github_repo_id=333,
+            new_repo="same-repo",
+        )
+        await db_session.commit()
+    assert updated_ids == []
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
 async def test_transfer_repo_by_repo_id_advances_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
@@ -314,6 +369,61 @@ async def test_transfer_repo_by_repo_id_advances_date_updated(
 
 
 @pytest.mark.asyncio
+async def test_transfer_repo_by_repo_id_noop_pins_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A transfer into the namespace already stored moves no clock.
+
+    Task #651: replaying ``repository.transferred`` after it has landed
+    rewrites owner, owner_id, and repo with the values the row already
+    holds, which changes nothing a poller can observe.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="transfer-noop",
+                title="Transfer Noop",
+                github=ProjectGitHubBindingCreate(owner="beta", repo="repo"),
+            ),
+            github_owner="beta",
+            github_repo="repo",
+        )
+        await store.apply_installation_scope(
+            installation_id=111,
+            owner="beta",
+            owner_id=444,
+            repo="repo",
+            repo_id=333,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.transfer_repo_by_repo_id(
+            github_repo_id=333,
+            new_owner="beta",
+            new_owner_id=444,
+            new_repo="repo",
+        )
+        await db_session.commit()
+    assert updated_ids == []
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
 async def test_apply_installation_scope_advances_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
@@ -364,6 +474,64 @@ async def test_apply_installation_scope_advances_date_updated(
     assert after is not None
     assert after.github_installation_id == 11
     assert after.date_updated > baseline
+
+
+@pytest.mark.asyncio
+async def test_apply_installation_scope_redelivery_pins_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A redelivered ``installation`` webhook moves no clock.
+
+    Task #651: GitHub redelivers ``installation.created`` freely, and an
+    installation listing 40 already-scoped repos would otherwise retire
+    40 project ETags and re-emit 40 identical rows into every poller's
+    ``updated_since`` window. The write is now predicated on the binding
+    ids actually differing, so the redelivery matches no row.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="rescope-me",
+                title="Rescope Me",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="docs"),
+            ),
+            github_owner="acme",
+            github_repo="docs",
+        )
+        await store.apply_installation_scope(
+            installation_id=11,
+            owner="acme",
+            owner_id=22,
+            repo="docs",
+            repo_id=33,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.apply_installation_scope(
+            installation_id=11,
+            owner="acme",
+            owner_id=22,
+            repo="docs",
+            repo_id=33,
+        )
+        await db_session.commit()
+    assert updated_ids == []
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
 
 
 @pytest.mark.asyncio
@@ -418,6 +586,68 @@ async def test_update_github_metadata_advances_date_updated(
     assert after.github_owner_id == 20
     assert after.github_repo_id == 30
     assert after.date_updated > baseline
+
+
+@pytest.mark.asyncio
+async def test_update_github_metadata_reresolve_pins_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A re-resolve that finds nothing new moves no clock.
+
+    Task #651: the resolve worker runs on every PATCH of a bound
+    project, so a bulk retitle of 100 projects used to leave 100
+    phantom clock advances behind it — each one a second 200 with an
+    unchanged body for every poller. The write now matches no row when
+    the three ids are already in place, yet still reports success so
+    the worker logs ``completed`` rather than the binding-changed
+    ``skipped``.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="meta-again",
+                title="Meta Again",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
+            ),
+            github_owner="acme",
+            github_repo="repo",
+        )
+        await store.update_github_metadata(
+            project_id=created.id,
+            expected_owner="acme",
+            expected_repo="repo",
+            installation_id=10,
+            owner_id=20,
+            repo_id=30,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated = await store.update_github_metadata(
+            project_id=created.id,
+            expected_owner="acme",
+            expected_repo="repo",
+            installation_id=10,
+            owner_id=20,
+            repo_id=30,
+        )
+        await db_session.commit()
+    assert updated is True
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
 
 
 @pytest.mark.asyncio

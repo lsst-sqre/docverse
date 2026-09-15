@@ -19,6 +19,7 @@ from sqlalchemy import (
     Row,
     cast,
     extract,
+    or_,
     select,
     update,
 )
@@ -651,30 +652,28 @@ class ProjectStore:
         (:attr:`docverse_server.domain.project.Project.effective_source_url`),
         so it follows automatically without a stored value to rewrite.
 
-        ``date_updated`` is stamped forward (PRD #634): the project's
-        clock is a change signal for pollers such as Ook, not a "last
-        operator edit" marker, and a rename changes ``source_url`` on
-        the wire. Leaving the clock pinned would hide the new URL from
-        the listing's ETag and its ``updated_since`` filter alike. The
-        stamp is explicit rather than left to the
-        column's ``onupdate``, matching ``soft_delete`` and
-        :meth:`~docverse_server.storage.edition_store.EditionStore
-        .set_current_build`. The dashboard binding store's own
-        ``rename_repo_by_repo_id`` keeps its clock pinned; that row
-        feeds no public listing.
+        A rename changes ``source_url`` on the wire, so the project's
+        clock moves with it. The ``IS DISTINCT FROM`` predicate is what
+        keeps that honest the other way: a redelivered
+        ``repository.renamed``, or one naming the repo the row already
+        holds, matches no row rather than rewriting the same string and
+        retiring every ETag on the repo. Both halves of the rule live
+        on ``date_updated`` in
+        :class:`~docverse_server.dbschema.project.SqlProject`; the
+        dashboard binding store's own ``rename_repo_by_repo_id`` pins
+        its clock instead, because that row feeds no public listing.
 
-        Returns the list of updated project ids.
+        Returns the list of updated project ids — empty when the rename
+        was already applied.
         """
         stmt = (
             update(SqlProject)
             .where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
+                SqlProject.github_repo.is_distinct_from(new_repo),
             )
-            .values(
-                github_repo=new_repo,
-                date_updated=func.now(),
-            )
+            .values(github_repo=new_repo)
             .returning(SqlProject.id)
         )
         result = await self._session.execute(stmt)
@@ -700,25 +699,29 @@ class ProjectStore:
         flip; the operator-visible source URL is derived from the
         binding, so it follows automatically.
 
-        ``date_updated`` is stamped forward (PRD #634): a transfer
-        moves the repo into a new owner namespace, so the project's
-        ``source_url`` changes on the wire and the clock a poller such
-        as Ook watches has to advance with it. See
+        The ``IS DISTINCT FROM`` predicate keeps a replayed transfer —
+        one whose three columns already hold the payload's values —
+        from rewriting them and moving the project's clock anyway. See
         ``rename_repo_by_repo_id`` for the full rationale.
 
-        Returns the list of updated project ids.
+        Returns the list of updated project ids — empty when the
+        transfer was already applied.
         """
         stmt = (
             update(SqlProject)
             .where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
+                or_(
+                    SqlProject.github_owner.is_distinct_from(new_owner),
+                    SqlProject.github_owner_id.is_distinct_from(new_owner_id),
+                    SqlProject.github_repo.is_distinct_from(new_repo),
+                ),
             )
             .values(
                 github_owner=new_owner,
                 github_owner_id=new_owner_id,
                 github_repo=new_repo,
-                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )
@@ -746,16 +749,17 @@ class ProjectStore:
         ``Acme/Docs`` still matches a payload that delivers
         ``acme/docs``.
 
-        ``date_updated`` is stamped forward (PRD #634):
-        ``github_installation_id`` surfaces on the wire as the
-        binding's ``installation_status`` and ``app_url``, so a project
-        coming into an installation's scope is a change a poller such
-        as Ook has to be able to see. See ``rename_repo_by_repo_id``
-        for the full rationale.
+        The ``IS DISTINCT FROM`` predicate makes a redelivery free:
+        GitHub replays ``installation.created`` at will, and an
+        installation listing 40 already-scoped repos would otherwise
+        rewrite 40 rows with the values they already hold, advancing 40
+        project clocks and retiring every cached ETag in the org at
+        once. See ``rename_repo_by_repo_id``.
 
         Returns the list of project ids that were updated, so the
         caller can log a count (``projects_updated=N``) without a
-        separate round-trip.
+        separate round-trip. A redelivery that changed nothing returns
+        an empty list.
         """
         stmt = (
             update(SqlProject)
@@ -763,12 +767,18 @@ class ProjectStore:
                 func.lower(SqlProject.github_owner) == owner.lower(),
                 func.lower(SqlProject.github_repo) == repo.lower(),
                 SqlProject.date_deleted.is_(None),
+                or_(
+                    SqlProject.github_installation_id.is_distinct_from(
+                        installation_id
+                    ),
+                    SqlProject.github_owner_id.is_distinct_from(owner_id),
+                    SqlProject.github_repo_id.is_distinct_from(repo_id),
+                ),
             )
             .values(
                 github_installation_id=installation_id,
                 github_owner_id=owner_id,
                 github_repo_id=repo_id,
-                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )
@@ -798,36 +808,59 @@ class ProjectStore:
         binding's columns — better to lose this update than to write
         ids that disagree with ``github_owner`` / ``github_repo``.
 
-        ``date_updated`` is stamped forward (PRD #634): resolving the
-        installation flips the binding's ``installation_status`` (and
-        its ``app_url``) on the project GET, so the resolve is a change
-        the clock has to report to a poller such as Ook. The guard
-        above means a short-circuited run writes nothing and so leaves
-        the clock alone. See ``rename_repo_by_repo_id`` for the full
-        rationale.
+        Resolving the installation flips the binding's
+        ``installation_status`` (and its ``app_url``) on the project
+        GET, so a resolve that lands new ids moves the project's clock.
+        The ``IS DISTINCT FROM`` predicate covers the other case: a
+        re-resolve finding the three ids it already stored would
+        otherwise move the clock for a body no poller can tell apart
+        from the one it holds. See ``rename_repo_by_repo_id``.
 
-        Returns ``True`` when the row was updated, ``False`` when no
-        row matched (project deleted, or binding changed).
+        Returns ``True`` when the row now carries these ids — whether
+        this call wrote them or found them already in place — and
+        ``False`` when the guard matched no row (project deleted, or
+        binding changed). The second query runs only on the no-write
+        path, where it separates "already resolved" from "guard
+        missed"; the update path answers in one round-trip.
         """
+        guard = (
+            SqlProject.id == project_id,
+            SqlProject.github_owner == expected_owner,
+            SqlProject.github_repo == expected_repo,
+            SqlProject.date_deleted.is_(None),
+        )
         stmt = (
             update(SqlProject)
             .where(
-                SqlProject.id == project_id,
-                SqlProject.github_owner == expected_owner,
-                SqlProject.github_repo == expected_repo,
-                SqlProject.date_deleted.is_(None),
+                *guard,
+                or_(
+                    SqlProject.github_installation_id.is_distinct_from(
+                        installation_id
+                    ),
+                    SqlProject.github_owner_id.is_distinct_from(owner_id),
+                    SqlProject.github_repo_id.is_distinct_from(repo_id),
+                ),
             )
             .values(
                 github_installation_id=installation_id,
                 github_owner_id=owner_id,
                 github_repo_id=repo_id,
-                date_updated=func.now(),
             )
             .returning(SqlProject.id)
         )
         result = await self._session.execute(stmt)
         await self._session.flush()
-        return result.first() is not None
+        if result.first() is not None:
+            return True
+        # Nothing was written. The distinct predicate is the only thing
+        # the UPDATE added to ``guard``, so a row that still satisfies
+        # ``guard`` is one whose ids already equal the ones we were
+        # asked to persist — a success with no clock to move. No row at
+        # all means the guard missed.
+        unchanged = await self._session.execute(
+            select(SqlProject.id).where(*guard)
+        )
+        return unchanged.first() is not None
 
     async def soft_delete(
         self, *, org_id: int, slug: str, reason: TombstoneReason

@@ -173,6 +173,76 @@ async def test_patch_project_with_github_enqueues_resolve(
 
 
 @pytest.mark.asyncio
+async def test_patch_project_title_only_does_not_enqueue_resolve(
+    client: AsyncClient,
+) -> None:
+    """A metadata-only PATCH of a bound project enqueues nothing.
+
+    Task #651: the PATCH handler used to enqueue a resolve on every
+    edit of a bound project, so retitling 100 projects queued 100 jobs
+    whose only effect was to re-read the ids already stored — and, back
+    when that write stamped the clock unconditionally, to hand every
+    poller a second 200 with an unchanged body. The binding did not
+    move, so there is nothing to resolve.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/pgr-org/projects",
+        json={
+            "slug": "gh-retitle",
+            "title": "GH Retitle",
+            "github": {"owner": "lsst", "repo": "gh-retitle"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    before = _resolve_count()
+
+    patch = await client.patch(
+        "/docverse/orgs/pgr-org/projects/gh-retitle",
+        json={"title": "GH Retitled"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert patch.status_code == 200
+
+    after = _resolve_count()
+    assert after - before == 0
+
+
+@pytest.mark.asyncio
+async def test_patch_project_source_url_null_does_not_enqueue_resolve(
+    client: AsyncClient,
+) -> None:
+    """``source_url: null`` on a bound project enqueues nothing.
+
+    ``ProjectService._resolve_github_for_update`` treats an explicit
+    ``source_url: null`` as a no-op for the binding — the derived URL
+    already comes from ``github`` — so the gate reads it as a metadata
+    edit, not a rebind.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/pgr-org/projects",
+        json={
+            "slug": "gh-clear-url",
+            "title": "GH Clear URL",
+            "github": {"owner": "lsst", "repo": "gh-clear-url"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    before = _resolve_count()
+
+    patch = await client.patch(
+        "/docverse/orgs/pgr-org/projects/gh-clear-url",
+        json={"source_url": None},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert patch.status_code == 200
+
+    after = _resolve_count()
+    assert after - before == 0
+
+
+@pytest.mark.asyncio
 async def test_patch_project_clearing_github_does_not_enqueue_resolve(
     client: AsyncClient,
 ) -> None:

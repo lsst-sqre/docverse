@@ -24,6 +24,30 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import ProjectSearchCursor
 from docverse_server.storage.project_store import ProjectStore
 
+__all__ = ["ProjectService", "patch_changes_github_binding"]
+
+
+def patch_changes_github_binding(data: ProjectUpdate) -> bool:
+    """Report whether a PATCH body rewrites the project's GitHub binding.
+
+    Two PATCH shapes reach the binding columns, and they are exactly the
+    branches :meth:`ProjectService._resolve_github_for_update` acts on:
+    naming ``github`` (setting it, or clearing it with ``null``), and
+    supplying a non-null ``source_url``, which the validator guarantees
+    is non-GitHub and which therefore clears the binding. Every other
+    PATCH — a retitle, new lifecycle rules, an explicit
+    ``source_url: null`` on a bound project — leaves all five
+    ``github_*`` columns exactly as they were.
+
+    The handler uses this to decide whether a PATCH is worth a
+    ``project_github_resolve`` job (task #651). Without the gate a bulk
+    retitle of 100 projects queued 100 jobs that re-read the ids they
+    had already resolved. Keeping the predicate beside
+    ``_resolve_github_for_update``, which consults it for its own
+    short-circuit, is what stops the two from drifting apart.
+    """
+    return "github" in data.model_fields_set or data.source_url is not None
+
 
 class ProjectService:
     """Business logic for project management."""
@@ -102,8 +126,12 @@ class ProjectService:
           project flips to the non-GitHub URL.
         * otherwise → no github_* / source_url overrides; the
           ``exclude_unset`` model dump in the store handles a plain
-          ``source_url: null`` clear on its own.
+          ``source_url: null`` clear on its own. This is the case
+          :func:`patch_changes_github_binding` screens out, and the
+          handler's resolve-enqueue gate reads the same answer.
         """
+        if not patch_changes_github_binding(data):
+            return {}
         cleared = {
             "github_owner": None,
             "github_repo": None,
@@ -122,9 +150,9 @@ class ProjectService:
                 "github_installation_id": None,
                 "source_url": None,
             }
-        if data.source_url is not None:
-            return cleared
-        return {}
+        # A non-null ``source_url``, guaranteed non-GitHub by the
+        # validator, so the binding goes.
+        return cleared
 
     async def create(
         self, *, org_slug: str, data: ProjectCreate

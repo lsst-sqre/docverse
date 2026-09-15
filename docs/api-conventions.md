@@ -455,6 +455,17 @@ repoint. A repoint of any other edition, a `publish_status` flip, and a
 repoint the stale-build or deleted-build guard refuses all leave the
 project's clock alone.
 
+The clock is a change signal, so the writes that change nothing are
+held to the same rule from the other side. A GitHub-binding write only
+advances it when the binding values it writes actually differ from the
+ones already stored: a redelivered `installation.created` naming repos
+already in scope, a `repository.renamed` replayed after it landed, and
+a resolve that re-reads the ids it stored last time all match zero rows
+and move no clock. A `PATCH` that leaves the binding alone does not
+trigger a resolve at all. Without that, a poller would be told to
+refetch bodies it already holds — once per webhook redelivery, and a
+second time seconds after every metadata `PATCH`.
+
 Pair `updated_since` with `order=date_updated` for the "what changed?"
 traversal, and with the `ETag` above so that a pass finding nothing new
 costs one watermark query and no body at all. The `docverse` client

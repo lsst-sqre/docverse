@@ -86,6 +86,30 @@ class SqlProject(Base):
         server_default=func.now(),
     )
 
+    # The project's clock, and the one rule every writer obeys: this
+    # ``onupdate`` fires on any UPDATE of this row that does not name
+    # the column, so a write that changes something advances the clock
+    # without the writer saying so (PRD #634, tasks #644 / #651). That
+    # clock is a change signal for pollers such as Ook — it feeds the
+    # ``updated_since`` filter, the listing's ``clock_sum`` watermark,
+    # and the ETag on every project endpoint — not a "last operator
+    # edit" marker.
+    #
+    # Two consequences for writers, and no third idiom:
+    #
+    # * Never stamp ``date_updated=func.now()`` explicitly. It emits
+    #   the same SQL the default already emits, and a writer that
+    #   copies the line stops thinking about whether its write is a
+    #   change at all. The one exception lives outside this table's own
+    #   writers: ``EditionStore.set_current_build`` updates this row
+    #   from the edition side with no other column to carry the
+    #   ``onupdate``, so it names the column deliberately.
+    # * A write that may be a no-op — a redelivered webhook, a resolve
+    #   re-reading ids it already stored — narrows its ``WHERE`` with
+    #   ``IS DISTINCT FROM`` on the columns it sets, so the row is
+    #   never reached and the clock never moves. Pinning the column to
+    #   its own value would suppress the clock for *real* changes too;
+    #   the predicate distinguishes the two.
     date_updated: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
