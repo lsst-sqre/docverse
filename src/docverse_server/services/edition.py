@@ -166,6 +166,16 @@ class EditionService:
         and enqueue a ``publish_edition`` job. Unlike rollback, this path
         bypasses the history-membership guard.
 
+        The override runs *before* the metadata write, which is a lock
+        ordering requirement rather than a preference: it is the arm of
+        this method that reaches the project row, and
+        :mod:`docverse_server.storage.edition_store` fixes one order —
+        projects, then editions, then builds — for every writer that
+        touches more than one of them. Flushing the metadata first took
+        the edition row ahead of the project row, which only a payload
+        carrying *both* a metadata field and ``build`` could do: a
+        build-only PATCH emits no ``UPDATE editions`` of its own.
+
         Raises
         ------
         NotFoundError
@@ -178,21 +188,31 @@ class EditionService:
             data.model_dump(exclude={"build"}, exclude_unset=True)
         )
 
+        if build_public_id is not None:
+            target = await self._store.get_by_slug(
+                project_id=project.id, slug=slug
+            )
+            if target is None:
+                msg = f"Edition {slug!r} not found"
+                raise NotFoundError(msg)
+            await self._apply_build_override(
+                org_id=org.id,
+                project_id=project.id,
+                project_slug=project_slug,
+                edition=target,
+                build_public_id=build_public_id,
+            )
+
+        # Re-read rather than reuse the override's return value: the
+        # metadata write is the last thing to touch the row, so its
+        # result is the one that describes the edition the caller gets
+        # back.
         edition = await self._store.update(
             project_id=project.id, slug=slug, data=other_updates
         )
         if edition is None:
             msg = f"Edition {slug!r} not found"
             raise NotFoundError(msg)
-
-        if build_public_id is not None:
-            edition = await self._apply_build_override(
-                org_id=org.id,
-                project_id=project.id,
-                project_slug=project_slug,
-                edition=edition,
-                build_public_id=build_public_id,
-            )
 
         self._logger.info(
             "Updated edition", slug=slug, org=org_slug, project=project_slug

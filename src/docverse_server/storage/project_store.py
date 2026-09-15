@@ -872,6 +872,12 @@ class ProjectStore:
         editions stayed live. Rows already soft-deleted keep their
         earlier timestamps.
 
+        Project, then editions, then builds is also the tree's one lock
+        order, documented in
+        :mod:`docverse_server.storage.edition_store`; a repoint racing
+        this cascade takes the same three rows the same way round, so
+        one of the two waits instead of both aborting.
+
         The handler's post-commit CDN unpublish is unaffected: it
         iterates the edition slugs
         :meth:`~docverse_server.services.project.ProjectService.soft_delete`

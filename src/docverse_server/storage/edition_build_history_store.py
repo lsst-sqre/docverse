@@ -75,10 +75,12 @@ class EditionBuildHistoryStore:
         an ``IntegrityError`` at some caller that has no way to retry.
 
         The lock is released when the caller's transaction ends, per the
-        handler-owns-the-transaction rule, and is taken on ``editions``
-        *after* any ``builds`` lock the caller already holds — the
-        build-then-edition order every other writer on this pair uses.
-        An ``edition_id`` naming no row locks nothing: the store does not
+        handler-owns-the-transaction rule, and introduces no ordering of
+        its own: every caller that also holds a ``builds`` lock got here
+        from ``EditionStore.set_current_build``, which already took this
+        edition row ahead of that build under the order
+        :mod:`docverse_server.storage.edition_store` documents. An
+        ``edition_id`` naming no row locks nothing: the store does not
         own that referential check, and the constraint still backstops
         the position.
         """

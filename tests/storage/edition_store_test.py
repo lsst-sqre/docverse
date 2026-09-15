@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
@@ -40,7 +42,12 @@ from docverse_server.storage.keeper_sync import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.pagination import EditionSlugCursor
 from docverse_server.storage.project_store import ProjectStore
-from tests.support.rowlocks import record_statements
+from tests.support.rowlocks import (
+    LOCK_WAIT_TIMEOUT,
+    backend_pid,
+    record_statements,
+    wait_until_blocked_or_finished,
+)
 
 _HASH = "sha256:" + "a" * 64
 
@@ -1063,19 +1070,33 @@ async def test_set_current_build_leaves_project_when_guard_skips(
     assert after == before
 
 
+def _first_statement_index(
+    statements: list[str],
+    predicate: Callable[[str], bool],
+    what: str,
+) -> int:
+    """Return the index of the first statement matching ``predicate``."""
+    for index, statement in enumerate(statements):
+        if predicate(statement):
+            return index
+    msg = f"no {what} in {statements}"
+    raise AssertionError(msg)
+
+
 @pytest.mark.asyncio
-async def test_set_current_build_locks_project_before_edition(
+async def test_set_current_build_locks_project_then_edition_then_build(
     db_session: AsyncSession,
     edition_store: EditionStore,
 ) -> None:
-    """The ``__main`` repoint takes the project row before the edition.
+    """A ``__main`` repoint locks projects, then editions, then builds.
 
-    ``ProjectStore.soft_delete`` stamps ``projects.date_deleted`` and
-    only then cascades into ``editions``, so a publish that locked the
-    edition first and the project second would be holding exactly the
-    lock the DELETE wants next while waiting for the one it already
-    holds. Nothing in the tree retries a deadlock, so the orders have to
-    agree: project first, edition second.
+    The whole of the lock order this store documents, asserted on the
+    statements one repoint issues. ``ProjectStore.soft_delete`` walks
+    the same three tables in the same order as it cascades, so a
+    repoint that reached any of them early would be holding a row the
+    DELETE wants next while waiting for one the DELETE already holds.
+    Nothing in the tree retries a ``DeadlockDetected``, so the two
+    orders have to agree rather than each be locally reasonable.
     """
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
@@ -1108,16 +1129,165 @@ async def test_set_current_build_locks_project_before_edition(
         await db_session.commit()
     assert updated is not None
 
-    writes = [s.upper() for s in statements if s.upper().startswith("UPDATE ")]
-    project_writes = [
-        i for i, s in enumerate(writes) if s.startswith("UPDATE PROJECTS")
-    ]
-    edition_writes = [
-        i for i, s in enumerate(writes) if s.startswith("UPDATE EDITIONS")
-    ]
-    assert project_writes, f"no UPDATE projects in {writes}"
-    assert edition_writes, f"no UPDATE editions in {writes}"
-    assert max(project_writes) < min(edition_writes)
+    project_lock = _first_statement_index(
+        statements,
+        lambda s: (
+            s.startswith("SELECT projects.id")
+            and s.endswith("FOR NO KEY UPDATE")
+        ),
+        "projects row lock",
+    )
+    edition_lock = _first_statement_index(
+        statements,
+        lambda s: s.endswith("FOR NO KEY UPDATE OF editions"),
+        "editions row lock",
+    )
+    build_lock = _first_statement_index(
+        statements,
+        lambda s: s.endswith("FOR SHARE"),
+        "builds share lock",
+    )
+    assert project_lock < edition_lock < build_lock
+
+    project_write = _first_statement_index(
+        statements,
+        lambda s: s.startswith("UPDATE projects"),
+        "UPDATE projects",
+    )
+    edition_write = _first_statement_index(
+        statements,
+        lambda s: s.startswith("UPDATE editions"),
+        "UPDATE editions",
+    )
+    assert project_write < edition_write
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_does_not_deadlock_with_project_delete(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``__main`` repoint and a project DELETE serialize, not deadlock.
+
+    The interleaving the lock order exists for. The DELETE has stamped
+    ``projects``, cascaded ``editions``, and is about to cascade
+    ``builds`` when keeper-sync starts repointing the same project's
+    ``__main``. A repoint that reached the target build's ``FOR SHARE``
+    first would hold exactly the row the cascade wants next while
+    waiting for the project row the cascade already holds, and nothing
+    recovers from the abort PostgreSQL then picks: ``keeper_sync_project``
+    runs with ``max_tries=1`` and ``delete_project`` simply 500s.
+    Blocking on the project row first, with nothing else held, turns the
+    race into a wait — and the repoint, once it wakes, stands down on
+    the deleted-build guard.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:9999" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await db_session.commit()
+
+    # Park the DELETE between its edition cascade and its build
+    # cascade, which is the only window in which it holds the project
+    # row and still needs the build row.
+    at_builds = asyncio.Event()
+    release_builds = asyncio.Event()
+    cascade_builds = BuildStore.soft_delete_all_by_project
+
+    async def paused_cascade(
+        self: BuildStore, *, project_id: int
+    ) -> list[int]:
+        at_builds.set()
+        await release_builds.wait()
+        return await cascade_builds(self, project_id=project_id)
+
+    monkeypatch.setattr(
+        BuildStore, "soft_delete_all_by_project", paused_cascade
+    )
+
+    repointed: list[Edition | None] = []
+
+    async with (
+        db_session_factory() as delete_session,
+        db_session_factory() as publish_session,
+        db_session_factory() as probe,
+    ):
+        publish_pid = await backend_pid(publish_session)
+
+        async def run_delete() -> None:
+            store = ProjectStore(session=delete_session, logger=logger)
+            await store.soft_delete(
+                org_id=org_id,
+                slug="ed-proj",
+                reason=TombstoneReason.manual_delete,
+            )
+            await delete_session.commit()
+
+        async def run_repoint() -> None:
+            store = EditionStore(session=publish_session, logger=logger)
+            repointed.append(
+                await store.set_current_build(
+                    edition_id=edition.id, build_id=build.id
+                )
+            )
+            await publish_session.commit()
+
+        deleting = asyncio.ensure_future(run_delete())
+        repointing: asyncio.Task[None] | None = None
+        parked = False
+        try:
+            await asyncio.wait_for(at_builds.wait(), timeout=LOCK_WAIT_TIMEOUT)
+            repointing = asyncio.ensure_future(run_repoint())
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=publish_pid, task=repointing
+            )
+            release_builds.set()
+            await deleting
+            await repointing
+        finally:
+            release_builds.set()
+            for task in (deleting, repointing):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+            await delete_session.rollback()
+            await publish_session.rollback()
+
+    # The repoint waited on the project row rather than sailing past it
+    # holding the build.
+    assert parked
+    # And having waited, it found the build the cascade deleted.
+    assert repointed == [None]
+
+    async with db_session_factory() as reader:
+        row = (
+            await reader.execute(
+                select(SqlEdition).where(SqlEdition.id == edition.id)
+            )
+        ).scalar_one()
+        assert row.current_build_id is None
+        assert row.date_deleted is not None
 
 
 @pytest.mark.asyncio
