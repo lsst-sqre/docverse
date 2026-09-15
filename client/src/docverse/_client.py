@@ -79,16 +79,28 @@ class ProjectList:
     etag: str | None = None
     """The first page's ``ETag``, or `None` if the server sent none.
 
-    An opaque validator: pass it back verbatim as ``if_none_match`` on
-    the next poll rather than interpreting it.
+    **The validator to poll with.** Pass it back verbatim as
+    ``if_none_match`` on the next call rather than interpreting it: it
+    is opaque, and it is derived from the listing's watermark at full
+    precision, so it notices a change however soon after the last one
+    it landed.
     """
 
     last_modified: str | None = None
     """The first page's ``Last-Modified``, or `None` if none was sent.
 
-    The raw HTTP-date string, to be passed back verbatim as
-    ``if_modified_since``; it is left unparsed so a round trip cannot
-    lose the second-granularity truncation the server applied.
+    A **fallback** validator, for a caller that has no ``ETag`` to echo
+    — prefer `etag` whenever one is available. The raw HTTP-date
+    string, passed back verbatim as ``if_modified_since`` and left
+    unparsed so a round trip cannot lose the second-granularity
+    truncation the server applied.
+
+    That truncation is the reason it is second best. An HTTP date names
+    a whole second, so a write landing later in the second this value
+    names could not be told apart from the state the caller already
+    holds. The server declines a date-based 304 while that second is
+    still open (:rfc:`7232` §2.2.1), which closes the hole at the cost
+    of one redundant full response per second of write activity.
     """
 
     not_modified: bool = False
@@ -266,11 +278,16 @@ class DocverseClient:
         order
             Sort order: ``slug``, ``date_created``, or ``date_updated``.
         if_none_match
-            An ``ETag`` from a previous call, sent as ``If-None-Match``.
+            An ``ETag`` from a previous call, sent as ``If-None-Match``
+            — the validator to poll with, for the reason given on
+            `ProjectList.etag`.
         if_modified_since
             A ``Last-Modified`` value from a previous call, sent as
-            ``If-Modified-Since``. The server consults it only when
-            ``if_none_match`` is absent.
+            ``If-Modified-Since``. A fallback for a caller that holds
+            no ``ETag``: the server consults it only when
+            ``if_none_match`` is absent, and refuses it while the
+            second it names is still open, so a poll inside that second
+            costs a full response. See `ProjectList.last_modified`.
 
         Returns
         -------

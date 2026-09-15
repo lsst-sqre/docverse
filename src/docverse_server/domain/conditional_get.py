@@ -213,6 +213,7 @@ def evaluate_preconditions(
     if_modified_since: str | None,
     etag: str,
     last_modified: datetime,
+    now: datetime,
 ) -> ConditionalGetResult:
     """Decide whether a conditional GET may be answered with a 304.
 
@@ -228,6 +229,10 @@ def evaluate_preconditions(
         The watermark behind that representation, at full precision;
         it is truncated to the second here so the comparison matches
         what the ``Last-Modified`` header actually told the client.
+    now
+        The server's current instant, timezone-aware. Only the
+        date-based branch consults it, to refuse a 304 whose second is
+        still open (see Notes).
 
     Returns
     -------
@@ -240,6 +245,18 @@ def evaluate_preconditions(
     present it is evaluated and ``If-Modified-Since`` is not consulted
     at all — *even when the tags do not match*. The date is a fallback
     for clients that have no tag to echo, never a second opinion.
+
+    :rfc:`7232` §2.2.1 is why ``now`` is here. ``Last-Modified`` is the
+    watermark truncated to the second, so every write that lands later
+    in that same second is invisible to the date comparison — the
+    client echoes back the second it was told, and the truncated
+    watermark still matches it. The change would then stay hidden until
+    some unrelated later-second write moved the clock again. So while
+    the watermark's second is still the current one, the date is
+    refused as a validator and the representation is sent in full: one
+    needless body per second of write activity, in exchange for never
+    losing a change. Entity-tags hash the watermark at full precision
+    and are not affected, which is why they are the validator to prefer.
     """
     if if_none_match is not None:
         return ConditionalGetResult(
@@ -249,8 +266,11 @@ def evaluate_preconditions(
     if if_modified_since is not None:
         since = parse_http_date(if_modified_since)
         if since is not None:
+            second = truncate_to_second(last_modified)
             return ConditionalGetResult(
-                not_modified=truncate_to_second(last_modified) <= since,
+                not_modified=(
+                    second <= since and second < truncate_to_second(now)
+                ),
                 precondition=PreconditionKind.last_modified,
             )
     return ConditionalGetResult(not_modified=False, precondition=None)

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -23,7 +24,10 @@ from docverse_server.domain.base32id import (
     serialize_base32_id,
     validate_base32_id,
 )
-from docverse_server.domain.conditional_get import parse_http_date
+from docverse_server.domain.conditional_get import (
+    format_http_date,
+    parse_http_date,
+)
 from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
@@ -2088,6 +2092,23 @@ async def test_list_projects_include_deleted_with_query(
 # ---------------------------------------------------------------------------
 
 
+async def _wait_out_the_second(http_date: str) -> None:
+    """Block until the second an HTTP date names is behind the server.
+
+    A date-only 304 is refused while the watermark's second is still
+    the current one (RFC 7232 §2.2.1), and a resource a test wrote
+    moments earlier is in exactly that state. Waiting the second out is
+    how such a test reaches the ordinary steady state a poller sees.
+    """
+    named = parse_http_date(http_date)
+    assert named is not None
+    remaining = (
+        named + timedelta(seconds=1) - datetime.now(tz=UTC)
+    ).total_seconds()
+    if remaining > 0:
+        await asyncio.sleep(remaining + 0.05)
+
+
 @pytest.mark.asyncio
 async def test_list_projects_sends_validators(client: AsyncClient) -> None:
     """The listing carries a weak ``ETag`` and a ``Last-Modified``."""
@@ -2221,6 +2242,52 @@ async def test_list_projects_if_modified_since_alone_is_304(
 
 
 @pytest.mark.asyncio
+async def test_list_projects_if_modified_since_declines_an_open_second(
+    client: AsyncClient,
+) -> None:
+    """A date is refused while the watermark's second is still running.
+
+    ``Last-Modified`` carries whole seconds, so a write landing later
+    in the second a poller was told about would be invisible to the
+    date comparison (RFC 7232 §2.2.1). The listing answers 200 until
+    that second closes, and only then lets the date earn a 304.
+    """
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    # Put the org watermark in a second that is still open when the
+    # request lands — the shape of a write that commits between two
+    # polls. Stamped a second ahead so the boundary cannot fall
+    # between choosing the instant and the handler reading its clock.
+    watermark = datetime.now(tz=UTC).replace(microsecond=0) + timedelta(
+        seconds=1
+    )
+    await _stamp_date_updated(("tick-new", watermark))
+    http_date = format_http_date(watermark)
+
+    open_second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-Modified-Since": http_date},
+    )
+
+    assert open_second.status_code == 200
+    assert open_second.headers["Last-Modified"] == http_date
+
+    # Once the clock leaves that second, nothing more can land inside
+    # it and the same date becomes a sound validator.
+    await _wait_out_the_second(http_date)
+
+    closed_second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-Modified-Since": http_date},
+    )
+
+    assert closed_second.status_code == 304
+    assert closed_second.content == b""
+
+
+@pytest.mark.asyncio
 async def test_list_projects_pages_have_distinct_etags(
     client: AsyncClient,
 ) -> None:
@@ -2350,6 +2417,10 @@ async def test_get_project_if_modified_since_alone_is_304(
         "/docverse/orgs/proj-org/projects/solo", headers=headers
     )
     assert first.status_code == 200
+    # The project was written moments ago, so its second is still open
+    # and a date could not yet be trusted to reveal a write landing in
+    # it. Wait it out to reach the state an ordinary poller sees.
+    await _wait_out_the_second(first.headers["Last-Modified"])
 
     second = await client.get(
         "/docverse/orgs/proj-org/projects/solo",

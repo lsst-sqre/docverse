@@ -39,6 +39,7 @@ async def evaluate_conditional_get(
     project: str | None = None,
     etag: str,
     last_modified: datetime,
+    now: datetime,
 ) -> Response | None:
     """Apply a request's preconditions and set the response validators.
 
@@ -64,6 +65,15 @@ async def evaluate_conditional_get(
     last_modified
         The resource watermark, at full precision; it is truncated to
         the second on the way into the header.
+    now
+        The handler's current instant, timezone-aware. A date-only
+        precondition is refused while the watermark's second is still
+        open, because a write landing later in that same second would
+        be invisible to a comparison of truncated dates; see
+        :func:`~docverse_server.domain.conditional_get
+        .evaluate_preconditions`. Passed in rather than read here so
+        one handler's clock is one instant, whatever else it goes on
+        to compare it against.
 
     Returns
     -------
@@ -90,6 +100,7 @@ async def evaluate_conditional_get(
         if_modified_since=context.request.headers.get("If-Modified-Since"),
         etag=etag,
         last_modified=last_modified,
+        now=now,
     )
     outcome = ConditionalGetOutcome.from_not_modified(
         not_modified=result.not_modified

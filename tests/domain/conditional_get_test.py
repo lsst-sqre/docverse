@@ -56,6 +56,14 @@ WATERMARK = datetime(2026, 9, 14, 19, 15, 29, 654_321, tzinfo=UTC)
 ETAG = 'W/"0123456789abcdef0123456789abcdef"'
 """Stand-in current entity-tag for the precondition tests."""
 
+NOW = WATERMARK + timedelta(seconds=5)
+"""Stand-in "now" for the precondition tests.
+
+Far enough past :data:`WATERMARK` that its second has closed, which is
+the ordinary case — a date-only 304 is only safe once no further write
+can land inside the second the client was told about.
+"""
+
 
 def test_matching_if_none_match_is_not_modified() -> None:
     """Echoing back the current tag earns a 304 decided by the ETag."""
@@ -64,6 +72,7 @@ def test_matching_if_none_match_is_not_modified() -> None:
         if_modified_since=None,
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is True
@@ -77,6 +86,7 @@ def test_star_if_none_match_is_not_modified() -> None:
         if_modified_since=None,
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is True
@@ -90,6 +100,7 @@ def test_if_none_match_compares_weakly() -> None:
         if_modified_since=None,
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is True
@@ -107,6 +118,7 @@ def test_if_none_match_outranks_if_modified_since() -> None:
         if_modified_since=format_http_date(WATERMARK),
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is False
@@ -120,23 +132,68 @@ def test_unparsable_if_modified_since_is_ignored() -> None:
         if_modified_since="not a date",
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is False
     assert result.precondition is None
 
 
-def test_if_modified_since_alone_is_not_modified_when_clock_is_still() -> None:
-    """Echoing back the ``Last-Modified`` we sent earns a 304."""
+def test_if_modified_since_alone_is_304_once_the_second_closes() -> None:
+    """Echoing back the ``Last-Modified`` we sent earns a 304.
+
+    Once the watermark's second is behind the server, nothing more can
+    land inside it, so the date the client holds is a sound validator.
+    """
     result = evaluate_preconditions(
         if_none_match=None,
         if_modified_since=format_http_date(WATERMARK),
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is True
     assert result.precondition is PreconditionKind.last_modified
+
+
+def test_if_modified_since_is_declined_inside_the_watermark_second() -> None:
+    """A watermark in the current second cannot be validated by date.
+
+    :rfc:`7232` §2.2.1: while the clock is still inside the second the
+    client was told about, a write can land in that same second and the
+    truncated comparison would hide it. Answering 200 costs one
+    needless body and keeps the change from going missing.
+    """
+    result = evaluate_preconditions(
+        if_none_match=None,
+        if_modified_since=format_http_date(WATERMARK),
+        etag=ETAG,
+        last_modified=WATERMARK,
+        now=WATERMARK + timedelta(microseconds=1),
+    )
+
+    assert result.not_modified is False
+    assert result.precondition is PreconditionKind.last_modified
+
+
+def test_if_none_match_is_unaffected_inside_the_watermark_second() -> None:
+    """The ETag path keeps its 304 while the watermark's second runs.
+
+    A tag hashes the watermark at microsecond precision, so it cannot
+    be fooled by a write landing in the same second; only the truncated
+    date can, and only the date is held back.
+    """
+    result = evaluate_preconditions(
+        if_none_match=ETAG,
+        if_modified_since=format_http_date(WATERMARK),
+        etag=ETAG,
+        last_modified=WATERMARK,
+        now=WATERMARK + timedelta(microseconds=1),
+    )
+
+    assert result.not_modified is True
+    assert result.precondition is PreconditionKind.etag
 
 
 def test_if_modified_since_alone_is_modified_once_the_clock_moves() -> None:
@@ -146,6 +203,7 @@ def test_if_modified_since_alone_is_modified_once_the_clock_moves() -> None:
         if_modified_since=format_http_date(WATERMARK - timedelta(seconds=30)),
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is False
@@ -159,6 +217,7 @@ def test_request_without_preconditions_decides_nothing() -> None:
         if_modified_since=None,
         etag=ETAG,
         last_modified=WATERMARK,
+        now=NOW,
     )
 
     assert result.not_modified is False

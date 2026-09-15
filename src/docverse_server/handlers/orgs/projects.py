@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 from urllib.parse import urlencode
 
@@ -184,6 +184,7 @@ async def get_projects(
                 watermark=watermark,
             ),
             last_modified=watermark.date_updated,
+            now=datetime.now(tz=UTC),
         )
         if not_modified is not None:
             return not_modified
@@ -371,6 +372,7 @@ async def get_project(
                 include_deleted=include_deleted,
             ),
             last_modified=watermark,
+            now=datetime.now(tz=UTC),
         )
         if not_modified is not None:
             return not_modified

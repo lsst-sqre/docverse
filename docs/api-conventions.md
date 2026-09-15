@@ -354,6 +354,22 @@ way before comparing. Comparing against the untruncated instant would
 report "modified" forever, because a client can only ever echo back the
 second it was told.
 
+**The open second.** That truncation has a second consequence, and it
+is why `ETag` is the validator to poll with. A write landing later in
+the same second as the watermark a client was handed is, by date alone,
+indistinguishable from the state that client already holds
+([RFC 7232 §2.2.1](https://www.rfc-editor.org/rfc/rfc7232#section-2.2.1)):
+both truncate to the same second, so the comparison says 304 and the
+change stays hidden until some unrelated later write moves the clock
+again. An `If-Modified-Since` is therefore **refused** while the
+watermark's second is still the server's current one — the request is
+answered in full — and earns a 304 only once that second has closed and
+nothing more can land inside it. The cost is at most one redundant
+response per second of write activity. Entity-tags hash the watermark
+at microsecond precision, so they are not affected and need no such
+guard; the `docverse` client's `ProjectList` gives its callers the same
+advice.
+
 **`If-None-Match` takes precedence.** Per RFC 7232 §6, when
 `If-None-Match` is present it is evaluated and `If-Modified-Since` is
 not consulted at all — *even when the tags do not match*. The date is a

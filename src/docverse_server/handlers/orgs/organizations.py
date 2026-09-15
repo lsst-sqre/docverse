@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -160,6 +161,7 @@ async def get_organization(
             organization=org_slug,
             etag=_organization_etag(user.org),
             last_modified=user.org.date_updated,
+            now=datetime.now(tz=UTC),
         )
         if not_modified is not None:
             return not_modified
