@@ -517,6 +517,53 @@ async def test_rollback_retires_project_etag(
 
 
 @pytest.mark.asyncio
+async def test_rollback_retires_listing_etag(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """A ``__main`` rollback invalidates the project listing's tag.
+
+    The listing embeds the default edition (task #660) and hashes only
+    project clocks, so this is the proof that the one edition change a
+    poller must see — the current build moving — reaches the listing
+    tag through the project touch in ``set_current_build``.
+    """
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    before_response = await client.get(
+        "/docverse/orgs/rb-org/projects", headers=headers
+    )
+    assert before_response.status_code == 200
+    etag = before_response.headers["ETag"]
+    before_edition = before_response.json()[0]["default_edition"]
+
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=2)
+        await db_session.commit()
+
+    rollback_response = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": serialize_base32_id(builds[0][1])},
+        headers=headers,
+    )
+    assert rollback_response.status_code == 200
+
+    after_response = await client.get(
+        "/docverse/orgs/rb-org/projects",
+        headers={**headers, "If-None-Match": etag},
+    )
+
+    assert after_response.status_code == 200
+    assert after_response.headers["ETag"] != etag
+    after_edition = after_response.json()[0]["default_edition"]
+    assert after_edition["build_url"] != before_edition["build_url"]
+    assert after_edition["build_url"].endswith(
+        serialize_base32_id(builds[0][1])
+    )
+
+
+@pytest.mark.asyncio
 async def test_rollback_missing_build_field(client: AsyncClient) -> None:
     """Missing 'build' field in request body returns 422."""
     await _setup(client)

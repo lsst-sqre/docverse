@@ -223,6 +223,24 @@ class ProjectService:
             project_id=project_id, slug=DEFAULT_EDITION_SLUG
         )
 
+    async def get_default_editions(
+        self, project_ids: list[int]
+    ) -> dict[int, Edition]:
+        """Fetch the ``__main`` edition for each of several projects.
+
+        One query for the whole page, keyed by project id, so the
+        listing handler can embed every row's default edition without
+        the per-row round trip :meth:`get_default_edition` would cost
+        (task #660). A project whose default edition is soft-deleted —
+        which is every soft-deleted project — is simply absent from the
+        result, so a caller reads it with ``.get()`` and gets the same
+        ``None`` the single GET would show for it.
+        """
+        editions = await self._edition_store.list_by_project_ids_and_kind(
+            project_ids=project_ids, kind=EditionKind.main
+        )
+        return {edition.project_id: edition for edition in editions}
+
     async def list_by_org(
         self,
         org_slug: str,

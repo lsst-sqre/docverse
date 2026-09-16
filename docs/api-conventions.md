@@ -315,7 +315,7 @@ folding its own *watermark* into an `ETag`:
 
 | Endpoint | Metrics `endpoint` value | Watermark |
 | --- | --- | --- |
-| `GET /orgs/{org}/projects` | `projects_list` | the organization's project count and the sum of every project's `date_updated`, soft-deleted ones **included** |
+| `GET /orgs/{org}/projects` | `projects_list` | the organization's project count and the sum of every project's `date_updated`, soft-deleted ones **included** — project clocks only, even though each row embeds its default edition (see below) |
 | `GET /orgs/{org}/projects/{project}` | `project` | three clocks, hashed separately — the project's `date_updated`, its default `__main` edition's (the response embeds that edition), and the organization's (the embedded edition's `published_url` is derived from the org's `base_domain`, `url_scheme`, and `root_path_prefix`) |
 | `GET /orgs/{org}` | `organization` | the organization's own `date_updated` |
 
@@ -366,6 +366,21 @@ and then names whatever else distinguishes the representation:
   added. Beside it go the two parts of the org's listing watermark: a
   project that appears or disappears moves the count, and a clock that
   moves anywhere at all moves the sum.
+
+  Each row of the listing embeds the project's default `__main` edition,
+  so a poller reads every project's current build and `published_url`
+  from the listing alone. The watermark nevertheless stays over
+  `projects`: a repoint of the default edition to a new build touches
+  the project's clock (it is the one edition change a poller acts on),
+  so it retires the tag, while a **configuration-only edit to the
+  edition** — its `title`, `tracking_mode`, `lifecycle_exempt`, or a
+  `publish_status` transition — does not. That is what the weak tag
+  means here: two bodies that differ only in edition configuration are
+  the same representation for the listing's purpose. A consumer that
+  needs the edition's configuration reads the single project, whose tag
+  hashes the edition's clock as its own part. A soft-deleted project's
+  row carries `default_edition: null`, because its editions were
+  deleted with it.
 - The **single project** hashes its three clocks as three separate
   parts, plus its parsed `include_deleted` flag, the only parameter it
   takes. Hashing the *parsed* boolean means `?include_deleted=false`

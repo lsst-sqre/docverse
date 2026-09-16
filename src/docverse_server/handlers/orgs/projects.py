@@ -74,6 +74,17 @@ def _listing_etag(
     A row appearing or disappearing moves the count, and a clock moving
     anywhere at all moves the sum, so the pair covers every mutation
     whatever order it commits in.
+
+    The rows embed each project's default edition, but the watermark
+    deliberately stays over ``projects`` alone. A ``__main`` repoint
+    touches the project clock (task #636), so the one edition change a
+    poller acts on — the current build moving — retires the tag; a
+    configuration-only edit to the edition (its title, tracking, or
+    ``publish_status``) does not. The tag is weak for exactly this
+    reason: it marks semantic equivalence for the listing's purpose,
+    not byte identity. A consumer that needs the edition's
+    configuration reads the single project, whose tag hashes the
+    edition clock as its own part (task #660).
     """
     return make_weak_etag(
         (
@@ -91,12 +102,25 @@ def _listing_etag(
     response_model=list[Project],
     summary="List projects in an organization",
     name="get_projects",
+    description=(
+        "Each row embeds the project's default (``__main``) edition, so"
+        " a poller reads the current build and published URL of every"
+        " project from the listing alone. The listing's weak ``ETag``"
+        " tracks project clocks: it retires when a project is created,"
+        " edited, deleted, or has its default edition repointed to a"
+        " new build, but not on a configuration-only edit to the"
+        " edition (title, tracking, ``publish_status``). A consumer that"
+        " needs the edition's configuration should read the single"
+        " project, whose tag covers the edition's own clock."
+    ),
     responses={
         status.HTTP_304_NOT_MODIFIED: {
             "description": (
                 "The caller's ``If-None-Match`` already matched this"
                 " page, so no body is sent. The ``ETag`` is repeated so"
-                " a poller can carry it into its next request."
+                " a poller can carry it into its next request. The tag"
+                " is weak: it does not retire on a configuration-only"
+                " edit to an embedded default edition."
             )
         }
     },
@@ -213,6 +237,12 @@ async def get_projects(
                 updated_since=updated_since,
                 include_deleted=include_deleted,
             )
+        # One query for the page's default editions, whichever path
+        # produced the page, so a poller reads each project's current
+        # build and published URL from the listing alone (task #660).
+        default_editions = await service.get_default_editions(
+            [p.id for p in result.entries]
+        )
     link = result.link_header(context.request.url)
     if link:
         context.response.headers["Link"] = link
@@ -222,6 +252,7 @@ async def get_projects(
             p,
             context.request,
             org,
+            default_edition=default_editions.get(p.id),
             app_url=context.factory.github_app_html_url,
         )
         for p in result.entries

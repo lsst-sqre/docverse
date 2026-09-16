@@ -345,9 +345,12 @@ class Project(BaseModel):
     default_edition: EditionResponse | None = Field(
         default=None,
         description=(
-            "The default (__main) edition for this project. Populated on"
-            " single-project responses (GET, POST, PATCH) but omitted"
-            " from list responses."
+            "The default (__main) edition for this project, embedded on"
+            " every project response including each row of the project"
+            " listing, so a poller reads the current build and published"
+            " URL without a second request per project. ``null`` only"
+            " for a soft-deleted project, whose editions were deleted"
+            " with it."
         ),
     )
 

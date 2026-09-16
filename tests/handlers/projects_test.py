@@ -1040,27 +1040,107 @@ async def test_get_project_includes_default_edition(
 
 
 @pytest.mark.asyncio
-async def test_list_projects_no_default_edition(
+async def test_list_projects_includes_default_edition(
     client: AsyncClient,
 ) -> None:
-    """GET project list omits default_edition (None)."""
+    """Every listing row embeds the same default edition the GET does.
+
+    Ook polls the listing to learn which projects changed; embedding
+    the ``__main`` edition here is what lets it read the new
+    ``published_url`` and ``build_url`` without a second request per
+    project (task #660).
+    """
     await _setup(client)
-    await client.post(
-        "/docverse/orgs/proj-org/projects",
-        json={
-            "slug": "list-ed-proj",
-            "title": "List Ed Proj",
-            "source_url": "https://example.com/example/list-ed",
-        },
-        headers={"X-Auth-Request-User": "testuser"},
-    )
+    headers = {"X-Auth-Request-User": "testuser"}
+    for slug in ("list-ed-a", "list-ed-b"):
+        response = await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={
+                "slug": slug,
+                "title": f"List Ed {slug}",
+                "source_url": f"https://example.com/example/{slug}",
+            },
+            headers=headers,
+        )
+        assert response.status_code == 201
+
     response = await client.get(
-        "/docverse/orgs/proj-org/projects",
-        headers={"X-Auth-Request-User": "testuser"},
+        "/docverse/orgs/proj-org/projects", headers=headers
     )
     assert response.status_code == 200
-    for project in response.json():
-        assert project["default_edition"] is None
+    rows = {p["slug"]: p for p in response.json()}
+    assert set(rows) == {"list-ed-a", "list-ed-b"}
+    for slug, row in rows.items():
+        single = await client.get(
+            f"/docverse/orgs/proj-org/projects/{slug}", headers=headers
+        )
+        assert single.status_code == 200
+        assert row["default_edition"] == single.json()["default_edition"]
+        assert row["default_edition"]["slug"] == "__main"
+
+
+@pytest.mark.asyncio
+async def test_search_projects_includes_default_edition(
+    client: AsyncClient,
+) -> None:
+    """The ``q`` search path embeds the default edition too."""
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={"slug": "search-ed", "title": "Search Ed"},
+        headers=headers,
+    )
+    assert response.status_code == 201
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"q": "search-ed"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    rows = response.json()
+    assert [p["slug"] for p in rows] == ["search-ed"]
+    single = await client.get(
+        "/docverse/orgs/proj-org/projects/search-ed", headers=headers
+    )
+    assert rows[0]["default_edition"] == single.json()["default_edition"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_deleted_row_has_no_default_edition(
+    client: AsyncClient,
+) -> None:
+    """A soft-deleted row keeps ``default_edition: null``.
+
+    Deleting a project soft-deletes its editions with it, and the
+    single GET with ``include_deleted`` shows no edition for it; the
+    listing agrees rather than resurrecting a deleted edition.
+    """
+    await _setup(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+    for slug in ("del-ed-live", "del-ed-dead"):
+        response = await client.post(
+            "/docverse/orgs/proj-org/projects",
+            json={"slug": slug, "title": slug},
+            headers=headers,
+        )
+        assert response.status_code == 201
+    deleted = await client.delete(
+        "/docverse/orgs/proj-org/projects/del-ed-dead", headers=headers
+    )
+    assert deleted.status_code == 204
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        params={"include_deleted": "true"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    rows = {p["slug"]: p for p in response.json()}
+    assert rows["del-ed-live"]["default_edition"]["slug"] == "__main"
+    assert rows["del-ed-dead"]["date_deleted"] is not None
+    assert rows["del-ed-dead"]["default_edition"] is None
 
 
 @pytest.mark.asyncio
@@ -2216,6 +2296,50 @@ async def test_list_projects_etag_changes_after_a_clock_below_the_max(
 
     assert second.status_code == 200
     assert second.headers["ETag"] != first.headers["ETag"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_etag_survives_an_edition_config_patch(
+    client: AsyncClient,
+) -> None:
+    """An edition-configuration edit does not retire the listing tag.
+
+    The listing embeds each project's default edition, but its
+    watermark is over project clocks alone, and an edition PATCH that
+    only touches configuration leaves the project clock where it was.
+    The tag is weak precisely so it can stand for a body that differs
+    in ways a poller does not track; a consumer that needs the
+    edition's configuration reads the single project, whose tag hashes
+    the edition clock separately (task #660).
+    """
+    await _setup(client)
+    await _seed_clocked_projects(client)
+    headers = {"X-Auth-Request-User": "testuser"}
+
+    first = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert first.status_code == 200
+
+    patched = await client.patch(
+        "/docverse/orgs/proj-org/projects/tick-old/editions/__main",
+        json={"title": "Retitled edition"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+
+    second = await client.get(
+        "/docverse/orgs/proj-org/projects",
+        headers={**headers, "If-None-Match": first.headers["ETag"]},
+    )
+    assert second.status_code == 304
+
+    unconditional = await client.get(
+        "/docverse/orgs/proj-org/projects", headers=headers
+    )
+    assert unconditional.headers["ETag"] == first.headers["ETag"]
+    rows = {p["slug"]: p for p in unconditional.json()}
+    assert rows["tick-old"]["default_edition"]["title"] == "Retitled edition"
 
 
 @pytest.mark.asyncio
