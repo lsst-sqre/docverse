@@ -329,20 +329,37 @@ class DashboardGitHubTemplateBindingStore:
         only assigned when provided; passing ``None`` leaves the
         existing values in place so a failed sync keeps the last-good
         template reference and previously-captured GitHub identities.
+        That is why this is a core ``UPDATE`` built from a values dict
+        rather than ORM attribute assignment: the dict is where "only
+        when provided" lives, and the statement form is what lets the
+        clock be pinned (ORM assignment cannot suppress ``onupdate``).
+
+        A missing binding needs no pre-check: the ``UPDATE`` matches no
+        rows and the trailing read returns ``None``.
         """
-        row = await self._get_row(binding_id)
-        if row is None:
-            return None
-        row.last_sync_status = last_sync_status
-        row.last_sync_error = last_sync_error
+        values: dict[str, Any] = {
+            "last_sync_status": last_sync_status,
+            "last_sync_error": last_sync_error,
+            # Pinned: this runs on every sync attempt, success or
+            # failure. Recording what GitHub told us is bookkeeping,
+            # not an operator edit of the source coordinates.
+            # See the column's note in dbschema.
+            "date_updated": SqlDashboardGitHubTemplateBinding.date_updated,
+        }
         if github_template_id is not None:
-            row.github_template_id = github_template_id
+            values["github_template_id"] = github_template_id
         if github_owner_id is not None:
-            row.github_owner_id = github_owner_id
+            values["github_owner_id"] = github_owner_id
         if github_repo_id is not None:
-            row.github_repo_id = github_repo_id
+            values["github_repo_id"] = github_repo_id
         if github_installation_id is not None:
-            row.github_installation_id = github_installation_id
+            values["github_installation_id"] = github_installation_id
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(SqlDashboardGitHubTemplateBinding.id == binding_id)
+            .values(**values)
+        )
+        await self._session.execute(stmt)
         await self._session.flush()
         return await self.get_by_id(binding_id)
 

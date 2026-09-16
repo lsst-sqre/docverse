@@ -115,12 +115,15 @@ class SqlDashboardGitHubTemplateBinding(Base):
     # That is why the GitHub-side sync writers in
     # ``DashboardGitHubTemplateBindingStore`` pass
     # ``date_updated=SqlDashboardGitHubTemplateBinding.date_updated``:
-    # the pin suppresses this ``onupdate`` so a rename, transfer, or
-    # installation-state flip that GitHub told us about does not read
-    # back as an operator edit. Each such write carries a one-line
-    # ``Pinned:`` comment pointing here; do not copy the idiom into the
-    # projects table, where the same pin would hide a real change from
-    # every poller.
+    # the pin suppresses this ``onupdate`` so a recorded sync outcome,
+    # or a rename, transfer, or installation-state flip that GitHub
+    # told us about, does not read back as an operator edit. Those
+    # writers are all core ``UPDATE`` statements for that reason — ORM
+    # attribute assignment cannot suppress ``onupdate``, so a writer
+    # that wants the pin cannot be written in the ORM style. Each
+    # carries a one-line ``Pinned:`` comment pointing here; do not copy
+    # the idiom into the projects table, where the same pin would hide
+    # a real change from every poller.
     date_updated: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
