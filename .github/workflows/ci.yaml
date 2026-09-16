@@ -186,43 +186,55 @@ jobs:
                 && (startsWith(github.head_ref, 'tickets/')
                     || startsWith(github.head_ref, 't/'))) }}
 
-  client-test-packaging:
-    name: Test client packaging
+  client-package:
+    name: Build client package
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [lint, typing, test, client-test]
+    timeout-minutes: 10
+    # Runs on every CI run, not just releases, so a packaging regression
+    # (missing files, bad metadata, a version setuptools_scm can't derive)
+    # surfaces on the PR rather than on release day. The artifact it
+    # uploads is what client-pypi publishes: the release never rebuilds.
+    #
+    # hynek's action is used instead of lsst-sqre/build-and-publish-to-pypi
+    # because the client is a uv workspace member: `uv build` inside
+    # `client/` writes to the *workspace root's* dist/, so a publish step
+    # that looks in `client/dist/` finds nothing. This action passes an
+    # explicit --out-dir and also inspects the wheel and sdist (contents
+    # tree, twine check, metadata render) in the job summary.
+    outputs:
+      artifact-name: ${{ steps.build.outputs.artifact-name }}
 
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history for setuptools_scm
 
-      - name: Build and publish
-        uses: lsst-sqre/build-and-publish-to-pypi@v3
+      - name: Build and inspect the client package
+        id: build
+        uses: hynek/build-and-inspect-python-package@v3.0.1
         with:
-          working-directory: client
-          upload: false
+          path: client
 
   client-pypi:
     name: Upload client to PyPI
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [lint, typing, test, client-test, client-test-packaging]
+    needs: [lint, typing, test, client-test, client-package]
     environment:
       name: pypi
       url: https://pypi.org/p/docverse
     permissions:
-      id-token: write
+      id-token: write # trusted publishing
     if: >
       github.event_name == 'release'
       && startsWith(github.event.release.tag_name, 'client/')
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Download the built package
+        uses: actions/download-artifact@v8
         with:
-          fetch-depth: 0 # full history for setuptools_scm
+          name: ${{ needs.client-package.outputs.artifact-name }}
+          path: dist
 
-      - name: Build and publish
-        uses: lsst-sqre/build-and-publish-to-pypi@v3
-        with:
-          working-directory: client
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
