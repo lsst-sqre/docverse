@@ -896,9 +896,17 @@ class ProjectStore:
 
         Project, then editions, then builds is also the tree's one lock
         order, documented in
-        :mod:`docverse_server.storage.edition_store`; a repoint racing
-        this cascade takes the same three rows the same way round, so
-        one of the two waits instead of both aborting.
+        :mod:`docverse_server.storage.edition_store`. This is the
+        writer that ends up holding all three, so it is the one every
+        other multi-row writer has to agree with: a repoint racing this
+        cascade takes the same rows the same way round, and the two
+        composite writers that surround a repoint with other writes —
+        ``KeeperSyncService._finalize_synced_build`` and
+        ``EditionTrackingService.track_build`` — open with
+        :meth:`~docverse_server.storage.edition_store.EditionStore.lock_for_repoint`
+        so the agreement holds for their whole transaction rather than
+        for one call inside it. One of the two waits instead of both
+        aborting.
 
         The handler's post-commit CDN unpublish is unaffected: it
         iterates the edition slugs

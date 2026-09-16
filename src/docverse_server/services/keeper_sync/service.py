@@ -2279,7 +2279,21 @@ class KeeperSyncService:
         pointer: without it a keeper-sync repoint could land mid-publish
         and leave the CDN serving one build while the row records
         another as published.
+
+        This is a **composite writer** in the sense
+        :mod:`docverse_server.storage.edition_store` documents: four
+        locked writes on the ``builds`` row stand between the start of
+        the transaction and the repoint at the end of it. Left to
+        itself the transaction would therefore run ``builds ->
+        projects -> editions``, the reverse of the project soft-delete
+        cascade, and a DELETE landing on this project mid-sync would
+        deadlock against it — with nowhere to retry on either side.
+        :meth:`~docverse_server.storage.edition_store.EditionStore.lock_for_repoint`
+        moves the whole wait to the head of the transaction instead; the
+        ``set_current_build`` below then re-locks rows already held,
+        which costs nothing.
         """
+        await self._edition_store.lock_for_repoint(edition_id=edition.id)
         await self._build_store.update_content_hash(
             build_id=build.id,
             content_hash=copy_result.content_hash,

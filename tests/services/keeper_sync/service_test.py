@@ -9,11 +9,12 @@ state-store rows and copied object bytes.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,8 +26,8 @@ import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from safir.github import GitHubAppClientFactory
-from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
@@ -43,7 +44,7 @@ from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
@@ -52,9 +53,13 @@ from docverse_server.domain.lifecycle import (
 )
 from docverse_server.exceptions import (
     MAX_REPORTED_EDITION_SLUGS,
+    InvalidBuildStateError,
     KeeperSyncSystemicFailureError,
 )
-from docverse_server.services.keeper_sync.copier import BuildContentCopier
+from docverse_server.services.keeper_sync.copier import (
+    BuildContentCopier,
+    CopyResult,
+)
 from docverse_server.services.keeper_sync.service import (
     MAX_CONSECUTIVE_EDITION_FAILURES,
     BuildSyncOutcome,
@@ -95,6 +100,11 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions.build_processing import _process_build
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 from tests.support.lock_service_spy import RecordingLockService
+from tests.support.rowlocks import (
+    LOCK_WAIT_TIMEOUT,
+    backend_pid,
+    wait_until_blocked_or_finished,
+)
 
 FIXTURES_DIR = (
     Path(__file__).parent.parent.parent / "storage" / "ltd" / "fixtures"
@@ -6314,3 +6324,169 @@ async def test_republished_prefix_without_a_rebuilt_date_reconverges(
         # to short-circuit again.
         assert "date_rebuilt_seen_retracted" not in state.annotations
         assert "ltd_source_manifest_hash" not in state.annotations
+
+
+@pytest.mark.asyncio
+async def test_finalize_synced_build_does_not_deadlock_with_delete(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    http_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synced-build finalize and a project DELETE serialize.
+
+    ``_finalize_synced_build`` is a composite writer: it stamps the
+    placeholder build's hash, inventory and status — four locked writes
+    on the ``builds`` row — and only then repoints the edition. Left to
+    itself that transaction runs ``builds -> projects -> editions``,
+    the reverse of the project soft-delete cascade, so a DELETE parked
+    between its edition cascade and its build cascade would find the
+    build row held by a finalize that was itself waiting for the
+    project row the DELETE holds. PostgreSQL breaks that cycle by
+    aborting one side, and ``keeper_sync_project`` runs with
+    ``max_tries=1`` while ``delete_project`` simply 500s.
+
+    Taking the project and edition rows at the head of the transaction
+    turns the race into a wait, and the finalize — once it wakes —
+    stands down on the build the cascade cancelled out from under it.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-deadlock")
+        project_store = ProjectStore(session=db_session, logger=logger)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        build_store = BuildStore(session=db_session, logger=logger)
+        project = await project_store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="ks-deadlock-proj",
+                title="Deadlock",
+                source_url="https://example.com/example/repo",
+            ),
+        )
+        edition = await edition_store.create_internal(
+            project_id=project.id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        build = await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash=PLACEHOLDER_CONTENT_HASH,
+            ),
+            uploader="keeper-sync",
+        )
+
+    # Park the DELETE between its edition cascade and its build
+    # cascade: the only window in which it holds the project and
+    # edition rows and still needs the build row.
+    at_builds = asyncio.Event()
+    release_builds = asyncio.Event()
+    cascade_builds = BuildStore.soft_delete_all_by_project
+
+    async def paused_cascade(
+        self: BuildStore, *, project_id: int
+    ) -> list[int]:
+        at_builds.set()
+        await release_builds.wait()
+        return await cascade_builds(self, project_id=project_id)
+
+    monkeypatch.setattr(
+        BuildStore, "soft_delete_all_by_project", paused_cascade
+    )
+
+    copy_result = CopyResult(
+        object_count=2,
+        total_size_bytes=64,
+        content_hash="sha256:" + "b" * 64,
+    )
+    finalize_error: list[BaseException | None] = []
+
+    async with (
+        db_session_factory() as delete_session,
+        db_session_factory() as sync_session,
+        db_session_factory() as probe,
+    ):
+        # Leaves the PID's transaction open on purpose: the finalize
+        # below runs inside it, so the backend that blocks is the one
+        # the probe is watching.
+        sync_pid = await backend_pid(sync_session)
+
+        async def run_delete() -> None:
+            store = ProjectStore(session=delete_session, logger=logger)
+            await store.soft_delete(
+                org_id=org_id,
+                slug="ks-deadlock-proj",
+                reason=TombstoneReason.manual_delete,
+            )
+            await delete_session.commit()
+
+        async def run_finalize() -> None:
+            service = _build_service(
+                sync_session, http_client, MockObjectStore(), {}
+            )
+            try:
+                await service._finalize_synced_build(
+                    build=build,
+                    edition=edition,
+                    copy_result=copy_result,
+                    project_slug="ks-deadlock-proj",
+                    org_slug="ks-deadlock",
+                )
+                await sync_session.commit()
+            except BaseException as exc:
+                finalize_error.append(exc)
+            else:
+                finalize_error.append(None)
+
+        deleting = asyncio.ensure_future(run_delete())
+        finalizing: asyncio.Task[None] | None = None
+        parked = False
+        try:
+            await asyncio.wait_for(at_builds.wait(), timeout=LOCK_WAIT_TIMEOUT)
+            finalizing = asyncio.ensure_future(run_finalize())
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=sync_pid, task=finalizing
+            )
+            release_builds.set()
+            await deleting
+            await finalizing
+        finally:
+            release_builds.set()
+            for task in (deleting, finalizing):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+            await delete_session.rollback()
+            await sync_session.rollback()
+
+    # The finalize waited on the project row rather than sailing past
+    # it holding the build the cascade needed next.
+    assert parked
+    # Neither side was aborted: the DELETE committed...
+    async with db_session_factory() as reader:
+        project_row = (
+            await reader.execute(
+                select(SqlProject).where(SqlProject.id == project.id)
+            )
+        ).scalar_one()
+        assert project_row.date_deleted is not None
+        build_row = (
+            await reader.execute(
+                select(SqlBuild).where(SqlBuild.id == build.id)
+            )
+        ).scalar_one()
+        assert build_row.date_deleted is not None
+        assert build_row.status == BuildStatus.cancelled
+        assert build_row.content_hash == PLACEHOLDER_CONTENT_HASH
+    # ...and the finalize lost the way a loser should: a deterministic
+    # refusal to advance a build the DELETE had already cancelled, not
+    # a deadlock abort.
+    assert len(finalize_error) == 1
+    assert isinstance(finalize_error[0], InvalidBuildStateError)

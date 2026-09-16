@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 import structlog
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
@@ -21,10 +23,12 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import DEFAULT_EDITION_SLUG
+from docverse_server.domain.edition_tracking import EditionTrackingResult
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
 from docverse_server.services.edition_tracking import (
@@ -41,9 +45,15 @@ from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import TombstoneReason
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.lock_service_spy import RecordingLockService
+from tests.support.rowlocks import (
+    LOCK_WAIT_TIMEOUT,
+    backend_pid,
+    wait_until_blocked_or_finished,
+)
 
 _HASH = "sha256:" + "a" * 64
 
@@ -1952,3 +1962,151 @@ async def test_track_build_leaves_aggregate_kinds_untouched(
         assert minor is not None
         assert minor.kind == EditionKind.minor
         await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_does_not_deadlock_with_project_delete(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tracking a build and a project DELETE serialize, not deadlock.
+
+    ``track_build`` repoints *every* edition a completed build matches
+    inside one transaction, walking ``find_matching_editions`` in slug
+    order. Under the database's ``en_US.UTF-8`` collation ``__main``
+    sorts after ordinary slugs, so a build on ``main`` reaches a
+    co-matching ``git_ref`` edition first — locking ``editions`` and
+    ``builds`` — and only then asks for the ``projects`` row that the
+    ``__main`` repoint stamps. That is ``editions -> projects``, the
+    reverse of the soft-delete cascade, and a DELETE parked between its
+    project stamp and its edition cascade closes the cycle.
+
+    Taking the project row once, up front, is what makes the order a
+    property of the transaction rather than of each ``set_current_build``
+    call.
+    """
+    logger = _logger()
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="track-deadlock")
+        edition_store = EditionStore(session=db_session, logger=logger)
+        # ``docs-main`` sorts before ``__main`` under the DB collation,
+        # so it is the edition the loop reaches first.
+        early = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="docs-main",
+                title="Docs",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        main_edition = await edition_store.create_internal(
+            project_id=project.id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="main")
+
+    # Park the DELETE between its project stamp and its edition
+    # cascade: the window in which it holds the project row and still
+    # needs every edition row.
+    at_editions = asyncio.Event()
+    release_editions = asyncio.Event()
+    cascade_editions = EditionStore.soft_delete_all_by_project
+
+    async def paused_cascade(
+        self: EditionStore,
+        *,
+        org_id: int,
+        project_id: int,
+        reason: TombstoneReason,
+    ) -> list[int]:
+        at_editions.set()
+        await release_editions.wait()
+        return await cascade_editions(
+            self, org_id=org_id, project_id=project_id, reason=reason
+        )
+
+    monkeypatch.setattr(
+        EditionStore, "soft_delete_all_by_project", paused_cascade
+    )
+
+    tracked: list[BaseException | EditionTrackingResult] = []
+
+    async with (
+        db_session_factory() as delete_session,
+        db_session_factory() as track_session,
+        db_session_factory() as probe,
+    ):
+        # Left open on purpose: the tracking transaction runs on this
+        # backend, so it is the one the probe watches.
+        track_pid = await backend_pid(track_session)
+
+        async def run_delete() -> None:
+            store = ProjectStore(session=delete_session, logger=logger)
+            await store.soft_delete(
+                org_id=project.org_id,
+                slug="track-proj",
+                reason=TombstoneReason.manual_delete,
+            )
+            await delete_session.commit()
+
+        async def run_track() -> None:
+            service = _make_service(track_session)
+            try:
+                result = await service.track_build(build)
+                await track_session.commit()
+            except BaseException as exc:
+                tracked.append(exc)
+            else:
+                tracked.append(result)
+
+        deleting = asyncio.ensure_future(run_delete())
+        tracking: asyncio.Task[None] | None = None
+        parked = False
+        try:
+            await asyncio.wait_for(
+                at_editions.wait(), timeout=LOCK_WAIT_TIMEOUT
+            )
+            tracking = asyncio.ensure_future(run_track())
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=track_pid, task=tracking
+            )
+            release_editions.set()
+            await deleting
+            await tracking
+        finally:
+            release_editions.set()
+            for task in (deleting, tracking):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+            await delete_session.rollback()
+            await track_session.rollback()
+
+    # The tracking transaction waited on the project row rather than
+    # walking into the editions the cascade needed next.
+    assert parked
+    assert len(tracked) == 1
+    outcome = tracked[0]
+    assert isinstance(outcome, EditionTrackingResult)
+    # Having waited, it found every match retired and moved none.
+    assert {o.action for o in outcome.outcomes} == {"skipped"}
+
+    async with db_session_factory() as reader:
+        rows = (
+            await reader.execute(
+                select(SqlEdition).where(
+                    SqlEdition.id.in_([early.id, main_edition.id])
+                )
+            )
+        ).scalars()
+        for row in rows:
+            assert row.date_deleted is not None
+            assert row.current_build_id is None

@@ -16,7 +16,7 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.domain.build import Build
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
@@ -230,7 +230,15 @@ class EditionTrackingService:
             if not any(e.id == ve.id for e in editions):
                 editions.append(ve)
 
-        # 8. Converge kinds on the current derivation
+        # 8. Take the head-of-transaction lock. Steps 6 and 7 insert
+        #    rows rather than locking existing ones — an INSERT's
+        #    foreign-key check takes ``FOR KEY SHARE`` on the project,
+        #    which conflicts with nothing the soft-delete cascade
+        #    takes — so this still lands ahead of every row lock the
+        #    transaction contends for.
+        await self._lock_project_for_default_repoint(editions)
+
+        # 9. Converge kinds on the current derivation
         editions = await self._refresh_kinds(
             editions,
             derivation=derivation,
@@ -238,7 +246,7 @@ class EditionTrackingService:
             project_id=project.id,
         )
 
-        # 9. Update each edition
+        # 10. Update each edition
         outcomes = await self._update_editions(
             editions,
             build,
@@ -252,6 +260,38 @@ class EditionTrackingService:
             suppressed=False,
             outcomes=outcomes,
         )
+
+    async def _lock_project_for_default_repoint(
+        self, editions: list[Edition]
+    ) -> None:
+        """Take the project row when this build reaches ``__main``.
+
+        ``track_build`` is a **composite writer** in the sense
+        :mod:`docverse_server.storage.edition_store` documents: one
+        transaction repoints every edition the build matches, and the
+        matches arrive in slug order. Under the database's
+        ``en_US.UTF-8`` collation ``__main`` sorts after ordinary slugs,
+        so a co-matching ``git_ref`` or ``lsst_doc`` edition is
+        repointed first — locking ``editions`` and ``builds`` — and only
+        the later ``__main`` repoint asks for the ``projects`` row it
+        stamps. That is ``editions -> projects``, the reverse of the
+        project soft-delete cascade, and the two deadlock.
+
+        Asking for the project row here, before any edition row is
+        locked, makes the order a property of the whole transaction
+        rather than of each
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
+        call. Nothing is taken for a build that reaches no default
+        edition, which is what keeps unrelated projects' — and this
+        project's non-default — tracking from serializing on one row.
+        """
+        default = next(
+            (e for e in editions if e.slug.lower() == DEFAULT_EDITION_SLUG),
+            None,
+        )
+        if default is None:
+            return
+        await self._deps.edition_store.lock_for_repoint(edition_id=default.id)
 
     async def _refresh_kinds(
         self,

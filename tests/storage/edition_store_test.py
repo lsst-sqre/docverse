@@ -1163,6 +1163,69 @@ async def test_set_current_build_locks_project_then_edition_then_build(
 
 
 @pytest.mark.asyncio
+async def test_lock_for_repoint_takes_project_then_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The composite writers' head-of-transaction lock takes two rows.
+
+    ``set_current_build`` proves the order for a transaction that holds
+    nothing else. The two composite writers — keeper-sync's
+    ``_finalize_synced_build`` and ``EditionTrackingService.track_build``
+    — write ``builds`` and other ``editions`` rows in the same
+    transaction, so they call this at the head and let the repoint
+    re-lock rows the transaction already holds. It must therefore take
+    exactly the first two steps of the order and reach no build.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:7777" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            await edition_store.lock_for_repoint(edition_id=edition.id)
+        await db_session.commit()
+
+    project_lock = _first_statement_index(
+        statements,
+        lambda s: (
+            s.startswith("SELECT projects.id")
+            and s.endswith("FOR NO KEY UPDATE")
+        ),
+        "projects row lock",
+    )
+    edition_lock = _first_statement_index(
+        statements,
+        lambda s: (
+            s.startswith("SELECT editions.id")
+            and s.endswith("FOR NO KEY UPDATE")
+        ),
+        "editions row lock",
+    )
+    assert project_lock < edition_lock
+    assert not [s for s in statements if "builds" in s]
+
+
+@pytest.mark.asyncio
 async def test_set_current_build_does_not_deadlock_with_project_delete(
     app: FastAPI,
     db_session: AsyncSession,
