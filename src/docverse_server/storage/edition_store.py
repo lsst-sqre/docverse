@@ -72,7 +72,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import Select, select, update
+from sqlalchemy import ColumnElement, Select, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -479,17 +479,41 @@ class EditionStore:
         # Re-query to get current_build_public_id via join
         return await self.get_by_slug(project_id=project_id, slug=row.slug)
 
-    async def _lock_project_for_default_edition(self, edition_id: int) -> None:
+    async def _lock_project_for_repoint(
+        self,
+        *,
+        edition_id: int,
+        project_id: int | None,
+        is_default: bool | None,
+    ) -> None:
         """Lock the project row, but only for the default edition.
 
-        Step one of the lock order this module documents. The subquery
-        resolves to the edition's project when *edition_id* is the
-        project's ``__main`` edition and to NULL otherwise, so for every
-        other edition the predicate matches no row and no lock is taken
-        — which is what keeps the repoints keeper-sync makes across a
-        project's editions from serializing on one row. ``FOR NO KEY
-        UPDATE`` is both the strength the ``UPDATE projects`` clock
-        stamp takes anyway and the strength
+        Step one of the lock order this module documents, and the step
+        most repoints have no use for: only a ``__main`` repoint writes
+        the project row, and a project has one ``__main`` among however
+        many ticket and version editions keeper-sync repoints each
+        tick. Skipping the rest is also what keeps those repoints from
+        serializing on the one row.
+
+        Which case this is comes from the caller wherever the caller
+        knows. *is_default* and *project_id* are an assertion about the
+        edition named by *edition_id*, and every repoint in the tree
+        holds the :class:`~docverse_server.domain.edition.Edition` to
+        make it from; an edition's slug and its project are both
+        immutable, so the assertion cannot have gone stale between the
+        read that made it and this call. Given them, the lock is a
+        primary-key lookup, and for a non-default edition it is no
+        statement at all.
+
+        Without them it falls back to a subquery resolving to the
+        edition's project when *edition_id* is that project's
+        ``__main`` edition and to NULL otherwise — still one statement
+        rather than the two a separate lookup would cost, and for every
+        other edition it matches no row, which locks exactly as little
+        as the caller-informed path skips.
+
+        ``FOR NO KEY UPDATE`` is both the strength the ``UPDATE
+        projects`` clock stamp takes anyway and the strength
         :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
         takes to write ``date_deleted``, so the two conflict and one
         waits.
@@ -500,22 +524,34 @@ class EditionStore:
         ``editions`` read follows, which is where it belongs in the
         order.
         """
+        if is_default is False:
+            return
+        target: ColumnElement[bool]
+        if is_default and project_id is not None:
+            target = SqlProject.id == project_id
+        else:
+            target = SqlProject.id == (
+                select(SqlEdition.project_id)
+                .where(
+                    SqlEdition.id == edition_id,
+                    func.lower(SqlEdition.slug) == DEFAULT_EDITION_SLUG,
+                )
+                .scalar_subquery()
+            )
         with self._session.no_autoflush:
             await self._session.execute(
                 select(SqlProject.id)
-                .where(
-                    SqlProject.id
-                    == select(SqlEdition.project_id)
-                    .where(
-                        SqlEdition.id == edition_id,
-                        func.lower(SqlEdition.slug) == DEFAULT_EDITION_SLUG,
-                    )
-                    .scalar_subquery()
-                )
+                .where(target)
                 .with_for_update(key_share=True)
             )
 
-    async def lock_for_repoint(self, *, edition_id: int) -> None:
+    async def lock_for_repoint(
+        self,
+        *,
+        edition_id: int,
+        project_id: int | None = None,
+        is_default: bool | None = None,
+    ) -> None:
         """Take the first two rows of the lock order, and hold them.
 
         The entry point for a **composite writer** — a transaction that
@@ -538,8 +574,18 @@ class EditionStore:
         ``EditionTrackingService.track_build``, which repoints every
         edition a completed build matches in one transaction. Both are
         named in this module's docstring.
+
+        *project_id* and *is_default* say which project this edition
+        belongs to and whether it is that project's ``__main``; see
+        :meth:`_lock_project_for_repoint` for what they buy and what
+        happens without them. Pass the same values here as to
+        :meth:`set_current_build`, since the two describe one edition.
         """
-        await self._lock_project_for_default_edition(edition_id)
+        await self._lock_project_for_repoint(
+            edition_id=edition_id,
+            project_id=project_id,
+            is_default=is_default,
+        )
         await self._session.execute(
             select(SqlEdition.id)
             .where(SqlEdition.id == edition_id)
@@ -552,6 +598,8 @@ class EditionStore:
         edition_id: int,
         build_id: int,
         skip_date_guard: bool = False,
+        project_id: int | None = None,
+        is_default: bool | None = None,
     ) -> EditionRepoint:
         """Set the current build for an edition.
 
@@ -639,6 +687,18 @@ class EditionStore:
             When ``True``, bypass the date-based stale guard.  Used by
             version-based tracking modes where the version comparison
             in the service layer is the authoritative ordering.
+        project_id
+            The project the edition belongs to, if the caller knows it.
+        is_default
+            Whether the edition is that project's ``__main``, if the
+            caller knows it. Together with *project_id* this turns the
+            project lock into a primary-key lookup, and for anything
+            but ``__main`` removes it; see
+            :meth:`_lock_project_for_repoint` for the fallback when
+            either is missing. It is only ever the lock's business: the
+            stamp below is decided from the locked edition row, so a
+            caller that guessed wrong buys the wrong lock, not the
+            wrong outcome.
 
         Returns
         -------
@@ -656,7 +716,11 @@ class EditionStore:
         # :meth:`lock_for_repoint`, likewise holding nothing — so this
         # returns at once. Either way the wait happened before anything
         # else was locked.
-        await self._lock_project_for_default_edition(edition_id)
+        await self._lock_project_for_repoint(
+            edition_id=edition_id,
+            project_id=project_id,
+            is_default=is_default,
+        )
 
         # Step two: the edition row, read under the same ``FOR NO KEY
         # UPDATE`` its own write would take, so the lock is held from
@@ -688,9 +752,14 @@ class EditionStore:
         # soft-deleted build. Shared rather than exclusive because this
         # only needs the row to hold still, and concurrent repoints of
         # different editions onto the same build must not serialize.
+        # ``date_created`` rides along because the stale guard below
+        # wants it and this is the row it is on — already read, already
+        # held under this lock for the rest of the transaction, so a
+        # second select of it would be a round trip that can no longer
+        # learn anything.
         target = (
             await self._session.execute(
-                select(SqlBuild.date_deleted)
+                select(SqlBuild.date_deleted, SqlBuild.date_created)
                 .where(SqlBuild.id == build_id)
                 .with_for_update(read=True)
             )
@@ -698,19 +767,14 @@ class EditionStore:
         if target is None or target.date_deleted is not None:
             return self._refused_repoint()
 
-        if not skip_date_guard:
-            # Fetch incoming build's date_created
-            incoming_result = await self._session.execute(
-                select(SqlBuild.date_created).where(SqlBuild.id == build_id)
-            )
-            incoming_date = incoming_result.scalar_one()
-
-            # Stale-build guard: skip if current build is equally new or newer
-            if (
-                current_build_date is not None
-                and current_build_date >= incoming_date
-            ):
-                return self._refused_repoint()
+        # Stale-build guard: refuse when the edition already serves a
+        # build that is equally new or newer.
+        if (
+            not skip_date_guard
+            and current_build_date is not None
+            and current_build_date >= target.date_created
+        ):
+            return self._refused_repoint()
 
         # The unchanged outcome, decided on the row this transaction
         # holds rather than on anything a caller read before it. Placed
@@ -753,7 +817,6 @@ class EditionStore:
         row.current_build_id = build_id
         await self._session.flush()
 
-        await self._session.refresh(row)
         return EditionRepoint(
             outcome=RepointOutcome.repointed,
             edition=await self._load_edition_for_repoint(edition_id),
@@ -770,6 +833,12 @@ class EditionStore:
         A second query rather than the row already in hand, because the
         result carries the current build's ``public_id`` and ``git_ref``
         and those only come from the join.
+
+        It is also the whole of what the repoint needs after its flush:
+        loading the edition entity repopulates the ``date_updated`` the
+        flush expired — ``onupdate`` is a SQL expression, so its value
+        comes back from the database — which is why the repoint asks
+        for no ``refresh`` of its own on the way here.
         """
         stmt = self._base_query().where(SqlEdition.id == edition_id)
         edition_row, build_public_id, build_git_ref = (

@@ -16,7 +16,7 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.domain.build import Build
-from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
@@ -285,13 +285,14 @@ class EditionTrackingService:
         edition, which is what keeps unrelated projects' — and this
         project's non-default — tracking from serializing on one row.
         """
-        default = next(
-            (e for e in editions if e.slug.lower() == DEFAULT_EDITION_SLUG),
-            None,
-        )
+        default = next((e for e in editions if e.is_default), None)
         if default is None:
             return
-        await self._deps.edition_store.lock_for_repoint(edition_id=default.id)
+        await self._deps.edition_store.lock_for_repoint(
+            edition_id=default.id,
+            project_id=default.project_id,
+            is_default=True,
+        )
 
     async def _refresh_kinds(
         self,
@@ -425,6 +426,7 @@ class EditionTrackingService:
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=skip_date_guard,
+            is_default=edition.is_default,
         )
         if updated is None:
             self._deps.logger.info(
@@ -506,6 +508,7 @@ class EditionTrackingService:
         edition_id: int,
         build_id: int,
         skip_date_guard: bool,
+        is_default: bool,
     ) -> Edition | None:
         """Update the edition pointer under an EDITION_UPDATE lock.
 
@@ -513,6 +516,14 @@ class EditionTrackingService:
         or nothing": tracking has the same work to do whether the
         repoint moved the binding or found it already where it wanted
         it, and a guard's refusal is the only answer it stands down on.
+
+        *project_id* and *is_default* are passed down to the store,
+        which needs the ``projects`` row only for a ``__main`` repoint
+        and would otherwise re-derive both from the edition it is about
+        to lock. The matched edition is right here, and its slug and
+        project cannot change under it, so answering saves the lock
+        step a subquery on every repoint and the statement entirely on
+        every edition that is not the default.
         """
         async with self._edition_update_lock(
             org_id=org_id, project_id=project_id, edition_id=edition_id
@@ -521,6 +532,8 @@ class EditionTrackingService:
                 edition_id=edition_id,
                 build_id=build_id,
                 skip_date_guard=skip_date_guard,
+                project_id=project_id,
+                is_default=is_default,
             )
             return repoint.edition
 

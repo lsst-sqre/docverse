@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
     BuildCreate,
+    EditionCreate,
     EditionKind,
     EditionUpdate,
     OrganizationCreate,
@@ -46,6 +47,7 @@ from docverse_server.storage.project_store import ProjectStore
 from tests.support.rowlocks import (
     LOCK_WAIT_TIMEOUT,
     backend_pid,
+    record_statements,
     wait_until_blocked_or_finished,
 )
 
@@ -125,6 +127,56 @@ async def _seed(db_session: AsyncSession, *, n_builds: int = 1) -> _Seeded:
         edition_id=edition.id,
         builds=builds,
     )
+
+
+@pytest.mark.asyncio
+async def test_build_override_off_default_takes_no_project_lock(
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """A ``build`` override off ``__main`` reaches ``projects`` not at all.
+
+    The project clock follows its default edition, so an override that
+    lands anywhere else leaves the row alone — and now does not lock it
+    either. The service resolved the edition to find its slug, so it
+    can tell the store which case this is instead of leaving it to
+    re-ask the database on every repoint. Pinned here rather than only
+    in the store, because the saving is only real if the caller
+    actually answers.
+    """
+    async with db_session.begin():
+        seeded = await _seed(db_session)
+        await EditionStore(session=db_session, logger=_logger()).create(
+            project_id=seeded.project_id,
+            data=EditionCreate(
+                slug="v1",
+                title="v1",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+    (build,) = seeded.builds
+
+    service = _edition_service(db_session)
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            write = await service.update(
+                org_slug="es-org",
+                project_slug="es-proj",
+                slug="v1",
+                data=EditionUpdate(build=serialize_base32_id(build.public_id)),
+            )
+        await db_session.commit()
+
+    assert write.changed
+    assert write.edition.current_build_id == build.id
+    project_locks = [
+        s
+        for s in statements
+        if "FROM projects" in s and "FOR NO KEY UPDATE" in s
+    ]
+    assert not project_locks, statements
 
 
 @pytest.mark.asyncio

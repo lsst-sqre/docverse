@@ -1651,6 +1651,8 @@ class KeeperSyncService:
                     edition_id=current.id,
                     build_id=build.id,
                     skip_date_guard=True,
+                    project_id=current.project_id,
+                    is_default=current.is_default,
                 )
                 updated = repoint.edition
                 if updated is None:
@@ -1941,6 +1943,8 @@ class KeeperSyncService:
                         edition_id=edition.id,
                         build_id=existing_build.id,
                         skip_date_guard=True,
+                        project_id=edition.project_id,
+                        is_default=edition.is_default,
                     )
                 await self._state_store.upsert(
                     org_id=org_id,
@@ -2294,7 +2298,11 @@ class KeeperSyncService:
         ``set_current_build`` below then re-locks rows already held,
         which costs nothing.
         """
-        await self._edition_store.lock_for_repoint(edition_id=edition.id)
+        await self._edition_store.lock_for_repoint(
+            edition_id=edition.id,
+            project_id=edition.project_id,
+            is_default=edition.is_default,
+        )
         await self._build_store.update_content_hash(
             build_id=build.id,
             content_hash=copy_result.content_hash,
@@ -2328,6 +2336,8 @@ class KeeperSyncService:
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=True,
+            project_id=edition.project_id,
+            is_default=edition.is_default,
         )
 
 

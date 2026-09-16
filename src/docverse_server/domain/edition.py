@@ -118,6 +118,24 @@ class Edition(BaseModel):
         description="Timestamp when the edition was soft-deleted.",
     )
 
+    @property
+    def is_default(self) -> bool:
+        """Whether this is its project's default (``__main``) edition.
+
+        The one edition whose content *is* the project's, which is why
+        repointing it moves ``projects.date_updated`` (PRD #634) and
+        repointing any other leaves the project alone.
+
+        Every writer that repoints an edition holds one of these and
+        hands the answer to
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`,
+        which needs it to decide whether to lock the ``projects`` row
+        and would otherwise re-derive it from the database on every
+        repoint. A slug never changes, so the answer cannot go stale
+        between the read that loaded this edition and the write.
+        """
+        return self.slug.lower() == DEFAULT_EDITION_SLUG
+
 
 class RepointOutcome(StrEnum):
     """What a repoint did to an edition's ``current_build_id``.

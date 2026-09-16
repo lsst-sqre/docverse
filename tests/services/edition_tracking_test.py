@@ -52,6 +52,7 @@ from tests.support.lock_service_spy import RecordingLockService
 from tests.support.rowlocks import (
     LOCK_WAIT_TIMEOUT,
     backend_pid,
+    record_statements,
     wait_until_blocked_or_finished,
 )
 
@@ -1962,6 +1963,53 @@ async def test_track_build_leaves_aggregate_kinds_untouched(
         assert minor is not None
         assert minor.kind == EditionKind.minor
         await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_takes_no_project_lock_off_default(
+    db_session: AsyncSession,
+) -> None:
+    """Tracking that reaches no ``__main`` locks no ``projects`` row.
+
+    The other half of the lock order's bargain. Taking the project row
+    up front is what keeps a transaction that repoints several editions
+    from walking ``editions -> projects``, but only a ``__main``
+    repoint writes that row, and most completed builds match a ticket
+    or version edition and nothing else. Tracking holds each matched
+    edition already, so it can say which case this is, and for these it
+    says "not the default" — the project row is neither locked nor
+    looked up, and uploads to unrelated projects' branch editions stop
+    queueing behind one another's project rows.
+    """
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="track-nolock")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="docs-main",
+                title="Docs",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        build = await _create_build(db_session, project.id, git_ref="main")
+        await db_session.commit()
+
+    service = _make_service(db_session)
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            result = await service.track_build(build)
+        await db_session.commit()
+
+    assert [outcome.action for outcome in result.outcomes] == ["updated"]
+    project_locks = [
+        s
+        for s in statements
+        if "FROM projects" in s and "FOR NO KEY UPDATE" in s
+    ]
+    assert not project_locks, statements
 
 
 @pytest.mark.asyncio

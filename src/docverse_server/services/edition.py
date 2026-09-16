@@ -330,6 +330,8 @@ class EditionService:
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=True,
+            project_id=edition.project_id,
+            is_default=edition.is_default,
         )
         current = repoint.edition
         if current is None:

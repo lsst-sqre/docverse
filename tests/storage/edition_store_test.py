@@ -596,6 +596,64 @@ async def test_set_current_build(
 
 
 @pytest.mark.asyncio
+async def test_set_current_build_reports_the_fresh_edition_clock(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The repoint hands back the ``date_updated`` it just wrote.
+
+    ``editions.date_updated`` is a SQL-expression ``onupdate``, so the
+    flush does not compute the value — it expires the attribute and
+    the database supplies it. Loading the edition again to pick up the
+    current build's ``public_id`` is what brings it back, which is why
+    the repoint keeps no ``refresh`` of its own; pinned so a later
+    rearrangement of those two cannot quietly report callers the
+    timestamp from before the write.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:bbbb" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="clock",
+                title="Clock",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        repoint = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id
+        )
+        await db_session.commit()
+    assert repoint.edition is not None
+    assert repoint.edition.date_updated > edition.date_updated
+
+    async with db_session.begin():
+        stored = (
+            await db_session.execute(
+                select(SqlEdition.date_updated).where(
+                    SqlEdition.id == edition.id
+                )
+            )
+        ).scalar_one()
+    assert repoint.edition.date_updated == stored
+
+
+@pytest.mark.asyncio
 async def test_set_current_build_skips_stale(
     db_session: AsyncSession,
     edition_store: EditionStore,
@@ -1225,6 +1283,125 @@ async def test_set_current_build_locks_project_then_edition_then_build(
 
 
 @pytest.mark.asyncio
+async def test_set_current_build_costs_four_statements_before_the_write(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A ``__main`` repoint pays for four statements, then writes.
+
+    The repoint runs once per ticket branch per keeper-sync tick and
+    once per completed upload, under an advisory lock that serializes
+    the fleet's repoints against each other, so every round trip it
+    makes is one the whole queue waits behind. Four earn their place
+    ahead of the write — the project lock, the edition lock, the
+    target build's one read, and the project clock stamp — and the
+    re-query afterwards is the fifth and last, because it is the only
+    way to report the build's ``public_id``.
+
+    Pinned as a count because the statements that crept in here were
+    each locally reasonable: a second read of a build row already
+    locked, and a ``refresh`` of a row about to be re-queried anyway.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:9999" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            updated = await edition_store.set_current_build(
+                edition_id=edition.id,
+                build_id=build.id,
+                project_id=project_id,
+                is_default=True,
+            )
+        await db_session.commit()
+    assert updated.outcome is RepointOutcome.repointed
+
+    edition_write = _first_statement_index(
+        statements,
+        lambda s: s.startswith("UPDATE editions"),
+        "UPDATE editions",
+    )
+    assert edition_write == 4, statements
+    assert len(statements) == edition_write + 2, statements
+
+    build_reads = [s for s in statements if s.startswith("SELECT builds.")]
+    assert len(build_reads) == 1, statements
+    assert "builds.date_deleted" in build_reads[0]
+    assert "builds.date_created" in build_reads[0]
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_skips_the_project_lock_off_default(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A caller that says "not ``__main``" buys no ``projects`` lock.
+
+    Most repoints are not the default edition — a project's ticket and
+    version editions outnumber its one ``__main`` — and none of them
+    writes the project row. Told so by the caller, which holds the
+    edition and therefore its slug, the repoint reaches ``projects``
+    not at all rather than through a subquery guaranteed to match
+    nothing.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:aaaa" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="not-main",
+                title="Not Main",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            updated = await edition_store.set_current_build(
+                edition_id=edition.id,
+                build_id=build.id,
+                project_id=project_id,
+                is_default=False,
+            )
+        await db_session.commit()
+    assert updated.outcome is RepointOutcome.repointed
+    assert not [s for s in statements if "projects" in s], statements
+
+
+@pytest.mark.asyncio
 async def test_lock_for_repoint_takes_project_then_edition(
     db_session: AsyncSession,
     edition_store: EditionStore,
@@ -1285,6 +1462,47 @@ async def test_lock_for_repoint_takes_project_then_edition(
     )
     assert project_lock < edition_lock
     assert not [s for s in statements if "builds" in s]
+
+
+@pytest.mark.asyncio
+async def test_lock_for_repoint_takes_only_the_edition_off_default(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Off ``__main`` the composite writers' lock takes one row.
+
+    A composite writer opens with this whether or not the repoint it is
+    heading for will touch the project, because opening with it is what
+    makes the order a property of the transaction. Told the edition is
+    not the default, it takes the edition row and stops: there is no
+    project row in that transaction's future to get out of order with,
+    and keeper-sync finalizing a ticket branch's build no longer parks
+    on its project's row on the way past.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="not-main",
+                title="Not Main",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            await edition_store.lock_for_repoint(
+                edition_id=edition.id,
+                project_id=project_id,
+                is_default=False,
+            )
+        await db_session.commit()
+
+    assert [s for s in statements if s.startswith("SELECT editions.id")]
+    assert not [s for s in statements if "projects" in s], statements
 
 
 @pytest.mark.asyncio
