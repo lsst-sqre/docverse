@@ -32,6 +32,9 @@ from docverse_server.worker.functions import (
     purgatory_cleanup_dispatcher,
     purgatory_cleanup_reaper,
 )
+from docverse_server.worker.functions.project_github_resolve import (
+    PROJECT_GITHUB_RESOLVE_MAX_TRIES,
+)
 from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
     MaintenanceWorkerSettings,
@@ -972,3 +975,20 @@ def test_default_worker_does_not_register_edition_reconcile_reaper() -> None:
         if isinstance(job, CronJob)
     }
     assert edition_reconcile_reaper not in coroutines
+
+
+def test_project_github_resolve_registers_explicit_max_tries() -> None:
+    """The resolve carries the retry budget its own code enforces.
+
+    Task #656 makes a transient GitHub failure raise ``arq.Retry``
+    rather than returning ``"failed"``, and the worker stops deferring
+    once ``job_try`` reaches
+    :data:`PROJECT_GITHUB_RESOLVE_MAX_TRIES`. arq enforces its own
+    ceiling independently, so leaving the registration on arq's
+    implicit default would let the two numbers drift — pinning it here
+    keeps the budget the code reasons about and the budget the queue
+    applies the same number.
+    """
+    entry = _function_by_coroutine(project_github_resolve)
+
+    assert entry.max_tries == PROJECT_GITHUB_RESOLVE_MAX_TRIES

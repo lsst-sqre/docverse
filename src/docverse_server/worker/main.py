@@ -75,6 +75,7 @@ from .functions import (
     purgatory_cleanup_dispatcher,
     purgatory_cleanup_reaper,
 )
+from .functions.project_github_resolve import PROJECT_GITHUB_RESOLVE_MAX_TRIES
 from .queues import KEEPER_SYNC_QUEUE_NAME, MAINTENANCE_QUEUE_NAME
 
 config = Configuration()
@@ -691,9 +692,11 @@ class MaintenanceWorkerSettings:
     runs here: PRD #419 moves it off the default publishing pool because
     its installation-id resolution is not time-sensitive and should not
     contend with the live publishing flow. It is the one event-driven
-    (rather than cron-driven) function on the pool and is registered
-    plainly — no ``func`` timeout wrapper — exactly as it was on the
-    default pool.
+    (rather than cron-driven) function on the pool, and the one that
+    inverts the pool's ``max_tries=1`` convention: having no cron behind
+    it, it defers itself with :class:`arq.Retry` on a transient GitHub
+    failure and so declares the matching multi-attempt budget. It still
+    carries no ``func`` timeout, as on the default pool.
 
     ``max_jobs`` is declared rather than left to arq's implicit
     default so the pool's concurrency is visible to operators and
@@ -795,10 +798,31 @@ class MaintenanceWorkerSettings:
         # resolve (PRD #346). PRD #419 moves it off the default
         # publishing pool onto this maintenance pool: its work is not
         # time-sensitive and must not contend with the live publishing
-        # flow. Registered plainly (no ``func`` timeout wrapper, arq's
-        # default retry policy) exactly as it was on the default pool,
-        # so the move changes only which pool runs it.
-        instrument_arq_task(project_github_resolve),
+        # flow.
+        #
+        # Alone among Docverse's worker functions it uses ``arq.Retry``,
+        # so ``max_tries`` is pinned here rather than left to arq's
+        # implicit 5. Every other job on this pool owns its recovery —
+        # a failed tick is re-planned by the next cron, minutes away —
+        # and therefore asks for a single attempt. This one has no cron
+        # behind it: it runs only when a project's GitHub binding is
+        # created or changed, and task #651 (rightly) stopped an
+        # unrelated PATCH from re-enqueueing it. A GitHub outage during
+        # that one chance used to leave the ids NULL for good, with the
+        # API reporting ``not_installed`` for a repo the App is
+        # installed on, until an operator re-PATCHed the binding. So
+        # the function defers itself on a transient error instead, and
+        # the budget it enforces internally
+        # (``PROJECT_GITHUB_RESOLVE_MAX_TRIES``) is the budget declared
+        # here — two independently-enforced ceilings that must not
+        # drift. No ``timeout`` is added, so the job keeps arq's own
+        # default — two small GitHub GETs want nothing like the pool's
+        # hour-long per-job budget, and inheriting one is the current
+        # behaviour this change is not meant to touch.
+        func(
+            instrument_arq_task(project_github_resolve),
+            max_tries=PROJECT_GITHUB_RESOLVE_MAX_TRIES,
+        ),
     ]
     cron_jobs = [
         cron(

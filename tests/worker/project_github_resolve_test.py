@@ -8,6 +8,7 @@ import httpx
 import pytest
 import sentry_sdk
 import structlog
+from arq import Retry
 from pydantic import SecretStr
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
@@ -19,6 +20,7 @@ from docverse_server.dbschema.project import SqlProject
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions.project_github_resolve import (
+    PROJECT_GITHUB_RESOLVE_MAX_TRIES,
     project_github_resolve,
 )
 from tests.support.github_mock import GitHubMock
@@ -288,12 +290,15 @@ async def test_project_github_resolve_captures_genuine_github_error(
     mock_github: GitHubMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-404 GitHub error fails the resolve and is paged to Sentry.
+    """The attempt that exhausts the budget fails and pages Sentry.
 
     Only a 404 is the expected "App not installed" state. Any other
-    GitHub error (here a 500) is a genuine failure: the worker leaves
-    the ids NULL, returns ``"failed"``, and still calls
-    ``sentry_sdk.capture_exception`` so an operator is paged.
+    GitHub error (here a 500) is a failure — but task #656 makes the
+    transient ones non-terminal until the retry budget runs out, so the
+    terminal verdict is asserted on the *last* attempt: the worker
+    leaves the ids NULL, returns ``"failed"``, and calls
+    ``sentry_sdk.capture_exception`` exactly once so an operator is
+    paged for the outcome rather than for each attempt.
     """
     async with db_session.begin():
         _org_id, project_id = await _seed_org_and_project(db_session)
@@ -311,6 +316,7 @@ async def test_project_github_resolve_captures_genuine_github_error(
 
     async with httpx.AsyncClient() as http_client:
         ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        ctx["job_try"] = PROJECT_GITHUB_RESOLVE_MAX_TRIES
         result = await project_github_resolve(ctx, {"project_id": project_id})
 
     assert result == "failed"
@@ -345,3 +351,152 @@ async def test_project_github_resolve_skips_missing_project(
 
     assert result == "skipped"
     assert mock_github.router.calls.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_retries_transient_github_error(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub 503 defers the job instead of burning the only attempt.
+
+    Task #656: #651 gated the ``patch_project`` enqueue on an actual
+    binding change, which removed the accidental self-heal a later
+    PATCH used to provide. A transient GitHub outage must therefore be
+    non-terminal inside the worker: the job raises :class:`arq.Retry`
+    with a backoff ``defer`` so arq re-runs it, and it stays out of
+    Sentry — nothing is broken yet, and paging on every attempt would
+    turn one outage into a storm.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(
+        return_value=httpx.Response(
+            503, json={"message": "Service Unavailable"}
+        )
+    )
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        ctx["job_try"] = 1
+        with pytest.raises(Retry) as exc_info:
+            await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert exc_info.value.defer_score is not None
+    assert exc_info.value.defer_score > 0
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_backoff_grows_between_attempts(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Each deferred attempt waits longer than the one before it.
+
+    A fixed short delay would hammer a struggling GitHub for the whole
+    budget and re-trip the secondary rate limits that caused the
+    failure; the exponential spread is what makes four attempts cover
+    an outage of minutes rather than seconds.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(
+        return_value=httpx.Response(
+            503, json={"message": "Service Unavailable"}
+        )
+    )
+
+    defers: list[int | None] = []
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        for job_try in (1, 2):
+            ctx["job_try"] = job_try
+            with pytest.raises(Retry) as exc_info:
+                await project_github_resolve(ctx, {"project_id": project_id})
+            defers.append(exc_info.value.defer_score)
+
+    first, second = defers
+    assert first is not None
+    assert second is not None
+    assert second > first
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_retries_connection_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A transport failure defers too, not just an HTTP status.
+
+    The resolve's two legs reach GitHub through the shared
+    ``httpx.AsyncClient``, so a DNS blip or a dropped connection
+    surfaces as an ``httpx`` transport error with no response behind
+    it. That is the same "GitHub could not answer right now" condition
+    a 503 is, and must earn the same deferral.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(side_effect=httpx.ConnectError("connection refused"))
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        ctx["job_try"] = 1
+        with pytest.raises(Retry):
+            await project_github_resolve(ctx, {"project_id": project_id})
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_does_not_retry_bad_credentials(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 is a verdict, so it fails on the first attempt.
+
+    Credentials GitHub has rejected will be rejected again in a minute
+    and in ten, so spending the retry budget on them only delays the
+    Sentry event an operator needs to see. The worker pages and returns
+    ``"failed"`` straight away, on the first of its four attempts.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    route = mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/installation"
+    ).mock(
+        return_value=httpx.Response(401, json={"message": "Bad credentials"})
+    )
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        ctx["job_try"] = 1
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "failed"
+    assert len(captured) == 1
+    assert route.call_count == 1

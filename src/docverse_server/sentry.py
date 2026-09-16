@@ -8,6 +8,7 @@ from importlib.metadata import version
 from typing import Any, Literal
 
 import sentry_sdk
+from arq import Retry
 from arq.typing import WorkerCoroutine
 from safir.sentry import initialize_sentry as _safir_initialize_sentry
 from safir.sentry import should_enable_sentry
@@ -134,6 +135,16 @@ def instrument_arq_task(fn: WorkerCoroutine) -> WorkerCoroutine:
             ):
                 try:
                     return await fn(ctx, *args, **kwargs)
+                except Retry:
+                    # Not a failure: ``arq.Retry`` is how a task asks
+                    # arq to run it again later, and it only happens to
+                    # be an ``Exception`` because arq raises it through
+                    # the coroutine. Capturing it would page once per
+                    # deferred attempt for a condition nobody can act
+                    # on — see ``project_github_resolve``, which rides
+                    # out a GitHub outage this way and reports its own
+                    # terminal failure once the budget is spent.
+                    raise
                 except Exception as exc:
                     # arq has no Sentry integration to capture uncaught
                     # exceptions, so the wrapper does it explicitly. Tasks
