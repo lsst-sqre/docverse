@@ -1,4 +1,66 @@
-"""Database operations for the editions table."""
+"""Database operations for the editions table.
+
+Lock order
+----------
+
+Every writer that touches more than one of ``projects``, ``editions``,
+and ``builds`` in a single transaction takes their rows in that order:
+**projects, then editions, then builds**. This module is where that
+invariant is written down; the methods that obey it point back here
+rather than restate it.
+
+The contract is **per transaction**, not per call. A transaction that
+reaches a ``builds`` row before it has taken the ``projects`` row has
+already broken the order even if every store method it called was
+locally well-behaved, because the lock is held until commit and it is
+the transaction, not the method, that PostgreSQL sees in its wait
+graph.
+
+Why it matters:
+:meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
+stamps the project row and cascades outward, editions then builds, so
+it ends up holding all three. Interleave a writer that walks them any
+other way round and each holds a row the other needs next; nothing in
+the tree recovers from the abort PostgreSQL then picks, because
+``keeper_sync_project`` runs with ``max_tries=1`` and charges the
+failed edition to its systemic-abort breaker, while ``delete_project``,
+the edition PATCH, and the rollback handler simply 500.
+
+What follows the order, and how:
+
+- :meth:`EditionStore.set_current_build` locks the project row first —
+  only for a ``__main`` repoint, the only kind that writes it — then the
+  edition row, then the target build. A transaction that is nothing but
+  one of these is in order by construction.
+- :meth:`~docverse_server.services.edition.EditionService.update` applies
+  a ``build`` override, the arm of the PATCH that reaches the project
+  row, before flushing the edition's metadata.
+- :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
+  cascades in this order already, which is what makes it safe for it to
+  end up holding all three.
+
+**Composite writers** — the transactions that write ``builds`` or other
+``editions`` rows *around* a repoint — cannot get the order from
+``set_current_build`` alone, because by the time it runs the
+transaction is already holding rows. Each one therefore opens with
+:meth:`EditionStore.lock_for_repoint`, which takes the project (for a
+``__main`` repoint) and the edition up front; the repoint then re-locks
+rows the transaction already holds, which costs nothing. There are two:
+
+- ``KeeperSyncService._finalize_synced_build`` writes the synced build's
+  content hash, inventory, and two status transitions — four locked
+  ``builds`` writes — before repointing the edition at it.
+- ``EditionTrackingService.track_build`` repoints every edition a
+  completed build matches in one transaction, in slug order, so a
+  co-matching ``git_ref`` or ``lsst_doc`` edition locks ``editions`` and
+  ``builds`` before ``__main`` asks for ``projects``.
+
+A writer that needs only one of the three is unconstrained by this:
+:meth:`~docverse_server.services.build.BuildService.soft_delete` locks a
+build and reads editions without locking them, ``enqueue_publish`` locks
+only the edition, and the per-column writes on this store lock nothing
+else.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +72,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import Select, select, update
+from sqlalchemy import ColumnElement, Select, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -27,7 +89,12 @@ from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import (
+    DEFAULT_EDITION_SLUG,
+    Edition,
+    EditionRepoint,
+    RepointOutcome,
+)
 from docverse_server.domain.edition_reconcile import ReconcileEdition
 from docverse_server.domain.version import (
     EupsDailyVersion,
@@ -412,18 +479,143 @@ class EditionStore:
         # Re-query to get current_build_public_id via join
         return await self.get_by_slug(project_id=project_id, slug=row.slug)
 
+    async def _lock_project_for_repoint(
+        self,
+        *,
+        edition_id: int,
+        project_id: int | None,
+        is_default: bool | None,
+    ) -> None:
+        """Lock the project row, but only for the default edition.
+
+        Step one of the lock order this module documents, and the step
+        most repoints have no use for: only a ``__main`` repoint writes
+        the project row, and a project has one ``__main`` among however
+        many ticket and version editions keeper-sync repoints each
+        tick. Skipping the rest is also what keeps those repoints from
+        serializing on the one row.
+
+        Which case this is comes from the caller wherever the caller
+        knows. *is_default* and *project_id* are an assertion about the
+        edition named by *edition_id*, and every repoint in the tree
+        holds the :class:`~docverse_server.domain.edition.Edition` to
+        make it from; an edition's slug and its project are both
+        immutable, so the assertion cannot have gone stale between the
+        read that made it and this call. Given them, the lock is a
+        primary-key lookup, and for a non-default edition it is no
+        statement at all.
+
+        Without them it falls back to a subquery resolving to the
+        edition's project when *edition_id* is that project's
+        ``__main`` edition and to NULL otherwise — still one statement
+        rather than the two a separate lookup would cost, and for every
+        other edition it matches no row, which locks exactly as little
+        as the caller-informed path skips.
+
+        ``FOR NO KEY UPDATE`` is both the strength the ``UPDATE
+        projects`` clock stamp takes anyway and the strength
+        :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
+        takes to write ``date_deleted``, so the two conflict and one
+        waits.
+
+        Autoflush is held off for this one statement so a caller with a
+        pending edition write does not emit it — an ``editions`` lock —
+        ahead of the project lock. The flush still happens at whichever
+        ``editions`` read follows, which is where it belongs in the
+        order.
+        """
+        if is_default is False:
+            return
+        target: ColumnElement[bool]
+        if is_default and project_id is not None:
+            target = SqlProject.id == project_id
+        else:
+            target = SqlProject.id == (
+                select(SqlEdition.project_id)
+                .where(
+                    SqlEdition.id == edition_id,
+                    func.lower(SqlEdition.slug) == DEFAULT_EDITION_SLUG,
+                )
+                .scalar_subquery()
+            )
+        with self._session.no_autoflush:
+            await self._session.execute(
+                select(SqlProject.id)
+                .where(target)
+                .with_for_update(key_share=True)
+            )
+
+    async def lock_for_repoint(
+        self,
+        *,
+        edition_id: int,
+        project_id: int | None = None,
+        is_default: bool | None = None,
+    ) -> None:
+        """Take the first two rows of the lock order, and hold them.
+
+        The entry point for a **composite writer** — a transaction that
+        writes ``builds`` or other ``editions`` rows around a repoint
+        rather than consisting of one :meth:`set_current_build` call.
+        Called at the head of such a transaction, before anything else
+        it does, it moves the whole of the wait onto the project row:
+        the project (for a ``__main`` repoint) and then the edition,
+        both ``FOR NO KEY UPDATE``, and no build.
+
+        :meth:`set_current_build` then re-locks rows this transaction
+        already holds, which PostgreSQL treats as a no-op, so the
+        repoint itself is unchanged and a caller that *is* a lone
+        repoint needs nothing from here.
+
+        The two callers are keeper-sync's
+        ``KeeperSyncService._finalize_synced_build``, which writes the
+        synced build's hash, inventory and status before repointing the
+        edition at it, and
+        ``EditionTrackingService.track_build``, which repoints every
+        edition a completed build matches in one transaction. Both are
+        named in this module's docstring.
+
+        *project_id* and *is_default* say which project this edition
+        belongs to and whether it is that project's ``__main``; see
+        :meth:`_lock_project_for_repoint` for what they buy and what
+        happens without them. Pass the same values here as to
+        :meth:`set_current_build`, since the two describe one edition.
+        """
+        await self._lock_project_for_repoint(
+            edition_id=edition_id,
+            project_id=project_id,
+            is_default=is_default,
+        )
+        await self._session.execute(
+            select(SqlEdition.id)
+            .where(SqlEdition.id == edition_id)
+            .with_for_update(key_share=True)
+        )
+
     async def set_current_build(
         self,
         *,
         edition_id: int,
         build_id: int,
         skip_date_guard: bool = False,
-    ) -> Edition | None:
+        project_id: int | None = None,
+        is_default: bool | None = None,
+    ) -> EditionRepoint:
         """Set the current build for an edition.
 
+        Reports one of three outcomes — see
+        :class:`~docverse_server.domain.edition.RepointOutcome`: the
+        repoint happened, a guard **refused** it, or the edition
+        already served the target so there was **nothing to change**.
+        The last two are kept apart because they owe the caller
+        different things — a refusal means stand down, an unchanged
+        binding means the postcondition already holds — and only this
+        method can tell them apart, because only it has the edition row
+        under lock when the question is asked.
+
         Two guards can refuse the repoint, and both report the refusal
-        the same way — by returning ``None``, which every caller already
-        treats as "this build does not become current".
+        the same way: ``refused``, carrying no edition, which every
+        caller already treats as "this build does not become current".
 
         The **deleted-build guard** refuses a target whose
         ``date_deleted`` is set (or that no longer exists at all). A
@@ -444,6 +636,47 @@ class EditionStore:
         already points to a build that is equally new or newer, the
         update is skipped (SQR-112).
 
+        The **unchanged** outcome is what is left when the target is
+        the build the edition already serves. It is only reachable
+        under ``skip_date_guard``, because the stale-build guard
+        refuses a build compared with itself — a build's
+        ``date_created`` is never newer than its own — so the callers
+        that meet it are exactly the two operator-driven repoints, the
+        ``build`` override on the editions ``PATCH`` and rollback, both
+        of which mean "serve this build regardless of what is newer".
+        Nothing is written for it: not the column, and not the project
+        clock below, which would otherwise retire every cached ``ETag``
+        on a project whose content never moved (PRD #634). The edition
+        is still returned, because it is the answer to "what is this
+        edition serving now".
+
+        Deciding it here, rather than from a read the caller took
+        earlier, is the point. The service's own pre-read of the
+        edition happens outside the row lock, so a concurrent repoint
+        committing in between would leave it reporting "already serving
+        that build" about a build the edition no longer serves. By the
+        time the comparison below runs, this transaction holds the row.
+
+        A repoint that survives both guards **and** lands on the
+        project's default ``__main`` edition also stamps
+        ``projects.date_updated`` in the same transaction (PRD #634).
+        Every path that moves ``current_build_id`` — the edition
+        service, the tracking service, keeper-sync, rollback — comes
+        through here, so this is the one place that has to know.
+
+        The three rows this can lock — the project row for a ``__main``
+        repoint, the edition row, the target build — are taken in the
+        order this module documents, ahead of the guards rather than as
+        each guard needs them. The comments below say which statement
+        takes which.
+
+        That makes a transaction consisting of one of these calls
+        ordered by construction. It does **not** order a transaction
+        that wrote a ``builds`` or ``editions`` row before calling here:
+        the contract is per transaction, so a composite writer takes
+        :meth:`lock_for_repoint` at its head first, and the locks below
+        then land on rows it already holds.
+
         Parameters
         ----------
         edition_id
@@ -454,17 +687,63 @@ class EditionStore:
             When ``True``, bypass the date-based stale guard.  Used by
             version-based tracking modes where the version comparison
             in the service layer is the authoritative ordering.
+        project_id
+            The project the edition belongs to, if the caller knows it.
+        is_default
+            Whether the edition is that project's ``__main``, if the
+            caller knows it. Together with *project_id* this turns the
+            project lock into a primary-key lookup, and for anything
+            but ``__main`` removes it; see
+            :meth:`_lock_project_for_repoint` for the fallback when
+            either is missing. It is only ever the lock's business: the
+            stamp below is decided from the locked edition row, so a
+            caller that guessed wrong buys the wrong lock, not the
+            wrong outcome.
 
         Returns
         -------
-        Edition or None
-            The updated edition, or ``None`` if the update was skipped
-            because the target build is soft-deleted or the edition
-            already points to a newer build.
+        EditionRepoint
+            The outcome, and the edition as it stands after the call —
+            ``None`` only for ``refused``, where the target build is
+            soft-deleted or the edition already points to a newer
+            build.
         """
-        # Deleted-build guard: a *locking* read of the target, so the
-        # answer cannot go stale between here and the write. ``FOR
-        # SHARE`` conflicts with the ``FOR UPDATE`` that
+        # Step one of the lock order: the project row, taken before
+        # either guard reads anything and only for a ``__main`` repoint.
+        # A repoint that is the whole transaction parks there holding
+        # nothing. A repoint inside a composite writer already holds the
+        # row — its transaction parked on it back at
+        # :meth:`lock_for_repoint`, likewise holding nothing — so this
+        # returns at once. Either way the wait happened before anything
+        # else was locked.
+        await self._lock_project_for_repoint(
+            edition_id=edition_id,
+            project_id=project_id,
+            is_default=is_default,
+        )
+
+        # Step two: the edition row, read under the same ``FOR NO KEY
+        # UPDATE`` its own write would take, so the lock is held from
+        # here rather than from the write — the window the deleted-build
+        # guard below would otherwise sit inside while holding a builds
+        # lock. ``of`` scopes the clause to ``editions``: PostgreSQL
+        # refuses a locking clause on the nullable side of an outer
+        # join, and the joined build is only read for the stale guard.
+        stmt = (
+            select(
+                SqlEdition,
+                SqlBuild.date_created.label("current_build_date"),
+            )
+            .outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
+            .where(SqlEdition.id == edition_id)
+            .with_for_update(key_share=True, of=SqlEdition)
+        )
+        result = await self._session.execute(stmt)
+        row, current_build_date = result.one()
+
+        # Deleted-build guard, and step three: a *locking* read of the
+        # target, so the answer cannot go stale between here and the
+        # write. ``FOR SHARE`` conflicts with the ``FOR UPDATE`` that
         # :meth:`docverse_server.services.build.BuildService.soft_delete`
         # takes before it asks what points at the build, so a rollback
         # racing a DELETE blocks and then re-reads ``date_deleted`` as
@@ -473,52 +752,98 @@ class EditionStore:
         # soft-deleted build. Shared rather than exclusive because this
         # only needs the row to hold still, and concurrent repoints of
         # different editions onto the same build must not serialize.
-        # Lock ordering matches every other build/edition writer —
-        # build row first, edition row second — so this cannot deadlock
-        # against the DELETE, which never locks editions at all.
+        # ``date_created`` rides along because the stale guard below
+        # wants it and this is the row it is on — already read, already
+        # held under this lock for the rest of the transaction, so a
+        # second select of it would be a round trip that can no longer
+        # learn anything.
         target = (
             await self._session.execute(
-                select(SqlBuild.date_deleted)
+                select(SqlBuild.date_deleted, SqlBuild.date_created)
                 .where(SqlBuild.id == build_id)
                 .with_for_update(read=True)
             )
         ).one_or_none()
         if target is None or target.date_deleted is not None:
-            return None
+            return self._refused_repoint()
 
-        # Fetch edition row
-        stmt = (
-            select(
-                SqlEdition,
-                SqlBuild.date_created.label("current_build_date"),
+        # Stale-build guard: refuse when the edition already serves a
+        # build that is equally new or newer.
+        if (
+            not skip_date_guard
+            and current_build_date is not None
+            and current_build_date >= target.date_created
+        ):
+            return self._refused_repoint()
+
+        # The unchanged outcome, decided on the row this transaction
+        # holds rather than on anything a caller read before it. Placed
+        # after the stale guard so the answer to a same-build repoint
+        # is the one that guard has always given wherever it is in
+        # force; what reaches here is a guard-waiving caller, and for
+        # those this is the whole difference between a repoint and a
+        # request whose postcondition already holds.
+        if row.current_build_id == build_id:
+            return EditionRepoint(
+                outcome=RepointOutcome.unchanged,
+                edition=await self._load_edition_for_repoint(edition_id),
             )
-            .outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
-            .where(SqlEdition.id == edition_id)
-        )
-        result = await self._session.execute(stmt)
-        row, current_build_date = result.one()
 
-        if not skip_date_guard:
-            # Fetch incoming build's date_created
-            incoming_result = await self._session.execute(
-                select(SqlBuild.date_created).where(SqlBuild.id == build_id)
+        # The project's clock follows its default edition's content
+        # (PRD #634). This is the only place ``current_build_id``
+        # changes, and we are past both guards and past the build the
+        # edition already served, so a repoint of ``__main`` that
+        # actually happened is exactly the event a
+        # consumer polling the project listing with ``updated_since``
+        # needs to see. ``publish_status`` flips and every other
+        # edition-row write leave the project alone, so the clock means
+        # "the content behind this project moved", not "some row
+        # changed". ``func.now()`` is the transaction timestamp,
+        # matching the ORM ``onupdate`` that metadata edits use, so a
+        # publish and a PATCH in the same transaction agree.
+        #
+        # The row is already locked, so this waits for nothing; the
+        # guards and the unchanged check running between the lock and
+        # the stamp is what keeps a repoint that did not happen from
+        # moving the clock.
+        if row.slug.lower() == DEFAULT_EDITION_SLUG:
+            await self._session.execute(
+                update(SqlProject)
+                .where(SqlProject.id == row.project_id)
+                .values(date_updated=func.now())
+                .execution_options(synchronize_session=False)
             )
-            incoming_date = incoming_result.scalar_one()
-
-            # Stale-build guard: skip if current build is equally new or newer
-            if (
-                current_build_date is not None
-                and current_build_date >= incoming_date
-            ):
-                return None
 
         row.current_build_id = build_id
         await self._session.flush()
-        await self._session.refresh(row)
-        # Re-query to get current_build_public_id + git_ref
-        stmt2 = self._base_query().where(SqlEdition.id == edition_id)
-        result2 = await self._session.execute(stmt2)
-        edition_row, build_public_id, build_git_ref = result2.one()
+
+        return EditionRepoint(
+            outcome=RepointOutcome.repointed,
+            edition=await self._load_edition_for_repoint(edition_id),
+        )
+
+    @staticmethod
+    def _refused_repoint() -> EditionRepoint:
+        """Report a guard's refusal, the one outcome with no edition."""
+        return EditionRepoint(outcome=RepointOutcome.refused, edition=None)
+
+    async def _load_edition_for_repoint(self, edition_id: int) -> Edition:
+        """Re-read an edition to report it in a repoint result.
+
+        A second query rather than the row already in hand, because the
+        result carries the current build's ``public_id`` and ``git_ref``
+        and those only come from the join.
+
+        It is also the whole of what the repoint needs after its flush:
+        loading the edition entity repopulates the ``date_updated`` the
+        flush expired — ``onupdate`` is a SQL expression, so its value
+        comes back from the database — which is why the repoint asks
+        for no ``refresh`` of its own on the way here.
+        """
+        stmt = self._base_query().where(SqlEdition.id == edition_id)
+        edition_row, build_public_id, build_git_ref = (
+            await self._session.execute(stmt)
+        ).one()
         return self._validate(edition_row, build_public_id, build_git_ref)
 
     async def list_live_slugs_by_current_build(

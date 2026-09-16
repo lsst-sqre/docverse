@@ -230,7 +230,15 @@ class EditionTrackingService:
             if not any(e.id == ve.id for e in editions):
                 editions.append(ve)
 
-        # 8. Converge kinds on the current derivation
+        # 8. Take the head-of-transaction lock. Steps 6 and 7 insert
+        #    rows rather than locking existing ones — an INSERT's
+        #    foreign-key check takes ``FOR KEY SHARE`` on the project,
+        #    which conflicts with nothing the soft-delete cascade
+        #    takes — so this still lands ahead of every row lock the
+        #    transaction contends for.
+        await self._lock_project_for_default_repoint(editions)
+
+        # 9. Converge kinds on the current derivation
         editions = await self._refresh_kinds(
             editions,
             derivation=derivation,
@@ -238,7 +246,7 @@ class EditionTrackingService:
             project_id=project.id,
         )
 
-        # 9. Update each edition
+        # 10. Update each edition
         outcomes = await self._update_editions(
             editions,
             build,
@@ -251,6 +259,39 @@ class EditionTrackingService:
             derived_slug=derivation.slug,
             suppressed=False,
             outcomes=outcomes,
+        )
+
+    async def _lock_project_for_default_repoint(
+        self, editions: list[Edition]
+    ) -> None:
+        """Take the project row when this build reaches ``__main``.
+
+        ``track_build`` is a **composite writer** in the sense
+        :mod:`docverse_server.storage.edition_store` documents: one
+        transaction repoints every edition the build matches, and the
+        matches arrive in slug order. Under the database's
+        ``en_US.UTF-8`` collation ``__main`` sorts after ordinary slugs,
+        so a co-matching ``git_ref`` or ``lsst_doc`` edition is
+        repointed first — locking ``editions`` and ``builds`` — and only
+        the later ``__main`` repoint asks for the ``projects`` row it
+        stamps. That is ``editions -> projects``, the reverse of the
+        project soft-delete cascade, and the two deadlock.
+
+        Asking for the project row here, before any edition row is
+        locked, makes the order a property of the whole transaction
+        rather than of each
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
+        call. Nothing is taken for a build that reaches no default
+        edition, which is what keeps unrelated projects' — and this
+        project's non-default — tracking from serializing on one row.
+        """
+        default = next((e for e in editions if e.is_default), None)
+        if default is None:
+            return
+        await self._deps.edition_store.lock_for_repoint(
+            edition_id=default.id,
+            project_id=default.project_id,
+            is_default=True,
         )
 
     async def _refresh_kinds(
@@ -385,6 +426,7 @@ class EditionTrackingService:
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=skip_date_guard,
+            is_default=edition.is_default,
         )
         if updated is None:
             self._deps.logger.info(
@@ -466,16 +508,34 @@ class EditionTrackingService:
         edition_id: int,
         build_id: int,
         skip_date_guard: bool,
+        is_default: bool,
     ) -> Edition | None:
-        """Update the edition pointer under an EDITION_UPDATE lock."""
+        """Update the edition pointer under an EDITION_UPDATE lock.
+
+        Flattens the store's three-valued outcome back to "the edition,
+        or nothing": tracking has the same work to do whether the
+        repoint moved the binding or found it already where it wanted
+        it, and a guard's refusal is the only answer it stands down on.
+
+        *project_id* and *is_default* are passed down to the store,
+        which needs the ``projects`` row only for a ``__main`` repoint
+        and would otherwise re-derive both from the edition it is about
+        to lock. The matched edition is right here, and its slug and
+        project cannot change under it, so answering saves the lock
+        step a subquery on every repoint and the statement entirely on
+        every edition that is not the default.
+        """
         async with self._edition_update_lock(
             org_id=org_id, project_id=project_id, edition_id=edition_id
         ):
-            return await self._deps.edition_store.set_current_build(
+            repoint = await self._deps.edition_store.set_current_build(
                 edition_id=edition_id,
                 build_id=build_id,
                 skip_date_guard=skip_date_guard,
+                project_id=project_id,
+                is_default=is_default,
             )
+            return repoint.edition
 
     # ------------------------------------------------------------------
     # Private helpers

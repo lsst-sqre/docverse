@@ -51,3 +51,32 @@ async def test_get_by_slug_returns_typed_keeper_sync_config(
         "https://keeper.lsst.codes/"
     )
     assert org.keeper_sync_config.project_slugs == ["dmtn-001", "sqr-112"]
+
+
+@pytest.mark.asyncio
+async def test_create_mints_time_ordered_public_id(
+    db_session: AsyncSession,
+) -> None:
+    """Orgs created in succession sort by ``public_id`` in that order."""
+    logger = structlog.get_logger("test")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        first = await org_store.create(
+            OrganizationCreate(
+                slug="pid-first",
+                title="First",
+                base_domain="pid-first.example.com",
+            )
+        )
+        second = await org_store.create(
+            OrganizationCreate(
+                slug="pid-second",
+                title="Second",
+                base_domain="pid-second.example.com",
+            )
+        )
+        await db_session.commit()
+
+    assert first.public_id > 0
+    assert second.public_id > first.public_id

@@ -329,20 +329,37 @@ class DashboardGitHubTemplateBindingStore:
         only assigned when provided; passing ``None`` leaves the
         existing values in place so a failed sync keeps the last-good
         template reference and previously-captured GitHub identities.
+        That is why this is a core ``UPDATE`` built from a values dict
+        rather than ORM attribute assignment: the dict is where "only
+        when provided" lives, and the statement form is what lets the
+        clock be pinned (ORM assignment cannot suppress ``onupdate``).
+
+        A missing binding needs no pre-check: the ``UPDATE`` matches no
+        rows and the trailing read returns ``None``.
         """
-        row = await self._get_row(binding_id)
-        if row is None:
-            return None
-        row.last_sync_status = last_sync_status
-        row.last_sync_error = last_sync_error
+        values: dict[str, Any] = {
+            "last_sync_status": last_sync_status,
+            "last_sync_error": last_sync_error,
+            # Pinned: this runs on every sync attempt, success or
+            # failure. Recording what GitHub told us is bookkeeping,
+            # not an operator edit of the source coordinates.
+            # See the column's note in dbschema.
+            "date_updated": SqlDashboardGitHubTemplateBinding.date_updated,
+        }
         if github_template_id is not None:
-            row.github_template_id = github_template_id
+            values["github_template_id"] = github_template_id
         if github_owner_id is not None:
-            row.github_owner_id = github_owner_id
+            values["github_owner_id"] = github_owner_id
         if github_repo_id is not None:
-            row.github_repo_id = github_repo_id
+            values["github_repo_id"] = github_repo_id
         if github_installation_id is not None:
-            row.github_installation_id = github_installation_id
+            values["github_installation_id"] = github_installation_id
+        stmt = (
+            update(SqlDashboardGitHubTemplateBinding)
+            .where(SqlDashboardGitHubTemplateBinding.id == binding_id)
+            .values(**values)
+        )
+        await self._session.execute(stmt)
         await self._session.flush()
         return await self.get_by_id(binding_id)
 
@@ -355,12 +372,6 @@ class DashboardGitHubTemplateBindingStore:
         the queue-job row exists, inside the same transaction. The
         previous FK is overwritten so the binding always points at the
         most recent sync attempt.
-
-        ``date_updated`` is explicitly preserved — this column tracks
-        operator-visible source-coordinate changes (owner/repo/ref/
-        root_path), and a sync-bookkeeping write should not bump it.
-        Including ``date_updated`` in the ``values()`` dict suppresses
-        the column's ``onupdate=now()`` server-side default.
         """
         existing = await self._get_row(binding_id)
         if existing is None:
@@ -370,6 +381,10 @@ class DashboardGitHubTemplateBindingStore:
             .where(SqlDashboardGitHubTemplateBinding.id == binding_id)
             .values(
                 last_sync_queue_job_id=queue_job_id,
+                # Pinned: pointing the binding at its own sync job
+                # is bookkeeping, not an operator edit of the
+                # source coordinates.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
         )
@@ -399,9 +414,7 @@ class DashboardGitHubTemplateBindingStore:
 
         Used by the ``repository.renamed`` webhook handler: any binding
         whose first sync captured ``github_repo_id`` matches here, even
-        when its display name is now stale. ``date_updated`` is
-        preserved because operator-visible source-coordinate writes
-        come through PUT, not through GitHub-side metadata sync.
+        when its display name is now stale.
         """
         stmt = (
             update(SqlDashboardGitHubTemplateBinding)
@@ -411,6 +424,9 @@ class DashboardGitHubTemplateBindingStore:
             )
             .values(
                 github_repo=new_repo,
+                # Pinned: GitHub renamed the repo; the operator did not
+                # re-point the binding.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)
@@ -443,6 +459,9 @@ class DashboardGitHubTemplateBindingStore:
             )
             .values(
                 github_repo=new_repo,
+                # Pinned: same rename, reached by display name because this
+                # binding has never synced.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)
@@ -478,6 +497,10 @@ class DashboardGitHubTemplateBindingStore:
                 github_owner=new_owner,
                 github_owner_id=new_owner_id,
                 github_repo=new_repo,
+                # Pinned: GitHub moved the repo to a new owner; the binding's
+                # coordinates followed, the operator's intent did not
+                # change.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)
@@ -507,6 +530,8 @@ class DashboardGitHubTemplateBindingStore:
             )
             .values(
                 github_owner=new_owner,
+                # Pinned: GitHub renamed the owner account under us.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)
@@ -537,6 +562,9 @@ class DashboardGitHubTemplateBindingStore:
             )
             .values(
                 github_owner=new_owner,
+                # Pinned: same owner rename, reached by login because this
+                # binding has never synced.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)
@@ -557,8 +585,7 @@ class DashboardGitHubTemplateBindingStore:
         ``reason`` lands in ``last_sync_error`` as a machine-readable
         tag (e.g. ``installation_suspended``) so the
         ``installation.unsuspend`` clearer can target the same set of
-        rows. ``date_updated`` is preserved — installation-state flips
-        are not source-coordinate edits.
+        rows.
         """
         stmt = (
             update(SqlDashboardGitHubTemplateBinding)
@@ -569,6 +596,9 @@ class DashboardGitHubTemplateBindingStore:
             .values(
                 last_sync_status="failed",
                 last_sync_error=reason,
+                # Pinned: the App was deleted or suspended; that is
+                # a GitHub-side state flip, not a binding edit.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)
@@ -602,6 +632,8 @@ class DashboardGitHubTemplateBindingStore:
             .values(
                 last_sync_status="pending",
                 last_sync_error=None,
+                # Pinned: the App came back; likewise a GitHub-side state flip.
+                # See the column's note in dbschema.
                 date_updated=SqlDashboardGitHubTemplateBinding.date_updated,
             )
             .returning(SqlDashboardGitHubTemplateBinding.id)

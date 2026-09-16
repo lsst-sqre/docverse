@@ -8,7 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ._examples import EXAMPLE_ORG_URL
+from ._examples import EXAMPLE_ORG_ID, EXAMPLE_ORG_URL
 from .editions import DefaultEditionConfig, EditionAutocreationConfig
 from .lifecycle import LifecycleRuleSet
 from .memberships import OrgMembershipCreate, OrgRole
@@ -186,6 +186,16 @@ class Organization(BaseModel):
         examples=[f"{EXAMPLE_ORG_URL}/keeper-sync"],
     )
 
+    id: str = Field(
+        description=(
+            "Public Crockford Base32 identifier for the organization."
+            " Stable for the life of the organization, so it still"
+            " identifies this resource if the slug is ever renamed. Path"
+            " parameters use the slug, not this id."
+        ),
+        examples=[EXAMPLE_ORG_ID],
+    )
+
     slug: str = Field(
         description="URL-safe identifier for the organization.",
         examples=["lsst"],
@@ -323,6 +333,14 @@ class OrganizationSummary(BaseModel):
     self_url: str = Field(
         description="URL to this organization resource.",
         examples=[EXAMPLE_ORG_URL],
+    )
+
+    id: str = Field(
+        description=(
+            "Public Crockford Base32 identifier for the organization —"
+            " the same value the full organization resource carries."
+        ),
+        examples=[EXAMPLE_ORG_ID],
     )
 
     slug: str = Field(

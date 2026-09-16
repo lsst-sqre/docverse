@@ -27,7 +27,7 @@ from typing import Any, cast
 
 import pytest
 import sentry_sdk
-from arq import func
+from arq import Retry, func
 from arq.typing import WorkerCoroutine
 from safir.testing.sentry import (
     TestTransport,
@@ -143,6 +143,40 @@ async def test_instrument_arq_task_sets_transaction_and_job_tags(
     assert event["transaction"] == "boom_task"
     assert event["tags"]["arq.job_id"] == "abc123"
     assert event["tags"]["arq.job_try"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_instrument_arq_task_does_not_capture_arq_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``arq.Retry`` is flow control, so the wrapper lets it through.
+
+    :class:`arq.Retry` is a :class:`RuntimeError` subclass, so the
+    wrapper's blanket ``except Exception`` would otherwise page Sentry
+    once per deferred attempt — turning a task that rides out a
+    third-party outage (``project_github_resolve``, task #656) into a
+    burst of issues for a condition nobody needs to act on. A task that
+    exhausts its budget reports the terminal failure itself, which is
+    the event worth paging on. The exception still propagates: arq
+    reads it off the coroutine to schedule the re-run.
+    """
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    _patch_sentry_init_with_test_transport(monkeypatch)
+
+    async def deferring_task(ctx: dict[str, Any]) -> None:
+        raise Retry(defer=30)
+
+    wrapped = instrument_arq_task(deferring_task)
+
+    with sentry_init_fixture():
+        initialize_sentry(component="worker")
+        captured = capture_events_fixture(monkeypatch)()
+
+        with pytest.raises(Retry):
+            await wrapped({"job_id": "abc123", "job_try": 1})
+
+    assert captured.errors == []
 
 
 @pytest.mark.asyncio

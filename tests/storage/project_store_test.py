@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
@@ -23,6 +24,7 @@ from docverse.models import (
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.conditional_get import datetime_to_microseconds
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -31,8 +33,12 @@ from docverse_server.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse_server.storage.organization_store import OrganizationStore
-from docverse_server.storage.pagination import ProjectSlugCursor
+from docverse_server.storage.pagination import (
+    ProjectDateUpdatedCursor,
+    ProjectSlugCursor,
+)
 from docverse_server.storage.project_store import ProjectStore
+from tests.support.rowlocks import record_statements
 
 
 @pytest.fixture
@@ -185,17 +191,19 @@ async def test_update_project(
 
 
 @pytest.mark.asyncio
-async def test_rename_repo_by_repo_id_preserves_date_updated(
+async def test_rename_repo_by_repo_id_advances_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """A GitHub-side repo rename must not bump ``date_updated``.
+    """A GitHub-side repo rename advances ``date_updated``.
 
-    ``date_updated`` is the operator-visible "last source-coordinate
-    edit" signal; those edits arrive through PUT/PATCH, not through a
-    GitHub-side metadata sync. The rename still flips ``github_repo``;
-    the effective source URL is derived from the binding.
+    PRD #634 turned ``date_updated`` into a change signal for pollers
+    such as Ook rather than a "last operator edit" marker. A rename
+    flips ``github_repo`` and therefore the project's
+    ``source_url`` on the wire, so the clock — and with it the
+    listing's ETag and its ``updated_since`` filter — has to move
+    with it.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -211,8 +219,6 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
             github_owner="acme",
             github_repo="old-repo",
         )
-        # Set github_repo_id without bumping date_updated so the baseline
-        # below is the create timestamp.
         await store.apply_installation_scope(
             installation_id=111,
             owner="acme",
@@ -227,9 +233,9 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
     assert before is not None
     baseline = before.date_updated
 
-    # Run the rename in a later transaction so a re-fired
-    # ``onupdate=func.now()`` would yield a strictly greater timestamp
-    # than the create transaction's ``now()``.
+    # Run the rename in a later transaction: ``func.now()`` is
+    # transaction-stable in PostgreSQL, so only a separate transaction
+    # yields a strictly greater timestamp than the create's.
     await asyncio.sleep(0.05)
     async with db_session.begin():
         updated_ids = await store.rename_repo_by_repo_id(
@@ -245,20 +251,75 @@ async def test_rename_repo_by_repo_id_preserves_date_updated(
     assert after.github_repo == "new-repo"
     assert after.source_url is None
     assert after.effective_source_url == "https://github.com/acme/new-repo"
-    assert after.date_updated == baseline
+    assert after.date_updated > baseline
 
 
 @pytest.mark.asyncio
-async def test_transfer_repo_by_repo_id_preserves_date_updated(
+async def test_rename_repo_by_repo_id_noop_pins_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """A GitHub-side repo transfer must not bump ``date_updated``.
+    """A rename to the name already stored moves no clock.
 
-    The transfer still flips ``github_owner`` / ``github_owner_id`` /
-    ``github_repo``; the effective source URL is derived from the
-    binding.
+    Task #651: a redelivered ``repository.renamed`` (or one whose
+    payload has already been applied) writes the name the row holds, so
+    nothing changes on the wire and no ETag should be retired.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="rename-noop",
+                title="Rename Noop",
+                github=ProjectGitHubBindingCreate(
+                    owner="acme", repo="same-repo"
+                ),
+            ),
+            github_owner="acme",
+            github_repo="same-repo",
+        )
+        await store.apply_installation_scope(
+            installation_id=111,
+            owner="acme",
+            owner_id=222,
+            repo="same-repo",
+            repo_id=333,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.rename_repo_by_repo_id(
+            github_repo_id=333,
+            new_repo="same-repo",
+        )
+        await db_session.commit()
+    assert updated_ids == []
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_transfer_repo_by_repo_id_advances_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A GitHub-side repo transfer advances ``date_updated``.
+
+    The transfer moves the repo to a new owner namespace, so the
+    project's ``source_url`` changes on the wire and the clock a poller
+    reads has to follow it.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -304,19 +365,187 @@ async def test_transfer_repo_by_repo_id_preserves_date_updated(
     assert after.github_owner_id == 444
     assert after.source_url is None
     assert after.effective_source_url == "https://github.com/beta/repo"
-    assert after.date_updated == baseline
+    assert after.date_updated > baseline
 
 
 @pytest.mark.asyncio
-async def test_update_github_metadata_preserves_date_updated(
+async def test_transfer_repo_by_repo_id_noop_pins_date_updated(
     db_session: AsyncSession,
     store: ProjectStore,
     org_store: OrganizationStore,
 ) -> None:
-    """Capturing the github_*_id columns preserves ``date_updated``.
+    """A transfer into the namespace already stored moves no clock.
 
-    The three numeric ids are sync-bookkeeping, not an operator-visible
-    source-coordinate edit.
+    Task #651: replaying ``repository.transferred`` after it has landed
+    rewrites owner, owner_id, and repo with the values the row already
+    holds, which changes nothing a poller can observe.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="transfer-noop",
+                title="Transfer Noop",
+                github=ProjectGitHubBindingCreate(owner="beta", repo="repo"),
+            ),
+            github_owner="beta",
+            github_repo="repo",
+        )
+        await store.apply_installation_scope(
+            installation_id=111,
+            owner="beta",
+            owner_id=444,
+            repo="repo",
+            repo_id=333,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.transfer_repo_by_repo_id(
+            github_repo_id=333,
+            new_owner="beta",
+            new_owner_id=444,
+            new_repo="repo",
+        )
+        await db_session.commit()
+    assert updated_ids == []
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_apply_installation_scope_advances_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Capturing the installation scope advances ``date_updated``.
+
+    ``github_installation_id`` surfaces on the wire as the binding's
+    ``installation_status`` (and its ``app_url``), so an
+    ``installation`` webhook bringing ``owner/repo`` into scope is a
+    change a poller must be able to see.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="scope-me",
+                title="Scope Me",
+                github=ProjectGitHubBindingCreate(owner="Acme", repo="Docs"),
+            ),
+            github_owner="Acme",
+            github_repo="Docs",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        # Lower-cased payload, to keep the case-insensitive match
+        # covered alongside the clock.
+        updated_ids = await store.apply_installation_scope(
+            installation_id=11,
+            owner="acme",
+            owner_id=22,
+            repo="docs",
+            repo_id=33,
+        )
+        await db_session.commit()
+    assert updated_ids == [created.id]
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.github_installation_id == 11
+    assert after.date_updated > baseline
+
+
+@pytest.mark.asyncio
+async def test_apply_installation_scope_redelivery_pins_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A redelivered ``installation`` webhook moves no clock.
+
+    Task #651: GitHub redelivers ``installation.created`` freely, and an
+    installation listing 40 already-scoped repos would otherwise retire
+    40 project ETags and re-emit 40 identical rows into every poller's
+    ``updated_since`` window. The write is now predicated on the binding
+    ids actually differing, so the redelivery matches no row.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="rescope-me",
+                title="Rescope Me",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="docs"),
+            ),
+            github_owner="acme",
+            github_repo="docs",
+        )
+        await store.apply_installation_scope(
+            installation_id=11,
+            owner="acme",
+            owner_id=22,
+            repo="docs",
+            repo_id=33,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated_ids = await store.apply_installation_scope(
+            installation_id=11,
+            owner="acme",
+            owner_id=22,
+            repo="docs",
+            repo_id=33,
+        )
+        await db_session.commit()
+    assert updated_ids == []
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_update_github_metadata_advances_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The resolve worker's write advances ``date_updated``.
+
+    ``github_installation_id`` drives the binding's
+    ``installation_status`` on the wire, so the resolve worker landing
+    it is a change to what the project GET returns — and therefore a
+    change the project clock has to report.
     """
     async with db_session.begin():
         org_id = await _create_org(org_store)
@@ -356,6 +585,68 @@ async def test_update_github_metadata_preserves_date_updated(
     assert after.github_installation_id == 10
     assert after.github_owner_id == 20
     assert after.github_repo_id == 30
+    assert after.date_updated > baseline
+
+
+@pytest.mark.asyncio
+async def test_update_github_metadata_reresolve_pins_date_updated(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A re-resolve that finds nothing new moves no clock.
+
+    Task #651: the resolve worker runs on every PATCH of a bound
+    project, so a bulk retitle of 100 projects used to leave 100
+    phantom clock advances behind it — each one a second 200 with an
+    unchanged body for every poller. The write now matches no row when
+    the three ids are already in place, yet still reports success so
+    the worker logs ``completed`` rather than the binding-changed
+    ``skipped``.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store)
+        created = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="meta-again",
+                title="Meta Again",
+                github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
+            ),
+            github_owner="acme",
+            github_repo="repo",
+        )
+        await store.update_github_metadata(
+            project_id=created.id,
+            expected_owner="acme",
+            expected_repo="repo",
+            installation_id=10,
+            owner_id=20,
+            repo_id=30,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(created.id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        updated = await store.update_github_metadata(
+            project_id=created.id,
+            expected_owner="acme",
+            expected_repo="repo",
+            installation_id=10,
+            owner_id=20,
+            repo_id=30,
+        )
+        await db_session.commit()
+    assert updated is True
+
+    async with db_session.begin():
+        after = await store.get_by_id(created.id)
+    assert after is not None
     assert after.date_updated == baseline
 
 
@@ -1267,3 +1558,520 @@ async def test_list_slugs_by_ids_is_empty_for_no_ids(
     """No ids means no query: the sweep often purges nothing at all."""
     async with db_session.begin():
         assert await store.list_slugs_by_ids([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_create_mints_time_ordered_public_id(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Projects created in succession sort by ``public_id`` in that order."""
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="pid-order-org")
+        first = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(slug="first", title="First"),
+        )
+        second = await store.create(
+            org_id=org_id,
+            data=ProjectCreate(slug="second", title="Second"),
+        )
+        await db_session.commit()
+
+    assert first.public_id > 0
+    assert second.public_id > first.public_id
+
+
+# ---------------------------------------------------------------------------
+# ``date_updated`` ordering and the ``updated_since`` filter
+# ---------------------------------------------------------------------------
+
+# Three fixed instants, oldest to newest. Pinned rather than derived from
+# ``now()`` because ``projects.date_updated`` is stamped by the
+# transaction timestamp: rows written in one transaction would otherwise
+# all share a value and there would be nothing to order or filter on.
+T_OLD = datetime(2026, 1, 1, tzinfo=UTC)
+T_MID = datetime(2026, 2, 1, tzinfo=UTC)
+T_NEW = datetime(2026, 3, 1, tzinfo=UTC)
+
+
+async def _seed_clocked_projects(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+    *,
+    org_slug: str,
+    title: str = "Clocked",
+) -> int:
+    """Create three projects stamped with `T_OLD`, `T_MID`, and `T_NEW`.
+
+    The timestamps are written with a Core ``UPDATE`` because
+    ``SqlProject.date_updated`` carries an ORM ``onupdate``, which would
+    overwrite any value an ORM flush tried to set. ``expire_all`` then
+    drops the identity map so the listing under test reads the new
+    timestamps from the database rather than the stale loaded rows.
+
+    Returns the org id.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug=org_slug)
+        for slug in ("clock-old", "clock-mid", "clock-new"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=title),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        for slug, stamp in (
+            ("clock-old", T_OLD),
+            ("clock-mid", T_MID),
+            ("clock-new", T_NEW),
+        ):
+            await db_session.execute(
+                update(SqlProject)
+                .where(
+                    SqlProject.org_id == org_id,
+                    SqlProject.slug == slug,
+                )
+                .values(date_updated=stamp)
+                .execution_options(synchronize_session=False)
+            )
+        await db_session.commit()
+    db_session.expire_all()
+    return org_id
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_date_updated_orders_newest_first(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """``ProjectDateUpdatedCursor`` sorts most-recently-touched first."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-order-org"
+    )
+
+    async with db_session.begin():
+        result = await store.list_by_org(
+            org_id, cursor_type=ProjectDateUpdatedCursor, limit=25
+        )
+
+    assert [p.slug for p in result.entries] == [
+        "clock-new",
+        "clock-mid",
+        "clock-old",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_date_updated_pages_forward(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The ``date_updated`` cursor walks forward without repeating rows."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-fwd-org"
+    )
+
+    async with db_session.begin():
+        first = await store.list_by_org(
+            org_id, cursor_type=ProjectDateUpdatedCursor, limit=2
+        )
+        assert first.next_cursor is not None
+        second = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectDateUpdatedCursor,
+            cursor=first.next_cursor,
+            limit=2,
+        )
+
+    assert [p.slug for p in first.entries] == ["clock-new", "clock-mid"]
+    assert [p.slug for p in second.entries] == ["clock-old"]
+    assert second.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_date_updated_pages_backward(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The second page's ``prev`` cursor returns the first page."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-back-org"
+    )
+
+    async with db_session.begin():
+        first = await store.list_by_org(
+            org_id, cursor_type=ProjectDateUpdatedCursor, limit=2
+        )
+        assert first.next_cursor is not None
+        second = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectDateUpdatedCursor,
+            cursor=first.next_cursor,
+            limit=2,
+        )
+        assert second.prev_cursor is not None
+        back = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectDateUpdatedCursor,
+            cursor=second.prev_cursor,
+            limit=2,
+        )
+
+    assert [p.slug for p in back.entries] == ["clock-new", "clock-mid"]
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_updated_since_is_inclusive(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """``updated_since`` keeps rows whose clock equals the boundary.
+
+    The boundary is inclusive so a poller can pass back the newest
+    ``date_updated`` it saw without a "did I already have this?"
+    round-trip; re-seeing one row is cheaper than the risk of skipping
+    one written in the same microsecond.
+    """
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-since-org"
+    )
+
+    async with db_session.begin():
+        result = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectSlugCursor,
+            limit=25,
+            updated_since=T_MID,
+        )
+
+    assert [p.slug for p in result.entries] == ["clock-mid", "clock-new"]
+    assert result.count == 2
+
+
+@pytest.mark.asyncio
+async def test_search_by_org_honours_updated_since(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The fuzzy-search path applies the same inclusive clock filter."""
+    org_id = await _seed_clocked_projects(
+        db_session, store, org_store, org_slug="clock-search-org"
+    )
+
+    async with db_session.begin():
+        result = await store.search_by_org(
+            org_id, query="clock", limit=25, updated_since=T_MID
+        )
+
+    assert sorted(p.slug for p in result.entries) == [
+        "clock-mid",
+        "clock-new",
+    ]
+    assert result.count == 2
+
+
+# ---------------------------------------------------------------------------
+# ``include_deleted``
+# ---------------------------------------------------------------------------
+
+
+async def _seed_live_and_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+    *,
+    org_slug: str,
+) -> int:
+    """Create a live ``gone-live`` project and a deleted ``gone-dead`` one.
+
+    Both slugs share the ``gone-`` prefix so a single trigram query
+    matches the pair, which is what the search-path test needs.
+
+    Returns the org id.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug=org_slug)
+        for slug in ("gone-live", "gone-dead"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=f"Gone {slug}"),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await store.soft_delete(
+            org_id=org_id,
+            slug="gone-dead",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+    db_session.expire_all()
+    return org_id
+
+
+@pytest.mark.asyncio
+async def test_get_by_slug_include_deleted_returns_deleted_project(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """``include_deleted`` resolves a soft-deleted slug to its row.
+
+    ``uq_projects_org_slug`` ignores ``date_deleted``, so a slug is
+    never reused after a delete and the widened lookup still names
+    exactly one row.
+    """
+    org_id = await _seed_live_and_deleted(
+        db_session, store, org_store, org_slug="gone-get-org"
+    )
+
+    async with db_session.begin():
+        without_flag = await store.get_by_slug(org_id=org_id, slug="gone-dead")
+        with_flag = await store.get_by_slug(
+            org_id=org_id, slug="gone-dead", include_deleted=True
+        )
+
+    assert without_flag is None
+    assert with_flag is not None
+    assert with_flag.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_list_by_org_include_deleted_lists_and_counts_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The ordered listing widens to deleted rows and counts them."""
+    org_id = await _seed_live_and_deleted(
+        db_session, store, org_store, org_slug="gone-list-org"
+    )
+
+    async with db_session.begin():
+        without_flag = await store.list_by_org(
+            org_id, cursor_type=ProjectSlugCursor, limit=25
+        )
+        with_flag = await store.list_by_org(
+            org_id,
+            cursor_type=ProjectSlugCursor,
+            limit=25,
+            include_deleted=True,
+        )
+
+    assert [p.slug for p in without_flag.entries] == ["gone-live"]
+    assert without_flag.count == 1
+    assert [p.slug for p in with_flag.entries] == ["gone-dead", "gone-live"]
+    assert with_flag.count == 2
+
+
+@pytest.mark.asyncio
+async def test_search_by_org_include_deleted_matches_deleted(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The fuzzy-search path widens the same way the listing does."""
+    org_id = await _seed_live_and_deleted(
+        db_session, store, org_store, org_slug="gone-search-org"
+    )
+
+    async with db_session.begin():
+        without_flag = await store.search_by_org(
+            org_id, query="gone", limit=25
+        )
+        with_flag = await store.search_by_org(
+            org_id, query="gone", limit=25, include_deleted=True
+        )
+
+    assert [p.slug for p in without_flag.entries] == ["gone-live"]
+    assert without_flag.count == 1
+    assert sorted(p.slug for p in with_flag.entries) == [
+        "gone-dead",
+        "gone-live",
+    ]
+    assert with_flag.count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_includes_deleted_projects(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The watermark counts deleted rows and sums their clocks too.
+
+    A soft delete is the one mutation whose row drops out of the
+    default listing, so a watermark that filtered deleted rows would
+    sit still through exactly the change a poller most needs to see.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="watermark-org")
+        for slug in ("wm-live", "wm-dead"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=f"Watermark {slug}"),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await store.soft_delete(
+            org_id=org_id,
+            slug="wm-dead",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    # ``now()`` is transaction-stable in PostgreSQL, so rows written in
+    # one transaction are otherwise indistinguishable.
+    live_clock = datetime(2026, 4, 1, tzinfo=UTC)
+    dead_clock = datetime(2026, 5, 1, tzinfo=UTC)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "wm-live")
+            .values(date_updated=live_clock)
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "wm-dead")
+            .values(date_updated=dead_clock)
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+    db_session.expire_all()
+
+    async with db_session.begin():
+        watermark = await store.get_org_watermark(org_id)
+
+    assert watermark.project_count == 2
+    assert watermark.clock_sum == datetime_to_microseconds(
+        live_clock
+    ) + datetime_to_microseconds(dead_clock)
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_is_zero_for_an_empty_org(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """An org with no projects aggregates to zeroes, not to ``None``.
+
+    The endpoint's tag also hashes the org's public id, so two empty
+    organizations still validate apart without the aggregate having to
+    join ``organizations`` for a per-org fallback.
+    """
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="watermark-empty-org",
+                title="Test Org",
+                base_domain="test.example.com",
+            )
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        watermark = await store.get_org_watermark(org.id)
+
+    assert watermark.project_count == 0
+    assert watermark.clock_sum == 0
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_notices_a_clock_below_the_max(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A late commit under the maximum still moves the watermark.
+
+    ``now()`` is PostgreSQL's *transaction start* time, and commit
+    order is not start order, so a slow writer can land a
+    ``date_updated`` below the maximum a poller has already read. A
+    maximum would sit still through exactly that change; the sum of
+    every row's clock must not.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="skew-org")
+        for slug in ("skew-old", "skew-new"):
+            await store.create(
+                org_id=org_id,
+                data=ProjectCreate(slug=slug, title=f"Skew {slug}"),
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "skew-old")
+            .values(date_updated=datetime(2026, 1, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "skew-new")
+            .values(date_updated=datetime(2026, 3, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_org_watermark(org_id)
+
+    # The late commit: a clock that moves but stays under the maximum.
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.slug == "skew-old")
+            .values(date_updated=datetime(2026, 2, 1, tzinfo=UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        after = await store.get_org_watermark(org_id)
+
+    assert after.project_count == before.project_count
+    assert after != before
+
+
+@pytest.mark.asyncio
+async def test_get_org_watermark_runs_one_joinless_aggregate(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """The watermark costs one aggregate over ``projects`` and no join.
+
+    Conditional GET exists to make a poller's empty pass cheap, so the
+    query on that path has to stay something PostgreSQL can answer from
+    ``idx_projects_org_date_updated`` alone. Joining ``organizations``
+    for a per-org empty fallback would defeat that scan, which is why
+    an empty org simply aggregates to zeroes.
+    """
+    async with db_session.begin():
+        org_id = await _create_org(org_store, slug="joinless-org")
+        await store.create(
+            org_id=org_id,
+            data=ProjectCreate(slug="joinless-one", title="Joinless"),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        with record_statements(db_session) as statements:
+            await store.get_org_watermark(org_id)
+
+    assert len(statements) == 1
+    assert "JOIN" not in statements[0].upper()
+    assert statements[0].upper().count("SELECT") == 1

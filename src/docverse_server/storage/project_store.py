@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -10,14 +12,27 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import REAL, cast, select, update
+from sqlalchemy import (
+    REAL,
+    ColumnElement,
+    Numeric,
+    Row,
+    cast,
+    extract,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import expression, func
 
 from docverse.models import ProjectCreate, ProjectUpdate
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.project import Project
+from docverse_server.domain.project import Project, ProjectListingWatermark
+from docverse_server.storage._public_id import (
+    insert_with_time_ordered_public_id,
+)
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
@@ -25,6 +40,13 @@ from docverse_server.storage.pagination import ProjectSearchCursor
 
 _TRGM_SIMILARITY_THRESHOLD = 0.1
 """Minimum trigram similarity score for fuzzy search results."""
+
+_MICROSECONDS_PER_SECOND = 1_000_000
+"""Scale factor turning ``extract(epoch ...)`` seconds into microseconds.
+
+``timestamptz`` stores microseconds, so this is the largest factor that
+still renders every stored clock as an exact integer.
+"""
 
 
 class ProjectStore:
@@ -61,21 +83,32 @@ class ProjectStore:
         from the request payload. The validator guarantees a
         GitHub-bound project sends no ``source_url``, so the column is
         persisted NULL for those rows.
+
+        The ``public_id`` is a time-ordered Crockford Base32 resource ID
+        minted at insert time and re-minted on the (rare)
+        same-millisecond collision. Unlike a build's, it is embedded in
+        no object-store key, so nothing else has to be recomputed per
+        attempt.
         """
         lifecycle_rules = None
         if data.lifecycle_rules is not None:
             lifecycle_rules = data.lifecycle_rules.model_dump(mode="json")
-        row = SqlProject(
-            slug=data.slug,
-            title=data.title,
-            org_id=org_id,
-            source_url=data.source_url,
-            github_owner=github_owner,
-            github_repo=github_repo,
-            lifecycle_rules=lifecycle_rules,
+
+        def _make_row(public_id: int) -> SqlProject:
+            return SqlProject(
+                public_id=public_id,
+                slug=data.slug,
+                title=data.title,
+                org_id=org_id,
+                source_url=data.source_url,
+                github_owner=github_owner,
+                github_repo=github_repo,
+                lifecycle_rules=lifecycle_rules,
+            )
+
+        row = await insert_with_time_ordered_public_id(
+            self._session, _make_row
         )
-        self._session.add(row)
-        await self._session.flush()
         await self._session.refresh(row)
         return Project.model_validate(row)
 
@@ -92,15 +125,28 @@ class ProjectStore:
             return None
         return Project.model_validate(row)
 
-    async def get_by_slug(self, *, org_id: int, slug: str) -> Project | None:
-        """Fetch a project by org_id and slug."""
-        result = await self._session.execute(
-            select(SqlProject).where(
-                SqlProject.org_id == org_id,
-                SqlProject.slug == slug,
-                SqlProject.date_deleted.is_(None),
-            )
+    async def get_by_slug(
+        self, *, org_id: int, slug: str, include_deleted: bool = False
+    ) -> Project | None:
+        """Fetch a project by org_id and slug.
+
+        Parameters
+        ----------
+        include_deleted
+            When ``True``, a soft-deleted project resolves instead of
+            reading as missing. The lookup stays unambiguous because
+            ``uq_projects_org_slug`` ignores ``date_deleted``: a slug is
+            never reused once its project is gone, so widening the
+            filter can only ever surface the one row that already owned
+            the slug.
+        """
+        stmt = select(SqlProject).where(
+            SqlProject.org_id == org_id,
+            SqlProject.slug == slug,
         )
+        if not include_deleted:
+            stmt = stmt.where(SqlProject.date_deleted.is_(None))
+        result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
             return None
@@ -250,17 +296,96 @@ class ProjectStore:
         cursor_type: type[PaginationCursor[Project]],
         cursor: PaginationCursor[Project] | None = None,
         limit: int,
+        updated_since: datetime | None = None,
+        include_deleted: bool = False,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
-        """List non-deleted projects for an organization with pagination."""
-        stmt = select(SqlProject).where(
-            SqlProject.org_id == org_id,
-            SqlProject.date_deleted.is_(None),
-        )
+        """List an organization's projects with pagination.
+
+        Parameters
+        ----------
+        updated_since
+            When given, keep only projects whose ``date_updated`` is at
+            or after this timezone-aware instant. The comparison is
+            inclusive so a poller can hand back the newest timestamp it
+            saw and be certain it skips nothing written in that same
+            microsecond; the cost is re-seeing the boundary row.
+        include_deleted
+            When ``True``, soft-deleted projects are listed alongside
+            live ones and counted in the total. A poller that mirrors
+            the listing needs the deletion to show up as a row it can
+            act on, not as a project that silently stops appearing.
+        """
+        stmt = select(SqlProject).where(SqlProject.org_id == org_id)
+        if not include_deleted:
+            stmt = stmt.where(SqlProject.date_deleted.is_(None))
+        if updated_since is not None:
+            stmt = stmt.where(SqlProject.date_updated >= updated_since)
         runner = CountedPaginatedQueryRunner(
             entry_type=Project, cursor_type=cursor_type
         )
         return await runner.query_object(
             self._session, stmt, cursor=cursor, limit=limit
+        )
+
+    async def get_org_watermark(self, org_id: int) -> ProjectListingWatermark:
+        """Return the conditional-GET aggregate over an org's projects.
+
+        This is the moving part of the ``ETag`` for
+        ``GET /orgs/{org}/projects``. Soft-deleted projects count in
+        both aggregates: a delete is the one mutation whose row leaves
+        the default listing, so a watermark that skipped deleted rows
+        would stand still through exactly the change a poller most
+        needs to notice.
+
+        Two aggregates rather than one maximum, because the maximum is
+        not monotonic. Every mutation stamps ``date_updated`` with
+        ``now()``, which in PostgreSQL is the *transaction start* time,
+        and commit order is not start order: a writer that began before
+        a poller's read but committed after it lands a clock below the
+        maximum the poller stored. ``project_count`` catches a row that
+        appeared or disappeared and ``clock_sum`` catches a clock that
+        moved anywhere at all, so the pair changes on every insert,
+        update, and soft delete regardless of commit order. See
+        :class:`~docverse_server.domain.project.ProjectListingWatermark`.
+
+        The statement is one aggregate over ``projects`` with no join,
+        so PostgreSQL can answer it from the
+        ``idx_projects_org_date_updated`` index alone. An org that owns
+        no projects reports ``(0, 0)``; the endpoint's tag also hashes
+        the org's public id, so two empty orgs still validate apart.
+
+        Parameters
+        ----------
+        org_id
+            Internal id of the organization.
+
+        Returns
+        -------
+        ProjectListingWatermark
+            The row count and the sum of every row's clock in
+            microseconds.
+        """
+        stmt = select(
+            func.count(),
+            func.coalesce(
+                func.sum(
+                    # Cast per row so the sum is exact NUMERIC
+                    # arithmetic: a float sum of present-day
+                    # microsecond counts loses the low digits that are
+                    # the whole point, and a bigint sum overflows after
+                    # a few thousand rows.
+                    cast(
+                        extract("epoch", SqlProject.date_updated)
+                        * _MICROSECONDS_PER_SECOND,
+                        Numeric(),
+                    )
+                ),
+                0,
+            ),
+        ).where(SqlProject.org_id == org_id)
+        count, clock_sum = (await self._session.execute(stmt)).one()
+        return ProjectListingWatermark(
+            project_count=count, clock_sum=int(clock_sum)
         )
 
     async def search_by_org(
@@ -270,18 +395,31 @@ class ProjectStore:
         query: str,
         limit: int,
         cursor: ProjectSearchCursor | None = None,
+        updated_since: datetime | None = None,
+        include_deleted: bool = False,
     ) -> CountedPaginatedList[Project, PaginationCursor[Project]]:
-        """Search non-deleted projects by trigram similarity on slug/title."""
+        """Search an org's projects by trigram similarity on slug/title.
+
+        ``updated_since`` and ``include_deleted`` narrow (or widen) the
+        candidate set exactly as they do on :meth:`list_by_org` — the
+        clock bound inclusive, the deleted rows counted in the total —
+        so a poller that also filters by a search term sees the same
+        rows the unfiltered listing would have handed it.
+        """
         relevance = func.greatest(
             func.similarity(SqlProject.slug, query),
             func.similarity(SqlProject.title, query),
         ).label("relevance")
 
-        base_filter = expression.and_(
+        clauses = [
             SqlProject.org_id == org_id,
-            SqlProject.date_deleted.is_(None),
             relevance > _TRGM_SIMILARITY_THRESHOLD,
-        )
+        ]
+        if not include_deleted:
+            clauses.append(SqlProject.date_deleted.is_(None))
+        if updated_since is not None:
+            clauses.append(SqlProject.date_updated >= updated_since)
+        base_filter = expression.and_(*clauses)
 
         # Count total matches (no cursor so count is stable across pages)
         count_stmt = (
@@ -291,43 +429,13 @@ class ProjectStore:
         total = count_result.scalar_one()
 
         # Build fetch query with compound keyset cursor
+        keyset, ordering = self._search_keyset(relevance, cursor)
         fetch_stmt = select(SqlProject, relevance).where(base_filter)
-
-        if cursor is None:
-            fetch_stmt = fetch_stmt.order_by(
-                relevance.desc(), SqlProject.id.desc()
-            )
-        elif not cursor.previous:
-            # Forward pagination: rows after the cursor.
-            # Cast cursor.score to REAL (float4) to match the precision of
-            # PostgreSQL's similarity() return type and avoid float8 vs float4
-            # comparison mismatches.
-            score = cast(cursor.score, REAL)
-            fetch_stmt = fetch_stmt.where(
-                expression.or_(
-                    relevance < score,
-                    expression.and_(
-                        relevance == score,
-                        SqlProject.id < cursor.id,
-                    ),
-                )
-            ).order_by(relevance.desc(), SqlProject.id.desc())
-        else:
-            # Backward pagination: rows before the cursor (reversed order)
-            score = cast(cursor.score, REAL)
-            fetch_stmt = fetch_stmt.where(
-                expression.or_(
-                    relevance > score,
-                    expression.and_(
-                        relevance == score,
-                        SqlProject.id > cursor.id,
-                    ),
-                )
-            ).order_by(relevance.asc(), SqlProject.id.asc())
-
-        fetch_stmt = fetch_stmt.limit(limit + 1)
+        if keyset is not None:
+            fetch_stmt = fetch_stmt.where(keyset)
+        fetch_stmt = fetch_stmt.order_by(*ordering).limit(limit + 1)
         result = await self._session.execute(fetch_stmt)
-        rows = result.all()
+        rows = list(result.all())
 
         has_more = len(rows) > limit
         rows = rows[:limit]
@@ -336,49 +444,93 @@ class ProjectStore:
             rows = list(reversed(rows))
 
         entries = [Project.model_validate(row.SqlProject) for row in rows]
-
-        # Build next/prev cursors
-        next_cursor: ProjectSearchCursor | None = None
-        prev_cursor: ProjectSearchCursor | None = None
-
-        if cursor is None or not cursor.previous:
-            # Forward traversal
-            if has_more and entries:
-                last = rows[-1]
-                next_cursor = ProjectSearchCursor(
-                    score=float(last.relevance),
-                    id=last.SqlProject.id,
-                    previous=False,
-                )
-            if cursor is not None and entries:
-                first = rows[0]
-                prev_cursor = ProjectSearchCursor(
-                    score=float(first.relevance),
-                    id=first.SqlProject.id,
-                    previous=True,
-                )
-        else:
-            # Backward traversal
-            if has_more and entries:
-                first = rows[0]
-                prev_cursor = ProjectSearchCursor(
-                    score=float(first.relevance),
-                    id=first.SqlProject.id,
-                    previous=True,
-                )
-            if cursor is not None and entries:
-                last = rows[-1]
-                next_cursor = ProjectSearchCursor(
-                    score=float(last.relevance),
-                    id=last.SqlProject.id,
-                    previous=False,
-                )
+        next_cursor, prev_cursor = self._search_page_cursors(
+            rows, cursor=cursor, has_more=has_more
+        )
 
         return CountedPaginatedList[Project, PaginationCursor[Project]](
             entries=entries,
             count=total,
             next_cursor=next_cursor,
             prev_cursor=prev_cursor,
+        )
+
+    @staticmethod
+    def _search_keyset(
+        relevance: ColumnElement[Any],
+        cursor: ProjectSearchCursor | None,
+    ) -> tuple[ColumnElement[bool] | None, tuple[ColumnElement[Any], ...]]:
+        """Derive the keyset predicate and ordering for a search page.
+
+        Returns ``(predicate, ordering)``; the predicate is ``None`` on
+        the first page, which has no cursor to seek past.
+
+        ``cursor.score`` is cast to REAL (float4) to match the precision
+        of PostgreSQL's ``similarity()`` return type, so a float8 literal
+        never compares unequal to the float4 value the previous page
+        actually emitted.
+        """
+        forward_order = (relevance.desc(), SqlProject.id.desc())
+        if cursor is None:
+            return None, forward_order
+        score = cast(cursor.score, REAL)
+        if not cursor.previous:
+            # Forward pagination: rows after the cursor.
+            return (
+                expression.or_(
+                    relevance < score,
+                    expression.and_(
+                        relevance == score, SqlProject.id < cursor.id
+                    ),
+                ),
+                forward_order,
+            )
+        # Backward pagination: rows before the cursor, scanned in
+        # reverse so the limit takes the ones nearest the cursor. The
+        # caller flips the page back into relevance order.
+        return (
+            expression.or_(
+                relevance > score,
+                expression.and_(relevance == score, SqlProject.id > cursor.id),
+            ),
+            (relevance.asc(), SqlProject.id.asc()),
+        )
+
+    @staticmethod
+    def _search_page_cursors(
+        rows: Sequence[Row[Any]],
+        *,
+        cursor: ProjectSearchCursor | None,
+        has_more: bool,
+    ) -> tuple[ProjectSearchCursor | None, ProjectSearchCursor | None]:
+        """Derive ``(next, prev)`` cursors for a fetched search page.
+
+        ``rows`` is the trimmed page already flipped back into relevance
+        order, so ``rows[0]`` is always the most relevant row on it and
+        ``rows[-1]`` the least. Which end anchors which cursor therefore
+        does not depend on the traversal direction — only on whether the
+        scan overran the limit (there is a further page *ahead* of the
+        direction travelled) and on whether this page had a cursor at
+        all (a page reached without one is the first page, so there is
+        nothing behind it).
+        """
+        if not rows:
+            return None, None
+        ahead = ProjectSearchCursor(
+            score=float(rows[-1].relevance),
+            id=rows[-1].SqlProject.id,
+            previous=False,
+        )
+        behind = ProjectSearchCursor(
+            score=float(rows[0].relevance),
+            id=rows[0].SqlProject.id,
+            previous=True,
+        )
+        if cursor is not None and cursor.previous:
+            return ahead, (behind if has_more else None)
+        return (
+            ahead if has_more else None,
+            behind if cursor is not None else None,
         )
 
     async def update(
@@ -500,25 +652,28 @@ class ProjectStore:
         (:attr:`docverse_server.domain.project.Project.effective_source_url`),
         so it follows automatically without a stored value to rewrite.
 
-        ``date_updated`` is explicitly preserved (pinned to its current
-        value so the column's ``onupdate=func.now()`` does not fire): a
-        GitHub-side rename is sync-bookkeeping, not an operator-visible
-        source-coordinate edit, which arrives through PUT/PATCH. This
-        mirrors the discipline of the dashboard binding store's
-        ``rename_repo_by_repo_id`` and of ``apply_installation_scope``.
+        A rename changes ``source_url`` on the wire, so the project's
+        clock moves with it. The ``IS DISTINCT FROM`` predicate is what
+        keeps that honest the other way: a redelivered
+        ``repository.renamed``, or one naming the repo the row already
+        holds, matches no row rather than rewriting the same string and
+        retiring every ETag on the repo. Both halves of the rule live
+        on ``date_updated`` in
+        :class:`~docverse_server.dbschema.project.SqlProject`; the
+        dashboard binding store's own ``rename_repo_by_repo_id`` pins
+        its clock instead, because that row feeds no public listing.
 
-        Returns the list of updated project ids.
+        Returns the list of updated project ids — empty when the rename
+        was already applied.
         """
         stmt = (
             update(SqlProject)
             .where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
+                SqlProject.github_repo.is_distinct_from(new_repo),
             )
-            .values(
-                github_repo=new_repo,
-                date_updated=SqlProject.date_updated,
-            )
+            .values(github_repo=new_repo)
             .returning(SqlProject.id)
         )
         result = await self._session.execute(stmt)
@@ -544,26 +699,29 @@ class ProjectStore:
         flip; the operator-visible source URL is derived from the
         binding, so it follows automatically.
 
-        ``date_updated`` is explicitly preserved (pinned to its current
-        value so the column's ``onupdate=func.now()`` does not fire): a
-        GitHub-side transfer is sync-bookkeeping, not an operator-
-        visible source-coordinate edit, which arrives through PUT/PATCH.
-        This mirrors the discipline of the dashboard binding store's
-        ``transfer_repo_by_repo_id`` and of ``apply_installation_scope``.
+        The ``IS DISTINCT FROM`` predicate keeps a replayed transfer —
+        one whose three columns already hold the payload's values —
+        from rewriting them and moving the project's clock anyway. See
+        ``rename_repo_by_repo_id`` for the full rationale.
 
-        Returns the list of updated project ids.
+        Returns the list of updated project ids — empty when the
+        transfer was already applied.
         """
         stmt = (
             update(SqlProject)
             .where(
                 SqlProject.github_repo_id == github_repo_id,
                 SqlProject.date_deleted.is_(None),
+                or_(
+                    SqlProject.github_owner.is_distinct_from(new_owner),
+                    SqlProject.github_owner_id.is_distinct_from(new_owner_id),
+                    SqlProject.github_repo.is_distinct_from(new_repo),
+                ),
             )
             .values(
                 github_owner=new_owner,
                 github_owner_id=new_owner_id,
                 github_repo=new_repo,
-                date_updated=SqlProject.date_updated,
             )
             .returning(SqlProject.id)
         )
@@ -591,17 +749,17 @@ class ProjectStore:
         ``Acme/Docs`` still matches a payload that delivers
         ``acme/docs``.
 
-        ``date_updated`` is explicitly preserved: this write is
-        sync-bookkeeping, not an operator-visible source-coordinate
-        edit, and bumping ``date_updated`` here would mislead any
-        consumer that reads it as ``last operator change``. Mirrors
-        the same discipline the dashboard binding store's
-        ``rename_*`` / ``mark_unreachable_by_installation_id``
-        methods already apply.
+        The ``IS DISTINCT FROM`` predicate makes a redelivery free:
+        GitHub replays ``installation.created`` at will, and an
+        installation listing 40 already-scoped repos would otherwise
+        rewrite 40 rows with the values they already hold, advancing 40
+        project clocks and retiring every cached ETag in the org at
+        once. See ``rename_repo_by_repo_id``.
 
         Returns the list of project ids that were updated, so the
         caller can log a count (``projects_updated=N``) without a
-        separate round-trip.
+        separate round-trip. A redelivery that changed nothing returns
+        an empty list.
         """
         stmt = (
             update(SqlProject)
@@ -609,12 +767,18 @@ class ProjectStore:
                 func.lower(SqlProject.github_owner) == owner.lower(),
                 func.lower(SqlProject.github_repo) == repo.lower(),
                 SqlProject.date_deleted.is_(None),
+                or_(
+                    SqlProject.github_installation_id.is_distinct_from(
+                        installation_id
+                    ),
+                    SqlProject.github_owner_id.is_distinct_from(owner_id),
+                    SqlProject.github_repo_id.is_distinct_from(repo_id),
+                ),
             )
             .values(
                 github_installation_id=installation_id,
                 github_owner_id=owner_id,
                 github_repo_id=repo_id,
-                date_updated=SqlProject.date_updated,
             )
             .returning(SqlProject.id)
         )
@@ -644,35 +808,59 @@ class ProjectStore:
         binding's columns — better to lose this update than to write
         ids that disagree with ``github_owner`` / ``github_repo``.
 
-        ``date_updated`` is explicitly preserved: capturing the three
-        opportunistic ``github_*_id`` columns is sync-bookkeeping, not
-        an operator-visible source-coordinate edit, so bumping
-        ``date_updated`` here would mislead any consumer that reads it
-        as ``last operator change``. Mirrors ``apply_installation_scope``
-        and the dashboard binding store.
+        Resolving the installation flips the binding's
+        ``installation_status`` (and its ``app_url``) on the project
+        GET, so a resolve that lands new ids moves the project's clock.
+        The ``IS DISTINCT FROM`` predicate covers the other case: a
+        re-resolve finding the three ids it already stored would
+        otherwise move the clock for a body no poller can tell apart
+        from the one it holds. See ``rename_repo_by_repo_id``.
 
-        Returns ``True`` when the row was updated, ``False`` when no
-        row matched (project deleted, or binding changed).
+        Returns ``True`` when the row now carries these ids — whether
+        this call wrote them or found them already in place — and
+        ``False`` when the guard matched no row (project deleted, or
+        binding changed). The second query runs only on the no-write
+        path, where it separates "already resolved" from "guard
+        missed"; the update path answers in one round-trip.
         """
+        guard = (
+            SqlProject.id == project_id,
+            SqlProject.github_owner == expected_owner,
+            SqlProject.github_repo == expected_repo,
+            SqlProject.date_deleted.is_(None),
+        )
         stmt = (
             update(SqlProject)
             .where(
-                SqlProject.id == project_id,
-                SqlProject.github_owner == expected_owner,
-                SqlProject.github_repo == expected_repo,
-                SqlProject.date_deleted.is_(None),
+                *guard,
+                or_(
+                    SqlProject.github_installation_id.is_distinct_from(
+                        installation_id
+                    ),
+                    SqlProject.github_owner_id.is_distinct_from(owner_id),
+                    SqlProject.github_repo_id.is_distinct_from(repo_id),
+                ),
             )
             .values(
                 github_installation_id=installation_id,
                 github_owner_id=owner_id,
                 github_repo_id=repo_id,
-                date_updated=SqlProject.date_updated,
             )
             .returning(SqlProject.id)
         )
         result = await self._session.execute(stmt)
         await self._session.flush()
-        return result.first() is not None
+        if result.first() is not None:
+            return True
+        # Nothing was written. The distinct predicate is the only thing
+        # the UPDATE added to ``guard``, so a row that still satisfies
+        # ``guard`` is one whose ids already equal the ones we were
+        # asked to persist — a success with no clock to move. No row at
+        # all means the guard missed.
+        unchanged = await self._session.execute(
+            select(SqlProject.id).where(*guard)
+        )
+        return unchanged.first() is not None
 
     async def soft_delete(
         self, *, org_id: int, slug: str, reason: TombstoneReason
@@ -705,6 +893,20 @@ class ProjectStore:
         build any live edition still points at, and the project's own
         editions stayed live. Rows already soft-deleted keep their
         earlier timestamps.
+
+        Project, then editions, then builds is also the tree's one lock
+        order, documented in
+        :mod:`docverse_server.storage.edition_store`. This is the
+        writer that ends up holding all three, so it is the one every
+        other multi-row writer has to agree with: a repoint racing this
+        cascade takes the same rows the same way round, and the two
+        composite writers that surround a repoint with other writes —
+        ``KeeperSyncService._finalize_synced_build`` and
+        ``EditionTrackingService.track_build`` — open with
+        :meth:`~docverse_server.storage.edition_store.EditionStore.lock_for_repoint`
+        so the agreement holds for their whole transaction rather than
+        for one call inside it. One of the two waits instead of both
+        aborting.
 
         The handler's post-commit CDN unpublish is unaffected: it
         iterates the edition slugs

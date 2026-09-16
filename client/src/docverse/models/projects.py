@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ._examples import EXAMPLE_ORG_URL, EXAMPLE_PROJECT_URL
+from ._examples import EXAMPLE_ORG_URL, EXAMPLE_PROJECT_ID, EXAMPLE_PROJECT_URL
 from .editions import DefaultEditionConfig, EditionAutocreationConfig
 from .editions import Edition as EditionResponse
 from .lifecycle import LifecycleRuleSet
@@ -284,6 +284,16 @@ class Project(BaseModel):
         examples=[f"{EXAMPLE_PROJECT_URL}/dashboard-template"],
     )
 
+    id: str = Field(
+        description=(
+            "Public Crockford Base32 identifier for the project. Stable"
+            " for the life of the project, so it still identifies this"
+            " resource if the slug is ever renamed. Path parameters use"
+            " the slug, not this id."
+        ),
+        examples=[EXAMPLE_PROJECT_ID],
+    )
+
     slug: str = Field(
         description="URL-safe identifier for the project.",
         examples=["pipelines"],
@@ -335,9 +345,12 @@ class Project(BaseModel):
     default_edition: EditionResponse | None = Field(
         default=None,
         description=(
-            "The default (__main) edition for this project. Populated on"
-            " single-project responses (GET, POST, PATCH) but omitted"
-            " from list responses."
+            "The default (__main) edition for this project, embedded on"
+            " every project response including each row of the project"
+            " listing, so a poller reads the current build and published"
+            " URL without a second request per project. ``null`` only"
+            " for a soft-deleted project, whose editions were deleted"
+            " with it."
         ),
     )
 
@@ -347,6 +360,18 @@ class Project(BaseModel):
 
     date_updated: datetime = Field(
         description="Timestamp of the most recent update."
+    )
+
+    date_deleted: datetime | None = Field(
+        default=None,
+        description=(
+            "Timestamp when the project was soft-deleted, or ``null``"
+            " for a live project. A deleted project is only ever"
+            " returned when the request asked for it with"
+            " ``include_deleted=true``; the field is present either way"
+            " so a consumer mirroring the listing can tell a deletion"
+            " from a project that simply stopped appearing."
+        ),
     )
 
 

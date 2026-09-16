@@ -104,3 +104,56 @@ async def test_highest_role_wins_across_memberships(
     assert response.status_code == 200
     by_slug = {entry["slug"]: entry for entry in response.json()}
     assert by_slug["dual-org"]["role"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_listing_entries_carry_base32_public_id(
+    client: AsyncClient,
+) -> None:
+    """Each listing entry exposes the org's Base32 ``id``.
+
+    The summary's ``id`` is the same public identifier the full
+    organization resource carries, so a caller can correlate the two
+    without ever seeing an integer row id.
+    """
+    await seed_org_with_admin(client, "summary-pid-org", "alice")
+
+    response = await client.get(
+        "/docverse/orgs",
+        headers={"X-Auth-Request-User": "alice"},
+    )
+    assert response.status_code == 200
+    entry = next(e for e in response.json() if e["slug"] == "summary-pid-org")
+    org_id = entry["id"]
+    assert isinstance(org_id, str)
+    assert len(org_id) == 17
+    assert org_id.count("-") == 3
+
+    detail = await client.get(
+        "/docverse/orgs/summary-pid-org",
+        headers={"X-Auth-Request-User": "alice"},
+    )
+    assert detail.json()["id"] == org_id
+
+
+@pytest.mark.asyncio
+async def test_orgs_listing_sends_no_validators(client: AsyncClient) -> None:
+    """``GET /orgs`` is deliberately outside conditional GET.
+
+    The listing is membership-filtered, so its content changes when a
+    membership is granted or revoked — neither of which touches any
+    organization's ``date_updated``. A date watermark would therefore
+    hand a poller a 304 over a listing that had in fact changed, so the
+    endpoint carries no validators at all rather than unsound ones
+    (PRD #634 §5).
+    """
+    await seed_org_with_admin(client, "noval-org", "alice")
+
+    response = await client.get(
+        "/docverse/orgs",
+        headers={"X-Auth-Request-User": "alice"},
+    )
+
+    assert response.status_code == 200
+    assert "ETag" not in response.headers
+    assert "Last-Modified" not in response.headers

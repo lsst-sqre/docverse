@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import structlog
 from sqlalchemy import Table
@@ -455,6 +457,54 @@ async def test_update_sync_state_keeps_github_ids_when_none_passed(
     assert updated.github_owner_id == 12345
     assert updated.github_repo_id == 67890
     assert updated.github_installation_id == 111222
+
+
+@pytest.mark.asyncio
+async def test_update_sync_state_pins_date_updated(
+    db_session: AsyncSession,
+) -> None:
+    """Recording a sync outcome must not move the operator-edit clock.
+
+    Task #657: ``date_updated`` on a binding means "when an operator
+    last edited the source coordinates through PUT", and every other
+    GitHub-side writer in this store pins it. ``update_sync_state``
+    runs on every sync success *and* every sync failure, so an
+    unpinned write here would have made that column mean "when a sync
+    last ran" instead.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org_and_project(db_session)
+        store = _store(db_session)
+        binding = await store.create(_binding(org_id=org_id))
+        await db_session.commit()
+    baseline = binding.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        store = _store(db_session)
+        succeeded = await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="succeeded",
+            last_sync_error=None,
+            github_owner_id=12345,
+        )
+        await db_session.commit()
+    assert succeeded is not None
+    assert succeeded.last_sync_status == "succeeded"
+    assert succeeded.date_updated == baseline
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        store = _store(db_session)
+        failed = await store.update_sync_state(
+            binding_id=binding.id,
+            last_sync_status="failed",
+            last_sync_error="boom",
+        )
+        await db_session.commit()
+    assert failed is not None
+    assert failed.last_sync_status == "failed"
+    assert failed.date_updated == baseline
 
 
 def test_bindings_table_has_repo_id_ref_composite_index() -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,18 +23,78 @@ from .models import (
     OrgMembership,
     OrgMembershipUpdate,
     OrgRole,
+    Project,
     QueueJob,
 )
 from .models.builds import BuildAnnotations
 from .models.queue_enums import JobStatus
 
-__all__ = ["DocverseClient"]
+__all__ = [
+    "DEFAULT_UPDATED_SINCE_OVERLAP",
+    "DocverseClient",
+    "ProjectList",
+]
 
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 15.0
 _BACKOFF_FACTOR = 2.0
 _VERBOSE_BODY_MAX = 2000
 _TOKEN_SUFFIX_LEN = 4
+
+DEFAULT_UPDATED_SINCE_OVERLAP = timedelta(seconds=60)
+"""How far `DocverseClient.list_projects` backdates ``updated_since``.
+
+A project's ``date_updated`` is stamped with PostgreSQL's transaction
+*start* clock, and commit order is not start order, so a write that
+began before a poll can become visible after it while wearing a
+timestamp that poll has already passed. Asking from a minute earlier
+than the caller believes it needs covers a write that took up to that
+long to commit; the price is re-receiving the rows in the window, which
+a caller keyed on a project's ``id`` simply overwrites.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectList:
+    """One complete pass over an organization's project listing.
+
+    Returned by `DocverseClient.list_projects`, which walks every page
+    before handing this back, so ``projects`` is the whole listing and
+    not one page of it.
+
+    A pass filtered by ``updated_since`` re-sends rows the previous
+    pass already delivered: the request is backdated by
+    `DEFAULT_UPDATED_SINCE_OVERLAP` so a slow commit cannot slip
+    between two polls, and the inclusive bound re-sends the boundary
+    row besides. Treat the listing as a set of upserts keyed on each
+    project's ``id`` rather than as a stream of distinct changes.
+    """
+
+    projects: list[Project] = field(default_factory=list)
+    """Every project the listing returned, in server order across pages.
+
+    Empty when ``not_modified`` is `True`.
+    """
+
+    etag: str | None = None
+    """The first page's ``ETag``, or `None` if the server sent none.
+
+    **The validator to poll with**, and the only one Docverse offers:
+    the listing sends no ``Last-Modified`` and ignores an
+    ``If-Modified-Since``. Pass it back verbatim as ``if_none_match``
+    on the next call rather than interpreting it — it is opaque, and it
+    is derived from the listing's watermark at full precision, so it
+    notices a change however soon after the last one it landed and
+    whichever order the two writes committed in.
+    """
+
+    not_modified: bool = False
+    """Whether the server answered the first page with a 304.
+
+    `True` means the caller's precondition matched and nothing in the
+    listing has changed, so ``projects`` is empty because there was
+    nothing to fetch — not because the organization has no projects.
+    """
 
 
 class DocverseClient:
@@ -153,6 +215,96 @@ class DocverseClient:
             OrganizationSummary.model_validate(item)
             for item in response.json()
         ]
+
+    async def list_projects(
+        self,
+        org: str,
+        *,
+        updated_since: datetime | None = None,
+        updated_since_overlap: timedelta = DEFAULT_UPDATED_SINCE_OVERLAP,
+        include_deleted: bool = False,
+        order: str = "slug",
+        if_none_match: str | None = None,
+    ) -> ProjectList:
+        """List every project in an organization, following pagination.
+
+        Walks the listing's ``Link rel="next"`` chain to the last page,
+        so the result holds the whole listing rather than one page.
+
+        A pass filtered by ``updated_since`` **re-sends rows**: the
+        bound is backdated by ``updated_since_overlap`` and is
+        inclusive besides, so a caller must be prepared to see a
+        project it has already processed. Deduplicate on the project's
+        ``id``, which is stable across a slug rename.
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        updated_since
+            Only return projects whose ``date_updated`` is at or after
+            this instant, less ``updated_since_overlap``. Must be
+            timezone-aware; the server rejects a naive timestamp with a
+            422.
+        updated_since_overlap
+            How far to backdate ``updated_since`` before sending it.
+            A project's clock is PostgreSQL's transaction *start* time
+            and commit order is not start order, so a write that began
+            before the caller's last pass can become visible after it
+            while wearing a timestamp that pass has already gone by;
+            the overlap is the window of slow commits that covers.
+            Defaults to `DEFAULT_UPDATED_SINCE_OVERLAP`. Pass
+            ``timedelta(0)`` to send the caller's instant unmodified,
+            accepting that a concurrent write can be missed.
+        include_deleted
+            Also return soft-deleted projects, each with its
+            ``date_deleted`` set.
+        order
+            Sort order: ``slug``, ``date_created``, or ``date_updated``.
+        if_none_match
+            An ``ETag`` from a previous call, sent as ``If-None-Match``
+            — the only validator Docverse publishes, for the reason
+            given on `ProjectList.etag`.
+
+        Returns
+        -------
+        ProjectList
+            The projects, plus the first page's ``ETag``. When the
+            server answers the first page 304, ``not_modified`` is
+            `True` and ``projects`` is empty.
+        """
+        params: dict[str, Any] = {
+            "order": order,
+            "include_deleted": include_deleted,
+        }
+        if updated_since is not None:
+            params["updated_since"] = (
+                updated_since - updated_since_overlap
+            ).isoformat()
+        headers: dict[str, str] = {}
+        if if_none_match is not None:
+            headers["If-None-Match"] = if_none_match
+
+        # The precondition belongs to the first request alone: the
+        # server validates the page the caller already holds, and the
+        # ``Link`` URLs that follow are pages it has never seen.
+        response = await self._client.get(
+            f"/orgs/{org}/projects", params=params, headers=headers
+        )
+        etag = response.headers.get("ETag")
+        if response.status_code == httpx.codes.NOT_MODIFIED:
+            return ProjectList(etag=etag, not_modified=True)
+        _raise_for_status(response)
+        projects = [Project.model_validate(item) for item in response.json()]
+        next_url = _next_page_url(response)
+        while next_url is not None:
+            response = await self._client.get(next_url)
+            _raise_for_status(response)
+            projects.extend(
+                Project.model_validate(item) for item in response.json()
+            )
+            next_url = _next_page_url(response)
+        return ProjectList(projects=projects, etag=etag)
 
     async def update_member(
         self, org: str, member: str, *, role: OrgRole
@@ -400,6 +552,11 @@ class DocverseClient:
             jitter = random.uniform(0, delay * 0.5)  # noqa: S311
             await asyncio.sleep(delay + jitter)
             delay = min(delay * _BACKOFF_FACTOR, _BACKOFF_MAX)
+
+
+def _next_page_url(response: httpx.Response) -> str | None:
+    """Return the ``Link rel="next"`` URL, or `None` on the last page."""
+    return response.links.get("next", {}).get("url")
 
 
 def _mask_token(value: str) -> str:

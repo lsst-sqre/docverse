@@ -45,7 +45,7 @@ from docverse_server.domain.content_hash import (
     EMPTY_MANIFEST_HASH,
     PLACEHOLDER_CONTENT_HASH,
 )
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
     resolve_edition_autocreation,
@@ -86,10 +86,7 @@ from docverse_server.services.lifecycle.evaluator import (
     resolve_rule_set,
 )
 from docverse_server.services.lock_service import LockKey, LockService
-from docverse_server.services.project import (
-    DEFAULT_EDITION_SLUG,
-    ProjectService,
-)
+from docverse_server.services.project import ProjectService
 from docverse_server.services.project_github_binding import (
     ProjectGitHubBindingResolver,
 )
@@ -1650,11 +1647,14 @@ class KeeperSyncService:
                     return None
                 if current.current_build_id == build.id:
                     return None
-                updated = await self._edition_store.set_current_build(
+                repoint = await self._edition_store.set_current_build(
                     edition_id=current.id,
                     build_id=build.id,
                     skip_date_guard=True,
+                    project_id=current.project_id,
+                    is_default=current.is_default,
                 )
+                updated = repoint.edition
                 if updated is None:
                     return None
         self._logger.info(
@@ -1943,6 +1943,8 @@ class KeeperSyncService:
                         edition_id=edition.id,
                         build_id=existing_build.id,
                         skip_date_guard=True,
+                        project_id=edition.project_id,
+                        is_default=edition.is_default,
                     )
                 await self._state_store.upsert(
                     org_id=org_id,
@@ -2282,7 +2284,25 @@ class KeeperSyncService:
         pointer: without it a keeper-sync repoint could land mid-publish
         and leave the CDN serving one build while the row records
         another as published.
+
+        This is a **composite writer** in the sense
+        :mod:`docverse_server.storage.edition_store` documents: four
+        locked writes on the ``builds`` row stand between the start of
+        the transaction and the repoint at the end of it. Left to
+        itself the transaction would therefore run ``builds ->
+        projects -> editions``, the reverse of the project soft-delete
+        cascade, and a DELETE landing on this project mid-sync would
+        deadlock against it — with nowhere to retry on either side.
+        :meth:`~docverse_server.storage.edition_store.EditionStore.lock_for_repoint`
+        moves the whole wait to the head of the transaction instead; the
+        ``set_current_build`` below then re-locks rows already held,
+        which costs nothing.
         """
+        await self._edition_store.lock_for_repoint(
+            edition_id=edition.id,
+            project_id=edition.project_id,
+            is_default=edition.is_default,
+        )
         await self._build_store.update_content_hash(
             build_id=build.id,
             content_hash=copy_result.content_hash,
@@ -2316,6 +2336,8 @@ class KeeperSyncService:
             edition_id=edition.id,
             build_id=build.id,
             skip_date_guard=True,
+            project_id=edition.project_id,
+            is_default=edition.is_default,
         )
 
 

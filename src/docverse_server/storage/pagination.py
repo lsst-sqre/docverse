@@ -57,6 +57,7 @@ __all__ = [
     "KeeperSyncRunDateStartedCursor",
     "KeeperSyncStateDateTombstonedCursor",
     "ProjectDateCreatedCursor",
+    "ProjectDateUpdatedCursor",
     "ProjectSearchCursor",
     "ProjectSlugCursor",
     "ProjectSortOrder",
@@ -80,6 +81,7 @@ class ProjectSortOrder(StrEnum):
 
     slug = "slug"
     date_created = "date_created"
+    date_updated = "date_updated"
 
 
 class EditionSortOrder(StrEnum):
@@ -378,6 +380,33 @@ class ProjectDateCreatedCursor(_TzAwareDatetimeIdCursor[Project]):
 
 
 @dataclass(slots=True)
+class ProjectDateUpdatedCursor(_TzAwareDatetimeIdCursor[Project]):
+    """Keyset cursor for projects ordered by date_updated DESC, id DESC.
+
+    Backs ``order=date_updated`` on the project listing, the ordering a
+    poller wants when it asks "what changed?" — most-recently-touched
+    first. ``projects.date_updated`` moves on a metadata edit, a
+    GitHub-binding resolve, a soft delete, and a repoint of the project's
+    default edition, so this is the clock ``updated_since`` filters on.
+    """
+
+    @staticmethod
+    @override
+    def id_column() -> InstrumentedAttribute[int]:
+        return SqlProject.id
+
+    @staticmethod
+    @override
+    def time_column() -> InstrumentedAttribute[datetime]:
+        return SqlProject.date_updated
+
+    @override
+    @classmethod
+    def from_entry(cls, entry: Project, *, reverse: bool = False) -> Self:
+        return cls(time=entry.date_updated, id=entry.id, previous=reverse)
+
+
+@dataclass(slots=True)
 class EditionDateCreatedCursor(_TzAwareDatetimeIdCursor[Edition]):
     """Keyset cursor for editions ordered by date_created DESC, id DESC."""
 
@@ -595,6 +624,7 @@ PROJECT_CURSOR_TYPES: dict[
 ] = {
     ProjectSortOrder.slug: ProjectSlugCursor,
     ProjectSortOrder.date_created: ProjectDateCreatedCursor,
+    ProjectSortOrder.date_updated: ProjectDateUpdatedCursor,
 }
 
 EDITION_CURSOR_TYPES: dict[

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from .enums import (
+    ConditionalGetEndpoint,
+    ConditionalGetOutcome,
+    ConditionalGetPrecondition,
     EditionPublishTrigger,
     LifecycleAction,
     LifecycleActionTrigger,
@@ -17,6 +20,7 @@ from .manager import build_event_manager
 from .payloads import (
     BuildProcessedEvent,
     BuildUploadedEvent,
+    ConditionalGetEvent,
     DashboardBuiltEvent,
     DocverseEventBase,
     EditionLifecycleEvent,
@@ -33,6 +37,10 @@ from .payloads import (
 __all__ = [
     "BuildProcessedEvent",
     "BuildUploadedEvent",
+    "ConditionalGetEndpoint",
+    "ConditionalGetEvent",
+    "ConditionalGetOutcome",
+    "ConditionalGetPrecondition",
     "DashboardBuiltEvent",
     "DocverseEventBase",
     "DocverseEvents",

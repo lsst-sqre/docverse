@@ -103,6 +103,27 @@ class SqlDashboardGitHubTemplateBinding(Base):
         server_default=func.now(),
     )
 
+    # This clock is NOT the project clock's sibling. ``projects
+    # .date_updated`` is a poller change signal (PRD #634): it feeds
+    # ``updated_since``, the listing watermark, and every project ETag,
+    # so any write that changes the representation has to advance it.
+    # A binding row feeds none of those — it is read back only by the
+    # operator who wrote it, on a binding endpoint with no conditional
+    # GET — so its ``date_updated`` stays what it has always meant:
+    # when an operator last edited the source coordinates through PUT.
+    #
+    # That is why the GitHub-side sync writers in
+    # ``DashboardGitHubTemplateBindingStore`` pass
+    # ``date_updated=SqlDashboardGitHubTemplateBinding.date_updated``:
+    # the pin suppresses this ``onupdate`` so a recorded sync outcome,
+    # or a rename, transfer, or installation-state flip that GitHub
+    # told us about, does not read back as an operator edit. Those
+    # writers are all core ``UPDATE`` statements for that reason — ORM
+    # attribute assignment cannot suppress ``onupdate``, so a writer
+    # that wants the pin cannot be written in the ORM style. Each
+    # carries a one-line ``Pinned:`` comment pointing here; do not copy
+    # the idiom into the projects table, where the same pin would hide
+    # a real change from every poller.
     date_updated: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
