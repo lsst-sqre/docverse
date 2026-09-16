@@ -13,6 +13,8 @@ from docverse.models import EditionKind, EditionKindSource, TrackingMode
 from docverse.models.queue_enums import PublishStatus
 
 from .base32id import Base32Id
+from .organization import Organization
+from .project import Project
 
 DEFAULT_EDITION_SLUG = "__main"
 """Slug for the default edition auto-created with every project.
@@ -155,3 +157,36 @@ class EditionRepoint:
     outcome: RepointOutcome
 
     edition: Edition | None
+
+
+@dataclass(frozen=True, slots=True)
+class EditionWrite:
+    """The result of one operator write against an edition.
+
+    What :meth:`~docverse_server.services.edition.EditionService.update`
+    and :meth:`~docverse_server.services.edition.EditionService.rollback`
+    hand back: the resolved organization and project their handlers need
+    to build the response, the edition as it now stands, and whether the
+    request changed anything.
+
+    ``changed`` is what separates a request that moved the edition from
+    one whose postcondition already held. Both answer ``200`` with the
+    same body, but only the first owes the world an announcement — an
+    ``edition_lifecycle`` metrics event and a ``dashboard_build`` job —
+    and the second must not pay for one, because the ``200``-on-retry
+    contract those endpoints advertise is an invitation to send the
+    request again. A rollback or ``build`` override onto the build the
+    edition already serves changes nothing; re-driving a **failed**
+    publish of that build does, since it records a history row and
+    returns the edition to ``pending``; and so does any payload with a
+    metadata field in it, whose write moves the edition's own
+    ``date_updated`` whatever the values are.
+    """
+
+    organization: Organization
+
+    project: Project
+
+    edition: Edition
+
+    changed: bool

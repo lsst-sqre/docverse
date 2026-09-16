@@ -11,7 +11,11 @@ from docverse.models import EditionCreate, EditionKind, EditionUpdate
 from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
-from docverse_server.domain.edition import Edition, RepointOutcome
+from docverse_server.domain.edition import (
+    Edition,
+    EditionWrite,
+    RepointOutcome,
+)
 from docverse_server.domain.edition_build_history import (
     EditionBuildHistoryWithBuild,
 )
@@ -177,7 +181,7 @@ class EditionService:
         project_slug: str,
         slug: str,
         data: EditionUpdate,
-    ) -> tuple[Organization, Project, Edition]:
+    ) -> EditionWrite:
         """Update an edition.
 
         If ``data.build`` is set, apply an emergency build override:
@@ -189,6 +193,15 @@ class EditionService:
         nothing; see :meth:`_repoint_and_publish` for what that does
         and does not still do. A metadata field in the same payload is
         applied either way.
+
+        The returned :class:`~docverse_server.domain.edition.EditionWrite`
+        reports whether anything was written, so the handler can tell a
+        real update from a request whose postcondition already held and
+        skip announcing the latter. A payload carrying metadata is
+        always a write, because the store sets whatever fields it names
+        and moves the edition's ``date_updated`` with them; a payload
+        carrying nothing but a ``build`` the edition already serves
+        (with its publish settled) is not, and neither is an empty one.
 
         The metadata write is skipped entirely when the payload carries
         nothing but ``build``. It would have nothing to write, but it is
@@ -220,6 +233,7 @@ class EditionService:
         )
 
         edition: Edition | None = None
+        repointed = False
         if build_public_id is not None:
             target = await self._store.get_by_slug(
                 project_id=project.id, slug=slug
@@ -227,7 +241,7 @@ class EditionService:
             if target is None:
                 msg = f"Edition {slug!r} not found"
                 raise NotFoundError(msg)
-            edition = await self._apply_build_override(
+            edition, repointed = await self._apply_build_override(
                 org_id=org.id,
                 project_id=project.id,
                 project_slug=project_slug,
@@ -241,7 +255,8 @@ class EditionService:
         # back. An override on its own already returned that row; a
         # payload that is neither still comes through here, because an
         # empty PATCH of a missing edition has to 404 like any other.
-        if other_updates.model_fields_set or edition is None:
+        wrote_metadata = bool(other_updates.model_fields_set)
+        if wrote_metadata or edition is None:
             edition = await self._store.update(
                 project_id=project.id, slug=slug, data=other_updates
             )
@@ -252,7 +267,12 @@ class EditionService:
         self._logger.info(
             "Updated edition", slug=slug, org=org_slug, project=project_slug
         )
-        return org, project, edition
+        return EditionWrite(
+            organization=org,
+            project=project,
+            edition=edition,
+            changed=repointed or wrote_metadata,
+        )
 
     async def _repoint_and_publish(
         self,
@@ -388,12 +408,17 @@ class EditionService:
         project_slug: str,
         edition: Edition,
         build_public_id: str,
-    ) -> Edition:
+    ) -> tuple[Edition, bool]:
         """Point ``edition`` at an arbitrary build (emergency override).
 
         Naming the build the edition already serves repoints nothing
         and, unless the publish of that build failed, does nothing else
         either; see :meth:`_repoint_and_publish`.
+
+        Returns the edition as it now stands and whether the repoint
+        sequence actually ran — ``False`` for the inert case, which is
+        what lets ``PATCH`` skip announcing a change that did not
+        happen.
         """
         public_id = parse_base32_id(build_public_id, resource="build")
 
@@ -421,7 +446,7 @@ class EditionService:
                     child_job.public_id
                 ),
             )
-        return updated_edition
+        return updated_edition, child_job is not None
 
     async def set_current_build(
         self, *, edition_id: int, build_id: int
@@ -488,7 +513,7 @@ class EditionService:
         project_slug: str,
         edition_slug: str,
         build_public_id: str,
-    ) -> tuple[Organization, Project, Edition]:
+    ) -> EditionWrite:
         """Roll back an edition to a previously-recorded build.
 
         Rolling back to the build the edition already serves repoints
@@ -498,6 +523,11 @@ class EditionService:
         this edition's history is a 404 even when it happens to be the
         one being served — an override can leave the edition on a build
         rollback was never offered.
+
+        The returned
+        :class:`~docverse_server.domain.edition.EditionWrite` reports
+        which of those two it was, so the handler can skip announcing
+        the inert one.
 
         Parameters
         ----------
@@ -560,7 +590,12 @@ class EditionService:
                     child_job.public_id
                 ),
             )
-        return org, project, updated_edition
+        return EditionWrite(
+            organization=org,
+            project=project,
+            edition=updated_edition,
+            changed=child_job is not None,
+        )
 
     async def soft_delete(
         self,

@@ -299,16 +299,25 @@ async def post_edition_rollback(
     real state of the publish rather than a ``pending`` nothing will
     clear.
 
-    Such a request is otherwise inert. It records no history entry,
-    enqueues no ``publish_edition`` job, and leaves the project's
-    ``date_updated`` where it was, so a consumer polling
-    ``GET /orgs/{org}/projects`` with ``updated_since`` or an ``ETag``
-    is not told to refetch a project whose content did not move. The
-    exception is a publish that **failed**: re-requesting the build
+    Such a request is otherwise inert, and inert all the way out: it
+    records no history entry, enqueues no ``publish_edition`` job,
+    publishes no ``edition_lifecycle`` event, enqueues no
+    ``dashboard_build``, and leaves the project's ``date_updated``
+    where it was, so a consumer polling ``GET /orgs/{org}/projects``
+    with ``updated_since`` or an ``ETag`` is not told to refetch a
+    project whose content did not move. The last two matter because
+    this endpoint invites the retry: the metric would report a rollback
+    with no history row behind it, and the dashboard enqueue dedupes
+    only against a job still queued or in flight, so a client retrying
+    a dropped connection would otherwise buy a full dashboard render
+    and object-store upload per attempt.
+
+    The exception is a publish that **failed**: re-requesting the build
     being served is the only way to retry it, so that request does
-    record a history entry, return the edition to ``pending``, and
-    enqueue the job — still without moving the project's clock, since
-    the build being served is the same one.
+    record a history entry, return the edition to ``pending``, enqueue
+    the job, and announce itself as the change it is — still without
+    moving the project's clock, since the build being served is the
+    same one.
 
     A build that is not in this edition's history is still a ``404``,
     checked first: an emergency ``build`` override can leave an edition
@@ -316,37 +325,41 @@ async def post_edition_rollback(
     """
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        org, project, edition = await service.rollback(
+        written = await service.rollback(
             org_slug=org_slug,
             project_slug=project_slug,
             edition_slug=edition_slug,
             build_public_id=data.build,
         )
         await context.session.commit()
+    # A no-op rollback deferred nothing, so this dispatch is itself a
+    # no-op; it stays unconditional because the dispatcher is what
+    # hands over whatever a *real* rollback queued.
     await context.factory.queue_dispatcher.dispatch()
-    # Publish after the commit (best-effort; raise_on_error=False).
-    await context.events.edition_lifecycle.publish(
-        EditionLifecycleEvent(
-            organization=org_slug,
-            project=project_slug,
-            action=LifecycleAction.rollback,
-            edition_kind=MetricsEditionKind.from_api(edition.kind),
+    if written.changed:
+        # Publish after the commit (best-effort; raise_on_error=False).
+        await context.events.edition_lifecycle.publish(
+            EditionLifecycleEvent(
+                organization=org_slug,
+                project=project_slug,
+                action=LifecycleAction.rollback,
+                edition_kind=MetricsEditionKind.from_api(written.edition.kind),
+            )
         )
-    )
-    await try_enqueue_dashboard_build_by_slug(
-        factory=context.factory,
-        session=context.session,
-        logger=context.logger,
-        org_slug=org_slug,
-        project_slug=project_slug,
-    )
-    project_url = project_published_url(org, project)
+        await try_enqueue_dashboard_build_by_slug(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+    project_url = project_published_url(written.organization, written.project)
     return edition_from_domain(
-        edition,
+        written.edition,
         context.request,
         org_slug,
         project_slug,
-        published_url=edition_published_url(project_url, edition),
+        published_url=edition_published_url(project_url, written.edition),
     )
 
 
@@ -376,53 +389,64 @@ async def patch_edition(
     ``POST .../rollback``, and decided the same way — under the
     edition's row lock, so an override racing another operator's
     repoint repoints for real rather than reporting a build the
-    edition no longer serves. Such a request is otherwise inert: no
-    history entry, no ``publish_edition`` job, and the project's
-    ``date_updated`` stays where it was, so a consumer polling
-    ``GET /orgs/{org}/projects`` with ``updated_since`` or an ``ETag``
-    is not told to refetch a project whose content did not move. The
-    exception, again as for rollback, is a publish that **failed**:
-    re-requesting the served build is the only way to retry it, so it
-    records a history entry, returns the edition to ``pending``, and
-    enqueues the job without moving the project's clock. A metadata
-    field in the same payload is still applied.
+    edition no longer serves. Such a request is otherwise inert, and
+    inert all the way out: no history entry, no ``publish_edition``
+    job, no ``edition_lifecycle`` event, no ``dashboard_build``, and
+    the project's ``date_updated`` stays where it was, so a consumer
+    polling ``GET /orgs/{org}/projects`` with ``updated_since`` or an
+    ``ETag`` is not told to refetch a project whose content did not
+    move. The exception, again as for rollback, is a publish that
+    **failed**: re-requesting the served build is the only way to retry
+    it, so it records a history entry, returns the edition to
+    ``pending``, enqueues the job, and announces itself as the change
+    it is — without moving the project's clock.
+
+    Only a payload with nothing in it but that already-current
+    ``build`` is inert, though. A metadata field alongside it is
+    applied, and its write is a real update: it sets the fields it
+    names whatever their values, so the edition's own ``date_updated``
+    moves and the event and dashboard rebuild are owed.
     """
     if edition_slug.lower() == "__main" and data.kind is not None:
         msg = "Cannot change the kind of the default '__main' edition"
         raise PermissionDeniedError(msg)
     async with context.session.begin():
         service = context.factory.create_edition_service()
-        org, project, edition = await service.update(
+        written = await service.update(
             org_slug=org_slug,
             project_slug=project_slug,
             slug=edition_slug,
             data=data,
         )
         await context.session.commit()
+    # An inert PATCH deferred nothing, so this dispatch is itself a
+    # no-op; it stays unconditional because the dispatcher is what
+    # hands over whatever a *real* override queued.
     await context.factory.queue_dispatcher.dispatch()
-    # Publish after the commit (best-effort; raise_on_error=False).
-    await context.events.edition_lifecycle.publish(
-        EditionLifecycleEvent(
-            organization=org_slug,
-            project=project_slug,
-            action=LifecycleAction.update,
-            edition_kind=MetricsEditionKind.from_api(edition.kind),
+    if written.changed:
+        # Publish after the commit (best-effort; raise_on_error=False).
+        await context.events.edition_lifecycle.publish(
+            EditionLifecycleEvent(
+                organization=org_slug,
+                project=project_slug,
+                action=LifecycleAction.update,
+                edition_kind=MetricsEditionKind.from_api(written.edition.kind),
+            )
         )
-    )
-    await try_enqueue_dashboard_build_by_slug(
-        factory=context.factory,
-        session=context.session,
-        logger=context.logger,
-        org_slug=org_slug,
-        project_slug=project_slug,
-    )
-    project_url = project_published_url(org, project)
+        await try_enqueue_dashboard_build_by_slug(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            org_slug=org_slug,
+            project_slug=project_slug,
+        )
+    project_url = project_published_url(written.organization, written.project)
     return edition_from_domain(
-        edition,
+        written.edition,
         context.request,
         org_slug,
         project_slug,
-        published_url=edition_published_url(project_url, edition),
+        published_url=edition_published_url(project_url, written.edition),
     )
 
 

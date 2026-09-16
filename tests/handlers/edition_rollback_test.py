@@ -807,3 +807,143 @@ async def test_rollback_redriving_a_failed_publish_leaves_the_clock(
     async with db_session.begin():
         after = await _read_project_date_updated(db_session)
     assert after == before
+
+
+async def _count_dashboard_build_jobs(db_session: AsyncSession) -> int:
+    """Count ``dashboard_build`` rows in ``queue_jobs``."""
+    result = await db_session.execute(
+        select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.dashboard_build.value
+        )
+    )
+    return len(list(result.scalars().all()))
+
+
+async def _settle_dashboard_build_jobs(db_session: AsyncSession) -> None:
+    """Drive every ``dashboard_build`` row to ``completed``.
+
+    The enqueuer dedupes only against rows that are ``queued`` or
+    ``in_progress``, so leaving the previous request's row in flight
+    would suppress the next enqueue on its own and hide whichever
+    behavior the test is actually after.
+    """
+    logger = structlog.get_logger("docverse")
+    store = QueueJobStore(session=db_session, logger=logger)
+    result = await db_session.execute(
+        select(SqlQueueJob).where(
+            SqlQueueJob.kind == JobKind.dashboard_build.value
+        )
+    )
+    for row in result.scalars().all():
+        await store.start_if_queued(row.id)
+        await store.complete(row.id)
+
+
+def _rollback_event_count() -> int:
+    """Count published ``edition_lifecycle`` events with ``rollback``."""
+    events = context_dependency._events
+    assert events is not None
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    return len(
+        [
+            e
+            for e in publisher.published
+            if e.action == LifecycleAction.rollback
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollback_noop_announces_nothing(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """An inert rollback publishes no event and rebuilds no dashboard.
+
+    The handler's ``200``-on-retry contract invites the client that lost
+    its connection to send the request again. That retry must cost what
+    it claims to cost: no ``EditionLifecycleEvent`` (the metric would
+    report a rollback with no history row behind it) and no
+    ``dashboard_build`` job (the worker renders and re-uploads the whole
+    dashboard with no content-hash short-circuit).
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    headers = {"X-Auth-Request-User": "testuser"}
+    first = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    async with db_session.begin():
+        await _settle_dashboard_build_jobs(db_session)
+        dashboard_rows_before = await _count_dashboard_build_jobs(db_session)
+        await db_session.commit()
+    events_before = _rollback_event_count()
+    assert dashboard_rows_before == 1
+    assert events_before == 1
+
+    second = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert second.status_code == 200
+
+    async with db_session.begin():
+        assert await _count_dashboard_build_jobs(db_session) == 1
+    mock_arq = arq_dependency._arq_queue
+    assert isinstance(mock_arq, MockArqQueue)
+    assert len(get_jobs_by_name(mock_arq, "dashboard_build")) == 1
+    assert _rollback_event_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_rollback_redriving_a_failed_publish_announces(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Re-driving a failed publish is a change, so it announces one.
+
+    Rolling back onto the served build with the pair ``failed`` records
+    a history row, returns the edition to ``pending``, and enqueues the
+    publish — a real change, even though the build did not move — so it
+    keeps the ``edition_lifecycle`` event and the dashboard rebuild that
+    report it. Only a *settled* publish makes the request inert.
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    headers = {"X-Auth-Request-User": "testuser"}
+    first = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    async with db_session.begin():
+        await _fail_current_publish(db_session)
+        await _settle_dashboard_build_jobs(db_session)
+        await db_session.commit()
+
+    second = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert second.status_code == 200
+
+    async with db_session.begin():
+        assert await _count_dashboard_build_jobs(db_session) == 2
+    assert _rollback_event_count() == 2

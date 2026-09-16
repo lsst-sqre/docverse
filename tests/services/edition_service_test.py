@@ -368,7 +368,7 @@ async def test_build_only_patch_skips_the_metadata_write(
 
     async with db_session.begin():
         service = _edition_service(db_session)
-        _, _, edition = await service.update(
+        written = await service.update(
             org_slug="es-org",
             project_slug="es-proj",
             slug=DEFAULT_EDITION_SLUG,
@@ -377,7 +377,7 @@ async def test_build_only_patch_skips_the_metadata_write(
         await db_session.commit()
 
     assert calls == []
-    assert edition.current_build_id == build.id
+    assert written.edition.current_build_id == build.id
 
 
 @pytest.mark.asyncio
@@ -411,7 +411,7 @@ async def test_patch_with_build_and_metadata_applies_both(
 
     async with db_session.begin():
         service = _edition_service(db_session)
-        _, _, edition = await service.update(
+        written = await service.update(
             org_slug="es-org",
             project_slug="es-proj",
             slug=DEFAULT_EDITION_SLUG,
@@ -422,5 +422,5 @@ async def test_patch_with_build_and_metadata_applies_both(
         await db_session.commit()
 
     assert len(calls) == 1
-    assert edition.title == "Renamed"
-    assert edition.current_build_id == build.id
+    assert written.edition.title == "Renamed"
+    assert written.edition.current_build_id == build.id
