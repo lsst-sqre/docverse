@@ -1647,11 +1647,12 @@ class KeeperSyncService:
                     return None
                 if current.current_build_id == build.id:
                     return None
-                updated = await self._edition_store.set_current_build(
+                repoint = await self._edition_store.set_current_build(
                     edition_id=current.id,
                     build_id=build.id,
                     skip_date_guard=True,
                 )
+                updated = repoint.edition
                 if updated is None:
                     return None
         self._logger.info(

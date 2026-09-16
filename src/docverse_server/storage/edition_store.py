@@ -89,7 +89,12 @@ from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.edition import (
+    DEFAULT_EDITION_SLUG,
+    Edition,
+    EditionRepoint,
+    RepointOutcome,
+)
 from docverse_server.domain.edition_reconcile import ReconcileEdition
 from docverse_server.domain.version import (
     EupsDailyVersion,
@@ -547,12 +552,22 @@ class EditionStore:
         edition_id: int,
         build_id: int,
         skip_date_guard: bool = False,
-    ) -> Edition | None:
+    ) -> EditionRepoint:
         """Set the current build for an edition.
 
+        Reports one of three outcomes — see
+        :class:`~docverse_server.domain.edition.RepointOutcome`: the
+        repoint happened, a guard **refused** it, or the edition
+        already served the target so there was **nothing to change**.
+        The last two are kept apart because they owe the caller
+        different things — a refusal means stand down, an unchanged
+        binding means the postcondition already holds — and only this
+        method can tell them apart, because only it has the edition row
+        under lock when the question is asked.
+
         Two guards can refuse the repoint, and both report the refusal
-        the same way — by returning ``None``, which every caller already
-        treats as "this build does not become current".
+        the same way: ``refused``, carrying no edition, which every
+        caller already treats as "this build does not become current".
 
         The **deleted-build guard** refuses a target whose
         ``date_deleted`` is set (or that no longer exists at all). A
@@ -572,6 +587,27 @@ class EditionStore:
         ``date_created`` against the current build's. If the edition
         already points to a build that is equally new or newer, the
         update is skipped (SQR-112).
+
+        The **unchanged** outcome is what is left when the target is
+        the build the edition already serves. It is only reachable
+        under ``skip_date_guard``, because the stale-build guard
+        refuses a build compared with itself — a build's
+        ``date_created`` is never newer than its own — so the callers
+        that meet it are exactly the two operator-driven repoints, the
+        ``build`` override on the editions ``PATCH`` and rollback, both
+        of which mean "serve this build regardless of what is newer".
+        Nothing is written for it: not the column, and not the project
+        clock below, which would otherwise retire every cached ``ETag``
+        on a project whose content never moved (PRD #634). The edition
+        is still returned, because it is the answer to "what is this
+        edition serving now".
+
+        Deciding it here, rather than from a read the caller took
+        earlier, is the point. The service's own pre-read of the
+        edition happens outside the row lock, so a concurrent repoint
+        committing in between would leave it reporting "already serving
+        that build" about a build the edition no longer serves. By the
+        time the comparison below runs, this transaction holds the row.
 
         A repoint that survives both guards **and** lands on the
         project's default ``__main`` edition also stamps
@@ -606,10 +642,11 @@ class EditionStore:
 
         Returns
         -------
-        Edition or None
-            The updated edition, or ``None`` if the update was skipped
-            because the target build is soft-deleted or the edition
-            already points to a newer build.
+        EditionRepoint
+            The outcome, and the edition as it stands after the call —
+            ``None`` only for ``refused``, where the target build is
+            soft-deleted or the edition already points to a newer
+            build.
         """
         # Step one of the lock order: the project row, taken before
         # either guard reads anything and only for a ``__main`` repoint.
@@ -659,7 +696,7 @@ class EditionStore:
             )
         ).one_or_none()
         if target is None or target.date_deleted is not None:
-            return None
+            return self._refused_repoint()
 
         if not skip_date_guard:
             # Fetch incoming build's date_created
@@ -673,12 +710,26 @@ class EditionStore:
                 current_build_date is not None
                 and current_build_date >= incoming_date
             ):
-                return None
+                return self._refused_repoint()
+
+        # The unchanged outcome, decided on the row this transaction
+        # holds rather than on anything a caller read before it. Placed
+        # after the stale guard so the answer to a same-build repoint
+        # is the one that guard has always given wherever it is in
+        # force; what reaches here is a guard-waiving caller, and for
+        # those this is the whole difference between a repoint and a
+        # request whose postcondition already holds.
+        if row.current_build_id == build_id:
+            return EditionRepoint(
+                outcome=RepointOutcome.unchanged,
+                edition=await self._load_edition_for_repoint(edition_id),
+            )
 
         # The project's clock follows its default edition's content
         # (PRD #634). This is the only place ``current_build_id``
-        # changes, and we are past both guards, so a repoint of
-        # ``__main`` that actually happened is exactly the event a
+        # changes, and we are past both guards and past the build the
+        # edition already served, so a repoint of ``__main`` that
+        # actually happened is exactly the event a
         # consumer polling the project listing with ``updated_since``
         # needs to see. ``publish_status`` flips and every other
         # edition-row write leave the project alone, so the clock means
@@ -688,8 +739,9 @@ class EditionStore:
         # publish and a PATCH in the same transaction agree.
         #
         # The row is already locked, so this waits for nothing; the
-        # guards running between the lock and the stamp is what keeps a
-        # refused repoint from moving the clock.
+        # guards and the unchanged check running between the lock and
+        # the stamp is what keeps a repoint that did not happen from
+        # moving the clock.
         if row.slug.lower() == DEFAULT_EDITION_SLUG:
             await self._session.execute(
                 update(SqlProject)
@@ -702,10 +754,27 @@ class EditionStore:
         await self._session.flush()
 
         await self._session.refresh(row)
-        # Re-query to get current_build_public_id + git_ref
-        stmt2 = self._base_query().where(SqlEdition.id == edition_id)
-        result2 = await self._session.execute(stmt2)
-        edition_row, build_public_id, build_git_ref = result2.one()
+        return EditionRepoint(
+            outcome=RepointOutcome.repointed,
+            edition=await self._load_edition_for_repoint(edition_id),
+        )
+
+    @staticmethod
+    def _refused_repoint() -> EditionRepoint:
+        """Report a guard's refusal, the one outcome with no edition."""
+        return EditionRepoint(outcome=RepointOutcome.refused, edition=None)
+
+    async def _load_edition_for_repoint(self, edition_id: int) -> Edition:
+        """Re-read an edition to report it in a repoint result.
+
+        A second query rather than the row already in hand, because the
+        result carries the current build's ``public_id`` and ``git_ref``
+        and those only come from the join.
+        """
+        stmt = self._base_query().where(SqlEdition.id == edition_id)
+        edition_row, build_public_id, build_git_ref = (
+            await self._session.execute(stmt)
+        ).one()
         return self._validate(edition_row, build_public_id, build_git_ref)
 
     async def list_live_slugs_by_current_build(

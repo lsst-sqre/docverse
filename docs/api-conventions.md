@@ -468,18 +468,27 @@ second time seconds after every metadata `PATCH`.
 
 The same rule covers the two repoints an operator drives by hand. A
 `PATCH .../editions/{edition}` carrying a `build`, and a
-`POST .../editions/{edition}/rollback`, both waive the stale-build
-guard — that is what "serve this build regardless of what is newer"
-means — and the waiver is also what stopped refusing a build compared
-against itself. Naming the build the edition already serves is
-therefore answered with a **200 and the unchanged edition** rather than
-a 409: the postcondition already holds, and an operator retrying a
-rollback after a dropped connection should not have to tell a conflict
-from a success. That request is inert in every respect — no history
-entry, no `publish_edition` job, and no movement of the project's
-clock. A rollback to a build outside the edition's history is still a
-404, checked first, because an override can leave an edition on a build
-rollback was never offered.
+`POST .../editions/{edition}/rollback`, both mean "serve this build
+regardless of what is newer", so both reach the case where the build
+named is the one already being served. That is answered with a **200
+and the unchanged edition** rather than a 409: the postcondition
+already holds, and an operator retrying a rollback after a dropped
+connection should not have to tell a conflict from a success. Whether
+the edition already serves the build is decided while the edition row
+is locked, so a request racing another operator's repoint answers on
+the state that repoint left behind rather than on a build it no longer
+serves.
+
+Such a request is otherwise inert — no history entry, no
+`publish_edition` job, and no movement of the project's clock. The one
+exception is an edition whose current publish **failed**: naming the
+build it is already serving is the only way to ask for that publish to
+be retried, so it records a history entry, returns the edition to
+`pending`, and enqueues the job. The project's clock still does not
+move, because the build being served has not changed. A rollback to a
+build outside the edition's history is still a 404, checked first,
+because an override can leave an edition on a build rollback was never
+offered.
 
 Pair `updated_since` with `order=date_updated` for the "what changed?"
 traversal, and with the `ETag` above so that a pass finding nothing new

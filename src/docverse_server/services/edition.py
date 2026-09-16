@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from safir.database import CountedPaginatedList, PaginationCursor
 
 from docverse.models import EditionCreate, EditionKind, EditionUpdate
 from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.build import Build
+from docverse_server.domain.edition import Edition, RepointOutcome
 from docverse_server.domain.edition_build_history import (
     EditionBuildHistoryWithBuild,
 )
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.project import Project
+from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.metrics import EditionPublishTrigger
 from docverse_server.services.queue_dispatch import QueueDispatcher
@@ -30,6 +34,22 @@ from docverse_server.storage.pagination import (
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.validation import parse_base32_id
+
+_SETTLED_PUBLISH_STATUSES = frozenset(
+    {
+        PublishStatus.pending,
+        PublishStatus.publishing,
+        PublishStatus.published,
+    }
+)
+"""Publish states that leave a repoint onto the current build nothing
+to do.
+
+The complement — ``failed``, and the ``None`` of an edition that has
+never been published — is what makes re-requesting the build an
+edition already serves meaningful: it is the only operator-reachable
+way to re-drive the publish. See :meth:`EditionService._repoint_and_publish`.
+"""
 
 
 class EditionService:
@@ -160,14 +180,22 @@ class EditionService:
     ) -> tuple[Organization, Project, Edition]:
         """Update an edition.
 
-        If ``data.build`` is set, apply an emergency build override: point
-        the edition at the target build (even one not in history), record
-        a new history entry, mark the edition ``publish_status=pending``,
-        and enqueue a ``publish_edition`` job. Unlike rollback, this path
-        bypasses the history-membership guard. Naming the build the
-        edition already serves does none of those things and leaves the
-        edition alone; see :meth:`_is_noop_repoint`. A metadata field in
-        the same payload is applied either way.
+        If ``data.build`` is set, apply an emergency build override:
+        point the edition at the target build (even one not in
+        history), record a new history entry, mark the edition
+        ``publish_status=pending``, and enqueue a ``publish_edition``
+        job. Unlike rollback, this path bypasses the history-membership
+        guard. Naming the build the edition already serves repoints
+        nothing; see :meth:`_repoint_and_publish` for what that does
+        and does not still do. A metadata field in the same payload is
+        applied either way.
+
+        The metadata write is skipped entirely when the payload carries
+        nothing but ``build``. It would have nothing to write, but it is
+        not free: it re-selects the edition, flushes, refreshes, and
+        re-reads it through the join — four round-trips taken while the
+        transaction holds the project, edition, and build rows, on the
+        commonest shape of this request.
 
         The override runs *before* the metadata write, which is a lock
         ordering requirement rather than a preference: it is the arm of
@@ -191,6 +219,7 @@ class EditionService:
             data.model_dump(exclude={"build"}, exclude_unset=True)
         )
 
+        edition: Edition | None = None
         if build_public_id is not None:
             target = await self._store.get_by_slug(
                 project_id=project.id, slug=slug
@@ -198,7 +227,7 @@ class EditionService:
             if target is None:
                 msg = f"Edition {slug!r} not found"
                 raise NotFoundError(msg)
-            await self._apply_build_override(
+            edition = await self._apply_build_override(
                 org_id=org.id,
                 project_id=project.id,
                 project_slug=project_slug,
@@ -206,66 +235,150 @@ class EditionService:
                 build_public_id=build_public_id,
             )
 
-        # Re-read rather than reuse the override's return value: the
-        # metadata write is the last thing to touch the row, so its
+        # The metadata write runs when there is metadata to write, and
+        # when it does it is the last thing to touch the row, so its
         # result is the one that describes the edition the caller gets
-        # back.
-        edition = await self._store.update(
-            project_id=project.id, slug=slug, data=other_updates
-        )
-        if edition is None:
-            msg = f"Edition {slug!r} not found"
-            raise NotFoundError(msg)
+        # back. An override on its own already returned that row; a
+        # payload that is neither still comes through here, because an
+        # empty PATCH of a missing edition has to 404 like any other.
+        if other_updates.model_fields_set or edition is None:
+            edition = await self._store.update(
+                project_id=project.id, slug=slug, data=other_updates
+            )
+            if edition is None:
+                msg = f"Edition {slug!r} not found"
+                raise NotFoundError(msg)
 
         self._logger.info(
             "Updated edition", slug=slug, org=org_slug, project=project_slug
         )
         return org, project, edition
 
-    def _is_noop_repoint(
-        self, *, edition: Edition, build_id: int, build_public_id: str
-    ) -> bool:
-        """Report whether a repoint would leave the edition where it is.
+    async def _repoint_and_publish(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        project_slug: str,
+        edition: Edition,
+        build: Build,
+        build_public_id: str,
+        trigger: EditionPublishTrigger | None = None,
+    ) -> tuple[Edition, QueueJob | None]:
+        """Point an edition at a build and queue the publish it owes.
 
-        The two operator-driven repoints — the ``build`` override on
-        ``PATCH .../editions/{slug}`` and :meth:`rollback` — both waive
-        the stale-build guard, because both mean "serve this build
-        regardless of what is newer". That waiver also takes away the
-        one thing that used to stop a repoint onto the edition's
-        *current* build: ``date_created >= date_created`` holds of a
-        build compared with itself, so the guard refused it and
-        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
-        returned ``None`` having written nothing.
+        The whole of what the two operator-driven repoints — the
+        ``build`` override on ``PATCH .../editions/{slug}`` and
+        :meth:`rollback` — do once they have resolved their target:
+        move the binding, record the history row, mark both the edition
+        and that row ``pending``, and enqueue the ``publish_edition``
+        job. They differ only in how they choose the build and in what
+        they log, so the sequence lives here and a fix to it is a fix
+        to both.
 
-        Since PRD #634 a ``__main`` repoint that passes the guards
-        stamps ``projects.date_updated``, so the waiver is no longer
-        free: naming the build the edition already serves would retire
-        every cached ``ETag`` on the project and re-emit a
-        byte-identical row into every consumer's ``updated_since``
-        window. Both callers therefore ask here first and, on ``True``,
-        skip the repoint along with the history row, the
-        ``publish_status`` flip, and the publish job — all four of which
-        announce a change that is not happening. That is also why the
-        check lives here rather than in the store: only the service can
-        skip those three side effects. (The keeper-sync aggregate path
-        makes the same comparison for its own reasons.)
+        Both waive the stale-build guard, because both mean "serve this
+        build regardless of what is newer", which is what makes the
+        build the edition *already* serves reachable here. That case is
+        answered by
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`,
+        under the edition's row lock, rather than by comparing against
+        a read taken before it: a concurrent repoint committing in that
+        window would otherwise have this path report "already serving
+        that build" about a build the edition no longer serves.
 
-        The comparison is ``current_build_id``, the binding itself,
-        rather than any timestamp: it is the column the repoint would
-        write, so it answers exactly "would this write change the row?"
-        A merely *equivalent* build — same content hash, different row —
-        is a real repoint and takes the full path, because the edition's
-        binding does move.
+        An unchanged binding still leaves a question the store cannot
+        answer, which is whether the *publish* is settled. Where it is
+        — ``pending``, ``publishing`` or ``published`` — there is
+        nothing to do, and doing it anyway would announce a change that
+        is not happening: a history row, a ``publish_status`` flip, a
+        publish job, and (for ``__main``) a project clock stamp that
+        retires every cached ``ETag`` and re-emits a byte-identical row
+        into every consumer's ``updated_since`` window. Where it is
+        ``failed`` or has never been set, re-requesting the current
+        build is the only operator-reachable way to re-drive the
+        publish — the reconcile worker leaves a failed pair alone by
+        design, keeper-sync's self-heal skips it, and there is no
+        republish endpoint — so the full sequence runs. The project
+        clock stays put either way, because the served build is the
+        same one.
+
+        Returns the edition as it now stands, and the publish job if
+        one was enqueued; ``None`` for the job says the request was a
+        no-op, which is what the callers log (or decline to log).
         """
-        if edition.current_build_id != build_id:
-            return False
-        self._logger.info(
-            "Skipped no-op edition repoint",
+        repoint = await self._store.set_current_build(
             edition_id=edition.id,
-            edition_slug=edition.slug,
-            build=build_public_id,
+            build_id=build.id,
+            skip_date_guard=True,
         )
-        return True
+        current = repoint.edition
+        if current is None:
+            # The refused outcome. ``skip_date_guard`` waives the
+            # ordering guard, so the only guard left is the
+            # deleted-build one: the build this read as live was
+            # soft-deleted between that read and this write.
+            msg = (
+                f"Build {build_public_id!r} was deleted while repointing "
+                f"edition {edition.slug!r}"
+            )
+            raise RuntimeError(msg)
+
+        if (
+            repoint.outcome is RepointOutcome.unchanged
+            and current.publish_status in _SETTLED_PUBLISH_STATUSES
+        ):
+            self._logger.info(
+                "Skipped no-op edition repoint",
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                build=build_public_id,
+                publish_status=current.publish_status,
+            )
+            return current, None
+
+        new_history_entry = await self._history_store.record(
+            edition_id=edition.id, build_id=build.id
+        )
+
+        await self._store.set_publish_status(
+            edition_id=edition.id, status=PublishStatus.pending
+        )
+        await self._history_store.set_publish_status(
+            history_id=new_history_entry.id, status=PublishStatus.pending
+        )
+        current.publish_status = PublishStatus.pending
+
+        child_job = await self._queue_job_store.create(
+            kind=JobKind.publish_edition,
+            org_id=org_id,
+            project_id=project_id,
+            build_id=build.id,
+            edition_id=edition.id,
+        )
+        payload: dict[str, Any] = {
+            "org_id": org_id,
+            "project_slug": project_slug,
+            "edition_id": edition.id,
+            "edition_slug": edition.slug,
+            "build_id": build.id,
+            "build_public_id": serialize_base32_id(build.public_id),
+            # Name the row just recorded. Rollback is what puts two
+            # rows on one ``(edition, build)`` pair, so a worker that
+            # resolved the pair instead could pick up — and overwrite —
+            # whichever row a *later* repoint added.
+            "history_id": new_history_entry.id,
+        }
+        if trigger is not None:
+            # Tag the publish so its edition_published metric reports
+            # the operator action rather than the default build fan-out
+            # (the queue job carries no keeper_sync_run_id). SQR-112 D7.
+            payload["trigger"] = trigger.value
+        self._dispatcher.defer(
+            queue_job=child_job,
+            job_type="publish_edition",
+            payload=payload,
+        )
+        return current, child_job
 
     async def _apply_build_override(
         self,
@@ -278,9 +391,9 @@ class EditionService:
     ) -> Edition:
         """Point ``edition`` at an arbitrary build (emergency override).
 
-        Naming the build the edition already serves is a no-op, not a
-        repoint: it returns the edition untouched. See
-        :meth:`_is_noop_repoint`.
+        Naming the build the edition already serves repoints nothing
+        and, unless the publish of that build failed, does nothing else
+        either; see :meth:`_repoint_and_publish`.
         """
         public_id = parse_base32_id(build_public_id, resource="build")
 
@@ -291,70 +404,23 @@ class EditionService:
             msg = f"Build {build_public_id!r} not found"
             raise NotFoundError(msg)
 
-        if self._is_noop_repoint(
-            edition=edition, build_id=build.id, build_public_id=build_public_id
-        ):
-            return edition
-
-        updated_edition = await self._store.set_current_build(
-            edition_id=edition.id,
-            build_id=build.id,
-            skip_date_guard=True,
-        )
-        if updated_edition is None:
-            # ``skip_date_guard`` waives the ordering guard, so the only
-            # way back is the deleted-build guard: the build this read
-            # as live was soft-deleted between that read and this write.
-            msg = (
-                f"Build {build_public_id!r} was deleted while repointing "
-                f"edition {edition.slug!r}"
-            )
-            raise RuntimeError(msg)
-
-        new_history_entry = await self._history_store.record(
-            edition_id=edition.id, build_id=build.id
-        )
-
-        await self._store.set_publish_status(
-            edition_id=edition.id, status=PublishStatus.pending
-        )
-        await self._history_store.set_publish_status(
-            history_id=new_history_entry.id, status=PublishStatus.pending
-        )
-        updated_edition.publish_status = PublishStatus.pending
-
-        child_job = await self._queue_job_store.create(
-            kind=JobKind.publish_edition,
+        updated_edition, child_job = await self._repoint_and_publish(
             org_id=org_id,
             project_id=project_id,
-            build_id=build.id,
-            edition_id=edition.id,
+            project_slug=project_slug,
+            edition=edition,
+            build=build,
+            build_public_id=build_public_id,
         )
-        self._dispatcher.defer(
-            queue_job=child_job,
-            job_type="publish_edition",
-            payload={
-                "org_id": org_id,
-                "project_slug": project_slug,
-                "edition_id": edition.id,
-                "edition_slug": edition.slug,
-                "build_id": build.id,
-                "build_public_id": serialize_base32_id(build.public_id),
-                # The row just recorded, so a late delivery cannot
-                # resolve the pair to a row some later repoint added
-                # (see the rollback path's note).
-                "history_id": new_history_entry.id,
-            },
-        )
-
-        self._logger.info(
-            "Applied edition build override",
-            edition_id=edition.id,
-            build=build_public_id,
-            publish_queue_job_public_id=serialize_base32_id(
-                child_job.public_id
-            ),
-        )
+        if child_job is not None:
+            self._logger.info(
+                "Applied edition build override",
+                edition_id=edition.id,
+                build=build_public_id,
+                publish_queue_job_public_id=serialize_base32_id(
+                    child_job.public_id
+                ),
+            )
         return updated_edition
 
     async def set_current_build(
@@ -368,9 +434,11 @@ class EditionService:
             The updated edition, or ``None`` if the update was skipped
             because the edition already points to a newer build.
         """
-        edition = await self._store.set_current_build(
-            edition_id=edition_id, build_id=build_id
-        )
+        edition = (
+            await self._store.set_current_build(
+                edition_id=edition_id, build_id=build_id
+            )
+        ).edition
         if edition is None:
             self._logger.info(
                 "Skipped stale build for edition",
@@ -423,12 +491,13 @@ class EditionService:
     ) -> tuple[Organization, Project, Edition]:
         """Roll back an edition to a previously-recorded build.
 
-        Rolling back to the build the edition already serves returns it
-        unchanged rather than repointing it; see
-        :meth:`_is_noop_repoint`. The membership guard is still checked
-        first, so a build outside this edition's history is a 404 even
-        when it happens to be the one being served — an override can
-        leave the edition on a build rollback was never offered.
+        Rolling back to the build the edition already serves repoints
+        nothing and, unless the publish of that build failed, does
+        nothing else either; see :meth:`_repoint_and_publish`. The
+        membership guard is still checked first, so a build outside
+        this edition's history is a 404 even when it happens to be the
+        one being served — an override can leave the edition on a build
+        rollback was never offered.
 
         Parameters
         ----------
@@ -471,77 +540,26 @@ class EditionService:
             msg = "Build is not in this edition's history"
             raise NotFoundError(msg)
 
-        if self._is_noop_repoint(
-            edition=edition, build_id=build.id, build_public_id=build_public_id
-        ):
-            return org, project, edition
-
-        updated_edition = await self._store.set_current_build(
-            edition_id=edition.id,
-            build_id=build.id,
-            skip_date_guard=True,
-        )
-        if updated_edition is None:
-            # ``skip_date_guard`` waives the ordering guard, so the only
-            # way back is the deleted-build guard: the build this read
-            # as live was soft-deleted between that read and this write.
-            msg = (
-                f"Build {build_public_id!r} was deleted while repointing "
-                f"edition {edition.slug!r}"
-            )
-            raise RuntimeError(msg)
-
-        new_history_entry = await self._history_store.record(
-            edition_id=edition.id, build_id=build.id
-        )
-
-        await self._store.set_publish_status(
-            edition_id=edition.id, status=PublishStatus.pending
-        )
-        await self._history_store.set_publish_status(
-            history_id=new_history_entry.id, status=PublishStatus.pending
-        )
-        updated_edition.publish_status = PublishStatus.pending
-
-        child_job = await self._queue_job_store.create(
-            kind=JobKind.publish_edition,
+        updated_edition, child_job = await self._repoint_and_publish(
             org_id=org.id,
             project_id=project.id,
-            build_id=build.id,
-            edition_id=edition.id,
+            project_slug=project_slug,
+            edition=edition,
+            build=build,
+            build_public_id=build_public_id,
+            trigger=EditionPublishTrigger.rollback,
         )
-        self._dispatcher.defer(
-            queue_job=child_job,
-            job_type="publish_edition",
-            payload={
-                "org_id": org.id,
-                "project_slug": project_slug,
-                "edition_id": edition.id,
-                "edition_slug": edition.slug,
-                "build_id": build.id,
-                "build_public_id": serialize_base32_id(build.public_id),
-                # Name the row just recorded. Rollback is what puts two
-                # rows on one ``(edition, build)`` pair, so a worker
-                # that resolved the pair instead could pick up — and
-                # overwrite — whichever row a *later* rollback added.
-                "history_id": new_history_entry.id,
-                # Tag the publish so its edition_published metric reports
-                # trigger=rollback rather than the default build fan-out
-                # (the queue job carries no keeper_sync_run_id). SQR-112 D7.
-                "trigger": EditionPublishTrigger.rollback.value,
-            },
-        )
-
-        self._logger.info(
-            "Rolled back edition",
-            slug=edition_slug,
-            org=org_slug,
-            project=project_slug,
-            build=build_public_id,
-            publish_queue_job_public_id=serialize_base32_id(
-                child_job.public_id
-            ),
-        )
+        if child_job is not None:
+            self._logger.info(
+                "Rolled back edition",
+                slug=edition_slug,
+                org=org_slug,
+                project=project_slug,
+                build=build_public_id,
+                publish_queue_job_public_id=serialize_base32_id(
+                    child_job.public_id
+                ),
+            )
         return org, project, updated_edition
 
     async def soft_delete(

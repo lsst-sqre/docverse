@@ -507,15 +507,22 @@ class EditionTrackingService:
         build_id: int,
         skip_date_guard: bool,
     ) -> Edition | None:
-        """Update the edition pointer under an EDITION_UPDATE lock."""
+        """Update the edition pointer under an EDITION_UPDATE lock.
+
+        Flattens the store's three-valued outcome back to "the edition,
+        or nothing": tracking has the same work to do whether the
+        repoint moved the binding or found it already where it wanted
+        it, and a guard's refusal is the only answer it stands down on.
+        """
         async with self._edition_update_lock(
             org_id=org_id, project_id=project_id, edition_id=edition_id
         ):
-            return await self._deps.edition_store.set_current_build(
+            repoint = await self._deps.edition_store.set_current_build(
                 edition_id=edition_id,
                 build_id=build_id,
                 skip_date_guard=skip_date_guard,
             )
+            return repoint.edition
 
     # ------------------------------------------------------------------
     # Private helpers

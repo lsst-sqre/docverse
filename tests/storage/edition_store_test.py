@@ -31,7 +31,7 @@ from docverse_server.config import config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, RepointOutcome
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -589,9 +589,10 @@ async def test_set_current_build(
             edition_id=edition.id, build_id=build.id
         )
         await db_session.commit()
-    assert updated is not None
-    assert updated.current_build_id == build.id
-    assert updated.current_build_public_id == build.public_id
+    assert updated.outcome is RepointOutcome.repointed
+    assert updated.edition is not None
+    assert updated.edition.current_build_id == build.id
+    assert updated.edition.current_build_public_id == build.public_id
 
 
 @pytest.mark.asyncio
@@ -648,14 +649,14 @@ async def test_set_current_build_skips_stale(
         applied = await edition_store.set_current_build(
             edition_id=edition.id, build_id=newer_build.id
         )
-        assert applied is not None
+        assert applied.outcome is RepointOutcome.repointed
 
         # Try to set to the older build — should be skipped
         skipped = await edition_store.set_current_build(
             edition_id=edition.id, build_id=older_build.id
         )
         await db_session.commit()
-    assert skipped is None
+    assert skipped.outcome is RepointOutcome.refused
 
 
 @pytest.mark.asyncio
@@ -709,13 +710,13 @@ async def test_set_current_build_skips_equal(
         applied = await edition_store.set_current_build(
             edition_id=edition.id, build_id=build_a.id
         )
-        assert applied is not None
+        assert applied.outcome is RepointOutcome.repointed
 
         skipped = await edition_store.set_current_build(
             edition_id=edition.id, build_id=build_b.id
         )
         await db_session.commit()
-    assert skipped is None
+    assert skipped.outcome is RepointOutcome.refused
 
 
 @pytest.mark.asyncio
@@ -776,9 +777,10 @@ async def test_set_current_build_applies_when_newer(
             edition_id=edition.id, build_id=newer_build.id
         )
         await db_session.commit()
-    assert updated is not None
-    assert updated.current_build_id == newer_build.id
-    assert updated.current_build_public_id == newer_build.public_id
+    assert updated.outcome is RepointOutcome.repointed
+    assert updated.edition is not None
+    assert updated.edition.current_build_id == newer_build.id
+    assert updated.edition.current_build_public_id == newer_build.public_id
 
 
 @pytest.mark.asyncio
@@ -820,7 +822,7 @@ async def test_set_current_build_skips_deleted_build(
             edition_id=edition.id, build_id=build.id
         )
         await db_session.commit()
-    assert skipped is None
+    assert skipped.outcome is RepointOutcome.refused
     refreshed = await edition_store.get_by_id(edition.id)
     assert refreshed is not None
     assert refreshed.current_build_id is None
@@ -873,7 +875,7 @@ async def test_set_current_build_skips_deleted_build_without_date_guard(
             build_id=live_build.id,
             skip_date_guard=True,
         )
-        assert applied is not None
+        assert applied.outcome is RepointOutcome.repointed
         assert await build_store.soft_delete(build_id=deleted_build.id) is True
 
         skipped = await edition_store.set_current_build(
@@ -882,7 +884,7 @@ async def test_set_current_build_skips_deleted_build_without_date_guard(
             skip_date_guard=True,
         )
         await db_session.commit()
-    assert skipped is None
+    assert skipped.outcome is RepointOutcome.refused
     refreshed = await edition_store.get_by_id(edition.id)
     assert refreshed is not None
     assert refreshed.current_build_id == live_build.id
@@ -944,7 +946,7 @@ async def test_set_current_build_touches_project_for_default_edition(
             edition_id=edition.id, build_id=build.id
         )
         await db_session.commit()
-    assert updated is not None
+    assert updated.outcome is RepointOutcome.repointed
 
     async with db_session.begin():
         after = await _read_project_date_updated(db_session, project_id)
@@ -991,7 +993,7 @@ async def test_set_current_build_leaves_project_for_other_edition(
             edition_id=edition.id, build_id=build.id
         )
         await db_session.commit()
-    assert updated is not None
+    assert updated.outcome is RepointOutcome.repointed
 
     async with db_session.begin():
         after = await _read_project_date_updated(db_session, project_id)
@@ -1055,7 +1057,7 @@ async def test_set_current_build_leaves_project_when_guard_skips(
             edition_id=edition.id, build_id=newer_build.id
         )
         await db_session.commit()
-    assert applied is not None
+    assert applied.outcome is RepointOutcome.repointed
 
     async with db_session.begin():
         before = await _read_project_date_updated(db_session, project_id)
@@ -1063,7 +1065,67 @@ async def test_set_current_build_leaves_project_when_guard_skips(
             edition_id=edition.id, build_id=older_build.id
         )
         await db_session.commit()
-    assert skipped is None
+    assert skipped.outcome is RepointOutcome.refused
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session, project_id)
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_set_current_build_reports_unchanged_target(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Repointing an edition at its own build reports ``unchanged``.
+
+    The third outcome, distinct from both a repoint and a guard's
+    refusal, and the one the operator paths key on: a caller that
+    waives the stale-build guard — the ``PATCH`` build override and
+    rollback do — asks for a build the edition may already serve, and
+    only the store can answer that *after* taking the edition row lock.
+    Nothing is written, so the project clock stays where it was rather
+    than retiring every cached ``ETag`` for content that did not move.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(
+                git_ref="main",
+                content_hash="sha256:8888" + "0" * 60,
+            ),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        first = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id, skip_date_guard=True
+        )
+        await db_session.commit()
+    assert first.outcome is RepointOutcome.repointed
+
+    async with db_session.begin():
+        before = await _read_project_date_updated(db_session, project_id)
+        again = await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id, skip_date_guard=True
+        )
+        await db_session.commit()
+    assert again.outcome is RepointOutcome.unchanged
+    assert again.edition is not None
+    assert again.edition.current_build_id == build.id
 
     async with db_session.begin():
         after = await _read_project_date_updated(db_session, project_id)
@@ -1127,7 +1189,7 @@ async def test_set_current_build_locks_project_then_edition_then_build(
                 edition_id=edition.id, build_id=build.id
             )
         await db_session.commit()
-    assert updated is not None
+    assert updated.outcome is RepointOutcome.repointed
 
     project_lock = _first_statement_index(
         statements,
@@ -1288,7 +1350,7 @@ async def test_set_current_build_does_not_deadlock_with_project_delete(
         BuildStore, "soft_delete_all_by_project", paused_cascade
     )
 
-    repointed: list[Edition | None] = []
+    repointed: list[RepointOutcome] = []
 
     async with (
         db_session_factory() as delete_session,
@@ -1308,11 +1370,10 @@ async def test_set_current_build_does_not_deadlock_with_project_delete(
 
         async def run_repoint() -> None:
             store = EditionStore(session=publish_session, logger=logger)
-            repointed.append(
-                await store.set_current_build(
-                    edition_id=edition.id, build_id=build.id
-                )
+            result = await store.set_current_build(
+                edition_id=edition.id, build_id=build.id
             )
+            repointed.append(result.outcome)
             await publish_session.commit()
 
         deleting = asyncio.ensure_future(run_delete())
@@ -1341,7 +1402,7 @@ async def test_set_current_build_does_not_deadlock_with_project_delete(
     # holding the build.
     assert parked
     # And having waited, it found the build the cascade deleted.
-    assert repointed == [None]
+    assert repointed == [RepointOutcome.refused]
 
     async with db_session_factory() as reader:
         row = (
@@ -3091,7 +3152,7 @@ async def test_set_current_build_waits_for_an_in_flight_delete(
                     assert await store.soft_delete(build_id=build_id) is True
                     await session.commit()
 
-        async def repoint() -> Edition | None:
+        async def repoint() -> RepointOutcome:
             await build_locked.wait()
             async with maker() as session:
                 store = EditionStore(session=session, logger=logger)
@@ -3100,13 +3161,13 @@ async def test_set_current_build_waits_for_an_in_flight_delete(
                         edition_id=edition_id, build_id=build_id
                     )
                     await session.commit()
-                return updated
+                return updated.outcome
 
-        _, updated = await asyncio.gather(delete_build(), repoint())
+        _, outcome = await asyncio.gather(delete_build(), repoint())
     finally:
         await engine.dispose()
 
-    assert updated is None
+    assert outcome is RepointOutcome.refused
     refreshed = await edition_store.get_by_id(edition_id)
     assert refreshed is not None
     assert refreshed.current_build_id is None

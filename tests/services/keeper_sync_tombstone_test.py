@@ -1200,9 +1200,11 @@ async def test_clear_names_editions_left_pointing_at_a_purged_build(
     _revivable_build_id, purged_build_id = build_ids
 
     async with db_session.begin():
-        pointed = await edition_store.set_current_build(
-            edition_id=edition_id, build_id=purged_build_id
-        )
+        pointed = (
+            await edition_store.set_current_build(
+                edition_id=edition_id, build_id=purged_build_id
+            )
+        ).edition
     assert pointed is not None
 
     async with db_session.begin():

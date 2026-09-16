@@ -666,3 +666,144 @@ async def test_rollback_different_build_advances_project_clock(
     async with db_session.begin():
         after = await _read_project_date_updated(db_session)
     assert after > before
+
+
+async def _fail_current_publish(db_session: AsyncSession) -> None:
+    """Record the ``__main`` edition's current publish as failed.
+
+    What a ``publish_edition`` job leaves behind when it gives up: the
+    edition and the history row for the pair both carry ``failed``, and
+    nothing in the tree picks that pair up again — the reconcile worker
+    classifies it ``failed_left_alone`` by design, keeper-sync's
+    self-heal skips it, and there is no republish endpoint.
+    """
+    logger = structlog.get_logger("docverse")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
+
+    org = await org_store.get_by_slug("rb-org")
+    assert org is not None
+    project = await proj_store.get_by_slug(org_id=org.id, slug="rb-proj")
+    assert project is not None
+    edition = await edition_store.get_by_slug(
+        project_id=project.id, slug="__main"
+    )
+    assert edition is not None
+    assert edition.current_build_id is not None
+    await edition_store.set_publish_status(
+        edition_id=edition.id, status=PublishStatus.failed
+    )
+    entry = await history_store.get_by_edition_and_build(
+        edition_id=edition.id, build_id=edition.current_build_id
+    )
+    assert entry is not None
+    await history_store.set_publish_status(
+        history_id=entry.id, status=PublishStatus.failed
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollback_redrives_a_failed_publish_of_the_same_build(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Rolling back onto a failed publish re-drives it.
+
+    A rollback naming the build the edition already serves is the only
+    operator-reachable way to retry a ``publish_edition`` job that
+    failed, so it is a no-op only while the publish is settled. With
+    the pair ``failed``, the full path runs: a fresh history row, back
+    to ``pending``, and another job.
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    headers = {"X-Auth-Request-User": "testuser"}
+    first = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    async with db_session.begin():
+        await _fail_current_publish(db_session)
+        await db_session.commit()
+
+    second = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert second.status_code == 200
+    assert second.json()["publish_status"] == PublishStatus.pending.value
+
+    history_response = await client.get(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/history",
+        headers=headers,
+    )
+    assert history_response.status_code == 200
+    # 3 seeded entries plus one for each of the two rollbacks.
+    assert len(history_response.json()) == 5
+
+    async with db_session.begin():
+        result = await db_session.execute(
+            select(SqlQueueJob).where(
+                SqlQueueJob.kind == JobKind.publish_edition.value
+            )
+        )
+        assert len(result.scalars().all()) == 2
+
+    mock_arq = arq_dependency._arq_queue
+    assert isinstance(mock_arq, MockArqQueue)
+    assert len(get_jobs_by_name(mock_arq, "publish_edition")) == 2
+
+
+@pytest.mark.asyncio
+async def test_rollback_redriving_a_failed_publish_leaves_the_clock(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Re-driving a failed publish is not a change to the project.
+
+    The retry re-runs the publish of the build the edition is already
+    serving, so no content moves and a poller holding the project's
+    ``ETag`` has nothing to refetch — even though this request is not
+    the inert no-op a settled publish gets.
+    """
+    await _setup(client)
+    async with db_session.begin():
+        builds = await _create_builds_with_history(db_session, n_builds=3)
+        await db_session.commit()
+
+    target_public_id = serialize_base32_id(builds[0][1])
+    headers = {"X-Auth-Request-User": "testuser"}
+    first = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    async with db_session.begin():
+        await _fail_current_publish(db_session)
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await _read_project_date_updated(db_session)
+
+    second = await client.post(
+        "/docverse/orgs/rb-org/projects/rb-proj/editions/__main/rollback",
+        json={"build": target_public_id},
+        headers=headers,
+    )
+    assert second.status_code == 200
+
+    async with db_session.begin():
+        after = await _read_project_date_updated(db_session)
+    assert after == before

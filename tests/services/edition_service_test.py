@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from typing import NamedTuple
 
 import pytest
 import structlog
@@ -30,10 +31,14 @@ from docverse.models import (
 from docverse_server.config import Configuration
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.build import Build
 from docverse_server.domain.edition import DEFAULT_EDITION_SLUG
 from docverse_server.factory import Factory
 from docverse_server.services.edition import EditionService
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_build_history_store import (
+    EditionBuildHistoryStore,
+)
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import TombstoneReason
 from docverse_server.storage.organization_store import OrganizationStore
@@ -44,7 +49,6 @@ from tests.support.rowlocks import (
     wait_until_blocked_or_finished,
 )
 
-_HASH = "sha256:" + "c" * 64
 _config = Configuration()
 
 
@@ -62,10 +66,20 @@ def _edition_service(db_session: AsyncSession) -> EditionService:
     return factory.create_edition_service()
 
 
-async def _seed(db_session: AsyncSession) -> tuple[int, int, str]:
-    """Insert an org, a project, its ``__main`` edition, and a build.
+class _Seeded(NamedTuple):
+    """What :func:`_seed` put in the database."""
 
-    Returns ``(org_id, edition_id, build_public_id)``.
+    org_id: int
+    project_id: int
+    edition_id: int
+    builds: list[Build]
+
+
+async def _seed(db_session: AsyncSession, *, n_builds: int = 1) -> _Seeded:
+    """Insert an org, a project, its ``__main`` edition, and builds.
+
+    The builds are returned oldest first, so a test that wants a
+    "current" build and something to move it to can unpack two.
     """
     logger = _logger()
     org = await OrganizationStore(session=db_session, logger=logger).create(
@@ -93,13 +107,24 @@ async def _seed(db_session: AsyncSession) -> tuple[int, int, str]:
         tracking_mode=TrackingMode.git_ref,
         tracking_params={"git_ref": "main"},
     )
-    build = await BuildStore(session=db_session, logger=logger).create(
+    build_store = BuildStore(session=db_session, logger=logger)
+    builds = [
+        await build_store.create(
+            project_id=project.id,
+            project_slug=project.slug,
+            data=BuildCreate(
+                git_ref="main", content_hash=f"sha256:{index:064x}"
+            ),
+            uploader="testuser",
+        )
+        for index in range(n_builds)
+    ]
+    return _Seeded(
+        org_id=org.id,
         project_id=project.id,
-        project_slug=project.slug,
-        data=BuildCreate(git_ref="main", content_hash=_HASH),
-        uploader="testuser",
+        edition_id=edition.id,
+        builds=builds,
     )
-    return org.id, edition.id, serialize_base32_id(build.public_id)
 
 
 @pytest.mark.asyncio
@@ -125,8 +150,11 @@ async def test_update_with_metadata_and_build_does_not_deadlock(
     edition row on this path too, so the DELETE simply waits.
     """
     async with db_session.begin():
-        org_id, edition_id, build_public_id = await _seed(db_session)
+        seeded = await _seed(db_session)
         await db_session.commit()
+    org_id = seeded.org_id
+    edition_id = seeded.edition_id
+    build_public_id = serialize_base32_id(seeded.builds[0].public_id)
 
     # Park the PATCH immediately after its metadata write, the point at
     # which the old order was already holding the edition row.
@@ -208,3 +236,191 @@ async def test_update_with_metadata_and_build_does_not_deadlock(
         assert row.title == "Renamed"
         assert row.current_build_id is not None
         assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_same_build_override_decides_under_the_row_lock(
+    app: FastAPI,
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A same-build override answers on the state it holds a lock over.
+
+    "The edition already serves this build" is only true for as long as
+    nothing else repoints it, and the service's own read of the edition
+    happens outside the row lock the repoint takes. Two operators
+    reacting to the same incident — one rolling back to A, one naming
+    the B the edition is serving — could therefore both be told their
+    postcondition held, while the edition ended up on A and the B
+    caller's 200 named a build it no longer served.
+
+    Here the override arrives while a repoint onto A is still in
+    flight. It has to park on the rows that repoint holds and answer on
+    what it finds afterwards: B is no longer current, so this is a real
+    repoint, with the history row and the publish that go with one.
+    """
+    async with db_session.begin():
+        seeded = await _seed(db_session, n_builds=2)
+        await db_session.commit()
+    build_a, build_b = seeded.builds
+    edition_id = seeded.edition_id
+
+    # The edition starts out serving B, the build the override names.
+    async with db_session.begin():
+        await EditionStore(
+            session=db_session, logger=_logger()
+        ).set_current_build(
+            edition_id=edition_id, build_id=build_b.id, skip_date_guard=True
+        )
+        await db_session.commit()
+
+    async with (
+        db_session_factory() as repoint_session,
+        db_session_factory() as patch_session,
+        db_session_factory() as probe,
+    ):
+        patch_pid = await backend_pid(patch_session)
+
+        # The other operator's rollback onto A, uncommitted: it holds
+        # the project and edition rows, and READ COMMITTED still shows
+        # everyone else the edition on B.
+        await EditionStore(
+            session=repoint_session, logger=_logger()
+        ).set_current_build(
+            edition_id=edition_id, build_id=build_a.id, skip_date_guard=True
+        )
+
+        async def run_patch() -> None:
+            service = _edition_service(patch_session)
+            await service.update(
+                org_slug="es-org",
+                project_slug="es-proj",
+                slug=DEFAULT_EDITION_SLUG,
+                data=EditionUpdate(
+                    build=serialize_base32_id(build_b.public_id)
+                ),
+            )
+            await patch_session.commit()
+
+        patching = asyncio.ensure_future(run_patch())
+        parked = False
+        try:
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=patch_pid, task=patching
+            )
+            await repoint_session.commit()
+            await patching
+        finally:
+            if not patching.done():
+                patching.cancel()
+                with suppress(asyncio.CancelledError):
+                    await patching
+            await repoint_session.rollback()
+            await patch_session.rollback()
+
+    # The override waited rather than deciding on its own stale read.
+    assert parked
+
+    async with db_session_factory() as reader:
+        logger = _logger()
+        edition = await EditionStore(session=reader, logger=logger).get_by_id(
+            edition_id
+        )
+        assert edition is not None
+        # Having waited, it found A in place and really did repoint.
+        assert edition.current_build_id == build_b.id
+        history = await EditionBuildHistoryStore(
+            session=reader, logger=logger
+        ).list_by_edition(edition_id)
+        assert [entry.build_id for entry in history] == [build_b.id]
+
+
+@pytest.mark.asyncio
+async def test_build_only_patch_skips_the_metadata_write(
+    app: FastAPI,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PATCH carrying only ``build`` never reaches the metadata write.
+
+    There is nothing for that write to write — the payload's only field
+    was consumed by the override — but it is not free: it re-selects
+    the edition, flushes, refreshes, and re-reads it through the
+    current-build join, all while the transaction holds the project,
+    edition, and build rows. The override already returned the row this
+    request produced, so the caller gets that instead.
+    """
+    async with db_session.begin():
+        seeded = await _seed(db_session)
+        await db_session.commit()
+    build = seeded.builds[0]
+
+    calls: list[object] = []
+    store_update = EditionStore.update
+
+    async def counted_update(
+        self: EditionStore, **kwargs: object
+    ) -> object | None:
+        calls.append(kwargs)
+        return await store_update(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(EditionStore, "update", counted_update)
+
+    async with db_session.begin():
+        service = _edition_service(db_session)
+        _, _, edition = await service.update(
+            org_slug="es-org",
+            project_slug="es-proj",
+            slug=DEFAULT_EDITION_SLUG,
+            data=EditionUpdate(build=serialize_base32_id(build.public_id)),
+        )
+        await db_session.commit()
+
+    assert calls == []
+    assert edition.current_build_id == build.id
+
+
+@pytest.mark.asyncio
+async def test_patch_with_build_and_metadata_applies_both(
+    app: FastAPI,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A payload carrying both still gets both, in that order.
+
+    The metadata write is skipped only when the payload has nothing
+    left for it, so a ``build`` alongside a metadata field runs both
+    arms — the override first, which is what keeps this path's locks in
+    the projects → editions order.
+    """
+    async with db_session.begin():
+        seeded = await _seed(db_session)
+        await db_session.commit()
+    build = seeded.builds[0]
+
+    calls: list[object] = []
+    store_update = EditionStore.update
+
+    async def counted_update(
+        self: EditionStore, **kwargs: object
+    ) -> object | None:
+        calls.append(kwargs)
+        return await store_update(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(EditionStore, "update", counted_update)
+
+    async with db_session.begin():
+        service = _edition_service(db_session)
+        _, _, edition = await service.update(
+            org_slug="es-org",
+            project_slug="es-proj",
+            slug=DEFAULT_EDITION_SLUG,
+            data=EditionUpdate(
+                title="Renamed", build=serialize_base32_id(build.public_id)
+            ),
+        )
+        await db_session.commit()
+
+    assert len(calls) == 1
+    assert edition.title == "Renamed"
+    assert edition.current_build_id == build.id

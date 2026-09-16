@@ -289,20 +289,30 @@ async def post_edition_rollback(
     ``200`` and the unchanged edition, not a ``409``: the request's
     postcondition already holds, and an operator retrying after a
     dropped connection — or two operators reacting to the same
-    incident — should not have to tell a conflict from a success. The
-    response is the edition as it stands, so its ``publish_status``
-    reports the real state of the publish rather than a ``pending``
-    nothing will clear.
+    incident — should not have to tell a conflict from a success.
+    Whether it already serves that build is decided under the
+    edition's row lock, so a rollback racing another operator's
+    repoint answers on what that repoint actually left behind: an
+    edition that has moved on is rolled back for real, rather than
+    handed a ``200`` naming a build it no longer serves. The response
+    is the edition as it stands, so its ``publish_status`` reports the
+    real state of the publish rather than a ``pending`` nothing will
+    clear.
 
-    Such a request is inert. It records no history entry, enqueues no
-    ``publish_edition`` job, and leaves the project's ``date_updated``
-    where it was, so a consumer polling ``GET /orgs/{org}/projects``
-    with ``updated_since`` or an ``ETag`` is not told to refetch a
-    project whose content did not move.
+    Such a request is otherwise inert. It records no history entry,
+    enqueues no ``publish_edition`` job, and leaves the project's
+    ``date_updated`` where it was, so a consumer polling
+    ``GET /orgs/{org}/projects`` with ``updated_since`` or an ``ETag``
+    is not told to refetch a project whose content did not move. The
+    exception is a publish that **failed**: re-requesting the build
+    being served is the only way to retry it, so that request does
+    record a history entry, return the edition to ``pending``, and
+    enqueue the job — still without moving the project's clock, since
+    the build being served is the same one.
 
     A build that is not in this edition's history is still a ``404``,
-    checked before the no-op case: an emergency ``build`` override can
-    leave an edition serving a build that rollback was never offered.
+    checked first: an emergency ``build`` override can leave an edition
+    serving a build that rollback was never offered.
     """
     async with context.session.begin():
         service = context.factory.create_edition_service()
@@ -363,12 +373,19 @@ async def patch_edition(
 
     Naming the build the edition **already serves** is answered with
     ``200`` and the unchanged edition, on the same reasoning as
-    ``POST .../rollback``. Such a request is inert: no history entry, no
-    ``publish_edition`` job, and the project's ``date_updated`` stays
-    where it was, so a consumer polling
+    ``POST .../rollback``, and decided the same way — under the
+    edition's row lock, so an override racing another operator's
+    repoint repoints for real rather than reporting a build the
+    edition no longer serves. Such a request is otherwise inert: no
+    history entry, no ``publish_edition`` job, and the project's
+    ``date_updated`` stays where it was, so a consumer polling
     ``GET /orgs/{org}/projects`` with ``updated_since`` or an ``ETag``
-    is not told to refetch a project whose content did not move. A
-    metadata field in the same payload is still applied.
+    is not told to refetch a project whose content did not move. The
+    exception, again as for rollback, is a publish that **failed**:
+    re-requesting the served build is the only way to retry it, so it
+    records a history entry, returns the edition to ``pending``, and
+    enqueues the job without moving the project's clock. A metadata
+    field in the same payload is still applied.
     """
     if edition_slug.lower() == "__main" and data.kind is not None:
         msg = "Cannot change the kind of the default '__main' edition"

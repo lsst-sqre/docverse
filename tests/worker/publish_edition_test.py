@@ -341,9 +341,11 @@ async def _setup_publish_scenario(
     assert refreshed_build is not None
     # Every producer repoints the edition before it enqueues, so the
     # job's build is the one the edition points at when the job runs.
-    pointed_edition = await edition_store.set_current_build(
-        edition_id=edition.id, build_id=refreshed_build.id
-    )
+    pointed_edition = (
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=refreshed_build.id
+        )
+    ).edition
     assert pointed_edition is not None
     history_entry = await history_store.record(
         edition_id=edition.id, build_id=refreshed_build.id
@@ -408,9 +410,11 @@ async def _roll_edition_and_queue_publish(
     edition_store = EditionStore(session=db_session, logger=logger)
     history_store = EditionBuildHistoryStore(session=db_session, logger=logger)
     queue_job_store = QueueJobStore(session=db_session, logger=logger)
-    repointed = await edition_store.set_current_build(
-        edition_id=edition.id, build_id=build.id, skip_date_guard=True
-    )
+    repointed = (
+        await edition_store.set_current_build(
+            edition_id=edition.id, build_id=build.id, skip_date_guard=True
+        )
+    ).edition
     assert repointed is not None
     await edition_store.set_publish_status(
         edition_id=edition.id, status=PublishStatus.pending

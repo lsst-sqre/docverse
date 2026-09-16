@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -113,3 +115,43 @@ class Edition(BaseModel):
         default=None,
         description="Timestamp when the edition was soft-deleted.",
     )
+
+
+class RepointOutcome(StrEnum):
+    """What a repoint did to an edition's ``current_build_id``.
+
+    The three answers
+    :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
+    can give, kept apart because callers act on them differently:
+
+    - ``repointed`` — the binding moved, so everything that announces a
+      change (the history row, the ``publish_status`` flip, the publish
+      job, the project's clock) is owed.
+    - ``unchanged`` — the edition already served the target, so nothing
+      was written. Only reachable where the stale-build guard is waived:
+      that guard refuses a build compared with itself, because a build's
+      ``date_created`` is never newer than its own.
+    - ``refused`` — a guard turned the repoint down, either because the
+      target is soft-deleted or because the edition already serves a
+      build that is equally new or newer.
+    """
+
+    repointed = "repointed"
+    unchanged = "unchanged"
+    refused = "refused"
+
+
+@dataclass(frozen=True, slots=True)
+class EditionRepoint:
+    """The result of one repoint attempt.
+
+    ``edition`` is the edition as it stands after the call — the
+    repointed row for ``repointed``, the untouched row for
+    ``unchanged`` — and is ``None`` exactly when the outcome is
+    ``refused``, which is the case in which there is no meaningful "as
+    it stands" to report and every caller stands down anyway.
+    """
+
+    outcome: RepointOutcome
+
+    edition: Edition | None
