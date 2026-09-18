@@ -165,14 +165,50 @@ jobs:
       - name: Run deploy-worker integration test
         run: uv run --only-group=nox nox -s deploy_worker_test
 
+  # Derives the versions setuptools_scm would compute from a full-history
+  # checkout and hands them to the Docker build as build arguments. The build
+  # context excludes .git (see .dockerignore), so this is the image's only
+  # source of version information. Letting setuptools_scm run inside the
+  # build instead labelled tagged releases as the *next* version with a
+  # `.dev0+g<hash>.d<date>` suffix: .dockerignore drops tracked files such as
+  # tests/ from the context, so git described the tree as dirty.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      server: ${{ steps.scm.outputs.server }}
+      client: ${{ steps.scm.outputs.client }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history for setuptools_scm
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Derive versions with setuptools_scm
+        id: scm
+        run: |
+          server="$(uvx --from 'setuptools-scm>=8' python -m setuptools_scm)"
+          client="$(cd client && uvx --from 'setuptools-scm>=8' python -m setuptools_scm)"
+          echo "server=${server}" >> "$GITHUB_OUTPUT"
+          echo "client=${client}" >> "$GITHUB_OUTPUT"
+          echo "server=${server} client=${client}"
+
   build:
     concurrency:
       group: docker
       queue: max
-    needs: [typing, test, client-test, worker-test, deploy-worker-test]
+    needs: [version, typing, test, client-test, worker-test, deploy-worker-test]
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
     with:
       images: ghcr.io/${{ github.repository }}
+      build-args: |
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOCVERSE_SERVER=${{ needs.version.outputs.server }}
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOCVERSE=${{ needs.version.outputs.client }}
       # Only push on server releases (tags like "server/0.1.0") and ticket
       # branch PRs. Non-matching PRs still build the image as validation but
       # skip the push + manifest steps — this lets the required

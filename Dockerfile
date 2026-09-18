@@ -46,10 +46,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=client/pyproject.toml,target=client/pyproject.toml \
     uv sync --frozen --no-default-groups --compile-bytecode --no-install-workspace
 
-# Install the application itself.
+# Version stamps for setuptools_scm. CI derives these from a full-history
+# checkout and passes them as build arguments (see the `version` job in
+# .github/workflows/ci.yaml). The build context carries no .git directory, so
+# a build without them yields the pyproject `fallback_version` (0.0.0) for
+# both packages. An empty value is ignored by setuptools_scm.
+ARG SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOCVERSE_SERVER
+ARG SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOCVERSE
+
+# Install the application itself. The two workspace packages are always
+# rebuilt: uv's cache keys their wheels on the source tree alone, so a
+# persistent cache would otherwise hand back a wheel stamped with whatever
+# version the previous build was given.
 ADD . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-default-groups --compile-bytecode --no-editable
+    uv sync --frozen --no-default-groups --compile-bytecode --no-editable \
+    --reinstall-package docverse-server --reinstall-package docverse
 
 FROM base-image AS runtime-image
 

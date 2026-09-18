@@ -6,6 +6,11 @@
 *.egg-info/
 *.sqlite
 
+# Version control. The image's version is passed in as a build argument (see
+# Dockerfile); with .git in the context, setuptools_scm saw the tracked files
+# excluded below as deletions and reported every build as dirty.
+.git/
+
 # Development and CI directories
 .claude/
 .github/
