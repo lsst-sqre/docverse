@@ -206,6 +206,10 @@ jobs:
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
     with:
       images: ghcr.io/${{ github.repository }}
+      # A shallow checkout is all the image build needs: the version comes
+      # in through build-args below and .git is not part of the build
+      # context, so nothing here runs setuptools_scm or git describe.
+      fetch-depth: 1
       build-args: |
         SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOCVERSE_SERVER=${{ needs.version.outputs.server }}
         SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DOCVERSE=${{ needs.version.outputs.client }}
