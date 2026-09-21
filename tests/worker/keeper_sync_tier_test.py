@@ -29,6 +29,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -107,6 +108,9 @@ async def _seed_org(
     *,
     slug: str = "ks-tier",
     project_slugs: list[str] | str = "*",
+    project_slug_patterns: list[str] | None = None,
+    exclude_project_slugs: list[str] | None = None,
+    exclude_project_slug_patterns: list[str] | None = None,
     enabled: bool = True,
 ) -> tuple[int, str]:
     """Seed an org with the given keeper-sync config."""
@@ -124,6 +128,11 @@ async def _seed_org(
         config=KeeperSyncConfig(
             enabled=enabled,
             project_slugs=project_slugs,  # type: ignore[arg-type]
+            project_slug_patterns=project_slug_patterns or [],
+            exclude_project_slugs=exclude_project_slugs or [],
+            exclude_project_slug_patterns=(
+                exclude_project_slug_patterns or []
+            ),
         ),
     )
     return org.id, org.slug
@@ -1246,6 +1255,211 @@ async def test_tier_main_skips_tombstoned_main_edition(
     )
 
 
+@pytest.mark.asyncio
+async def test_tier_main_honours_scope_patterns_and_excludes(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """tier_main resolves its candidates through the config scope rule.
+
+    PRD #667: ``sqr-100`` is in scope only because of the include
+    pattern — it never appeared in ``project_slugs``, which is how a
+    product created on LTD after the config was written joins the
+    cadence with no config change. ``sqr-999`` matches the same
+    pattern but is excluded, and ``www`` is not included at all;
+    neither is stubbed on LTD, so a scope leak fails the tick.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session,
+            slug="ks-tier-main-scope",
+            project_slugs=[],
+            project_slug_patterns=[r"sqr-\d+"],
+            exclude_project_slugs=["sqr-999"],
+        )
+
+    _stub_products(mock_discovery, ["sqr-100", "sqr-999", "www"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-100", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
+
+
+@pytest.mark.asyncio
+async def test_tier_main_logs_scope_counts(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The tier scope log event reports the same counts as run discovery."""
+    async with db_session.begin():
+        await _seed_org(
+            db_session,
+            slug="ks-tier-main-scope-log",
+            project_slugs="*",
+            exclude_project_slugs=["www"],
+            exclude_project_slug_patterns=[r"test-.*"],
+        )
+
+    _stub_products(mock_discovery, ["sqr-100", "www", "test-one"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-100", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    scope_events = [
+        e
+        for e in captured
+        if e["event"] == "Resolved keeper-sync tier scope"
+        and e["org"] == "ks-tier-main-scope-log"
+    ]
+    assert len(scope_events) == 1
+    assert scope_events[0]["ltd_count"] == 3
+    assert scope_events[0]["in_scope_count"] == 1
+    assert scope_events[0]["excluded_count"] == 2
+    assert scope_events[0]["tombstoned_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tier_main_leaves_newly_excluded_project_rows_alone(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Excluding a synced project stops its jobs without touching its rows.
+
+    PRD #667: falling out of scope is not a delete. ``old-proj`` was
+    synced before the exclude was added — its state rows lag LTD, so a
+    scope leak would enqueue it — and after the tick those rows are
+    still there, un-tombstoned, ready to resume if the exclude is
+    lifted.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-excluded",
+            project_slugs="*",
+            exclude_project_slugs=["old-proj"],
+        )
+        # ``old-proj`` looks freshly synced and hot, so nothing but the
+        # exclude keeps it out of this tick.
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="old-proj",
+            date_last_synced=now - timedelta(minutes=1),
+            date_rebuilt_seen=now - timedelta(minutes=1),
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2),
+        )
+
+    _stub_products(mock_discovery, ["old-proj", "live-proj"])
+    # Both products are stubbed on LTD: a scope leak would enqueue
+    # ``old-proj`` rather than error out.
+    _stub_editions_listing(
+        mock_discovery, product_slug="old-proj", edition_ids=[2]
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="live-proj", edition_ids=[12]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=12,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["live-proj"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="old-proj",
+                include_tombstoned=True,
+            )
+            assert project_state is not None
+            assert project_state.date_tombstoned is None
+            edition_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=2,
+                include_tombstoned=True,
+            )
+            assert edition_state is not None
+            assert edition_state.date_tombstoned is None
+            assert edition_state.date_rebuilt_seen == (
+                _FIXTURE_MAIN_DATE_REBUILT - timedelta(hours=2)
+            )
+
+
 # ---------------------------------------------------------------------------
 # tier_discovery
 # ---------------------------------------------------------------------------
@@ -1963,6 +2177,49 @@ async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
     )
 
 
+@pytest.mark.asyncio
+async def test_tier_discovery_honours_scope_patterns_and_excludes(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """tier_discovery resolves its candidates through the config scope rule.
+
+    ``sqr-100`` reaches the cron through the include pattern alone —
+    the shape a product created on LTD after the config was written
+    takes — while the excluded ``sqr-999`` and the unmatched ``www``
+    never do. Neither is stubbed on LTD, so a scope leak fails the
+    tick.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session,
+            slug="ks-tier-disc-scope",
+            project_slugs=[],
+            project_slug_patterns=[r"sqr-\d+"],
+            exclude_project_slugs=["sqr-999"],
+        )
+
+    _stub_products(mock_discovery, ["sqr-100", "sqr-999", "www"])
+    # No editions stub: ``sqr-100`` has no project state row, so
+    # discovery enqueues on the cheap path without walking editions.
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
+
+
 # ---------------------------------------------------------------------------
 # tier_other
 # ---------------------------------------------------------------------------
@@ -2579,6 +2836,69 @@ async def test_tier_other_skips_tombstoned_project_slug(
     )
     slugs = {c.kwargs["payload"]["ltd_slug"] for c in children}
     assert slugs == {"live-proj"}
+
+
+@pytest.mark.asyncio
+async def test_tier_other_honours_scope_patterns_and_excludes(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """tier_other resolves its candidates through the config scope rule.
+
+    ``sqr-100`` is in scope by pattern only and its non-main edition is
+    stale, so it enqueues; the excluded ``sqr-999`` and the unmatched
+    ``www`` are never fetched from LTD, so a scope leak fails the tick.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-scope",
+            project_slugs=[],
+            project_slug_patterns=[r"sqr-\d+"],
+            exclude_project_slugs=["sqr-999"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=stale,
+        )
+
+    _stub_products(mock_discovery, ["sqr-100", "sqr-999", "www"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-100", edition_ids=[2, 1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,7 @@ from __future__ import annotations
 import traceback
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 import httpx
 import sentry_sdk
@@ -503,7 +503,7 @@ async def keeper_sync_run_discovery(
             ltd_slugs = await _fetch_ltd_product_slugs(
                 factory=factory, config=config, logger=logger
             )
-            in_scope = _filter_to_allowlist(ltd_slugs, config.project_slugs)
+            in_scope, excluded_count = _resolve_scope(ltd_slugs, config)
             # Drop tombstoned project slugs from the fan-out so we do
             # not enqueue ``keeper_sync_project`` children that
             # ``sync_project`` would only short-circuit on its own
@@ -520,6 +520,7 @@ async def keeper_sync_run_discovery(
                 "Resolved keeper-sync run scope",
                 ltd_count=len(ltd_slugs),
                 in_scope_count=len(in_scope),
+                excluded_count=excluded_count,
                 tombstoned_count=len(tombstoned_slugs),
             )
 
@@ -1451,19 +1452,42 @@ async def _fetch_ltd_product_slugs(
         raise
 
 
-def _filter_to_allowlist(
-    ltd_slugs: list[str], allowlist: list[str] | Literal["*"]
-) -> list[str]:
-    """Intersect an LTD slug list with the org's configured allowlist.
+def _resolve_scope(
+    ltd_slugs: list[str], config: KeeperSyncConfig
+) -> tuple[list[str], int]:
+    """Resolve an org's keeper-sync scope over an LTD product listing.
 
-    ``"*"`` is the wildcard — every LTD slug stays in scope. Otherwise
-    ordering follows the LTD listing so successive runs against the
-    same LTD instance fan out their children deterministically.
+    The scope rule itself lives on the config model
+    (:meth:`~docverse.models.KeeperSyncConfig.filter_in_scope`, PRD
+    #667): the listed slugs plus the include-pattern matches — or every
+    LTD slug under the ``"*"`` wildcard — minus the excludes, which
+    always win. Ordering follows the LTD listing so successive passes
+    against the same LTD instance fan out deterministically.
+
+    Parameters
+    ----------
+    ltd_slugs
+        Every product slug visible on the LTD instance, in LTD listing
+        order.
+    config
+        The org's keeper-sync config snapshot.
+
+    Returns
+    -------
+    tuple
+        The in-scope slugs, and the number of slugs an include rule
+        admitted but an exclude rule then removed — the
+        ``excluded_count`` the scope log events report.
     """
-    if allowlist == "*":
-        return list(ltd_slugs)
-    allowed = set(allowlist)
-    return [slug for slug in ltd_slugs if slug in allowed]
+    in_scope = config.filter_in_scope(ltd_slugs)
+    without_excludes = config.model_copy(
+        update={
+            "exclude_project_slugs": [],
+            "exclude_project_slug_patterns": [],
+        }
+    )
+    included_count = len(without_excludes.filter_in_scope(ltd_slugs))
+    return in_scope, included_count - len(in_scope)
 
 
 async def _fetch_tombstoned_project_slugs(
@@ -1474,13 +1498,14 @@ async def _fetch_tombstoned_project_slugs(
 ) -> set[str]:
     """Return the LTD slugs of all tombstoned project state rows.
 
-    The four discovery paths (``keeper_sync_run_discovery`` plus the
-    three tier crons) call this once per pass and subtract the result
-    from their in-scope slug list, so a ``keeper_sync_project`` child
-    is never enqueued for a Docverse-side-vetoed project. Without the
-    filter, ``sync_project`` would short-circuit on its own tombstone
-    check (PRD #332 §"Sync-side skip checks") a few milliseconds later
-    — same outcome, wasted queue + DB work. Issue #396 / user story 17.
+    The four discovery paths call this once per pass and subtract the
+    result from their in-scope slug list, so a ``keeper_sync_project``
+    child is never enqueued for a Docverse-side-vetoed project:
+    ``keeper_sync_run_discovery`` directly, and the three tier crons
+    through :func:`_list_in_scope_slugs`. Without the filter,
+    ``sync_project`` would short-circuit on its own tombstone check
+    (PRD #332 §"Sync-side skip checks") a few milliseconds later —
+    same outcome, wasted queue + DB work. Issue #396 / user story 17.
     """
     async with session.begin():
         project_states = await state_store.list_for_org(
@@ -1865,7 +1890,11 @@ async def _tier_main_for_org(
     if config_snapshot is None:
         return 0
     in_scope = await _list_in_scope_slugs(
-        factory=factory, config=config_snapshot
+        factory=factory,
+        session=session,
+        org=org,
+        config=config_snapshot,
+        logger=logger,
     )
     if not in_scope:
         return 0
@@ -1876,14 +1905,6 @@ async def _tier_main_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
-    # Drop tombstoned project slugs from the candidate set up front:
-    # ``sync_project`` would only short-circuit on them a few
-    # milliseconds later (issue #396 / PRD #332 user story 17).
-    tombstoned_slugs = await _fetch_tombstoned_project_slugs(
-        state_store=state_store, session=session, org_id=org.id
-    )
-    if tombstoned_slugs:
-        in_scope = [s for s in in_scope if s not in tombstoned_slugs]
     enqueued = 0
     for ltd_slug in in_scope:
         async with session.begin():
@@ -1979,7 +2000,11 @@ async def _tier_discovery_for_org(
     if config_snapshot is None:
         return 0
     in_scope = await _list_in_scope_slugs(
-        factory=factory, config=config_snapshot
+        factory=factory,
+        session=session,
+        org=org,
+        config=config_snapshot,
+        logger=logger,
     )
     if not in_scope:
         return 0
@@ -1990,14 +2015,6 @@ async def _tier_discovery_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
-    # Drop tombstoned project slugs up front (issue #396 / PRD #332
-    # user story 17): ``sync_project`` would short-circuit on its own
-    # tombstone check, so the enqueue is pure waste.
-    tombstoned_slugs = await _fetch_tombstoned_project_slugs(
-        state_store=state_store, session=session, org_id=org.id
-    )
-    if tombstoned_slugs:
-        in_scope = [s for s in in_scope if s not in tombstoned_slugs]
     # Hoist the org-wide edition-state read out of the per-slug loop.
     # The previous shape called ``list_for_org`` from inside
     # ``_project_needs_discovery``, so a 1500-slug discovery tick
@@ -2110,8 +2127,17 @@ async def _tier_other_for_org(
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
         return 0
+    # ``_list_in_scope_slugs`` drops tombstoned *project* slugs; for
+    # the editions themselves ``_has_stale_non_main_edition``'s default
+    # ``include_tombstoned=False`` already excludes tombstoned editions
+    # from the staleness scan, so no edition-level filter is needed
+    # here (issue #396 / PRD #332 user story 17).
     in_scope = await _list_in_scope_slugs(
-        factory=factory, config=config_snapshot
+        factory=factory,
+        session=session,
+        org=org,
+        config=config_snapshot,
+        logger=logger,
     )
     if not in_scope:
         return 0
@@ -2122,16 +2148,6 @@ async def _tier_other_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
-    # Drop tombstoned project slugs up front (issue #396 / PRD #332
-    # user story 17). ``_has_stale_non_main_edition``'s default
-    # ``include_tombstoned=False`` already excludes tombstoned
-    # editions from the staleness scan, so no edition-level filter is
-    # needed here.
-    tombstoned_slugs = await _fetch_tombstoned_project_slugs(
-        state_store=state_store, session=session, org_id=org.id
-    )
-    if tombstoned_slugs:
-        in_scope = [s for s in in_scope if s not in tombstoned_slugs]
     enqueued = 0
     for ltd_slug in in_scope:
         async with session.begin():
@@ -2197,20 +2213,53 @@ async def _tier_other_for_org(
 
 
 async def _list_in_scope_slugs(
-    *, factory: Factory, config: KeeperSyncConfig
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    org: Organization,
+    config: KeeperSyncConfig,
+    logger: structlog.stdlib.BoundLogger,
 ) -> list[str]:
-    """Fetch LTD's product list and intersect it with the org's allowlist.
+    """Resolve one tier cron's candidate slugs for an org.
 
     Wraps :class:`LtdProductsClient` so the three tier-cron processors
-    share the same list+filter pattern that ``keeper_sync_run_
-    discovery`` uses; lifting it here keeps the per-tier logic focused
-    on its decision rule.
+    share the same resolution ``keeper_sync_run_discovery`` performs:
+    list LTD's products, apply the config scope rule via
+    :func:`_resolve_scope`, then drop tombstoned project slugs so a
+    ``keeper_sync_project`` child is never enqueued for a Docverse-side
+    -vetoed project (issue #396 / PRD #332 user story 17) — the child
+    would only short-circuit on ``sync_project``'s own tombstone check
+    a few milliseconds later. Lifting all of it here keeps the per-tier
+    logic focused on its decision rule and gives every tick the same
+    "Resolved keeper-sync tier scope" counts the run-scope event logs.
+
+    The tombstone read is skipped when the config scope is already
+    empty: there is nothing left for it to subtract, and the read scans
+    the org's whole project-state table.
     """
     products_client = factory.create_ltd_products_client(
         base_url=str(config.ltd_base_url)
     )
     ltd_slugs = await products_client.list_product_slugs()
-    return _filter_to_allowlist(ltd_slugs, config.project_slugs)
+    in_scope, excluded_count = _resolve_scope(ltd_slugs, config)
+    tombstoned_slugs: set[str] = set()
+    if in_scope:
+        tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+            state_store=factory.create_keeper_sync_state_store(),
+            session=session,
+            org_id=org.id,
+        )
+        if tombstoned_slugs:
+            in_scope = [s for s in in_scope if s not in tombstoned_slugs]
+    logger.info(
+        "Resolved keeper-sync tier scope",
+        org=org.slug,
+        ltd_count=len(ltd_slugs),
+        in_scope_count=len(in_scope),
+        excluded_count=excluded_count,
+        tombstoned_count=len(tombstoned_slugs),
+    )
+    return in_scope
 
 
 async def _find_main_edition(

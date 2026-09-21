@@ -56,6 +56,9 @@ async def _seed_org(
     db_session: AsyncSession,
     *,
     project_slugs: list[str] | Literal["*"] = "*",
+    project_slug_patterns: list[str] | None = None,
+    exclude_project_slugs: list[str] | None = None,
+    exclude_project_slug_patterns: list[str] | None = None,
 ) -> tuple[int, str]:
     logger = _logger()
     org_store = OrganizationStore(session=db_session, logger=logger)
@@ -71,6 +74,11 @@ async def _seed_org(
         config=KeeperSyncConfig(
             enabled=True,
             project_slugs=project_slugs,
+            project_slug_patterns=project_slug_patterns or [],
+            exclude_project_slugs=exclude_project_slugs or [],
+            exclude_project_slug_patterns=(
+                exclude_project_slug_patterns or []
+            ),
         ),
     )
     return org.id, org.slug
@@ -232,6 +240,175 @@ async def test_discovery_with_wildcard_uses_all_ltd_slugs(
             )
             child_rows = (await session.execute(stmt)).scalars().all()
             assert len(child_rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_discovery_drops_excluded_slugs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """``exclude_project_slugs`` wins over the ``"*"`` wildcard.
+
+    PRD #667: excludes always win, so ``www`` stays out of the fan-out
+    even though every other LTD slug is in scope.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session,
+            project_slugs="*",
+            exclude_project_slugs=["www"],
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001", "www", "sqr-112"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert [j.kwargs["payload"]["ltd_slug"] for j in project_jobs] == [
+        "dmtn-001",
+        "sqr-112",
+    ]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            activity = await run_store.aggregate_activity(run_id=run_id)
+            # The discovery job is attributed to the run alongside its
+            # children, so the run totals one row per in-scope slug
+            # plus the discovery row itself.
+            assert activity.total_count == 3
+
+
+@pytest.mark.asyncio
+async def test_discovery_fans_out_pattern_matches_in_ltd_order(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An include pattern brings a whole document series into scope.
+
+    PRD #667: with an empty ``project_slugs`` the fan-out is exactly
+    the slugs the pattern fully matches, in LTD listing order, so
+    ``sqr-1`` never matches ``sqr-100``.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session,
+            project_slugs=[],
+            project_slug_patterns=[r"sqr-\d+"],
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _mock_ltd_products(
+        mock_discovery, ["sqr-112", "dmtn-001", "sqr-060", "sqr-alpha"]
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert [j.kwargs["payload"]["ltd_slug"] for j in project_jobs] == [
+        "sqr-112",
+        "sqr-060",
+    ]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            activity = await run_store.aggregate_activity(run_id=run_id)
+            # One row per in-scope slug plus the discovery row itself.
+            assert activity.total_count == 3
+
+
+@pytest.mark.asyncio
+async def test_discovery_logs_excluded_count(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The run-scope log event reports how many slugs an exclude removed."""
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session,
+            project_slugs="*",
+            exclude_project_slugs=["www"],
+            exclude_project_slug_patterns=[r"test-.*"],
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    _mock_ltd_products(
+        mock_discovery, ["dmtn-001", "www", "test-one", "test-two"]
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with capture_logs() as captured:
+        result = await keeper_sync_run_discovery(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    scope_events = [
+        e for e in captured if e["event"] == "Resolved keeper-sync run scope"
+    ]
+    assert len(scope_events) == 1
+    assert scope_events[0]["ltd_count"] == 4
+    assert scope_events[0]["in_scope_count"] == 1
+    assert scope_events[0]["excluded_count"] == 3
 
 
 @pytest.mark.asyncio
