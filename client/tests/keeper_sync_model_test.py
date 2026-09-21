@@ -11,6 +11,7 @@ from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
     KeeperSyncRun,
+    KeeperSyncScopePreview,
     KeeperSyncTombstone,
 )
 
@@ -409,3 +410,16 @@ def test_extra_fields_forbidden() -> None:
                 "unknown": True,
             }
         )
+
+
+def test_scope_preview_slug_lists_default_to_empty() -> None:
+    """Only the two counts are required; every slug list defaults empty.
+
+    An org whose scope resolves to nothing still gets a well-formed
+    report rather than a response with missing keys.
+    """
+    preview = KeeperSyncScopePreview(ltd_count=3, in_scope_count=0)
+    assert preview.in_scope_slugs == []
+    assert preview.new_slugs == []
+    assert preview.tombstoned_slugs == []
+    assert preview.unmatched_project_slugs == []

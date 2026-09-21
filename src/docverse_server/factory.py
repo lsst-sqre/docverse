@@ -51,6 +51,7 @@ from .services.keeper_sync import (
 from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.keeper_sync_project import KeeperSyncProjectService
 from .services.keeper_sync_run import KeeperSyncRunService
+from .services.keeper_sync_scope_preview import KeeperSyncScopePreviewService
 from .services.keeper_sync_tombstone import KeeperSyncTombstoneService
 from .services.lock_service import LockService
 from .services.organization import OrganizationService
@@ -314,6 +315,18 @@ class Factory:
             edition_store=self.create_edition_store(),
             state_store=self.create_keeper_sync_state_store(),
             ltd_client_factory=self.create_ltd_client,
+            logger=self._logger,
+        )
+
+    def create_keeper_sync_scope_preview_service(
+        self,
+    ) -> KeeperSyncScopePreviewService:
+        """Create a :class:`KeeperSyncScopePreviewService`."""
+        return KeeperSyncScopePreviewService(
+            org_store=self.create_org_store(),
+            config_service=self.create_keeper_sync_config_service(),
+            state_store=self.create_keeper_sync_state_store(),
+            products_client_factory=self.create_ltd_products_client,
             logger=self._logger,
         )
 

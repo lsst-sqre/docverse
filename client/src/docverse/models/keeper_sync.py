@@ -41,6 +41,7 @@ __all__ = [
     "KeeperSyncRunCreated",
     "KeeperSyncRunKind",
     "KeeperSyncRunStatus",
+    "KeeperSyncScopePreview",
     "KeeperSyncTierCohort",
     "KeeperSyncTierName",
     "KeeperSyncTierStatus",
@@ -359,6 +360,107 @@ class KeeperSyncConfigUpdate(BaseModel):
             )
             raise ValueError(msg)
         return value
+
+
+class KeeperSyncScopePreview(BaseModel):
+    """Side-effect-free resolution of a keeper-sync scope against LTD.
+
+    Response body of ``POST /orgs/{org}/keeper-sync/scope-preview``. The
+    endpoint merges an optional :class:`KeeperSyncConfigUpdate` over the
+    stored config exactly as ``PATCH`` would, resolves the result against
+    the *live* LTD product listing, and reports what that scope covers —
+    without persisting the candidate config or enqueueing any work.
+
+    Saving a wider scope is not inert: the tier crons act on the stored
+    config at their next tick. This report is how an operator checks a
+    candidate scope *before* saving it, which is what syncing lsst.io in
+    waves by document series needs.
+
+    ``in_scope_slugs`` is the scope as the *config* resolves it, so a
+    slug appears there even when a tombstone will make sync skip it;
+    ``tombstoned_slugs`` names that subset. The preview works whether or
+    not sync is ``enabled``.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "ltd_count": 1640,
+                    "in_scope_count": 3,
+                    "in_scope_slugs": ["sqr-060", "sqr-112", "dmtn-201"],
+                    "new_slugs": ["dmtn-201"],
+                    "tombstoned_slugs": ["sqr-060"],
+                    "unmatched_project_slugs": ["sqr-9999"],
+                }
+            ]
+        }
+    )
+
+    ltd_count: int = Field(
+        description=(
+            "Number of distinct product slugs the live LTD instance"
+            " listed when the preview ran."
+        ),
+        examples=[1640],
+    )
+
+    in_scope_count: int = Field(
+        description=(
+            "Size of ``in_scope_slugs``. This is how many child"
+            " ``keeper_sync_project`` jobs a backfill launched with the"
+            " same config would fan out — so the run's ``total_count``"
+            " is this plus one, the discovery job attributing itself to"
+            " the run. Slugs skipped for a tombstone or for an"
+            " already-running per-project job lower the child count"
+            " further."
+        ),
+        examples=[3],
+    )
+
+    in_scope_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The resolved scope, in LTD listing order — the order in"
+            " which a backfill would fan its children out. Includes"
+            " slugs that a tombstone will make sync skip; see"
+            " ``tombstoned_slugs``."
+        ),
+        examples=[["sqr-060", "sqr-112", "dmtn-201"]],
+    )
+
+    new_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "In-scope slugs with no keeper-sync state row on this"
+            " organization yet — what the next backfill would import for"
+            " the first time. In LTD listing order."
+        ),
+        examples=[["dmtn-201"]],
+    )
+
+    tombstoned_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "In-scope slugs that sync will skip because their"
+            " project-resource state row is tombstoned. Clear the"
+            " tombstone via ``DELETE /orgs/{org}/keeper-sync/tombstones/"
+            "{tombstone}`` to bring one back. In LTD listing order."
+        ),
+        examples=[["sqr-060"]],
+    )
+
+    unmatched_project_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Entries of ``project_slugs`` or ``exclude_project_slugs``"
+            " that the live LTD listing does not contain — the typo"
+            " catcher. Pattern fields are not checked here: a pattern"
+            " matching nothing is a legitimate way to stage a future"
+            " wave. Listed in config order, ``project_slugs`` first."
+        ),
+        examples=[["sqr-9999"]],
+    )
 
 
 class KeeperSyncRunKind(StrEnum):

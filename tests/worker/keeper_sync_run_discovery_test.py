@@ -29,7 +29,11 @@ from docverse_server.domain.base32id import (
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
+from docverse_server.services.keeper_sync_config import KeeperSyncConfigService
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.services.keeper_sync_scope_preview import (
+    KeeperSyncScopePreviewService,
+)
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -39,6 +43,7 @@ from docverse_server.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
+from docverse_server.storage.ltd.products_client import LtdProductsClient
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import (
@@ -1122,3 +1127,134 @@ async def test_discovery_lost_race_does_not_truncate_the_fanout(
             assert disc.status == JobStatus.completed
             assert disc.progress is not None
             assert disc.progress["enqueued_count"] == 1
+
+
+def _preview_service(
+    session: AsyncSession, http_client: httpx.AsyncClient
+) -> KeeperSyncScopePreviewService:
+    """Build the preview service against a live session + HTTP client."""
+    org_store = OrganizationStore(session=session, logger=_logger())
+    return KeeperSyncScopePreviewService(
+        org_store=org_store,
+        config_service=KeeperSyncConfigService(
+            org_store=org_store, logger=_logger()
+        ),
+        state_store=KeeperSyncStateStore(session=session, logger=_logger()),
+        products_client_factory=lambda *, base_url: LtdProductsClient(
+            http_client=http_client, base_url=base_url, logger=_logger()
+        ),
+        logger=_logger(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_predicts_the_backfill_a_widened_scope_launches(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The preview is an honest dry run of the backfill it precedes.
+
+    PRD #667's wave workflow is preview → ``PATCH`` → launch backfill,
+    which is only trustworthy if the preview reports what the backfill
+    then does. Against one LTD listing and one widened scope this pins
+    both halves of that promise: ``in_scope_count`` equals the run's
+    ``total_count``, and ``new_slugs`` equals the set of projects the
+    backfill imports for the *first* time — the in-scope slugs that had
+    no keeper-sync state row when the preview ran.
+    """
+    async with db_session.begin():
+        # The scope is already widened to both series; ``sqr-112`` has
+        # been imported by an earlier wave, so it is in scope but not
+        # new.
+        org_id, org_slug = await _seed_org(
+            db_session,
+            project_slugs=[],
+            project_slug_patterns=[r"sqr-\d+", r"dmtn-\d+"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="sqr-112",
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    ltd_slugs = ["sqr-112", "www", "dmtn-201", "sqr-060"]
+    _mock_ltd_products(mock_discovery, ltd_slugs)
+
+    async with httpx.AsyncClient() as preview_http_client:
+        async for session in db_session_dependency():
+            async with session.begin():
+                preview = await _preview_service(
+                    session, preview_http_client
+                ).preview(org_slug=org_slug)
+            break
+
+    # The resolved scope follows the LTD listing order, not the config's.
+    assert preview.in_scope_slugs == ["sqr-112", "dmtn-201", "sqr-060"]
+    assert preview.new_slugs == ["dmtn-201", "sqr-060"]
+
+    # Snapshot what keeper-sync already tracks, before the backfill: the
+    # slugs the run fans out that are *not* in here are the ones it
+    # imports for the first time.
+    async for session in db_session_dependency():
+        async with session.begin():
+            tracked_before = {
+                row.ltd_slug
+                for row in await KeeperSyncStateStore(
+                    session=session, logger=_logger()
+                ).list_for_org(
+                    org_id=org_id,
+                    resource_type=ResourceType.project,
+                    include_tombstoned=True,
+                )
+            }
+        break
+    assert tracked_before == {"sqr-112"}
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    result = await keeper_sync_run_discovery(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    fanned_out = [j.kwargs["payload"]["ltd_slug"] for j in project_jobs]
+    assert fanned_out == preview.in_scope_slugs
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            activity = await run_store.aggregate_activity(run_id=run_id)
+            # The run's ``total_count`` aggregates every queue job
+            # attributed to the run, and the discovery job attributes
+            # itself — so the promise ``in_scope_count`` makes is about
+            # the *children*, one per in-scope slug, and the run's total
+            # is that plus the one discovery job.
+            assert len(fanned_out) == preview.in_scope_count
+            assert activity.total_count == preview.in_scope_count + 1
+        break
+
+    # The backfill's first-time imports — fanned-out slugs keeper-sync
+    # was not already tracking — are exactly ``new_slugs``.
+    first_time = [s for s in fanned_out if s not in tracked_before]
+    assert first_time == preview.new_slugs

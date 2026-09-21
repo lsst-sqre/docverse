@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
 
 from docverse.models import (
     KeeperSyncConfig,
@@ -13,6 +13,7 @@ from docverse.models import (
     KeeperSyncResourceType,
     KeeperSyncRun,
     KeeperSyncRunStatus,
+    KeeperSyncScopePreview,
     KeeperSyncTombstoneReason,
 )
 from docverse_server.dependencies.auth import AuthenticatedUser, require_admin
@@ -25,6 +26,7 @@ from docverse_server.handlers.params import (
     RunIdParam,
     TombstoneIdParam,
 )
+from docverse_server.handlers.responses import error_responses
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse_server.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
@@ -109,6 +111,47 @@ async def patch_org_keeper_sync_config(
         result = await service.patch(org_slug=org_slug, update=data)
         await context.session.commit()
     return result
+
+
+@router.post(
+    "/orgs/{org}/keeper-sync/scope-preview",
+    response_model=KeeperSyncScopePreview,
+    summary="Preview what a keeper-sync scope resolves to on LTD",
+    name="post_org_keeper_sync_scope_preview",
+    responses=error_responses(status.HTTP_502_BAD_GATEWAY),
+)
+async def post_org_keeper_sync_scope_preview(
+    *,
+    org_slug: OrgSlugParam,
+    data: Annotated[
+        KeeperSyncConfigUpdate | None,
+        Body(
+            description=(
+                "Candidate partial config, merged over the stored config"
+                " exactly as ``PATCH`` merges it — and validated exactly"
+                " as ``PATCH`` validates it. Omit the body entirely to"
+                " preview the stored config as-is."
+            ),
+        ),
+    ] = None,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> KeeperSyncScopePreview:
+    """Resolve a candidate keeper-sync scope against the live LTD listing.
+
+    Side-effect-free: the candidate config is **not** persisted and no
+    jobs are enqueued. This matters because saving a wider scope is not
+    inert — the tier crons act on the stored config at their next tick —
+    so an operator rolling the lsst.io migration out in waves checks a
+    candidate here first, then ``PATCH``es it, then launches a backfill.
+
+    The preview works whether or not sync is ``enabled``. An LTD fetch
+    failure is reported as a 502 carrying LTD's own status, not a 500.
+    """
+    context.rebind_logger(actor=user.username)
+    async with context.session.begin():
+        service = context.factory.create_keeper_sync_scope_preview_service()
+        return await service.preview(org_slug=org_slug, update=data)
 
 
 @router.post(

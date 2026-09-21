@@ -74,6 +74,23 @@ class KeeperSyncConfigService:
             raise RuntimeError(msg)
         return updated.keeper_sync_config
 
+    @staticmethod
+    def merge(
+        current: KeeperSyncConfig, update: KeeperSyncConfigUpdate
+    ) -> KeeperSyncConfig:
+        """Merge an update over a config without persisting anything.
+
+        This is the whole of ``PATCH``'s JSON-Merge-Patch rule, factored
+        out so the side-effect-free scope preview (PRD #667) resolves a
+        candidate config through exactly the same merge the write path
+        applies — rather than a second implementation that could drift
+        from it. ``model_dump(exclude_unset=True)`` is what distinguishes
+        "omitted" from an explicit value, so unset fields carry over
+        unchanged and each provided list field replaces the stored list
+        wholesale.
+        """
+        return current.model_copy(update=update.model_dump(exclude_unset=True))
+
     async def patch(
         self, org_slug: str, update: KeeperSyncConfigUpdate
     ) -> KeeperSyncConfig:
@@ -90,6 +107,5 @@ class KeeperSyncConfigService:
             If the organization does not exist.
         """
         current = await self.get(org_slug=org_slug)
-        changes = update.model_dump(exclude_unset=True)
-        merged = current.model_copy(update=changes)
+        merged = self.merge(current, update)
         return await self.put(org_slug=org_slug, config=merged)

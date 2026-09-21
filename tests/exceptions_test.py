@@ -19,7 +19,9 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
+from fastapi import status
 from safir.slack.blockkit import SlackException, SlackMessage
+from safir.slack.webhook import SlackIgnoredException
 
 from docverse_server.domain.slug import InvalidSlugError
 from docverse_server.exceptions import (
@@ -30,6 +32,7 @@ from docverse_server.exceptions import (
     JobNotFoundError,
     KeeperSyncInvariantError,
     KeeperSyncSystemicFailureError,
+    UpstreamServiceError,
 )
 from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
 from docverse_server.storage.editionpublisher import CloudflareKvReadError
@@ -560,3 +563,37 @@ def test_keeper_sync_systemic_failure_message_caps_the_slug_list() -> None:
     assert len(rendered) < 1000
     # Callers still see every failed slug programmatically.
     assert exc.failed_ltd_edition_slugs == slugs
+
+
+def test_upstream_service_error_is_a_5xx_that_does_not_alert() -> None:
+    """``UpstreamServiceError`` renders a 502 and stays out of Slack.
+
+    It is the one ``ClientRequestError`` subclass in the tree with a 5xx
+    status, and the base class is the whole point: the org admin who
+    triggered the upstream call sees the failure synchronously, so a
+    Slack alert and a Sentry issue per retry would be noise. Inheriting
+    ``SlackIgnoredException`` is what suppresses them — pinned here
+    because nothing else in the suite would notice a re-parenting onto
+    ``DocverseSlackException``.
+    """
+    exc = UpstreamServiceError(
+        "The LTD Keeper product listing returned HTTP 503",
+        upstream_status=503,
+    )
+
+    assert isinstance(exc, SlackIgnoredException)
+    assert not isinstance(exc, SlackException)
+    assert UpstreamServiceError.status_code == status.HTTP_502_BAD_GATEWAY
+    # The upstream's status rides on its own attribute: naming it
+    # ``status_code`` would shadow the class variable above and silently
+    # change the status Docverse itself responds with.
+    assert exc.upstream_status == 503
+    assert exc.to_dict()["type"] == "upstream_error"
+
+
+def test_upstream_service_error_tolerates_a_missing_upstream_status() -> None:
+    """A transport failure never reached a response, so it has no status."""
+    exc = UpstreamServiceError("LTD could not be reached")
+
+    assert exc.upstream_status is None
+    assert exc.to_dict()["type"] == "upstream_error"
