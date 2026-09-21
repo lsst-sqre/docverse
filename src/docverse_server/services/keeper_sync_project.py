@@ -189,9 +189,9 @@ class KeeperSyncProjectService:
         ------
         NotFoundError
             If the org does not exist, LTD sync is not enabled on it,
-            or ``ltd_slug`` is not in the configured ``project_slugs``
-            allowlist (and the allowlist is not ``"*"``). Issue #317
-            specifies 404 for the disabled-sync and out-of-allowlist
+            or ``ltd_slug`` is not in the org's keeper-sync scope as
+            resolved by :meth:`KeeperSyncConfig.is_in_scope`. Issue #317
+            specifies 404 for the disabled-sync and out-of-scope
             cases — the resource (a sync-eligible project on this org)
             does not exist.
         """
@@ -205,13 +205,10 @@ class KeeperSyncProjectService:
                 f"LTD Keeper sync is not enabled for organization {org_slug!r}"
             )
             raise NotFoundError(msg)
-        if (
-            config.project_slugs != "*"
-            and ltd_slug not in config.project_slugs
-        ):
+        if not config.is_in_scope(ltd_slug):
             msg = (
-                f"LTD slug {ltd_slug!r} is not in the project_slugs"
-                f" allowlist for organization {org_slug!r}"
+                f"LTD slug {ltd_slug!r} is not in the keeper-sync scope"
+                f" for organization {org_slug!r}"
             )
             raise NotFoundError(msg)
 
@@ -277,7 +274,7 @@ class KeeperSyncProjectService:
         """Return a paginated page of editions for one keeper-sync project.
 
         Backs ``GET /orgs/{org}/keeper-sync/projects/{ltd_slug}/
-        editions``. Enforces the same enable/allowlist 404 gate as
+        editions``. Enforces the same enable/scope 404 gate as
         :meth:`get_project_status`. When the Docverse project does not
         yet exist for the LTD slug, returns an empty page (rather than
         404) — the slug is sync-eligible, it just has no editions yet.
@@ -286,8 +283,8 @@ class KeeperSyncProjectService:
         ------
         NotFoundError
             If the org does not exist, LTD sync is disabled on it, or
-            ``ltd_slug`` is not in the configured ``project_slugs``
-            allowlist (and the allowlist is not ``"*"``).
+            ``ltd_slug`` is not in the org's keeper-sync scope as
+            resolved by :meth:`KeeperSyncConfig.is_in_scope`.
         """
         org = await self._org_store.get_by_slug(org_slug)
         if org is None:
@@ -299,13 +296,10 @@ class KeeperSyncProjectService:
                 f"LTD Keeper sync is not enabled for organization {org_slug!r}"
             )
             raise NotFoundError(msg)
-        if (
-            config.project_slugs != "*"
-            and ltd_slug not in config.project_slugs
-        ):
+        if not config.is_in_scope(ltd_slug):
             msg = (
-                f"LTD slug {ltd_slug!r} is not in the project_slugs"
-                f" allowlist for organization {org_slug!r}"
+                f"LTD slug {ltd_slug!r} is not in the keeper-sync scope"
+                f" for organization {org_slug!r}"
             )
             raise NotFoundError(msg)
 
@@ -369,8 +363,8 @@ class KeeperSyncProjectService:
 
         Only projects with a ``keeper_sync_state`` row of
         ``resource_type=project`` for this org appear. Never-seen-but-
-        allowlisted slugs are intentionally excluded: operators can
-        still inspect them via :meth:`get_project_status`.
+        in-scope slugs are intentionally omitted: operators can still
+        inspect them via :meth:`get_project_status`.
 
         Per-page cost is O(1) round-trips regardless of page size:
         Docverse projects and ``__main`` editions for the page are

@@ -143,8 +143,8 @@ class KeeperSyncRunService:
         ------
         NotFoundError
             If the org does not exist, LTD sync is not enabled on it,
-            or ``ltd_slug`` is not in the org's ``project_slugs``
-            allowlist (and the allowlist is not ``"*"``).
+            or ``ltd_slug`` is not in the org's keeper-sync scope as
+            resolved by :meth:`KeeperSyncConfig.is_in_scope`.
         ConflictError
             If a ``keeper_sync_project`` job for this ``(org, ltd_slug)``
             is already queued or in progress. Per-project mutual
@@ -164,13 +164,10 @@ class KeeperSyncRunService:
                 f"LTD Keeper sync is not enabled for organization {org_slug!r}"
             )
             raise NotFoundError(msg)
-        if (
-            config.project_slugs != "*"
-            and ltd_slug not in config.project_slugs
-        ):
+        if not config.is_in_scope(ltd_slug):
             msg = (
-                f"LTD slug {ltd_slug!r} is not in the project_slugs"
-                f" allowlist for organization {org_slug!r}"
+                f"LTD slug {ltd_slug!r} is not in the keeper-sync scope"
+                f" for organization {org_slug!r}"
             )
             raise NotFoundError(msg)
 
