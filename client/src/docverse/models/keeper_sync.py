@@ -124,7 +124,19 @@ class KeeperSyncConfig(BaseModel):
     Stored as a JSONB blob on the ``organizations`` row and validated
     through this model on read and write. ``GET /orgs/{org}/keeper-sync``
     returns a default-disabled instance when no config has been
-    persisted; ``PUT`` replaces the stored config wholesale.
+    persisted; ``PUT`` replaces the stored config wholesale, and
+    ``PATCH`` merges a :class:`KeeperSyncConfigUpdate` over it.
+
+    Four fields compose into the **sync scope** — the set of LTD product
+    slugs this organization imports and keeps in step. A slug is
+    *included* when ``project_slugs`` is ``"*"``, when it is listed in
+    ``project_slugs``, or when it fully matches one of
+    ``project_slug_patterns``; it is *in scope* when it is included and
+    is neither listed in ``exclude_project_slugs`` nor fully matched by
+    one of ``exclude_project_slug_patterns``. Excludes always win. See
+    :meth:`filter_in_scope` for the rule, and
+    ``POST /orgs/{org}/keeper-sync/scope-preview`` for a side-effect-free
+    resolution of a candidate scope against the live LTD listing.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -143,7 +155,10 @@ class KeeperSyncConfig(BaseModel):
         default_factory=list,
         description=(
             'LTD project slugs to sync, or ``"*"`` for every project'
-            " visible on the LTD instance."
+            " visible on the LTD instance. Either way the exclude"
+            " fields still apply: excludes always win, so"
+            ' ``"*"`` with ``exclude_project_slugs`` is how an'
+            " organization syncs everything but a named few."
         ),
         examples=[["sqr-112", "dmtn-001"]],
     )
@@ -284,8 +299,9 @@ class KeeperSyncConfigUpdate(BaseModel):
         default=None,
         description=(
             'LTD project slugs to sync, or ``"*"`` for every project'
-            " visible on the LTD instance. When provided, replaces the"
-            " stored list wholesale (no append semantics)."
+            " visible on the LTD instance; the exclude fields still"
+            " apply either way. When provided, replaces the stored list"
+            " wholesale (no append semantics)."
         ),
         examples=[["sqr-112", "dmtn-001"]],
     )

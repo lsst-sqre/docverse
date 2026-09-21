@@ -22,9 +22,18 @@ from pathlib import Path
 from typing import get_args, get_type_hints
 
 from fastapi import params
+from fastapi.routing import APIRoute
 
+from docverse.models import KeeperSyncConfig, KeeperSyncScopePreview
+from docverse.models.keeper_sync import (
+    _MAX_SLUG_PATTERN_LENGTH,
+    _MAX_SLUG_PATTERNS,
+)
 from docverse_server.config import Configuration
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
+from docverse_server.handlers.orgs.keeper_sync import (
+    router as keeper_sync_router,
+)
 from docverse_server.handlers.orgs.projects import get_project, get_projects
 from docverse_server.metrics import (
     ConditionalGetEndpoint,
@@ -50,6 +59,9 @@ _RECONCILE_PAGE = "edition-reconcile.md"
 _API_PAGE = "api-conventions.md"
 """Reference page for the REST API's cross-cutting conventions."""
 
+_SCOPE_PAGE = "keeper-sync-scope.md"
+"""Operations page for the keeper-sync scope rule (PRD #667)."""
+
 
 def _read(name: str) -> str:
     return (_DOCS / name).read_text()
@@ -65,6 +77,19 @@ def _uncoded(names: Iterable[str], page: str) -> list[str]:
     house style and the only way these assertions have teeth.
     """
     return sorted(name for name in names if f"`{name}`" not in page)
+
+
+def _route_path(name: str) -> str:
+    """URL path of one keeper-sync route, looked up by handler name.
+
+    Read off the router rather than written out, so a page quoting an
+    endpoint's URL cannot survive that URL being moved.
+    """
+    for route in keeper_sync_router.routes:
+        if isinstance(route, APIRoute) and route.name == name:
+            return route.path
+    msg = f"no keeper-sync route named {name!r}"
+    raise AssertionError(msg)
 
 
 def _query_parameter_names(endpoint: Callable[..., object]) -> set[str]:
@@ -154,6 +179,74 @@ def test_sentry_message_documented() -> None:
 def test_docs_index_links_the_page() -> None:
     """The index points at the operations page."""
     assert _RECONCILE_PAGE in _read("index.md")
+
+
+def test_docs_index_links_the_scope_page() -> None:
+    """The index points at the keeper-sync scoping page."""
+    assert _SCOPE_PAGE in _read("index.md")
+
+
+def test_scope_config_fields_documented() -> None:
+    """Every config field that shapes the sync scope is documented.
+
+    The slug-bearing fields of :class:`KeeperSyncConfig` *are* the
+    scope rule's inputs, so a field added to the config — a second
+    exclude form, say — that this page does not name is a knob an
+    operator could only find by reading the OpenAPI schema.
+    """
+    page = _read(_SCOPE_PAGE)
+    fields = {name for name in KeeperSyncConfig.model_fields if "slug" in name}
+    assert fields, "the config exposes no slug fields"
+    assert not _uncoded(fields, page)
+
+
+def test_scope_preview_response_fields_documented() -> None:
+    """Every field of the scope-preview response is documented.
+
+    The page's whole job is teaching an operator to read this body
+    before saving a wider scope, so a field it does not name is one
+    nobody has been told how to act on.
+    """
+    page = _read(_SCOPE_PAGE)
+    fields = set(KeeperSyncScopePreview.model_fields)
+    assert fields, "the preview reports no fields"
+    assert not _uncoded(fields, page)
+
+
+def test_scope_pattern_caps_documented() -> None:
+    """The page quotes the two caps a 422 would otherwise explain.
+
+    Both are the mitigation this PRD chose *instead* of a match
+    timeout, so an operator writing a wave's patterns has to be able
+    to read the limits off the page rather than discover them by
+    tripping them.
+    """
+    page = _read(_SCOPE_PAGE)
+    assert str(_MAX_SLUG_PATTERNS) in page
+    assert str(_MAX_SLUG_PATTERN_LENGTH) in page
+
+
+def test_scope_endpoint_paths_documented() -> None:
+    """Every endpoint the scope rule governs is documented by URL.
+
+    The preview and the config writes are the wave workflow; the three
+    per-project endpoints are the ones that answer 404 once a slug
+    falls out of scope, which is the behaviour operators most often
+    mistake for data loss.
+    """
+    page = _read(_SCOPE_PAGE)
+    names = {
+        "get_org_keeper_sync_config",
+        "put_org_keeper_sync_config",
+        "patch_org_keeper_sync_config",
+        "post_org_keeper_sync_scope_preview",
+        "post_org_keeper_sync_run",
+        "get_org_keeper_sync_project_status",
+        "get_org_keeper_sync_project_editions",
+        "post_org_keeper_sync_project_refresh",
+    }
+    paths = {_route_path(name) for name in names}
+    assert not sorted(path for path in paths if path not in page)
 
 
 def test_conditional_get_endpoints_documented() -> None:
