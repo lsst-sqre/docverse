@@ -178,6 +178,7 @@ jobs:
     outputs:
       server: ${{ steps.scm.outputs.server }}
       client: ${{ steps.scm.outputs.client }}
+      image-tag: ${{ steps.image.outputs.tag }}
 
     steps:
       - uses: actions/checkout@v7
@@ -198,6 +199,25 @@ jobs:
           echo "client=${client}" >> "$GITHUB_OUTPUT"
           echo "server=${server} client=${client}"
 
+      # A server release's git tag carries a "server/" prefix that the image
+      # tag has no use for: "server/1.0.0" is published as image tag "1.0.0"
+      # rather than the "server-1.0.0" the build workflow would derive.
+      # Every other event leaves this empty, which keeps the build
+      # workflow's default of deriving the tag from the git ref (for example
+      # "tickets/DM-12345" becomes "tickets-DM-12345").
+      - name: Derive the image tag
+        id: image
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag=""
+          if [[ "$EVENT_NAME" == "release" && "$RELEASE_TAG" == server/* ]]; then
+            tag="${RELEASE_TAG#server/}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag:-<derived from the git ref>}"
+
   build:
     concurrency:
       group: docker
@@ -206,6 +226,8 @@ jobs:
     uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
     with:
       images: ghcr.io/${{ github.repository }}
+      # Empty except on server releases; see the version job.
+      tag: ${{ needs.version.outputs.image-tag }}
       # A shallow checkout is all the image build needs: the version comes
       # in through build-args below and .git is not part of the build
       # context, so nothing here runs setuptools_scm or git describe.
