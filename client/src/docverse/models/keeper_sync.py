@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    ValidationInfo,
+    field_validator,
+)
 
 from ._examples import (
     EXAMPLE_EDITION_URL,
@@ -42,6 +51,71 @@ __all__ = [
 
 _DEFAULT_LTD_BASE_URL = "https://keeper.lsst.codes"
 
+_MAX_SLUG_PATTERNS = 100
+"""Maximum number of entries accepted in one slug-pattern field."""
+
+_MAX_SLUG_PATTERN_LENGTH = 256
+"""Maximum length, in characters, of one slug pattern."""
+
+_PATTERN_ECHO_LENGTH = 64
+"""How much of an over-long pattern is echoed back in its error."""
+
+
+def _validate_slug_patterns(
+    patterns: list[str], field_name: str | None
+) -> list[str]:
+    """Validate one slug-pattern field's entries.
+
+    Patterns are org-admin-supplied and are matched against short LTD
+    slugs, so the count and length caps — rather than a match timeout or
+    an alternative regex engine — are what bound the cost of a
+    pathological pattern (PRD #667 §Out of scope).
+
+    Parameters
+    ----------
+    patterns
+        The field's candidate patterns.
+    field_name
+        Name of the field being validated, echoed in error messages so
+        a 422 points at the offending field.
+
+    Returns
+    -------
+    list of str
+        The patterns, unchanged.
+
+    Raises
+    ------
+    ValueError
+        If there are too many patterns, if one is too long, or if one
+        does not compile as a Python regular expression.
+    """
+    field = field_name or "slug patterns"
+    if len(patterns) > _MAX_SLUG_PATTERNS:
+        msg = (
+            f"{field} accepts at most {_MAX_SLUG_PATTERNS} patterns;"
+            f" got {len(patterns)}"
+        )
+        raise ValueError(msg)
+    for pattern in patterns:
+        if len(pattern) > _MAX_SLUG_PATTERN_LENGTH:
+            echo = pattern[:_PATTERN_ECHO_LENGTH]
+            msg = (
+                f"{field} pattern {echo!r}... is"
+                f" {len(pattern)} characters long; the limit is"
+                f" {_MAX_SLUG_PATTERN_LENGTH}"
+            )
+            raise ValueError(msg)
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            msg = (
+                f"{field} pattern {pattern!r} is not a valid Python"
+                f" regular expression: {exc}"
+            )
+            raise ValueError(msg) from exc
+    return patterns
+
 
 class KeeperSyncConfig(BaseModel):
     """LTD Keeper sync configuration for an organization.
@@ -70,7 +144,110 @@ class KeeperSyncConfig(BaseModel):
             'LTD project slugs to sync, or ``"*"`` for every project'
             " visible on the LTD instance."
         ),
+        examples=[["sqr-112", "dmtn-001"]],
     )
+
+    project_slug_patterns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Python regular expressions that *add* LTD project slugs to"
+            " the sync scope, on top of ``project_slugs``. Matched with"
+            " :func:`re.fullmatch` and case-sensitively, so ``sqr-1``"
+            " matches only ``sqr-1`` — not ``sqr-10`` or ``sqr-100``."
+            f" At most {_MAX_SLUG_PATTERNS} entries, each at most"
+            f" {_MAX_SLUG_PATTERN_LENGTH} characters."
+        ),
+        examples=[[r"sqr-\d+", r"dmtn-\d+"]],
+    )
+
+    exclude_project_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "LTD project slugs removed from the sync scope. Excludes"
+            " always win: a slug listed here is out of scope even when"
+            ' ``project_slugs`` is ``"*"`` or an include pattern'
+            " matches it."
+        ),
+        examples=[["www"]],
+    )
+
+    exclude_project_slug_patterns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Python regular expressions that *remove* LTD project slugs"
+            " from the sync scope. Matched with :func:`re.fullmatch` and"
+            " case-sensitively. Excludes always win over both"
+            " ``project_slugs`` and ``project_slug_patterns``."
+            f" At most {_MAX_SLUG_PATTERNS} entries, each at most"
+            f" {_MAX_SLUG_PATTERN_LENGTH} characters."
+        ),
+        examples=[[r"test-.*"]],
+    )
+
+    @field_validator("project_slug_patterns", "exclude_project_slug_patterns")
+    @classmethod
+    def _check_patterns(
+        cls, value: list[str], info: ValidationInfo
+    ) -> list[str]:
+        """Reject pattern lists that are too long or do not compile."""
+        return _validate_slug_patterns(value, info.field_name)
+
+    def is_in_scope(self, slug: str) -> bool:
+        """Report whether one LTD project slug is in the sync scope.
+
+        See :meth:`filter_in_scope` for the rule.
+        """
+        return bool(self.filter_in_scope([slug]))
+
+    def filter_in_scope(self, slugs: Iterable[str]) -> list[str]:
+        """Filter LTD project slugs down to the ones in the sync scope.
+
+        A slug is *included* when ``project_slugs`` is ``"*"``, when it
+        is listed in ``project_slugs``, or when it fully matches one of
+        ``project_slug_patterns``. It is *in scope* when it is included
+        and is neither listed in ``exclude_project_slugs`` nor fully
+        matched by one of ``exclude_project_slug_patterns`` — excludes
+        always win.
+
+        Pattern matching uses :func:`re.fullmatch` and is
+        case-sensitive.
+
+        Parameters
+        ----------
+        slugs
+            LTD project slugs to filter, typically in LTD listing order.
+
+        Returns
+        -------
+        list of str
+            The in-scope slugs, in the order they were given, so
+            successive passes over the same LTD listing fan out
+            deterministically.
+        """
+        configured = self.project_slugs
+        wildcard = configured == "*"
+        listed = set() if isinstance(configured, str) else set(configured)
+        excluded = set(self.exclude_project_slugs)
+        include_patterns = [
+            re.compile(pattern) for pattern in self.project_slug_patterns
+        ]
+        exclude_patterns = [
+            re.compile(pattern)
+            for pattern in self.exclude_project_slug_patterns
+        ]
+        return [
+            slug
+            for slug in slugs
+            if (
+                (
+                    wildcard
+                    or slug in listed
+                    or any(p.fullmatch(slug) for p in include_patterns)
+                )
+                and slug not in excluded
+                and not any(p.fullmatch(slug) for p in exclude_patterns)
+            )
+        ]
 
 
 class KeeperSyncConfigUpdate(BaseModel):
@@ -109,9 +286,63 @@ class KeeperSyncConfigUpdate(BaseModel):
             " visible on the LTD instance. When provided, replaces the"
             " stored list wholesale (no append semantics)."
         ),
+        examples=[["sqr-112", "dmtn-001"]],
     )
 
-    @field_validator("enabled", "ltd_base_url", "project_slugs")
+    project_slug_patterns: list[str] | None = Field(
+        default=None,
+        description=(
+            "Python regular expressions that *add* LTD project slugs to"
+            " the sync scope. When provided, replaces the stored list"
+            " wholesale (no append semantics). Validated exactly as on"
+            " ``PUT``."
+        ),
+        examples=[[r"sqr-\d+", r"dmtn-\d+"]],
+    )
+
+    exclude_project_slugs: list[str] | None = Field(
+        default=None,
+        description=(
+            "LTD project slugs removed from the sync scope. When"
+            " provided, replaces the stored list wholesale (no append"
+            " semantics)."
+        ),
+        examples=[["www"]],
+    )
+
+    exclude_project_slug_patterns: list[str] | None = Field(
+        default=None,
+        description=(
+            "Python regular expressions that *remove* LTD project slugs"
+            " from the sync scope. When provided, replaces the stored"
+            " list wholesale (no append semantics). Validated exactly as"
+            " on ``PUT``."
+        ),
+        examples=[[r"test-.*"]],
+    )
+
+    @field_validator("project_slug_patterns", "exclude_project_slug_patterns")
+    @classmethod
+    def _check_patterns(
+        cls, value: list[str] | None, info: ValidationInfo
+    ) -> list[str] | None:
+        """Apply the ``KeeperSyncConfig`` pattern rules to an update.
+
+        ``None`` passes through untouched so
+        :meth:`_reject_explicit_null` owns the explicit-null 422.
+        """
+        if value is None:
+            return None
+        return _validate_slug_patterns(value, info.field_name)
+
+    @field_validator(
+        "enabled",
+        "ltd_base_url",
+        "project_slugs",
+        "project_slug_patterns",
+        "exclude_project_slugs",
+        "exclude_project_slug_patterns",
+    )
     @classmethod
     def _reject_explicit_null(cls, value: object) -> object:
         """Reject an explicit ``null`` for any config field.

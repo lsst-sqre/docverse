@@ -31,6 +31,144 @@ async def test_get_returns_default_disabled_config(
     assert body["enabled"] is False
     assert body["ltd_base_url"] == "https://keeper.lsst.codes/"
     assert body["project_slugs"] == []
+    assert body["project_slug_patterns"] == []
+    assert body["exclude_project_slugs"] == []
+    assert body["exclude_project_slug_patterns"] == []
+
+
+@pytest.mark.asyncio
+async def test_put_round_trips_scope_fields(client: AsyncClient) -> None:
+    """``PUT`` persists the three scope fields, and ``GET`` returns them."""
+    await _setup(client)
+    payload = {
+        "enabled": True,
+        "ltd_base_url": "https://keeper.lsst.codes/",
+        "project_slugs": ["sqr-112"],
+        "project_slug_patterns": [r"sqr-\d+", r"dmtn-\d+"],
+        "exclude_project_slugs": ["www"],
+        "exclude_project_slug_patterns": [r"test-.*"],
+    }
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json=payload,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json() == payload
+
+    fetched = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_patch_round_trips_scope_fields(client: AsyncClient) -> None:
+    """``PATCH`` persists the scope fields, and ``GET`` returns them."""
+    await _setup(client)
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={
+            "enabled": True,
+            "project_slug_patterns": [r"sqr-\d+"],
+            "exclude_project_slugs": ["www"],
+            "exclude_project_slug_patterns": [r"test-.*"],
+        },
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+
+    fetched = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body["project_slug_patterns"] == [r"sqr-\d+"]
+    assert body["exclude_project_slugs"] == ["www"]
+    assert body["exclude_project_slug_patterns"] == [r"test-.*"]
+
+
+@pytest.mark.asyncio
+async def test_patch_one_scope_field_leaves_the_others(
+    client: AsyncClient,
+) -> None:
+    """Patching one scope field does not disturb the other three."""
+    await _setup(client)
+    stored = {
+        "enabled": True,
+        "ltd_base_url": "https://keeper.lsst.codes/",
+        "project_slugs": ["sqr-112"],
+        "project_slug_patterns": [r"sqr-\d+"],
+        "exclude_project_slugs": ["www"],
+        "exclude_project_slug_patterns": [r"test-.*"],
+    }
+    await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json=stored,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    response = await client.patch(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={"exclude_project_slugs": ["www", "legacy"]},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        **stored,
+        "exclude_project_slugs": ["www", "legacy"],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method",
+    ["put", "patch"],
+)
+@pytest.mark.parametrize(
+    "field",
+    ["project_slug_patterns", "exclude_project_slug_patterns"],
+)
+async def test_write_rejects_uncompilable_pattern(
+    client: AsyncClient, method: str, field: str
+) -> None:
+    """A bad regex is a 422 naming the field and pattern; nothing is stored."""
+    await _setup(client)
+    stored = {
+        "enabled": True,
+        "ltd_base_url": "https://keeper.lsst.codes/",
+        "project_slugs": ["sqr-112"],
+        "project_slug_patterns": [],
+        "exclude_project_slugs": [],
+        "exclude_project_slug_patterns": [],
+    }
+    await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json=stored,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    body = (
+        {**stored, field: ["sqr-("]} if method == "put" else {field: ["sqr-("]}
+    )
+    response = await client.request(
+        method.upper(),
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json=body,
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
+    detail = response.text
+    assert field in detail
+    assert "sqr-(" in detail
+
+    fetched = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert fetched.json() == stored
 
 
 @pytest.mark.asyncio
@@ -217,7 +355,12 @@ async def test_patch_empty_body_leaves_config_unchanged(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
-    assert response.json() == {**payload}
+    assert response.json() == {
+        **payload,
+        "project_slug_patterns": [],
+        "exclude_project_slugs": [],
+        "exclude_project_slug_patterns": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -253,7 +396,14 @@ async def test_patch_rejects_unknown_field(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field",
-    ["enabled", "ltd_base_url", "project_slugs"],
+    [
+        "enabled",
+        "ltd_base_url",
+        "project_slugs",
+        "project_slug_patterns",
+        "exclude_project_slugs",
+        "exclude_project_slug_patterns",
+    ],
 )
 async def test_patch_rejects_explicit_null(
     client: AsyncClient, field: str

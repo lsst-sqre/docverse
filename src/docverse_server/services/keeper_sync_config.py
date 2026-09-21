@@ -50,10 +50,21 @@ class KeeperSyncConfigService:
         if updated is None:
             msg = f"Organization {org_slug!r} not found"
             raise NotFoundError(msg)
+        # ``project_slugs_count`` is ``None`` for the ``"*"`` wildcard,
+        # which has no size; the other three are always plain lists.
+        slugs = config.project_slugs
         self._logger.info(
             "Updated keeper_sync_config",
             org_slug=org_slug,
             enabled=config.enabled,
+            project_slugs_count=(
+                None if isinstance(slugs, str) else len(slugs)
+            ),
+            project_slug_patterns_count=len(config.project_slug_patterns),
+            exclude_project_slugs_count=len(config.exclude_project_slugs),
+            exclude_project_slug_patterns_count=len(
+                config.exclude_project_slug_patterns
+            ),
         )
         if updated.keeper_sync_config is None:
             msg = (
@@ -69,9 +80,9 @@ class KeeperSyncConfigService:
         """Apply a JSON-Merge-Patch to the persisted config.
 
         Fields left unset on ``update`` are carried over unchanged from the
-        current (or default-disabled) config; ``project_slugs``, when
-        provided, replaces the stored list wholesale. Returns the
-        round-tripped merged value.
+        current (or default-disabled) config; each provided list field
+        (``project_slugs`` and the three scope fields) replaces the stored
+        list wholesale. Returns the round-tripped merged value.
 
         Raises
         ------
