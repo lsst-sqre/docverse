@@ -243,6 +243,7 @@ class WorkerFactoryBuilder:
         github_app_private_key: SecretStr | None,
         github_webhook_secret: SecretStr | None,
         purge_coalescer: CdnPurgeCoalescer | None = None,
+        cdn_purge_enabled: bool = False,
         default_queue_name: str,
         keeper_sync_copy_concurrency: int,
     ) -> None:
@@ -251,6 +252,7 @@ class WorkerFactoryBuilder:
         # burst's redundant per-project CDN purges needs state that spans
         # jobs rather than living inside one.
         self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
+        self._cdn_purge_enabled = cdn_purge_enabled
         self._encryptor = encryptor
         self._http_client = http_client
         self._arq_queue = arq_queue
@@ -308,6 +310,7 @@ class WorkerFactoryBuilder:
             github_webhook_secret=self._github_webhook_secret,
             github_app_validated=self._github_app_validated,
             purge_coalescer=self._purge_coalescer,
+            cdn_purge_enabled=self._cdn_purge_enabled,
             default_queue_name=self._default_queue_name,
             keeper_sync_copy_concurrency=self._keeper_sync_copy_concurrency,
         )
@@ -396,6 +399,7 @@ async def _startup(
         purge_coalescer=CdnPurgeCoalescer(
             min_interval=config.cdn_purge_min_interval_seconds
         ),
+        cdn_purge_enabled=config.cdn_purge_enabled,
         default_queue_name=config.arq_queue_name,
         keeper_sync_copy_concurrency=config.keeper_sync_copy_concurrency,
     )

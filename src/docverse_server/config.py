@@ -282,6 +282,27 @@ class Configuration(BaseSettings):
         ),
     )
 
+    cdn_purge_enabled: bool = Field(
+        default=False,
+        title="Whether long-profile publishes purge the CDN edge cache",
+        description=(
+            "Whether a long-profile publish is followed by a purge of"
+            " the project's hostname from the CDN edge cache. Off by"
+            " default because the Cloudflare Worker does not yet"
+            " edge-cache edition responses (it caches only 404s, and"
+            " only briefly), so a purge invalidates nothing while still"
+            " spending up to four calls against Cloudflare's per-account"
+            " purge rate limit — 5 requests per minute on the Free plan,"
+            " which a keeper-sync backfill across many hostnames exceeds"
+            " within seconds. The per-hostname coalescer"
+            " (``cdn_purge_min_interval_seconds``) folds repeated purges"
+            " of one hostname but cannot bound a burst across distinct"
+            " hostnames. Turn this on only once the Worker caches"
+            " edition responses at the edge, and together with a purge"
+            " budget sized to the zone's plan tier (docverse#683)."
+        ),
+    )
+
     publish_edition_job_timeout_seconds: int = Field(
         1800,
         title="Publish_edition per-job timeout, in seconds",

@@ -163,6 +163,7 @@ def _make_service(
     purger: CdnCachePurger | None = None,
     purger_provider_error: Exception | None = None,
     coalescer: CdnPurgeCoalescer | None = None,
+    purge_enabled: bool = True,
 ) -> EditionPublishingService:
     async def provider(*, org_id: int, service_label: str) -> EditionPublisher:
         if provider_raises:
@@ -198,6 +199,7 @@ def _make_service(
         purge_coalescer=(
             coalescer if coalescer is not None else CdnPurgeCoalescer()
         ),
+        purge_enabled=purge_enabled,
         logger=logger,
     )
 
@@ -551,6 +553,55 @@ async def test_publish_short_profile_does_not_purge(
 
     assert pending is None
     assert mock_purger.purge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_publish_with_purging_disabled_never_resolves_the_purger(
+    db_session: AsyncSession,
+) -> None:
+    """``purge_enabled=False`` publishes the pointer and prepares no purge.
+
+    The gate sits ahead of purger resolution, not just ahead of the
+    purge call: a disabled service must not read the org's CDN
+    credentials for a purger it will never run. The publish itself is
+    unaffected — the edition is marked published exactly as it would be
+    with purging on.
+    """
+    service = _make_service(
+        db_session,
+        publisher=MockEditionPublisher(),
+        purger_provider_error=AssertionError(
+            "purger must not be resolved while purging is disabled"
+        ),
+        purge_enabled=False,
+    )
+    async with db_session.begin():
+        org_id, edition, build, history_entry = await _setup(
+            db_session,
+            org_slug="purge-disabled-org",
+            cdn_service_label="cdn-prod",
+            edition_kind=EditionKind.main,
+        )
+        with capture_logs() as logs:
+            pending = await service.publish(
+                org_id=org_id,
+                project_slug=_PROJECT_SLUG,
+                edition=edition,
+                build=build,
+                history_entry=history_entry,
+            )
+        await db_session.commit()
+
+    assert pending is None
+    async with db_session.begin():
+        refreshed = await EditionStore(
+            session=db_session, logger=_logger()
+        ).get_by_id(edition.id)
+    assert refreshed is not None
+    assert refreshed.publish_status == PublishStatus.published
+    entries = [e for e in logs if e["event"] == "Published edition"]
+    assert len(entries) == 1
+    assert entries[0]["purge_pending"] is False
 
 
 @pytest.mark.asyncio

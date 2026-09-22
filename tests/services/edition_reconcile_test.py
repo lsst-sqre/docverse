@@ -104,6 +104,7 @@ def _publishing_service(session: AsyncSession) -> EditionPublishingService:
         publisher_provider=_unreachable_publisher_provider,
         purger_provider=_unreachable_purger_provider,
         purge_coalescer=CdnPurgeCoalescer(),
+        purge_enabled=False,
         logger=logger,
     )
 

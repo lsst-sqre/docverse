@@ -135,6 +135,7 @@ class Factory:
         github_app_name: str = "lsst-sqre/docverse",
         github_app_validated: bool = True,
         purge_coalescer: CdnPurgeCoalescer | None = None,
+        cdn_purge_enabled: bool = False,
         default_queue_name: str,
         keeper_sync_copy_concurrency: int = DEFAULT_COPY_CONCURRENCY,
     ) -> None:
@@ -146,6 +147,9 @@ class Factory:
         # constructed factories (tests, one-off scripts) working without
         # sharing coalescing state between them.
         self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
+        # Defaults to off like ``Configuration.cdn_purge_enabled``, so a
+        # directly constructed Factory behaves as a deployed one does.
+        self._cdn_purge_enabled = cdn_purge_enabled
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
@@ -649,6 +653,7 @@ class Factory:
             publisher_provider=self.create_edition_publisher_for_org,
             purger_provider=self.create_cdn_cache_purger_for_org,
             purge_coalescer=self._purge_coalescer,
+            purge_enabled=self._cdn_purge_enabled,
             logger=self._logger,
         )
 

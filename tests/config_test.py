@@ -427,3 +427,25 @@ def test_publish_edition_reaper_description_points_at_reconcile() -> None:
     assert description is not None
     assert "edition_reconcile" in description
     assert "does not sit in" not in description
+
+
+def test_cdn_purge_disabled_by_default() -> None:
+    """Long-profile publishes do not purge the CDN unless asked to.
+
+    The Cloudflare Worker does not yet edge-cache edition responses, so
+    a purge invalidates nothing while still spending calls against the
+    per-account purge rate limit (5/min on the Free plan). The default
+    stays off until the edge caches and a plan-sized purge budget
+    exists (docverse#683).
+    """
+    config = Configuration()
+    assert config.cdn_purge_enabled is False
+
+
+def test_cdn_purge_enabled_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Purging is switched on per deployment under the env prefix."""
+    monkeypatch.setenv("DOCVERSE_CDN_PURGE_ENABLED", "true")
+    config = Configuration()
+    assert config.cdn_purge_enabled is True

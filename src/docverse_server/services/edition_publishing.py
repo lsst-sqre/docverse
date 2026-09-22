@@ -141,6 +141,16 @@ class EditionPublishingService:
     :class:`PendingCdnPurge` for :meth:`purge_cdn_cache` to run once
     that transaction has committed. The purge is the one step that can
     block for tens of seconds, and it must not do so on a connection.
+
+    Parameters
+    ----------
+    purge_enabled
+        Whether a long-profile publish prepares a CDN purge at all
+        (``Configuration.cdn_purge_enabled``). When false, :meth:`publish`
+        always returns `None` and the purger provider is never called,
+        so nothing reaches Cloudflare's purge endpoint — the state the
+        service ships in until the edge caches edition responses and a
+        purge budget sized to the zone's plan exists (docverse#683).
     """
 
     def __init__(
@@ -152,6 +162,7 @@ class EditionPublishingService:
         publisher_provider: EditionPublisherProvider,
         purger_provider: CdnCachePurgerProvider,
         purge_coalescer: CdnPurgeCoalescer,
+        purge_enabled: bool,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._org_store = org_store
@@ -160,6 +171,7 @@ class EditionPublishingService:
         self._publisher_provider = publisher_provider
         self._purger_provider = purger_provider
         self._purge_coalescer = purge_coalescer
+        self._purge_enabled = purge_enabled
         self._logger = logger
 
     async def publish(
@@ -194,7 +206,8 @@ class EditionPublishingService:
         and :class:`PendingCdnPurge` for why the purge must not run
         inside the publish transaction. `None` is returned when no
         purge is warranted (no CDN configured, a short cache profile,
-        or the purger could not be resolved).
+        purging switched off via ``purge_enabled``, or the purger could
+        not be resolved).
 
         On a successful publish both the edition row and the supplied
         history entry are updated to ``PublishStatus.published``. When
@@ -243,7 +256,7 @@ class EditionPublishingService:
                 cache_profile=cache_profile,
             )
         pending_purge: PendingCdnPurge | None = None
-        if cache_profile == CACHE_PROFILE_LONG:
+        if cache_profile == CACHE_PROFILE_LONG and self._purge_enabled:
             pending_purge = await self._prepare_cdn_purge(
                 org=org,
                 service_label=org.cdn_service_label,
@@ -262,6 +275,7 @@ class EditionPublishingService:
             build_id=build.id,
             cdn_service_label=org.cdn_service_label,
             cache_profile=cache_profile,
+            purge_pending=pending_purge is not None,
         )
         return pending_purge
 
