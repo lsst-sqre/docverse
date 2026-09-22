@@ -178,9 +178,16 @@ validates it exactly as `PATCH` validates it, resolves it against the
 *live* LTD product listing, and **persists nothing and enqueues
 nothing**. An empty body previews the stored config as it stands. The
 preview works whether or not sync is `enabled`, so you can stage a
-scope before turning sync on at all. If LTD itself is unreachable or
-answers an error, the preview reports a **502** carrying LTD's own
-status — never a Docverse 500.
+scope before turning sync on at all.
+
+If the live product listing cannot be read, the preview reports a
+**502** — never a Docverse 500. That covers every way the listing can
+fail, not just the obvious one: LTD unreachable, LTD answering an
+error, and LTD answering `200` with something that is not a product
+listing, which is what a proxy or maintenance page in front of it
+serves. The response names LTD's own status (a `200` here is the
+useful surprise) and what could not be read, so you can tell an LTD
+outage from a Docverse bug without pod logs.
 
 ### Wave 1 — the SQR series
 

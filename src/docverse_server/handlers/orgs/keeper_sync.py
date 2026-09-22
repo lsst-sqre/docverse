@@ -155,8 +155,10 @@ async def post_org_keeper_sync_scope_preview(
     so an operator rolling the lsst.io migration out in waves checks a
     candidate here first, then ``PATCH``es it, then launches a backfill.
 
-    The preview works whether or not sync is ``enabled``. An LTD fetch
-    failure is reported as a 502 carrying LTD's own status, not a 500.
+    The preview works whether or not sync is ``enabled``. Any failure
+    to read the live LTD product listing — unreachable, an error
+    status, or a 200 whose body is not a product listing — is reported
+    as a 502 naming LTD's own status, never a Docverse 500.
     """
     context.rebind_logger(actor=user.username)
     async with context.session.begin():

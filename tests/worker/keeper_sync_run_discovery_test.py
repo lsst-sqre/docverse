@@ -9,9 +9,15 @@ from typing import Any, Literal
 import httpx
 import pytest
 import respx
+import sentry_sdk
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.testing.sentry import (
+    TestTransport,
+    capture_events_fixture,
+    sentry_init_fixture,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
@@ -29,6 +35,7 @@ from docverse_server.domain.base32id import (
     validate_base32_id,
 )
 from docverse_server.domain.queue import JobStatus
+from docverse_server.sentry import initialize_sentry
 from docverse_server.services.keeper_sync_config import KeeperSyncConfigService
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.keeper_sync_scope_preview import (
@@ -512,6 +519,100 @@ async def test_discovery_marks_run_failed_when_disabled(
             disc = await queue_job_store.get(queue_job_id)
             assert disc is not None
             assert disc.status == JobStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_discovery_fails_and_alerts_on_a_malformed_ltd_payload(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable LTD 200 fails the run and reaches Sentry.
+
+    Issue #675 moved the malformed-payload failure into the
+    ``LtdClientError`` taxonomy so the *attended* scope-preview endpoint
+    can answer 502 instead of 500. This pins the other half of that
+    change: the worker is unattended, so the same payload must still
+    fail the run loudly rather than being quietly mapped to "nothing in
+    scope" — which is what a Docverse-side ``except`` around the new
+    exception type would have cost us.
+
+    An HTML maintenance page served as 200 is the shape that broke: a
+    proxy in front of LTD answers 200, so nothing in the status check
+    notices, and the listing silently has no products in it.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+
+    mock_discovery.get("https://keeper.lsst.codes/products/").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"<html><body>LTD is down for maintenance</body></html>",
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    monkeypatch.setenv("SENTRY_DSN", "https://test@example.com/1")
+    monkeypatch.setenv("SENTRY_ENVIRONMENT", "test")
+    real_init = sentry_sdk.init
+
+    def _init_with_test_transport(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("transport", TestTransport())
+        return real_init(*args, **kwargs)
+
+    monkeypatch.setattr(sentry_sdk, "init", _init_with_test_transport)
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with sentry_init_fixture():
+        initialize_sentry(component="worker-keeper-sync")
+        captured = capture_events_fixture(monkeypatch)()
+
+        result = await keeper_sync_run_discovery(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+
+        assert result == "failed"
+        assert len(captured.errors) == 1
+        exc_values = captured.errors[0]["exception"]["values"]
+        assert any(exc["type"] == "LtdProductsError" for exc in exc_values)
+    await ctx["http_client"].aclose()
+
+    # No children fanned out, and both the job and the run are failed —
+    # an unreadable listing must never look like an empty one, which
+    # would have rolled the run up green with zero projects synced.
+    assert (
+        get_jobs_by_name(
+            mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+        )
+        == []
+    )
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.failed
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            disc = await queue_job_store.get(queue_job_id)
+            assert disc is not None
+            assert disc.status == JobStatus.failed
+            assert disc.errors is not None
+            assert disc.errors["type"] == "LtdProductsError"
 
 
 @pytest.mark.asyncio

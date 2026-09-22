@@ -37,7 +37,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-import httpx
 import sentry_sdk
 import structlog
 from safir.arq import ArqQueue
@@ -100,6 +99,7 @@ from docverse_server.storage.ltd import (
     LtdClientError,
     LtdEdition,
     LtdNotFoundError,
+    LtdProductsError,
 )
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
@@ -1440,14 +1440,30 @@ async def _fetch_ltd_product_slugs(
     config: KeeperSyncConfig,
     logger: structlog.stdlib.BoundLogger,
 ) -> list[str]:
-    """Fetch every product slug visible on the configured LTD instance."""
+    """Fetch every product slug visible on the configured LTD instance.
+
+    The single LTD-listing fetch for every *unattended* keeper-sync
+    path: ``keeper_sync_run_discovery`` and, through
+    :func:`_list_in_scope_slugs`, all three tier crons. The synchronous
+    scope-preview endpoint shares the fetch itself —
+    :meth:`LtdProductsClient.list_product_slugs`, which normalises
+    transport failures, non-2xx statuses, and a 200 whose body is not a
+    usable listing into one :class:`LtdProductsError` — but applies the
+    opposite error policy at its own call site, because an org admin is
+    watching that response (issue #675).
+
+    The policy here is a structured breadcrumb, then re-raise: both
+    callers already wrap the whole per-run / per-org pass in an
+    ``except`` that captures to Sentry and records the failure, so the
+    exception must keep propagating and must *not* be captured a second
+    time here.
+    """
     client = factory.create_ltd_products_client(
         base_url=str(config.ltd_base_url)
     )
     try:
         return await client.list_product_slugs()
-    except httpx.HTTPError as exc:
-        sentry_sdk.capture_exception(exc)
+    except LtdProductsError:
         logger.exception("Failed to fetch LTD product slugs")
         raise
 
@@ -2222,8 +2238,9 @@ async def _list_in_scope_slugs(
 ) -> list[str]:
     """Resolve one tier cron's candidate slugs for an org.
 
-    Wraps :class:`LtdProductsClient` so the three tier-cron processors
-    share the same resolution ``keeper_sync_run_discovery`` performs:
+    Goes through :func:`_fetch_ltd_product_slugs` so the three
+    tier-cron processors share the same resolution — and the same LTD
+    failure policy — ``keeper_sync_run_discovery`` performs:
     list LTD's products, apply the config scope rule via
     :func:`_resolve_scope`, then drop tombstoned project slugs so a
     ``keeper_sync_project`` child is never enqueued for a Docverse-side
@@ -2237,10 +2254,9 @@ async def _list_in_scope_slugs(
     empty: there is nothing left for it to subtract, and the read scans
     the org's whole project-state table.
     """
-    products_client = factory.create_ltd_products_client(
-        base_url=str(config.ltd_base_url)
+    ltd_slugs = await _fetch_ltd_product_slugs(
+        factory=factory, config=config, logger=logger
     )
-    ltd_slugs = await products_client.list_product_slugs()
     in_scope, excluded_count = _resolve_scope(ltd_slugs, config)
     tombstoned_slugs: set[str] = set()
     if in_scope:

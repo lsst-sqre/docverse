@@ -31,6 +31,7 @@ __all__ = [
     "LtdClient",
     "LtdClientError",
     "LtdNotFoundError",
+    "LtdProductsError",
 ]
 
 #: Ceiling on any single wait between attempts, overriding the tighter
@@ -148,6 +149,33 @@ class LtdNotFoundError(LtdClientError):
     default ``to_sentry`` override from :class:`LtdClientError` — the
     404 status code already gets surfaced as ``ltd_status_code`` so no
     further override is needed.
+    """
+
+
+class LtdProductsError(LtdClientError):
+    """Raised when the LTD product listing cannot be read as slugs.
+
+    The single failure type
+    :meth:`~docverse_server.storage.ltd.products_client.LtdProductsClient.list_product_slugs`
+    raises, covering both halves of "we have no product list": the
+    transport/status failures that never produced a body, and a 200
+    whose body is not a usable listing (an HTML maintenance page, a
+    JSON array where an object belongs, an entry that is not a product
+    URL).
+
+    Those second cases used to escape as ``json.JSONDecodeError`` /
+    ``AttributeError`` from outside the :class:`LtdClientError`
+    taxonomy every caller handles, which is what made the scope-preview
+    endpoint answer a Docverse 500 where its contract promises a 502
+    (issue #675). Folding them in here rather than at one call site
+    fixes it for the worker's discovery and tier-cron fetches too.
+
+    Inherits :class:`LtdClientError`'s constructor and ``to_sentry``
+    override unchanged: ``status_code`` is LTD's status when a response
+    came back at all (it is ``200`` for the malformed-body cases, which
+    is exactly the surprise a triager needs to see) and ``None`` for a
+    transport failure, and ``body`` carries the truncated response so
+    the maintenance page is one click away.
     """
 
 

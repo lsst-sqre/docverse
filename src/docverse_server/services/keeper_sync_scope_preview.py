@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-import httpx
 import structlog
 
 from docverse.models import (
@@ -27,6 +26,7 @@ from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
 )
+from docverse_server.storage.ltd.client import LtdProductsError
 from docverse_server.storage.ltd.products_client import LtdProductsClient
 from docverse_server.storage.organization_store import OrganizationStore
 
@@ -92,9 +92,11 @@ class KeeperSyncScopePreviewService:
         NotFoundError
             If the organization does not exist.
         UpstreamServiceError
-            If the LTD product listing could not be fetched. Surfaces as
-            a 502 carrying LTD's status, so an LTD outage is never
-            reported as a Docverse 500.
+            If the LTD product listing could not be fetched *or read* —
+            including a 200 whose body is not a usable listing, which
+            is what a proxy or maintenance page in front of LTD serves.
+            Surfaces as a 502 naming LTD's status, so an LTD outage is
+            never reported as a Docverse 500.
 
         Notes
         -----
@@ -156,28 +158,39 @@ class KeeperSyncScopePreviewService:
     async def _fetch_ltd_product_slugs(
         self, config: KeeperSyncConfig
     ) -> list[str]:
-        """Fetch the live LTD product listing, or raise a 502."""
+        """Fetch the live LTD product listing, or raise a 502.
+
+        The fetch itself is shared with the worker's discovery and
+        tier-cron passes — :meth:`LtdProductsClient.list_product_slugs`
+        is the one path, and it normalises transport failures, non-2xx
+        statuses, and a 200 whose body is not a usable listing into a
+        single :class:`LtdProductsError`. What differs is the *policy*,
+        which is why it stays here at the call site rather than in the
+        client: this caller is an org admin watching the response, so
+        the failure is theirs to read as a 502 and alerting per retry
+        would be noise. The worker's call sites are unattended, so they
+        let the same exception alert (see
+        :func:`docverse_server.worker.functions.keeper_sync._fetch_ltd_product_slugs`).
+
+        The underlying message is quoted into the 502 because it is the
+        only thing that distinguishes "LTD returned 503" from "LTD
+        returned 200 and an HTML maintenance page" — and an operator
+        staging a migration wave needs to tell those apart without pod
+        logs.
+        """
         base_url = str(config.ltd_base_url)
         client = self._products_client_factory(base_url=base_url)
         try:
             return await client.list_product_slugs()
-        except httpx.HTTPStatusError as exc:
-            upstream_status = exc.response.status_code
-            msg = (
-                f"The LTD Keeper product listing at {base_url} returned"
-                f" HTTP {upstream_status}; the keeper-sync scope cannot"
-                " be previewed until LTD responds"
-            )
-            raise UpstreamServiceError(
-                msg, upstream_status=upstream_status
-            ) from exc
-        except httpx.HTTPError as exc:
+        except LtdProductsError as exc:
             msg = (
                 f"The LTD Keeper product listing at {base_url} could not"
-                f" be reached ({exc.__class__.__name__}); the keeper-sync"
-                " scope cannot be previewed until LTD responds"
+                f" be read ({exc}); the keeper-sync scope cannot be"
+                " previewed until LTD serves a usable product listing"
             )
-            raise UpstreamServiceError(msg) from exc
+            raise UpstreamServiceError(
+                msg, upstream_status=exc.status_code
+            ) from exc
 
 
 def _unmatched_project_slugs(

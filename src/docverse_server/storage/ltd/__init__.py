@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from .client import LtdClient, LtdClientError, LtdNotFoundError
+from .client import (
+    LtdClient,
+    LtdClientError,
+    LtdNotFoundError,
+    LtdProductsError,
+)
 from .models import (
     LtdBuild,
     LtdEdition,
@@ -26,6 +31,7 @@ __all__ = [
     "LtdNotFoundError",
     "LtdProduct",
     "LtdProductsClient",
+    "LtdProductsError",
     "LtdProductsListing",
     "LtdS3Source",
     "LtdSourceAccessDeniedError",

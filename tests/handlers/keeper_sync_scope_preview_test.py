@@ -456,6 +456,61 @@ async def test_ltd_transport_failure_surfaces_as_502(
 
 
 @pytest.mark.asyncio
+async def test_ltd_html_body_on_a_200_surfaces_as_502(
+    client: AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A maintenance page served as 200 is still LTD's fault, not ours.
+
+    LTD answering 200 is not a promise that the body is the product
+    listing — a proxy or maintenance page in front of it answers 200
+    with HTML. Parsing that used to raise ``json.JSONDecodeError`` from
+    outside the handled taxonomy and render a Docverse 500, which the
+    endpoint's contract (and ``docs/keeper-sync-scope.md``) says never
+    happens (issue #675).
+    """
+    await _setup(client)
+    await _put_config(client, project_slugs="*")
+    mock_discovery.get(f"{_LTD_BASE}/products/").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"<html><body>LTD is down for maintenance</body></html>",
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    response = await _preview(client)
+
+    assert response.status_code == 502
+    detail = response.json()["detail"][0]
+    assert detail["type"] == "upstream_error"
+    # The upstream status is still named, even though it is a 200.
+    assert "200" in detail["msg"]
+
+
+@pytest.mark.asyncio
+async def test_ltd_json_array_body_surfaces_as_502(
+    client: AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A JSON array where the listing object belongs is also a 502."""
+    await _setup(client)
+    await _put_config(client, project_slugs="*")
+    mock_discovery.get(f"{_LTD_BASE}/products/").mock(
+        return_value=httpx.Response(
+            200,
+            content=json.dumps([f"{_LTD_BASE}/products/sqr-060/"]).encode(),
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    response = await _preview(client)
+
+    assert response.status_code == 502
+    assert response.json()["detail"][0]["type"] == "upstream_error"
+
+
+@pytest.mark.asyncio
 async def test_non_admin_is_rejected(
     client: AsyncClient,
     mock_discovery: respx.Router,
