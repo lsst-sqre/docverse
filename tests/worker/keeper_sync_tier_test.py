@@ -1353,6 +1353,82 @@ async def test_tier_main_logs_scope_counts(
     assert scope_events[0]["in_scope_count"] == 1
     assert scope_events[0]["excluded_count"] == 2
     assert scope_events[0]["tombstoned_count"] == 0
+    assert scope_events[0]["fan_out_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_main_scope_counts_split_tombstones_from_fan_out(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The tier scope counts obey ``in_scope - tombstoned = fan_out``.
+
+    Issue #680: the tier event uses the preview's field names, so it
+    has to use the preview's definitions — ``in_scope_count`` before
+    the tombstone subtraction, ``tombstoned_count`` scoped to it. The
+    org carries a second tombstone on a slug the config never admitted,
+    so a whole-state-table count would report ``2`` here.
+    """
+    org_slug = "ks-tier-main-scope-tombstones"
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug=org_slug,
+            project_slugs=["sqr-100", "sqr-200"],
+        )
+        for slug in ("sqr-200", "www"):
+            await _seed_tombstone(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=slug,
+            )
+
+    _stub_products(mock_discovery, ["sqr-100", "sqr-200", "www"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-100", edition_ids=[1]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    scope_events = [
+        e
+        for e in captured
+        if e["event"] == "Resolved keeper-sync tier scope"
+        and e["org"] == org_slug
+    ]
+    assert len(scope_events) == 1
+    event = scope_events[0]
+    assert event["ltd_count"] == 3
+    assert event["in_scope_count"] == 2
+    assert event["excluded_count"] == 0
+    assert event["tombstoned_count"] == 1
+    assert event["fan_out_count"] == 1
+    assert (
+        event["in_scope_count"] - event["tombstoned_count"]
+        == event["fan_out_count"]
+    )
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
 
 
 @pytest.mark.asyncio

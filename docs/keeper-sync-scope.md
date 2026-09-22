@@ -268,10 +268,13 @@ first wave's patterns alongside the new one:
 {"project_slug_patterns": ["sqr-\\d+", "dmtn-\\d+"]}
 ```
 
-Preview it, `PATCH` it, and launch another backfill. The run's
-`total_count` is the preview's `in_scope_count` plus one — the
-discovery job attributes itself to its own run — less any slug skipped
-for a tombstone or for a per-project job that is already running.
+Preview it, `PATCH` it, and launch another backfill. What the backfill
+then fans out is the preview's `in_scope_count` less its
+`tombstoned_slugs` — the identity spelled out under
+[Observability](#observability) — and the run's `total_count` is that
+plus one, because the discovery job attributes itself to its own run.
+A slug whose per-project job is already running is skipped as well, so
+`total_count` can come in lower still.
 
 ### Wave 3 — everything, minus the strays
 
@@ -304,7 +307,7 @@ config honest about what is actually doing the work.
 | Field | What it tells you |
 | --- | --- |
 | `ltd_count` | How many distinct product slugs the live LTD instance listed. A sanity check on the upstream, and the denominator for the wave. |
-| `in_scope_count` | The size of `in_scope_slugs`, and how many child jobs a backfill with this config would fan out. |
+| `in_scope_count` | The size of `in_scope_slugs`: everything the config admits, tombstones included. Subtract `tombstoned_slugs` to get the child jobs a backfill would fan out. |
 | `in_scope_slugs` | The resolved scope, in LTD listing order — the order a backfill would work through. Includes slugs a tombstone will make sync skip. |
 | `new_slugs` | In-scope slugs with no keeper-sync state row on this org yet: exactly what the next backfill would import **for the first time**. |
 | `tombstoned_slugs` | In scope by config, but skipped because the project-resource state row is tombstoned. |
@@ -321,7 +324,9 @@ On a second or third wave the two numbers diverge sharply, and it is
 **`tombstoned_slugs` explains a shortfall before you see it.** A
 tombstoned project is in scope by config and will still be skipped by
 sync, so a backfill fans out fewer children than `in_scope_count`
-suggested. If a slug listed here should in fact sync, clear its
+suggested — exactly this many fewer, which is what the run then
+reports as its `fan_out_count`. If a slug listed here should in fact
+sync, clear its
 tombstone with
 `DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}` — widening the
 scope will not do it, because the tombstone is a veto that outranks the
@@ -342,15 +347,16 @@ case.
 
 ## Observability
 
-Both places that resolve a scope log it at info with the same four
+Both places that resolve a scope log it at info with the same five
 counts, so a tier tick and a run's discovery job are directly
-comparable:
+comparable — and comparable with a preview, which reports three of
+them under the same names:
 
 - `Resolved keeper-sync run scope` (run discovery) and
   `Resolved keeper-sync tier scope` (each tier cron), both carrying
   `ltd_count`, `in_scope_count`, `excluded_count` — how many slugs an
-  include rule admitted and an exclude rule then removed — and
-  `tombstoned_count`.
+  include rule admitted and an exclude rule then removed —
+  `tombstoned_count`, and `fan_out_count`.
 - `Previewed keeper-sync scope`, from the preview endpoint, carrying
   the same `ltd_count` and `in_scope_count` plus `new_count`,
   `tombstoned_count`, `unmatched_count`, and a `candidate` flag
@@ -361,10 +367,43 @@ comparable:
   `project_slug_patterns_count`, `exclude_project_slugs_count` and
   `exclude_project_slug_patterns_count`.
 
+### The counts always add up
+
+The three counts a scope resolution and a preview share mean the same
+thing on both sides, and they compose into one identity you can check
+by eye:
+
+```
+`in_scope_count` - `tombstoned_count` = `fan_out_count`
+```
+
+- `in_scope_count` is the **config** resolution — every slug the four
+  scope fields admit, before tombstones are considered. It is the
+  preview's `in_scope_count` and the length of its `in_scope_slugs`.
+- `tombstoned_count` counts only the tombstones **inside that scope**.
+  It is the length of the preview's `tombstoned_slugs`, *not* how many
+  tombstoned projects the org has: a tombstone on a slug the config
+  never admitted is not this scope's shortfall to explain.
+- `fan_out_count` is what is left — the `keeper_sync_project` children
+  the pass actually enqueues, and on a run, its `total_count` less the
+  one discovery job (less, too, any slug skipped because a per-project
+  job for it was already running).
+
+So a preview reading `in_scope_count=3` with one entry in
+`tombstoned_slugs` predicts a run logging `in_scope_count=3`,
+`tombstoned_count=1`, `fan_out_count=2` — and a `total_count` of 3.
+If the two disagree, the LTD listing or the tombstones changed between
+the preview and the run; the counts themselves do not drift.
+
 An `excluded_count` that jumps unexpectedly is the signal that an
 exclude pattern is broader than intended — it is the only counter that
 distinguishes "the include rules never matched these" from "an exclude
 rule took them back out".
+
+The discovery job's own `queue_jobs` row carries the same two names on
+its `progress` when it completes: `in_scope_count` and `fan_out_count`,
+alongside `enqueued_count` — which is `fan_out_count` less the slugs
+whose per-project job was already running.
 
 ## Related
 

@@ -1109,6 +1109,107 @@ async def test_discovery_skips_tombstoned_project_slugs(
             assert child_rows[0].subject_label == "sqr-112"
 
 
+@pytest.mark.asyncio
+async def test_discovery_scope_counts_split_tombstones_from_fan_out(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The run-scope counts obey ``in_scope - tombstoned = fan_out``.
+
+    Issue #680: ``in_scope_count`` is the config resolution *before*
+    tombstones are subtracted — the quantity the preview reports under
+    the same name — ``tombstoned_count`` counts only the tombstones
+    that land inside that scope, and ``fan_out_count`` is what actually
+    reaches ``_enqueue_children``. The org here carries a second,
+    out-of-scope tombstone precisely so the two definitions cannot be
+    confused: reading the whole state table would report
+    ``tombstoned_count=2``.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001", "sqr-112"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        tombstone_service = KeeperSyncTombstoneService(
+            session=db_session,
+            state_store=KeeperSyncStateStore(
+                session=db_session, logger=_logger()
+            ),
+            logger=_logger(),
+        )
+        for slug in ("dmtn-001", "www"):
+            await tombstone_service.record(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=slug,
+                reason=TombstoneReason.manual_delete,
+            )
+
+    _mock_ltd_products(mock_discovery, ["dmtn-001", "sqr-112", "www"])
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with capture_logs() as captured:
+        result = await keeper_sync_run_discovery(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    scope_events = [
+        e for e in captured if e["event"] == "Resolved keeper-sync run scope"
+    ]
+    assert len(scope_events) == 1
+    event = scope_events[0]
+    assert event["ltd_count"] == 3
+    assert event["in_scope_count"] == 2
+    assert event["excluded_count"] == 0
+    # ``www`` is tombstoned but never was in scope, so it is not this
+    # scope's shortfall to explain.
+    assert event["tombstoned_count"] == 1
+    assert event["fan_out_count"] == 1
+    assert (
+        event["in_scope_count"] - event["tombstoned_count"]
+        == event["fan_out_count"]
+    )
+
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    assert [j.kwargs["payload"]["ltd_slug"] for j in project_jobs] == [
+        "sqr-112"
+    ]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            activity = await run_store.aggregate_activity(run_id=run_id)
+            # One child per fanned-out slug, plus the discovery row,
+            # which attributes itself to the run it fans out.
+            assert activity.total_count == event["fan_out_count"] + 1
+
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            disc = await queue_job_store.get(queue_job_id)
+            assert disc is not None
+            assert disc.progress is not None
+            assert disc.progress["in_scope_count"] == 2
+            assert disc.progress["fan_out_count"] == 1
+        break
+
+
 # ---------------------------------------------------------------------------
 # Lost active-job race in the discovery fan-out
 # ---------------------------------------------------------------------------
@@ -1364,3 +1465,109 @@ async def test_preview_predicts_the_backfill_a_widened_scope_launches(
     # was not already tracking — are exactly ``new_slugs``.
     first_time = [s for s in fanned_out if s not in tracked_before]
     assert first_time == preview.new_slugs
+
+
+@pytest.mark.asyncio
+async def test_preview_and_run_report_the_same_scope_counts(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Preview and run agree on what their shared field names mean.
+
+    Issue #680: the "Resolved keeper-sync run scope" event borrows
+    ``in_scope_count`` and ``tombstoned_count`` from
+    :class:`~docverse.models.KeeperSyncScopePreview`, so an operator
+    who previews a scope and then launches it must be able to lay the
+    two side by side. Against one config and one tombstone state this
+    pins both names to one quantity each, and pins the run's shortfall
+    — ``fan_out_count`` — to the difference the preview already
+    predicted through ``tombstoned_slugs``.
+
+    The org carries an out-of-scope tombstone as well, which is what
+    the two definitions used to disagree about: the run read the whole
+    state table and the preview read the intersection.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session,
+            project_slugs=[],
+            project_slug_patterns=[r"sqr-\d+"],
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+        tombstone_service = KeeperSyncTombstoneService(
+            session=db_session,
+            state_store=KeeperSyncStateStore(
+                session=db_session, logger=_logger()
+            ),
+            logger=_logger(),
+        )
+        for slug in ("sqr-060", "dmtn-201"):
+            await tombstone_service.record(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=slug,
+                reason=TombstoneReason.manual_delete,
+            )
+
+    _mock_ltd_products(
+        mock_discovery, ["sqr-112", "www", "sqr-060", "dmtn-201"]
+    )
+
+    async with httpx.AsyncClient() as preview_http_client:
+        async for session in db_session_dependency():
+            service = _preview_service(session, preview_http_client)
+            async with session.begin():
+                plan = await service.load_plan(org_slug=org_slug)
+            fetched = await service.fetch_ltd_product_slugs(plan)
+            async with session.begin():
+                preview = await service.report(plan=plan, ltd_slugs=fetched)
+            break
+
+    assert preview.in_scope_slugs == ["sqr-112", "sqr-060"]
+    assert preview.tombstoned_slugs == ["sqr-060"]
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    with capture_logs() as captured:
+        result = await keeper_sync_run_discovery(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    scope_events = [
+        e for e in captured if e["event"] == "Resolved keeper-sync run scope"
+    ]
+    assert len(scope_events) == 1
+    event = scope_events[0]
+
+    # The three names the two surfaces share, each one quantity.
+    assert event["ltd_count"] == preview.ltd_count
+    assert event["in_scope_count"] == preview.in_scope_count
+    assert event["tombstoned_count"] == len(preview.tombstoned_slugs)
+    # ...and the one only the run has, which the preview's own numbers
+    # already predict.
+    assert event["fan_out_count"] == preview.in_scope_count - len(
+        preview.tombstoned_slugs
+    )
+
+    project_jobs = get_jobs_by_name(
+        mock_arq, "keeper_sync_project", queue_name=KEEPER_SYNC_QUEUE_NAME
+    )
+    fanned_out = [j.kwargs["payload"]["ltd_slug"] for j in project_jobs]
+    assert fanned_out == [
+        s for s in preview.in_scope_slugs if s not in preview.tombstoned_slugs
+    ]

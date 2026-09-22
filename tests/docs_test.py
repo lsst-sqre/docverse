@@ -50,6 +50,7 @@ from docverse_server.storage.pagination import ProjectSortOrder
 from docverse_server.worker.functions.edition_reconcile import (
     RECONCILED_DRIFT_MESSAGE,
 )
+from docverse_server.worker.functions.keeper_sync import _ScopeCounts
 
 _DOCS = Path(__file__).parents[1] / "docs"
 
@@ -211,6 +212,33 @@ def test_scope_preview_response_fields_documented() -> None:
     fields = set(KeeperSyncScopePreview.model_fields)
     assert fields, "the preview reports no fields"
     assert not _uncoded(fields, page)
+
+
+def test_scope_log_counts_documented() -> None:
+    """Every count the scope-resolution log events carry is documented.
+
+    :class:`~docverse_server.worker.functions.keeper_sync._ScopeCounts`
+    *is* the run-discovery and tier-cron events' payload, and three of
+    its names are shared with the preview response — so a count added
+    or renamed without the page gaining the word for it is exactly the
+    drift issue #680 was filed about.
+    """
+    page = _read(_SCOPE_PAGE)
+    counts = set(_ScopeCounts.__annotations__)
+    assert counts, "the scope resolution reports no counts"
+    assert not _uncoded(counts, page)
+
+
+def test_scope_count_identity_documented() -> None:
+    """The page states the identity relating the five counts.
+
+    The counts are only comparable across a preview and the run it
+    launches because ``in_scope_count`` is the config resolution on
+    both sides; the identity is what tells an operator that a
+    shortfall between the two is the tombstones and nothing else.
+    """
+    page = _read(_SCOPE_PAGE)
+    assert "`in_scope_count` - `tombstoned_count` = `fan_out_count`" in page
 
 
 def test_scope_pattern_caps_documented() -> None:
