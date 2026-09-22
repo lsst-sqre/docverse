@@ -36,7 +36,6 @@ from docverse.models import (
     KeeperSyncTierStatus,
 )
 from docverse_server.domain.edition import Edition
-from docverse_server.exceptions import NotFoundError
 from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -52,6 +51,10 @@ from docverse_server.services.keeper_sync.scheduler import (
     TIER_OTHER_HOT_WINDOW,
     Tier,
     explain_tier_status,
+)
+from docverse_server.services.keeper_sync_gate import (
+    require_sync_eligible,
+    require_sync_enabled,
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -195,22 +198,9 @@ class KeeperSyncProjectService:
             cases — the resource (a sync-eligible project on this org)
             does not exist.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
-        if not config.is_in_scope(ltd_slug):
-            msg = (
-                f"LTD slug {ltd_slug!r} is not in the keeper-sync scope"
-                f" for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, config = await require_sync_eligible(
+            self._org_store, org_slug=org_slug, ltd_slug=ltd_slug
+        )
 
         now = datetime.now(tz=UTC)
         project_state = await self._state_store.get(
@@ -286,22 +276,9 @@ class KeeperSyncProjectService:
             ``ltd_slug`` is not in the org's keeper-sync scope as
             resolved by :meth:`KeeperSyncConfig.is_in_scope`.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
-        if not config.is_in_scope(ltd_slug):
-            msg = (
-                f"LTD slug {ltd_slug!r} is not in the keeper-sync scope"
-                f" for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, _ = await require_sync_eligible(
+            self._org_store, org_slug=org_slug, ltd_slug=ltd_slug
+        )
 
         project_state = await self._state_store.get(
             org_id=org.id,
@@ -376,16 +353,7 @@ class KeeperSyncProjectService:
         NotFoundError
             If the org does not exist or LTD sync is not enabled on it.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, _ = await require_sync_enabled(self._org_store, org_slug=org_slug)
 
         page = await self._state_store.list_project_resources_for_org(
             org_id=org.id, cursor=cursor, limit=limit

@@ -20,9 +20,13 @@ from docverse_server.domain.keeper_sync_run import (
     KeeperSyncRun,
     KeeperSyncRunWithActivity,
 )
-from docverse_server.domain.organization import Organization
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import ConflictError, NotFoundError
+from docverse_server.services.keeper_sync_gate import (
+    require_org,
+    require_sync_eligible,
+    require_sync_enabled,
+)
 from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.organization_store import OrganizationStore
@@ -65,16 +69,9 @@ class KeeperSyncRunService:
         already exists — both surface to the operator with
         actionable messages.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise ConflictError(msg)
+        org, _ = await require_sync_enabled(
+            self._org_store, org_slug=org_slug, disabled_error=ConflictError
+        )
 
         # Pre-check that no non-terminal run exists. The DB partial
         # unique index is the authoritative backstop, but checking
@@ -154,22 +151,9 @@ class KeeperSyncRunService:
             operator-facing API surfaces the conflict as 409 instead
             of a worker-side IntegrityError.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
-        if not config.is_in_scope(ltd_slug):
-            msg = (
-                f"LTD slug {ltd_slug!r} is not in the keeper-sync scope"
-                f" for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, config = await require_sync_eligible(
+            self._org_store, org_slug=org_slug, ltd_slug=ltd_slug
+        )
 
         # Mirrors the per-org run-uniqueness check above (lines
         # 105-115 for runs): pre-check the per-(org, ltd_slug)
@@ -222,7 +206,7 @@ class KeeperSyncRunService:
         public_id: int,
     ) -> KeeperSyncRunWithActivity:
         """Fetch a run by public id, with derived ``queue_jobs`` activity."""
-        org = await self._require_org(org_slug)
+        org = await require_org(self._org_store, org_slug=org_slug)
         run = await self._run_store.get_by_public_id(public_id)
         if run is None or run.org_id != org.id:
             msg = (
@@ -242,17 +226,10 @@ class KeeperSyncRunService:
         limit: int,
     ) -> CountedPaginatedList[KeeperSyncRun, KeeperSyncRunDateStartedCursor]:
         """List runs for an org, newest-first, with optional status filter."""
-        org = await self._require_org(org_slug)
+        org = await require_org(self._org_store, org_slug=org_slug)
         return await self._run_store.list_by_org(
             org_id=org.id,
             status=status,
             cursor=cursor,
             limit=limit,
         )
-
-    async def _require_org(self, org_slug: str) -> Organization:
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        return org

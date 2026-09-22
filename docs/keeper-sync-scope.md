@@ -134,7 +134,11 @@ and it is deliberately gentle:
   reading `is not in the keeper-sync scope`. That covers
   `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}`, its
   `/orgs/{org}/keeper-sync/projects/{ltd_slug}/editions`, and
-  `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`.
+  `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`. A
+  `{ltd_slug}` that LTD Keeper could not have issued in the first place
+  — anything outside `^[a-z][-a-z0-9]*[a-z0-9]$`, or longer than 255
+  characters — is a **422** from those same three routes instead: the
+  scope is never consulted about a slug that names no LTD product.
 - **Nothing else changes.** The Docverse project, its editions, its
   builds and its keeper-sync state rows are all left alone, and
   `https://<slug>.<base_domain>/` keeps serving exactly what it served

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Query, Response, status
 
 from docverse.models import (
     KeeperSyncConfig,
@@ -24,6 +24,7 @@ from docverse_server.dependencies.context import (
     context_dependency,
 )
 from docverse_server.handlers.params import (
+    LtdSlugParam,
     OrgSlugParam,
     RunIdParam,
     TombstoneIdParam,
@@ -273,10 +274,7 @@ async def get_org_keeper_sync_project_status(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    ltd_slug: Annotated[
-        str,
-        Path(description="LTD project slug to inspect."),
-    ],
+    ltd_slug: LtdSlugParam,
     ltd: Annotated[
         bool,
         Query(
@@ -310,10 +308,7 @@ async def get_org_keeper_sync_project_editions(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    ltd_slug: Annotated[
-        str,
-        Path(description="LTD project slug to list editions for."),
-    ],
+    ltd_slug: LtdSlugParam,
     cursor: Annotated[
         str | None,
         Query(
@@ -373,10 +368,7 @@ async def post_org_keeper_sync_project_refresh(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    ltd_slug: Annotated[
-        str,
-        Path(description="LTD project slug to refresh."),
-    ],
+    ltd_slug: LtdSlugParam,
 ) -> KeeperSyncProjectRefreshAccepted:
     async with context.session.begin():
         service = context.factory.create_keeper_sync_run_service()
