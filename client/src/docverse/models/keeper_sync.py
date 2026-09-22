@@ -31,6 +31,7 @@ from .editions import EditionKind
 __all__ = [
     "KeeperSyncConfig",
     "KeeperSyncConfigUpdate",
+    "KeeperSyncConfigWrite",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",
@@ -137,9 +138,21 @@ class KeeperSyncConfig(BaseModel):
     :meth:`filter_in_scope` for the rule, and
     ``POST /orgs/{org}/keeper-sync/scope-preview`` for a side-effect-free
     resolution of a candidate scope against the live LTD listing.
+
+    This is a **read** model, so ``extra="ignore"``: it parses both the
+    stored JSONB blob and a server's response body, and either may carry
+    a field written by a newer server than the code reading it — a
+    rolled-back server loading a row a newer one wrote, or a published
+    client parsing a newer server's response. Discarding such a field
+    keeps the older reader working; rejecting it would fail validation
+    over a value that would be dropped anyway, *after* the write had
+    already landed. Request bodies are strict instead:
+    :class:`KeeperSyncConfigWrite` (``PUT``) and
+    :class:`KeeperSyncConfigUpdate` (``PATCH``) both ``forbid`` unknown
+    fields, so a misspelled field in a request is still a 422.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = Field(
         default=False,
@@ -264,6 +277,26 @@ class KeeperSyncConfig(BaseModel):
                 and not any(p.fullmatch(slug) for p in exclude_patterns)
             )
         ]
+
+
+class KeeperSyncConfigWrite(KeeperSyncConfig):
+    """Full replacement of an organization's LTD Keeper sync configuration.
+
+    Request model for ``PUT /orgs/{org}/keeper-sync``. It carries exactly
+    the fields of :class:`KeeperSyncConfig` — and validates them by the
+    same rules, since it inherits them — but restores ``extra="forbid"``,
+    which the read model gives up so an older reader can tolerate a field
+    a newer server wrote.
+
+    The split is what lets the two directions differ: an unknown key
+    arriving at a *reader* is a newer writer's field and is dropped,
+    while an unknown key in a *request body* is the caller's typo and is
+    rejected with a 422 rather than silently discarded. ``PATCH`` uses
+    :class:`KeeperSyncConfigUpdate`, which forbids unknown fields for the
+    same reason.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class KeeperSyncConfigUpdate(BaseModel):

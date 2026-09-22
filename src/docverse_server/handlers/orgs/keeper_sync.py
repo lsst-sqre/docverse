@@ -9,6 +9,7 @@ from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
 from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
+    KeeperSyncConfigWrite,
     KeeperSyncEditionStatus,
     KeeperSyncResourceType,
     KeeperSyncRun,
@@ -76,10 +77,19 @@ async def get_org_keeper_sync_config(
 async def put_org_keeper_sync_config(
     *,
     org_slug: OrgSlugParam,
-    data: KeeperSyncConfig,
+    data: KeeperSyncConfigWrite,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> KeeperSyncConfig:
+    """Replace the org's keeper-sync config wholesale.
+
+    The request body is :class:`KeeperSyncConfigWrite` rather than the
+    response's :class:`KeeperSyncConfig`: the response model ignores
+    unknown keys so an older reader can load a config a newer server
+    wrote, while the request body keeps ``extra="forbid"`` so a
+    misspelled field is a 422 instead of a value silently dropped on its
+    way into the database.
+    """
     async with context.session.begin():
         service = context.factory.create_keeper_sync_config_service()
         result = await service.put(org_slug=org_slug, config=data)

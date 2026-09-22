@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
+    KeeperSyncConfigWrite,
     KeeperSyncRun,
     KeeperSyncScopePreview,
     KeeperSyncTombstone,
@@ -400,9 +401,37 @@ def test_keeper_sync_tombstone_id_is_base32_string() -> None:
     assert restored.id == "AAAA-BBBB-CCCC-05"
 
 
-def test_extra_fields_forbidden() -> None:
+def test_unknown_fields_are_ignored() -> None:
+    """A config carrying an unknown key loads, with the key dropped.
+
+    ``KeeperSyncConfig`` is a *read* model: it parses both the stored
+    JSONB blob and a server's response body, either of which may carry a
+    field a newer server writes and this release does not know. Tolerating
+    it keeps an older reader — a rolled-back server loading the row, or a
+    published client parsing the response — working instead of failing
+    validation on a field it would only discard anyway.
+    """
+    config = KeeperSyncConfig.model_validate(
+        {
+            "enabled": False,
+            "ltd_base_url": "https://keeper.lsst.codes/",
+            "project_slugs": [],
+            "unknown": True,
+        }
+    )
+    assert config.enabled is False
+    assert "unknown" not in config.model_dump()
+
+
+def test_config_write_forbids_unknown_fields() -> None:
+    """``PUT``'s request model stays strict even though the read model isn't.
+
+    The asymmetry is the point: an unknown key reaching a reader is a
+    newer writer's field and is dropped, but an unknown key in a request
+    body is the caller's typo and must not be silently discarded.
+    """
     with pytest.raises(ValidationError):
-        KeeperSyncConfig.model_validate(
+        KeeperSyncConfigWrite.model_validate(
             {
                 "enabled": False,
                 "ltd_base_url": "https://keeper.lsst.codes/",
@@ -410,6 +439,30 @@ def test_extra_fields_forbidden() -> None:
                 "unknown": True,
             }
         )
+
+
+def test_config_write_accepts_a_full_config_payload() -> None:
+    """The write model parses every field the read model does."""
+    payload = {
+        "enabled": True,
+        "ltd_base_url": "https://keeper.example.com/",
+        "project_slugs": ["sqr-112"],
+        "project_slug_patterns": [r"sqr-\d+"],
+        "exclude_project_slugs": ["www"],
+        "exclude_project_slug_patterns": [r"test-.*"],
+    }
+    write = KeeperSyncConfigWrite.model_validate(payload)
+    assert write.model_dump(mode="json") == payload
+    assert KeeperSyncConfig.model_validate(payload) == KeeperSyncConfig(
+        **write.model_dump()
+    )
+
+
+def test_config_write_validates_patterns() -> None:
+    """An uncompilable pattern is rejected on ``PUT`` as it is on ``PATCH``."""
+    with pytest.raises(ValidationError) as excinfo:
+        KeeperSyncConfigWrite.model_validate({"project_slug_patterns": ["a("]})
+    assert "project_slug_patterns" in str(excinfo.value)
 
 
 def test_scope_preview_slug_lists_default_to_empty() -> None:

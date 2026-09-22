@@ -370,6 +370,36 @@ async def test_update_keeper_sync_config() -> None:
     assert config.project_slugs == ["dmtn-001"]
 
 
+@pytest.mark.asyncio
+async def test_update_keeper_sync_config_ignores_unknown_response_field() -> (
+    None
+):
+    """A response field this client release predates does not break parsing.
+
+    The write has already applied by the time the response is parsed, so
+    failing here would report an error for a change that did land. The
+    unknown field is dropped and the known ones come back intact.
+    """
+    payload = {
+        "enabled": True,
+        "ltd_base_url": "https://keeper.lsst.codes/",
+        "project_slugs": ["dmtn-001"],
+        "future_scope_field": ["not-yet-a-thing"],
+    }
+    async with respx.mock(base_url=BASE_URL) as router:
+        router.patch("/orgs/myorg/keeper-sync").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            config = await client.update_keeper_sync_config(
+                "myorg", KeeperSyncConfigUpdate(enabled=True)
+            )
+
+    assert config.enabled is True
+    assert config.project_slugs == ["dmtn-001"]
+    assert "future_scope_field" not in config.model_dump()
+
+
 def test_org_membership_update_forbids_identity_fields() -> None:
     """OrgMembershipUpdate rejects principal/principal_type fields."""
     with pytest.raises(ValidationError):

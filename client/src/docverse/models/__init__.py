@@ -46,6 +46,7 @@ from .infrastructure import (
 from .keeper_sync import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
+    KeeperSyncConfigWrite,
     KeeperSyncEditionDiff,
     KeeperSyncEditionStatus,
     KeeperSyncProjectRefreshAccepted,
@@ -143,6 +144,7 @@ __all__ = [
     "JobStatus",
     "KeeperSyncConfig",
     "KeeperSyncConfigUpdate",
+    "KeeperSyncConfigWrite",
     "KeeperSyncEditionDiff",
     "KeeperSyncEditionStatus",
     "KeeperSyncProjectRefreshAccepted",

@@ -394,6 +394,36 @@ async def test_patch_rejects_unknown_field(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_put_rejects_unknown_field(client: AsyncClient) -> None:
+    """``PUT`` still 422s on an unknown field, and stores nothing.
+
+    ``KeeperSyncConfig`` itself now ignores unknown keys so an older
+    reader can load a row a newer server wrote, but the ``PUT`` request
+    body is ``KeeperSyncConfigWrite``, which forbids them — a caller's
+    typo must not be silently dropped on the way into the database.
+    """
+    await _setup(client)
+    response = await client.put(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        json={
+            "enabled": True,
+            "ltd_base_url": "https://keeper.lsst.codes/",
+            "project_slugs": ["sqr-112"],
+            "unknown": True,
+        },
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 422
+
+    fetched = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["enabled"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field",
     [
