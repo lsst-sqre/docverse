@@ -23,6 +23,8 @@ second.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -213,14 +215,21 @@ class KeeperSyncScopePreviewService:
             if row.date_tombstoned is not None
         }
 
+        # Each exact-slug field is reported on separately; see
+        # ``_unmatched_slugs`` for why they are not merged.
+        listed = config.project_slugs
+        available = frozenset(ltd_slugs)
         preview = KeeperSyncScopePreview(
             ltd_count=len(ltd_slugs),
             in_scope_count=len(in_scope_slugs),
             in_scope_slugs=in_scope_slugs,
             new_slugs=[s for s in in_scope_slugs if s not in known_slugs],
             tombstoned_slugs=[s for s in in_scope_slugs if s in tombstoned],
-            unmatched_project_slugs=_unmatched_project_slugs(
-                config, ltd_slugs
+            unmatched_project_slugs=_unmatched_slugs(
+                () if isinstance(listed, str) else listed, available
+            ),
+            unmatched_exclude_project_slugs=_unmatched_slugs(
+                config.exclude_project_slugs, available
             ),
         )
         self._logger.info(
@@ -231,7 +240,14 @@ class KeeperSyncScopePreviewService:
             in_scope_count=preview.in_scope_count,
             new_count=len(preview.new_slugs),
             tombstoned_count=len(preview.tombstoned_slugs),
-            unmatched_count=len(preview.unmatched_project_slugs),
+            # Named for the response fields they count, rather than one
+            # ``unmatched_count``, so a log line says which field an
+            # operator has to go fix — the same reason the response
+            # carries two lists.
+            unmatched_project_slugs_count=len(preview.unmatched_project_slugs),
+            unmatched_exclude_project_slugs_count=len(
+                preview.unmatched_exclude_project_slugs
+            ),
         )
         return preview
 
@@ -291,25 +307,47 @@ class KeeperSyncScopePreviewService:
             ) from exc
 
 
-def _unmatched_project_slugs(
-    config: KeeperSyncConfig, ltd_slugs: list[str]
+def _unmatched_slugs(
+    configured: Iterable[str], available: AbstractSet[str]
 ) -> list[str]:
-    """Return configured exact slugs the LTD listing does not contain.
+    """Return one field's entries that the LTD listing does not contain.
 
-    The typo catcher: a misspelled ``project_slugs`` entry silently
-    syncs nothing and a misspelled ``exclude_project_slugs`` entry
-    silently excludes nothing, and neither is visible in the resolved
-    scope. Only the two *exact*-slug fields are checked — a pattern
-    matching nothing is a legitimate way to stage a future wave, and
-    ``project_slugs == "*"`` names no slugs at all.
+    The typo catcher, applied to each *exact*-slug field separately —
+    :attr:`KeeperSyncConfig.project_slugs` and
+    :attr:`KeeperSyncConfig.exclude_project_slugs` each get their own
+    call and their own response field. Merging them would save a line
+    here and cost the operator the only thing that makes the report
+    actionable: which field the entry came from. A missed include
+    admits nothing and is almost certainly a misspelling; a missed
+    exclude holds nothing back, which is either a misspelling — the
+    dangerous case, because the product it was meant to stop syncs
+    anyway — or a stale entry for a product since deleted from Keeper,
+    which is harmless. Those are different fixes, so they are different
+    lists.
 
-    Entries are reported in config order with ``project_slugs`` first,
-    de-duplicated, so a slug listed in both fields is named once.
+    For the same reason the two lists are not de-duplicated *against
+    each other*: a slug typed the same wrong way in both fields is a
+    mistake in both fields. Within one field, repeated entries are
+    reported once, in config order.
+
+    The pattern fields are checked by neither call: a pattern matching
+    nothing is a legitimate way to stage a future wave. Nor is
+    ``project_slugs == "*"``, which names no slugs at all — callers
+    pass an empty iterable for it.
+
+    Parameters
+    ----------
+    configured
+        One field's configured slugs, in config order.
+    available
+        Every slug the live LTD listing contained.
+
+    Returns
+    -------
+    list of str
+        The entries absent from ``available``, in config order,
+        de-duplicated.
     """
-    listed = config.project_slugs
-    configured = [] if isinstance(listed, str) else list(listed)
-    configured.extend(config.exclude_project_slugs)
-    available = set(ltd_slugs)
     unmatched: list[str] = []
     seen: set[str] = set()
     for slug in configured:

@@ -300,7 +300,8 @@ config honest about what is actually doing the work.
   "in_scope_slugs": ["sqr-060", "sqr-112", "dmtn-201"],
   "new_slugs": ["dmtn-201"],
   "tombstoned_slugs": ["sqr-060"],
-  "unmatched_project_slugs": ["sqr-9999"]
+  "unmatched_project_slugs": ["sqr-9999"],
+  "unmatched_exclude_project_slugs": ["wwww"]
 }
 ```
 
@@ -311,9 +312,10 @@ config honest about what is actually doing the work.
 | `in_scope_slugs` | The resolved scope, in LTD listing order — the order a backfill would work through. Includes slugs a tombstone will make sync skip. |
 | `new_slugs` | In-scope slugs with no keeper-sync state row on this org yet: exactly what the next backfill would import **for the first time**. |
 | `tombstoned_slugs` | In scope by config, but skipped because the project-resource state row is tombstoned. |
-| `unmatched_project_slugs` | Configured exact slugs the LTD listing does not contain — the typo catcher. |
+| `unmatched_project_slugs` | `project_slugs` entries the LTD listing does not contain — the typo catcher for the include list. |
+| `unmatched_exclude_project_slugs` | `exclude_project_slugs` entries the LTD listing does not contain. |
 
-Three of these deserve more than a row.
+Four of these deserve more than a row.
 
 **`new_slugs` is the one to size a wave by.** `in_scope_count` counts
 everything the config admits, including the projects already synced
@@ -333,17 +335,36 @@ scope will not do it, because the tombstone is a veto that outranks the
 config.
 
 **`unmatched_project_slugs` catches the silent mistakes.** A misspelled
-entry in `project_slugs` syncs nothing and a misspelled entry in
-`exclude_project_slugs` excludes nothing, and neither error shows up
-anywhere in the resolved scope — the scope just quietly comes out
-wrong. Anything listed here is a slug you named that LTD does not have.
-Only those two *exact*-slug fields are checked: a pattern that matches
-nothing is a legitimate way to stage a future wave, and `"*"` names no
-slugs at all.
+entry in `project_slugs` admits nothing, and that error shows up
+nowhere in the resolved scope — the scope just quietly comes out
+smaller than you meant. Anything listed here is a slug you named that
+LTD does not have, so it is almost always a typo: fix the spelling and
+preview again.
 
-An empty `unmatched_project_slugs` with an `in_scope_count` of zero
-means your patterns matched nothing — check `fullmatch`, and check the
-case.
+**`unmatched_exclude_project_slugs` is the same check with a different
+meaning**, which is why it is a separate list rather than being folded
+into the one above. An `exclude_project_slugs` entry LTD does not list
+holds nothing back, and that is either:
+
+- a **typo** — the dangerous case. The product you meant to keep out
+  has a slug you never actually excluded, so it is in scope and the
+  next backfill or tier tick will sync it. Check it against
+  `in_scope_slugs`.
+- a **stale entry** for a product since deleted from Keeper. Harmless:
+  there is nothing left to exclude. Drop the entry from the config
+  whenever you next `PATCH` it, so the list keeps telling you the
+  truth.
+
+Nothing in the response distinguishes those two, because Docverse
+cannot tell them apart — only you know whether the slug was ever meant
+to exist. What the split does guarantee is that you are asked the
+question about the right field.
+
+Neither list checks the *pattern* fields: a pattern that matches
+nothing is a legitimate way to stage a future wave, and `"*"` names no
+slugs at all. So two empty unmatched lists with an `in_scope_count` of
+zero mean your patterns matched nothing — check `fullmatch`, and check
+the case.
 
 ## Observability
 
@@ -359,8 +380,13 @@ them under the same names:
   `tombstoned_count`, and `fan_out_count`.
 - `Previewed keeper-sync scope`, from the preview endpoint, carrying
   the same `ltd_count` and `in_scope_count` plus `new_count`,
-  `tombstoned_count`, `unmatched_count`, and a `candidate` flag
+  `tombstoned_count`, `unmatched_project_slugs_count`,
+  `unmatched_exclude_project_slugs_count`, and a `candidate` flag
   distinguishing a previewed candidate body from the stored config.
+  The two unmatched counts are named for the response fields they
+  count, and are logged separately for the same reason the response
+  carries two lists: a line saying only how many entries were
+  unmatched does not say which field to go fix.
 - `Updated keeper_sync_config`, on every `PUT` and `PATCH`, recording
   the size of each of the four scope fields as `project_slugs_count`
   (`null` for the `"*"` wildcard, which has no size),

@@ -380,14 +380,17 @@ async def test_tombstoned_in_scope_slug_is_reported(
 
 
 @pytest.mark.asyncio
-async def test_misspelled_exact_slugs_are_reported_as_unmatched(
+async def test_misspelled_exact_slugs_are_reported_per_field(
     client: AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """Exact-slug entries LTD does not list are surfaced as typos.
+    """Each exact-slug field gets its own unmatched list.
 
-    Both exact-slug fields are checked, ``project_slugs`` first. Pattern
-    fields are not: a pattern matching nothing is how a future wave is
+    A missed include and a missed exclude read differently — an include
+    admits nothing, while an exclude holds nothing back and so lets the
+    product it was meant to stop sync anyway — so the response has to
+    say which field an entry came from. Pattern fields are checked by
+    neither list: a pattern matching nothing is how a future wave is
     staged, so flagging it would be noise.
     """
     await _setup(client)
@@ -396,6 +399,7 @@ async def test_misspelled_exact_slugs_are_reported_as_unmatched(
         project_slugs=["sqr-112", "sqr-9999"],
         project_slug_patterns=[r"nothing-matches-\d+"],
         exclude_project_slugs=["wwww"],
+        exclude_project_slug_patterns=[r"also-nothing-\d+"],
     )
     _mock_ltd_products(mock_discovery, ["sqr-060", "sqr-112", "www"])
 
@@ -403,8 +407,37 @@ async def test_misspelled_exact_slugs_are_reported_as_unmatched(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["unmatched_project_slugs"] == ["sqr-9999", "wwww"]
+    assert body["unmatched_project_slugs"] == ["sqr-9999"]
+    assert body["unmatched_exclude_project_slugs"] == ["wwww"]
     assert body["in_scope_slugs"] == ["sqr-112"]
+
+
+@pytest.mark.asyncio
+async def test_slug_missing_from_ltd_in_both_fields_is_reported_twice(
+    client: AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A slug named in both exact fields is reported under both.
+
+    The two lists are independent reports on two independent fields,
+    not one de-duplicated set, so a slug typed the same wrong way in
+    both places is a mistake in both places and is named in both. Each
+    list still de-duplicates *within itself*.
+    """
+    await _setup(client)
+    await _put_config(
+        client,
+        project_slugs=["sqr-9999", "sqr-9999"],
+        exclude_project_slugs=["sqr-9999"],
+    )
+    _mock_ltd_products(mock_discovery, ["sqr-060", "sqr-112"])
+
+    response = await _preview(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unmatched_project_slugs"] == ["sqr-9999"]
+    assert body["unmatched_exclude_project_slugs"] == ["sqr-9999"]
 
 
 @pytest.mark.asyncio
@@ -714,5 +747,6 @@ async def test_openapi_documents_the_endpoint(client: AsyncClient) -> None:
         "new_slugs",
         "tombstoned_slugs",
         "unmatched_project_slugs",
+        "unmatched_exclude_project_slugs",
     ):
         assert schema["properties"][name]["description"]

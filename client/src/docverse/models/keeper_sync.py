@@ -578,6 +578,7 @@ class KeeperSyncScopePreview(BaseModel):
                     "new_slugs": ["dmtn-201"],
                     "tombstoned_slugs": ["sqr-060"],
                     "unmatched_project_slugs": ["sqr-9999"],
+                    "unmatched_exclude_project_slugs": ["wwww"],
                 }
             ]
         }
@@ -639,13 +640,32 @@ class KeeperSyncScopePreview(BaseModel):
     unmatched_project_slugs: list[str] = Field(
         default_factory=list,
         description=(
-            "Entries of ``project_slugs`` or ``exclude_project_slugs``"
-            " that the live LTD listing does not contain — the typo"
-            " catcher. Pattern fields are not checked here: a pattern"
-            " matching nothing is a legitimate way to stage a future"
-            " wave. Listed in config order, ``project_slugs`` first."
+            "Entries of ``project_slugs`` that the live LTD listing does"
+            " not contain — the typo catcher for the include list. Such"
+            " an entry admits nothing, so it is almost always a"
+            " misspelling. ``project_slug_patterns`` is not checked"
+            " here: a pattern matching nothing is a legitimate way to"
+            " stage a future wave. Listed in config order and"
+            " de-duplicated."
         ),
         examples=[["sqr-9999"]],
+    )
+
+    unmatched_exclude_project_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Entries of ``exclude_project_slugs`` that the live LTD"
+            " listing does not contain. Reported separately from"
+            " ``unmatched_project_slugs`` because it reads differently:"
+            " such an entry removes nothing, so it is either a"
+            " misspelling — dangerous, because the product it was meant"
+            " to hold back syncs anyway — or a stale entry for a"
+            " product since deleted from LTD, which is harmless and can"
+            " be dropped from the config. ``exclude_project_slug_"
+            "patterns`` is not checked here. Listed in config order and"
+            " de-duplicated."
+        ),
+        examples=[["wwww"]],
     )
 
 

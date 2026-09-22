@@ -661,3 +661,24 @@ def test_scope_preview_slug_lists_default_to_empty() -> None:
     assert preview.new_slugs == []
     assert preview.tombstoned_slugs == []
     assert preview.unmatched_project_slugs == []
+    assert preview.unmatched_exclude_project_slugs == []
+
+
+def test_scope_preview_example_validates_against_the_model() -> None:
+    """The OpenAPI example is a real response body, field for field.
+
+    The example is what an operator reads in the API docs before they
+    ever call the endpoint, so it has to parse as the model *and* name
+    every field — a field missing from the example is one the docs
+    quietly imply the response does not have.
+    """
+    schema_extra = KeeperSyncScopePreview.model_config["json_schema_extra"]
+    assert isinstance(schema_extra, dict)
+    examples = schema_extra["examples"]
+    assert isinstance(examples, list)
+    example = examples[0]
+    assert isinstance(example, dict)
+
+    assert set(example) == set(KeeperSyncScopePreview.model_fields)
+    preview = KeeperSyncScopePreview.model_validate(example)
+    assert preview.model_dump(mode="json") == example
