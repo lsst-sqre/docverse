@@ -13,6 +13,7 @@ from docverse.models import (
     KeeperSyncConfigWrite,
     KeeperSyncRun,
     KeeperSyncScopePreview,
+    KeeperSyncScopePreviewRequest,
     KeeperSyncTombstone,
 )
 
@@ -343,6 +344,62 @@ def test_config_update_rejects_unknown_string_token() -> None:
     """Only the literal ``"*"`` is accepted for ``project_slugs``."""
     with pytest.raises(ValidationError):
         KeeperSyncConfigUpdate(project_slugs="ALL")  # type: ignore[arg-type]
+
+
+def test_scope_preview_request_rejects_ltd_base_url() -> None:
+    """A preview body may not repoint the LTD instance it fetches.
+
+    The preview resolves a *scope*, and the LTD instance is not part of
+    a scope. Honouring a candidate ``ltd_base_url`` would make the
+    endpoint fetch an operator-supplied URL from inside the cluster and
+    report the upstream status back — an interactive status oracle for
+    internal hosts — so the field is refused outright, by name.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        KeeperSyncScopePreviewRequest.model_validate(
+            {"ltd_base_url": "http://169.254.169.254/"}
+        )
+    assert "ltd_base_url" in str(excinfo.value)
+
+
+def test_scope_preview_request_rejects_null_ltd_base_url() -> None:
+    """Even an explicit ``null`` for the field is refused.
+
+    Nothing about ``null`` is a safe special case: the field simply has
+    no meaning in a preview body, so naming it at all is the error.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        KeeperSyncScopePreviewRequest.model_validate({"ltd_base_url": None})
+    assert "ltd_base_url" in str(excinfo.value)
+
+
+def test_scope_preview_request_schema_omits_ltd_base_url() -> None:
+    """The published schema does not advertise a field it always rejects."""
+    schema = KeeperSyncScopePreviewRequest.model_json_schema()
+    assert "ltd_base_url" not in schema["properties"]
+    assert "project_slug_patterns" in schema["properties"]
+
+
+def test_scope_preview_request_is_a_config_update() -> None:
+    """It merges over the stored config exactly as a ``PATCH`` body does."""
+    request = KeeperSyncScopePreviewRequest(project_slugs="*")
+    assert isinstance(request, KeeperSyncConfigUpdate)
+    assert request.model_dump(exclude_unset=True) == {"project_slugs": "*"}
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["project_slug_patterns", "exclude_project_slug_patterns"],
+)
+def test_scope_preview_request_validates_patterns_like_patch(
+    field: str,
+) -> None:
+    """The preview is not a way to sneak an invalid pattern past ``PATCH``."""
+    with pytest.raises(ValidationError) as excinfo:
+        KeeperSyncScopePreviewRequest.model_validate({field: ["sqr-("]})
+    message = str(excinfo.value)
+    assert field in message
+    assert "sqr-(" in message
 
 
 def test_keeper_sync_run_id_is_base32_string() -> None:

@@ -15,6 +15,7 @@ from pydantic import (
     HttpUrl,
     ValidationInfo,
     field_validator,
+    model_validator,
 )
 
 from ._examples import (
@@ -43,6 +44,7 @@ __all__ = [
     "KeeperSyncRunKind",
     "KeeperSyncRunStatus",
     "KeeperSyncScopePreview",
+    "KeeperSyncScopePreviewRequest",
     "KeeperSyncTierCohort",
     "KeeperSyncTierName",
     "KeeperSyncTierStatus",
@@ -409,6 +411,66 @@ class KeeperSyncConfigUpdate(BaseModel):
             )
             raise ValueError(msg)
         return value
+
+
+def _hide_ltd_base_url(schema: dict[str, Any]) -> None:
+    """Drop the inherited ``ltd_base_url`` from a generated JSON schema.
+
+    :class:`KeeperSyncScopePreviewRequest` inherits the field so that it
+    stays a :class:`KeeperSyncConfigUpdate` — which is what lets the
+    preview reuse ``PATCH``'s merge unchanged — but it rejects the field
+    outright. Publishing a property that is always a 422 would be a lie
+    in the OpenAPI contract, so the schema omits it and the rejection is
+    the only thing a caller can discover.
+    """
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("ltd_base_url", None)
+
+
+class KeeperSyncScopePreviewRequest(KeeperSyncConfigUpdate):
+    """Candidate scope for ``POST /orgs/{org}/keeper-sync/scope-preview``.
+
+    Every field of :class:`KeeperSyncConfigUpdate`, validated by exactly
+    the same rules and merged over the stored config by exactly the same
+    merge — minus ``ltd_base_url``, which is rejected with a 422 naming
+    the field.
+
+    The preview resolves a *scope*, and the LTD instance a scope is
+    resolved against is not part of it. Honouring a candidate
+    ``ltd_base_url`` would have the server fetch an
+    operator-supplied URL from inside the cluster and echo the upstream
+    status and failure mode back in the 502 — an interactive status
+    oracle for internal hosts such as ``http://169.254.169.254/`` or a
+    bare in-cluster service name. So the preview always fetches from the
+    *stored* config's ``ltd_base_url`` (or the model default when no
+    config has been stored), and repointing the LTD instance stays what
+    it was: a ``PUT`` or ``PATCH`` the operator has to actually save.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra=_hide_ltd_base_url
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_ltd_base_url(cls, data: Any) -> Any:
+        """Refuse a body that names ``ltd_base_url`` at all.
+
+        Checked before field validation, and on the raw payload, so an
+        explicit ``null`` is refused for the same reason a URL is: the
+        field has no meaning in a preview body, and naming it is the
+        error.
+        """
+        if isinstance(data, dict) and "ltd_base_url" in data:
+            msg = (
+                "ltd_base_url is not accepted by the scope preview; the"
+                " preview always resolves the scope against the stored"
+                " config's LTD instance. Change it with PUT or PATCH"
+                " /orgs/{org}/keeper-sync instead."
+            )
+            raise ValueError(msg)
+        return data
 
 
 class KeeperSyncScopePreview(BaseModel):

@@ -10,7 +10,8 @@ without persisting it or enqueueing any work.
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal, cast
 
 import httpx
 import pytest
@@ -18,8 +19,10 @@ import respx
 import structlog
 from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import OrgRole
+from docverse_server.factory import Factory
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -28,6 +31,7 @@ from docverse_server.storage.keeper_sync import (
     ResourceType,
     TombstoneReason,
 )
+from docverse_server.storage.ltd.products_client import LtdProductsClient
 from docverse_server.storage.organization_store import OrganizationStore
 from tests.conftest import seed_member, seed_org_with_admin
 
@@ -101,6 +105,71 @@ def _mock_ltd_products(router: respx.Router, slugs: list[str]) -> None:
             headers={"content-type": "application/json"},
         )
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _Fetch:
+    """One observed attempt to read the LTD product listing."""
+
+    base_url: str
+    in_transaction: bool
+
+
+@dataclass(slots=True)
+class _FetchProbe:
+    """Every LTD product-listing fetch a request made, in order."""
+
+    fetches: list[_Fetch] = field(default_factory=list)
+
+
+class _ProbeProductsClient:
+    """Records the session state each LTD fetch is made under.
+
+    Wraps the real client rather than replacing it, so the respx-mocked
+    listing still supplies the data and only the observation is added.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: AsyncSession,
+        inner: LtdProductsClient,
+        base_url: str,
+        probe: _FetchProbe,
+    ) -> None:
+        self._session = session
+        self._inner = inner
+        self._base_url = base_url
+        self._probe = probe
+
+    async def list_product_slugs(self) -> list[str]:
+        self._probe.fetches.append(
+            _Fetch(
+                base_url=self._base_url,
+                in_transaction=self._session.in_transaction(),
+            )
+        )
+        return await self._inner.list_product_slugs()
+
+
+def _install_fetch_probe(monkeypatch: pytest.MonkeyPatch) -> _FetchProbe:
+    """Observe every LTD product fetch the request-scoped factory mints."""
+    probe = _FetchProbe()
+    create = Factory.create_ltd_products_client
+
+    def _create(self: Factory, *, base_url: str) -> LtdProductsClient:
+        return cast(
+            "LtdProductsClient",
+            _ProbeProductsClient(
+                session=self._session,
+                inner=create(self, base_url=base_url),
+                base_url=base_url,
+                probe=probe,
+            ),
+        )
+
+    monkeypatch.setattr(Factory, "create_ltd_products_client", _create)
+    return probe
 
 
 async def _setup(client: AsyncClient) -> None:
@@ -405,6 +474,84 @@ async def test_uncompilable_candidate_pattern_is_rejected(
 
 
 @pytest.mark.asyncio
+async def test_ltd_is_fetched_with_no_transaction_open(
+    client: AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The LTD fetch never runs inside a database transaction.
+
+    LTD is a third party on the far side of an httpx timeout. Reading
+    the org row and then awaiting that fetch inside one transaction
+    pinned a pooled Postgres connection ``idle in transaction`` for the
+    whole timeout — and previews are exactly what an operator retries
+    when LTD is slow, so the pin multiplies under the retries. The
+    request therefore takes two short transactions with the fetch in
+    the gap between them.
+    """
+    await _setup(client)
+    await _put_config(client, project_slugs="*")
+    _mock_ltd_products(mock_discovery, ["sqr-060", "sqr-112"])
+    probe = _install_fetch_probe(monkeypatch)
+
+    response = await _preview(client)
+
+    assert response.status_code == 200
+    assert response.json()["in_scope_slugs"] == ["sqr-060", "sqr-112"]
+    assert [fetch.in_transaction for fetch in probe.fetches] == [False]
+    # And the listing came from the stored config's LTD instance.
+    assert probe.fetches[0].base_url.startswith(_LTD_BASE)
+
+
+@pytest.mark.asyncio
+async def test_candidate_ltd_base_url_is_rejected_before_any_fetch(
+    client: AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate ``ltd_base_url`` is a 422, and nothing is fetched.
+
+    Merging a candidate base URL in before the fetch turned the preview
+    into an interactive status oracle: an org admin could aim it at an
+    in-cluster service name or ``http://169.254.169.254/`` and read the
+    upstream status and failure class back out of the 502. The field is
+    refused by name, and the refusal lands before any outbound request.
+    """
+    await _setup(client)
+    await _put_config(client, project_slugs="*")
+    _mock_ltd_products(mock_discovery, ["sqr-060"])
+    probe = _install_fetch_probe(monkeypatch)
+
+    response = await _preview(
+        client,
+        body={
+            "project_slugs": "*",
+            "ltd_base_url": "http://169.254.169.254/",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "ltd_base_url" in json.dumps(response.json()["detail"])
+    assert probe.fetches == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_null_ltd_base_url_is_rejected(
+    client: AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Naming the field at all is the error, ``null`` included."""
+    await _setup(client)
+    await _put_config(client, project_slugs="*")
+    _mock_ltd_products(mock_discovery, ["sqr-060"])
+
+    response = await _preview(client, body={"ltd_base_url": None})
+
+    assert response.status_code == 422
+    assert "ltd_base_url" in json.dumps(response.json()["detail"])
+
+
+@pytest.mark.asyncio
 async def test_explicit_null_candidate_field_is_rejected(
     client: AsyncClient,
 ) -> None:
@@ -545,6 +692,18 @@ async def test_openapi_documents_the_endpoint(client: AsyncClient) -> None:
     # stored config.
     assert operation["requestBody"].get("required", False) is False
     assert "502" in operation["responses"]
+
+    # The body is the preview's own request model, and it does not
+    # advertise ``ltd_base_url`` — a field it would always reject.
+    body_ref = operation["requestBody"]["content"]["application/json"][
+        "schema"
+    ]
+    assert "KeeperSyncScopePreviewRequest" in json.dumps(body_ref)
+    request_schema = spec["components"]["schemas"][
+        "KeeperSyncScopePreviewRequest"
+    ]
+    assert "ltd_base_url" not in request_schema["properties"]
+    assert "project_slug_patterns" in request_schema["properties"]
 
     schema = spec["components"]["schemas"]["KeeperSyncScopePreview"]
     assert schema["examples"]

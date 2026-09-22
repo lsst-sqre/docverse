@@ -1291,10 +1291,15 @@ async def test_preview_predicts_the_backfill_a_widened_scope_launches(
 
     async with httpx.AsyncClient() as preview_http_client:
         async for session in db_session_dependency():
+            # Two short transactions with the LTD fetch in the gap, as
+            # the handler drives it — no transaction is held open across
+            # the third-party call.
+            service = _preview_service(session, preview_http_client)
             async with session.begin():
-                preview = await _preview_service(
-                    session, preview_http_client
-                ).preview(org_slug=org_slug)
+                plan = await service.load_plan(org_slug=org_slug)
+            fetched = await service.fetch_ltd_product_slugs(plan)
+            async with session.begin():
+                preview = await service.report(plan=plan, ltd_slugs=fetched)
             break
 
     # The resolved scope follows the LTD listing order, not the config's.

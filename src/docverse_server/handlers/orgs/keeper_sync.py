@@ -15,6 +15,7 @@ from docverse.models import (
     KeeperSyncRun,
     KeeperSyncRunStatus,
     KeeperSyncScopePreview,
+    KeeperSyncScopePreviewRequest,
     KeeperSyncTombstoneReason,
 )
 from docverse_server.dependencies.auth import AuthenticatedUser, require_admin
@@ -134,13 +135,15 @@ async def post_org_keeper_sync_scope_preview(
     *,
     org_slug: OrgSlugParam,
     data: Annotated[
-        KeeperSyncConfigUpdate | None,
+        KeeperSyncScopePreviewRequest | None,
         Body(
             description=(
                 "Candidate partial config, merged over the stored config"
                 " exactly as ``PATCH`` merges it — and validated exactly"
                 " as ``PATCH`` validates it. Omit the body entirely to"
-                " preview the stored config as-is."
+                " preview the stored config as-is. ``ltd_base_url`` is"
+                " the one ``PATCH`` field not accepted here: the preview"
+                " always resolves against the stored LTD instance."
             ),
         ),
     ] = None,
@@ -159,11 +162,25 @@ async def post_org_keeper_sync_scope_preview(
     to read the live LTD product listing — unreachable, an error
     status, or a 200 whose body is not a product listing — is reported
     as a 502 naming LTD's own status, never a Docverse 500.
+
+    The LTD listing always comes from the **stored** config's
+    ``ltd_base_url``; a body that sets that field is a 422 naming it.
+    Previewing an operator-supplied base URL would make this endpoint a
+    status oracle for whatever the pod can reach.
+
+    Two short transactions, not one, with the LTD fetch in the gap:
+    holding a transaction open across a third-party call that can hang
+    for an httpx timeout pins a pooled Postgres connection ``idle in
+    transaction`` — and a slow LTD is exactly when operators retry the
+    preview.
     """
     context.rebind_logger(actor=user.username)
+    service = context.factory.create_keeper_sync_scope_preview_service()
     async with context.session.begin():
-        service = context.factory.create_keeper_sync_scope_preview_service()
-        return await service.preview(org_slug=org_slug, update=data)
+        plan = await service.load_plan(org_slug=org_slug, update=data)
+    ltd_slugs = await service.fetch_ltd_product_slugs(plan)
+    async with context.session.begin():
+        return await service.report(plan=plan, ltd_slugs=ltd_slugs)
 
 
 @router.post(

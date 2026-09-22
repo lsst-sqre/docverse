@@ -7,18 +7,31 @@ what a candidate scope resolves to *before* it is saved. This service
 merges the candidate over the stored config with exactly the merge
 ``PATCH`` uses, resolves it against the live LTD product listing, and
 returns a report. It writes nothing and enqueues nothing.
+
+The work is deliberately split into three steps rather than one
+``preview()`` call, because the LTD fetch in the middle must not run
+inside a database transaction: LTD sits behind an httpx timeout, and a
+transaction held open across it pins a pooled Postgres connection
+``idle in transaction`` for the whole timeout — under exactly the
+retries a slow LTD provokes. Handlers own transactions (see
+``CLAUDE.md``), so the handler runs :meth:`~KeeperSyncScopePreview
+Service.load_plan` in one short transaction, awaits
+:meth:`~KeeperSyncScopePreviewService.fetch_ltd_product_slugs` with
+none open, and runs :meth:`~KeeperSyncScopePreviewService.report` in a
+second.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 import structlog
 
 from docverse.models import (
     KeeperSyncConfig,
-    KeeperSyncConfigUpdate,
     KeeperSyncScopePreview,
+    KeeperSyncScopePreviewRequest,
 )
 from docverse_server.exceptions import NotFoundError, UpstreamServiceError
 from docverse_server.services.keeper_sync_config import KeeperSyncConfigService
@@ -30,20 +43,58 @@ from docverse_server.storage.ltd.client import LtdProductsError
 from docverse_server.storage.ltd.products_client import LtdProductsClient
 from docverse_server.storage.organization_store import OrganizationStore
 
-__all__ = ["KeeperSyncScopePreviewService", "LtdProductsClientFactory"]
+__all__ = [
+    "KeeperSyncScopePlan",
+    "KeeperSyncScopePreviewService",
+    "LtdProductsClientFactory",
+]
 
 
 class LtdProductsClientFactory(Protocol):
     """Callable minting an :class:`LtdProductsClient` for a base URL.
 
-    Threaded in so the service pins the LTD base URL from the config it
-    is previewing — which may be the *candidate* base URL, not the
-    stored one. ``Factory.create_ltd_products_client`` already matches
-    this shape; the indirection lets unit tests pass a fake client.
+    Threaded in so the service can pin the LTD base URL it fetches from
+    — always the *stored* config's, never a candidate's.
+    ``Factory.create_ltd_products_client`` already matches this shape;
+    the indirection lets unit tests pass a fake client.
     """
 
     def __call__(self, *, base_url: str) -> LtdProductsClient:
         """Return an :class:`LtdProductsClient` for ``base_url``."""
+
+
+@dataclass(frozen=True, slots=True)
+class KeeperSyncScopePlan:
+    """Everything the preview reads from the database before it calls LTD.
+
+    Carried across the untransacted LTD fetch, so the fetch itself needs
+    no session and the two database reads on either side of it can each
+    be their own short transaction. Every field is a plain value or a
+    detached pydantic model — nothing here is a live ORM row that would
+    re-open a transaction when touched after the first one commits.
+    """
+
+    org_id: int
+    """Internal row id of the organization being previewed."""
+
+    org_slug: str
+    """Organization slug, for logging."""
+
+    config: KeeperSyncConfig
+    """Candidate config: the stored one with any candidate merged over."""
+
+    ltd_base_url: str
+    """LTD instance to fetch, taken from the **stored** config.
+
+    Read off the stored config rather than the merged one, so the
+    preview cannot be pointed at an operator-supplied host even if a
+    future change lets a candidate body carry ``ltd_base_url`` again.
+    :class:`~docverse.models.KeeperSyncScopePreviewRequest` rejects that
+    field today; this is the second lock on the same door.
+    """
+
+    is_candidate: bool
+    """Whether a candidate body was merged in, for logging."""
 
 
 class KeeperSyncScopePreviewService:
@@ -64,13 +115,19 @@ class KeeperSyncScopePreviewService:
         self._products_client_factory = products_client_factory
         self._logger = logger
 
-    async def preview(
+    async def load_plan(
         self,
         *,
         org_slug: str,
-        update: KeeperSyncConfigUpdate | None = None,
-    ) -> KeeperSyncScopePreview:
-        """Report what a candidate scope resolves to on the live LTD.
+        update: KeeperSyncScopePreviewRequest | None = None,
+    ) -> KeeperSyncScopePlan:
+        """Read the org row and resolve the candidate config.
+
+        The first of the preview's two database reads, and the only one
+        that has to happen *before* LTD is called: the stored config is
+        what names the LTD instance to fetch. Keep it in its own short
+        transaction — see this module's docstring for why the fetch must
+        not join it.
 
         Parameters
         ----------
@@ -83,20 +140,14 @@ class KeeperSyncScopePreviewService:
 
         Returns
         -------
-        KeeperSyncScopePreview
-            Counts and slug lists describing the resolved scope. Nothing
-            is written and nothing is enqueued.
+        KeeperSyncScopePlan
+            The resolved candidate config plus the stored LTD base URL,
+            in a form that survives the transaction's commit.
 
         Raises
         ------
         NotFoundError
             If the organization does not exist.
-        UpstreamServiceError
-            If the LTD product listing could not be fetched *or read* —
-            including a 200 whose body is not a usable listing, which
-            is what a proxy or maintenance page in front of LTD serves.
-            Surfaces as a 502 naming LTD's status, so an LTD outage is
-            never reported as a Docverse 500.
 
         Notes
         -----
@@ -114,15 +165,44 @@ class KeeperSyncScopePreviewService:
             if update is None
             else self._config_service.merge(stored, update)
         )
+        return KeeperSyncScopePlan(
+            org_id=org.id,
+            org_slug=org_slug,
+            config=config,
+            ltd_base_url=str(stored.ltd_base_url),
+            is_candidate=update is not None,
+        )
 
-        ltd_slugs = await self._fetch_ltd_product_slugs(config)
+    async def report(
+        self, *, plan: KeeperSyncScopePlan, ltd_slugs: list[str]
+    ) -> KeeperSyncScopePreview:
+        """Resolve the plan against a fetched LTD listing.
+
+        The preview's second database read, and the last step: call it
+        in its own short transaction once
+        :meth:`fetch_ltd_product_slugs` has returned. Nothing is written
+        and nothing is enqueued.
+
+        Parameters
+        ----------
+        plan
+            What :meth:`load_plan` resolved.
+        ltd_slugs
+            The live LTD product slugs, in listing order.
+
+        Returns
+        -------
+        KeeperSyncScopePreview
+            Counts and slug lists describing the resolved scope.
+        """
+        config = plan.config
         in_scope_slugs = config.filter_in_scope(ltd_slugs)
 
         # One query covers both derived lists: ``new_slugs`` needs every
         # project-resource row (a tombstoned slug is known, not new), so
         # the tombstoned rows have to come back too.
         state_rows = await self._state_store.list_for_org(
-            org_id=org.id,
+            org_id=plan.org_id,
             resource_type=ResourceType.project,
             include_tombstoned=True,
         )
@@ -145,8 +225,8 @@ class KeeperSyncScopePreviewService:
         )
         self._logger.info(
             "Previewed keeper-sync scope",
-            org=org_slug,
-            candidate=update is not None,
+            org=plan.org_slug,
+            candidate=plan.is_candidate,
             ltd_count=preview.ltd_count,
             in_scope_count=preview.in_scope_count,
             new_count=len(preview.new_slugs),
@@ -155,10 +235,28 @@ class KeeperSyncScopePreviewService:
         )
         return preview
 
-    async def _fetch_ltd_product_slugs(
-        self, config: KeeperSyncConfig
+    async def fetch_ltd_product_slugs(
+        self, plan: KeeperSyncScopePlan
     ) -> list[str]:
         """Fetch the live LTD product listing, or raise a 502.
+
+        Touches no database session, and must be awaited with **no
+        transaction open**: this is the call that can hang for an httpx
+        timeout, and a transaction spanning it would pin a pooled
+        Postgres connection for the duration.
+
+        The listing always comes from ``plan.ltd_base_url`` — the
+        *stored* config's LTD instance — so a preview body can never
+        aim an outbound request at a host of the caller's choosing.
+
+        Raises
+        ------
+        UpstreamServiceError
+            If the LTD product listing could not be fetched *or read* —
+            including a 200 whose body is not a usable listing, which
+            is what a proxy or maintenance page in front of LTD serves.
+            Surfaces as a 502 naming LTD's status, so an LTD outage is
+            never reported as a Docverse 500.
 
         The fetch itself is shared with the worker's discovery and
         tier-cron passes — :meth:`LtdProductsClient.list_product_slugs`
@@ -178,7 +276,7 @@ class KeeperSyncScopePreviewService:
         staging a migration wave needs to tell those apart without pod
         logs.
         """
-        base_url = str(config.ltd_base_url)
+        base_url = plan.ltd_base_url
         client = self._products_client_factory(base_url=base_url)
         try:
             return await client.list_product_slugs()

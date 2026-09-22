@@ -180,6 +180,40 @@ nothing**. An empty body previews the stored config as it stands. The
 preview works whether or not sync is `enabled`, so you can stage a
 scope before turning sync on at all.
 
+### The preview always uses the stored LTD URL
+
+`ltd_base_url` is the one `PATCH` field the preview body does **not**
+accept. The listing is always fetched from the LTD instance named by
+the **stored** config — or from the model default,
+`https://keeper.lsst.codes`, when the org has no stored config yet.
+Sending `ltd_base_url` in a preview body is a **422** naming the
+field, and nothing is fetched:
+
+```json
+{"project_slugs": "*", "ltd_base_url": "https://keeper.example.org/"}
+```
+
+```
+ltd_base_url is not accepted by the scope preview; the preview always
+resolves the scope against the stored config's LTD instance. Change it
+with PUT or PATCH /orgs/{org}/keeper-sync instead.
+```
+
+The reason is that a preview resolves a *scope*, and the LTD instance a
+scope is resolved against is not part of one. Honouring a candidate
+base URL would have the server issue an outbound request to an
+arbitrary operator-supplied host from inside the cluster and report the
+result back synchronously — which is a probe for whatever the pod can
+reach, not a scope check. Repointing the LTD instance stays what it
+always was: a `PUT` or `PATCH` you actually save, and then preview.
+
+The preview also holds **no database transaction** while it waits on
+LTD — it takes one short transaction to read the config, releases it,
+fetches, and takes a second to read the sync state. That is why
+retrying a preview against a slow or hanging LTD costs nothing but the
+outbound requests: it cannot leave pooled Postgres connections sitting
+idle in transaction behind an httpx timeout.
+
 If the live product listing cannot be read, the preview reports a
 **502** — never a Docverse 500. That covers every way the listing can
 fail, not just the obvious one: LTD unreachable, LTD answering an
@@ -335,7 +369,9 @@ rule took them back out".
 ## Related
 
 - `client/src/docverse/models/keeper_sync.py` — `KeeperSyncConfig`,
-  where the scope rule and its validation are defined once, and
+  where the scope rule and its validation are defined once,
+  `KeeperSyncScopePreviewRequest` (the preview body, which is a
+  `KeeperSyncConfigUpdate` minus `ltd_base_url`), and
   `KeeperSyncScopePreview`.
 - `src/docverse_server/services/keeper_sync_scope_preview.py` — the
   side-effect-free preview service.
