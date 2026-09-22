@@ -6,6 +6,7 @@ import re
 from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any, Literal
 
 from pydantic import (
@@ -63,6 +64,47 @@ _MAX_SLUG_PATTERN_LENGTH = 256
 
 _PATTERN_ECHO_LENGTH = 64
 """How much of an over-long pattern is echoed back in its error."""
+
+_PATTERN_CACHE_SIZE = 64
+"""How many distinct slug-pattern lists keep their compiled form."""
+
+
+@lru_cache(maxsize=_PATTERN_CACHE_SIZE)
+def _compile_slug_patterns(
+    patterns: tuple[str, ...],
+) -> tuple[re.Pattern[str], ...]:
+    """Compile one scope field's patterns, memoized on the pattern list.
+
+    The scope rule is evaluated on the hot path — ``is_in_scope`` gates
+    every per-project keeper-sync request, and the tier crons resolve the
+    whole LTD listing every few minutes — so compiling up to
+    :data:`_MAX_SLUG_PATTERNS` regexes per call is wasted work.
+
+    The cache lives here, on the module, rather than on the model
+    instance. Pydantic compares ``__pydantic_private__`` in
+    ``BaseModel.__eq__``, so a lazily-populated private attribute would
+    make two configs with identical *fields* compare unequal as soon as
+    one of them had resolved a scope. Keying on the pattern tuple also
+    means the compiled form survives the model instance: a config parsed
+    fresh from the stored JSONB on each request or tier tick — which is
+    how this model is actually used — still hits the cache.
+
+    Every pattern reaching here has already been compiled once by
+    :func:`_validate_slug_patterns`, so this never raises for a validated
+    model.
+
+    Parameters
+    ----------
+    patterns
+        One scope field's patterns, as a hashable tuple.
+
+    Returns
+    -------
+    tuple of re.Pattern
+        The compiled patterns, in the order given. Immutable, because
+        callers share the cached value.
+    """
+    return tuple(re.compile(pattern) for pattern in patterns)
 
 
 def _validate_slug_patterns(
@@ -137,7 +179,7 @@ class KeeperSyncConfig(BaseModel):
     ``project_slug_patterns``; it is *in scope* when it is included and
     is neither listed in ``exclude_project_slugs`` nor fully matched by
     one of ``exclude_project_slug_patterns``. Excludes always win. See
-    :meth:`filter_in_scope` for the rule, and
+    :meth:`resolve_scope` for the rule, and
     ``POST /orgs/{org}/keeper-sync/scope-preview`` for a side-effect-free
     resolution of a candidate scope against the live LTD listing.
 
@@ -226,22 +268,15 @@ class KeeperSyncConfig(BaseModel):
     def is_in_scope(self, slug: str) -> bool:
         """Report whether one LTD project slug is in the sync scope.
 
-        See :meth:`filter_in_scope` for the rule.
+        See :meth:`resolve_scope` for the rule.
         """
         return bool(self.filter_in_scope([slug]))
 
     def filter_in_scope(self, slugs: Iterable[str]) -> list[str]:
         """Filter LTD project slugs down to the ones in the sync scope.
 
-        A slug is *included* when ``project_slugs`` is ``"*"``, when it
-        is listed in ``project_slugs``, or when it fully matches one of
-        ``project_slug_patterns``. It is *in scope* when it is included
-        and is neither listed in ``exclude_project_slugs`` nor fully
-        matched by one of ``exclude_project_slug_patterns`` — excludes
-        always win.
-
-        Pattern matching uses :func:`re.fullmatch` and is
-        case-sensitive.
+        A thin wrapper over :meth:`resolve_scope`, for the callers that
+        want the in-scope slugs and not the excluded count.
 
         Parameters
         ----------
@@ -255,30 +290,70 @@ class KeeperSyncConfig(BaseModel):
             successive passes over the same LTD listing fan out
             deterministically.
         """
+        return self.resolve_scope(slugs)[0]
+
+    def resolve_scope(self, slugs: Iterable[str]) -> tuple[list[str], int]:
+        """Classify LTD project slugs against the sync scope.
+
+        A slug is *included* when ``project_slugs`` is ``"*"``, when it
+        is listed in ``project_slugs``, or when it fully matches one of
+        ``project_slug_patterns``. It is *in scope* when it is included
+        and is neither listed in ``exclude_project_slugs`` nor fully
+        matched by one of ``exclude_project_slug_patterns`` — excludes
+        always win.
+
+        Pattern matching uses :func:`re.fullmatch` and is
+        case-sensitive, so ``sqr-1`` cannot match ``sqr-100``.
+
+        This is a single classifying pass: the in-scope slugs and the
+        excluded tally come out of the same walk over ``slugs``, with the
+        compiled patterns taken from :func:`_compile_slug_patterns`. The
+        tier crons resolve the whole LTD listing (~1,645 slugs on
+        lsst.io) on every tick, so a second pass just to derive the
+        counter would double the cost of the tick's scope resolution.
+
+        Parameters
+        ----------
+        slugs
+            LTD project slugs to classify, typically in LTD listing
+            order.
+
+        Returns
+        -------
+        tuple
+            The in-scope slugs, in the order they were given, and the
+            number of slugs an include rule admitted but an exclude rule
+            then removed — the ``excluded_count`` the scope log events
+            report. A slug no include rule admitted is not counted:
+            there was no scope for an exclude to take it out of.
+        """
         configured = self.project_slugs
         wildcard = configured == "*"
         listed = set() if isinstance(configured, str) else set(configured)
         excluded = set(self.exclude_project_slugs)
-        include_patterns = [
-            re.compile(pattern) for pattern in self.project_slug_patterns
-        ]
-        exclude_patterns = [
-            re.compile(pattern)
-            for pattern in self.exclude_project_slug_patterns
-        ]
-        return [
-            slug
-            for slug in slugs
-            if (
-                (
-                    wildcard
-                    or slug in listed
-                    or any(p.fullmatch(slug) for p in include_patterns)
-                )
-                and slug not in excluded
-                and not any(p.fullmatch(slug) for p in exclude_patterns)
+        include_patterns = _compile_slug_patterns(
+            tuple(self.project_slug_patterns)
+        )
+        exclude_patterns = _compile_slug_patterns(
+            tuple(self.exclude_project_slug_patterns)
+        )
+        in_scope: list[str] = []
+        excluded_count = 0
+        for slug in slugs:
+            included = (
+                wildcard
+                or slug in listed
+                or any(p.fullmatch(slug) for p in include_patterns)
             )
-        ]
+            if not included:
+                continue
+            if slug in excluded or any(
+                p.fullmatch(slug) for p in exclude_patterns
+            ):
+                excluded_count += 1
+                continue
+            in_scope.append(slug)
+        return in_scope, excluded_count
 
 
 class KeeperSyncConfigWrite(KeeperSyncConfig):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -175,6 +176,133 @@ def test_filter_in_scope_wildcard_returns_every_slug() -> None:
     config = KeeperSyncConfig(project_slugs="*")
     given = ["b", "a", "c"]
     assert config.filter_in_scope(given) == given
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "slugs", "expected_in_scope", "expected_excluded"),
+    [
+        # An exact exclude removes an explicitly included slug.
+        (
+            {
+                "project_slugs": ["sqr-112", "dmtn-001"],
+                "exclude_project_slugs": ["dmtn-001"],
+            },
+            ["sqr-112", "dmtn-001"],
+            ["sqr-112"],
+            1,
+        ),
+        # An exclude pattern removes pattern-included slugs.
+        (
+            {
+                "project_slug_patterns": [r"sqr-\d+"],
+                "exclude_project_slug_patterns": [r"sqr-9\d"],
+            },
+            ["sqr-1", "sqr-90", "sqr-91", "dmtn-001"],
+            ["sqr-1"],
+            2,
+        ),
+        # Both exclude kinds contribute to the same counter.
+        (
+            {
+                "project_slugs": "*",
+                "exclude_project_slugs": ["www"],
+                "exclude_project_slug_patterns": [r"test-.*"],
+            },
+            ["www", "test-a", "test-b", "sqr-1"],
+            ["sqr-1"],
+            3,
+        ),
+        # ``"*"`` plus an exclude: everything is included, one removed.
+        (
+            {"project_slugs": "*", "exclude_project_slugs": ["www"]},
+            ["www", "sqr-1"],
+            ["sqr-1"],
+            1,
+        ),
+        # A slug excluded that no include rule admitted counts zero: it
+        # was never in scope for an exclude to take away.
+        (
+            {
+                "project_slugs": ["sqr-112"],
+                "exclude_project_slugs": ["dmtn-001"],
+            },
+            ["sqr-112", "dmtn-001"],
+            ["sqr-112"],
+            0,
+        ),
+        # No exclude rules at all.
+        (
+            {"project_slug_patterns": [r"sqr-\d+"]},
+            ["sqr-1", "dmtn-001"],
+            ["sqr-1"],
+            0,
+        ),
+    ],
+)
+def test_resolve_scope_reports_excluded_count(
+    *,
+    config_kwargs: dict[str, object],
+    slugs: list[str],
+    expected_in_scope: list[str],
+    expected_excluded: int,
+) -> None:
+    """``resolve_scope`` classifies in one pass: in-scope list + count."""
+    config = KeeperSyncConfig(**config_kwargs)  # type: ignore[arg-type]
+    in_scope, excluded_count = config.resolve_scope(slugs)
+    assert in_scope == expected_in_scope
+    assert excluded_count == expected_excluded
+    # ``filter_in_scope`` is the same pass with the counter dropped.
+    assert config.filter_in_scope(slugs) == in_scope
+
+
+def test_resolve_scope_preserves_input_order() -> None:
+    """``resolve_scope`` keeps the caller's (LTD listing) order."""
+    config = KeeperSyncConfig(
+        project_slugs=["zulu", "alpha"],
+        project_slug_patterns=[r"sqr-\d+"],
+        exclude_project_slugs=["sqr-999"],
+    )
+    given = ["sqr-999", "zulu", "dmtn-001", "sqr-1", "alpha", "sqr-2"]
+    in_scope, excluded_count = config.resolve_scope(given)
+    assert in_scope == ["zulu", "sqr-1", "alpha", "sqr-2"]
+    assert excluded_count == 1
+
+
+def test_compiled_scope_patterns_are_reused_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One instance compiles each scope pattern once, not once per call.
+
+    ``is_in_scope`` is the per-request scope gate, so a fresh compile of
+    every include and exclude pattern on each call is what this guards
+    against (issue #676).
+    """
+    # Patterns unique to this test, so the compiled-pattern cache is
+    # cold no matter what else ran first.
+    config = KeeperSyncConfig(
+        project_slug_patterns=[r"reuse-probe-\d+"],
+        exclude_project_slug_patterns=[r"reuse-probe-9\d"],
+    )
+
+    compiled: list[str] = []
+    real_compile = re.compile
+
+    def counting_compile(pattern: str, flags: int = 0) -> re.Pattern[str]:
+        compiled.append(pattern)
+        return real_compile(pattern, flags)
+
+    monkeypatch.setattr(re, "compile", counting_compile)
+
+    assert config.is_in_scope("reuse-probe-1") is True
+    first_pass = list(compiled)
+    assert sorted(first_pass) == [r"reuse-probe-9\d", r"reuse-probe-\d+"]
+
+    assert config.is_in_scope("reuse-probe-90") is False
+    assert config.filter_in_scope(["reuse-probe-2", "other"]) == [
+        "reuse-probe-2"
+    ]
+    assert config.resolve_scope(["reuse-probe-3"]) == (["reuse-probe-3"], 0)
+    assert compiled == first_pass
 
 
 def test_stored_config_without_scope_fields_loads_with_defaults() -> None:

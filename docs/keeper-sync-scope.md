@@ -58,12 +58,12 @@ excludes:
 
 which syncs every LTD product except `www`.
 
-The rule is defined once, on `KeeperSyncConfig.is_in_scope` /
-`filter_in_scope` in the client package, and every consumer — run
-discovery, the three tier crons, and the per-project endpoints — calls
-those methods. Scope resolution preserves LTD listing order, so
-successive passes over the same LTD instance fan their work out
-deterministically.
+The rule is defined once, on `KeeperSyncConfig.resolve_scope` — and its
+`is_in_scope` / `filter_in_scope` wrappers — in the client package, and
+every consumer (run discovery, the three tier crons, and the
+per-project endpoints) calls those methods. Scope resolution preserves
+LTD listing order, so successive passes over the same LTD instance fan
+their work out deterministically.
 
 ## What a pattern matches
 

@@ -1474,11 +1474,16 @@ def _resolve_scope(
     """Resolve an org's keeper-sync scope over an LTD product listing.
 
     The scope rule itself lives on the config model
-    (:meth:`~docverse.models.KeeperSyncConfig.filter_in_scope`, PRD
+    (:meth:`~docverse.models.KeeperSyncConfig.resolve_scope`, PRD
     #667): the listed slugs plus the include-pattern matches — or every
     LTD slug under the ``"*"`` wildcard — minus the excludes, which
     always win. Ordering follows the LTD listing so successive passes
     against the same LTD instance fan out deterministically.
+
+    One classifying pass produces both values. Deriving
+    ``excluded_count`` from a second, excludes-stripped pass would walk
+    and re-match the whole listing again — ~1,645 slugs on lsst.io,
+    every five minutes on the ``main`` tier — to populate one log field.
 
     Parameters
     ----------
@@ -1495,15 +1500,7 @@ def _resolve_scope(
         admitted but an exclude rule then removed — the
         ``excluded_count`` the scope log events report.
     """
-    in_scope = config.filter_in_scope(ltd_slugs)
-    without_excludes = config.model_copy(
-        update={
-            "exclude_project_slugs": [],
-            "exclude_project_slug_patterns": [],
-        }
-    )
-    included_count = len(without_excludes.filter_in_scope(ltd_slugs))
-    return in_scope, included_count - len(in_scope)
+    return config.resolve_scope(ltd_slugs)
 
 
 async def _fetch_tombstoned_project_slugs(
