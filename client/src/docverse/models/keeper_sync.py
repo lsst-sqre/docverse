@@ -1061,6 +1061,26 @@ class KeeperSyncProjectStatus(BaseModel):
         examples=["pipelines"],
     )
 
+    in_scope: bool = Field(
+        default=True,
+        description=(
+            "Whether ``ltd_slug`` is currently inside the organization's"
+            " keeper-sync scope. The org-wide listing"
+            " (``GET /orgs/{org}/keeper-sync/projects``) is deliberately"
+            " *not* scope-filtered — a project that falls out of scope"
+            " keeps its state rows and keeps appearing there — so this"
+            " flag is the only thing distinguishing a project that is"
+            " still syncing from one that silently stopped. Filter the"
+            " listing on it with ``?in_scope=false`` to find stale"
+            " excludes. Always ``true`` on the per-project"
+            " ``GET .../projects/{ltd_slug}``, which answers 404 for an"
+            " out-of-scope slug rather than reporting one. Defaults to"
+            " ``true`` so a response from a server predating the field"
+            " still parses, with the meaning that listing always had."
+        ),
+        examples=[True, False],
+    )
+
     project_state: KeeperSyncProjectStateSummary | None = Field(
         default=None,
         description=(

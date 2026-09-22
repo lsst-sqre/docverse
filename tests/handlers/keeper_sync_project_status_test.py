@@ -314,6 +314,27 @@ async def test_get_status_200_for_pattern_included_slug(
 
 
 @pytest.mark.asyncio
+async def test_get_status_always_reports_in_scope_true(
+    client: AsyncClient,
+) -> None:
+    """The per-project GET can only ever report ``in_scope: true``.
+
+    The scope gate 404s an out-of-scope slug before the service runs,
+    so the flag this endpoint shares with the listing has exactly one
+    reachable value here. Asserting it keeps the two endpoints' bodies
+    the same shape for a client that reads either.
+    """
+    await _setup_org(client)
+    await _enable_sync(client, project_slugs=[_LTD_SLUG])
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json()["in_scope"] is True
+
+
+@pytest.mark.asyncio
 async def test_get_status_403_for_non_admin(client: AsyncClient) -> None:
     """A reader-role user gets 403."""
     await _setup_org(client)

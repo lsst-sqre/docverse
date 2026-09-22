@@ -1,0 +1,3 @@
+### New features
+
+- `KeeperSyncProjectStatus` gains `in_scope`, reporting whether the project's LTD slug is currently inside the organization's keeper-sync scope. `GET /orgs/{org}/keeper-sync/projects` is deliberately not scope-filtered — a project that falls out of scope keeps its state rows and keeps appearing in the listing — so this flag is what distinguishes a project that is still syncing from one that has silently stopped. The per-project `GET …/keeper-sync/projects/{ltd_slug}` always reports `true`, because it answers 404 for an out-of-scope slug rather than describing one. The field defaults to `true`, so a response from a server that predates it still parses, carrying the meaning that listing always had.

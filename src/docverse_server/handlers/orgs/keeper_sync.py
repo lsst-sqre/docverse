@@ -242,6 +242,27 @@ async def get_org_keeper_sync_projects(
             description="Maximum number of results per page.",
         ),
     ] = DEFAULT_PAGE_LIMIT,
+    in_scope: Annotated[
+        bool | None,
+        Query(
+            description=(
+                "Keep only the projects inside (``true``) or outside"
+                " (``false``) the organization's keeper-sync scope."
+                " Omitted, the listing returns every project with a"
+                " state row, in scope or not, each carrying its own"
+                " ``in_scope`` flag; ``in_scope=false`` is how you find"
+                " a project a stale exclude has quietly stopped"
+                " syncing. Scope is a regular-expression rule rather"
+                " than a SQL predicate, so this filter is applied to"
+                " each page *after* its rows are read: a filtered page"
+                " can carry fewer than ``limit`` entries — even none —"
+                " while the ``Link`` header still offers a ``next``"
+                " cursor, and ``X-Total-Count`` stays the unfiltered"
+                " row count. Follow ``next`` until it is gone rather"
+                " than stopping at the first short page."
+            ),
+        ),
+    ] = None,
 ) -> list[KeeperSyncProjectStatus]:
     parsed_cursor = (
         KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE.from_str(cursor)
@@ -251,7 +272,10 @@ async def get_org_keeper_sync_projects(
     async with context.session.begin():
         service = context.factory.create_keeper_sync_project_service()
         result = await service.list_project_statuses(
-            org_slug=org_slug, cursor=parsed_cursor, limit=limit
+            org_slug=org_slug,
+            cursor=parsed_cursor,
+            limit=limit,
+            in_scope=in_scope,
         )
     context.response.headers["Link"] = result.page.link_header(
         context.request.url

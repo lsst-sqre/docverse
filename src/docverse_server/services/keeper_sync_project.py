@@ -109,6 +109,7 @@ class KeeperSyncProjectStatusResult:
     org_slug: str
     ltd_slug: str
     docverse_project_slug: str | None
+    in_scope: bool
     project_state: KeeperSyncProjectStateSummary | None
     tier_status: list[KeeperSyncTierStatus]
     main_edition_row: KeeperSyncEditionStatusRow | None
@@ -247,6 +248,11 @@ class KeeperSyncProjectService:
             org_slug=org_slug,
             ltd_slug=ltd_slug,
             docverse_project_slug=docverse_project_slug,
+            # Unconditionally in scope: ``require_sync_eligible`` above
+            # has already 404'd every slug that is not, so this endpoint
+            # has no way to report ``False``. The field is shared with
+            # the listing, which is where it actually varies.
+            in_scope=True,
             project_state=_summarise_project_state(project_state),
             tier_status=tier_status,
             main_edition_row=main_edition_row,
@@ -335,6 +341,7 @@ class KeeperSyncProjectService:
         org_slug: str,
         cursor: KeeperSyncProjectStateIdCursor | None,
         limit: int,
+        in_scope: bool | None = None,
     ) -> KeeperSyncProjectListResult:
         """Return a paginated page of every keeper-sync project for an org.
 
@@ -343,25 +350,65 @@ class KeeperSyncProjectService:
         in-scope slugs are intentionally omitted: operators can still
         inspect them via :meth:`get_project_status`.
 
+        The listing is not scope-filtered by default: a project that has
+        fallen out of the org's keeper-sync scope keeps its state rows
+        and keeps appearing here, flagged ``in_scope=False``. That
+        asymmetry with the per-project endpoints — which 404 for an
+        out-of-scope slug — is the feature, because the listing is how
+        an operator finds a project whose detail endpoint has started
+        answering 404.
+
         Per-page cost is O(1) round-trips regardless of page size:
         Docverse projects and ``__main`` editions for the page are
         batch-loaded, and the org-wide edition state rows are fetched
         once and indexed in-memory for the main-edition left-join.
+
+        Parameters
+        ----------
+        org_slug
+            Slug of the organization to list projects for.
+        cursor
+            Opaque pagination cursor, or ``None`` for the first page.
+        limit
+            Maximum number of *state rows* read per page.
+        in_scope
+            When not ``None``, keep only the rows whose scope membership
+            equals it. Scope is a regular-expression rule rather than a
+            SQL predicate, so the filter is applied to the page **after**
+            its state rows are read: the returned ``entries`` may be
+            shorter than ``limit`` — possibly empty — while ``page``
+            still carries a next cursor and the unfiltered total. The
+            caller keeps following the cursor rather than expecting a
+            full page.
 
         Raises
         ------
         NotFoundError
             If the org does not exist or LTD sync is not enabled on it.
         """
-        org, _ = await require_sync_enabled(self._org_store, org_slug=org_slug)
+        org, config = await require_sync_enabled(
+            self._org_store, org_slug=org_slug
+        )
 
         page = await self._state_store.list_project_resources_for_org(
             org_id=org.id, cursor=cursor, limit=limit
         )
-        project_ids = [
-            row.docverse_id
+        # One classifying pass over the page's slugs rather than a
+        # per-row ``is_in_scope``, matching how run discovery and the
+        # tier crons resolve their scope.
+        in_scope_slugs = set(
+            config.filter_in_scope(row.ltd_slug for row in page.entries)
+        )
+        # ``page`` itself is left whole: its cursor and count describe
+        # the collection, not this filtered view of it, so paging stays
+        # correct when the filter empties a page.
+        rows = [
+            row
             for row in page.entries
-            if row.docverse_id is not None
+            if in_scope is None or (row.ltd_slug in in_scope_slugs) is in_scope
+        ]
+        project_ids = [
+            row.docverse_id for row in rows if row.docverse_id is not None
         ]
         projects_by_id = {
             project.id: project
@@ -385,7 +432,7 @@ class KeeperSyncProjectService:
         now = datetime.now(tz=UTC)
 
         entries: list[KeeperSyncProjectStatusResult] = []
-        for state_row in page.entries:
+        for state_row in rows:
             project = (
                 projects_by_id.get(state_row.docverse_id)
                 if state_row.docverse_id is not None
@@ -409,6 +456,7 @@ class KeeperSyncProjectService:
                     org_slug=org_slug,
                     ltd_slug=state_row.ltd_slug,
                     docverse_project_slug=docverse_project_slug,
+                    in_scope=state_row.ltd_slug in in_scope_slugs,
                     project_state=_summarise_project_state(state_row),
                     tier_status=_explain_all_tiers(state=state_row, now=now),
                     main_edition_row=main_edition_row,

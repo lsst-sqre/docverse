@@ -31,6 +31,12 @@ _ADMIN = "admin-user"
 _ORG = "ks-projects-list-org"
 _LTD_BASE = "https://keeper.lsst.codes"
 
+_TRIO_SLUGS = ("pipelines", "sqr-060", "sqr-112")
+"""Listed, pattern-included, and excluded — in state-row seeding order."""
+
+_TRIO_LISTED = list(reversed(_TRIO_SLUGS))
+"""The same three as the listing orders them: newest state row first."""
+
 
 def _logger() -> structlog.stdlib.BoundLogger:
     return structlog.get_logger("test")  # type: ignore[no-any-return]
@@ -44,17 +50,48 @@ async def _enable_sync(
     client: AsyncClient,
     *,
     project_slugs: list[str] | Literal["*"] = "*",
+    project_slug_patterns: list[str] | None = None,
+    exclude_project_slugs: list[str] | None = None,
 ) -> None:
+    body: dict[str, Any] = {
+        "enabled": True,
+        "ltd_base_url": f"{_LTD_BASE}/",
+        "project_slugs": project_slugs,
+    }
+    if project_slug_patterns is not None:
+        body["project_slug_patterns"] = project_slug_patterns
+    if exclude_project_slugs is not None:
+        body["exclude_project_slugs"] = exclude_project_slugs
     response = await client.put(
         f"/docverse/orgs/{_ORG}/keeper-sync",
-        json={
-            "enabled": True,
-            "ltd_base_url": f"{_LTD_BASE}/",
-            "project_slugs": project_slugs,
-        },
+        json=body,
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 200
+
+
+async def _seed_scoped_trio(client: AsyncClient) -> None:
+    """Seed one listed, one pattern-included and one excluded project.
+
+    All three hold a project-resource state row, which is what makes the
+    listing show them all: falling out of scope leaves the state rows
+    alone, so the row set is the same either way and only ``in_scope``
+    tells the three apart.
+    """
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs=["pipelines"],
+        project_slug_patterns=[r"sqr-\d+"],
+        exclude_project_slugs=["sqr-112"],
+    )
+    org_id = await _get_org_id()
+    for slug in _TRIO_SLUGS:
+        await _seed_state(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug=slug,
+        )
 
 
 async def _create_project(client: AsyncClient, *, slug: str) -> int:
@@ -230,6 +267,112 @@ async def test_list_projects_only_returns_projects_with_state_rows(
     slugs = {entry["ltd_slug"] for entry in entries}
     assert slugs == {"pipelines", "obstac"}
     assert response.headers["X-Total-Count"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_flags_the_out_of_scope_row(
+    client: AsyncClient,
+) -> None:
+    """``in_scope`` tells an excluded project from a syncing one.
+
+    The listing is deliberately not scope-filtered, so an excluded
+    project keeps its state row and keeps appearing here — which is how
+    an operator finds it. Before this flag the row was indistinguishable
+    from a synced one even though its status endpoint 404'd and every
+    run skipped it.
+    """
+    await _seed_scoped_trio(client)
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    entries = response.json()
+    assert [entry["ltd_slug"] for entry in entries] == _TRIO_LISTED
+    assert {entry["ltd_slug"]: entry["in_scope"] for entry in entries} == {
+        "pipelines": True,
+        "sqr-060": True,
+        "sqr-112": False,
+    }
+    assert response.headers["X-Total-Count"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_in_scope_true_omits_the_excluded_row(
+    client: AsyncClient,
+) -> None:
+    """``?in_scope=true`` narrows the page to the projects still syncing."""
+    await _seed_scoped_trio(client)
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects?in_scope=true",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    entries = response.json()
+    assert [entry["ltd_slug"] for entry in entries] == ["sqr-060", "pipelines"]
+    assert all(entry["in_scope"] is True for entry in entries)
+
+
+@pytest.mark.asyncio
+async def test_list_projects_in_scope_false_returns_only_the_excluded_row(
+    client: AsyncClient,
+) -> None:
+    """``?in_scope=false`` is the stale-exclude report.
+
+    The whole point of keeping out-of-scope rows in the listing: one
+    query answers "what have I stopped syncing?" without diffing the
+    full collection against the config by hand.
+    """
+    await _seed_scoped_trio(client)
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects?in_scope=false",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    entries = response.json()
+    assert [entry["ltd_slug"] for entry in entries] == ["sqr-112"]
+    assert entries[0]["in_scope"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_projects_filtered_page_may_be_short_but_still_pages(
+    client: AsyncClient,
+) -> None:
+    """A filtered page can be short — or empty — and still offer ``next``.
+
+    Scope is a regex rule, not a SQL predicate, so the filter is applied
+    after ``limit`` rows have been read. ``limit`` bounds the *rows*
+    read, never the entries returned, and the cursor keeps walking the
+    unfiltered collection: a client that stops at the first short page
+    would miss later matches. ``X-Total-Count`` stays the unfiltered
+    count for the same reason.
+    """
+    await _seed_scoped_trio(client)
+
+    first = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects?in_scope=false&limit=2",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert first.status_code == 200
+    # Rows 1-2 of 3 are ``sqr-112`` and ``sqr-060``; only the first is
+    # out of scope, so the page is one entry short of ``limit``.
+    assert [entry["ltd_slug"] for entry in first.json()] == ["sqr-112"]
+    assert first.headers["X-Total-Count"] == "3"
+    links = PaginationLinkData.from_header(first.headers.get("link"))
+    assert links.next_url is not None
+
+    # The last row is in scope, so the final page filters down to
+    # nothing — an empty page is a legitimate answer, not the end of
+    # the collection being signalled early.
+    second = await client.get(
+        links.next_url, headers={"X-Auth-Request-User": _ADMIN}
+    )
+    assert second.status_code == 200
+    assert second.json() == []
+    assert second.headers["X-Total-Count"] == "3"
 
 
 # ---------------------------------------------------------------------------

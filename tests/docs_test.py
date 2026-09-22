@@ -241,6 +241,21 @@ def test_scope_count_identity_documented() -> None:
     assert "`in_scope_count` - `tombstoned_count` = `fan_out_count`" in page
 
 
+def test_scope_listing_flag_and_filter_documented() -> None:
+    """The page names the listing's scope flag and the query that filters it.
+
+    The listing is the one keeper-sync endpoint that reports an
+    out-of-scope project rather than 404ing it, so the flag telling the
+    two apart — and the query that turns the listing into a
+    stale-exclude report — are what makes the "nothing else changes"
+    section above actionable rather than merely reassuring.
+    """
+    page = _read(_SCOPE_PAGE)
+    assert _route_path("get_org_keeper_sync_projects") in page
+    assert not _uncoded({"in_scope"}, page)
+    assert "?in_scope=false" in page
+
+
 def test_scope_pattern_caps_documented() -> None:
     """The page quotes the two caps a 422 would otherwise explain.
 

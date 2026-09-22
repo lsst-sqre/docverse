@@ -150,12 +150,47 @@ and it is deliberately gentle:
   backfill to re-run, though a backfill is the fastest way to catch it
   up.
 
+### Finding the projects that fell out
+
 The collection listing
 `GET /orgs/{org}/keeper-sync/projects` is deliberately **not**
 scope-filtered: it lists every project-resource state row on the org,
 so a project that has fallen out of scope still appears there. That
 asymmetry is the feature — the listing is how you find a project whose
 detail endpoint has started answering 404.
+
+Each entry carries an `in_scope` boolean saying which side of the scope
+it is on, so an excluded project is visibly excluded rather than
+indistinguishable from the ones still syncing:
+
+```json
+{"ltd_slug": "sqr-112", "in_scope": false, "project_url": "..."}
+```
+
+The per-project `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}`
+always reports `in_scope: true`, because it 404s every slug that is
+not.
+
+Filter the listing on the same flag to ask the question directly:
+
+```
+GET /orgs/{org}/keeper-sync/projects?in_scope=false
+```
+
+That is the **stale-exclude report** — every project this org once
+synced and no longer does. Run it after each wave's `PATCH`: anything
+listed is either an exclude you meant (fine) or a pattern that stopped
+matching something you did not mean to drop. `?in_scope=true` narrows
+the listing the other way, and omitting the parameter returns
+everything, as before.
+
+One thing to know about the filter: scope is a regular-expression rule,
+not a SQL predicate, so it is applied to each page **after** that
+page's rows have been read. `limit` therefore bounds the *rows read*,
+not the entries returned — a page can come back shorter than `limit`,
+or empty, while its `Link` header still offers a `next` cursor, and
+`X-Total-Count` stays the unfiltered row count. **Follow `next` until
+it is gone** rather than stopping at the first short page.
 
 ## The wave workflow
 
@@ -358,6 +393,11 @@ holds nothing back, and that is either:
   there is nothing left to exclude. Drop the entry from the config
   whenever you next `PATCH` it, so the list keeps telling you the
   truth.
+
+Neither case says what the excludes that *did* match are holding back.
+For that, read the scope from the Docverse side with
+`GET /orgs/{org}/keeper-sync/projects?in_scope=false`, which lists the
+projects this org has state rows for and has stopped syncing.
 
 Nothing in the response distinguishes those two, because Docverse
 cannot tell them apart — only you know whether the slug was ever meant

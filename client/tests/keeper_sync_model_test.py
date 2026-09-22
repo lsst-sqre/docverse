@@ -12,11 +12,36 @@ from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
     KeeperSyncConfigWrite,
+    KeeperSyncProjectStatus,
     KeeperSyncRun,
     KeeperSyncScopePreview,
     KeeperSyncScopePreviewRequest,
     KeeperSyncTombstone,
 )
+
+_PROJECT_STATUS_BASE = "https://docverse.example/orgs/o"
+
+
+def _project_status_payload(**overrides: object) -> dict[str, object]:
+    """Build a minimal well-formed ``KeeperSyncProjectStatus`` body.
+
+    Only the required fields, so a test can say which optional field it
+    is actually about by naming it in ``overrides``.
+    """
+    payload: dict[str, object] = {
+        "self_url": f"{_PROJECT_STATUS_BASE}/keeper-sync/projects/sqr-112",
+        "org_url": _PROJECT_STATUS_BASE,
+        "sync_refresh_url": (
+            f"{_PROJECT_STATUS_BASE}/keeper-sync/projects/sqr-112/refresh"
+        ),
+        "editions_sync_url": (
+            f"{_PROJECT_STATUS_BASE}/keeper-sync/projects/sqr-112/editions"
+        ),
+        "ltd_slug": "sqr-112",
+        "tier_status": [],
+    }
+    payload.update(overrides)
+    return payload
 
 
 def test_default_is_disabled_with_default_url_and_empty_allowlist() -> None:
@@ -682,3 +707,47 @@ def test_scope_preview_example_validates_against_the_model() -> None:
     assert set(example) == set(KeeperSyncScopePreview.model_fields)
     preview = KeeperSyncScopePreview.model_validate(example)
     assert preview.model_dump(mode="json") == example
+
+
+def test_project_status_in_scope_defaults_to_true() -> None:
+    """A body without ``in_scope`` reads back as in scope.
+
+    The field is new, so a response from a server that predates it
+    carries no such key. Defaulting to ``true`` keeps that body meaning
+    what it always meant: every project the old listing returned was
+    one an operator had no reason to treat as excluded.
+    """
+    status = KeeperSyncProjectStatus.model_validate(_project_status_payload())
+    assert status.in_scope is True
+
+
+def test_project_status_in_scope_round_trips_false() -> None:
+    """An excluded project reports ``in_scope: false`` and keeps it.
+
+    This is the value the flag exists for: the listing keeps returning
+    a project that has fallen out of scope, so ``false`` has to survive
+    a dump/validate round-trip to reach whatever reads the listing.
+    """
+    status = KeeperSyncProjectStatus.model_validate(
+        _project_status_payload(in_scope=False)
+    )
+    assert status.in_scope is False
+    assert status.model_dump(mode="json")["in_scope"] is False
+
+
+def test_project_status_in_scope_examples_validate_against_the_model() -> None:
+    """The field's OpenAPI examples are values the model accepts.
+
+    An example in the published schema is what an operator reads before
+    they ever call the endpoint, so both of them have to parse — and
+    the field has to carry the description that says which endpoint can
+    report ``false``.
+    """
+    field = KeeperSyncProjectStatus.model_fields["in_scope"]
+    assert field.description
+    assert field.examples == [True, False]
+    for example in field.examples:
+        status = KeeperSyncProjectStatus.model_validate(
+            _project_status_payload(in_scope=example)
+        )
+        assert status.in_scope is example

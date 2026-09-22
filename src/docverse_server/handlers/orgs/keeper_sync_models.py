@@ -232,6 +232,7 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
                 )
             ),
             ltd_slug=result.ltd_slug,
+            in_scope=result.in_scope,
             project_state=result.project_state,
             tier_status=result.tier_status,
             main_edition=main_edition,
