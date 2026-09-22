@@ -1,0 +1,3 @@
+### New features
+
+- New `KeeperSyncScopePreviewRequest` model, the request body of `POST /orgs/{org}/keeper-sync/scope-preview`. It is a `KeeperSyncConfigUpdate` — same fields, same validation, same merge over the stored config — minus `ltd_base_url`, which it rejects with a validation error naming the field. The preview always resolves a scope against the stored config's LTD instance, so a candidate base URL has no meaning there; repoint the instance with `PUT` or `PATCH` instead. The field is also omitted from the model's published JSON schema, so the contract does not advertise a property that is always refused.

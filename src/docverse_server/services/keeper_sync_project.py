@@ -36,7 +36,6 @@ from docverse.models import (
     KeeperSyncTierStatus,
 )
 from docverse_server.domain.edition import Edition
-from docverse_server.exceptions import NotFoundError
 from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -52,6 +51,10 @@ from docverse_server.services.keeper_sync.scheduler import (
     TIER_OTHER_HOT_WINDOW,
     Tier,
     explain_tier_status,
+)
+from docverse_server.services.keeper_sync_gate import (
+    require_sync_eligible,
+    require_sync_enabled,
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -106,6 +109,7 @@ class KeeperSyncProjectStatusResult:
     org_slug: str
     ltd_slug: str
     docverse_project_slug: str | None
+    in_scope: bool
     project_state: KeeperSyncProjectStateSummary | None
     tier_status: list[KeeperSyncTierStatus]
     main_edition_row: KeeperSyncEditionStatusRow | None
@@ -189,31 +193,15 @@ class KeeperSyncProjectService:
         ------
         NotFoundError
             If the org does not exist, LTD sync is not enabled on it,
-            or ``ltd_slug`` is not in the configured ``project_slugs``
-            allowlist (and the allowlist is not ``"*"``). Issue #317
-            specifies 404 for the disabled-sync and out-of-allowlist
+            or ``ltd_slug`` is not in the org's keeper-sync scope as
+            resolved by :meth:`KeeperSyncConfig.is_in_scope`. Issue #317
+            specifies 404 for the disabled-sync and out-of-scope
             cases — the resource (a sync-eligible project on this org)
             does not exist.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
-        if (
-            config.project_slugs != "*"
-            and ltd_slug not in config.project_slugs
-        ):
-            msg = (
-                f"LTD slug {ltd_slug!r} is not in the project_slugs"
-                f" allowlist for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, config = await require_sync_eligible(
+            self._org_store, org_slug=org_slug, ltd_slug=ltd_slug
+        )
 
         now = datetime.now(tz=UTC)
         project_state = await self._state_store.get(
@@ -260,6 +248,11 @@ class KeeperSyncProjectService:
             org_slug=org_slug,
             ltd_slug=ltd_slug,
             docverse_project_slug=docverse_project_slug,
+            # Unconditionally in scope: ``require_sync_eligible`` above
+            # has already 404'd every slug that is not, so this endpoint
+            # has no way to report ``False``. The field is shared with
+            # the listing, which is where it actually varies.
+            in_scope=True,
             project_state=_summarise_project_state(project_state),
             tier_status=tier_status,
             main_edition_row=main_edition_row,
@@ -277,7 +270,7 @@ class KeeperSyncProjectService:
         """Return a paginated page of editions for one keeper-sync project.
 
         Backs ``GET /orgs/{org}/keeper-sync/projects/{ltd_slug}/
-        editions``. Enforces the same enable/allowlist 404 gate as
+        editions``. Enforces the same enable/scope 404 gate as
         :meth:`get_project_status`. When the Docverse project does not
         yet exist for the LTD slug, returns an empty page (rather than
         404) — the slug is sync-eligible, it just has no editions yet.
@@ -286,28 +279,12 @@ class KeeperSyncProjectService:
         ------
         NotFoundError
             If the org does not exist, LTD sync is disabled on it, or
-            ``ltd_slug`` is not in the configured ``project_slugs``
-            allowlist (and the allowlist is not ``"*"``).
+            ``ltd_slug`` is not in the org's keeper-sync scope as
+            resolved by :meth:`KeeperSyncConfig.is_in_scope`.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
-        if (
-            config.project_slugs != "*"
-            and ltd_slug not in config.project_slugs
-        ):
-            msg = (
-                f"LTD slug {ltd_slug!r} is not in the project_slugs"
-                f" allowlist for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, _ = await require_sync_eligible(
+            self._org_store, org_slug=org_slug, ltd_slug=ltd_slug
+        )
 
         project_state = await self._state_store.get(
             org_id=org.id,
@@ -364,42 +341,74 @@ class KeeperSyncProjectService:
         org_slug: str,
         cursor: KeeperSyncProjectStateIdCursor | None,
         limit: int,
+        in_scope: bool | None = None,
     ) -> KeeperSyncProjectListResult:
         """Return a paginated page of every keeper-sync project for an org.
 
         Only projects with a ``keeper_sync_state`` row of
         ``resource_type=project`` for this org appear. Never-seen-but-
-        allowlisted slugs are intentionally excluded: operators can
-        still inspect them via :meth:`get_project_status`.
+        in-scope slugs are intentionally omitted: operators can still
+        inspect them via :meth:`get_project_status`.
+
+        The listing is not scope-filtered by default: a project that has
+        fallen out of the org's keeper-sync scope keeps its state rows
+        and keeps appearing here, flagged ``in_scope=False``. That
+        asymmetry with the per-project endpoints — which 404 for an
+        out-of-scope slug — is the feature, because the listing is how
+        an operator finds a project whose detail endpoint has started
+        answering 404.
 
         Per-page cost is O(1) round-trips regardless of page size:
         Docverse projects and ``__main`` editions for the page are
         batch-loaded, and the org-wide edition state rows are fetched
         once and indexed in-memory for the main-edition left-join.
 
+        Parameters
+        ----------
+        org_slug
+            Slug of the organization to list projects for.
+        cursor
+            Opaque pagination cursor, or ``None`` for the first page.
+        limit
+            Maximum number of *state rows* read per page.
+        in_scope
+            When not ``None``, keep only the rows whose scope membership
+            equals it. Scope is a regular-expression rule rather than a
+            SQL predicate, so the filter is applied to the page **after**
+            its state rows are read: the returned ``entries`` may be
+            shorter than ``limit`` — possibly empty — while ``page``
+            still carries a next cursor and the unfiltered total. The
+            caller keeps following the cursor rather than expecting a
+            full page.
+
         Raises
         ------
         NotFoundError
             If the org does not exist or LTD sync is not enabled on it.
         """
-        org = await self._org_store.get_by_slug(org_slug)
-        if org is None:
-            msg = f"Organization {org_slug!r} not found"
-            raise NotFoundError(msg)
-        config = org.keeper_sync_config
-        if config is None or not config.enabled:
-            msg = (
-                f"LTD Keeper sync is not enabled for organization {org_slug!r}"
-            )
-            raise NotFoundError(msg)
+        org, config = await require_sync_enabled(
+            self._org_store, org_slug=org_slug
+        )
 
         page = await self._state_store.list_project_resources_for_org(
             org_id=org.id, cursor=cursor, limit=limit
         )
-        project_ids = [
-            row.docverse_id
+        # One classifying pass over the page's slugs rather than a
+        # per-row ``is_in_scope``, matching how run discovery and the
+        # tier crons resolve their scope.
+        in_scope_slugs = set(
+            config.filter_in_scope(row.ltd_slug for row in page.entries)
+        )
+        # ``page`` itself is left whole: its cursor and count describe
+        # the collection, not this filtered view of it, so paging stays
+        # correct when the filter empties a page.
+        rows = [
+            row
             for row in page.entries
-            if row.docverse_id is not None
+            if in_scope is None or (row.ltd_slug in in_scope_slugs) is in_scope
+        ]
+        project_ids = [
+            row.docverse_id for row in rows if row.docverse_id is not None
         ]
         projects_by_id = {
             project.id: project
@@ -423,7 +432,7 @@ class KeeperSyncProjectService:
         now = datetime.now(tz=UTC)
 
         entries: list[KeeperSyncProjectStatusResult] = []
-        for state_row in page.entries:
+        for state_row in rows:
             project = (
                 projects_by_id.get(state_row.docverse_id)
                 if state_row.docverse_id is not None
@@ -447,6 +456,7 @@ class KeeperSyncProjectService:
                     org_slug=org_slug,
                     ltd_slug=state_row.ltd_slug,
                     docverse_project_slug=docverse_project_slug,
+                    in_scope=state_row.ltd_slug in in_scope_slugs,
                     project_state=_summarise_project_state(state_row),
                     tier_status=_explain_all_tiers(state=state_row, now=now),
                     main_edition_row=main_edition_row,

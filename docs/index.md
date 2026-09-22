@@ -24,6 +24,10 @@ that back each of them up.
   `edition_reconcile` loop: the drift it detects, its full decision
   table, its configuration knobs and Phalanx values, and how to read
   one tick's outcome.
+- [Scoping the keeper sync](keeper-sync-scope.md) — which LTD products
+  an organization syncs: the include/exclude rule, `fullmatch` pattern
+  semantics, what happens when a project falls out of scope, and the
+  preview → `PATCH` → backfill workflow a wave migration uses.
 
 The other maintenance-pool jobs do not have operations pages yet;
 until they do, their module docstrings under

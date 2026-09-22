@@ -9,6 +9,11 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute, iter_route_contexts
 from httpx import AsyncClient
 
+from docverse_server.handlers.params import (
+    LTD_SLUG_MAX_LENGTH,
+    LTD_SLUG_PATTERN,
+)
+
 __all__ = []
 
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete"})
@@ -306,3 +311,39 @@ async def test_build_progress_retirement_fields_are_declared(
     members = set(schemas["RetiredBuildStatus"]["enum"])
     assert "missing" in members
     assert {"cancelled", "failed", "superseded"} <= members
+
+
+@pytest.mark.asyncio
+async def test_ltd_slug_path_parameter_documents_its_constraints(
+    client: AsyncClient,
+) -> None:
+    """The three per-project keeper-sync routes publish the slug's shape.
+
+    ``{ltd_slug}`` is constrained to what LTD Keeper accepts for a
+    product slug, and a caller sending anything else gets a 422 rather
+    than a 404. That is a contract, so the length and character-class
+    limits have to be discoverable from the served spec instead of only
+    from a rejected request — and asserting against the shared alias's
+    own constants keeps the spec and the routes from drifting apart.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    base = "/docverse/orgs/{org}/keeper-sync/projects/{ltd_slug}"
+    operations = [
+        spec["paths"][base]["get"],
+        spec["paths"][f"{base}/editions"]["get"],
+        spec["paths"][f"{base}/refresh"]["post"],
+    ]
+    schemas = []
+    for operation in operations:
+        parameters = {
+            parameter["name"]: parameter
+            for parameter in operation["parameters"]
+        }
+        assert "ltd_slug" in parameters
+        schemas.append(parameters["ltd_slug"]["schema"])
+    assert [schema.get("maxLength") for schema in schemas] == [
+        LTD_SLUG_MAX_LENGTH
+    ] * len(operations)
+    assert [schema.get("pattern") for schema in schemas] == [
+        LTD_SLUG_PATTERN
+    ] * len(operations)

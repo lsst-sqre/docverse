@@ -59,6 +59,9 @@ async def _enable_sync(
     client: AsyncClient,
     *,
     project_slugs: list[str] | Literal["*"] = "*",
+    project_slug_patterns: list[str] | None = None,
+    exclude_project_slugs: list[str] | None = None,
+    exclude_project_slug_patterns: list[str] | None = None,
 ) -> None:
     response = await client.put(
         f"/docverse/orgs/{_ORG}/keeper-sync",
@@ -66,6 +69,11 @@ async def _enable_sync(
             "enabled": True,
             "ltd_base_url": f"{_LTD_BASE}/",
             "project_slugs": project_slugs,
+            "project_slug_patterns": project_slug_patterns or [],
+            "exclude_project_slugs": exclude_project_slugs or [],
+            "exclude_project_slug_patterns": (
+                exclude_project_slug_patterns or []
+            ),
         },
         headers={"X-Auth-Request-User": _ADMIN},
     )
@@ -229,6 +237,101 @@ async def test_get_status_returns_404_when_slug_not_in_allowlist(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_status_404_when_slug_excluded(
+    client: AsyncClient,
+) -> None:
+    """An excluded slug 404s even when ``project_slugs`` also lists it.
+
+    Excludes always win over every include rule, so a slug named in
+    both places is out of scope. The status endpoint resolves scope
+    through the same config-model rule the worker uses, so an operator
+    never sees a status page for a project sync will never touch.
+    """
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs=[_LTD_SLUG, "retired"],
+        exclude_project_slugs=["retired"],
+    )
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/retired",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+    assert (
+        "not in the keeper-sync scope" in response.json()["detail"][0]["msg"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_status_404_when_slug_matches_exclude_pattern(
+    client: AsyncClient,
+) -> None:
+    """An exclude pattern removes a slug the ``"*"`` wildcard admits."""
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs="*",
+        exclude_project_slug_patterns=[r"test-.*"],
+    )
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/test-scratch",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+    assert (
+        "not in the keeper-sync scope" in response.json()["detail"][0]["msg"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_status_200_for_pattern_included_slug(
+    client: AsyncClient,
+) -> None:
+    """A slug in scope only through ``project_slug_patterns`` resolves."""
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs=[],
+        project_slug_patterns=[r"sqr-\d+"],
+    )
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/sqr-112",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json()["ltd_slug"] == "sqr-112"
+
+    # A slug the pattern does not fully match stays out of scope.
+    miss = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/sqr-112a",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert miss.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_status_always_reports_in_scope_true(
+    client: AsyncClient,
+) -> None:
+    """The per-project GET can only ever report ``in_scope: true``.
+
+    The scope gate 404s an out-of-scope slug before the service runs,
+    so the flag this endpoint shares with the listing has exactly one
+    reachable value here. Asserting it keeps the two endpoints' bodies
+    the same shape for a client that reads either.
+    """
+    await _setup_org(client)
+    await _enable_sync(client, project_slugs=[_LTD_SLUG])
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    assert response.json()["in_scope"] is True
 
 
 @pytest.mark.asyncio

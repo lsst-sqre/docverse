@@ -33,6 +33,18 @@ Pick the base by the error's audience, not by where it's raised:
    Sentry would drown the signal we care about. Do not migrate them
    onto `DocverseSlackException`.
 
+   **One deliberate 5xx lives on this base**: `UpstreamServiceError`
+   (`src/docverse_server/exceptions.py`), a 502 raised when a
+   *synchronous, operator-triggered* request depends on a third-party
+   API that is down (today: the LTD product listing behind
+   `POST /orgs/{org}/keeper-sync/scope-preview`). It is a
+   `ClientRequestError` for the routing it inherits: the caller sees
+   the failure in the response body, so alerting per retry would be
+   noise. **This is not a general licence for 5xx on this base** — the
+   test is whether a human is watching the response. The *unattended*
+   call sites for the same integration (the keeper-sync worker
+   functions) keep raising `LtdClientError`, which does alert.
+
 2. **Is the error server-side** (worker job failure, integration
    outage, internal invariant violated, configuration missing in the
    process environment)?

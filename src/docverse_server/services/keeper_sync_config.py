@@ -50,10 +50,21 @@ class KeeperSyncConfigService:
         if updated is None:
             msg = f"Organization {org_slug!r} not found"
             raise NotFoundError(msg)
+        # ``project_slugs_count`` is ``None`` for the ``"*"`` wildcard,
+        # which has no size; the other three are always plain lists.
+        slugs = config.project_slugs
         self._logger.info(
             "Updated keeper_sync_config",
             org_slug=org_slug,
             enabled=config.enabled,
+            project_slugs_count=(
+                None if isinstance(slugs, str) else len(slugs)
+            ),
+            project_slug_patterns_count=len(config.project_slug_patterns),
+            exclude_project_slugs_count=len(config.exclude_project_slugs),
+            exclude_project_slug_patterns_count=len(
+                config.exclude_project_slug_patterns
+            ),
         )
         if updated.keeper_sync_config is None:
             msg = (
@@ -63,15 +74,32 @@ class KeeperSyncConfigService:
             raise RuntimeError(msg)
         return updated.keeper_sync_config
 
+    @staticmethod
+    def merge(
+        current: KeeperSyncConfig, update: KeeperSyncConfigUpdate
+    ) -> KeeperSyncConfig:
+        """Merge an update over a config without persisting anything.
+
+        This is the whole of ``PATCH``'s JSON-Merge-Patch rule, factored
+        out so the side-effect-free scope preview (PRD #667) resolves a
+        candidate config through exactly the same merge the write path
+        applies — rather than a second implementation that could drift
+        from it. ``model_dump(exclude_unset=True)`` is what distinguishes
+        "omitted" from an explicit value, so unset fields carry over
+        unchanged and each provided list field replaces the stored list
+        wholesale.
+        """
+        return current.model_copy(update=update.model_dump(exclude_unset=True))
+
     async def patch(
         self, org_slug: str, update: KeeperSyncConfigUpdate
     ) -> KeeperSyncConfig:
         """Apply a JSON-Merge-Patch to the persisted config.
 
         Fields left unset on ``update`` are carried over unchanged from the
-        current (or default-disabled) config; ``project_slugs``, when
-        provided, replaces the stored list wholesale. Returns the
-        round-tripped merged value.
+        current (or default-disabled) config; each provided list field
+        (``project_slugs`` and the three scope fields) replaces the stored
+        list wholesale. Returns the round-tripped merged value.
 
         Raises
         ------
@@ -79,6 +107,5 @@ class KeeperSyncConfigService:
             If the organization does not exist.
         """
         current = await self.get(org_slug=org_slug)
-        changes = update.model_dump(exclude_unset=True)
-        merged = current.model_copy(update=changes)
+        merged = self.merge(current, update)
         return await self.put(org_slug=org_slug, config=merged)

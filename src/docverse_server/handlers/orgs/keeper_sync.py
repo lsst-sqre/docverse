@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Query, Response, status
 
 from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
+    KeeperSyncConfigWrite,
     KeeperSyncEditionStatus,
     KeeperSyncResourceType,
     KeeperSyncRun,
     KeeperSyncRunStatus,
+    KeeperSyncScopePreview,
+    KeeperSyncScopePreviewRequest,
     KeeperSyncTombstoneReason,
 )
 from docverse_server.dependencies.auth import AuthenticatedUser, require_admin
@@ -21,10 +24,12 @@ from docverse_server.dependencies.context import (
     context_dependency,
 )
 from docverse_server.handlers.params import (
+    LtdSlugParam,
     OrgSlugParam,
     RunIdParam,
     TombstoneIdParam,
 )
+from docverse_server.handlers.responses import error_responses
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
 from docverse_server.storage.pagination import (
     DEFAULT_PAGE_LIMIT,
@@ -74,10 +79,19 @@ async def get_org_keeper_sync_config(
 async def put_org_keeper_sync_config(
     *,
     org_slug: OrgSlugParam,
-    data: KeeperSyncConfig,
+    data: KeeperSyncConfigWrite,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
 ) -> KeeperSyncConfig:
+    """Replace the org's keeper-sync config wholesale.
+
+    The request body is :class:`KeeperSyncConfigWrite` rather than the
+    response's :class:`KeeperSyncConfig`: the response model ignores
+    unknown keys so an older reader can load a config a newer server
+    wrote, while the request body keeps ``extra="forbid"`` so a
+    misspelled field is a 422 instead of a value silently dropped on its
+    way into the database.
+    """
     async with context.session.begin():
         service = context.factory.create_keeper_sync_config_service()
         result = await service.put(org_slug=org_slug, config=data)
@@ -109,6 +123,65 @@ async def patch_org_keeper_sync_config(
         result = await service.patch(org_slug=org_slug, update=data)
         await context.session.commit()
     return result
+
+
+@router.post(
+    "/orgs/{org}/keeper-sync/scope-preview",
+    response_model=KeeperSyncScopePreview,
+    summary="Preview what a keeper-sync scope resolves to on LTD",
+    name="post_org_keeper_sync_scope_preview",
+    responses=error_responses(status.HTTP_502_BAD_GATEWAY),
+)
+async def post_org_keeper_sync_scope_preview(
+    *,
+    org_slug: OrgSlugParam,
+    data: Annotated[
+        KeeperSyncScopePreviewRequest | None,
+        Body(
+            description=(
+                "Candidate partial config, merged over the stored config"
+                " exactly as ``PATCH`` merges it — and validated exactly"
+                " as ``PATCH`` validates it. Omit the body entirely to"
+                " preview the stored config as-is. ``ltd_base_url`` is"
+                " the one ``PATCH`` field not accepted here: the preview"
+                " always resolves against the stored LTD instance."
+            ),
+        ),
+    ] = None,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> KeeperSyncScopePreview:
+    """Resolve a candidate keeper-sync scope against the live LTD listing.
+
+    Side-effect-free: the candidate config is **not** persisted and no
+    jobs are enqueued. This matters because saving a wider scope is not
+    inert — the tier crons act on the stored config at their next tick —
+    so an operator rolling the lsst.io migration out in waves checks a
+    candidate here first, then ``PATCH``es it, then launches a backfill.
+
+    The preview works whether or not sync is ``enabled``. Any failure
+    to read the live LTD product listing — unreachable, an error
+    status, or a 200 whose body is not a product listing — is reported
+    as a 502 naming LTD's own status, never a Docverse 500.
+
+    The LTD listing always comes from the **stored** config's
+    ``ltd_base_url``; a body that sets that field is a 422 naming it.
+    Previewing an operator-supplied base URL would make this endpoint a
+    status oracle for whatever the pod can reach.
+
+    Two short transactions, not one, with the LTD fetch in the gap:
+    holding a transaction open across a third-party call that can hang
+    for an httpx timeout pins a pooled Postgres connection ``idle in
+    transaction`` — and a slow LTD is exactly when operators retry the
+    preview.
+    """
+    context.rebind_logger(actor=user.username)
+    service = context.factory.create_keeper_sync_scope_preview_service()
+    async with context.session.begin():
+        plan = await service.load_plan(org_slug=org_slug, update=data)
+    ltd_slugs = await service.fetch_ltd_product_slugs(plan)
+    async with context.session.begin():
+        return await service.report(plan=plan, ltd_slugs=ltd_slugs)
 
 
 @router.post(
@@ -169,6 +242,27 @@ async def get_org_keeper_sync_projects(
             description="Maximum number of results per page.",
         ),
     ] = DEFAULT_PAGE_LIMIT,
+    in_scope: Annotated[
+        bool | None,
+        Query(
+            description=(
+                "Keep only the projects inside (``true``) or outside"
+                " (``false``) the organization's keeper-sync scope."
+                " Omitted, the listing returns every project with a"
+                " state row, in scope or not, each carrying its own"
+                " ``in_scope`` flag; ``in_scope=false`` is how you find"
+                " a project a stale exclude has quietly stopped"
+                " syncing. Scope is a regular-expression rule rather"
+                " than a SQL predicate, so this filter is applied to"
+                " each page *after* its rows are read: a filtered page"
+                " can carry fewer than ``limit`` entries — even none —"
+                " while the ``Link`` header still offers a ``next``"
+                " cursor, and ``X-Total-Count`` stays the unfiltered"
+                " row count. Follow ``next`` until it is gone rather"
+                " than stopping at the first short page."
+            ),
+        ),
+    ] = None,
 ) -> list[KeeperSyncProjectStatus]:
     parsed_cursor = (
         KEEPER_SYNC_PROJECT_STATE_CURSOR_TYPE.from_str(cursor)
@@ -178,7 +272,10 @@ async def get_org_keeper_sync_projects(
     async with context.session.begin():
         service = context.factory.create_keeper_sync_project_service()
         result = await service.list_project_statuses(
-            org_slug=org_slug, cursor=parsed_cursor, limit=limit
+            org_slug=org_slug,
+            cursor=parsed_cursor,
+            limit=limit,
+            in_scope=in_scope,
         )
     context.response.headers["Link"] = result.page.link_header(
         context.request.url
@@ -201,10 +298,7 @@ async def get_org_keeper_sync_project_status(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    ltd_slug: Annotated[
-        str,
-        Path(description="LTD project slug to inspect."),
-    ],
+    ltd_slug: LtdSlugParam,
     ltd: Annotated[
         bool,
         Query(
@@ -238,10 +332,7 @@ async def get_org_keeper_sync_project_editions(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    ltd_slug: Annotated[
-        str,
-        Path(description="LTD project slug to list editions for."),
-    ],
+    ltd_slug: LtdSlugParam,
     cursor: Annotated[
         str | None,
         Query(
@@ -301,10 +392,7 @@ async def post_org_keeper_sync_project_refresh(
     org_slug: OrgSlugParam,
     context: Annotated[RequestContext, Depends(context_dependency)],
     user: Annotated[AuthenticatedUser, Depends(require_admin)],
-    ltd_slug: Annotated[
-        str,
-        Path(description="LTD project slug to refresh."),
-    ],
+    ltd_slug: LtdSlugParam,
 ) -> KeeperSyncProjectRefreshAccepted:
     async with context.session.begin():
         service = context.factory.create_keeper_sync_run_service()

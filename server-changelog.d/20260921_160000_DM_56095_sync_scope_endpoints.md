@@ -1,0 +1,8 @@
+### New features
+
+- The per-project keeper-sync endpoints — `GET /orgs/{org}/keeper-sync/projects/{slug}`, its `/editions` collection, and `POST …/projects/{slug}/refresh` — now resolve scope through the config model's shared rule instead of consulting `project_slugs` alone, so they agree with the worker on exactly which LTD products sync. A slug in scope only through `project_slug_patterns` is now inspectable and refreshable, and one removed by `exclude_project_slugs` or `exclude_project_slug_patterns` returns 404 even when `project_slugs` (or the `"*"` wildcard) also admits it.
+- Every entry of `GET /orgs/{org}/keeper-sync/projects` now carries an `in_scope` boolean, and the endpoint accepts an optional `in_scope` query parameter that filters on it. The listing itself is unchanged and still not scope-filtered — an excluded project keeps its state rows and keeps appearing there, which is how you find one whose per-project endpoint has started answering 404 — so `?in_scope=false` is the stale-exclude report and `?in_scope=true` narrows the page to what is still syncing. Scope is a regular-expression rule rather than a SQL predicate, so the filter is applied to each page *after* its rows are read: a filtered page can come back shorter than `limit`, or empty, while its `Link` header still offers a `next` cursor and `X-Total-Count` stays the unfiltered row count.
+
+### Other changes
+
+- The 404 those three endpoints return for an out-of-scope slug now reads "is not in the keeper-sync scope for organization …" rather than naming the `project_slugs` allowlist, which is no longer the whole rule.

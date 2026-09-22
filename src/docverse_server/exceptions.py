@@ -24,6 +24,7 @@ __all__ = [
     "MissingConfigurationError",
     "NotFoundError",
     "PermissionDeniedError",
+    "UpstreamServiceError",
     "format_ltd_edition_slugs",
 ]
 
@@ -112,6 +113,46 @@ class PermissionDeniedError(ClientRequestError):
 
     error = "permission_denied"
     status_code = status.HTTP_403_FORBIDDEN
+
+
+class UpstreamServiceError(ClientRequestError):
+    """An upstream service a read endpoint depends on could not be reached.
+
+    Rendered as a 502 rather than a 500: the Docverse request itself was
+    well-formed and Docverse is healthy — a third-party API it had to
+    call synchronously is not. ``upstream_status`` carries the status
+    that service returned, when it returned one at all (a connect
+    timeout or DNS failure has none), so the operator reading the error
+    body can tell an LTD outage apart from a Docverse bug without
+    pulling pod logs.
+
+    This is the one :class:`~safir.fastapi.ClientRequestError` subclass
+    in the tree with a 5xx status. It sits here, rather than on
+    :class:`DocverseSlackException`, for the routing it inherits: the
+    caller is the org admin who triggered the upstream call and sees the
+    failure synchronously in the response, so a Sentry issue and a Slack
+    alert per retry would be noise. The *unattended* LTD call sites —
+    the keeper-sync worker functions — keep raising
+    :class:`~docverse_server.storage.ltd.client.LtdClientError`, which
+    does alert, because nobody is watching those.
+
+    ``upstream_status`` is deliberately not named ``status_code``: that
+    name is the ``ClientRequestError`` class variable holding the status
+    Docverse responds with (502), and shadowing it on the instance would
+    silently change the rendered response code.
+    """
+
+    error = "upstream_error"
+    status_code = status.HTTP_502_BAD_GATEWAY
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        upstream_status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
 
 
 class InvalidJobStateError(DocverseSlackException):

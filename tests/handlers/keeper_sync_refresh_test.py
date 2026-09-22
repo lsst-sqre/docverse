@@ -37,6 +37,9 @@ async def _enable_sync(
     client: AsyncClient,
     *,
     project_slugs: list[str] | Literal["*"] = "*",
+    project_slug_patterns: list[str] | None = None,
+    exclude_project_slugs: list[str] | None = None,
+    exclude_project_slug_patterns: list[str] | None = None,
 ) -> None:
     response = await client.put(
         f"/docverse/orgs/{_ORG}/keeper-sync",
@@ -44,6 +47,11 @@ async def _enable_sync(
             "enabled": True,
             "ltd_base_url": "https://keeper.lsst.codes/",
             "project_slugs": project_slugs,
+            "project_slug_patterns": project_slug_patterns or [],
+            "exclude_project_slugs": exclude_project_slugs or [],
+            "exclude_project_slug_patterns": (
+                exclude_project_slug_patterns or []
+            ),
         },
         headers={"X-Auth-Request-User": _ADMIN},
     )
@@ -145,6 +153,82 @@ async def test_post_refresh_returns_404_when_slug_not_in_allowlist(
         headers={"X-Auth-Request-User": _ADMIN},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_post_refresh_404_when_slug_excluded(
+    client: AsyncClient,
+) -> None:
+    """An excluded slug 404s even when ``project_slugs`` also lists it.
+
+    Excludes always win over every include rule, so listing a slug in
+    both places leaves it out of scope — the refresh trigger must agree
+    with the worker rather than re-deriving scope from ``project_slugs``
+    alone.
+    """
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs=[_LTD_SLUG, "retired"],
+        exclude_project_slugs=["retired"],
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/retired/refresh",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+    assert (
+        "not in the keeper-sync scope" in response.json()["detail"][0]["msg"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_refresh_404_when_slug_matches_exclude_pattern(
+    client: AsyncClient,
+) -> None:
+    """An exclude pattern removes a slug the ``"*"`` wildcard admits."""
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs="*",
+        exclude_project_slug_patterns=[r"test-.*"],
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/test-scratch/refresh",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 404
+    assert (
+        "not in the keeper-sync scope" in response.json()["detail"][0]["msg"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_refresh_202_for_pattern_included_slug(
+    client: AsyncClient,
+) -> None:
+    """A slug in scope only through ``project_slug_patterns`` refreshes."""
+    await _setup_org(client)
+    await _enable_sync(
+        client,
+        project_slugs=[],
+        project_slug_patterns=[r"sqr-\d+"],
+    )
+
+    response = await client.post(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/sqr-112/refresh",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 202
+
+    # A slug the pattern does not fully match stays out of scope.
+    miss = await client.post(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/sqr-112a/refresh",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert miss.status_code == 404
 
 
 @pytest.mark.asyncio
