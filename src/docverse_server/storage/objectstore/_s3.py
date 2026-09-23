@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from time import monotonic
 from types import TracebackType
 from typing import Self
 
@@ -348,6 +349,15 @@ class S3ObjectStore:
         httpx.TransportError
             If the transport keeps failing until the attempt budget is
             exhausted, or fails in a way a retry cannot fix.
+
+        Notes
+        -----
+        Both "Presigned upload failed" lines report ``attempts`` and
+        ``elapsed_seconds`` — how long the object was tried, backoff
+        included — so the Sentry event for an outage says whether the
+        budget or the outage was too short. The transport line logs the
+        exception's ``repr`` because ``str(httpx.ConnectTimeout())`` is
+        the empty string.
         """
         logger = self._logger.bind(key=key)
 
@@ -364,6 +374,7 @@ class S3ObjectStore:
                 headers={"Content-Type": content_type},
             )
 
+        started = monotonic()
         try:
             outcome = await retry_request(
                 send,
@@ -375,9 +386,10 @@ class S3ObjectStore:
         except RETRYABLE_TRANSPORT_ERRORS as exc:
             logger.exception(
                 "Presigned upload failed",
-                error=str(exc),
+                error=repr(exc),
                 error_type=type(exc).__name__,
                 attempts=self._max_attempts,
+                elapsed_seconds=monotonic() - started,
                 retryable=True,
             )
             raise
@@ -395,6 +407,7 @@ class S3ObjectStore:
             status_code=outcome.response.status_code,
             response_body=outcome.response.text,
             attempts=outcome.attempts,
+            elapsed_seconds=monotonic() - started,
             retryable=outcome.retryable,
         )
         outcome.response.raise_for_status()

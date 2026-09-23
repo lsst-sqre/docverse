@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -284,7 +285,12 @@ async def retry_request(
     logger
         Logger for the retry warnings. Bind the caller's identifying
         context (object key, hostname, edition slug) onto it first —
-        this function adds only the attempt and delay fields.
+        this function adds only the attempt, delay and failure fields.
+        The transport-failure warning logs the exception's ``repr``
+        rather than its ``str``, because ``str(httpx.ConnectTimeout())``
+        is the empty string, and says how many seconds have passed since
+        the first attempt so a long outage is visible before the budget
+        runs out.
     max_attempts
         Attempts allowed including the original. Clamped to at least 1
         so a misconfigured budget degrades to "try once, no retries"
@@ -320,6 +326,7 @@ async def retry_request(
         failure outlasts the attempt budget.
     """
     budget = max(1, max_attempts)
+    started = monotonic()
     attempt = 0
     while True:
         attempt += 1
@@ -339,11 +346,12 @@ async def retry_request(
             )
             logger.warning(
                 f"Retrying {operation} after transport error",
-                error=str(exc),
+                error=repr(exc),
                 error_type=type(exc).__name__,
                 attempt=attempt,
                 max_attempts=budget,
                 retry_delay=delay,
+                elapsed_seconds=monotonic() - started,
             )
             await asyncio.sleep(delay)
             continue

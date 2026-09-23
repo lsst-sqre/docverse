@@ -15,6 +15,7 @@ import pytest
 import structlog
 from structlog.testing import capture_logs
 
+from docverse_server.storage import _http_retry
 from docverse_server.storage._http_retry import (
     MAX_BACKOFF_SECONDS,
     RETRYABLE_TRANSPORT_ERRORS,
@@ -32,6 +33,26 @@ def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         delays.append(delay)
 
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    return delays
+
+
+def _record_sleeps_on_a_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record sleeps and advance ``retry_request``'s clock by each one.
+
+    With ``asyncio.sleep`` stubbed out no real time passes, so the loop's
+    ``elapsed_seconds`` would always read zero. Driving its clock from
+    the recorded delays makes the elapsed time exactly the backoff spent
+    so far, which a test can assert.
+    """
+    delays: list[float] = []
+    now = [1000.0]
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(_http_retry, "monotonic", lambda: now[0])
     return delays
 
 
@@ -406,16 +427,24 @@ async def test_retry_request_honours_a_raised_backoff_ceiling(
 
 
 @pytest.mark.asyncio
-async def test_retry_request_logs_each_retry_with_its_operation() -> None:
+async def test_retry_request_logs_each_retry_with_its_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Every retry is visible even when the call eventually succeeds.
 
     A transient rate limit that clears never reaches a caller's terminal
     error log, so this warning is the only record that Docverse is being
     throttled — the signal an operator needs before it becomes an outage.
+
+    The transport line has to say what failed and for how long even when
+    the exception has no message: ``str(httpx.ConnectTimeout())`` is the
+    empty string, so it logs the repr, and reports the time spent since
+    the first attempt alongside the attempt count and the coming delay.
     """
+    _record_sleeps_on_a_clock(monkeypatch)
     send, _ = _sender(
         httpx.Response(429),
-        httpx.ConnectError("connection refused"),
+        httpx.ConnectTimeout(""),
         httpx.Response(200),
     )
 
@@ -424,7 +453,7 @@ async def test_retry_request_logs_each_retry_with_its_operation() -> None:
             send,
             operation="widget purge",
             logger=structlog.get_logger("test"),
-            base_backoff_seconds=0.0,
+            base_backoff_seconds=0.5,
         )
 
     warnings = [entry for entry in logs if entry["log_level"] == "warning"]
@@ -434,7 +463,13 @@ async def test_retry_request_logs_each_retry_with_its_operation() -> None:
     ]
     assert warnings[0]["status_code"] == 429
     assert warnings[0]["attempt"] == 1
-    assert warnings[1]["error_type"] == "ConnectError"
+    transport = warnings[1]
+    assert transport["error"] == "ConnectTimeout('')"
+    assert transport["error_type"] == "ConnectTimeout"
+    assert transport["attempt"] == 2
+    assert transport["max_attempts"] == 4
+    assert transport["retry_delay"] == 1.0
+    assert transport["elapsed_seconds"] == 0.5
 
 
 @pytest.mark.asyncio

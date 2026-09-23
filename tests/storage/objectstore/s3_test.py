@@ -25,14 +25,20 @@ import structlog
 from aiobotocore.client import AioBaseClient
 from structlog.testing import capture_logs
 
+from docverse_server.storage import _http_retry
 from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
-from docverse_server.storage.objectstore import ObjectStoreError, S3ObjectStore
+from docverse_server.storage.objectstore import (
+    ObjectStoreError,
+    S3ObjectStore,
+    _s3,
+)
 
 
 def _make_store(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     max_attempts: int = 4,
+    base_backoff_seconds: float = 0.0,
 ) -> tuple[S3ObjectStore, httpx.AsyncClient]:
     """Build a store whose presigned PUTs land in ``handler``."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -45,7 +51,7 @@ def _make_store(
         logger=structlog.get_logger("test"),
         http_client=client,
         max_attempts=max_attempts,
-        base_backoff_seconds=0.0,
+        base_backoff_seconds=base_backoff_seconds,
     )
     return store, client
 
@@ -58,6 +64,27 @@ def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         delays.append(delay)
 
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    return delays
+
+
+def _record_sleeps_on_a_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record sleeps and advance the upload's clocks by each one.
+
+    With ``asyncio.sleep`` stubbed out no real time passes, so both the
+    retry loop's and the store's ``elapsed_seconds`` would read zero.
+    Driving their clocks from the recorded delays makes the elapsed time
+    exactly the backoff spent so far, which a test can assert.
+    """
+    delays: list[float] = []
+    now = [1000.0]
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(_http_retry, "monotonic", lambda: now[0])
+    monkeypatch.setattr(_s3, "monotonic", lambda: now[0])
     return delays
 
 
@@ -208,8 +235,15 @@ async def test_upload_object_does_not_retry_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upload_object_raises_when_retries_are_exhausted() -> None:
-    """A never-clearing `500` still raises, so ``copy_build`` still fails."""
+async def test_upload_object_raises_when_retries_are_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-clearing `500` still raises, so ``copy_build`` still fails.
+
+    The failure line says how long the object was tried, backoff
+    included, as well as how many attempts that took.
+    """
+    _record_sleeps_on_a_clock(monkeypatch)
     attempts: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -217,7 +251,9 @@ async def test_upload_object_raises_when_retries_are_exhausted() -> None:
         return httpx.Response(500, text="internal error")
 
     with capture_logs() as logs:
-        store, client = _make_store(handler, max_attempts=3)
+        store, client = _make_store(
+            handler, max_attempts=3, base_backoff_seconds=0.5
+        )
         async with client, store as s:
             with pytest.raises(httpx.HTTPStatusError) as excinfo:
                 await s.upload_object(
@@ -233,28 +269,75 @@ async def test_upload_object_raises_when_retries_are_exhausted() -> None:
     assert len(errors) == 1
     assert errors[0]["key"] == "build/index.html"
     assert errors[0]["attempts"] == 3
+    assert errors[0]["elapsed_seconds"] == 1.5
     assert errors[0]["retryable"] is True
 
 
 @pytest.mark.asyncio
-async def test_upload_object_raises_when_transport_retries_exhausted() -> None:
-    """Transport failures share the status path's attempt budget."""
+async def test_upload_object_raises_when_transport_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transport failures share the status path's attempt budget.
+
+    An R2 connect outage surfaces as an ``httpx.ConnectTimeout`` whose
+    ``str`` is empty, so every line on the way to giving up has to name
+    the failure by its repr and say how long the object has been tried:
+    the retry warnings are the only record of a retry that recovers, and
+    the "Presigned upload failed" line is the Sentry event for one that
+    does not.
+    """
+    delays = _record_sleeps_on_a_clock(monkeypatch)
     attempts: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(len(attempts) + 1)
-        raise httpx.ConnectError("connection refused", request=request)
+        raise httpx.ConnectTimeout("", request=request)
 
-    store, client = _make_store(handler, max_attempts=3)
-    async with client, store as s:
-        with pytest.raises(httpx.ConnectError):
-            await s.upload_object(
-                key="build/index.html",
-                data=b"<html></html>",
-                content_type="text/html",
-            )
+    with capture_logs() as logs:
+        store, client = _make_store(
+            handler, max_attempts=3, base_backoff_seconds=0.5
+        )
+        async with client, store as s:
+            with pytest.raises(httpx.ConnectTimeout):
+                await s.upload_object(
+                    key="build/index.html",
+                    data=b"<html></html>",
+                    content_type="text/html",
+                )
 
     assert attempts == [1, 2, 3]
+    assert delays == [0.5, 1.0]
+
+    retries = [
+        entry
+        for entry in logs
+        if entry["event"] == "Retrying presigned upload after transport error"
+    ]
+    assert [
+        (
+            entry["attempt"],
+            entry["max_attempts"],
+            entry["retry_delay"],
+            entry["elapsed_seconds"],
+        )
+        for entry in retries
+    ] == [(1, 3, 0.5, 0.0), (2, 3, 1.0, 0.5)]
+    for entry in retries:
+        assert entry["key"] == "build/index.html"
+        assert entry["error"] == "ConnectTimeout('')"
+        assert entry["error_type"] == "ConnectTimeout"
+
+    failures = [
+        entry for entry in logs if entry["event"] == "Presigned upload failed"
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["key"] == "build/index.html"
+    assert failure["error"] == "ConnectTimeout('')"
+    assert failure["error_type"] == "ConnectTimeout"
+    assert failure["attempts"] == 3
+    assert failure["elapsed_seconds"] == 1.5
+    assert failure["retryable"] is True
 
 
 @pytest.mark.asyncio
