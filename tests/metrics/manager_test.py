@@ -23,6 +23,7 @@ from structlog.testing import capture_logs
 
 from docverse_server.config import Configuration
 from docverse_server.metrics import (
+    BuildContentCopiedEvent,
     BuildProcessedEvent,
     BuildUploadedEvent,
     ConditionalGetEndpoint,
@@ -61,6 +62,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.resource_inventory, MockEventPublisher)
     assert isinstance(events.purgatory_cleanup_completed, MockEventPublisher)
     assert isinstance(events.conditional_get, MockEventPublisher)
+    assert isinstance(events.build_content_copied, MockEventPublisher)
 
     await manager.aclose()
 
@@ -314,5 +316,57 @@ async def test_conditional_get_records_which_header_decided() -> None:
     assert event.endpoint == ConditionalGetEndpoint.projects_list
     assert event.outcome == ConditionalGetOutcome.not_modified
     assert event.precondition == ConditionalGetPrecondition.etag
+
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_build_content_copied_reports_transport_health() -> None:
+    """One event per keeper-sync build copy carries its transport counts.
+
+    The PRD #685 campaign lost 38 of 208 jobs to an R2 connect outage
+    that only showed up as Sentry events after the fact. Plotting
+    ``retried_object_count`` and ``exhausted_object_count`` per copy over
+    a campaign shows the outage as it builds, and ``build_retry_used``
+    says how often the build-level backstop had to step in.
+    """
+    config = Configuration()
+    manager, events = await build_event_manager(config)
+    publisher = events.build_content_copied
+    assert isinstance(publisher, MockEventPublisher)
+
+    await publisher.publish(
+        BuildContentCopiedEvent(
+            organization="org",
+            project="pipelines",
+            ltd_slug="pipelines",
+            object_count=42,
+            total_size_bytes=4096,
+            duration_seconds=12.5,
+            peak_concurrent_copies=8,
+            retried_object_count=3,
+            exhausted_object_count=1,
+            build_retry_used=True,
+            succeeded=True,
+        )
+    )
+
+    publisher.published.assert_published_all(
+        [
+            {
+                "organization": "org",
+                "project": "pipelines",
+                "ltd_slug": "pipelines",
+                "object_count": 42,
+                "total_size_bytes": 4096,
+                "duration_seconds": 12.5,
+                "peak_concurrent_copies": 8,
+                "retried_object_count": 3,
+                "exhausted_object_count": 1,
+                "build_retry_used": True,
+                "succeeded": True,
+            }
+        ]
+    )
 
     await manager.aclose()

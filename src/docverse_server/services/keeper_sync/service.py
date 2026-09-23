@@ -24,6 +24,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 
 import sentry_sdk
@@ -119,7 +120,7 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
-from .copier import CopyResult
+from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
     derive_edition_kind,
@@ -134,6 +135,8 @@ __all__ = [
     "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",
     "MAX_CONSECUTIVE_EDITION_FAILURES",
     "AggregateEditionOutcome",
+    "BuildCopiedCallback",
+    "BuildCopyReport",
     "BuildSyncOutcome",
     "CopyCallable",
     "EditionSyncFailure",
@@ -268,10 +271,12 @@ _PERMANENT_EDITION_FAILURE_TYPES: tuple[type[BaseException], ...] = (
     KeeperSyncGitRefUnresolvableError,
 )
 
-#: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
-#: callable the service consumes. Tests inject a fake; the production
-#: factory wires it onto a real :class:`BuildContentCopier`.
-CopyCallable = Callable[[str, str], Awaitable[CopyResult]]
+#: Type alias for the ``(source_prefix, dest_prefix, tally) ->
+#: CopyResult`` callable the service consumes. Tests inject a fake; the
+#: production factory wires it onto a real :class:`BuildContentCopier`,
+#: passing the :class:`CopyTally` through to ``copy_build`` so the
+#: service can read a pass's counts even when it raises.
+CopyCallable = Callable[[str, str, CopyTally], Awaitable[CopyResult]]
 
 #: Type alias for the ``(source_prefix) -> manifest_hash`` callable
 #: used for dual-upload convergence: the service computes the inbound
@@ -324,6 +329,52 @@ _AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
 #: upsert that clears the column, and disappears on the next clean
 #: resolve because ``annotations`` replaces wholesale.
 _DATE_REBUILT_RETRACTED_KEY = "date_rebuilt_seen_retracted"
+
+
+@dataclass(frozen=True)
+class BuildCopyReport:
+    """One build-content copy, as ``on_build_copied`` receives it.
+
+    :meth:`KeeperSyncService.sync_build` hands one to the service's
+    ``on_build_copied`` hook after every copy, whether it succeeded or
+    failed, and the keeper-sync worker publishes it as a
+    ``BuildContentCopiedEvent``. A copy the build-level retry re-ran is
+    still one copy and one report: the transport counts are summed over
+    both passes, and the object counts are the last pass's.
+    """
+
+    project_slug: str
+    """Slug of the Docverse project the build belongs to."""
+
+    object_count: int
+    """Objects the last pass stored (all of them on success)."""
+
+    total_size_bytes: int
+    """Bytes the last pass stored."""
+
+    duration_seconds: float
+    """Seconds from the first pass's start to the last's end, wait included."""
+
+    peak_concurrent_copies: int
+    """Most objects in flight at once, over both passes."""
+
+    retried_object_count: int
+    """Objects stored only after an upload retry, over both passes."""
+
+    exhausted_object_count: int
+    """Objects whose upload ran out of its retry budget, over both passes."""
+
+    build_retry_used: bool
+    """Whether the copy was re-run after a transport error."""
+
+    succeeded: bool
+    """Whether the copy, after any re-run, stored every object."""
+
+
+#: Type alias for the ``on_build_copied`` hook: awaited with one
+#: :class:`BuildCopyReport` per build copy. The keeper-sync worker's
+#: hook publishes it as a metrics event.
+BuildCopiedCallback = Callable[[BuildCopyReport], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -670,6 +721,7 @@ class KeeperSyncService:
         ref_set_fetcher: GitHubRefSetFetcher | None = None,
         lock_service: LockService | None = None,
         copy_retry_delay_seconds: float = DEFAULT_COPY_RETRY_DELAY_SECONDS,
+        on_build_copied: BuildCopiedCallback | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -688,6 +740,7 @@ class KeeperSyncService:
         self._ref_set_fetcher = ref_set_fetcher
         self._lock_service = lock_service
         self._copy_retry_delay_seconds = copy_retry_delay_seconds
+        self._on_build_copied = on_build_copied
 
     @property
     def copy_retry_delay_seconds(self) -> float:
@@ -2032,6 +2085,7 @@ class KeeperSyncService:
         copy_result = await self._copy_build_content(
             source_prefix=source.prefix,
             dest_prefix=new_build.storage_prefix,
+            project_slug=project.slug,
             logger=self._logger.bind(
                 ltd_build_id=ltd_build.ltd_id,
                 edition_slug=edition.slug,
@@ -2146,6 +2200,54 @@ class KeeperSyncService:
         *,
         source_prefix: str,
         dest_prefix: str,
+        project_slug: str,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> CopyResult:
+        """Copy one build's content and report the copy to the hook.
+
+        Runs :meth:`_copy_with_build_retry` and then hands
+        ``on_build_copied`` one :class:`BuildCopyReport` for it — after a
+        success and after a failure alike, so the metrics event the
+        worker publishes also covers the copies that went wrong. The
+        failure still propagates unchanged once the report is out. A
+        cancelled copy (the arq job timing out) is not reported: it
+        neither landed nor failed on its own account.
+        """
+        started = monotonic()
+        passes: list[CopyTally] = []
+        try:
+            result = await self._copy_with_build_retry(
+                source_prefix=source_prefix,
+                dest_prefix=dest_prefix,
+                passes=passes,
+                logger=logger,
+            )
+        except Exception:
+            await self._report_build_copy(
+                project_slug=project_slug,
+                passes=passes,
+                started=started,
+                succeeded=False,
+                logger=logger,
+            )
+            # A bare ``raise`` re-raises the copy's own exception as it
+            # stands — the report above does not become its context.
+            raise
+        await self._report_build_copy(
+            project_slug=project_slug,
+            passes=passes,
+            started=started,
+            succeeded=True,
+            logger=logger,
+        )
+        return result
+
+    async def _copy_with_build_retry(
+        self,
+        *,
+        source_prefix: str,
+        dest_prefix: str,
+        passes: list[CopyTally],
         logger: structlog.stdlib.BoundLogger,
     ) -> CopyResult:
         """Copy one build's content, re-running once after a transport error.
@@ -2167,9 +2269,15 @@ class KeeperSyncService:
         kind propagate unchanged, so :meth:`sync_edition`'s per-edition
         failure accounting and the orphan-placeholder reclaim see
         exactly what they did before.
+
+        Each pass's :class:`CopyTally` is appended to ``passes`` before
+        the pass starts, so the caller can report on every pass that ran
+        whether this returns or raises.
         """
+        first = CopyTally()
+        passes.append(first)
         try:
-            return await self._copy_callable(source_prefix, dest_prefix)
+            return await self._copy_callable(source_prefix, dest_prefix, first)
         except Exception as exc:
             transport_error = _retryable_transport_error(exc)
             if transport_error is None:
@@ -2185,7 +2293,51 @@ class KeeperSyncService:
         # propagates as itself, without the first chained on as its
         # ``__context__``.
         await _sleep(self._copy_retry_delay_seconds)
-        return await self._copy_callable(source_prefix, dest_prefix)
+        second = CopyTally()
+        passes.append(second)
+        return await self._copy_callable(source_prefix, dest_prefix, second)
+
+    async def _report_build_copy(
+        self,
+        *,
+        project_slug: str,
+        passes: Sequence[CopyTally],
+        started: float,
+        succeeded: bool,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Hand ``on_build_copied`` the report for one build copy, if wired.
+
+        The hook is a side channel, so it may not decide the copy's fate:
+        whatever it raises is sent to Sentry and logged, and the copy's
+        own result or exception carries on as if it had not run — the
+        same isolation ``sync_project`` gives ``on_edition_synced``.
+        """
+        if self._on_build_copied is None:
+            return
+        last = passes[-1]
+        report = BuildCopyReport(
+            project_slug=project_slug,
+            object_count=last.object_count,
+            total_size_bytes=last.total_size_bytes,
+            duration_seconds=monotonic() - started,
+            peak_concurrent_copies=max(
+                tally.peak_concurrent_copies for tally in passes
+            ),
+            retried_object_count=sum(
+                tally.retried_object_count for tally in passes
+            ),
+            exhausted_object_count=sum(
+                tally.exhausted_object_count for tally in passes
+            ),
+            build_retry_used=len(passes) > 1,
+            succeeded=succeeded,
+        )
+        try:
+            await self._on_build_copied(report)
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            logger.exception("on_build_copied callback raised; continuing")
 
     async def _resolve_build_source(
         self,

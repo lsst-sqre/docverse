@@ -20,6 +20,16 @@ async def test_upload_and_download() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upload_reports_a_single_attempt() -> None:
+    """An in-memory write never retries, so it always took one attempt."""
+    store = MockObjectStore()
+    attempts = await store.upload_object(
+        key="test/file.txt", data=b"x", content_type="text/plain"
+    )
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_download_missing_raises() -> None:
     store = MockObjectStore()
     with pytest.raises(KeyError):

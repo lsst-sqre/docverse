@@ -57,6 +57,7 @@ from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
 from docverse_server.factory import Factory
+from docverse_server.metrics import BuildContentCopiedEvent, DocverseEvents
 from docverse_server.services.keeper_sync.scheduler import (
     _TIER_ANNOTATION_KEYS,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
@@ -74,6 +75,8 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_refresh_other_edition,
 )
 from docverse_server.services.keeper_sync.service import (
+    BuildCopiedCallback,
+    BuildCopyReport,
     EditionSyncFailure,
     EditionSyncOutcome,
     ProjectSyncResult,
@@ -694,6 +697,11 @@ async def keeper_sync_project(
                 org_id=org_id,
                 service_label=publishing_store_label,
                 ltd_base_url=ltd_base_url,
+                on_build_copied=_build_on_build_copied(
+                    events=ctx.get("events"),
+                    org_slug=org_slug,
+                    ltd_slug=ltd_slug,
+                ),
             )
 
             on_edition_synced = _build_on_edition_synced(
@@ -901,6 +909,49 @@ def _build_on_edition_synced(
             run_id=run_id,
             outcome=outcome,
             logger=logger,
+        )
+
+    return callback
+
+
+def _build_on_build_copied(
+    *,
+    events: DocverseEvents | None,
+    org_slug: str,
+    ltd_slug: str,
+) -> BuildCopiedCallback | None:
+    """Build the hook that publishes each build copy as a metrics event.
+
+    :meth:`KeeperSyncService.sync_build
+    <docverse_server.services.keeper_sync.service.KeeperSyncService.sync_build>`
+    awaits it once per build-content copy — after a success and after a
+    failure, a build-level re-run included — and each call publishes one
+    ``BuildContentCopiedEvent``, so a Sasquatch dashboard can plot
+    transport health over a sync campaign (PRD #685). The report
+    carries the Docverse project slug; the organization and the LTD
+    product slug come from the job payload.
+
+    Returns ``None`` when the worker has no metrics events (unit tests
+    that do not ask for them), so the service skips the report entirely.
+    """
+    if events is None:
+        return None
+
+    async def callback(report: BuildCopyReport) -> None:
+        await events.build_content_copied.publish(
+            BuildContentCopiedEvent(
+                organization=org_slug,
+                project=report.project_slug,
+                ltd_slug=ltd_slug,
+                object_count=report.object_count,
+                total_size_bytes=report.total_size_bytes,
+                duration_seconds=report.duration_seconds,
+                peak_concurrent_copies=report.peak_concurrent_copies,
+                retried_object_count=report.retried_object_count,
+                exhausted_object_count=report.exhausted_object_count,
+                build_retry_used=report.build_retry_used,
+                succeeded=report.succeeded,
+            )
         )
 
     return callback

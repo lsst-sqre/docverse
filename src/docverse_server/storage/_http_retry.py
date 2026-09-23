@@ -44,6 +44,7 @@ __all__ = [
     "RetryOutcome",
     "backoff_for_attempt",
     "backoff_for_response",
+    "retry_budget_exhausted",
     "retry_request",
 ]
 
@@ -241,6 +242,41 @@ class RetryOutcome:
         from "fix the credential".
         """
         return self.response.status_code in RETRYABLE_STATUS_CODES
+
+
+def retry_budget_exhausted(exc: BaseException) -> bool:
+    """Whether a failed request's exception means its budget ran out.
+
+    For an exception raised out of `retry_request`, or by
+    ``raise_for_status`` on the `RetryOutcome` it returned: ``True`` when
+    the failure is one the loop retries — a
+    `RETRYABLE_TRANSPORT_ERRORS` transport failure, or an
+    ``httpx.HTTPStatusError`` for one of `RETRYABLE_STATUS_CODES` —
+    because the loop only lets either out once every attempt is spent.
+    Anything else (a ``403``, an unfollowed redirect, a local protocol
+    bug, an error that never came from the loop) fails the same way on
+    the first attempt whatever the budget, so it is not an exhaustion.
+
+    This is the exception-side twin of `RetryOutcome.retryable`, for
+    callers that only see the raise — the keeper-sync copier counts the
+    objects whose upload outlasted its budget with it.
+
+    Parameters
+    ----------
+    exc
+        The exception the request, or its ``raise_for_status``, raised.
+
+    Returns
+    -------
+    bool
+        Whether more attempts might have let the request succeed.
+    """
+    if isinstance(exc, RETRYABLE_TRANSPORT_ERRORS):
+        return True
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in RETRYABLE_STATUS_CODES
+    )
 
 
 async def retry_request(

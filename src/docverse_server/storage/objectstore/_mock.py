@@ -107,8 +107,9 @@ class MockObjectStore:
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
-    ) -> None:
-        """Upload an object to the in-memory store."""
+    ) -> int:
+        """Upload an object to the in-memory store, in one attempt."""
         self._objects[key] = _StoredObject(
             data=data, content_type=content_type
         )
+        return 1

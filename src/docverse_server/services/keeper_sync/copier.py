@@ -45,6 +45,7 @@ from docverse_server.domain.content_hash import (
     EMPTY_MANIFEST_HASH,
     hash_manifest_pairs,
 )
+from docverse_server.storage._http_retry import retry_budget_exhausted
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
 
@@ -52,6 +53,7 @@ __all__ = [
     "DEFAULT_COPY_CONCURRENCY",
     "BuildContentCopier",
     "CopyResult",
+    "CopyTally",
 ]
 
 DEFAULT_COPY_CONCURRENCY = 8
@@ -78,6 +80,33 @@ class CopyResult:
     total_size_bytes: int
     content_hash: str
     """``sha256:<64 hex chars>`` over the deterministic manifest."""
+
+
+@dataclass
+class CopyTally:
+    """Running counts for one ``BuildContentCopier.copy_build`` call.
+
+    The caller passes one in and reads it afterwards, whether the copy
+    returned or raised. That is the point of it: a copy that fails
+    returns no :class:`CopyResult`, yet the failed copies are exactly
+    the ones whose transport counts the keeper-sync metrics event
+    (``BuildContentCopiedEvent``) exists to report.
+    """
+
+    object_count: int = 0
+    """Objects stored so far."""
+
+    total_size_bytes: int = 0
+    """Bytes stored so far."""
+
+    peak_concurrent_copies: int = 0
+    """Most objects in flight at once."""
+
+    retried_object_count: int = 0
+    """Objects stored only after the destination retried their upload."""
+
+    exhausted_object_count: int = 0
+    """Objects whose upload ran out of the destination's retry budget."""
 
 
 class BuildContentCopier:
@@ -140,7 +169,11 @@ class BuildContentCopier:
         return hash_manifest_pairs(manifest_entries)
 
     async def copy_build(
-        self, *, source_prefix: str, dest_prefix: str
+        self,
+        *,
+        source_prefix: str,
+        dest_prefix: str,
+        tally: CopyTally | None = None,
     ) -> CopyResult:
         """Copy every key under ``source_prefix`` to ``dest_prefix``.
 
@@ -150,12 +183,18 @@ class BuildContentCopier:
         terminating in ``/`` for the purpose of computing relative
         keys.
 
+        Pass ``tally`` to read the copy's counts — including the objects
+        whose upload the destination had to retry — after it returns or
+        raises; see :class:`CopyTally`.
+
         Returns
         -------
         CopyResult
             Object count, total bytes, and the deterministic manifest
             hash suitable for ``Build.content_hash``.
         """
+        if tally is None:
+            tally = CopyTally()
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
         normalized_dest_prefix = _ensure_trailing_slash(dest_prefix)
         listed = await self._source.list_keys(prefix=normalized_source_prefix)
@@ -186,16 +225,31 @@ class BuildContentCopier:
                 data = await self._source.download_object(key=source_key)
                 digest = hashlib.sha256(data).hexdigest()
                 size = len(data)
-                await self._destination.upload_object(
-                    key=dest_key,
-                    data=data,
-                    content_type=content_type,
-                )
+                try:
+                    attempts = await self._destination.upload_object(
+                        key=dest_key,
+                        data=data,
+                        content_type=content_type,
+                    )
+                except Exception as exc:
+                    # Counted, then re-raised untouched: the bare
+                    # ``raise`` leaves the error and its chain exactly
+                    # as the store built them.
+                    if retry_budget_exhausted(exc):
+                        tally.exhausted_object_count += 1
+                    raise
             # ``data`` dies with this coroutine's frame, before the
             # worker that ran it allocates the next object's buffer.
             manifest_entries.append((relative, digest, size))
+            tally.object_count += 1
+            tally.total_size_bytes += size
+            if attempts > 1:
+                tally.retried_object_count += 1
 
-        await self._run_bounded(keys, _copy_one)
+        try:
+            await self._run_bounded(keys, _copy_one)
+        finally:
+            tally.peak_concurrent_copies = in_flight.peak
 
         # Size is deliberately not part of a manifest line — it is
         # derivable from the bytes already hashed — so it is dropped on
@@ -211,6 +265,8 @@ class BuildContentCopier:
             total_size_bytes=total_bytes,
             content_hash=manifest_hash,
             peak_concurrent_copies=in_flight.peak,
+            retried_object_count=tally.retried_object_count,
+            exhausted_object_count=tally.exhausted_object_count,
         )
 
         return CopyResult(

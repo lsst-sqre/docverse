@@ -313,28 +313,35 @@ class S3ObjectStore:
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
-    ) -> None:
+    ) -> int:
         """Upload an object via presigned URL if http_client is available.
 
         Falls back to direct put_object when no http_client is set. The
         fallback needs no retry logic of its own: aiobotocore inherits
         botocore's standard retry mode.
+
+        Returns
+        -------
+        int
+            Attempts the presigned upload spent, counting the first. The
+            fallback reports ``1``: botocore retries inside ``put_object``
+            where this store cannot count them.
         """
         if self._http_client is not None:
-            await self._upload_via_presigned_url(
+            return await self._upload_via_presigned_url(
                 http_client=self._http_client,
                 key=key,
                 data=data,
                 content_type=content_type,
             )
-        else:
-            client = self._get_client()
-            await client.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=data,
-                ContentType=content_type,
-            )
+        client = self._get_client()
+        await client.put_object(
+            Bucket=self._bucket,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        return 1
 
     async def _upload_via_presigned_url(
         self,
@@ -343,7 +350,7 @@ class S3ObjectStore:
         key: str,
         data: bytes,
         content_type: str,
-    ) -> None:
+    ) -> int:
         """PUT an object to a presigned URL, retrying transient failures.
 
         Cloudflare R2 answers a bulk copy with occasional ``500``s and
@@ -351,6 +358,13 @@ class S3ObjectStore:
         fallback — is the one production takes, so the retry lives here
         rather than in every caller. Retrying is safe because a PUT of
         the same key with the same bytes is idempotent.
+
+        Returns
+        -------
+        int
+            Attempts the upload spent before it landed, counting the
+            first — `RetryOutcome.attempts
+            <docverse_server.storage._http_retry.RetryOutcome.attempts>`.
 
         Raises
         ------
@@ -412,19 +426,19 @@ class S3ObjectStore:
         # region/endpoint redirect from S3 or R2 (this client does not
         # follow redirects, so the body went nowhere) as much as a 4xx or
         # 5xx — has to fail loudly rather than report a build as copied
-        # when the object was never stored.
-        if outcome.response.is_success:
-            return
-
-        logger.error(
-            "Presigned upload failed",
-            status_code=outcome.response.status_code,
-            response_body=outcome.response.text,
-            attempts=outcome.attempts,
-            elapsed_seconds=monotonic() - started,
-            retryable=outcome.retryable,
-        )
-        outcome.response.raise_for_status()
+        # when the object was never stored. ``raise_for_status`` raises
+        # for every non-2xx, so only a landed object reaches the return.
+        if not outcome.response.is_success:
+            logger.error(
+                "Presigned upload failed",
+                status_code=outcome.response.status_code,
+                response_body=outcome.response.text,
+                attempts=outcome.attempts,
+                elapsed_seconds=monotonic() - started,
+                retryable=outcome.retryable,
+            )
+            outcome.response.raise_for_status()
+        return outcome.attempts
 
     async def _generate_upload_url(self, key: str) -> str:
         """Mint a short-lived presigned PUT URL for ``key``."""

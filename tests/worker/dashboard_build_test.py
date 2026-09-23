@@ -563,9 +563,9 @@ class _RecordingMockObjectStore(MockObjectStore):
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
-    ) -> None:
+    ) -> int:
         self._op_timestamps.append(time.monotonic())
-        await super().upload_object(
+        return await super().upload_object(
             key=key, data=data, content_type=content_type
         )
 

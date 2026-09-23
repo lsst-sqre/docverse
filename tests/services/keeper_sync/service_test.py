@@ -67,10 +67,13 @@ from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync.copier import (
     BuildContentCopier,
     CopyResult,
+    CopyTally,
 )
 from docverse_server.services.keeper_sync.service import (
     DEFAULT_COPY_RETRY_DELAY_SECONDS,
     MAX_CONSECUTIVE_EDITION_FAILURES,
+    BuildCopiedCallback,
+    BuildCopyReport,
     BuildSyncOutcome,
     CopyCallable,
     EditionSyncOutcome,
@@ -110,6 +113,7 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions.build_processing import _process_build
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 from tests.support.lock_service_spy import RecordingLockService
+from tests.support.objectstore import ScriptedUploadStore
 from tests.support.rowlocks import (
     LOCK_WAIT_TIMEOUT,
     backend_pid,
@@ -210,6 +214,7 @@ def _build_service(
     after_manifest_hash: Callable[[str], None] | None = None,
     wrap_copy: Callable[[CopyCallable], CopyCallable] | None = None,
     copy_retry_delay_seconds: float | None = None,
+    on_build_copied: BuildCopiedCallback | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -232,6 +237,8 @@ def _build_service(
     it — the seam the build-level copy-retry tests use to fail a copy
     (see :func:`_flaky_copy`). ``copy_retry_delay_seconds`` overrides
     the service's default wait before re-running a failed copy.
+    ``on_build_copied`` receives one report per build copy (see
+    :func:`_record_copy_reports`).
     """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -258,10 +265,10 @@ def _build_service(
     )
 
     async def copy_callable(
-        source_prefix: str, dest_prefix: str
+        source_prefix: str, dest_prefix: str, tally: CopyTally
     ) -> CopyResult:
         return await copier.copy_build(
-            source_prefix=source_prefix, dest_prefix=dest_prefix
+            source_prefix=source_prefix, dest_prefix=dest_prefix, tally=tally
         )
 
     copy: CopyCallable = copy_callable
@@ -300,6 +307,7 @@ def _build_service(
             if copy_retry_delay_seconds is not None
             else DEFAULT_COPY_RETRY_DELAY_SECONDS
         ),
+        on_build_copied=on_build_copied,
     )
 
 
@@ -2891,12 +2899,14 @@ def _flaky_copy(
     """
 
     def wrap(copy: CopyCallable) -> CopyCallable:
-        async def flaky(source_prefix: str, dest_prefix: str) -> CopyResult:
+        async def flaky(
+            source_prefix: str, dest_prefix: str, tally: CopyTally
+        ) -> CopyResult:
             calls.append((source_prefix, dest_prefix))
             queued = failures.get(source_prefix.rstrip("/"))
             if queued:
                 raise queued.pop(0)
-            return await copy(source_prefix, dest_prefix)
+            return await copy(source_prefix, dest_prefix, tally)
 
         return flaky
 
@@ -3130,6 +3140,239 @@ async def test_sync_build_reruns_copy_when_transport_error_is_the_cause(
     retries = _copy_retry_logs(logs)
     assert len(retries) == 1
     assert retries[0]["error_type"] == "ConnectTimeout"
+
+
+def _record_copy_reports() -> tuple[
+    list[BuildCopyReport], BuildCopiedCallback
+]:
+    """Return a list and an ``on_build_copied`` hook that appends to it."""
+    reports: list[BuildCopyReport] = []
+
+    async def _record(report: BuildCopyReport) -> None:
+        reports.append(report)
+
+    return reports, _record
+
+
+def _forbidden() -> httpx.HTTPStatusError:
+    """Build the error ``raise_for_status`` gives for an R2 ``403``."""
+    request = httpx.Request("PUT", "https://r2.example/index.html")
+    return httpx.HTTPStatusError(
+        "403 Forbidden",
+        request=request,
+        response=httpx.Response(403, request=request),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_the_copy_and_its_retried_objects(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A copied build is reported once, with the uploads that needed retries.
+
+    The report is what the keeper-sync worker publishes as a
+    ``BuildContentCopiedEvent``; an upload that landed on its second
+    attempt shows in it even though the copy itself never failed.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    body = b"<html>v1</html>"
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore({"index.html": [2]}),
+        {"pipelines/builds/42/index.html": body},
+        on_build_copied=on_build_copied,
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.project_slug == "pipelines"
+    assert report.object_count == 1
+    assert report.total_size_bytes == len(body)
+    assert report.peak_concurrent_copies == 1
+    assert report.retried_object_count == 1
+    assert report.exhausted_object_count == 0
+    assert report.build_retry_used is False
+    assert report.succeeded is True
+    assert report.duration_seconds >= 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_a_rerun_copy_as_one_copy(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy the build-level retry recovered is still one report.
+
+    It says the retry was used and keeps the first pass's exhausted
+    upload — that object is the outage the retry rode out.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-rerun")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore({"index.html": [httpx.ConnectTimeout("")]}),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        copy_retry_delay_seconds=7.0,
+        on_build_copied=on_build_copied,
+    )
+    _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_failures == ()
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.build_retry_used is True
+    assert report.succeeded is True
+    assert report.exhausted_object_count == 1
+    assert report.object_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_a_copy_that_failed_both_passes(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that outlasts the build-level retry is reported as failed.
+
+    Each pass's exhausted upload is counted, and the report goes out
+    before the failure reaches ``sync_edition``'s accounting — here the
+    project's only edition, so the sync then fails as a whole.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-failed")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore(
+            {
+                "index.html": [
+                    httpx.ConnectTimeout("first"),
+                    httpx.ConnectTimeout("second"),
+                ]
+            }
+        ),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        copy_retry_delay_seconds=7.0,
+        on_build_copied=on_build_copied,
+    )
+    _record_copy_retry_sleeps(monkeypatch, db_session)
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.succeeded is False
+    assert report.build_retry_used is True
+    assert report.exhausted_object_count == 2
+    assert report.object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_a_copy_that_failed_without_a_rerun(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-transport copy failure is reported once, with no retry used.
+
+    A ``403`` from R2 ends the copy on its first attempt, so nothing ran
+    out of budget and the build-level retry never fired.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-403")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore({"index.html": [_forbidden()]}),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=on_build_copied,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert sleeps == []
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.succeeded is False
+    assert report.build_retry_used is False
+    assert report.exhausted_object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_isolates_a_raising_copy_report_hook(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metrics hook that raises cannot fail the build it reports on.
+
+    The report is a side channel: the copy already landed, so the hook's
+    error goes to Sentry and the log, and the sync carries on.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-raises")
+
+    _seed_ltd(mock_discovery)
+    hook_error = RuntimeError("metrics are down")
+
+    async def _raising_hook(report: BuildCopyReport) -> None:
+        raise hook_error
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=_raising_hook,
+    )
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    outcome = result.edition_outcomes[0].build_outcome
+    assert outcome is not None
+    assert outcome.short_circuited is False
+    assert captured == [hook_error]
+    assert any(
+        entry["event"] == "on_build_copied callback raised; continuing"
+        for entry in logs
+    )
 
 
 @pytest.mark.asyncio

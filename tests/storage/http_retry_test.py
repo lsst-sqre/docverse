@@ -21,6 +21,7 @@ from docverse_server.storage._http_retry import (
     RETRYABLE_TRANSPORT_ERRORS,
     backoff_for_attempt,
     backoff_for_response,
+    retry_budget_exhausted,
     retry_request,
 )
 
@@ -501,3 +502,40 @@ async def test_retry_request_adds_caller_context_to_retry_logs() -> None:
     warnings = [entry for entry in logs if entry["log_level"] == "warning"]
     assert len(warnings) == 1
     assert warnings[0]["error_codes"] == [1134]
+
+
+def _status_error(status_code: int) -> httpx.HTTPStatusError:
+    """Build the error ``raise_for_status`` gives for ``status_code``."""
+    request = httpx.Request("PUT", "https://r2.example/key")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"status {status_code}", request=request, response=response
+    )
+
+
+@pytest.mark.parametrize(
+    ("exc", "exhausted"),
+    [
+        (httpx.ConnectTimeout(""), True),
+        (httpx.WriteError("connection reset"), True),
+        (httpx.RemoteProtocolError("peer closed"), True),
+        (_status_error(503), True),
+        (_status_error(429), True),
+        (_status_error(403), False),
+        (_status_error(301), False),
+        (httpx.LocalProtocolError("bad header"), False),
+        (RuntimeError("AccessDenied"), False),
+    ],
+)
+def test_retry_budget_exhausted_names_what_more_attempts_might_fix(
+    exc: BaseException, *, exhausted: bool
+) -> None:
+    """Only a failure the loop would have retried means the budget ran out.
+
+    ``retry_request`` re-raises a retryable transport error only once the
+    budget is spent, and returns a retryable status only on the last
+    attempt — so either, surfacing from an upload, is an exhausted budget.
+    A ``403``, a redirect, or a local protocol bug fails on the first
+    attempt whatever the budget, and says nothing about transport health.
+    """
+    assert retry_budget_exhausted(exc) is exhausted

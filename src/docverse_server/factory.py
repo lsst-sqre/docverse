@@ -45,7 +45,9 @@ from .services.keeper_sync import (
     DEFAULT_COPY_CONCURRENCY,
     DEFAULT_COPY_RETRY_DELAY_SECONDS,
     BuildContentCopier,
+    BuildCopiedCallback,
     CopyResult,
+    CopyTally,
     KeeperSyncContext,
     KeeperSyncService,
 )
@@ -1149,6 +1151,7 @@ class Factory:
         org_id: int,
         service_label: str,
         ltd_base_url: str = "https://keeper.lsst.codes",
+        on_build_copied: BuildCopiedCallback | None = None,
     ) -> KeeperSyncService:
         """Create a :class:`KeeperSyncService` for one org's sync run.
 
@@ -1157,17 +1160,23 @@ class Factory:
         updates it shares with the native ``build_processing`` path.
         Direct unit-test constructions of the service may omit it and
         run unwrapped, exactly as ``EditionTrackingService`` does.
+
+        ``on_build_copied`` is handed one report per build-content copy;
+        the keeper-sync worker passes a hook that publishes it as a
+        ``BuildContentCopiedEvent``.
         """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
         async def copy_callable(
-            source_prefix: str, dest_prefix: str
+            source_prefix: str, dest_prefix: str, tally: CopyTally
         ) -> CopyResult:
             async with self.create_build_content_copier_for_org(
                 org_id=org_id, service_label=service_label
             ) as copier:
                 return await copier.copy_build(
-                    source_prefix=source_prefix, dest_prefix=dest_prefix
+                    source_prefix=source_prefix,
+                    dest_prefix=dest_prefix,
+                    tally=tally,
                 )
 
         async def manifest_callable(source_prefix: str) -> str:
@@ -1215,6 +1224,7 @@ class Factory:
             ref_set_fetcher=ref_set_fetcher,
             lock_service=self.create_lock_service(),
             copy_retry_delay_seconds=self._keeper_sync_copy_retry_delay_seconds,
+            on_build_copied=on_build_copied,
         )
 
 

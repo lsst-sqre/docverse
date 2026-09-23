@@ -65,9 +65,14 @@ from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.queue import JobStatus
 from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.factory import Factory
-from docverse_server.metrics import build_event_manager
+from docverse_server.metrics import (
+    BuildContentCopiedEvent,
+    DocverseEvents,
+    build_event_manager,
+)
 from docverse_server.sentry import initialize_sentry
 from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
+from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.lock_service import LockClass, LockKey
 from docverse_server.storage.build_store import BuildStore
@@ -91,6 +96,7 @@ from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.support.objectstore import ScriptedUploadStore
 from tests.support.queue_dispatch import make_dispatcher
 from tests.worker.conftest import make_worker_ctx
 
@@ -936,6 +942,166 @@ async def test_keeper_sync_project_publishes_run_completed(
     assert event.succeeded_count == 0
     assert event.failed_count == 1
     assert event.elapsed >= timedelta(0)
+
+
+async def _prepare_copy_metrics_sync(
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    object_store: MockObjectStore,
+) -> tuple[dict[str, Any], dict[str, Any], DocverseEvents]:
+    """Set up one ``keeper_sync_project`` run with metrics recording on.
+
+    Seeds the single-edition ``pipelines`` product, routes the copier's
+    destination to ``object_store``, and stubs the build-level copy
+    retry's 30 s wait. Returns the worker ctx, the job payload, and the
+    events whose ``build_content_copied`` publisher the test reads.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+    _seed_ltd(mock_discovery)
+    _patch_factory_io(
+        monkeypatch,
+        object_store=object_store,
+        source_objects={"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+
+    async def _no_wait(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(service_module, "_sleep", _no_wait)
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+    payload = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "run_id": run_id,
+        "queue_job_id": queue_job_id,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    return ctx, payload, events
+
+
+def _copied_events(events: DocverseEvents) -> list[BuildContentCopiedEvent]:
+    """Return what the ``build_content_copied`` publisher recorded."""
+    publisher = events.build_content_copied
+    assert isinstance(publisher, MockEventPublisher)
+    return list(publisher.published)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_publishes_build_content_copied(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied build publishes one event naming the uploads it retried.
+
+    The upload that landed on its second attempt never failed the copy,
+    so this event is the only place a dashboard can see it.
+    """
+    ctx, payload, events = await _prepare_copy_metrics_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        object_store=ScriptedUploadStore({"index.html": [2]}),
+    )
+
+    result = await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    published = _copied_events(events)
+    assert len(published) == 1
+    event = published[0]
+    assert event.organization == payload["org_slug"]
+    assert event.project == "pipelines"
+    assert event.ltd_slug == "pipelines"
+    assert event.object_count == 1
+    assert event.total_size_bytes == len(b"<html>v1</html>")
+    assert event.peak_concurrent_copies == 1
+    assert event.retried_object_count == 1
+    assert event.exhausted_object_count == 0
+    assert event.build_retry_used is False
+    assert event.succeeded is True
+    assert event.duration_seconds >= 0
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_reports_a_rerun_copy_once(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy the build-level retry recovered publishes one event, not two."""
+    ctx, payload, events = await _prepare_copy_metrics_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        object_store=ScriptedUploadStore(
+            {"index.html": [httpx.ConnectTimeout("")]}
+        ),
+    )
+
+    result = await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    published = _copied_events(events)
+    assert len(published) == 1
+    assert published[0].build_retry_used is True
+    assert published[0].succeeded is True
+    assert published[0].exhausted_object_count == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_reports_a_copy_that_failed_twice(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that fails both passes still publishes its one event.
+
+    The failure goes on to fail the job — the project's only edition
+    imported nothing — but the event is already out, saying which
+    uploads ran out of attempts.
+    """
+    ctx, payload, events = await _prepare_copy_metrics_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        object_store=ScriptedUploadStore(
+            {
+                "index.html": [
+                    httpx.ConnectTimeout("first"),
+                    httpx.ConnectTimeout("second"),
+                ]
+            }
+        ),
+    )
+
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    published = _copied_events(events)
+    assert len(published) == 1
+    assert published[0].succeeded is False
+    assert published[0].build_retry_used is True
+    assert published[0].exhausted_object_count >= 1
 
 
 @pytest.mark.asyncio

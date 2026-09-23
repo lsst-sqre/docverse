@@ -11,17 +11,23 @@ import asyncio
 import hashlib
 import traceback
 
+import httpx
 import pytest
 import structlog
 from botocore.exceptions import ClientError
+from structlog.testing import capture_logs
 
 from docverse_server.domain.content_hash import EMPTY_MANIFEST_HASH
-from docverse_server.services.keeper_sync.copier import BuildContentCopier
+from docverse_server.services.keeper_sync.copier import (
+    BuildContentCopier,
+    CopyTally,
+)
 from docverse_server.storage.ltd import (
     LtdSourceAccessDeniedError,
     LtdSourceProtocol,
 )
 from docverse_server.storage.objectstore import MockObjectStore
+from tests.support.objectstore import ScriptedUploadStore
 
 
 class _FakeSource(LtdSourceProtocol):
@@ -675,3 +681,108 @@ async def test_marker_only_prefix_hashes_as_an_empty_prefix() -> None:
     ).compute_manifest_hash(source_prefix="src/builds/1/")
 
     assert hashed == EMPTY_MANIFEST_HASH
+
+
+@pytest.mark.asyncio
+async def test_copy_tallies_objects_that_landed_after_a_retry() -> None:
+    """An upload that took more than one attempt counts as retried.
+
+    The count reaches the caller through the tally it passed in, which
+    is what the keeper-sync metrics event reads.
+    """
+    objects = {
+        "src/1/index.html": b"<html></html>",
+        "src/1/app.css": b"body{}",
+        "src/1/app.js": b"x",
+    }
+    tally = CopyTally()
+
+    result = await BuildContentCopier(
+        source=_FakeSource(objects),
+        destination=ScriptedUploadStore({"app.css": [2]}),
+        logger=_logger(),
+    ).copy_build(source_prefix="src/1/", dest_prefix="dst/", tally=tally)
+
+    assert tally.retried_object_count == 1
+    assert tally.exhausted_object_count == 0
+    assert tally.object_count == result.object_count == 3
+    assert tally.total_size_bytes == result.total_size_bytes
+    assert tally.peak_concurrent_copies >= 1
+
+
+@pytest.mark.asyncio
+async def test_copy_tallies_an_upload_that_exhausted_its_budget() -> None:
+    """An upload that outlasted its retry budget counts as exhausted.
+
+    The copy still fails with that upload's own error — the build-level
+    retry keys off it — but the tally survives the raise, so the failed
+    copy's metrics event can say an object ran out of attempts.
+    """
+    timeout = httpx.ConnectTimeout("")
+    tally = CopyTally()
+    copier = BuildContentCopier(
+        source=_FakeSource({"src/1/index.html": b"<html></html>"}),
+        destination=ScriptedUploadStore({"index.html": [timeout]}),
+        logger=_logger(),
+    )
+
+    with pytest.raises(httpx.ConnectTimeout) as excinfo:
+        await copier.copy_build(
+            source_prefix="src/1/", dest_prefix="dst/", tally=tally
+        )
+
+    assert excinfo.value is timeout
+    assert tally.exhausted_object_count == 1
+    assert tally.object_count == 0
+    assert tally.peak_concurrent_copies == 1
+
+
+@pytest.mark.asyncio
+async def test_copy_does_not_count_a_refused_upload_as_exhausted() -> None:
+    """A ``403`` fails on its first attempt whatever the budget.
+
+    It says the credential is wrong, not that R2 is flaky, so it stays
+    out of the transport-health count.
+    """
+    request = httpx.Request("PUT", "https://r2.example/dst/index.html")
+    forbidden = httpx.HTTPStatusError(
+        "403 Forbidden",
+        request=request,
+        response=httpx.Response(403, request=request),
+    )
+    tally = CopyTally()
+    copier = BuildContentCopier(
+        source=_FakeSource({"src/1/index.html": b"<html></html>"}),
+        destination=ScriptedUploadStore({"index.html": [forbidden]}),
+        logger=_logger(),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await copier.copy_build(
+            source_prefix="src/1/", dest_prefix="dst/", tally=tally
+        )
+
+    assert tally.exhausted_object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_copied_build_content_log_reports_transport_counts() -> None:
+    """The "Copied build content" line says how many uploads were retried.
+
+    Both counts ride on the one info line every successful copy already
+    writes, so a log search finds a flaky copy without the metrics
+    stream.
+    """
+    objects = {"src/1/index.html": b"<html></html>", "src/1/app.css": b"x"}
+
+    with capture_logs() as logs:
+        await BuildContentCopier(
+            source=_FakeSource(objects),
+            destination=ScriptedUploadStore({"app.css": [3]}),
+            logger=_logger(),
+        ).copy_build(source_prefix="src/1/", dest_prefix="dst/")
+
+    copied = [e for e in logs if e["event"] == "Copied build content"]
+    assert len(copied) == 1
+    assert copied[0]["retried_object_count"] == 1
+    assert copied[0]["exhausted_object_count"] == 0

@@ -122,6 +122,40 @@ async def test_upload_object_retries_500_then_succeeds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upload_object_reports_the_attempts_it_spent() -> None:
+    """The store says how many attempts each upload took to land.
+
+    A retry that eventually succeeds leaves no trace but a warning log,
+    so this count is what lets the keeper-sync copier tally retried
+    objects for its metrics event. It counts the first attempt, so an
+    upload that landed first time reports 1.
+    """
+    responses = [
+        httpx.Response(200),
+        httpx.Response(503),
+        httpx.Response(200),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    store, client = _make_store(handler)
+    async with client, store as s:
+        first = await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+        second = await s.upload_object(
+            key="build/app.css",
+            data=b"body{}",
+            content_type="text/css",
+        )
+
+    assert (first, second) == (1, 2)
+
+
+@pytest.mark.asyncio
 async def test_upload_object_retries_read_timeout_then_succeeds() -> None:
     """A bare ``ReadTimeout`` is retried, not propagated."""
     attempts: list[int] = []

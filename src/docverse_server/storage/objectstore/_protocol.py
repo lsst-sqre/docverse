@@ -189,7 +189,7 @@ class ObjectStore(Protocol):
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
-    ) -> None:
+    ) -> int:
         """Upload an object directly.
 
         Parameters
@@ -200,5 +200,15 @@ class ObjectStore(Protocol):
             Object contents.
         content_type
             MIME type of the object.
+
+        Returns
+        -------
+        int
+            Attempts the upload spent, counting the first, so ``1``
+            means it landed first time. A path that retries somewhere
+            the store cannot count (aiobotocore's own retry mode), or
+            never retries at all, reports ``1``. The keeper-sync copier
+            tallies retried objects from it for its metrics event; every
+            other caller ignores it.
         """
         ...
