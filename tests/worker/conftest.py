@@ -55,6 +55,7 @@ def make_worker_ctx(
     github_app_private_key: SecretStr | None = None,
     github_webhook_secret: SecretStr | None = None,
     events: DocverseEvents | None = None,
+    cdn_purge_enabled: bool = False,
 ) -> dict[str, Any]:
     """Build a worker ctx dict that mirrors ``worker.main.startup``.
 
@@ -66,6 +67,9 @@ def make_worker_ctx(
     test asserts on published metrics; production's ``_startup`` always
     sets ``ctx["events"]``, but tests that do not care about metrics may
     leave it unset and the emitting worker simply skips publication.
+    ``cdn_purge_enabled`` defaults to off like
+    ``Configuration.cdn_purge_enabled``; tests that exercise the CDN
+    purge path pass ``True``.
     """
     if encryptor is None:
         encryptor = CredentialEncryptor(
@@ -83,8 +87,16 @@ def make_worker_ctx(
         github_app_id=github_app_id,
         github_app_private_key=github_app_private_key,
         github_webhook_secret=github_webhook_secret,
+        cdn_purge_enabled=cdn_purge_enabled,
         default_queue_name=_config.arq_queue_name,
         keeper_sync_copy_concurrency=_config.keeper_sync_copy_concurrency,
+        keeper_sync_upload_max_attempts=_config.keeper_sync_upload_max_attempts,
+        keeper_sync_upload_max_backoff_seconds=(
+            _config.keeper_sync_upload_max_backoff_seconds
+        ),
+        keeper_sync_copy_retry_delay_seconds=(
+            _config.keeper_sync_copy_retry_delay_seconds
+        ),
     )
     ctx: dict[str, Any] = {
         "factory_builder": builder,

@@ -17,12 +17,14 @@ from .models import (
 )
 from .products_client import LtdProductsClient
 from .s3_source import (
+    RETRYABLE_SOURCE_TRANSPORT_ERRORS,
     LtdS3Source,
     LtdSourceAccessDeniedError,
     LtdSourceProtocol,
 )
 
 __all__ = [
+    "RETRYABLE_SOURCE_TRANSPORT_ERRORS",
     "LtdBuild",
     "LtdClient",
     "LtdClientError",

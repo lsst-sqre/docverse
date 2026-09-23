@@ -22,6 +22,7 @@ from docverse_server.domain.slug import (
     AnySlugRewriteRule,
     derive_edition_kind_from_ref,
 )
+from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
 from docverse_server.storage.ltd import LtdBuild, LtdEdition, LtdEditionMode
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "derive_edition_kind",
     "derive_edition_slug",
     "derive_edition_source_prefix",
+    "derive_synced_build_git_ref",
     "map_edition_tracking",
 ]
 
@@ -270,10 +272,17 @@ def map_edition_tracking(
 
     Raises
     ------
+    KeeperSyncGitRefUnresolvableError
+        If ``mode == "manual"`` and the supplied ``build``'s
+        ``git_refs`` is empty/None. That is permanent for the (edition,
+        build) pair — a build's ``git_refs`` is fixed at upload — so it
+        shares the type ``sync_project`` reports as a per-edition
+        failure rather than as evidence of an outage.
     ValueError
         If ``mode == "git_refs"`` but ``tracked_refs`` is empty/None,
-        if ``mode == "manual"`` but ``build`` is None or its
-        ``git_refs`` is empty/None, or if ``mode`` is an unknown LTD
+        if ``mode == "manual"`` but ``build`` is None (the proactive
+        lifecycle pass relies on this to fall ``manual`` editions
+        through to ``sync_edition``), or if ``mode`` is an unknown LTD
         string (schema drift).
     """
     try:
@@ -321,10 +330,37 @@ def _map_manual(
         )
         raise ValueError(msg)
     if not build.git_refs:
-        msg = (
-            f"LTD edition {edition.slug!r} declares mode=manual and the"
-            f" published build (id={build.ltd_id}) reports no git_refs;"
-            " cannot derive a Docverse git_ref tracking pair"
+        raise KeeperSyncGitRefUnresolvableError(
+            ltd_edition_slug=edition.slug,
+            ltd_build_id=build.ltd_id,
+            message=(
+                f"LTD edition {edition.slug!r} declares mode=manual and the"
+                f" published build (id={build.ltd_id}) reports no git_refs;"
+                " cannot derive a Docverse git_ref tracking pair"
+            ),
         )
-        raise ValueError(msg)
     return TrackingMode.git_ref, {"git_ref": build.git_refs[0]}
+
+
+def derive_synced_build_git_ref(edition: LtdEdition, build: LtdBuild) -> str:
+    """Name the git ref a synced Docverse build was built from.
+
+    The edition's ``tracked_refs`` wins when LTD fills it (``git_refs``
+    mode), so already-synced projects keep deriving exactly the ref
+    they did before. Every other LTD mode reports ``tracked_refs:
+    null`` (#682), and there the published build's own ``git_refs`` —
+    the ref LTD actually built those bytes from — is the answer,
+    whichever edition mode selected the build.
+
+    Raises
+    ------
+    KeeperSyncGitRefUnresolvableError
+        If neither the edition nor the build names a ref.
+    """
+    if edition.tracked_refs:
+        return edition.tracked_refs[0]
+    if build.git_refs:
+        return build.git_refs[0]
+    raise KeeperSyncGitRefUnresolvableError(
+        ltd_edition_slug=edition.slug, ltd_build_id=build.ltd_id
+    )

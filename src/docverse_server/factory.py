@@ -43,8 +43,11 @@ from .services.infrastructure import InfrastructureService
 from .services.inventory_census import InventoryCensusService
 from .services.keeper_sync import (
     DEFAULT_COPY_CONCURRENCY,
+    DEFAULT_COPY_RETRY_DELAY_SECONDS,
     BuildContentCopier,
+    BuildCopiedCallback,
     CopyResult,
+    CopyTally,
     KeeperSyncContext,
     KeeperSyncService,
 )
@@ -60,6 +63,7 @@ from .services.project_github_binding import ProjectGitHubBindingResolver
 from .services.purgatory import PurgatoryService
 from .services.queue_dispatch import QueueDispatcher
 from .services.ref_deleted_processor import RefDeletedWebhookProcessor
+from .storage._http_retry import DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS
 from .storage.build_store import BuildStore
 from .storage.cdncachepurger import CdnCachePurger, create_cdn_cache_purger
 from .storage.dashboard_templates.github import (
@@ -127,6 +131,7 @@ class Factory:
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        copy_http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue | None = None,
         discovery: DiscoveryClient | None = None,
         github_app_id: int | None = None,
@@ -135,8 +140,14 @@ class Factory:
         github_app_name: str = "lsst-sqre/docverse",
         github_app_validated: bool = True,
         purge_coalescer: CdnPurgeCoalescer | None = None,
+        cdn_purge_enabled: bool = False,
         default_queue_name: str,
         keeper_sync_copy_concurrency: int = DEFAULT_COPY_CONCURRENCY,
+        keeper_sync_upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        keeper_sync_upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+        keeper_sync_copy_retry_delay_seconds: float = (
+            DEFAULT_COPY_RETRY_DELAY_SECONDS
+        ),
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -146,11 +157,24 @@ class Factory:
         # constructed factories (tests, one-off scripts) working without
         # sharing coalescing state between them.
         self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
+        # Defaults to off like ``Configuration.cdn_purge_enabled``, so a
+        # directly constructed Factory behaves as a deployed one does.
+        self._cdn_purge_enabled = cdn_purge_enabled
         self._session = session
         self._logger = logger
         self._credential_encryptor = credential_encryptor
         self._superadmin_usernames = superadmin_usernames or []
         self._http_client = http_client
+        # The client a keeper-sync copier's destination store PUTs
+        # presigned uploads over, and no other store or client this
+        # factory builds. Falls back to the shared client so directly
+        # constructed factories (tests, scripts) behave exactly as
+        # before; the arq worker threads its dedicated copy client
+        # (``worker.main.create_copy_http_client``) through
+        # ``WorkerFactoryBuilder``.
+        self._copy_http_client = (
+            copy_http_client if copy_http_client is not None else http_client
+        )
         self._arq_queue = arq_queue
         self._discovery = discovery
         self._github_app_id = github_app_id
@@ -165,6 +189,25 @@ class Factory:
         # threads ``Config.keeper_sync_copy_concurrency`` through
         # ``WorkerFactoryBuilder``.
         self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
+        # The presigned-upload budget of the store a keeper-sync copier
+        # writes through, and of no other store this factory builds.
+        # Defaults to the shared ``_http_retry`` budget so directly
+        # constructed factories behave exactly as before; the arq worker
+        # threads ``Config.keeper_sync_upload_max_attempts`` and
+        # ``Config.keeper_sync_upload_max_backoff_seconds`` through
+        # ``WorkerFactoryBuilder``.
+        self._keeper_sync_upload_max_attempts = keeper_sync_upload_max_attempts
+        self._keeper_sync_upload_max_backoff_seconds = (
+            keeper_sync_upload_max_backoff_seconds
+        )
+        # How long a keeper-sync service waits before re-running a build
+        # copy that failed on a transport error. Defaults to the
+        # service's own fallback; the arq worker threads
+        # ``Config.keeper_sync_copy_retry_delay_seconds`` through
+        # ``WorkerFactoryBuilder``.
+        self._keeper_sync_copy_retry_delay_seconds = (
+            keeper_sync_copy_retry_delay_seconds
+        )
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -185,9 +228,33 @@ class Factory:
         return self._purge_coalescer
 
     @property
+    def copy_http_client(self) -> httpx.AsyncClient | None:
+        """Client a keeper-sync copier's destination store PUTs over.
+
+        The worker's dedicated copy client when one was given, otherwise
+        the shared client (``None`` when neither was).
+        """
+        return self._copy_http_client
+
+    @property
     def keeper_sync_copy_concurrency(self) -> int:
         """Fan-out bound handed to every copier this factory builds."""
         return self._keeper_sync_copy_concurrency
+
+    @property
+    def keeper_sync_upload_max_attempts(self) -> int:
+        """Presigned-upload attempts for a keeper-sync copier's store."""
+        return self._keeper_sync_upload_max_attempts
+
+    @property
+    def keeper_sync_upload_max_backoff_seconds(self) -> float:
+        """Presigned-upload wait ceiling for a keeper-sync copier's store."""
+        return self._keeper_sync_upload_max_backoff_seconds
+
+    @property
+    def keeper_sync_copy_retry_delay_seconds(self) -> float:
+        """Wait before a keeper-sync service re-runs a failed build copy."""
+        return self._keeper_sync_copy_retry_delay_seconds
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -649,6 +716,7 @@ class Factory:
             publisher_provider=self.create_edition_publisher_for_org,
             purger_provider=self.create_cdn_cache_purger_for_org,
             purge_coalescer=self._purge_coalescer,
+            purge_enabled=self._cdn_purge_enabled,
             logger=self._logger,
         )
 
@@ -924,7 +992,13 @@ class Factory:
         return svc.provider, svc.config, cred_payload
 
     async def create_objectstore_for_org(
-        self, *, org_id: int, service_label: str
+        self,
+        *,
+        org_id: int,
+        service_label: str,
+        upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+        upload_http_client: httpx.AsyncClient | None = None,
     ) -> ObjectStore:
         """Resolve an org's ObjectStore from its service configuration.
 
@@ -938,6 +1012,17 @@ class Factory:
         service_label
             Service label to use (e.g., the org's
             ``publishing_store_label``).
+        upload_max_attempts
+            Attempts the store spends on one presigned upload, including
+            the first. Defaults to the shared ``_http_retry`` budget,
+            which every caller but the keeper-sync copier keeps.
+        upload_max_backoff_seconds
+            Ceiling on any single wait between presigned upload
+            attempts. Defaults to the shared ``_http_retry`` ceiling.
+        upload_http_client
+            Client the store PUTs presigned uploads over. Defaults to
+            the factory's shared client, which every caller but the
+            keeper-sync copier keeps.
 
         Returns
         -------
@@ -966,7 +1051,13 @@ class Factory:
             config=svc.config,
             credentials=cred_payload,
             logger=self._logger,
-            http_client=self._http_client,
+            http_client=(
+                upload_http_client
+                if upload_http_client is not None
+                else self._http_client
+            ),
+            max_attempts=upload_max_attempts,
+            max_backoff_seconds=upload_max_backoff_seconds,
         )
 
     def create_ltd_client(
@@ -1006,13 +1097,28 @@ class Factory:
         sync worker's memory ceiling without a code change. Peak
         resident size scales with the pool's ``max_jobs`` times that
         bound times the largest object under a build prefix.
+
+        The destination store is the only one this factory builds with
+        the ``keeper_sync_upload_*`` retry budget rather than the shared
+        one: a build copy holds no transaction or lock while an upload
+        backs off, so it can ride out an R2 connect outage that the
+        shared budget gives up inside (PRD #685). It is likewise the
+        only store that PUTs over :attr:`copy_http_client`, the worker's
+        client sized for its full copy concurrency, rather than the
+        shared client.
         """
 
         @asynccontextmanager
         async def _open() -> AsyncGenerator[BuildContentCopier]:
             async with self._session.begin():
                 destination = await self.create_objectstore_for_org(
-                    org_id=org_id, service_label=service_label
+                    org_id=org_id,
+                    service_label=service_label,
+                    upload_max_attempts=self._keeper_sync_upload_max_attempts,
+                    upload_max_backoff_seconds=(
+                        self._keeper_sync_upload_max_backoff_seconds
+                    ),
+                    upload_http_client=self._copy_http_client,
                 )
             source = self.create_ltd_s3_source()
             async with source, destination:
@@ -1045,6 +1151,7 @@ class Factory:
         org_id: int,
         service_label: str,
         ltd_base_url: str = "https://keeper.lsst.codes",
+        on_build_copied: BuildCopiedCallback | None = None,
     ) -> KeeperSyncService:
         """Create a :class:`KeeperSyncService` for one org's sync run.
 
@@ -1053,17 +1160,23 @@ class Factory:
         updates it shares with the native ``build_processing`` path.
         Direct unit-test constructions of the service may omit it and
         run unwrapped, exactly as ``EditionTrackingService`` does.
+
+        ``on_build_copied`` is handed one report per build-content copy;
+        the keeper-sync worker passes a hook that publishes it as a
+        ``BuildContentCopiedEvent``.
         """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
         async def copy_callable(
-            source_prefix: str, dest_prefix: str
+            source_prefix: str, dest_prefix: str, tally: CopyTally
         ) -> CopyResult:
             async with self.create_build_content_copier_for_org(
                 org_id=org_id, service_label=service_label
             ) as copier:
                 return await copier.copy_build(
-                    source_prefix=source_prefix, dest_prefix=dest_prefix
+                    source_prefix=source_prefix,
+                    dest_prefix=dest_prefix,
+                    tally=tally,
                 )
 
         async def manifest_callable(source_prefix: str) -> str:
@@ -1110,6 +1223,8 @@ class Factory:
             binding_resolver=binding_resolver,
             ref_set_fetcher=ref_set_fetcher,
             lock_service=self.create_lock_service(),
+            copy_retry_delay_seconds=self._keeper_sync_copy_retry_delay_seconds,
+            on_build_copied=on_build_copied,
         )
 
 

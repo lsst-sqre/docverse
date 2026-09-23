@@ -17,11 +17,13 @@ from pydantic import HttpUrl
 
 from docverse.models import EditionKind, TrackingMode
 from docverse_server.domain.slug import parse_slug_rewrite_rules
+from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
 from docverse_server.services.keeper_sync.mappers import (
     KindDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
+    derive_synced_build_git_ref,
     map_edition_tracking,
 )
 from docverse_server.storage.ltd import LtdBuild, LtdEdition
@@ -355,18 +357,26 @@ def test_map_edition_tracking_manual_without_build_raises() -> None:
         map_edition_tracking(edition)
 
 
-def test_map_edition_tracking_manual_missing_build_git_refs_raises() -> None:
-    edition = _edition(mode="manual", tracked_refs=None)
-    build = _build(git_refs=None)
-    with pytest.raises(ValueError, match="git_refs"):
-        map_edition_tracking(edition, build=build)
+@pytest.mark.parametrize("git_refs", [None, []])
+def test_map_edition_tracking_manual_build_without_git_refs_is_unresolvable(
+    git_refs: list[str] | None,
+) -> None:
+    """A ``manual`` edition whose published build names no ref is typed.
 
-
-def test_map_edition_tracking_manual_empty_build_git_refs_raises() -> None:
-    edition = _edition(mode="manual", tracked_refs=None)
-    build = _build(git_refs=[])
-    with pytest.raises(ValueError, match="git_refs"):
+    The build's ``git_refs`` is fixed at upload, so this is as permanent
+    as :func:`derive_synced_build_git_ref`'s unresolvable case — and it
+    has to carry the same type, or ``sync_project`` would count it as a
+    systemic-outage candidate and fail the job on every tier tick.
+    """
+    edition = _edition(slug="current", mode="manual", tracked_refs=None)
+    build = _build(git_refs=git_refs)
+    with pytest.raises(KeeperSyncGitRefUnresolvableError) as exc_info:
         map_edition_tracking(edition, build=build)
+    assert exc_info.value.ltd_edition_slug == "current"
+    assert exc_info.value.ltd_build_id == 42
+    assert "current" in str(exc_info.value)
+    assert "42" in str(exc_info.value)
+    assert "manual" in str(exc_info.value)
 
 
 def test_map_edition_tracking_unknown_mode_raises() -> None:
@@ -473,3 +483,35 @@ class TestDeriveEditionSourcePrefix:
             )
             is None
         )
+
+
+class TestDeriveSyncedBuildGitRef:
+    """The synced build's ``git_ref`` is the ref its bytes were built from."""
+
+    def test_tracked_ref_wins_over_the_build_ref(self) -> None:
+        """A ``git_refs`` edition keeps naming its build after its ref."""
+        edition = _edition(mode="git_refs", tracked_refs=["main"])
+        build = _build(git_refs=["v22_0_0", "main"])
+        assert derive_synced_build_git_ref(edition, build) == "main"
+
+    def test_falls_back_to_the_published_build_ref(self) -> None:
+        """``lsst_doc`` editions carry no ``tracked_refs`` (#682).
+
+        LTD's ``lsst_doc`` mode follows the newest semver tag with a
+        ``main`` / ``master`` fallback and never fills ``tracked_refs``,
+        so the only record of what the published bytes were built from
+        is the build's own ``git_refs``.
+        """
+        edition = _edition(mode="lsst_doc", tracked_refs=None)
+        build = _build(git_refs=["master"])
+        assert derive_synced_build_git_ref(edition, build) == "master"
+
+    def test_raises_when_neither_side_names_a_ref(self) -> None:
+        edition = _edition(slug="main", mode="lsst_doc", tracked_refs=None)
+        build = _build(git_refs=None)
+        with pytest.raises(KeeperSyncGitRefUnresolvableError) as exc_info:
+            derive_synced_build_git_ref(edition, build)
+        assert exc_info.value.ltd_edition_slug == "main"
+        assert exc_info.value.ltd_build_id == 42
+        assert "main" in str(exc_info.value)
+        assert "42" in str(exc_info.value)

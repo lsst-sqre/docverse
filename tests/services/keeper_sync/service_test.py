@@ -13,10 +13,17 @@ import asyncio
 import io
 import json
 import tarfile
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -24,6 +31,12 @@ import pytest_asyncio
 import respx
 import sentry_sdk
 import structlog
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from safir.dependencies.db_session import db_session_dependency
 from safir.github import GitHubAppClientFactory
 from sqlalchemy import select, update
@@ -56,17 +69,24 @@ from docverse_server.exceptions import (
     InvalidBuildStateError,
     KeeperSyncSystemicFailureError,
 )
+from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync.copier import (
     BuildContentCopier,
     CopyResult,
+    CopyTally,
 )
 from docverse_server.services.keeper_sync.service import (
+    DEFAULT_COPY_RETRY_DELAY_SECONDS,
     MAX_CONSECUTIVE_EDITION_FAILURES,
+    BuildCopiedCallback,
+    BuildCopyReport,
     BuildSyncOutcome,
+    CopyCallable,
     EditionSyncOutcome,
     KeeperSyncContext,
     KeeperSyncService,
     _now,
+    _retryable_transport_error,
 )
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -100,6 +120,7 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions.build_processing import _process_build
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 from tests.support.lock_service_spy import RecordingLockService
+from tests.support.objectstore import ScriptedUploadStore
 from tests.support.rowlocks import (
     LOCK_WAIT_TIMEOUT,
     backend_pid,
@@ -198,6 +219,9 @@ def _build_service(
     source: _FakeLtdSource | None = None,
     lock_service: LockService | None = None,
     after_manifest_hash: Callable[[str], None] | None = None,
+    wrap_copy: Callable[[CopyCallable], CopyCallable] | None = None,
+    copy_retry_delay_seconds: float | None = None,
+    on_build_copied: BuildCopiedCallback | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -215,6 +239,13 @@ def _build_service(
     ``sync_build`` leaves between deciding on a hash and copying the
     bytes. It is the seam the mid-resolution-republish tests use to
     mutate the LTD source at that instant.
+
+    ``wrap_copy`` wraps the real copy callable before the service gets
+    it — the seam the build-level copy-retry tests use to fail a copy
+    (see :func:`_flaky_copy`). ``copy_retry_delay_seconds`` overrides
+    the service's default wait before re-running a failed copy.
+    ``on_build_copied`` receives one report per build copy (see
+    :func:`_record_copy_reports`).
     """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -240,10 +271,16 @@ def _build_service(
         source=source, destination=object_store, logger=logger
     )
 
-    async def copy_callable(source_prefix: str, dest_prefix: str) -> object:
+    async def copy_callable(
+        source_prefix: str, dest_prefix: str, tally: CopyTally
+    ) -> CopyResult:
         return await copier.copy_build(
-            source_prefix=source_prefix, dest_prefix=dest_prefix
+            source_prefix=source_prefix, dest_prefix=dest_prefix, tally=tally
         )
+
+    copy: CopyCallable = copy_callable
+    if wrap_copy is not None:
+        copy = wrap_copy(copy)
 
     async def manifest_callable(source_prefix: str) -> str:
         manifest_hash = await copier.compute_manifest_hash(
@@ -265,13 +302,19 @@ def _build_service(
         session=session,
         context=context,
         ltd_client=ltd_client,
-        copy_callable=copy_callable,  # type: ignore[arg-type]
+        copy_callable=copy,
         manifest_callable=manifest_callable,
         logger=logger,
         tombstone_service=tombstone_service,
         binding_resolver=binding_resolver,
         ref_set_fetcher=ref_set_fetcher,
         lock_service=lock_service,
+        copy_retry_delay_seconds=(
+            copy_retry_delay_seconds
+            if copy_retry_delay_seconds is not None
+            else DEFAULT_COPY_RETRY_DELAY_SECONDS
+        ),
+        on_build_copied=on_build_copied,
     )
 
 
@@ -1076,15 +1119,10 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
 
     edition_payload = _load("edition_main_git_refs.json")
     edition_payload["mode"] = "manual"
-    # Keep ``tracked_refs`` set so the existing ``_create_synced_build``
-    # path remains happy; the assertion on tracking_params below proves
-    # the mapper still pins to the BUILD's git_refs[0] rather than the
-    # edition's tracked_refs[0]. Hardening
-    # ``_create_synced_build`` to derive the Docverse build's git_ref
-    # from ``LtdBuild.git_refs[0]`` (so manual editions with
-    # ``tracked_refs is None`` round-trip cleanly) is tracked as
-    # follow-up — out of scope for this mapper-only slice.
-    edition_payload["tracked_refs"] = ["main"]
+    # LTD leaves ``tracked_refs`` null on a ``manual`` edition; both the
+    # tracking pair and the synced build's git_ref come from the BUILD's
+    # git_refs[0] (#682).
+    edition_payload["tracked_refs"] = None
     build_payload = _load("build.json")
     build_payload["git_refs"] = ["v22_0_0", "main"]
     _seed_ltd(
@@ -1111,6 +1149,9 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
     state_store = KeeperSyncStateStore(
         session=db_session, logger=structlog.get_logger("test")
     )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
     async with db_session.begin():
         project = await project_store.get_by_slug(
             org_id=org_id, slug="pipelines"
@@ -1124,6 +1165,10 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
         # The build's first git_ref is pinned, NOT the edition's
         # tracked_refs (which manual editions need not maintain).
         assert edition.tracking_params == {"git_ref": "v22_0_0"}
+        assert edition.current_build_id is not None
+        build = await build_store.get_by_id(edition.current_build_id)
+        assert build is not None
+        assert build.git_ref == "v22_0_0"
 
         state = await state_store.get(
             org_id=org_id,
@@ -1134,6 +1179,72 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
         assert state.annotations is not None
         # Original LTD mode preserved for reversibility.
         assert state.annotations["ltd_mode"] == "manual"
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_imports_lsst_doc_main_without_tracked_refs(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An ``lsst_doc`` main edition with ``tracked_refs: null`` imports.
+
+    The shape of every older LDM/DMTN-era product (#682, found on
+    ``sqr-028`` in the first production wave): LTD's ``lsst_doc`` mode
+    follows the newest semver tag with a ``main`` / ``master`` fallback
+    and never fills ``tracked_refs``. The synced build takes its
+    ``git_ref`` from the published build's ``git_refs`` instead, and
+    the edition keeps ``lsst_doc`` tracking so post-cutover uploads
+    follow the same rule rather than pinning to whichever ref happened
+    to be published at sync time.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = ["master"]
+    _seed_ltd(
+        mock_discovery,
+        edition_main=_load("edition_main_lsst_doc.json"),
+        build_payload=build_payload,
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>sqr-028</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_failures == ()
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+        assert edition.tracking_mode == TrackingMode.lsst_doc
+        assert edition.tracking_params == {}
+        assert edition.current_build_id is not None
+
+        build = await build_store.get_by_id(edition.current_build_id)
+        assert build is not None
+        assert build.status == BuildStatus.completed
+        assert build.git_ref == "master"
 
 
 @pytest.mark.asyncio
@@ -2495,6 +2606,95 @@ async def test_sync_project_permanent_denials_alone_are_not_systemic(
 
 
 @pytest.mark.asyncio
+async def test_sync_project_unresolvable_git_ref_is_not_systemic(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition with no derivable git ref is a permanent per-edition fault.
+
+    The #682 shape, one step worse: an ``lsst_doc`` main edition with
+    ``tracked_refs: null`` whose published build also reports no
+    ``git_refs``. That is deterministic for the (edition, build) pair —
+    a build's ``git_refs`` is fixed at upload — so failing the job
+    would hand the tier cron a replay that fails identically forever,
+    and the cause would be visible only in the job traceback. Reporting
+    it under ``edition_failures`` puts the reason on the API.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-no-git-ref")
+
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = None
+    _seed_ltd(
+        mock_discovery,
+        edition_main=_load("edition_main_lsst_doc.json"),
+        build_payload=build_payload,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>no ref</html>"},
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "main"
+    assert failure.error_type == "KeeperSyncGitRefUnresolvableError"
+    assert "42" in failure.error_message
+
+
+@pytest.mark.asyncio
+async def test_sync_project_manual_edition_without_git_refs_is_not_systemic(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A ``manual`` edition whose build names no ref fails per-edition.
+
+    The same permanent (edition, build) fault as the ``lsst_doc`` case
+    above, surfacing one step earlier: ``manual`` needs the published
+    build's ``git_refs`` to *map* its tracking pair, so it fails in
+    ``map_edition_tracking`` before ``sync_build`` runs. For a product
+    whose only edition has that shape, counting it as a systemic
+    candidate would fail the job — and the tier cron's replay — forever.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-manual-no-git-ref")
+
+    edition_payload = _load("edition_main_git_refs.json")
+    edition_payload["mode"] = "manual"
+    edition_payload["tracked_refs"] = None
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = None
+    _seed_ltd(
+        mock_discovery,
+        edition_main=edition_payload,
+        build_payload=build_payload,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>no ref</html>"},
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "main"
+    assert failure.error_type == "KeeperSyncGitRefUnresolvableError"
+    assert "manual" in failure.error_message
+    assert "42" in failure.error_message
+
+
+@pytest.mark.asyncio
 async def test_sync_project_transport_failure_amid_denials_still_aborts(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -2691,6 +2891,706 @@ async def test_sync_project_reports_no_failures_when_all_editions_succeed(
         "u-jsick-other",
     ]
     assert result.edition_failures == ()
+
+
+def _flaky_copy(
+    failures: dict[str, list[BaseException]],
+    calls: list[tuple[str, str]],
+) -> Callable[[CopyCallable], CopyCallable]:
+    """Wrap a copy callable so chosen build copies fail first.
+
+    ``failures`` maps an LTD build prefix (no trailing slash) to the
+    exceptions its next copies raise, one per call and in order; once
+    a prefix's queue is empty its copies run for real. Every call is
+    appended to ``calls`` as ``(source_prefix, dest_prefix)``.
+    """
+
+    def wrap(copy: CopyCallable) -> CopyCallable:
+        async def flaky(
+            source_prefix: str, dest_prefix: str, tally: CopyTally
+        ) -> CopyResult:
+            calls.append((source_prefix, dest_prefix))
+            queued = failures.get(source_prefix.rstrip("/"))
+            if queued:
+                raise queued.pop(0)
+            return await copy(source_prefix, dest_prefix, tally)
+
+        return flaky
+
+    return wrap
+
+
+def _record_copy_retry_sleeps(
+    monkeypatch: pytest.MonkeyPatch, session: AsyncSession
+) -> list[tuple[float, bool]]:
+    """Stub the service's copy-retry wait and record each one.
+
+    Each entry is ``(delay, in_transaction)``: the second half pins that
+    the wait never holds a database transaction open.
+    """
+    sleeps: list[tuple[float, bool]] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append((delay, session.in_transaction()))
+
+    monkeypatch.setattr(service_module, "_sleep", _fake_sleep)
+    return sleeps
+
+
+def _copy_retry_logs(
+    logs: Sequence[MutableMapping[str, Any]],
+) -> list[MutableMapping[str, Any]]:
+    """Pick the build-level copy-retry warnings out of captured logs."""
+    return [
+        entry
+        for entry in logs
+        if entry["event"] == "Retrying build copy after transport error"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reruns_copy_once_after_transport_failure(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that dies on an R2 connect timeout is re-run, and lands.
+
+    The 2026-09-22 ``sqr-`` campaign lost 38 of 208 jobs to a ~40 s R2
+    connect outage that outlasted every per-object retry. The copy is
+    content-hashed and idempotent and holds no transaction, so
+    ``sync_build`` waits the configured delay and runs it once more into
+    the same placeholder build rather than failing the edition.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry")
+
+    _seed_ltd(mock_discovery)
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        wrap_copy=_flaky_copy(
+            {"pipelines/builds/42": [httpx.ConnectTimeout("")]}, calls
+        ),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    outcome = result.edition_outcomes[0].build_outcome
+    assert outcome is not None
+    assert outcome.short_circuited is False
+    assert outcome.object_count == 1
+    # Both runs copied into the one placeholder build.
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert sleeps == [(7.0, False)]
+    retries = _copy_retry_logs(logs)
+    assert len(retries) == 1
+    assert retries[0]["log_level"] == "warning"
+    assert retries[0]["error_type"] == "ConnectTimeout"
+    assert retries[0]["retry_delay"] == 7.0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_propagates_second_copy_transport_failure(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copy is re-run once, not until it succeeds.
+
+    A second transport failure fails the edition exactly as a first one
+    used to: ``sync_project``'s per-edition boundary records it and
+    reports the *second* exception, unchained from the first, while the
+    editions either side still sync.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-twice")
+
+    _seed_three_editions(mock_discovery)
+    first = httpx.ConnectTimeout("first")
+    second = httpx.ConnectTimeout("second")
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+        wrap_copy=_flaky_copy({"pipelines/builds/43": [first, second]}, calls),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    middle_calls = [c for c in calls if c[0].startswith("pipelines/builds/43")]
+    assert len(middle_calls) == 2
+    assert sleeps == [(7.0, False)]
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-other",
+    ]
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "u-jsick-feature"
+    assert failure.error_type == "ConnectTimeout"
+    assert len(captured) == 1
+    assert captured[0] is second
+    assert second.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_sync_build_does_not_rerun_copy_after_access_denied(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-transport copy failure fails the edition on the first try.
+
+    An LTD ``AccessDenied`` is permanent, so re-running the copy would
+    only spend the retry delay on a certain second failure.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-denied")
+
+    _seed_three_editions(mock_discovery)
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+        wrap_copy=_flaky_copy(
+            {
+                "pipelines/builds/43": [
+                    LtdSourceAccessDeniedError(
+                        bucket="lsst-the-docs",
+                        key="pipelines/builds/43/index.html",
+                        operation="GetObject",
+                    )
+                ]
+            },
+            calls,
+        ),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    middle_calls = [c for c in calls if c[0].startswith("pipelines/builds/43")]
+    assert len(middle_calls) == 1
+    assert sleeps == []
+    assert _copy_retry_logs(logs) == []
+    assert len(result.edition_failures) == 1
+    assert result.edition_failures[0].error_type == (
+        "LtdSourceAccessDeniedError"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reruns_copy_when_transport_error_is_the_cause(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport error chained as a failure's cause is still retried.
+
+    The copier re-raises a failing object's exception with its chain
+    intact, so a wrapper raised ``from`` a connect timeout carries the
+    same "try again later" signal as the timeout itself. The warning
+    names the transport error, not the wrapper.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-cause")
+
+    _seed_ltd(mock_discovery)
+    wrapper = RuntimeError("upload failed")
+    wrapper.__cause__ = httpx.ConnectTimeout("")
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        wrap_copy=_flaky_copy({"pipelines/builds/42": [wrapper]}, calls),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    assert len(calls) == 2
+    assert sleeps == [(7.0, False)]
+    retries = _copy_retry_logs(logs)
+    assert len(retries) == 1
+    assert retries[0]["error_type"] == "ConnectTimeout"
+
+
+_LTD_ENDPOINT = "https://lsst-the-docs.s3.amazonaws.com/"
+
+
+class _FlakyDownloadLtdSource(_FakeLtdSource):
+    """In-memory LTD source whose chosen downloads fail.
+
+    ``outcomes`` maps a key to what its successive ``download_object``
+    calls do, in order: an exception is raised, ``None`` returns the
+    bytes. Once a key's queue is empty its downloads succeed. keeper-sync
+    downloads every object once to hash the build's manifest before it
+    copies, so a key's first entry is the hash, its second the copy's
+    first pass, and its third the build-level re-run. Every call is
+    appended to ``downloads``.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, bytes],
+        *,
+        outcomes: dict[str, list[BaseException | None]],
+    ) -> None:
+        super().__init__(objects)
+        self._outcomes = outcomes
+        self.downloads: list[str] = []
+
+    async def download_object(self, *, key: str) -> bytes:
+        self.downloads.append(key)
+        queued = self._outcomes.get(key)
+        if queued:
+            outcome = queued.pop(0)
+            if outcome is not None:
+                raise outcome
+        return await super().download_object(key=key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ReadTimeoutError(endpoint_url=_LTD_ENDPOINT),
+        EndpointConnectionError(endpoint_url=_LTD_ENDPOINT),
+        ConnectionClosedError(endpoint_url=_LTD_ENDPOINT),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+async def test_sync_build_reruns_copy_after_ltd_download_transport_failure(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    """A copy that loses the LTD bucket mid-download is re-run, and lands.
+
+    Every copy reads LTD through aiobotocore as well as writing R2
+    through httpx, and a re-run is as safe on one end as the other. So a
+    botocore transport error from the LTD download earns the same one
+    re-run, after the same wait, as an R2 connect timeout does.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-ltd")
+
+    _seed_ltd(mock_discovery)
+    key = "pipelines/builds/42/index.html"
+    source = _FlakyDownloadLtdSource(
+        {key: b"<html>v1</html>"}, outcomes={key: [None, error]}
+    )
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {},
+        source=source,
+        wrap_copy=_flaky_copy({}, calls),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    outcome = result.edition_outcomes[0].build_outcome
+    assert outcome is not None
+    assert outcome.short_circuited is False
+    assert outcome.object_count == 1
+    # Hash, failed first pass, re-run.
+    assert source.downloads == [key, key, key]
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert sleeps == [(7.0, False)]
+    retries = _copy_retry_logs(logs)
+    assert len(retries) == 1
+    assert retries[0]["log_level"] == "warning"
+    assert retries[0]["error_type"] == type(error).__name__
+    assert retries[0]["error"] == repr(error)
+    assert retries[0]["retry_delay"] == 7.0
+
+
+def _slow_down() -> ClientError:
+    """Build the error botocore raises for an S3 ``503 SlowDown``."""
+    return ClientError(
+        {
+            "Error": {"Code": "SlowDown", "Message": "Please reduce"},
+            "ResponseMetadata": {"HTTPStatusCode": 503},
+        },
+        "GetObject",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_build_does_not_rerun_copy_after_ltd_client_error(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3 throttling the LTD download fails the edition on the first try.
+
+    A botocore ``ClientError`` is S3 answering, not S3 unreachable. Like
+    an R2 upload that kept getting ``429``/``5xx``, it is left to the
+    next sync rather than re-run, even though ``SlowDown`` is transient.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-slowdown")
+
+    _seed_three_editions(mock_discovery)
+    key = "pipelines/builds/43/index.html"
+    throttled = _slow_down()
+    source = _FlakyDownloadLtdSource(
+        dict(_THREE_EDITION_SOURCE_OBJECTS), outcomes={key: [None, throttled]}
+    )
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {},
+        source=source,
+        wrap_copy=_flaky_copy({}, calls),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    middle_calls = [c for c in calls if c[0].startswith("pipelines/builds/43")]
+    assert len(middle_calls) == 1
+    assert source.downloads.count(key) == 2
+    assert sleeps == []
+    assert _copy_retry_logs(logs) == []
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-other",
+    ]
+    assert len(result.edition_failures) == 1
+    assert result.edition_failures[0].error_type == "ClientError"
+    assert captured == [throttled]
+
+
+def test_retryable_transport_error_recognizes_a_botocore_transport_error() -> (
+    None
+):
+    """An LTD download that timed out is as retryable as an R2 upload.
+
+    Every copy reads the LTD bucket through aiobotocore as well as
+    writing R2 through httpx, so a botocore transport error is the
+    source-side leaf the build-level retry has to recognize.
+    """
+    error = ReadTimeoutError(endpoint_url=_LTD_ENDPOINT)
+
+    assert _retryable_transport_error(error) is error
+
+
+def test_retryable_transport_error_follows_a_botocore_cause() -> None:
+    """A wrapper raised ``from`` a botocore transport error is retryable."""
+    cause = EndpointConnectionError(endpoint_url=_LTD_ENDPOINT)
+    wrapper = RuntimeError("download failed")
+    wrapper.__cause__ = cause
+
+    assert _retryable_transport_error(wrapper) is cause
+
+
+def test_retryable_transport_error_ignores_a_botocore_context() -> None:
+    """A botocore error reached only through ``__context__`` is not retried.
+
+    An exception raised while *handling* a dropped LTD connection says
+    nothing about whether a re-run can succeed, so the implicit context
+    link is not followed for botocore errors any more than for httpx.
+    """
+    handled = ConnectionClosedError(endpoint_url=_LTD_ENDPOINT)
+    raised = RuntimeError("bug in the error handler")
+    raised.__context__ = handled
+
+    assert raised.__cause__ is None
+    assert _retryable_transport_error(raised) is None
+
+
+def test_retryable_transport_error_ignores_a_botocore_client_error() -> None:
+    """S3 answering with an error, even a throttle, is not transport."""
+    assert _retryable_transport_error(_slow_down()) is None
+
+
+def _record_copy_reports() -> tuple[
+    list[BuildCopyReport], BuildCopiedCallback
+]:
+    """Return a list and an ``on_build_copied`` hook that appends to it."""
+    reports: list[BuildCopyReport] = []
+
+    async def _record(report: BuildCopyReport) -> None:
+        reports.append(report)
+
+    return reports, _record
+
+
+def _forbidden() -> httpx.HTTPStatusError:
+    """Build the error ``raise_for_status`` gives for an R2 ``403``."""
+    request = httpx.Request("PUT", "https://r2.example/index.html")
+    return httpx.HTTPStatusError(
+        "403 Forbidden",
+        request=request,
+        response=httpx.Response(403, request=request),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_the_copy_and_its_retried_objects(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A copied build is reported once, with the uploads that needed retries.
+
+    The report is what the keeper-sync worker publishes as a
+    ``BuildContentCopiedEvent``; an upload that landed on its second
+    attempt shows in it even though the copy itself never failed.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    body = b"<html>v1</html>"
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore({"index.html": [2]}),
+        {"pipelines/builds/42/index.html": body},
+        on_build_copied=on_build_copied,
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.project_slug == "pipelines"
+    assert report.object_count == 1
+    assert report.total_size_bytes == len(body)
+    assert report.peak_concurrent_copies == 1
+    assert report.retried_object_count == 1
+    assert report.exhausted_object_count == 0
+    assert report.build_retry_used is False
+    assert report.succeeded is True
+    assert report.duration_seconds >= 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_a_rerun_copy_as_one_copy(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy the build-level retry recovered is still one report.
+
+    It says the retry was used and keeps the first pass's exhausted
+    upload — that object is the outage the retry rode out.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-rerun")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore({"index.html": [httpx.ConnectTimeout("")]}),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        copy_retry_delay_seconds=7.0,
+        on_build_copied=on_build_copied,
+    )
+    _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_failures == ()
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.build_retry_used is True
+    assert report.succeeded is True
+    assert report.exhausted_object_count == 1
+    assert report.object_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_a_copy_that_failed_both_passes(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that outlasts the build-level retry is reported as failed.
+
+    Each pass's exhausted upload is counted, and the report goes out
+    before the failure reaches ``sync_edition``'s accounting — here the
+    project's only edition, so the sync then fails as a whole.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-failed")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore(
+            {
+                "index.html": [
+                    httpx.ConnectTimeout("first"),
+                    httpx.ConnectTimeout("second"),
+                ]
+            }
+        ),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        copy_retry_delay_seconds=7.0,
+        on_build_copied=on_build_copied,
+    )
+    _record_copy_retry_sleeps(monkeypatch, db_session)
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.succeeded is False
+    assert report.build_retry_used is True
+    assert report.exhausted_object_count == 2
+    assert report.object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_a_copy_that_failed_without_a_rerun(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-transport copy failure is reported once, with no retry used.
+
+    A ``403`` from R2 ends the copy on its first attempt, so nothing ran
+    out of budget and the build-level retry never fired.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-403")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore({"index.html": [_forbidden()]}),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=on_build_copied,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert sleeps == []
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.succeeded is False
+    assert report.build_retry_used is False
+    assert report.exhausted_object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_isolates_a_raising_copy_report_hook(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metrics hook that raises cannot fail the build it reports on.
+
+    The report is a side channel: the copy already landed, so the hook's
+    error goes to Sentry and the log, and the sync carries on.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-raises")
+
+    _seed_ltd(mock_discovery)
+    hook_error = RuntimeError("metrics are down")
+
+    async def _raising_hook(report: BuildCopyReport) -> None:
+        raise hook_error
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=_raising_hook,
+    )
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    outcome = result.edition_outcomes[0].build_outcome
+    assert outcome is not None
+    assert outcome.short_circuited is False
+    assert captured == [hook_error]
+    assert any(
+        entry["event"] == "on_build_copied callback raised; continuing"
+        for entry in logs
+    )
 
 
 @pytest.mark.asyncio

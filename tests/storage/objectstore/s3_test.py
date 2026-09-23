@@ -25,17 +25,34 @@ import structlog
 from aiobotocore.client import AioBaseClient
 from structlog.testing import capture_logs
 
+from docverse_server.storage import _http_retry
 from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
-from docverse_server.storage.objectstore import ObjectStoreError, S3ObjectStore
+from docverse_server.storage.objectstore import (
+    ObjectStoreError,
+    S3ObjectStore,
+    _s3,
+)
 
 
 def _make_store(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     max_attempts: int = 4,
+    base_backoff_seconds: float = 0.0,
+    max_backoff_seconds: float | None = None,
 ) -> tuple[S3ObjectStore, httpx.AsyncClient]:
-    """Build a store whose presigned PUTs land in ``handler``."""
+    """Build a store whose presigned PUTs land in ``handler``.
+
+    ``max_backoff_seconds`` is passed on only when given, so a test that
+    leaves it out exercises a store built exactly as callers that never
+    heard of the knob build one.
+    """
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ceiling: dict[str, float] = (
+        {}
+        if max_backoff_seconds is None
+        else {"max_backoff_seconds": max_backoff_seconds}
+    )
     store = S3ObjectStore(
         endpoint_url="https://account.r2.cloudflarestorage.com",
         bucket="docs",
@@ -45,7 +62,8 @@ def _make_store(
         logger=structlog.get_logger("test"),
         http_client=client,
         max_attempts=max_attempts,
-        base_backoff_seconds=0.0,
+        base_backoff_seconds=base_backoff_seconds,
+        **ceiling,
     )
     return store, client
 
@@ -58,6 +76,27 @@ def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         delays.append(delay)
 
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    return delays
+
+
+def _record_sleeps_on_a_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record sleeps and advance the upload's clocks by each one.
+
+    With ``asyncio.sleep`` stubbed out no real time passes, so both the
+    retry loop's and the store's ``elapsed_seconds`` would read zero.
+    Driving their clocks from the recorded delays makes the elapsed time
+    exactly the backoff spent so far, which a test can assert.
+    """
+    delays: list[float] = []
+    now = [1000.0]
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(_http_retry, "monotonic", lambda: now[0])
+    monkeypatch.setattr(_s3, "monotonic", lambda: now[0])
     return delays
 
 
@@ -80,6 +119,40 @@ async def test_upload_object_retries_500_then_succeeds() -> None:
         )
 
     assert seen == [b"<html></html>"] * 3
+
+
+@pytest.mark.asyncio
+async def test_upload_object_reports_the_attempts_it_spent() -> None:
+    """The store says how many attempts each upload took to land.
+
+    A retry that eventually succeeds leaves no trace but a warning log,
+    so this count is what lets the keeper-sync copier tally retried
+    objects for its metrics event. It counts the first attempt, so an
+    upload that landed first time reports 1.
+    """
+    responses = [
+        httpx.Response(200),
+        httpx.Response(503),
+        httpx.Response(200),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    store, client = _make_store(handler)
+    async with client, store as s:
+        first = await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+        second = await s.upload_object(
+            key="build/app.css",
+            data=b"body{}",
+            content_type="text/css",
+        )
+
+    assert (first, second) == (1, 2)
 
 
 @pytest.mark.asyncio
@@ -208,8 +281,15 @@ async def test_upload_object_does_not_retry_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upload_object_raises_when_retries_are_exhausted() -> None:
-    """A never-clearing `500` still raises, so ``copy_build`` still fails."""
+async def test_upload_object_raises_when_retries_are_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-clearing `500` still raises, so ``copy_build`` still fails.
+
+    The failure line says how long the object was tried, backoff
+    included, as well as how many attempts that took.
+    """
+    _record_sleeps_on_a_clock(monkeypatch)
     attempts: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -217,7 +297,9 @@ async def test_upload_object_raises_when_retries_are_exhausted() -> None:
         return httpx.Response(500, text="internal error")
 
     with capture_logs() as logs:
-        store, client = _make_store(handler, max_attempts=3)
+        store, client = _make_store(
+            handler, max_attempts=3, base_backoff_seconds=0.5
+        )
         async with client, store as s:
             with pytest.raises(httpx.HTTPStatusError) as excinfo:
                 await s.upload_object(
@@ -233,28 +315,221 @@ async def test_upload_object_raises_when_retries_are_exhausted() -> None:
     assert len(errors) == 1
     assert errors[0]["key"] == "build/index.html"
     assert errors[0]["attempts"] == 3
+    assert errors[0]["elapsed_seconds"] == 1.5
     assert errors[0]["retryable"] is True
 
 
 @pytest.mark.asyncio
-async def test_upload_object_raises_when_transport_retries_exhausted() -> None:
-    """Transport failures share the status path's attempt budget."""
+async def test_upload_object_raises_when_transport_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transport failures share the status path's attempt budget.
+
+    An R2 connect outage surfaces as an ``httpx.ConnectTimeout`` whose
+    ``str`` is empty, so every line on the way to giving up has to name
+    the failure by its repr and say how long the object has been tried:
+    the retry warnings are the only record of a retry that recovers, and
+    the "Presigned upload failed" line is the Sentry event for one that
+    does not.
+    """
+    delays = _record_sleeps_on_a_clock(monkeypatch)
     attempts: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(len(attempts) + 1)
-        raise httpx.ConnectError("connection refused", request=request)
+        raise httpx.ConnectTimeout("", request=request)
 
-    store, client = _make_store(handler, max_attempts=3)
+    with capture_logs() as logs:
+        store, client = _make_store(
+            handler, max_attempts=3, base_backoff_seconds=0.5
+        )
+        async with client, store as s:
+            with pytest.raises(httpx.ConnectTimeout):
+                await s.upload_object(
+                    key="build/index.html",
+                    data=b"<html></html>",
+                    content_type="text/html",
+                )
+
+    assert attempts == [1, 2, 3]
+    assert delays == [0.5, 1.0]
+
+    retries = [
+        entry
+        for entry in logs
+        if entry["event"] == "Retrying presigned upload after transport error"
+    ]
+    assert [
+        (
+            entry["attempt"],
+            entry["max_attempts"],
+            entry["retry_delay"],
+            entry["elapsed_seconds"],
+        )
+        for entry in retries
+    ] == [(1, 3, 0.5, 0.0), (2, 3, 1.0, 0.5)]
+    for entry in retries:
+        assert entry["key"] == "build/index.html"
+        assert entry["error"] == "ConnectTimeout('')"
+        assert entry["error_type"] == "ConnectTimeout"
+
+    failures = [
+        entry for entry in logs if entry["event"] == "Presigned upload failed"
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["key"] == "build/index.html"
+    assert failure["error"] == "ConnectTimeout('')"
+    assert failure["error_type"] == "ConnectTimeout"
+    assert failure["attempts"] == 3
+    assert failure["elapsed_seconds"] == 1.5
+    assert failure["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_upload_object_rides_out_five_connect_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The keeper-sync budget turns five connect timeouts into a success.
+
+    Six attempts at the shared 0.5 s base backoff is the keeper-sync
+    copy path's default budget, which is what lets an object outlast an
+    R2 connect outage the shared four-attempt budget gave up inside.
+    """
+    delays = _record_sleeps(monkeypatch)
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= 5:
+            raise httpx.ConnectTimeout("", request=request)
+        return httpx.Response(200)
+
+    store, client = _make_store(
+        handler,
+        max_attempts=6,
+        base_backoff_seconds=0.5,
+        max_backoff_seconds=30.0,
+    )
     async with client, store as s:
-        with pytest.raises(httpx.ConnectError):
+        await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert attempts == [1, 2, 3, 4, 5, 6]
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0]
+
+
+@pytest.mark.asyncio
+async def test_upload_object_raises_after_six_connect_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sixth connect timeout exhausts the budget and says so.
+
+    The "Presigned upload failed" line is the Sentry event for an object
+    that outlasted its budget, so it has to report the budget actually
+    spent — six attempts over the 15.5 s of backoff between them — and
+    name the failure even though ``str(httpx.ConnectTimeout())`` is empty.
+    """
+    delays = _record_sleeps_on_a_clock(monkeypatch)
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        raise httpx.ConnectTimeout("", request=request)
+
+    with capture_logs() as logs:
+        store, client = _make_store(
+            handler,
+            max_attempts=6,
+            base_backoff_seconds=0.5,
+            max_backoff_seconds=30.0,
+        )
+        async with client, store as s:
+            with pytest.raises(httpx.ConnectTimeout):
+                await s.upload_object(
+                    key="build/index.html",
+                    data=b"<html></html>",
+                    content_type="text/html",
+                )
+
+    assert attempts == [1, 2, 3, 4, 5, 6]
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0]
+
+    failures = [
+        entry for entry in logs if entry["event"] == "Presigned upload failed"
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["attempts"] == 6
+    assert failure["elapsed_seconds"] == 15.5
+    assert failure["error"] == "ConnectTimeout('')"
+
+
+@pytest.mark.asyncio
+async def test_upload_object_caps_backoff_at_its_own_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store given a ceiling clamps its exponential backoff to it.
+
+    Eight attempts at a 0.5 s base would sleep 32 s before the last
+    one; a 30 s ceiling caps that sleep at 30 s, and every earlier
+    sleep — including the 16 s one the shared 10 s ceiling would have
+    clamped — goes through untouched.
+    """
+    delays = _record_sleeps(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("", request=request)
+
+    store, client = _make_store(
+        handler,
+        max_attempts=8,
+        base_backoff_seconds=0.5,
+        max_backoff_seconds=30.0,
+    )
+    async with client, store as s:
+        with pytest.raises(httpx.ConnectTimeout):
             await s.upload_object(
                 key="build/index.html",
                 data=b"<html></html>",
                 content_type="text/html",
             )
 
-    assert attempts == [1, 2, 3]
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_upload_object_honours_retry_after_up_to_its_own_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raised ceiling lets a longer ``Retry-After`` through, still capped.
+
+    The ceiling is the one knob that decides how long R2 may ask the
+    copy to wait, so a 20 s request is honoured whole under a 30 s
+    ceiling, while a pathological 300 s one is still clamped to it.
+    """
+    delays = _record_sleeps(monkeypatch)
+    responses = [
+        httpx.Response(503, headers={"Retry-After": "20"}),
+        httpx.Response(503, headers={"Retry-After": "300"}),
+        httpx.Response(200),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    store, client = _make_store(handler, max_backoff_seconds=30.0)
+    async with client, store as s:
+        await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert delays == [20.0, 30.0]
 
 
 @pytest.mark.asyncio
@@ -286,11 +561,13 @@ async def test_upload_object_honours_numeric_retry_after(
 async def test_upload_object_caps_long_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The store keeps the tight shared ceiling on ``Retry-After``.
+    """A store built without a ceiling keeps the shared one.
 
-    Uploads run inside a build-copy job whose progress the rest of the
-    publish waits on, so a five-minute obedient sleep is worse than
-    another attempt — only ``LtdClient`` raises its ceiling.
+    Every object store but the keeper-sync copier's runs on the shared
+    ceiling, and those uploads (dashboard renders, build processing) run
+    inside jobs whose progress a publish waits on, so a five-minute
+    obedient sleep is worse than another attempt. Only a caller that
+    asks for a longer ceiling gets one.
     """
     delays = _record_sleeps(monkeypatch)
     responses = [

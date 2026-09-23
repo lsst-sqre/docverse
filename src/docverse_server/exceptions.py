@@ -19,6 +19,7 @@ __all__ = [
     "InvalidBuildStateError",
     "InvalidJobStateError",
     "JobNotFoundError",
+    "KeeperSyncGitRefUnresolvableError",
     "KeeperSyncInvariantError",
     "KeeperSyncSystemicFailureError",
     "MissingConfigurationError",
@@ -378,6 +379,66 @@ class JobNotFoundError(DocverseSlackException):
         if job_public_id is not None:
             return f"Queue job {job_public_id} not found"
         return "Queue job not found"
+
+
+class KeeperSyncGitRefUnresolvableError(DocverseSlackException):
+    """No git ref can be derived for a keeper-synced build.
+
+    A synced Docverse build records the git ref its bytes were built
+    from. LTD names that ref in two places: the edition's
+    ``tracked_refs`` (only populated in ``git_refs`` mode — ``lsst_doc``
+    and the ``eups_*`` modes leave it ``null``, #682) and the published
+    build's own ``git_refs``. This is raised when *both* are empty, or
+    — for a ``manual`` edition, whose tracking pair is pinned to the
+    published build's ref — when the build's ``git_refs`` is empty.
+    Nothing about a retry can change either answer: an LTD build's
+    ``git_refs`` is fixed at upload, and a republish that swaps the
+    edition onto a different build is a different sync (its
+    ``date_rebuilt`` moves). That is why
+    ``KeeperSyncService.sync_project`` counts it as a permanent
+    per-edition fault rather than evidence of an outage.
+
+    No ``to_sentry`` override: the message names the LTD edition slug
+    and build id, which is the whole triage story — the LTD API is
+    public, so both paste straight into ``keeper.lsst.codes`` URLs.
+    Mirrors :class:`KeeperSyncInvariantError`.
+    """
+
+    def __init__(
+        self,
+        *,
+        ltd_edition_slug: str | None = None,
+        ltd_build_id: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.ltd_edition_slug = ltd_edition_slug
+        self.ltd_build_id = ltd_build_id
+        super().__init__(
+            message
+            if message is not None
+            else self._format_message(
+                ltd_edition_slug=ltd_edition_slug, ltd_build_id=ltd_build_id
+            )
+        )
+
+    @staticmethod
+    def _format_message(
+        *, ltd_edition_slug: str | None, ltd_build_id: int | None
+    ) -> str:
+        edition = (
+            f"LTD edition {ltd_edition_slug!r}"
+            if ltd_edition_slug is not None
+            else "LTD edition"
+        )
+        build = (
+            f"published build (id={ltd_build_id})"
+            if ltd_build_id is not None
+            else "published build"
+        )
+        return (
+            f"{edition} has no tracked_refs and its {build} reports no"
+            " git_refs; cannot derive a git_ref for the synced build"
+        )
 
 
 class KeeperSyncInvariantError(DocverseSlackException):

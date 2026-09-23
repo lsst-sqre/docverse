@@ -1298,6 +1298,7 @@ async def _run_publish_with_purge_probe(
     ctx = make_worker_ctx(
         http_client=httpx.AsyncClient(),
         job_id=backend_job_id,
+        cdn_purge_enabled=True,
     )
     payload = _make_payload(
         org=org,
@@ -1491,6 +1492,7 @@ async def test_publish_edition_survives_cancellation_during_purge(
     ctx = make_worker_ctx(
         http_client=httpx.AsyncClient(),
         job_id="test-publish-arq-purge-cancel",
+        cdn_purge_enabled=True,
     )
     payload = _make_payload(
         org=org,
@@ -1511,6 +1513,90 @@ async def test_publish_edition_survives_cancellation_during_purge(
             assert job is not None
             assert job.status == JobStatus.completed
             assert job.date_completed is not None
+
+            ed_store = EditionStore(session=session, logger=logger)
+            refreshed_ed = await ed_store.get_by_id(edition.id)
+            assert refreshed_ed is not None
+            assert refreshed_ed.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_skips_purge_by_default(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With purging off (the default), a long-profile publish never
+    resolves a purger and still completes.
+
+    This is the state production ships in: the Worker does not edge-cache
+    edition responses yet, so the purge would only spend Cloudflare's
+    purge rate limit (docverse#683). The flag travels from
+    ``WorkerFactoryBuilder`` through ``Factory`` to the publishing
+    service, so this exercises the whole wiring rather than the service
+    alone.
+    """
+    logger = _logger()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-purge-off-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-purge-off",
+        )
+
+    async def _create_purger(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> Any:
+        _ = (self, org_id, service_label)
+        msg = "purger must not be resolved while purging is disabled"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(MockEditionPublisher()),
+    )
+    monkeypatch.setattr(
+        Factory, "create_cdn_cache_purger_for_org", _create_purger
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-purge-off",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    with capture_logs() as logs:
+        result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+    assert not [e for e in logs if e["event"] == "CDN cache purge failed"]
+    assert not [e for e in logs if e["event"] == "Purged CDN cache"]
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
 
             ed_store = EditionStore(session=session, logger=logger)
             refreshed_ed = await ed_store.get_by_id(edition.id)

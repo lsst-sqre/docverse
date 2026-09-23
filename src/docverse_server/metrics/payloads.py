@@ -29,6 +29,7 @@ from .enums import (
 )
 
 __all__ = [
+    "BuildContentCopiedEvent",
     "BuildProcessedEvent",
     "BuildUploadedEvent",
     "ConditionalGetEvent",
@@ -287,6 +288,76 @@ class KeeperSyncRunCompletedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time from the run starting to its terminal transition."""
+
+
+class BuildContentCopiedEvent(DocverseEventBase):
+    """A keeper-sync worker finished copying one build's content into R2.
+
+    Emitted once per build-content copy — after the copy succeeds, and
+    after it fails — by the ``keeper_sync_project`` worker. A copy that
+    fails on a transport error and is re-run by the build-level retry
+    (``KeeperSyncService.sync_build``) is still *one* copy, so it emits
+    one event, with ``build_retry_used`` set and the object counters
+    summed over both passes. The event is project-scoped: ``project`` is
+    the Docverse project slug the build belongs to, and ``ltd_slug`` the
+    LTD product it was copied from, which differ when the organization
+    rewrites slugs.
+
+    It exists to plot transport health over a sync campaign (PRD #685).
+    ``retried_object_count`` rising across a campaign is R2 getting
+    flaky while the per-object budget still absorbs it;
+    ``exhausted_object_count`` above zero is an object that outlasted
+    that whole budget, which on a copy with ``succeeded=True`` the
+    build-level retry recovered and on one with ``succeeded=False``
+    failed the edition.
+    """
+
+    ltd_slug: str
+    """Slug of the LTD product the build was copied from."""
+
+    object_count: int
+    """Objects stored by the copy's last pass.
+
+    The build's whole object count on success; on failure, the objects
+    that pass stored before it stopped.
+    """
+
+    total_size_bytes: int
+    """Bytes stored by the copy's last pass, counted as ``object_count``."""
+
+    duration_seconds: float
+    """Wall-clock seconds from the first pass starting to the last ending.
+
+    Includes the build-level retry's wait when it ran. A float named in
+    seconds, rather than the ``timedelta`` the other events carry, so it
+    reads in the same unit as the ``elapsed_seconds`` on the upload
+    retry log lines it is compared against.
+    """
+
+    peak_concurrent_copies: int
+    """Most objects in flight at once, over both passes."""
+
+    retried_object_count: int
+    """Objects stored only after at least one upload retry.
+
+    Summed over both passes; an object that exhausted its budget is
+    counted in ``exhausted_object_count`` instead.
+    """
+
+    exhausted_object_count: int
+    """Objects whose upload ran out of its retry budget, over both passes.
+
+    Only failures a retry could have fixed count: a connect timeout or
+    dropped connection, or a retryable status (``429``/``5xx``), that
+    lasted every attempt. A ``403`` or a failed LTD download is not an
+    exhausted upload.
+    """
+
+    build_retry_used: bool
+    """Whether the build-level retry re-ran the copy after it failed."""
+
+    succeeded: bool
+    """Whether the copy, after any build-level retry, stored every object."""
 
 
 class LifecycleActionEvent(DocverseEventBase):

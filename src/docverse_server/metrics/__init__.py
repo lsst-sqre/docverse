@@ -18,6 +18,7 @@ from .enums import (
 from .events import DocverseEvents
 from .manager import build_event_manager
 from .payloads import (
+    BuildContentCopiedEvent,
     BuildProcessedEvent,
     BuildUploadedEvent,
     ConditionalGetEvent,
@@ -35,6 +36,7 @@ from .payloads import (
 )
 
 __all__ = [
+    "BuildContentCopiedEvent",
     "BuildProcessedEvent",
     "BuildUploadedEvent",
     "ConditionalGetEndpoint",

@@ -282,6 +282,27 @@ class Configuration(BaseSettings):
         ),
     )
 
+    cdn_purge_enabled: bool = Field(
+        default=False,
+        title="Whether long-profile publishes purge the CDN edge cache",
+        description=(
+            "Whether a long-profile publish is followed by a purge of"
+            " the project's hostname from the CDN edge cache. Off by"
+            " default because the Cloudflare Worker does not yet"
+            " edge-cache edition responses (it caches only 404s, and"
+            " only briefly), so a purge invalidates nothing while still"
+            " spending up to four calls against Cloudflare's per-account"
+            " purge rate limit — 5 requests per minute on the Free plan,"
+            " which a keeper-sync backfill across many hostnames exceeds"
+            " within seconds. The per-hostname coalescer"
+            " (``cdn_purge_min_interval_seconds``) folds repeated purges"
+            " of one hostname but cannot bound a burst across distinct"
+            " hostnames. Turn this on only once the Worker caches"
+            " edition responses at the edge, and together with a purge"
+            " budget sized to the zone's plan tier (docverse#683)."
+        ),
+    )
+
     publish_edition_job_timeout_seconds: int = Field(
         1800,
         title="Publish_edition per-job timeout, in seconds",
@@ -335,7 +356,10 @@ class Configuration(BaseSettings):
             " under a build prefix — 80 buffered object bodies at the"
             " stock 10 x 8. That product is what the sync worker's"
             " memory limit is sized against; raising either knob"
-            " requires raising the limit with it."
+            " requires raising the limit with it. **Connections:** the"
+            " same product, plus 10, sizes the connection pool of the"
+            " worker's dedicated build-copy HTTP client, so every"
+            " in-flight presigned upload has a connection of its own."
         ),
     )
 
@@ -356,6 +380,75 @@ class Configuration(BaseSettings):
             " At the stock 10 x 8 that is 80 buffered bodies, which is"
             " what the sync worker's memory limit is sized against;"
             " raising either knob requires raising that limit with it."
+            " **Connections:** the worker's dedicated build-copy HTTP"
+            " client allows ``keeper_sync_max_jobs`` x this value + 10"
+            " connections and keeps twice this value alive between"
+            " builds."
+        ),
+    )
+
+    keeper_sync_upload_max_attempts: int = Field(
+        6,
+        ge=1,
+        title="Attempts per keeper-sync presigned upload",
+        description=(
+            "Attempts, including the first, that the keeper-sync"
+            " worker's object store spends on one presigned PUT of a"
+            " copied object before failing the build copy. Transport"
+            " failures (an R2 connect timeout, a reset connection) and"
+            " retryable statuses (429, 5xx) share the budget. Backoff"
+            " starts at 0.5 s and doubles, so six attempts sleep"
+            " 0.5 + 1 + 2 + 4 + 8 = 15.5 s between them; with the copy"
+            " client's 10 s connect timeout, an object rides out an R2"
+            " connect outage of about 15.5 + 5 x 10 = 65 s (its last"
+            " attempt starts that long after its first). The shared"
+            " default of four attempts, behind the shared client's 5 s"
+            " connect timeout, rode out only 3.5 + 3 x 5 = 18.5 s —"
+            " shorter than the 40 s outage that failed 38 of 208"
+            " ``sqr-`` jobs on 2026-09-22. Only the keeper-sync copy"
+            " path uses this; every other object store keeps the shared"
+            " four-attempt default."
+        ),
+    )
+
+    keeper_sync_upload_max_backoff_seconds: float = Field(
+        30.0,
+        ge=0.0,
+        title="Longest wait between keeper-sync presigned upload attempts",
+        description=(
+            "Ceiling, in seconds, on any single wait between attempts"
+            " of a keeper-sync presigned PUT, including one R2 asks for"
+            " with ``Retry-After``. The shared 10 s ceiling protects"
+            " callers that sleep while holding a database transaction or"
+            " a purge lock; a build copy holds neither, so it can afford"
+            " to honour a longer server-requested wait. At the default"
+            " six attempts the exponential backoff peaks at 8 s and"
+            " never reaches this ceiling, so it only bites for a"
+            " ``Retry-After`` above 10 s or when"
+            " ``keeper_sync_upload_max_attempts`` is raised past seven."
+            " At zero, retries go out back to back."
+        ),
+    )
+
+    keeper_sync_copy_retry_delay_seconds: float = Field(
+        30.0,
+        ge=0.0,
+        title="Wait before re-running a keeper-sync build copy",
+        description=(
+            "Seconds ``KeeperSyncService.sync_build`` waits before"
+            " re-running a build-content copy that failed on a"
+            " transport error on either end: an R2 connect timeout or"
+            " dropped connection that outlasted the per-object"
+            " ``keeper_sync_upload_*`` budget, or an LTD S3 timeout or"
+            " dropped connection during a download, which has no"
+            " per-object retry. The copy is re-run exactly once, into"
+            " the same placeholder build; copies are content-hashed and"
+            " idempotent, so objects that already landed are simply"
+            " overwritten with the same bytes. A second failure, or any"
+            " non-transport failure (an LTD ``AccessDenied``, an S3"
+            " client error such as ``SlowDown``, an HTTP error status),"
+            " fails the edition as before. The wait holds no database"
+            " transaction. At zero, the copy is re-run at once."
         ),
     )
 

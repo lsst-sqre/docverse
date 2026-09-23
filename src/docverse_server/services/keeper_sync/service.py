@@ -9,18 +9,22 @@ build content into Docverse R2 via :class:`BuildContentCopier`. The
 :class:`KeeperSyncStateStore` row is the idempotency key: a re-run
 with unchanged LTD state short-circuits.
 
-This slice covers only the ``git_refs`` LTD edition mode; other modes
-raise :class:`NotImplementedError` from
-:func:`docverse_server.services.keeper_sync.mappers.map_edition_tracking` and
-are filled in by issue #289.
+Every LTD edition mode is importable.
+:func:`docverse_server.services.keeper_sync.mappers.map_edition_tracking`
+maps the mode onto Docverse's tracking pair, and
+:func:`docverse_server.services.keeper_sync.mappers.derive_synced_build_git_ref`
+names the synced build's git ref from the edition's ``tracked_refs`` or,
+for the modes that leave it null, the published build's ``git_refs``.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 
 import sentry_sdk
@@ -71,6 +75,7 @@ from docverse_server.domain.version import (
 )
 from docverse_server.exceptions import (
     MAX_REPORTED_EDITION_SLUGS,
+    KeeperSyncGitRefUnresolvableError,
     KeeperSyncInvariantError,
     KeeperSyncSystemicFailureError,
     NotFoundError,
@@ -90,6 +95,7 @@ from docverse_server.services.project import ProjectService
 from docverse_server.services.project_github_binding import (
     ProjectGitHubBindingResolver,
 )
+from docverse_server.storage._http_retry import RETRYABLE_TRANSPORT_ERRORS
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.github import (
@@ -104,6 +110,7 @@ from docverse_server.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse_server.storage.ltd import (
+    RETRYABLE_SOURCE_TRANSPORT_ERRORS,
     LtdBuild,
     LtdClient,
     LtdEdition,
@@ -114,19 +121,23 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
-from .copier import CopyResult
+from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
+    derive_synced_build_git_ref,
     map_edition_tracking,
 )
 
 __all__ = [
+    "DEFAULT_COPY_RETRY_DELAY_SECONDS",
     "DEFAULT_ORPHAN_RECLAIM_MAX_AGE",
     "MAX_CONSECUTIVE_EDITION_FAILURES",
     "AggregateEditionOutcome",
+    "BuildCopiedCallback",
+    "BuildCopyReport",
     "BuildSyncOutcome",
     "CopyCallable",
     "EditionSyncFailure",
@@ -144,6 +155,21 @@ __all__ = [
 #: older is assumed to be from a worker that crashed between the
 #: placeholder commit and the finalize commit.
 DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
+
+#: Default wait, in seconds, before :meth:`KeeperSyncService.sync_build`
+#: re-runs a build copy that failed on a transport error. It is the
+#: service's fallback for direct construction; the worker threads
+#: ``Config.keeper_sync_copy_retry_delay_seconds`` (same default)
+#: through ``Factory.create_keeper_sync_service``.
+#:
+#: Thirty seconds is sized against the R2 connect outage that failed 38
+#: of 208 ``sqr-`` jobs on 2026-09-22 (about 40 s). An R2 failure only
+#: gets here after one object has already spent its whole per-object
+#: budget (about 65 s at the keeper-sync defaults), so the wait plus the
+#: re-run's own budget covers an outage well past the observed one. An
+#: LTD download has no such budget, so for the source side this wait is
+#: most of what a copy rides out.
+DEFAULT_COPY_RETRY_DELAY_SECONDS = 30.0
 
 #: Number of *consecutive* per-edition failures that ``sync_project``
 #: treats as a systemic outage rather than a run of independent
@@ -215,13 +241,23 @@ MAX_CONSECUTIVE_EDITION_FAILURES = 75
 #: 5-minute tier tick, forever, because tombstone short-circuits are
 #: neutral for ``contacted_ltd`` and left ``ltd_successes == 0``.
 #:
-#: :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` is
-#: the only member today, and is permanent by construction rather than
-#: by observation: LTD's oldest uploads carry no public-read object ACL,
-#: :class:`~docverse_server.storage.ltd.LtdS3Source` is deliberately
-#: anonymous with no credentials to fall back on, and LTD Keeper is
-#: read-only source material — so nothing about a replay can change the
-#: answer. Every other per-edition fault in this path arrives as a bare
+#: Both members are permanent by construction rather than by
+#: observation, and LTD Keeper is read-only source material, so nothing
+#: about a replay can change either answer:
+#:
+#: * :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` —
+#:   LTD's oldest uploads carry no public-read object ACL and
+#:   :class:`~docverse_server.storage.ltd.LtdS3Source` is deliberately
+#:   anonymous with no credentials to fall back on.
+#: * :class:`~docverse_server.exceptions.KeeperSyncGitRefUnresolvableError`
+#:   — neither the edition's ``tracked_refs`` nor its published build's
+#:   ``git_refs`` names a ref (#682), or a ``manual`` edition's
+#:   published build names none to pin its tracking pair to. A build's
+#:   ``git_refs`` is fixed at upload, and a republish onto a different
+#:   build moves the edition's ``date_rebuilt`` and is re-attempted as a
+#:   different sync anyway.
+#:
+#: Every other per-edition fault in this path arrives as a bare
 #: ``RuntimeError`` or a transport error and cannot be distinguished by
 #: type, which is why the tuple is not larger: membership has to be
 #: earned by that "cannot be transient" argument, not by a hunch that a
@@ -235,12 +271,15 @@ MAX_CONSECUTIVE_EDITION_FAILURES = 75
 #: denial block walk further than the threshold allows.
 _PERMANENT_EDITION_FAILURE_TYPES: tuple[type[BaseException], ...] = (
     LtdSourceAccessDeniedError,
+    KeeperSyncGitRefUnresolvableError,
 )
 
-#: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
-#: callable the service consumes. Tests inject a fake; the production
-#: factory wires it onto a real :class:`BuildContentCopier`.
-CopyCallable = Callable[[str, str], Awaitable[CopyResult]]
+#: Type alias for the ``(source_prefix, dest_prefix, tally) ->
+#: CopyResult`` callable the service consumes. Tests inject a fake; the
+#: production factory wires it onto a real :class:`BuildContentCopier`,
+#: passing the :class:`CopyTally` through to ``copy_build`` so the
+#: service can read a pass's counts even when it raises.
+CopyCallable = Callable[[str, str, CopyTally], Awaitable[CopyResult]]
 
 #: Type alias for the ``(source_prefix) -> manifest_hash`` callable
 #: used for dual-upload convergence: the service computes the inbound
@@ -293,6 +332,52 @@ _AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
 #: upsert that clears the column, and disappears on the next clean
 #: resolve because ``annotations`` replaces wholesale.
 _DATE_REBUILT_RETRACTED_KEY = "date_rebuilt_seen_retracted"
+
+
+@dataclass(frozen=True)
+class BuildCopyReport:
+    """One build-content copy, as ``on_build_copied`` receives it.
+
+    :meth:`KeeperSyncService.sync_build` hands one to the service's
+    ``on_build_copied`` hook after every copy, whether it succeeded or
+    failed, and the keeper-sync worker publishes it as a
+    ``BuildContentCopiedEvent``. A copy the build-level retry re-ran is
+    still one copy and one report: the transport counts are summed over
+    both passes, and the object counts are the last pass's.
+    """
+
+    project_slug: str
+    """Slug of the Docverse project the build belongs to."""
+
+    object_count: int
+    """Objects the last pass stored (all of them on success)."""
+
+    total_size_bytes: int
+    """Bytes the last pass stored."""
+
+    duration_seconds: float
+    """Seconds from the first pass's start to the last's end, wait included."""
+
+    peak_concurrent_copies: int
+    """Most objects in flight at once, over both passes."""
+
+    retried_object_count: int
+    """Objects stored only after an upload retry, over both passes."""
+
+    exhausted_object_count: int
+    """Objects whose upload ran out of its retry budget, over both passes."""
+
+    build_retry_used: bool
+    """Whether the copy was re-run after a transport error."""
+
+    succeeded: bool
+    """Whether the copy, after any re-run, stored every object."""
+
+
+#: Type alias for the ``on_build_copied`` hook: awaited with one
+#: :class:`BuildCopyReport` per build copy. The keeper-sync worker's
+#: hook publishes it as a metrics event.
+BuildCopiedCallback = Callable[[BuildCopyReport], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -638,6 +723,8 @@ class KeeperSyncService:
         binding_resolver: ProjectGitHubBindingResolver | None = None,
         ref_set_fetcher: GitHubRefSetFetcher | None = None,
         lock_service: LockService | None = None,
+        copy_retry_delay_seconds: float = DEFAULT_COPY_RETRY_DELAY_SECONDS,
+        on_build_copied: BuildCopiedCallback | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -655,6 +742,13 @@ class KeeperSyncService:
         self._binding_resolver = binding_resolver
         self._ref_set_fetcher = ref_set_fetcher
         self._lock_service = lock_service
+        self._copy_retry_delay_seconds = copy_retry_delay_seconds
+        self._on_build_copied = on_build_copied
+
+    @property
+    def copy_retry_delay_seconds(self) -> float:
+        """Wait before re-running a build copy after a transport failure."""
+        return self._copy_retry_delay_seconds
 
     @asynccontextmanager
     async def _edition_update_lock(
@@ -1978,20 +2072,32 @@ class KeeperSyncService:
                 total_size_bytes=None,
             )
 
+        git_ref = derive_synced_build_git_ref(ltd_edition, ltd_build)
         async with self._session.begin():
             await self._reclaim_orphan_placeholders(
                 project_id=project.id,
                 project_slug=project.slug,
                 org_slug=org_slug,
                 edition_slug=edition.slug,
-                ltd_edition=ltd_edition,
+                git_ref=git_ref,
             )
             new_build = await self._create_synced_build(
-                project=project, ltd_edition=ltd_edition
+                project=project, git_ref=git_ref
             )
 
-        copy_result = await self._copy_callable(
-            source.prefix, new_build.storage_prefix
+        copy_result = await self._copy_build_content(
+            source_prefix=source.prefix,
+            dest_prefix=new_build.storage_prefix,
+            project_slug=project.slug,
+            logger=self._logger.bind(
+                ltd_build_id=ltd_build.ltd_id,
+                edition_slug=edition.slug,
+                project=project.slug,
+                docverse_build_public_id=serialize_base32_id(
+                    new_build.public_id
+                ),
+                ltd_source_prefix=source.prefix,
+            ),
         )
 
         # The hash the dedupe/convergence decision above was made on and
@@ -2092,6 +2198,155 @@ class KeeperSyncService:
             total_size_bytes=copy_result.total_size_bytes,
         )
 
+    async def _copy_build_content(
+        self,
+        *,
+        source_prefix: str,
+        dest_prefix: str,
+        project_slug: str,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> CopyResult:
+        """Copy one build's content and report the copy to the hook.
+
+        Runs :meth:`_copy_with_build_retry` and then hands
+        ``on_build_copied`` one :class:`BuildCopyReport` for it — after a
+        success and after a failure alike, so the metrics event the
+        worker publishes also covers the copies that went wrong. The
+        failure still propagates unchanged once the report is out. A
+        cancelled copy (the arq job timing out) is not reported: it
+        neither landed nor failed on its own account.
+        """
+        started = monotonic()
+        passes: list[CopyTally] = []
+        try:
+            result = await self._copy_with_build_retry(
+                source_prefix=source_prefix,
+                dest_prefix=dest_prefix,
+                passes=passes,
+                logger=logger,
+            )
+        except Exception:
+            await self._report_build_copy(
+                project_slug=project_slug,
+                passes=passes,
+                started=started,
+                succeeded=False,
+                logger=logger,
+            )
+            # A bare ``raise`` re-raises the copy's own exception as it
+            # stands — the report above does not become its context.
+            raise
+        await self._report_build_copy(
+            project_slug=project_slug,
+            passes=passes,
+            started=started,
+            succeeded=True,
+            logger=logger,
+        )
+        return result
+
+    async def _copy_with_build_retry(
+        self,
+        *,
+        source_prefix: str,
+        dest_prefix: str,
+        passes: list[CopyTally],
+        logger: structlog.stdlib.BoundLogger,
+    ) -> CopyResult:
+        """Copy one build's content, re-running once after a transport error.
+
+        The build-level backstop for an outage on either end of the copy
+        (PRD #685). An R2 connect outage that outlasts one object's whole
+        upload budget, or an LTD S3 timeout or dropped connection during
+        a download (which has no per-object budget, only botocore's own
+        retries), fails the copy with that object's transport error; this
+        waits
+        ``copy_retry_delay_seconds`` and runs the copy exactly once more
+        into the same ``dest_prefix``. That is safe because a copy is
+        content-hashed and idempotent — objects that already landed are
+        rewritten with the same bytes — and because :meth:`sync_build`
+        calls this between its transactions, so the wait holds no
+        database transaction or advisory lock.
+
+        Only a failure :func:`_retryable_transport_error` recognizes — an
+        httpx transport error from the R2 upload or a botocore transport
+        error from the LTD download — is re-run. Anything else — an LTD
+        ``AccessDenied``, a botocore ``ClientError`` (even a ``SlowDown``
+        throttle), an ``httpx.HTTPStatusError`` from an upload that kept
+        getting a bad status — and a second failure of any kind propagate
+        unchanged, so :meth:`sync_edition`'s per-edition failure
+        accounting and the orphan-placeholder reclaim see exactly what
+        they did before.
+
+        Each pass's :class:`CopyTally` is appended to ``passes`` before
+        the pass starts, so the caller can report on every pass that ran
+        whether this returns or raises.
+        """
+        first = CopyTally()
+        passes.append(first)
+        try:
+            return await self._copy_callable(source_prefix, dest_prefix, first)
+        except Exception as exc:
+            transport_error = _retryable_transport_error(exc)
+            if transport_error is None:
+                raise
+            logger.warning(
+                "Retrying build copy after transport error",
+                error=repr(transport_error),
+                error_type=type(transport_error).__name__,
+                retry_delay=self._copy_retry_delay_seconds,
+                dest_prefix=dest_prefix,
+            )
+        # Outside the ``except`` block on purpose: a second failure then
+        # propagates as itself, without the first chained on as its
+        # ``__context__``.
+        await _sleep(self._copy_retry_delay_seconds)
+        second = CopyTally()
+        passes.append(second)
+        return await self._copy_callable(source_prefix, dest_prefix, second)
+
+    async def _report_build_copy(
+        self,
+        *,
+        project_slug: str,
+        passes: Sequence[CopyTally],
+        started: float,
+        succeeded: bool,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """Hand ``on_build_copied`` the report for one build copy, if wired.
+
+        The hook is a side channel, so it may not decide the copy's fate:
+        whatever it raises is sent to Sentry and logged, and the copy's
+        own result or exception carries on as if it had not run — the
+        same isolation ``sync_project`` gives ``on_edition_synced``.
+        """
+        if self._on_build_copied is None:
+            return
+        last = passes[-1]
+        report = BuildCopyReport(
+            project_slug=project_slug,
+            object_count=last.object_count,
+            total_size_bytes=last.total_size_bytes,
+            duration_seconds=monotonic() - started,
+            peak_concurrent_copies=max(
+                tally.peak_concurrent_copies for tally in passes
+            ),
+            retried_object_count=sum(
+                tally.retried_object_count for tally in passes
+            ),
+            exhausted_object_count=sum(
+                tally.exhausted_object_count for tally in passes
+            ),
+            build_retry_used=len(passes) > 1,
+            succeeded=succeeded,
+        )
+        try:
+            await self._on_build_copied(report)
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            logger.exception("on_build_copied callback raised; continuing")
+
     async def _resolve_build_source(
         self,
         *,
@@ -2189,7 +2444,7 @@ class KeeperSyncService:
         self,
         *,
         project_id: int,
-        ltd_edition: LtdEdition,
+        git_ref: str,
         project_slug: str | None = None,
         org_slug: str | None = None,
         edition_slug: str | None = None,
@@ -2208,9 +2463,6 @@ class KeeperSyncService:
         ``failed`` so they stop showing up in the project's build
         list.
         """
-        if not ltd_edition.tracked_refs:
-            return
-        git_ref = ltd_edition.tracked_refs[0]
         cutoff = _now() - self._orphan_reclaim_max_age
         orphans = await self._build_store.list_pending_older_than(
             project_id=project_id,
@@ -2238,20 +2490,14 @@ class KeeperSyncService:
         )
 
     async def _create_synced_build(
-        self, *, project: Project, ltd_edition: LtdEdition
+        self, *, project: Project, git_ref: str
     ) -> Build:
         """Insert a placeholder build row that the copier can write into."""
-        if not ltd_edition.tracked_refs:
-            msg = (
-                f"LTD edition {ltd_edition.slug!r} has no tracked_refs;"
-                " cannot derive git_ref for synced build"
-            )
-            raise ValueError(msg)
         return await self._build_store.create(
             project_id=project.id,
             project_slug=project.slug,
             data=BuildCreate(
-                git_ref=ltd_edition.tracked_refs[0],
+                git_ref=git_ref,
                 content_hash=PLACEHOLDER_CONTENT_HASH,
             ),
             uploader=_SYNC_UPLOADER,
@@ -2343,6 +2589,49 @@ class KeeperSyncService:
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+async def _sleep(delay: float) -> None:
+    """Wait before re-running a failed build copy.
+
+    A seam over :func:`asyncio.sleep` so tests can stub the build-level
+    copy retry's wait without stubbing every other sleep in the process.
+    """
+    await asyncio.sleep(delay)
+
+
+#: Transport failures on either end of a build copy: the httpx errors of
+#: the R2 presigned upload and the botocore errors of the LTD download.
+_RETRYABLE_COPY_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    *RETRYABLE_TRANSPORT_ERRORS,
+    *RETRYABLE_SOURCE_TRANSPORT_ERRORS,
+)
+
+
+def _retryable_transport_error(exc: BaseException) -> BaseException | None:
+    """Return the transport error behind a failed build copy, if any.
+
+    Checks ``exc`` and then each explicit ``__cause__`` beneath it, and
+    returns the first one that is a transport failure on either end of
+    the copy: an R2 upload's
+    :data:`~docverse_server.storage._http_retry.RETRYABLE_TRANSPORT_ERRORS`
+    or an LTD download's
+    :data:`~docverse_server.storage.ltd.RETRYABLE_SOURCE_TRANSPORT_ERRORS`.
+    The copier re-raises the first failing object's own exception with
+    its chain intact, so the transport error is normally ``exc`` itself;
+    walking the causes also recognizes one a caller wrapped with
+    ``raise ... from``. Implicit ``__context__`` links are not followed:
+    an exception merely raised while handling a transport error says
+    nothing about whether a re-run can succeed.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, _RETRYABLE_COPY_TRANSPORT_ERRORS):
+            return current
+        seen.add(id(current))
+        current = current.__cause__
+    return None
 
 
 def _ensure_trailing_slash(prefix: str) -> str:

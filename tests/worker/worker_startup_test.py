@@ -38,16 +38,21 @@ def _logger() -> structlog.stdlib.BoundLogger:
 def _make_builder(
     *,
     http_client: httpx.AsyncClient,
+    copy_http_client: httpx.AsyncClient | None = None,
     github_app_id: int | None = None,
     github_app_private_key: SecretStr | None = None,
     github_webhook_secret: SecretStr | None = None,
     keeper_sync_copy_concurrency: int | None = None,
+    keeper_sync_upload_max_attempts: int | None = None,
+    keeper_sync_upload_max_backoff_seconds: float | None = None,
+    keeper_sync_copy_retry_delay_seconds: float | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
             current_key=Fernet.generate_key().decode()
         ),
         http_client=http_client,
+        copy_http_client=copy_http_client,
         arq_queue=MockArqQueue(default_queue_name=_config.arq_queue_name),
         discovery=DiscoveryClient(http_client),
         github_app_id=github_app_id,
@@ -58,6 +63,21 @@ def _make_builder(
             keeper_sync_copy_concurrency
             if keeper_sync_copy_concurrency is not None
             else _config.keeper_sync_copy_concurrency
+        ),
+        keeper_sync_upload_max_attempts=(
+            keeper_sync_upload_max_attempts
+            if keeper_sync_upload_max_attempts is not None
+            else _config.keeper_sync_upload_max_attempts
+        ),
+        keeper_sync_upload_max_backoff_seconds=(
+            keeper_sync_upload_max_backoff_seconds
+            if keeper_sync_upload_max_backoff_seconds is not None
+            else _config.keeper_sync_upload_max_backoff_seconds
+        ),
+        keeper_sync_copy_retry_delay_seconds=(
+            keeper_sync_copy_retry_delay_seconds
+            if keeper_sync_copy_retry_delay_seconds is not None
+            else _config.keeper_sync_copy_retry_delay_seconds
         ),
     )
 
@@ -80,6 +100,81 @@ async def test_builder_threads_copy_concurrency_to_per_job_factory(
         )
         factory = builder(session=db_session, logger=_logger())
         assert factory.keeper_sync_copy_concurrency == 3
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_upload_budget_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """The keeper-sync presigned-upload budget is process-config driven.
+
+    The sync worker's copier is the only caller that needs more than
+    the shared retry budget to ride out an R2 connect outage (PRD #685),
+    so the builder must carry both operator knobs onto every per-job
+    factory rather than letting it fall back to the shared defaults.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client,
+            keeper_sync_upload_max_attempts=9,
+            keeper_sync_upload_max_backoff_seconds=42.0,
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.keeper_sync_upload_max_attempts == 9
+        assert factory.keeper_sync_upload_max_backoff_seconds == 42.0
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_copy_retry_delay_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """The build-level copy retry delay is process-config driven.
+
+    ``keeper_sync_project`` is the only job that copies build content,
+    so the builder must carry the operator knob onto every per-job
+    factory rather than letting the sync service fall back to its own
+    default.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client,
+            keeper_sync_copy_retry_delay_seconds=3.5,
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.keeper_sync_copy_retry_delay_seconds == 3.5
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_copy_client_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """Every per-job factory copies build content over the copy client.
+
+    ``_startup`` builds the copy client once per process, sized for the
+    keeper-sync pool's full copy concurrency (PRD #685); a per-job
+    factory that fell back to the shared client would put every copy
+    burst back on the pool the discovery, LTD API and GitHub calls use.
+    """
+    async with (
+        httpx.AsyncClient() as http_client,
+        httpx.AsyncClient() as copy_http_client,
+    ):
+        builder = _make_builder(
+            http_client=http_client, copy_http_client=copy_http_client
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.copy_http_client is copy_http_client
+
+
+@pytest.mark.asyncio
+async def test_builder_without_copy_client_copies_over_shared_client(
+    db_session: AsyncSession,
+) -> None:
+    """A builder given no copy client leaves copies on the shared one."""
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client)
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.copy_http_client is http_client
 
 
 @pytest.mark.asyncio

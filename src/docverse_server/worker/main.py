@@ -192,6 +192,151 @@ async def initialize_worker_db_pool(*, max_jobs: int) -> None:
     )
 
 
+COPY_HTTP_TIMEOUT = httpx.Timeout(
+    connect=10.0, read=60.0, write=60.0, pool=30.0
+)
+"""Timeouts of the HTTP client that carries build-content copies.
+
+The copy client PUTs every object a keeper-sync ``BuildContentCopier``
+writes to R2 through a presigned URL, and nothing else. Each timeout is
+wider than the shared client's flat 5 s for its own reason:
+
+- ``connect`` (10 s) gives each upload attempt room to reach R2 through
+  a connect stall rather than failing it outright. It is also the per
+  attempt term of the ride-out that
+  ``Config.keeper_sync_upload_max_attempts`` documents: six attempts
+  ride out about 15.5 s of backoff plus 5 x 10 s of connect timeouts.
+- ``read`` and ``write`` (60 s) cover streaming one whole object body
+  up and waiting for R2 to acknowledge it; a large build asset can take
+  longer than 5 s to send on a busy pod.
+- ``pool`` (30 s) is how long an upload waits for a free connection.
+  The pool is sized so that wait should not happen (see
+  :func:`copy_http_limits`), but if it does, a long wait is better than
+  failing an attempt that never reached R2.
+
+These are constants rather than configuration: they bound transport
+behaviour an operator has no reason to tune, while the retry budget
+that sits on top of them is configurable. Every timeout raises a
+subclass of ``httpx.TimeoutException``, which the presigned upload's
+retry loop treats as a retryable transport error.
+"""
+
+COPY_HTTP_CONNECTION_HEADROOM = 10
+"""Copy-client connections allowed above one per in-flight object copy.
+
+:func:`copy_http_limits` budgets one connection for every object
+transfer that can be in flight at once — ``keeper_sync_max_jobs``
+concurrent jobs, each running a copier of ``keeper_sync_copy_concurrency``
+transfers — so no presigned PUT waits on the pool at full concurrency.
+The headroom above that budget keeps a brief overlap, such as a
+connection being torn down after a failed attempt while its retry opens
+a replacement, from queueing an upload behind the pool.
+"""
+
+COPY_HTTP_KEEPALIVE_PER_COPY_SLOT = 2
+"""Idle copy-client connections kept alive per copier transfer slot.
+
+Two copiers' worth of connections stay warm between builds, so the next
+build a job copies reuses them instead of paying a TLS handshake per
+object, without holding the full burst's worth of sockets to R2 open
+while the queue is idle.
+"""
+
+
+def copy_http_limits(*, max_jobs: int, copy_concurrency: int) -> httpx.Limits:
+    """Derive the copy client's connection pool from copy concurrency.
+
+    The worker's shared client keeps httpx's defaults (100 connections,
+    20 kept alive), which the stock 10 x 8 = 80 concurrent presigned
+    PUTs ran close enough to that a pool wait also surfaced as an
+    upload timeout (PRD #685). The copy client is instead sized from the
+    two settings that bound its load.
+
+    Parameters
+    ----------
+    max_jobs
+        Concurrent jobs in the keeper-sync pool
+        (``Config.keeper_sync_max_jobs``).
+    copy_concurrency
+        Concurrent object transfers per copier
+        (``Config.keeper_sync_copy_concurrency``).
+
+    Returns
+    -------
+    httpx.Limits
+        One connection per in-flight copy plus
+        :data:`COPY_HTTP_CONNECTION_HEADROOM`, with
+        :data:`COPY_HTTP_KEEPALIVE_PER_COPY_SLOT` idle connections kept
+        per transfer slot.
+    """
+    return httpx.Limits(
+        max_connections=max_jobs * copy_concurrency
+        + COPY_HTTP_CONNECTION_HEADROOM,
+        max_keepalive_connections=(
+            copy_concurrency * COPY_HTTP_KEEPALIVE_PER_COPY_SLOT
+        ),
+    )
+
+
+def create_copy_http_client(
+    *, max_jobs: int, copy_concurrency: int
+) -> httpx.AsyncClient:
+    """Build the worker's dedicated HTTP client for build-content copies.
+
+    Presigned PUTs of copied build content go over this client so that
+    a copy burst neither queues behind nor starves the discovery, LTD
+    API, GitHub, Cloudflare KV and purge calls on the shared client. The
+    caller owns its lifetime: :func:`shutdown` closes it.
+
+    Parameters
+    ----------
+    max_jobs
+        Concurrent jobs in the keeper-sync pool
+        (``Config.keeper_sync_max_jobs``).
+    copy_concurrency
+        Concurrent object transfers per copier
+        (``Config.keeper_sync_copy_concurrency``).
+    """
+    return httpx.AsyncClient(
+        timeout=COPY_HTTP_TIMEOUT,
+        limits=copy_http_limits(
+            max_jobs=max_jobs, copy_concurrency=copy_concurrency
+        ),
+    )
+
+
+def initialize_worker_http_clients(
+    ctx: dict[str, Any],
+) -> tuple[httpx.AsyncClient, httpx.AsyncClient]:
+    """Open this worker process's two HTTP clients and record them in ctx.
+
+    ``ctx["http_client"]`` is the shared client (httpx defaults) and
+    ``ctx["copy_http_client"]`` the build-copy client from
+    :func:`create_copy_http_client`, sized from the keeper-sync pool's
+    settings whichever pool is starting: the pools share
+    :func:`_startup`, only keeper-sync jobs copy, and the copy client
+    opens no connection until a copy uses it.
+
+    Split out of :func:`_startup`, like :func:`initialize_worker_db_pool`,
+    so the clients a worker actually ships with are reachable without
+    standing up Redis, Alembic and the metrics event manager.
+    :func:`shutdown` closes both.
+
+    Returns
+    -------
+    tuple of (httpx.AsyncClient, httpx.AsyncClient)
+        The shared client and the copy client.
+    """
+    http_client = httpx.AsyncClient()
+    copy_http_client = create_copy_http_client(
+        max_jobs=config.keeper_sync_max_jobs,
+        copy_concurrency=config.keeper_sync_copy_concurrency,
+    )
+    ctx["http_client"] = http_client
+    ctx["copy_http_client"] = copy_http_client
+    return http_client, copy_http_client
+
+
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
 """Five-minute cadence for the ``arq_queue_stats`` gauge.
 
@@ -237,22 +382,33 @@ class WorkerFactoryBuilder:
         *,
         encryptor: CredentialEncryptor,
         http_client: httpx.AsyncClient,
+        copy_http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue,
         discovery: DiscoveryClient,
         github_app_id: int | None,
         github_app_private_key: SecretStr | None,
         github_webhook_secret: SecretStr | None,
         purge_coalescer: CdnPurgeCoalescer | None = None,
+        cdn_purge_enabled: bool = False,
         default_queue_name: str,
         keeper_sync_copy_concurrency: int,
+        keeper_sync_upload_max_attempts: int,
+        keeper_sync_upload_max_backoff_seconds: float,
+        keeper_sync_copy_retry_delay_seconds: float,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
         # burst's redundant per-project CDN purges needs state that spans
         # jobs rather than living inside one.
         self._purge_coalescer = purge_coalescer or CdnPurgeCoalescer()
+        self._cdn_purge_enabled = cdn_purge_enabled
         self._encryptor = encryptor
         self._http_client = http_client
+        # Process-lifetime like ``http_client``, and owned by
+        # ``shutdown`` the same way. Optional so test ctxs that never
+        # copy build content need not build one; a per-job factory then
+        # copies over ``http_client`` instead.
+        self._copy_http_client = copy_http_client
         self._arq_queue = arq_queue
         self._discovery = discovery
         self._github_app_id = github_app_id
@@ -264,6 +420,18 @@ class WorkerFactoryBuilder:
         # that copies build content, so a silent fallback here is
         # precisely the invisible memory bound #517 removes.
         self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
+        # Required for the same reason: a silent fallback to the shared
+        # retry budget is exactly the four-attempt budget an R2 connect
+        # outage outlasted (PRD #685).
+        self._keeper_sync_upload_max_attempts = keeper_sync_upload_max_attempts
+        self._keeper_sync_upload_max_backoff_seconds = (
+            keeper_sync_upload_max_backoff_seconds
+        )
+        # Required for the same reason: the build-level copy retry is the
+        # backstop behind that per-object budget (PRD #685).
+        self._keeper_sync_copy_retry_delay_seconds = (
+            keeper_sync_copy_retry_delay_seconds
+        )
 
     @property
     def github_app_enabled(self) -> bool:
@@ -301,6 +469,7 @@ class WorkerFactoryBuilder:
             logger=logger,
             credential_encryptor=self._encryptor,
             http_client=self._http_client,
+            copy_http_client=self._copy_http_client,
             arq_queue=self._arq_queue,
             discovery=self._discovery,
             github_app_id=self._github_app_id,
@@ -308,8 +477,16 @@ class WorkerFactoryBuilder:
             github_webhook_secret=self._github_webhook_secret,
             github_app_validated=self._github_app_validated,
             purge_coalescer=self._purge_coalescer,
+            cdn_purge_enabled=self._cdn_purge_enabled,
             default_queue_name=self._default_queue_name,
             keeper_sync_copy_concurrency=self._keeper_sync_copy_concurrency,
+            keeper_sync_upload_max_attempts=self._keeper_sync_upload_max_attempts,
+            keeper_sync_upload_max_backoff_seconds=(
+                self._keeper_sync_upload_max_backoff_seconds
+            ),
+            keeper_sync_copy_retry_delay_seconds=(
+                self._keeper_sync_copy_retry_delay_seconds
+            ),
         )
 
 
@@ -365,7 +542,7 @@ async def _startup(
         retired_key=retired_key,
     )
 
-    http_client = httpx.AsyncClient()
+    http_client, copy_http_client = initialize_worker_http_clients(ctx)
     discovery = DiscoveryClient(
         http_client,
         base_url=str(config.repertoire_base_url),
@@ -380,14 +557,15 @@ async def _startup(
         default_queue_name=config.arq_queue_name,
     )
 
-    # ``http_client`` and ``arq_queue`` stay in ctx because ``shutdown``
-    # owns their teardown. The factory builder captures them by reference,
-    # so worker functions never need to look them up directly.
-    ctx["http_client"] = http_client
+    # ``arq_queue`` and the two HTTP clients stay in ctx because
+    # ``shutdown`` owns their teardown. The factory builder captures them
+    # by reference, so worker functions never need to look them up
+    # directly.
     ctx["arq_queue"] = arq_queue
     factory_builder = WorkerFactoryBuilder(
         encryptor=encryptor,
         http_client=http_client,
+        copy_http_client=copy_http_client,
         arq_queue=arq_queue,
         discovery=discovery,
         github_app_id=config.github_app_id,
@@ -396,8 +574,16 @@ async def _startup(
         purge_coalescer=CdnPurgeCoalescer(
             min_interval=config.cdn_purge_min_interval_seconds
         ),
+        cdn_purge_enabled=config.cdn_purge_enabled,
         default_queue_name=config.arq_queue_name,
         keeper_sync_copy_concurrency=config.keeper_sync_copy_concurrency,
+        keeper_sync_upload_max_attempts=config.keeper_sync_upload_max_attempts,
+        keeper_sync_upload_max_backoff_seconds=(
+            config.keeper_sync_upload_max_backoff_seconds
+        ),
+        keeper_sync_copy_retry_delay_seconds=(
+            config.keeper_sync_copy_retry_delay_seconds
+        ),
     )
     await validate_github_app(
         state=factory_builder,
@@ -471,6 +657,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     if event_manager is not None:
         await event_manager.aclose()
     await ctx["http_client"].aclose()
+    await ctx["copy_http_client"].aclose()
     await db_session_dependency.aclose()
     logger = structlog.get_logger("docverse_server.worker")
     logger.info("Worker shutdown complete")

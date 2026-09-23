@@ -16,11 +16,13 @@ from aiobotocore.client import AioBaseClient
 from aiobotocore.session import AioSession, ClientCreatorContext, get_session
 from botocore import UNSIGNED
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, HTTPClientError
+from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
 from docverse_server.exceptions import DocverseSlackException
 
 __all__ = [
+    "RETRYABLE_SOURCE_TRANSPORT_ERRORS",
     "LtdS3Source",
     "LtdSourceAccessDeniedError",
     "LtdSourceProtocol",
@@ -35,6 +37,31 @@ _DEFAULT_REGION = "us-east-1"
 #: prefixes answers with one of these.
 _DENIAL_ERROR_CODES = frozenset(
     {"AccessDenied", "AccessDeniedException", "AllAccessDisabled", "403"}
+)
+
+
+#: botocore exceptions that mean the LTD bucket could not be reached, or
+#: stopped answering mid-response, rather than that it answered with an
+#: error: the source-side counterpart of
+#: :data:`~docverse_server.storage._http_retry.RETRYABLE_TRANSPORT_ERRORS`.
+#:
+#: - botocore's ``ConnectionError`` (not the builtin) is the parent of
+#:   every failure to reach the endpoint: ``EndpointConnectionError``,
+#:   ``ConnectTimeoutError``, ``ProxyConnectionError`` and ``SSLError``.
+#: - ``HTTPClientError`` is the parent of every failure once connected:
+#:   ``ReadTimeoutError``, ``ConnectionClosedError``,
+#:   ``ResponseStreamingError`` (a connection dropped mid-body), and the
+#:   generic wrapper aiobotocore raises for any other aiohttp client
+#:   error.
+#:
+#: ``ClientError`` is deliberately absent. It is S3 *answering*: a
+#: denial or a missing key is permanent, and a throttling status such as
+#: ``SlowDown`` is the source-side analogue of the R2 ``429``/``5xx``
+#: the keeper-sync build-level retry leaves alone. Defined here so that
+#: callers classifying a failed copy need not import botocore.
+RETRYABLE_SOURCE_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
+    BotocoreConnectionError,
+    HTTPClientError,
 )
 
 

@@ -30,6 +30,7 @@ from docverse_server.exceptions import (
     InvalidBuildStateError,
     InvalidJobStateError,
     JobNotFoundError,
+    KeeperSyncGitRefUnresolvableError,
     KeeperSyncInvariantError,
     KeeperSyncSystemicFailureError,
     UpstreamServiceError,
@@ -75,6 +76,14 @@ def _make_job_not_found() -> JobNotFoundError:
 
 def _make_keeper_sync_invariant() -> KeeperSyncInvariantError:
     return KeeperSyncInvariantError("state_id=42 has no tombstone")
+
+
+def _make_keeper_sync_git_ref_unresolvable() -> (
+    KeeperSyncGitRefUnresolvableError
+):
+    return KeeperSyncGitRefUnresolvableError(
+        ltd_edition_slug="main", ltd_build_id=6818
+    )
 
 
 def _make_keeper_sync_systemic_failure() -> KeeperSyncSystemicFailureError:
@@ -128,6 +137,10 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("JobNotFoundError", _make_job_not_found),
     ("InvalidSlugError", _make_invalid_slug),
     ("KeeperSyncInvariantError", _make_keeper_sync_invariant),
+    (
+        "KeeperSyncGitRefUnresolvableError",
+        _make_keeper_sync_git_ref_unresolvable,
+    ),
     (
         "KeeperSyncSystemicFailureError",
         _make_keeper_sync_systemic_failure,

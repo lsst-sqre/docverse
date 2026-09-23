@@ -197,9 +197,9 @@ class _RecordingMockObjectStore(MockObjectStore):
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
-    ) -> None:
+    ) -> int:
         self._op_timestamps.append(time.monotonic())
-        await super().upload_object(
+        return await super().upload_object(
             key=key, data=data, content_type=content_type
         )
 
@@ -1800,20 +1800,20 @@ class _RetiringMockObjectStore(MockObjectStore):
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
-    ) -> None:
+    ) -> int:
         if not self._armed:
-            await super().upload_object(
+            return await super().upload_object(
                 key=key, data=data, content_type=content_type
             )
-            return
         self._armed = False
         await self._on_upload()
-        await super().upload_object(
+        attempts = await super().upload_object(
             key=key, data=data, content_type=content_type
         )
         if self._fail_after:
             msg = "Object store went away"
             raise RuntimeError(msg)
+        return attempts
 
 
 @pytest.mark.asyncio

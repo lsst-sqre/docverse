@@ -15,11 +15,13 @@ import pytest
 import structlog
 from structlog.testing import capture_logs
 
+from docverse_server.storage import _http_retry
 from docverse_server.storage._http_retry import (
     MAX_BACKOFF_SECONDS,
     RETRYABLE_TRANSPORT_ERRORS,
     backoff_for_attempt,
     backoff_for_response,
+    retry_budget_exhausted,
     retry_request,
 )
 
@@ -32,6 +34,26 @@ def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         delays.append(delay)
 
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    return delays
+
+
+def _record_sleeps_on_a_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record sleeps and advance ``retry_request``'s clock by each one.
+
+    With ``asyncio.sleep`` stubbed out no real time passes, so the loop's
+    ``elapsed_seconds`` would always read zero. Driving its clock from
+    the recorded delays makes the elapsed time exactly the backoff spent
+    so far, which a test can assert.
+    """
+    delays: list[float] = []
+    now = [1000.0]
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(_http_retry, "monotonic", lambda: now[0])
     return delays
 
 
@@ -406,16 +428,24 @@ async def test_retry_request_honours_a_raised_backoff_ceiling(
 
 
 @pytest.mark.asyncio
-async def test_retry_request_logs_each_retry_with_its_operation() -> None:
+async def test_retry_request_logs_each_retry_with_its_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Every retry is visible even when the call eventually succeeds.
 
     A transient rate limit that clears never reaches a caller's terminal
     error log, so this warning is the only record that Docverse is being
     throttled — the signal an operator needs before it becomes an outage.
+
+    The transport line has to say what failed and for how long even when
+    the exception has no message: ``str(httpx.ConnectTimeout())`` is the
+    empty string, so it logs the repr, and reports the time spent since
+    the first attempt alongside the attempt count and the coming delay.
     """
+    _record_sleeps_on_a_clock(monkeypatch)
     send, _ = _sender(
         httpx.Response(429),
-        httpx.ConnectError("connection refused"),
+        httpx.ConnectTimeout(""),
         httpx.Response(200),
     )
 
@@ -424,7 +454,7 @@ async def test_retry_request_logs_each_retry_with_its_operation() -> None:
             send,
             operation="widget purge",
             logger=structlog.get_logger("test"),
-            base_backoff_seconds=0.0,
+            base_backoff_seconds=0.5,
         )
 
     warnings = [entry for entry in logs if entry["log_level"] == "warning"]
@@ -434,7 +464,13 @@ async def test_retry_request_logs_each_retry_with_its_operation() -> None:
     ]
     assert warnings[0]["status_code"] == 429
     assert warnings[0]["attempt"] == 1
-    assert warnings[1]["error_type"] == "ConnectError"
+    transport = warnings[1]
+    assert transport["error"] == "ConnectTimeout('')"
+    assert transport["error_type"] == "ConnectTimeout"
+    assert transport["attempt"] == 2
+    assert transport["max_attempts"] == 4
+    assert transport["retry_delay"] == 1.0
+    assert transport["elapsed_seconds"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -466,3 +502,40 @@ async def test_retry_request_adds_caller_context_to_retry_logs() -> None:
     warnings = [entry for entry in logs if entry["log_level"] == "warning"]
     assert len(warnings) == 1
     assert warnings[0]["error_codes"] == [1134]
+
+
+def _status_error(status_code: int) -> httpx.HTTPStatusError:
+    """Build the error ``raise_for_status`` gives for ``status_code``."""
+    request = httpx.Request("PUT", "https://r2.example/key")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"status {status_code}", request=request, response=response
+    )
+
+
+@pytest.mark.parametrize(
+    ("exc", "exhausted"),
+    [
+        (httpx.ConnectTimeout(""), True),
+        (httpx.WriteError("connection reset"), True),
+        (httpx.RemoteProtocolError("peer closed"), True),
+        (_status_error(503), True),
+        (_status_error(429), True),
+        (_status_error(403), False),
+        (_status_error(301), False),
+        (httpx.LocalProtocolError("bad header"), False),
+        (RuntimeError("AccessDenied"), False),
+    ],
+)
+def test_retry_budget_exhausted_names_what_more_attempts_might_fix(
+    exc: BaseException, *, exhausted: bool
+) -> None:
+    """Only a failure the loop would have retried means the budget ran out.
+
+    ``retry_request`` re-raises a retryable transport error only once the
+    budget is spent, and returns a retryable status only on the last
+    attempt — so either, surfacing from an upload, is an exhausted budget.
+    A ``403``, a redirect, or a local protocol bug fails on the first
+    attempt whatever the budget, and says nothing about transport health.
+    """
+    assert retry_budget_exhausted(exc) is exhausted

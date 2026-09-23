@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -43,6 +44,7 @@ __all__ = [
     "RetryOutcome",
     "backoff_for_attempt",
     "backoff_for_response",
+    "retry_budget_exhausted",
     "retry_request",
 ]
 
@@ -242,6 +244,41 @@ class RetryOutcome:
         return self.response.status_code in RETRYABLE_STATUS_CODES
 
 
+def retry_budget_exhausted(exc: BaseException) -> bool:
+    """Whether a failed request's exception means its budget ran out.
+
+    For an exception raised out of `retry_request`, or by
+    ``raise_for_status`` on the `RetryOutcome` it returned: ``True`` when
+    the failure is one the loop retries — a
+    `RETRYABLE_TRANSPORT_ERRORS` transport failure, or an
+    ``httpx.HTTPStatusError`` for one of `RETRYABLE_STATUS_CODES` —
+    because the loop only lets either out once every attempt is spent.
+    Anything else (a ``403``, an unfollowed redirect, a local protocol
+    bug, an error that never came from the loop) fails the same way on
+    the first attempt whatever the budget, so it is not an exhaustion.
+
+    This is the exception-side twin of `RetryOutcome.retryable`, for
+    callers that only see the raise — the keeper-sync copier counts the
+    objects whose upload outlasted its budget with it.
+
+    Parameters
+    ----------
+    exc
+        The exception the request, or its ``raise_for_status``, raised.
+
+    Returns
+    -------
+    bool
+        Whether more attempts might have let the request succeed.
+    """
+    if isinstance(exc, RETRYABLE_TRANSPORT_ERRORS):
+        return True
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in RETRYABLE_STATUS_CODES
+    )
+
+
 async def retry_request(
     send: Callable[[], Awaitable[httpx.Response]],
     *,
@@ -284,7 +321,12 @@ async def retry_request(
     logger
         Logger for the retry warnings. Bind the caller's identifying
         context (object key, hostname, edition slug) onto it first —
-        this function adds only the attempt and delay fields.
+        this function adds only the attempt, delay and failure fields.
+        The transport-failure warning logs the exception's ``repr``
+        rather than its ``str``, because ``str(httpx.ConnectTimeout())``
+        is the empty string, and says how many seconds have passed since
+        the first attempt so a long outage is visible before the budget
+        runs out.
     max_attempts
         Attempts allowed including the original. Clamped to at least 1
         so a misconfigured budget degrades to "try once, no retries"
@@ -320,6 +362,7 @@ async def retry_request(
         failure outlasts the attempt budget.
     """
     budget = max(1, max_attempts)
+    started = monotonic()
     attempt = 0
     while True:
         attempt += 1
@@ -339,11 +382,12 @@ async def retry_request(
             )
             logger.warning(
                 f"Retrying {operation} after transport error",
-                error=str(exc),
+                error=repr(exc),
                 error_type=type(exc).__name__,
                 attempt=attempt,
                 max_attempts=budget,
                 retry_delay=delay,
+                elapsed_seconds=monotonic() - started,
             )
             await asyncio.sleep(delay)
             continue
