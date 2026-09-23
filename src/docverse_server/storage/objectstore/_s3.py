@@ -16,6 +16,7 @@ from botocore.config import Config
 from .._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
     DEFAULT_MAX_ATTEMPTS,
+    MAX_BACKOFF_SECONDS,
     RETRYABLE_TRANSPORT_ERRORS,
     retry_request,
 )
@@ -72,6 +73,16 @@ class S3ObjectStore:
     base_backoff_seconds
         Delay after a presigned upload's first failure; doubles each
         subsequent attempt.
+    max_backoff_seconds
+        Ceiling on any single wait between presigned upload attempts,
+        including one the destination asks for via ``Retry-After``.
+        Defaults to the shared, deliberately tight ceiling. The
+        keeper-sync copy path raises it (with ``max_attempts``) from
+        ``Config.keeper_sync_upload_max_backoff_seconds``, the way
+        `~docverse_server.storage.ltd.LtdClient` raises its own: a build
+        copy holds no database transaction or purge lock while it waits,
+        so it can afford to outlast an R2 outage instead of failing
+        inside it.
     """
 
     def __init__(
@@ -86,6 +97,7 @@ class S3ObjectStore:
         http_client: httpx.AsyncClient | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS,
+        max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._bucket = bucket
@@ -99,6 +111,7 @@ class S3ObjectStore:
         # log below can report it without re-deriving the policy.
         self._max_attempts = max(1, max_attempts)
         self._base_backoff_seconds = base_backoff_seconds
+        self._max_backoff_seconds = max_backoff_seconds
         self._session: AioSession = get_session()
         self._client_cm: ClientCreatorContext | None = None
         self._client: AioBaseClient | None = None
@@ -382,6 +395,7 @@ class S3ObjectStore:
                 logger=logger,
                 max_attempts=self._max_attempts,
                 base_backoff_seconds=self._base_backoff_seconds,
+                max_backoff_seconds=self._max_backoff_seconds,
             )
         except RETRYABLE_TRANSPORT_ERRORS as exc:
             logger.exception(

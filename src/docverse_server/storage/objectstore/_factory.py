@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 import structlog
 
+from .._http_retry import DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS
 from ._protocol import ObjectStore
 from ._s3 import S3ObjectStore
 
@@ -55,6 +56,8 @@ def create_objectstore(
     credentials: dict[str, Any],
     logger: structlog.stdlib.BoundLogger,
     http_client: httpx.AsyncClient | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
 ) -> ObjectStore:
     """Create an ObjectStore from service config and decrypted credentials.
 
@@ -69,6 +72,18 @@ def create_objectstore(
         Decrypted credential payload (access keys, tokens, etc.).
     logger
         Bound logger for contextual logging.
+    http_client
+        HTTP client the store PUTs presigned uploads over. Without one
+        the store uploads through aiobotocore instead, and the two
+        budget arguments below do not apply.
+    max_attempts
+        Attempts allowed for one presigned upload, including the first.
+        Defaults to the shared ``_http_retry`` budget; the keeper-sync
+        worker passes ``Config.keeper_sync_upload_max_attempts``.
+    max_backoff_seconds
+        Ceiling on any single wait between presigned upload attempts.
+        Defaults to the shared ``_http_retry`` ceiling; the keeper-sync
+        worker passes ``Config.keeper_sync_upload_max_backoff_seconds``.
 
     Returns
     -------
@@ -103,6 +118,8 @@ def create_objectstore(
             region=config.get("region", ""),
             logger=logger,
             http_client=http_client,
+            max_attempts=max_attempts,
+            max_backoff_seconds=max_backoff_seconds,
         )
     msg = f"Unsupported object store provider: {provider!r}"
     raise ValueError(msg)

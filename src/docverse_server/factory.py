@@ -60,6 +60,7 @@ from .services.project_github_binding import ProjectGitHubBindingResolver
 from .services.purgatory import PurgatoryService
 from .services.queue_dispatch import QueueDispatcher
 from .services.ref_deleted_processor import RefDeletedWebhookProcessor
+from .storage._http_retry import DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS
 from .storage.build_store import BuildStore
 from .storage.cdncachepurger import CdnCachePurger, create_cdn_cache_purger
 from .storage.dashboard_templates.github import (
@@ -138,6 +139,8 @@ class Factory:
         cdn_purge_enabled: bool = False,
         default_queue_name: str,
         keeper_sync_copy_concurrency: int = DEFAULT_COPY_CONCURRENCY,
+        keeper_sync_upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        keeper_sync_upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -169,6 +172,17 @@ class Factory:
         # threads ``Config.keeper_sync_copy_concurrency`` through
         # ``WorkerFactoryBuilder``.
         self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
+        # The presigned-upload budget of the store a keeper-sync copier
+        # writes through, and of no other store this factory builds.
+        # Defaults to the shared ``_http_retry`` budget so directly
+        # constructed factories behave exactly as before; the arq worker
+        # threads ``Config.keeper_sync_upload_max_attempts`` and
+        # ``Config.keeper_sync_upload_max_backoff_seconds`` through
+        # ``WorkerFactoryBuilder``.
+        self._keeper_sync_upload_max_attempts = keeper_sync_upload_max_attempts
+        self._keeper_sync_upload_max_backoff_seconds = (
+            keeper_sync_upload_max_backoff_seconds
+        )
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -192,6 +206,16 @@ class Factory:
     def keeper_sync_copy_concurrency(self) -> int:
         """Fan-out bound handed to every copier this factory builds."""
         return self._keeper_sync_copy_concurrency
+
+    @property
+    def keeper_sync_upload_max_attempts(self) -> int:
+        """Presigned-upload attempts for a keeper-sync copier's store."""
+        return self._keeper_sync_upload_max_attempts
+
+    @property
+    def keeper_sync_upload_max_backoff_seconds(self) -> float:
+        """Presigned-upload wait ceiling for a keeper-sync copier's store."""
+        return self._keeper_sync_upload_max_backoff_seconds
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -929,7 +953,12 @@ class Factory:
         return svc.provider, svc.config, cred_payload
 
     async def create_objectstore_for_org(
-        self, *, org_id: int, service_label: str
+        self,
+        *,
+        org_id: int,
+        service_label: str,
+        upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
     ) -> ObjectStore:
         """Resolve an org's ObjectStore from its service configuration.
 
@@ -943,6 +972,13 @@ class Factory:
         service_label
             Service label to use (e.g., the org's
             ``publishing_store_label``).
+        upload_max_attempts
+            Attempts the store spends on one presigned upload, including
+            the first. Defaults to the shared ``_http_retry`` budget,
+            which every caller but the keeper-sync copier keeps.
+        upload_max_backoff_seconds
+            Ceiling on any single wait between presigned upload
+            attempts. Defaults to the shared ``_http_retry`` ceiling.
 
         Returns
         -------
@@ -972,6 +1008,8 @@ class Factory:
             credentials=cred_payload,
             logger=self._logger,
             http_client=self._http_client,
+            max_attempts=upload_max_attempts,
+            max_backoff_seconds=upload_max_backoff_seconds,
         )
 
     def create_ltd_client(
@@ -1011,13 +1049,24 @@ class Factory:
         sync worker's memory ceiling without a code change. Peak
         resident size scales with the pool's ``max_jobs`` times that
         bound times the largest object under a build prefix.
+
+        The destination store is the only one this factory builds with
+        the ``keeper_sync_upload_*`` retry budget rather than the shared
+        one: a build copy holds no transaction or lock while an upload
+        backs off, so it can ride out an R2 connect outage that the
+        shared budget gives up inside (PRD #685).
         """
 
         @asynccontextmanager
         async def _open() -> AsyncGenerator[BuildContentCopier]:
             async with self._session.begin():
                 destination = await self.create_objectstore_for_org(
-                    org_id=org_id, service_label=service_label
+                    org_id=org_id,
+                    service_label=service_label,
+                    upload_max_attempts=self._keeper_sync_upload_max_attempts,
+                    upload_max_backoff_seconds=(
+                        self._keeper_sync_upload_max_backoff_seconds
+                    ),
                 )
             source = self.create_ltd_s3_source()
             async with source, destination:

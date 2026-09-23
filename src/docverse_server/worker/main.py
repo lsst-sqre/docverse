@@ -246,6 +246,8 @@ class WorkerFactoryBuilder:
         cdn_purge_enabled: bool = False,
         default_queue_name: str,
         keeper_sync_copy_concurrency: int,
+        keeper_sync_upload_max_attempts: int,
+        keeper_sync_upload_max_backoff_seconds: float,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -266,6 +268,13 @@ class WorkerFactoryBuilder:
         # that copies build content, so a silent fallback here is
         # precisely the invisible memory bound #517 removes.
         self._keeper_sync_copy_concurrency = keeper_sync_copy_concurrency
+        # Required for the same reason: a silent fallback to the shared
+        # retry budget is exactly the four-attempt budget an R2 connect
+        # outage outlasted (PRD #685).
+        self._keeper_sync_upload_max_attempts = keeper_sync_upload_max_attempts
+        self._keeper_sync_upload_max_backoff_seconds = (
+            keeper_sync_upload_max_backoff_seconds
+        )
 
     @property
     def github_app_enabled(self) -> bool:
@@ -313,6 +322,10 @@ class WorkerFactoryBuilder:
             cdn_purge_enabled=self._cdn_purge_enabled,
             default_queue_name=self._default_queue_name,
             keeper_sync_copy_concurrency=self._keeper_sync_copy_concurrency,
+            keeper_sync_upload_max_attempts=self._keeper_sync_upload_max_attempts,
+            keeper_sync_upload_max_backoff_seconds=(
+                self._keeper_sync_upload_max_backoff_seconds
+            ),
         )
 
 
@@ -402,6 +415,10 @@ async def _startup(
         cdn_purge_enabled=config.cdn_purge_enabled,
         default_queue_name=config.arq_queue_name,
         keeper_sync_copy_concurrency=config.keeper_sync_copy_concurrency,
+        keeper_sync_upload_max_attempts=config.keeper_sync_upload_max_attempts,
+        keeper_sync_upload_max_backoff_seconds=(
+            config.keeper_sync_upload_max_backoff_seconds
+        ),
     )
     await validate_github_app(
         state=factory_builder,

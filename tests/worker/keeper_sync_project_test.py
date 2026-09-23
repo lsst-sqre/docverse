@@ -156,7 +156,7 @@ def _patch_factory_io(
     """Route the factory's S3/objectstore wiring through in-memory doubles."""
 
     async def _create_objectstore_for_org(
-        self: Factory, *, org_id: int, service_label: str
+        self: Factory, *, org_id: int, service_label: str, **budget: float
     ) -> MockObjectStore:
         return object_store
 
@@ -1067,7 +1067,7 @@ async def test_keeper_sync_project_objectstore_failure_leaves_no_open_txn(
     _seed_ltd(mock_discovery)
 
     async def _create_objectstore_for_org_raises(
-        self: Factory, *, org_id: int, service_label: str
+        self: Factory, *, org_id: int, service_label: str, **budget: float
     ) -> MockObjectStore:
         msg = f"Service {service_label!r} not found"
         raise RuntimeError(msg)

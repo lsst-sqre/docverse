@@ -35,11 +35,25 @@ from docverse_server.config import (
 from docverse_server.services.keeper_sync.copier import (
     DEFAULT_COPY_CONCURRENCY,
 )
+from docverse_server.storage._http_retry import (
+    DEFAULT_BASE_BACKOFF_SECONDS,
+    backoff_for_attempt,
+)
 
 #: Cadence gap of the ``keeper_sync_reaper`` cron
 #: (``cron(minute={0, 30})``), the worst-case extra detection latency
 #: on top of the threshold.
 _REAPER_CRON_GAP_SECONDS = 1800
+
+#: Connect timeout of the client that carries keeper-sync presigned
+#: PUTs (PRD #685's dedicated copy client). An attempt that hits an R2
+#: connect outage burns this long before it fails.
+_COPY_CONNECT_TIMEOUT_SECONDS = 10.0
+
+#: Length of the R2 connect outage that failed 38 of 208 ``sqr-``
+#: keeper-sync jobs on roundtable-prod (19:51:13-19:51:53 UTC,
+#: 2026-09-22) after the shared four-attempt budget ran out.
+_OBSERVED_R2_OUTAGE_SECONDS = 40.0
 
 
 def test_keeper_sync_timeout_defaults() -> None:
@@ -170,6 +184,79 @@ def test_sync_worker_buffered_body_budget_is_the_documented_product() -> None:
     assert (
         config.keeper_sync_max_jobs * config.keeper_sync_copy_concurrency
     ) == 80
+
+
+def test_keeper_sync_upload_budget_defaults() -> None:
+    """The keeper-sync presigned upload gets six attempts and a 30 s ceiling.
+
+    The shared ``_http_retry`` defaults (four attempts, 10 s ceiling)
+    are what every other storage client keeps; the copy path needs its
+    own, larger budget to outlast an R2 connect outage.
+    """
+    config = Configuration()
+    assert config.keeper_sync_upload_max_attempts == 6
+    assert config.keeper_sync_upload_max_backoff_seconds == 30.0
+
+
+def test_keeper_sync_upload_budget_rides_out_the_observed_outage() -> None:
+    """The default budget outlasts the outage that failed the campaign.
+
+    An object survives an outage when its last attempt starts after the
+    outage clears: that is every earlier attempt's connect timeout plus
+    every backoff sleep between them (0.5 + 1 + 2 + 4 + 8 s at the
+    defaults, about 65 s in all).
+    """
+    config = Configuration()
+    failed_attempts = config.keeper_sync_upload_max_attempts - 1
+    backoff = sum(
+        backoff_for_attempt(
+            attempt,
+            base_backoff_seconds=DEFAULT_BASE_BACKOFF_SECONDS,
+            max_backoff_seconds=config.keeper_sync_upload_max_backoff_seconds,
+        )
+        for attempt in range(1, failed_attempts + 1)
+    )
+    ride_out = backoff + failed_attempts * _COPY_CONNECT_TIMEOUT_SECONDS
+    assert backoff == 15.5
+    assert ride_out > _OBSERVED_R2_OUTAGE_SECONDS
+
+
+def test_keeper_sync_upload_budget_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both upload-budget knobs are env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_ATTEMPTS", "8")
+    monkeypatch.setenv(
+        "DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_BACKOFF_SECONDS", "45.5"
+    )
+    config = Configuration()
+    assert config.keeper_sync_upload_max_attempts == 8
+    assert config.keeper_sync_upload_max_backoff_seconds == 45.5
+
+
+def test_keeper_sync_upload_max_attempts_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero attempts is refused at startup rather than clamped silently.
+
+    ``S3ObjectStore`` would clamp it to one attempt, so a value meant as
+    "more retries" would quietly become "no retries at all".
+    """
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_ATTEMPTS", "0")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+
+def test_keeper_sync_upload_max_backoff_refuses_negative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative ceiling is refused; zero (retry without waiting) is not."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_BACKOFF_SECONDS", "-1")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_BACKOFF_SECONDS", "0")
+    assert Configuration().keeper_sync_upload_max_backoff_seconds == 0.0
 
 
 def test_publish_edition_job_timeout_default() -> None:

@@ -380,6 +380,49 @@ class Configuration(BaseSettings):
         ),
     )
 
+    keeper_sync_upload_max_attempts: int = Field(
+        6,
+        ge=1,
+        title="Attempts per keeper-sync presigned upload",
+        description=(
+            "Attempts, including the first, that the keeper-sync"
+            " worker's object store spends on one presigned PUT of a"
+            " copied object before failing the build copy. Transport"
+            " failures (an R2 connect timeout, a reset connection) and"
+            " retryable statuses (429, 5xx) share the budget. Backoff"
+            " starts at 0.5 s and doubles, so six attempts sleep"
+            " 0.5 + 1 + 2 + 4 + 8 = 15.5 s between them; with the copy"
+            " client's 10 s connect timeout, an object rides out an R2"
+            " connect outage of about 15.5 + 5 x 10 = 65 s (its last"
+            " attempt starts that long after its first). The shared"
+            " default of four attempts, behind the shared client's 5 s"
+            " connect timeout, rode out only 3.5 + 3 x 5 = 18.5 s —"
+            " shorter than the 40 s outage that failed 38 of 208"
+            " ``sqr-`` jobs on 2026-09-22. Only the keeper-sync copy"
+            " path uses this; every other object store keeps the shared"
+            " four-attempt default."
+        ),
+    )
+
+    keeper_sync_upload_max_backoff_seconds: float = Field(
+        30.0,
+        ge=0.0,
+        title="Longest wait between keeper-sync presigned upload attempts",
+        description=(
+            "Ceiling, in seconds, on any single wait between attempts"
+            " of a keeper-sync presigned PUT, including one R2 asks for"
+            " with ``Retry-After``. The shared 10 s ceiling protects"
+            " callers that sleep while holding a database transaction or"
+            " a purge lock; a build copy holds neither, so it can afford"
+            " to honour a longer server-requested wait. At the default"
+            " six attempts the exponential backoff peaks at 8 s and"
+            " never reaches this ceiling, so it only bites for a"
+            " ``Retry-After`` above 10 s or when"
+            " ``keeper_sync_upload_max_attempts`` is raised past seven."
+            " At zero, retries go out back to back."
+        ),
+    )
+
     keeper_sync_reaper_threshold_seconds: int = Field(
         default_factory=_default_keeper_sync_reaper_threshold,
         title="Keeper-sync stuck-run reaper threshold, in seconds",

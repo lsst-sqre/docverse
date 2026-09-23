@@ -42,6 +42,8 @@ def _make_builder(
     github_app_private_key: SecretStr | None = None,
     github_webhook_secret: SecretStr | None = None,
     keeper_sync_copy_concurrency: int | None = None,
+    keeper_sync_upload_max_attempts: int | None = None,
+    keeper_sync_upload_max_backoff_seconds: float | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
@@ -58,6 +60,16 @@ def _make_builder(
             keeper_sync_copy_concurrency
             if keeper_sync_copy_concurrency is not None
             else _config.keeper_sync_copy_concurrency
+        ),
+        keeper_sync_upload_max_attempts=(
+            keeper_sync_upload_max_attempts
+            if keeper_sync_upload_max_attempts is not None
+            else _config.keeper_sync_upload_max_attempts
+        ),
+        keeper_sync_upload_max_backoff_seconds=(
+            keeper_sync_upload_max_backoff_seconds
+            if keeper_sync_upload_max_backoff_seconds is not None
+            else _config.keeper_sync_upload_max_backoff_seconds
         ),
     )
 
@@ -80,6 +92,28 @@ async def test_builder_threads_copy_concurrency_to_per_job_factory(
         )
         factory = builder(session=db_session, logger=_logger())
         assert factory.keeper_sync_copy_concurrency == 3
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_upload_budget_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """The keeper-sync presigned-upload budget is process-config driven.
+
+    The sync worker's copier is the only caller that needs more than
+    the shared retry budget to ride out an R2 connect outage (PRD #685),
+    so the builder must carry both operator knobs onto every per-job
+    factory rather than letting it fall back to the shared defaults.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client,
+            keeper_sync_upload_max_attempts=9,
+            keeper_sync_upload_max_backoff_seconds=42.0,
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.keeper_sync_upload_max_attempts == 9
+        assert factory.keeper_sync_upload_max_backoff_seconds == 42.0
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,10 @@ def make_worker_ctx(
         cdn_purge_enabled=cdn_purge_enabled,
         default_queue_name=_config.arq_queue_name,
         keeper_sync_copy_concurrency=_config.keeper_sync_copy_concurrency,
+        keeper_sync_upload_max_attempts=_config.keeper_sync_upload_max_attempts,
+        keeper_sync_upload_max_backoff_seconds=(
+            _config.keeper_sync_upload_max_backoff_seconds
+        ),
     )
     ctx: dict[str, Any] = {
         "factory_builder": builder,
