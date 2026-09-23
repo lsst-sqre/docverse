@@ -477,6 +477,10 @@ whose per-project job was already running.
 
 ## Related
 
+- [Keeper-sync transport resilience](keeper-sync-transport.md) — how
+  a wave's build copies ride out an R2 outage, what happens to an
+  edition whose copy still fails, and how to read the
+  `build_content_copied` event each copy publishes.
 - `client/src/docverse/models/keeper_sync.py` — `KeeperSyncConfig`,
   where the scope rule and its validation are defined once,
   `KeeperSyncScopePreviewRequest` (the preview body, which is a

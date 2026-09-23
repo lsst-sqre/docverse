@@ -36,6 +36,7 @@ from docverse_server.handlers.orgs.keeper_sync import (
 )
 from docverse_server.handlers.orgs.projects import get_project, get_projects
 from docverse_server.metrics import (
+    BuildContentCopiedEvent,
     ConditionalGetEndpoint,
     ConditionalGetEvent,
     ConditionalGetOutcome,
@@ -46,11 +47,21 @@ from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
     _ApplySkip,
 )
+from docverse_server.storage._http_retry import (
+    DEFAULT_BASE_BACKOFF_SECONDS,
+    backoff_for_attempt,
+)
 from docverse_server.storage.pagination import ProjectSortOrder
 from docverse_server.worker.functions.edition_reconcile import (
     RECONCILED_DRIFT_MESSAGE,
 )
 from docverse_server.worker.functions.keeper_sync import _ScopeCounts
+from docverse_server.worker.main import (
+    COPY_HTTP_CONNECTION_HEADROOM,
+    COPY_HTTP_KEEPALIVE_PER_COPY_SLOT,
+    COPY_HTTP_TIMEOUT,
+    copy_http_limits,
+)
 
 _DOCS = Path(__file__).parents[1] / "docs"
 
@@ -63,9 +74,31 @@ _API_PAGE = "api-conventions.md"
 _SCOPE_PAGE = "keeper-sync-scope.md"
 """Operations page for the keeper-sync scope rule (PRD #667)."""
 
+_TRANSPORT_PAGE = "keeper-sync-transport.md"
+"""Operations page for keeper-sync transport resilience (PRD #685)."""
+
+_TRANSPORT_KNOB_PREFIXES = ("keeper_sync_upload_", "keeper_sync_copy_retry_")
+"""Name prefixes of the settings that shape a build copy's retries."""
+
 
 def _read(name: str) -> str:
     return (_DOCS / name).read_text()
+
+
+def _table_row(page: str, first_cell: str) -> str:
+    """Return the Markdown table row whose first cell is ``first_cell``.
+
+    The cell is matched as inline code. This lets a test assert that a
+    setting's environment variable and default sit on the *same* row as
+    its name, which a page-wide substring search cannot tell apart from
+    the three appearing in unrelated places.
+    """
+    prefix = f"| `{first_cell}` |"
+    for line in page.splitlines():
+        if line.startswith(prefix):
+            return line
+    msg = f"no table row starts with {prefix!r}"
+    raise AssertionError(msg)
 
 
 def _uncoded(names: Iterable[str], page: str) -> list[str]:
@@ -373,3 +406,128 @@ def test_project_sort_orders_documented() -> None:
     orders = {order.value for order in ProjectSortOrder}
     assert orders, "the project listing accepts no orderings"
     assert not _uncoded(orders, page)
+
+
+def test_docs_index_links_the_transport_page() -> None:
+    """The index points at the keeper-sync transport page."""
+    assert _TRANSPORT_PAGE in _read("index.md")
+
+
+def test_scope_page_related_links_the_transport_page() -> None:
+    """The scope page's related reading points at the transport page.
+
+    The two pages are the keeper-sync operations docs; an operator who
+    has just launched a wave from the scope page is the one who then
+    has to read that wave's copy failures.
+    """
+    related = _read(_SCOPE_PAGE).split("\n## Related\n", 1)
+    assert len(related) == 2, "the scope page has no Related section"
+    assert _TRANSPORT_PAGE in related[1]
+
+
+def test_transport_knobs_documented_with_env_var_and_default() -> None:
+    """Every build-copy retry setting is a row naming its env var and default.
+
+    Read off :class:`Configuration` rather than written out, so renaming
+    a setting, changing its default, or adding another knob under the
+    same prefixes fails here until the page's table says so.
+    """
+    page = _read(_TRANSPORT_PAGE)
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    knobs = {
+        name
+        for name in Configuration.model_fields
+        if name.startswith(_TRANSPORT_KNOB_PREFIXES)
+    }
+    assert knobs, "configuration exposes no build-copy retry knobs"
+    for name in sorted(knobs):
+        row = _table_row(page, name)
+        env_var = f"{env_prefix}{name}".upper()
+        default = Configuration.model_fields[name].default
+        assert f"`{env_var}`" in row, name
+        assert f"`{default}`" in row, name
+
+
+def test_transport_page_names_the_copy_pool_sizing_knobs() -> None:
+    """The page names both settings the copy client's pool is sized from."""
+    page = _read(_TRANSPORT_PAGE)
+    assert not _uncoded(
+        {"keeper_sync_max_jobs", "keeper_sync_copy_concurrency"}, page
+    )
+
+
+def test_transport_ride_out_arithmetic_documented() -> None:
+    """The page's per-object ride-out sum matches the shipped defaults.
+
+    An object rides out a connect outage until its last attempt starts:
+    every backoff sleep plus every earlier attempt's connect timeout.
+    Recomputed here from the retry policy, the default budget and the
+    copy client's timeout, so a change to any of them has to be carried
+    into the page's arithmetic.
+    """
+    page = _read(_TRANSPORT_PAGE)
+    fields = Configuration.model_fields
+    max_attempts = fields["keeper_sync_upload_max_attempts"].default
+    max_backoff = fields["keeper_sync_upload_max_backoff_seconds"].default
+    connect = COPY_HTTP_TIMEOUT.connect
+    assert connect is not None
+    delays = [
+        backoff_for_attempt(
+            attempt,
+            base_backoff_seconds=DEFAULT_BASE_BACKOFF_SECONDS,
+            max_backoff_seconds=max_backoff,
+        )
+        for attempt in range(1, max_attempts)
+    ]
+    ride_out = sum(delays) + (max_attempts - 1) * connect
+    assert " + ".join(f"{delay:g}" for delay in delays) in page
+    assert f"{ride_out:g} s" in page
+
+
+def test_copy_client_timeouts_documented() -> None:
+    """Each copy-client timeout is a row carrying its shipped value."""
+    page = _read(_TRANSPORT_PAGE)
+    assert not _uncoded({"COPY_HTTP_TIMEOUT"}, page)
+    for field in ("connect", "read", "write", "pool"):
+        value = getattr(COPY_HTTP_TIMEOUT, field)
+        assert value is not None, field
+        assert f"| {value:g} s |" in _table_row(page, field), field
+
+
+def test_copy_client_pool_documented() -> None:
+    """The pool rows name the constants they add and the stock result.
+
+    The stock values are derived from the configuration defaults through
+    :func:`copy_http_limits` itself, so the page's "at the defaults"
+    column cannot drift from what a worker actually opens.
+    """
+    page = _read(_TRANSPORT_PAGE)
+    fields = Configuration.model_fields
+    limits = copy_http_limits(
+        max_jobs=fields["keeper_sync_max_jobs"].default,
+        copy_concurrency=fields["keeper_sync_copy_concurrency"].default,
+    )
+
+    connections = _table_row(page, "max_connections")
+    assert "`COPY_HTTP_CONNECTION_HEADROOM`" in connections
+    assert f"({COPY_HTTP_CONNECTION_HEADROOM})" in connections
+    assert connections.endswith(f"| {limits.max_connections} |")
+
+    keepalive = _table_row(page, "max_keepalive_connections")
+    assert "`COPY_HTTP_KEEPALIVE_PER_COPY_SLOT`" in keepalive
+    assert f"({COPY_HTTP_KEEPALIVE_PER_COPY_SLOT})" in keepalive
+    assert keepalive.endswith(f"| {limits.max_keepalive_connections} |")
+
+
+def test_build_content_copied_event_fields_documented() -> None:
+    """Every field of ``BuildContentCopiedEvent`` is documented.
+
+    Only the fields the event declares itself: ``organization`` and
+    ``project`` come from the shared payload base and are documented
+    once, with the metrics envelope, rather than on every page that
+    mentions an event.
+    """
+    page = _read(_TRANSPORT_PAGE)
+    fields = set(BuildContentCopiedEvent.__annotations__)
+    assert fields, "event declares no fields of its own"
+    assert not _uncoded(fields, page)

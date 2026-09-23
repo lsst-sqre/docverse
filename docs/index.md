@@ -28,6 +28,11 @@ that back each of them up.
   an organization syncs: the include/exclude rule, `fullmatch` pattern
   semantics, what happens when a project falls out of scope, and the
   preview → `PATCH` → backfill workflow a wave migration uses.
+- [Keeper-sync transport resilience](keeper-sync-transport.md) — how a
+  build copy rides out an R2 outage: the per-object upload budget and
+  its ride-out arithmetic, the dedicated copy client, the build-level
+  retry, what happens to an edition that still fails, and how to read
+  the `build_content_copied` metrics event.
 
 The other maintenance-pool jobs do not have operations pages yet;
 until they do, their module docstrings under
