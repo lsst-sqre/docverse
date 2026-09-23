@@ -110,6 +110,7 @@ from docverse_server.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse_server.storage.ltd import (
+    RETRYABLE_SOURCE_TRANSPORT_ERRORS,
     LtdBuild,
     LtdClient,
     LtdEdition,
@@ -162,10 +163,12 @@ DEFAULT_ORPHAN_RECLAIM_MAX_AGE = timedelta(hours=1)
 #: through ``Factory.create_keeper_sync_service``.
 #:
 #: Thirty seconds is sized against the R2 connect outage that failed 38
-#: of 208 ``sqr-`` jobs on 2026-09-22 (about 40 s). A copy only gets
-#: here after one object has already spent its whole per-object budget
-#: (about 65 s at the keeper-sync defaults), so the wait plus the
-#: re-run's own budget covers an outage well past the observed one.
+#: of 208 ``sqr-`` jobs on 2026-09-22 (about 40 s). An R2 failure only
+#: gets here after one object has already spent its whole per-object
+#: budget (about 65 s at the keeper-sync defaults), so the wait plus the
+#: re-run's own budget covers an outage well past the observed one. An
+#: LTD download has no such budget, so for the source side this wait is
+#: most of what a copy rides out.
 DEFAULT_COPY_RETRY_DELAY_SECONDS = 30.0
 
 #: Number of *consecutive* per-edition failures that ``sync_project``
@@ -2252,23 +2255,28 @@ class KeeperSyncService:
     ) -> CopyResult:
         """Copy one build's content, re-running once after a transport error.
 
-        The build-level backstop behind the object store's per-object
-        retry (PRD #685). An R2 connect outage that outlasts one
-        object's whole upload budget fails the copy with that object's
-        transport error; this waits ``copy_retry_delay_seconds`` and runs
-        the copy exactly once more into the same ``dest_prefix``. That is
-        safe because a copy is content-hashed and idempotent — objects
-        that already landed are rewritten with the same bytes — and
-        because :meth:`sync_build` calls this between its transactions,
-        so the wait holds no database transaction or advisory lock.
+        The build-level backstop for an outage on either end of the copy
+        (PRD #685). An R2 connect outage that outlasts one object's whole
+        upload budget, or an LTD S3 timeout or dropped connection during
+        a download (which has no per-object budget, only botocore's own
+        retries), fails the copy with that object's transport error; this
+        waits
+        ``copy_retry_delay_seconds`` and runs the copy exactly once more
+        into the same ``dest_prefix``. That is safe because a copy is
+        content-hashed and idempotent — objects that already landed are
+        rewritten with the same bytes — and because :meth:`sync_build`
+        calls this between its transactions, so the wait holds no
+        database transaction or advisory lock.
 
-        Only a failure :func:`_retryable_transport_error` recognizes is
-        re-run. Anything else — an LTD ``AccessDenied``, a botocore
-        ``ClientError``, an ``httpx.HTTPStatusError`` from an upload
-        that kept getting a bad status — and a second failure of any
-        kind propagate unchanged, so :meth:`sync_edition`'s per-edition
-        failure accounting and the orphan-placeholder reclaim see
-        exactly what they did before.
+        Only a failure :func:`_retryable_transport_error` recognizes — an
+        httpx transport error from the R2 upload or a botocore transport
+        error from the LTD download — is re-run. Anything else — an LTD
+        ``AccessDenied``, a botocore ``ClientError`` (even a ``SlowDown``
+        throttle), an ``httpx.HTTPStatusError`` from an upload that kept
+        getting a bad status — and a second failure of any kind propagate
+        unchanged, so :meth:`sync_edition`'s per-edition failure
+        accounting and the orphan-placeholder reclaim see exactly what
+        they did before.
 
         Each pass's :class:`CopyTally` is appended to ``passes`` before
         the pass starts, so the caller can report on every pass that ran
@@ -2592,12 +2600,23 @@ async def _sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
+#: Transport failures on either end of a build copy: the httpx errors of
+#: the R2 presigned upload and the botocore errors of the LTD download.
+_RETRYABLE_COPY_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    *RETRYABLE_TRANSPORT_ERRORS,
+    *RETRYABLE_SOURCE_TRANSPORT_ERRORS,
+)
+
+
 def _retryable_transport_error(exc: BaseException) -> BaseException | None:
     """Return the transport error behind a failed build copy, if any.
 
     Checks ``exc`` and then each explicit ``__cause__`` beneath it, and
-    returns the first one in
-    :data:`~docverse_server.storage._http_retry.RETRYABLE_TRANSPORT_ERRORS`.
+    returns the first one that is a transport failure on either end of
+    the copy: an R2 upload's
+    :data:`~docverse_server.storage._http_retry.RETRYABLE_TRANSPORT_ERRORS`
+    or an LTD download's
+    :data:`~docverse_server.storage.ltd.RETRYABLE_SOURCE_TRANSPORT_ERRORS`.
     The copier re-raises the first failing object's own exception with
     its chain intact, so the transport error is normally ``exc`` itself;
     walking the causes also recognizes one a caller wrapped with
@@ -2608,7 +2627,7 @@ def _retryable_transport_error(exc: BaseException) -> BaseException | None:
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
-        if isinstance(current, RETRYABLE_TRANSPORT_ERRORS):
+        if isinstance(current, _RETRYABLE_COPY_TRANSPORT_ERRORS):
             return current
         seen.add(id(current))
         current = current.__cause__

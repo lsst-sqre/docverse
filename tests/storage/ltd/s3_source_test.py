@@ -6,7 +6,9 @@ with an in-memory fake source. These tests just assert that the real
 calls so a copier wired with one cannot silently hang, and translates
 botocore's denial errors into the Docverse-side
 ``LtdSourceAccessDeniedError`` the keeper-sync edition-prefix fallback
-matches on.
+matches on, while leaving the botocore transport errors in
+``RETRYABLE_SOURCE_TRANSPORT_ERRORS`` (the ones the keeper-sync
+build-level retry re-runs a copy on) as they are.
 """
 
 from __future__ import annotations
@@ -15,13 +17,26 @@ from typing import Any
 
 import pytest
 import structlog
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    HTTPClientError,
+    ProxyConnectionError,
+    ReadTimeoutError,
+    ResponseStreamingError,
+    SSLError,
+)
 
 from docverse_server.storage.ltd import (
+    RETRYABLE_SOURCE_TRANSPORT_ERRORS,
     LtdS3Source,
     LtdSourceAccessDeniedError,
     LtdSourceProtocol,
 )
+
+_ENDPOINT = "https://lsst-the-docs.s3.amazonaws.com/"
 
 
 def _client_error(code: str, *, operation: str = "GetObject") -> ClientError:
@@ -85,6 +100,76 @@ async def test_download_leaves_other_client_errors_alone(
         await source.download_object(key="documenteer/builds/33/missing.html")
 
     assert not isinstance(excinfo.value, LtdSourceAccessDeniedError)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        EndpointConnectionError(endpoint_url=_ENDPOINT),
+        ConnectTimeoutError(endpoint_url=_ENDPOINT),
+        ProxyConnectionError(proxy_url="http://proxy.example:3128/"),
+        SSLError(endpoint_url=_ENDPOINT, error="handshake failed"),
+        ReadTimeoutError(endpoint_url=_ENDPOINT),
+        ConnectionClosedError(endpoint_url=_ENDPOINT),
+        ResponseStreamingError(error="connection reset by peer"),
+        HTTPClientError(error="aiohttp client error"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_retryable_source_transport_errors_cover_transport_failures(
+    error: Exception,
+) -> None:
+    """Every way aiobotocore reports S3 being unreachable is retryable.
+
+    A connect failure or timeout, a read timeout, a connection dropped
+    before or during the response body, and aiobotocore's generic
+    wrapper for any other aiohttp client error: each says "try again
+    later", which is what the keeper-sync build-level retry acts on.
+    """
+    assert isinstance(error, RETRYABLE_SOURCE_TRANSPORT_ERRORS)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _client_error("AccessDenied"),
+        _client_error("NoSuchKey"),
+        _client_error("SlowDown"),
+        LtdSourceAccessDeniedError(bucket="lsst-the-docs", key="a/b.html"),
+    ],
+    ids=["AccessDenied", "NoSuchKey", "SlowDown", "denied"],
+)
+def test_retryable_source_transport_errors_exclude_s3_answers(
+    error: Exception,
+) -> None:
+    """An S3 error *response* is not a transport failure.
+
+    ``AccessDenied`` and ``NoSuchKey`` are permanent, and a throttling
+    status such as ``SlowDown`` is the source-side analogue of an R2
+    ``429``/``5xx``, which the build-level retry deliberately leaves
+    alone.
+    """
+    assert not isinstance(error, RETRYABLE_SOURCE_TRANSPORT_ERRORS)
+
+
+@pytest.mark.asyncio
+async def test_download_leaves_transport_errors_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport failure escapes ``download_object`` as itself.
+
+    Only ``ClientError`` denials are translated, so the keeper-sync
+    build-level retry sees the botocore transport error it matches on.
+    """
+    source = LtdS3Source(logger=structlog.get_logger("test"))
+    error = ReadTimeoutError(endpoint_url=_ENDPOINT)
+    client = _RaisingClient(error)
+    monkeypatch.setattr(source, "_get_client", lambda: client)
+
+    with pytest.raises(ReadTimeoutError) as excinfo:
+        await source.download_object(key="documenteer/builds/33/index.html")
+
+    assert excinfo.value is error
 
 
 @pytest.mark.asyncio

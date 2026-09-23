@@ -31,6 +31,12 @@ import pytest_asyncio
 import respx
 import sentry_sdk
 import structlog
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from safir.dependencies.db_session import db_session_dependency
 from safir.github import GitHubAppClientFactory
 from sqlalchemy import select, update
@@ -80,6 +86,7 @@ from docverse_server.services.keeper_sync.service import (
     KeeperSyncContext,
     KeeperSyncService,
     _now,
+    _retryable_transport_error,
 )
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -3140,6 +3147,217 @@ async def test_sync_build_reruns_copy_when_transport_error_is_the_cause(
     retries = _copy_retry_logs(logs)
     assert len(retries) == 1
     assert retries[0]["error_type"] == "ConnectTimeout"
+
+
+_LTD_ENDPOINT = "https://lsst-the-docs.s3.amazonaws.com/"
+
+
+class _FlakyDownloadLtdSource(_FakeLtdSource):
+    """In-memory LTD source whose chosen downloads fail.
+
+    ``outcomes`` maps a key to what its successive ``download_object``
+    calls do, in order: an exception is raised, ``None`` returns the
+    bytes. Once a key's queue is empty its downloads succeed. keeper-sync
+    downloads every object once to hash the build's manifest before it
+    copies, so a key's first entry is the hash, its second the copy's
+    first pass, and its third the build-level re-run. Every call is
+    appended to ``downloads``.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, bytes],
+        *,
+        outcomes: dict[str, list[BaseException | None]],
+    ) -> None:
+        super().__init__(objects)
+        self._outcomes = outcomes
+        self.downloads: list[str] = []
+
+    async def download_object(self, *, key: str) -> bytes:
+        self.downloads.append(key)
+        queued = self._outcomes.get(key)
+        if queued:
+            outcome = queued.pop(0)
+            if outcome is not None:
+                raise outcome
+        return await super().download_object(key=key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ReadTimeoutError(endpoint_url=_LTD_ENDPOINT),
+        EndpointConnectionError(endpoint_url=_LTD_ENDPOINT),
+        ConnectionClosedError(endpoint_url=_LTD_ENDPOINT),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+async def test_sync_build_reruns_copy_after_ltd_download_transport_failure(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    """A copy that loses the LTD bucket mid-download is re-run, and lands.
+
+    Every copy reads LTD through aiobotocore as well as writing R2
+    through httpx, and a re-run is as safe on one end as the other. So a
+    botocore transport error from the LTD download earns the same one
+    re-run, after the same wait, as an R2 connect timeout does.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-ltd")
+
+    _seed_ltd(mock_discovery)
+    key = "pipelines/builds/42/index.html"
+    source = _FlakyDownloadLtdSource(
+        {key: b"<html>v1</html>"}, outcomes={key: [None, error]}
+    )
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {},
+        source=source,
+        wrap_copy=_flaky_copy({}, calls),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    outcome = result.edition_outcomes[0].build_outcome
+    assert outcome is not None
+    assert outcome.short_circuited is False
+    assert outcome.object_count == 1
+    # Hash, failed first pass, re-run.
+    assert source.downloads == [key, key, key]
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert sleeps == [(7.0, False)]
+    retries = _copy_retry_logs(logs)
+    assert len(retries) == 1
+    assert retries[0]["log_level"] == "warning"
+    assert retries[0]["error_type"] == type(error).__name__
+    assert retries[0]["error"] == repr(error)
+    assert retries[0]["retry_delay"] == 7.0
+
+
+def _slow_down() -> ClientError:
+    """Build the error botocore raises for an S3 ``503 SlowDown``."""
+    return ClientError(
+        {
+            "Error": {"Code": "SlowDown", "Message": "Please reduce"},
+            "ResponseMetadata": {"HTTPStatusCode": 503},
+        },
+        "GetObject",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_build_does_not_rerun_copy_after_ltd_client_error(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3 throttling the LTD download fails the edition on the first try.
+
+    A botocore ``ClientError`` is S3 answering, not S3 unreachable. Like
+    an R2 upload that kept getting ``429``/``5xx``, it is left to the
+    next sync rather than re-run, even though ``SlowDown`` is transient.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-retry-slowdown")
+
+    _seed_three_editions(mock_discovery)
+    key = "pipelines/builds/43/index.html"
+    throttled = _slow_down()
+    source = _FlakyDownloadLtdSource(
+        dict(_THREE_EDITION_SOURCE_OBJECTS), outcomes={key: [None, throttled]}
+    )
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {},
+        source=source,
+        wrap_copy=_flaky_copy({}, calls),
+        copy_retry_delay_seconds=7.0,
+    )
+    sleeps = _record_copy_retry_sleeps(monkeypatch, db_session)
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    middle_calls = [c for c in calls if c[0].startswith("pipelines/builds/43")]
+    assert len(middle_calls) == 1
+    assert source.downloads.count(key) == 2
+    assert sleeps == []
+    assert _copy_retry_logs(logs) == []
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-other",
+    ]
+    assert len(result.edition_failures) == 1
+    assert result.edition_failures[0].error_type == "ClientError"
+    assert captured == [throttled]
+
+
+def test_retryable_transport_error_recognizes_a_botocore_transport_error() -> (
+    None
+):
+    """An LTD download that timed out is as retryable as an R2 upload.
+
+    Every copy reads the LTD bucket through aiobotocore as well as
+    writing R2 through httpx, so a botocore transport error is the
+    source-side leaf the build-level retry has to recognize.
+    """
+    error = ReadTimeoutError(endpoint_url=_LTD_ENDPOINT)
+
+    assert _retryable_transport_error(error) is error
+
+
+def test_retryable_transport_error_follows_a_botocore_cause() -> None:
+    """A wrapper raised ``from`` a botocore transport error is retryable."""
+    cause = EndpointConnectionError(endpoint_url=_LTD_ENDPOINT)
+    wrapper = RuntimeError("download failed")
+    wrapper.__cause__ = cause
+
+    assert _retryable_transport_error(wrapper) is cause
+
+
+def test_retryable_transport_error_ignores_a_botocore_context() -> None:
+    """A botocore error reached only through ``__context__`` is not retried.
+
+    An exception raised while *handling* a dropped LTD connection says
+    nothing about whether a re-run can succeed, so the implicit context
+    link is not followed for botocore errors any more than for httpx.
+    """
+    handled = ConnectionClosedError(endpoint_url=_LTD_ENDPOINT)
+    raised = RuntimeError("bug in the error handler")
+    raised.__context__ = handled
+
+    assert raised.__cause__ is None
+    assert _retryable_transport_error(raised) is None
+
+
+def test_retryable_transport_error_ignores_a_botocore_client_error() -> None:
+    """S3 answering with an error, even a throttle, is not transport."""
+    assert _retryable_transport_error(_slow_down()) is None
 
 
 def _record_copy_reports() -> tuple[

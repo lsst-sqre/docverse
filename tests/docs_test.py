@@ -17,6 +17,7 @@ kind actually has.
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import get_args, get_type_hints
@@ -49,8 +50,10 @@ from docverse_server.services.edition_reconcile import (
 )
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
+    RETRYABLE_TRANSPORT_ERRORS,
     backoff_for_attempt,
 )
+from docverse_server.storage.ltd import RETRYABLE_SOURCE_TRANSPORT_ERRORS
 from docverse_server.storage.pagination import ProjectSortOrder
 from docverse_server.worker.functions.edition_reconcile import (
     RECONCILED_DRIFT_MESSAGE,
@@ -111,6 +114,30 @@ def _uncoded(names: Iterable[str], page: str) -> list[str]:
     house style and the only way these assertions have teeth.
     """
     return sorted(name for name in names if f"`{name}`" not in page)
+
+
+def _section(page: str, heading: str) -> str:
+    """Return the body of the page's ``## heading`` section.
+
+    Runs to the next second-level heading, so its own ``###``
+    subsections are part of it.
+    """
+    parts = page.split(f"\n## {heading}\n", 1)
+    assert len(parts) == 2, f"the page has no {heading!r} section"
+    return parts[1].split("\n## ", 1)[0]
+
+
+def _import_name(cls: type) -> str:
+    """Return the dotted name an exception class is imported by.
+
+    ``httpx.TimeoutException`` rather than the private module that
+    defines it, but ``botocore.exceptions.ConnectionError``, since
+    botocore does not re-export its exceptions at the top level.
+    """
+    package = cls.__module__.split(".", 1)[0]
+    if getattr(importlib.import_module(package), cls.__name__, None) is cls:
+        return f"{package}.{cls.__name__}"
+    return f"{cls.__module__}.{cls.__name__}"
 
 
 def _route_path(name: str) -> str:
@@ -531,3 +558,16 @@ def test_build_content_copied_event_fields_documented() -> None:
     fields = set(BuildContentCopiedEvent.__annotations__)
     assert fields, "event declares no fields of its own"
     assert not _uncoded(fields, page)
+
+
+def test_build_retry_transport_errors_documented() -> None:
+    """The build-level retry section names every error class it re-runs.
+
+    Read off both retryable tuples, the R2 upload's httpx classes and
+    the LTD download's botocore classes, so widening either one fails
+    here until the section that tells an operator what gets re-run says
+    so.
+    """
+    section = _section(_read(_TRANSPORT_PAGE), "The build-level retry")
+    classes = (*RETRYABLE_TRANSPORT_ERRORS, *RETRYABLE_SOURCE_TRANSPORT_ERRORS)
+    assert not _uncoded({_import_name(cls) for cls in classes}, section)

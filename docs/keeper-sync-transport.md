@@ -1,11 +1,13 @@
 # Keeper-sync transport resilience
 
-A keeper-sync build copy reads every object of one LTD build and PUTs
-it into the organization's R2 bucket through a presigned URL: thousands
-of PUTs for a large project, and up to 80 in flight at once on one sync
-worker at the stock settings. This page covers how a copy survives R2
-being briefly unreachable, what each layer of retry costs, and how to
-read the `build_content_copied` metrics event that reports every copy.
+A keeper-sync build copy reads every object of one LTD build from the
+`lsst-the-docs` S3 bucket and PUTs it into the organization's R2 bucket
+through a presigned URL: thousands of downloads and PUTs for a large
+project, and up to 80 in flight at once on one sync worker at the stock
+settings. This page covers how a copy survives either end, R2 or the
+LTD bucket, being briefly unreachable, what each layer of retry costs,
+and how to read the `build_content_copied` metrics event that reports
+every copy.
 
 It is for operators running a sync campaign, the waves
 [Scoping the keeper sync](keeper-sync-scope.md) describes, and for
@@ -29,12 +31,22 @@ The layers, innermost first:
 | --- | --- | --- | --- |
 | Per-object upload retry | `S3ObjectStore`'s presigned PUT, through the shared `retry_request` loop | A connect stall, a dropped connection, or a `429`/`5xx`, for about 65 s per object | `keeper_sync_upload_max_attempts`, `keeper_sync_upload_max_backoff_seconds` |
 | Dedicated copy client | `worker/main.py` | Pool waits that used to surface as upload timeouts; gives each attempt a 10 s connect window | Constants, sized from `keeper_sync_max_jobs` and `keeper_sync_copy_concurrency` |
-| Build-level retry | `KeeperSyncService.sync_build` | A transport outage that outlasts one object's whole budget: one re-run of the copy | `keeper_sync_copy_retry_delay_seconds` |
+| Build-level retry | `KeeperSyncService.sync_build` | A transport outage on either end of the copy: an R2 outage that outlasts one object's whole budget, or the LTD bucket timing out or dropping a connection during a download. One re-run of the copy | `keeper_sync_copy_retry_delay_seconds` |
 | Later syncs | The tier crons, `POST .../refresh`, a backfill run | Anything longer (see [When both retries fail](#when-both-retries-fail)) | None |
 
 Only the keeper-sync worker's copy path uses the first three. The API
 process, and every other object store a worker opens, keep the shared
 retry defaults and the shared HTTP client.
+
+The first two layers are on the R2 side only. The per-object budget
+applies to uploads, and LTD downloads go through aiobotocore rather
+than either HTTP client. An LTD download has no per-object budget of
+Docverse's: beneath the build-level retry there is only botocore's own
+retry of the request, in its default `legacy` mode (up to five
+attempts, with a randomized backoff of a few seconds), and a
+connection that drops while the body is streaming is not retried at
+that level at all. The build-level retry is the one layer that covers
+both ends.
 
 ## Configuration
 
@@ -182,10 +194,27 @@ uses it.
 
 When a copy fails, `KeeperSyncService.sync_build` looks at the
 exception the copier raised. That is the first failing object's own
-exception, with its cause chain intact. If it, or anything on its
-explicit `__cause__` chain, is a retryable transport error
-(`httpx.TimeoutException`, `httpx.NetworkError`,
-`httpx.RemoteProtocolError`), the service:
+exception, with its cause chain intact. An exception that was only
+being handled when another one was raised (its implicit `__context__`)
+does not count. If the exception, or anything on its explicit
+`__cause__` chain, is a retryable transport error from either end of
+the copy, the service re-runs it:
+
+- **R2 upload:** `httpx.TimeoutException`, `httpx.NetworkError` or
+  `httpx.RemoteProtocolError`, once the object has spent its whole
+  per-object budget.
+- **LTD download:** `botocore.exceptions.ConnectionError` (the parent
+  of `EndpointConnectionError`, `ConnectTimeoutError`,
+  `ProxyConnectionError` and `SSLError`) or
+  `botocore.exceptions.HTTPClientError` (the parent of
+  `ReadTimeoutError`, `ConnectionClosedError`, `ResponseStreamingError`
+  and aiobotocore's wrapper for any other aiohttp client error). These
+  come from listing the build prefix or downloading an object, after
+  botocore's own retries, if any, have given up. The service reads
+  them from `RETRYABLE_SOURCE_TRANSPORT_ERRORS` next to the LTD source,
+  so it does not import botocore itself.
+
+For either kind, the service:
 
 1. logs `Retrying build copy after transport error` at warning,
 2. waits `keeper_sync_copy_retry_delay_seconds`,
@@ -203,10 +232,15 @@ before the retry existed:
 - a second failure, of any kind;
 - `LtdSourceAccessDeniedError`, an LTD build prefix that anonymous
   reads are denied on;
-- a botocore `ClientError` from the LTD side of the copy;
+- a botocore `ClientError` from the LTD side of the copy, **including**
+  a throttling `SlowDown` or other `503`, and a `NoSuchKey`;
 - an `httpx.HTTPStatusError`, **including** an upload that spent its
-  whole budget on `429`/`5xx`. The build-level retry is for R2 being
-  unreachable, not for R2 answering with errors.
+  whole budget on `429`/`5xx`.
+
+The build-level retry is for either end being unreachable, not for it
+answering with errors. A `ClientError` is S3 answering, so a throttled
+LTD download is the source-side twin of a throttled R2 upload and is
+left to the next sync in the same way.
 
 Because those propagate unchanged, `sync_project`'s per-edition failure
 accounting (the job's `edition_failures`, the consecutive-failure
@@ -215,8 +249,9 @@ what they saw before.
 
 ### Ride-out with the build-level retry
 
-The first pass gives up when its first object's last attempt times
-out. The re-run then gives every object a fresh per-object budget:
+For an R2 connect outage, the first pass gives up when its first
+object's last attempt times out. The re-run then gives every object a
+fresh per-object budget:
 
 ```
 first pass gives up          75.5 s
@@ -225,10 +260,17 @@ re-run's ride-out          + 65.5 s
                            = 171 s
 ```
 
-A copy therefore survives a connect outage of just under three
+A copy therefore survives an R2 connect outage of just under three
 minutes, counted from its first failed connect. Treat that as a floor:
 the re-run lists and downloads before its first PUT, which only
 lengthens it.
+
+An LTD outage is ridden out for much less, because a download has no
+per-object budget. The first pass fails as soon as botocore's own
+retries give up, and the re-run lands only if LTD is answering again
+when it lists and downloads, `keeper_sync_copy_retry_delay_seconds`
+(30 s) later plus botocore's retries on the re-run. Raising that delay
+is the one knob that lengthens it.
 
 The cost of that resilience is time. A copy that fails both passes
 takes about three minutes, so a sustained R2 outage costs that much
@@ -245,12 +287,15 @@ The edition fails, as it always has. `sync_project` logs
 exception to Sentry, records the edition in the job's
 `progress.edition_failures`, and carries on with the next edition, so
 the job ends `completed_with_errors` (or `failed`, if the
-consecutive-failure breaker trips). For a connect timeout, the entry's
-`error_type` is `ConnectTimeout` and its `error_message` is often
-empty; the `Presigned upload failed` line described below has the
-detail. The failed copy leaves its placeholder build `pending`, and a
-later sync of the same git ref fails placeholders that are more than an
-hour old.
+consecutive-failure breaker trips). For an R2 connect timeout, the
+entry's `error_type` is `ConnectTimeout` and its `error_message` is
+often empty; the `Presigned upload failed` line described below has
+the detail. For an LTD download failure, `error_type` is the botocore
+class, such as `ReadTimeoutError` or `EndpointConnectionError`, and
+`error_message` names the endpoint; no `Presigned upload failed` line
+precedes it. The failed copy leaves its placeholder build `pending`,
+and a later sync of the same git ref fails placeholders that are more
+than an hour old.
 
 The failed copy records no build sync state, so the next sync of the
 edition cannot short-circuit on it and copies it again. What starts
@@ -272,7 +317,8 @@ without waiting, `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`
 enqueues a sync of it now, and a new backfill run,
 `POST /orgs/{org}/keeper-sync/runs`, re-drives a whole wave. For a
 `main`-only project, one of these is the only recovery path short of
-an LTD rebuild. Check a campaign's failed editions after any R2 outage.
+an LTD rebuild. Check a campaign's failed editions after any R2 or LTD
+outage.
 
 ## Reading a copy
 
@@ -295,7 +341,7 @@ Docverse event.
 | `peak_concurrent_copies` | Most objects in flight at once, over both passes. At most `keeper_sync_copy_concurrency`. |
 | `retried_object_count` | Objects that landed only after at least one upload retry, summed over both passes. |
 | `exhausted_object_count` | Objects whose upload spent its whole budget, summed over both passes. Only failures a retry could have fixed count: a transport failure or a `429`/`5xx` on every attempt. A `403` or a failed LTD download does not. |
-| `build_retry_used` | Whether the build-level retry re-ran the copy. |
+| `build_retry_used` | Whether the build-level retry re-ran the copy, after a transport error on either end. |
 | `succeeded` | Whether the copy, after any build-level retry, stored every object. |
 
 A build whose content Docverse already holds (the manifest-hash dedupe)
@@ -315,13 +361,19 @@ Two fields carry the campaign-level signal:
   a failed pass usually contributes exactly one. For the breadth of an
   outage, use `retried_object_count` and the retry log lines.
 
+Both counters describe R2 uploads only. An LTD outage moves neither:
+it shows as `build_retry_used` with `exhausted_object_count` at zero,
+and the retry log line's `error_type` names the botocore class.
+
 | `succeeded` | `build_retry_used` | `exhausted_object_count` | What happened | What to do |
 | --- | --- | --- | --- | --- |
 | true | false | 0 | A clean copy. A non-zero `retried_object_count` means the per-object budget absorbed some blips. | Nothing. Watch the trend. |
 | true | true | 1 or more | An R2 connect outage outlasted one object's whole budget, and the build-level retry re-ran the copy successfully. The edition synced. The first pass's `Presigned upload failed` error still reached Sentry. | Nothing for the edition. Many of these in one campaign means outages longer than a minute are routine; consider raising `keeper_sync_upload_max_attempts`. |
-| false | true | 1 or more | Both passes failed: the outage outlasted about three minutes, or the re-run hit a different failure. The edition failed. | See [When both retries fail](#when-both-retries-fail). |
+| true | true | 0 | The first pass lost the LTD bucket mid-download (a botocore transport error, which has no per-object budget to exhaust), and the re-run landed. The edition synced. | Nothing for the edition. The retry log line's `error_type` names the botocore class. Many of these in one campaign means LTD S3 is flaky; consider a longer `keeper_sync_copy_retry_delay_seconds`. |
+| false | true | 1 or more | Both passes failed, and at least one pass was an R2 outage: the outage outlasted about three minutes, or the re-run hit a different failure. The edition failed. | See [When both retries fail](#when-both-retries-fail). |
+| false | true | 0 | Both passes failed without an R2 upload exhausting its budget: most often LTD was still unreachable on the re-run. The edition failed. | Read the edition failure's `error_type`, then see [When both retries fail](#when-both-retries-fail). |
 | false | false | 1 or more | An upload spent its budget on a retryable *status* (`429`/`5xx`) rather than a transport error, which the build-level retry does not re-run. The edition failed. | R2 was answering with errors rather than unreachable. Check R2's status, then refresh the project. |
-| false | false | 0 | A failure no retry could fix: an LTD `AccessDenied`, an LTD download error, or a non-retryable R2 status such as `403`. | Not a transport problem. Read the edition failure's `error_type` on the job. |
+| false | false | 0 | A failure the build-level retry does not re-run: an LTD `AccessDenied`, a botocore `ClientError` such as an LTD `SlowDown`, or a non-retryable R2 status such as `403`. | Not a transport problem. Read the edition failure's `error_type` on the job. |
 
 ### Logs
 
@@ -341,6 +393,12 @@ for the full ride-out. `error` carries the exception's `repr` because
 `str(httpx.ConnectTimeout())` is the empty string. Before PRD #685 that
 field was logged as `error=""`.
 
+On `Retrying build copy after transport error`, `error_type` says
+which end of the copy failed: an httpx class such as `ConnectTimeout`
+or `ReadError` is the R2 upload, and a botocore class such as
+`ReadTimeoutError`, `EndpointConnectionError` or
+`ConnectionClosedError` is the LTD listing or download.
+
 `Copied build content` is logged once per **pass**. After a re-run it
 carries the second pass's counts only. The event above is the one that
 sums both passes.
@@ -359,6 +417,11 @@ same thing in one field. An edition that did fail also sends its
 exception from `sync_project`, alongside the `Edition sync failed`
 line.
 
+An LTD download failure sends nothing to Sentry on its own. A re-run
+that landed leaves only the warning log line; an edition that failed
+both passes sends the second pass's botocore exception from
+`sync_project`.
+
 ## What the layers deliberately do not do
 
 - **Cap in-flight copies across the process.** The ceiling stays
@@ -366,6 +429,12 @@ line.
   client's pool is sized to it rather than enforcing a lower one.
 - **Retry the LTD API differently.** The LTD client already rides out
   up to a 300 s backoff ceiling.
+- **Retry an LTD download per object.** A download has only botocore's
+  own retries beneath the build-level retry; there is no Docverse
+  budget for it like the one R2 uploads get.
+- **Re-run a copy on a status error from either end,** such as an R2
+  `429`/`5xx` or an LTD `SlowDown`. The build-level retry re-runs
+  transport failures only.
 - **Make the copy client's timeouts configurable,** or re-run a build
   copy more than once.
 - **Change the API process's object store,** or the shared client any
@@ -381,12 +450,16 @@ line.
   retryable statuses and transport errors, and the backoff.
 - `src/docverse_server/storage/objectstore/_s3.py`: the presigned PUT
   and its `Presigned upload failed` lines.
+- `src/docverse_server/storage/ltd/s3_source.py`: the LTD download and
+  `RETRYABLE_SOURCE_TRANSPORT_ERRORS`, the botocore transport errors
+  the build-level retry re-runs.
 - `src/docverse_server/worker/main.py`: `COPY_HTTP_TIMEOUT`,
   `copy_http_limits` and the copy client's lifetime.
 - `src/docverse_server/services/keeper_sync/service.py`: the
   build-level retry and the report behind the metrics event.
 - `src/docverse_server/metrics/payloads.py`: `BuildContentCopiedEvent`.
 - `tests/docs_test.py`: fails when this page stops naming a knob, a
-  default, a copy-client constant or an event field the code has, or
-  when its ride-out arithmetic no longer matches the defaults.
+  default, a copy-client constant, an event field, or an error class
+  the build-level retry re-runs that the code has, or when its ride-out
+  arithmetic no longer matches the defaults.
 - SQR-112, and PRD #685.
