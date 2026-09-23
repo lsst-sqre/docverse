@@ -217,7 +217,7 @@ async def test_copier_uses_factory_copy_concurrency(
     )
 
     async def _fake_objectstore(
-        *, org_id: int, service_label: str, **budget: float
+        *, org_id: int, service_label: str, **options: object
     ) -> MockObjectStore:
         return MockObjectStore()
 
@@ -247,7 +247,7 @@ async def test_copier_concurrency_defaults_to_copier_fallback(
     )
 
     async def _fake_objectstore(
-        *, org_id: int, service_label: str, **budget: float
+        *, org_id: int, service_label: str, **options: object
     ) -> MockObjectStore:
         return MockObjectStore()
 
@@ -358,3 +358,156 @@ async def test_objectstore_for_org_keeps_the_shared_upload_budget(
 
     assert len(attempts) == DEFAULT_MAX_ATTEMPTS
     assert delays == [MAX_BACKOFF_SECONDS] * (DEFAULT_MAX_ATTEMPTS - 1)
+
+
+def _recording_transport(puts: list[str]) -> httpx.MockTransport:
+    """Accept every request, recording each PUT's URL path."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            puts.append(request.url.path)
+        return httpx.Response(200)
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_copier_destination_puts_over_the_copy_client(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build-content copies PUT over the worker's dedicated copy client.
+
+    A copy burst used to share the worker's one client with discovery,
+    LTD API, GitHub and Cloudflare calls, and ran that client's pool
+    near its ceiling (PRD #685). With a copy client given, the copier's
+    presigned PUTs go over it and none reach the shared client.
+    """
+    shared_puts: list[str] = []
+    copy_puts: list[str] = []
+    async with (
+        httpx.AsyncClient(
+            transport=_recording_transport(shared_puts)
+        ) as http_client,
+        httpx.AsyncClient(
+            transport=_recording_transport(copy_puts)
+        ) as copy_http_client,
+    ):
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            credential_encryptor=CredentialEncryptor(
+                current_key=Fernet.generate_key().decode()
+            ),
+            http_client=http_client,
+            copy_http_client=copy_http_client,
+            default_queue_name="docverse:queue",
+        )
+        org_id = await _seed_minio_service(db_session, factory)
+        monkeypatch.setattr(
+            factory,
+            "create_ltd_s3_source",
+            lambda **kwargs: _StubLtdSource(
+                {"proj/builds/1/index.html": b"<html></html>"}
+            ),
+        )
+
+        async with factory.create_build_content_copier_for_org(
+            org_id=org_id, service_label="minio"
+        ) as copier:
+            await copier.copy_build(
+                source_prefix="proj/builds/1/",
+                dest_prefix="proj/__builds/1/",
+            )
+
+    assert copy_puts == ["/docs/proj/__builds/1/index.html"]
+    assert shared_puts == []
+
+
+@pytest.mark.asyncio
+async def test_copier_destination_falls_back_to_the_shared_client(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a copy client, the copier PUTs over the shared client.
+
+    Only the arq worker builds a dedicated copy client; every directly
+    constructed factory (tests, scripts) keeps uploading as before.
+    """
+    shared_puts: list[str] = []
+    async with httpx.AsyncClient(
+        transport=_recording_transport(shared_puts)
+    ) as http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            credential_encryptor=CredentialEncryptor(
+                current_key=Fernet.generate_key().decode()
+            ),
+            http_client=http_client,
+            default_queue_name="docverse:queue",
+        )
+        org_id = await _seed_minio_service(db_session, factory)
+        monkeypatch.setattr(
+            factory,
+            "create_ltd_s3_source",
+            lambda **kwargs: _StubLtdSource(
+                {"proj/builds/1/index.html": b"<html></html>"}
+            ),
+        )
+
+        async with factory.create_build_content_copier_for_org(
+            org_id=org_id, service_label="minio"
+        ) as copier:
+            await copier.copy_build(
+                source_prefix="proj/builds/1/",
+                dest_prefix="proj/__builds/1/",
+            )
+
+    assert shared_puts == ["/docs/proj/__builds/1/index.html"]
+
+
+@pytest.mark.asyncio
+async def test_objectstore_for_org_keeps_the_shared_client(
+    db_session: AsyncSession,
+) -> None:
+    """Every other store the factory builds uploads over the shared client.
+
+    Dashboard renders and build processing call
+    ``create_objectstore_for_org`` directly; the copy client is sized for
+    keeper-sync copies alone, so it must not leak into them.
+    """
+    shared_puts: list[str] = []
+    copy_puts: list[str] = []
+    async with (
+        httpx.AsyncClient(
+            transport=_recording_transport(shared_puts)
+        ) as http_client,
+        httpx.AsyncClient(
+            transport=_recording_transport(copy_puts)
+        ) as copy_http_client,
+    ):
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            credential_encryptor=CredentialEncryptor(
+                current_key=Fernet.generate_key().decode()
+            ),
+            http_client=http_client,
+            copy_http_client=copy_http_client,
+            default_queue_name="docverse:queue",
+        )
+        org_id = await _seed_minio_service(db_session, factory)
+        async with db_session.begin():
+            store = await factory.create_objectstore_for_org(
+                org_id=org_id, service_label="minio"
+            )
+        async with store:
+            await store.upload_object(
+                key="proj/__dashboard.html",
+                data=b"<html></html>",
+                content_type="text/html",
+            )
+
+    assert shared_puts == ["/docs/proj/__dashboard.html"]
+    assert copy_puts == []

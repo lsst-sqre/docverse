@@ -356,7 +356,10 @@ class Configuration(BaseSettings):
             " under a build prefix — 80 buffered object bodies at the"
             " stock 10 x 8. That product is what the sync worker's"
             " memory limit is sized against; raising either knob"
-            " requires raising the limit with it."
+            " requires raising the limit with it. **Connections:** the"
+            " same product, plus 10, sizes the connection pool of the"
+            " worker's dedicated build-copy HTTP client, so every"
+            " in-flight presigned upload has a connection of its own."
         ),
     )
 
@@ -377,6 +380,10 @@ class Configuration(BaseSettings):
             " At the stock 10 x 8 that is 80 buffered bodies, which is"
             " what the sync worker's memory limit is sized against;"
             " raising either knob requires raising that limit with it."
+            " **Connections:** the worker's dedicated build-copy HTTP"
+            " client allows ``keeper_sync_max_jobs`` x this value + 10"
+            " connections and keeps twice this value alive between"
+            " builds."
         ),
     )
 

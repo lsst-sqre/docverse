@@ -39,16 +39,12 @@ from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
     backoff_for_attempt,
 )
+from docverse_server.worker.main import COPY_HTTP_TIMEOUT
 
 #: Cadence gap of the ``keeper_sync_reaper`` cron
 #: (``cron(minute={0, 30})``), the worst-case extra detection latency
 #: on top of the threshold.
 _REAPER_CRON_GAP_SECONDS = 1800
-
-#: Connect timeout of the client that carries keeper-sync presigned
-#: PUTs (PRD #685's dedicated copy client). An attempt that hits an R2
-#: connect outage burns this long before it fails.
-_COPY_CONNECT_TIMEOUT_SECONDS = 10.0
 
 #: Length of the R2 connect outage that failed 38 of 208 ``sqr-``
 #: keeper-sync jobs on roundtable-prod (19:51:13-19:51:53 UTC,
@@ -207,6 +203,10 @@ def test_keeper_sync_upload_budget_rides_out_the_observed_outage() -> None:
     defaults, about 65 s in all).
     """
     config = Configuration()
+    # An attempt that hits an R2 connect outage burns the dedicated copy
+    # client's connect timeout before it fails.
+    connect_timeout = COPY_HTTP_TIMEOUT.connect
+    assert connect_timeout is not None
     failed_attempts = config.keeper_sync_upload_max_attempts - 1
     backoff = sum(
         backoff_for_attempt(
@@ -216,8 +216,9 @@ def test_keeper_sync_upload_budget_rides_out_the_observed_outage() -> None:
         )
         for attempt in range(1, failed_attempts + 1)
     )
-    ride_out = backoff + failed_attempts * _COPY_CONNECT_TIMEOUT_SECONDS
+    ride_out = backoff + failed_attempts * connect_timeout
     assert backoff == 15.5
+    assert ride_out == 65.5
     assert ride_out > _OBSERVED_R2_OUTAGE_SECONDS
 
 

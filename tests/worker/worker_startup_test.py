@@ -38,6 +38,7 @@ def _logger() -> structlog.stdlib.BoundLogger:
 def _make_builder(
     *,
     http_client: httpx.AsyncClient,
+    copy_http_client: httpx.AsyncClient | None = None,
     github_app_id: int | None = None,
     github_app_private_key: SecretStr | None = None,
     github_webhook_secret: SecretStr | None = None,
@@ -50,6 +51,7 @@ def _make_builder(
             current_key=Fernet.generate_key().decode()
         ),
         http_client=http_client,
+        copy_http_client=copy_http_client,
         arq_queue=MockArqQueue(default_queue_name=_config.arq_queue_name),
         discovery=DiscoveryClient(http_client),
         github_app_id=github_app_id,
@@ -114,6 +116,39 @@ async def test_builder_threads_upload_budget_to_per_job_factory(
         factory = builder(session=db_session, logger=_logger())
         assert factory.keeper_sync_upload_max_attempts == 9
         assert factory.keeper_sync_upload_max_backoff_seconds == 42.0
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_copy_client_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """Every per-job factory copies build content over the copy client.
+
+    ``_startup`` builds the copy client once per process, sized for the
+    keeper-sync pool's full copy concurrency (PRD #685); a per-job
+    factory that fell back to the shared client would put every copy
+    burst back on the pool the discovery, LTD API and GitHub calls use.
+    """
+    async with (
+        httpx.AsyncClient() as http_client,
+        httpx.AsyncClient() as copy_http_client,
+    ):
+        builder = _make_builder(
+            http_client=http_client, copy_http_client=copy_http_client
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.copy_http_client is copy_http_client
+
+
+@pytest.mark.asyncio
+async def test_builder_without_copy_client_copies_over_shared_client(
+    db_session: AsyncSession,
+) -> None:
+    """A builder given no copy client leaves copies on the shared one."""
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client)
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.copy_http_client is http_client
 
 
 @pytest.mark.asyncio

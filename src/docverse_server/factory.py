@@ -128,6 +128,7 @@ class Factory:
         credential_encryptor: CredentialEncryptor | None = None,
         superadmin_usernames: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        copy_http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue | None = None,
         discovery: DiscoveryClient | None = None,
         github_app_id: int | None = None,
@@ -158,6 +159,16 @@ class Factory:
         self._credential_encryptor = credential_encryptor
         self._superadmin_usernames = superadmin_usernames or []
         self._http_client = http_client
+        # The client a keeper-sync copier's destination store PUTs
+        # presigned uploads over, and no other store or client this
+        # factory builds. Falls back to the shared client so directly
+        # constructed factories (tests, scripts) behave exactly as
+        # before; the arq worker threads its dedicated copy client
+        # (``worker.main.create_copy_http_client``) through
+        # ``WorkerFactoryBuilder``.
+        self._copy_http_client = (
+            copy_http_client if copy_http_client is not None else http_client
+        )
         self._arq_queue = arq_queue
         self._discovery = discovery
         self._github_app_id = github_app_id
@@ -201,6 +212,15 @@ class Factory:
     def purge_coalescer(self) -> CdnPurgeCoalescer:
         """CDN purge coalescer backing this factory's publishing service."""
         return self._purge_coalescer
+
+    @property
+    def copy_http_client(self) -> httpx.AsyncClient | None:
+        """Client a keeper-sync copier's destination store PUTs over.
+
+        The worker's dedicated copy client when one was given, otherwise
+        the shared client (``None`` when neither was).
+        """
+        return self._copy_http_client
 
     @property
     def keeper_sync_copy_concurrency(self) -> int:
@@ -959,6 +979,7 @@ class Factory:
         service_label: str,
         upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+        upload_http_client: httpx.AsyncClient | None = None,
     ) -> ObjectStore:
         """Resolve an org's ObjectStore from its service configuration.
 
@@ -979,6 +1000,10 @@ class Factory:
         upload_max_backoff_seconds
             Ceiling on any single wait between presigned upload
             attempts. Defaults to the shared ``_http_retry`` ceiling.
+        upload_http_client
+            Client the store PUTs presigned uploads over. Defaults to
+            the factory's shared client, which every caller but the
+            keeper-sync copier keeps.
 
         Returns
         -------
@@ -1007,7 +1032,11 @@ class Factory:
             config=svc.config,
             credentials=cred_payload,
             logger=self._logger,
-            http_client=self._http_client,
+            http_client=(
+                upload_http_client
+                if upload_http_client is not None
+                else self._http_client
+            ),
             max_attempts=upload_max_attempts,
             max_backoff_seconds=upload_max_backoff_seconds,
         )
@@ -1054,7 +1083,10 @@ class Factory:
         the ``keeper_sync_upload_*`` retry budget rather than the shared
         one: a build copy holds no transaction or lock while an upload
         backs off, so it can ride out an R2 connect outage that the
-        shared budget gives up inside (PRD #685).
+        shared budget gives up inside (PRD #685). It is likewise the
+        only store that PUTs over :attr:`copy_http_client`, the worker's
+        client sized for its full copy concurrency, rather than the
+        shared client.
         """
 
         @asynccontextmanager
@@ -1067,6 +1099,7 @@ class Factory:
                     upload_max_backoff_seconds=(
                         self._keeper_sync_upload_max_backoff_seconds
                     ),
+                    upload_http_client=self._copy_http_client,
                 )
             source = self.create_ltd_s3_source()
             async with source, destination:
