@@ -272,10 +272,17 @@ def map_edition_tracking(
 
     Raises
     ------
+    KeeperSyncGitRefUnresolvableError
+        If ``mode == "manual"`` and the supplied ``build``'s
+        ``git_refs`` is empty/None. That is permanent for the (edition,
+        build) pair — a build's ``git_refs`` is fixed at upload — so it
+        shares the type ``sync_project`` reports as a per-edition
+        failure rather than as evidence of an outage.
     ValueError
         If ``mode == "git_refs"`` but ``tracked_refs`` is empty/None,
-        if ``mode == "manual"`` but ``build`` is None or its
-        ``git_refs`` is empty/None, or if ``mode`` is an unknown LTD
+        if ``mode == "manual"`` but ``build`` is None (the proactive
+        lifecycle pass relies on this to fall ``manual`` editions
+        through to ``sync_edition``), or if ``mode`` is an unknown LTD
         string (schema drift).
     """
     try:
@@ -323,12 +330,15 @@ def _map_manual(
         )
         raise ValueError(msg)
     if not build.git_refs:
-        msg = (
-            f"LTD edition {edition.slug!r} declares mode=manual and the"
-            f" published build (id={build.ltd_id}) reports no git_refs;"
-            " cannot derive a Docverse git_ref tracking pair"
+        raise KeeperSyncGitRefUnresolvableError(
+            ltd_edition_slug=edition.slug,
+            ltd_build_id=build.ltd_id,
+            message=(
+                f"LTD edition {edition.slug!r} declares mode=manual and the"
+                f" published build (id={build.ltd_id}) reports no git_refs;"
+                " cannot derive a Docverse git_ref tracking pair"
+            ),
         )
-        raise ValueError(msg)
     return TrackingMode.git_ref, {"git_ref": build.git_refs[0]}
 
 

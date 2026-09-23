@@ -357,18 +357,26 @@ def test_map_edition_tracking_manual_without_build_raises() -> None:
         map_edition_tracking(edition)
 
 
-def test_map_edition_tracking_manual_missing_build_git_refs_raises() -> None:
-    edition = _edition(mode="manual", tracked_refs=None)
-    build = _build(git_refs=None)
-    with pytest.raises(ValueError, match="git_refs"):
-        map_edition_tracking(edition, build=build)
+@pytest.mark.parametrize("git_refs", [None, []])
+def test_map_edition_tracking_manual_build_without_git_refs_is_unresolvable(
+    git_refs: list[str] | None,
+) -> None:
+    """A ``manual`` edition whose published build names no ref is typed.
 
-
-def test_map_edition_tracking_manual_empty_build_git_refs_raises() -> None:
-    edition = _edition(mode="manual", tracked_refs=None)
-    build = _build(git_refs=[])
-    with pytest.raises(ValueError, match="git_refs"):
+    The build's ``git_refs`` is fixed at upload, so this is as permanent
+    as :func:`derive_synced_build_git_ref`'s unresolvable case — and it
+    has to carry the same type, or ``sync_project`` would count it as a
+    systemic-outage candidate and fail the job on every tier tick.
+    """
+    edition = _edition(slug="current", mode="manual", tracked_refs=None)
+    build = _build(git_refs=git_refs)
+    with pytest.raises(KeeperSyncGitRefUnresolvableError) as exc_info:
         map_edition_tracking(edition, build=build)
+    assert exc_info.value.ltd_edition_slug == "current"
+    assert exc_info.value.ltd_build_id == 42
+    assert "current" in str(exc_info.value)
+    assert "42" in str(exc_info.value)
+    assert "manual" in str(exc_info.value)
 
 
 def test_map_edition_tracking_unknown_mode_raises() -> None:

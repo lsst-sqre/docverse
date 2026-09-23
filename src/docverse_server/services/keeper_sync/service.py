@@ -229,9 +229,11 @@ MAX_CONSECUTIVE_EDITION_FAILURES = 75
 #:   anonymous with no credentials to fall back on.
 #: * :class:`~docverse_server.exceptions.KeeperSyncGitRefUnresolvableError`
 #:   — neither the edition's ``tracked_refs`` nor its published build's
-#:   ``git_refs`` names a ref (#682). A build's ``git_refs`` is fixed at
-#:   upload, and a republish onto a different build moves the edition's
-#:   ``date_rebuilt`` and is re-attempted as a different sync anyway.
+#:   ``git_refs`` names a ref (#682), or a ``manual`` edition's
+#:   published build names none to pin its tracking pair to. A build's
+#:   ``git_refs`` is fixed at upload, and a republish onto a different
+#:   build moves the edition's ``date_rebuilt`` and is re-attempted as a
+#:   different sync anyway.
 #:
 #: Every other per-edition fault in this path arrives as a bare
 #: ``RuntimeError`` or a transport error and cannot be distinguished by

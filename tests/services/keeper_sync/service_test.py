@@ -2606,6 +2606,52 @@ async def test_sync_project_unresolvable_git_ref_is_not_systemic(
 
 
 @pytest.mark.asyncio
+async def test_sync_project_manual_edition_without_git_refs_is_not_systemic(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A ``manual`` edition whose build names no ref fails per-edition.
+
+    The same permanent (edition, build) fault as the ``lsst_doc`` case
+    above, surfacing one step earlier: ``manual`` needs the published
+    build's ``git_refs`` to *map* its tracking pair, so it fails in
+    ``map_edition_tracking`` before ``sync_build`` runs. For a product
+    whose only edition has that shape, counting it as a systemic
+    candidate would fail the job — and the tier cron's replay — forever.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-manual-no-git-ref")
+
+    edition_payload = _load("edition_main_git_refs.json")
+    edition_payload["mode"] = "manual"
+    edition_payload["tracked_refs"] = None
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = None
+    _seed_ltd(
+        mock_discovery,
+        edition_main=edition_payload,
+        build_payload=build_payload,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>no ref</html>"},
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "main"
+    assert failure.error_type == "KeeperSyncGitRefUnresolvableError"
+    assert "manual" in failure.error_message
+    assert "42" in failure.error_message
+
+
+@pytest.mark.asyncio
 async def test_sync_project_transport_failure_amid_denials_still_aborts(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,

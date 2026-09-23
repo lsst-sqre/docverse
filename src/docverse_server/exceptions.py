@@ -388,12 +388,15 @@ class KeeperSyncGitRefUnresolvableError(DocverseSlackException):
     from. LTD names that ref in two places: the edition's
     ``tracked_refs`` (only populated in ``git_refs`` mode — ``lsst_doc``
     and the ``eups_*`` modes leave it ``null``, #682) and the published
-    build's own ``git_refs``. This is raised only when *both* are empty,
-    which nothing about a retry can change: an LTD build's ``git_refs``
-    is fixed at upload, and a republish that swaps the edition onto a
-    different build is a different sync (its ``date_rebuilt`` moves).
-    That is why ``KeeperSyncService.sync_project`` counts it as a
-    permanent per-edition fault rather than evidence of an outage.
+    build's own ``git_refs``. This is raised when *both* are empty, or
+    — for a ``manual`` edition, whose tracking pair is pinned to the
+    published build's ref — when the build's ``git_refs`` is empty.
+    Nothing about a retry can change either answer: an LTD build's
+    ``git_refs`` is fixed at upload, and a republish that swaps the
+    edition onto a different build is a different sync (its
+    ``date_rebuilt`` moves). That is why
+    ``KeeperSyncService.sync_project`` counts it as a permanent
+    per-edition fault rather than evidence of an outage.
 
     No ``to_sentry`` override: the message names the LTD edition slug
     and build id, which is the whole triage story — the LTD API is
