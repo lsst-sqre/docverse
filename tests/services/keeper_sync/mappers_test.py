@@ -17,11 +17,13 @@ from pydantic import HttpUrl
 
 from docverse.models import EditionKind, TrackingMode
 from docverse_server.domain.slug import parse_slug_rewrite_rules
+from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
 from docverse_server.services.keeper_sync.mappers import (
     KindDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
+    derive_synced_build_git_ref,
     map_edition_tracking,
 )
 from docverse_server.storage.ltd import LtdBuild, LtdEdition
@@ -473,3 +475,35 @@ class TestDeriveEditionSourcePrefix:
             )
             is None
         )
+
+
+class TestDeriveSyncedBuildGitRef:
+    """The synced build's ``git_ref`` is the ref its bytes were built from."""
+
+    def test_tracked_ref_wins_over_the_build_ref(self) -> None:
+        """A ``git_refs`` edition keeps naming its build after its ref."""
+        edition = _edition(mode="git_refs", tracked_refs=["main"])
+        build = _build(git_refs=["v22_0_0", "main"])
+        assert derive_synced_build_git_ref(edition, build) == "main"
+
+    def test_falls_back_to_the_published_build_ref(self) -> None:
+        """``lsst_doc`` editions carry no ``tracked_refs`` (#682).
+
+        LTD's ``lsst_doc`` mode follows the newest semver tag with a
+        ``main`` / ``master`` fallback and never fills ``tracked_refs``,
+        so the only record of what the published bytes were built from
+        is the build's own ``git_refs``.
+        """
+        edition = _edition(mode="lsst_doc", tracked_refs=None)
+        build = _build(git_refs=["master"])
+        assert derive_synced_build_git_ref(edition, build) == "master"
+
+    def test_raises_when_neither_side_names_a_ref(self) -> None:
+        edition = _edition(slug="main", mode="lsst_doc", tracked_refs=None)
+        build = _build(git_refs=None)
+        with pytest.raises(KeeperSyncGitRefUnresolvableError) as exc_info:
+            derive_synced_build_git_ref(edition, build)
+        assert exc_info.value.ltd_edition_slug == "main"
+        assert exc_info.value.ltd_build_id == 42
+        assert "main" in str(exc_info.value)
+        assert "42" in str(exc_info.value)

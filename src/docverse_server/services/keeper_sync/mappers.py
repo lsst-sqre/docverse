@@ -22,6 +22,7 @@ from docverse_server.domain.slug import (
     AnySlugRewriteRule,
     derive_edition_kind_from_ref,
 )
+from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
 from docverse_server.storage.ltd import LtdBuild, LtdEdition, LtdEditionMode
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "derive_edition_kind",
     "derive_edition_slug",
     "derive_edition_source_prefix",
+    "derive_synced_build_git_ref",
     "map_edition_tracking",
 ]
 
@@ -328,3 +330,27 @@ def _map_manual(
         )
         raise ValueError(msg)
     return TrackingMode.git_ref, {"git_ref": build.git_refs[0]}
+
+
+def derive_synced_build_git_ref(edition: LtdEdition, build: LtdBuild) -> str:
+    """Name the git ref a synced Docverse build was built from.
+
+    The edition's ``tracked_refs`` wins when LTD fills it (``git_refs``
+    mode), so already-synced projects keep deriving exactly the ref
+    they did before. Every other LTD mode reports ``tracked_refs:
+    null`` (#682), and there the published build's own ``git_refs`` —
+    the ref LTD actually built those bytes from — is the answer,
+    whichever edition mode selected the build.
+
+    Raises
+    ------
+    KeeperSyncGitRefUnresolvableError
+        If neither the edition nor the build names a ref.
+    """
+    if edition.tracked_refs:
+        return edition.tracked_refs[0]
+    if build.git_refs:
+        return build.git_refs[0]
+    raise KeeperSyncGitRefUnresolvableError(
+        ltd_edition_slug=edition.slug, ltd_build_id=build.ltd_id
+    )

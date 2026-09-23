@@ -1076,15 +1076,10 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
 
     edition_payload = _load("edition_main_git_refs.json")
     edition_payload["mode"] = "manual"
-    # Keep ``tracked_refs`` set so the existing ``_create_synced_build``
-    # path remains happy; the assertion on tracking_params below proves
-    # the mapper still pins to the BUILD's git_refs[0] rather than the
-    # edition's tracked_refs[0]. Hardening
-    # ``_create_synced_build`` to derive the Docverse build's git_ref
-    # from ``LtdBuild.git_refs[0]`` (so manual editions with
-    # ``tracked_refs is None`` round-trip cleanly) is tracked as
-    # follow-up — out of scope for this mapper-only slice.
-    edition_payload["tracked_refs"] = ["main"]
+    # LTD leaves ``tracked_refs`` null on a ``manual`` edition; both the
+    # tracking pair and the synced build's git_ref come from the BUILD's
+    # git_refs[0] (#682).
+    edition_payload["tracked_refs"] = None
     build_payload = _load("build.json")
     build_payload["git_refs"] = ["v22_0_0", "main"]
     _seed_ltd(
@@ -1111,6 +1106,9 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
     state_store = KeeperSyncStateStore(
         session=db_session, logger=structlog.get_logger("test")
     )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
     async with db_session.begin():
         project = await project_store.get_by_slug(
             org_id=org_id, slug="pipelines"
@@ -1124,6 +1122,10 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
         # The build's first git_ref is pinned, NOT the edition's
         # tracked_refs (which manual editions need not maintain).
         assert edition.tracking_params == {"git_ref": "v22_0_0"}
+        assert edition.current_build_id is not None
+        build = await build_store.get_by_id(edition.current_build_id)
+        assert build is not None
+        assert build.git_ref == "v22_0_0"
 
         state = await state_store.get(
             org_id=org_id,
@@ -1134,6 +1136,72 @@ async def test_sync_edition_imports_manual_as_pinned_git_ref(
         assert state.annotations is not None
         # Original LTD mode preserved for reversibility.
         assert state.annotations["ltd_mode"] == "manual"
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_imports_lsst_doc_main_without_tracked_refs(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An ``lsst_doc`` main edition with ``tracked_refs: null`` imports.
+
+    The shape of every older LDM/DMTN-era product (#682, found on
+    ``sqr-028`` in the first production wave): LTD's ``lsst_doc`` mode
+    follows the newest semver tag with a ``main`` / ``master`` fallback
+    and never fills ``tracked_refs``. The synced build takes its
+    ``git_ref`` from the published build's ``git_refs`` instead, and
+    the edition keeps ``lsst_doc`` tracking so post-cutover uploads
+    follow the same rule rather than pinning to whichever ref happened
+    to be published at sync time.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = ["master"]
+    _seed_ltd(
+        mock_discovery,
+        edition_main=_load("edition_main_lsst_doc.json"),
+        build_payload=build_payload,
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>sqr-028</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_failures == ()
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    build_store = BuildStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="__main"
+        )
+        assert edition is not None
+        assert edition.tracking_mode == TrackingMode.lsst_doc
+        assert edition.tracking_params == {}
+        assert edition.current_build_id is not None
+
+        build = await build_store.get_by_id(edition.current_build_id)
+        assert build is not None
+        assert build.status == BuildStatus.completed
+        assert build.git_ref == "master"
 
 
 @pytest.mark.asyncio
@@ -2492,6 +2560,49 @@ async def test_sync_project_permanent_denials_alone_are_not_systemic(
     failure = result.edition_failures[0]
     assert failure.ltd_edition_slug == f"u-jsick-feat-{total}"
     assert failure.error_type == "LtdSourceAccessDeniedError"
+
+
+@pytest.mark.asyncio
+async def test_sync_project_unresolvable_git_ref_is_not_systemic(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition with no derivable git ref is a permanent per-edition fault.
+
+    The #682 shape, one step worse: an ``lsst_doc`` main edition with
+    ``tracked_refs: null`` whose published build also reports no
+    ``git_refs``. That is deterministic for the (edition, build) pair —
+    a build's ``git_refs`` is fixed at upload — so failing the job
+    would hand the tier cron a replay that fails identically forever,
+    and the cause would be visible only in the job traceback. Reporting
+    it under ``edition_failures`` puts the reason on the API.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-no-git-ref")
+
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = None
+    _seed_ltd(
+        mock_discovery,
+        edition_main=_load("edition_main_lsst_doc.json"),
+        build_payload=build_payload,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>no ref</html>"},
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_outcomes == []
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "main"
+    assert failure.error_type == "KeeperSyncGitRefUnresolvableError"
+    assert "42" in failure.error_message
 
 
 @pytest.mark.asyncio

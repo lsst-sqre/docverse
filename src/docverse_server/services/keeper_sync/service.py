@@ -9,10 +9,12 @@ build content into Docverse R2 via :class:`BuildContentCopier`. The
 :class:`KeeperSyncStateStore` row is the idempotency key: a re-run
 with unchanged LTD state short-circuits.
 
-This slice covers only the ``git_refs`` LTD edition mode; other modes
-raise :class:`NotImplementedError` from
-:func:`docverse_server.services.keeper_sync.mappers.map_edition_tracking` and
-are filled in by issue #289.
+Every LTD edition mode is importable.
+:func:`docverse_server.services.keeper_sync.mappers.map_edition_tracking`
+maps the mode onto Docverse's tracking pair, and
+:func:`docverse_server.services.keeper_sync.mappers.derive_synced_build_git_ref`
+names the synced build's git ref from the edition's ``tracked_refs`` or,
+for the modes that leave it null, the published build's ``git_refs``.
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ from docverse_server.domain.version import (
 )
 from docverse_server.exceptions import (
     MAX_REPORTED_EDITION_SLUGS,
+    KeeperSyncGitRefUnresolvableError,
     KeeperSyncInvariantError,
     KeeperSyncSystemicFailureError,
     NotFoundError,
@@ -120,6 +123,7 @@ from .mappers import (
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
+    derive_synced_build_git_ref,
     map_edition_tracking,
 )
 
@@ -215,13 +219,21 @@ MAX_CONSECUTIVE_EDITION_FAILURES = 75
 #: 5-minute tier tick, forever, because tombstone short-circuits are
 #: neutral for ``contacted_ltd`` and left ``ltd_successes == 0``.
 #:
-#: :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` is
-#: the only member today, and is permanent by construction rather than
-#: by observation: LTD's oldest uploads carry no public-read object ACL,
-#: :class:`~docverse_server.storage.ltd.LtdS3Source` is deliberately
-#: anonymous with no credentials to fall back on, and LTD Keeper is
-#: read-only source material — so nothing about a replay can change the
-#: answer. Every other per-edition fault in this path arrives as a bare
+#: Both members are permanent by construction rather than by
+#: observation, and LTD Keeper is read-only source material, so nothing
+#: about a replay can change either answer:
+#:
+#: * :class:`~docverse_server.storage.ltd.LtdSourceAccessDeniedError` —
+#:   LTD's oldest uploads carry no public-read object ACL and
+#:   :class:`~docverse_server.storage.ltd.LtdS3Source` is deliberately
+#:   anonymous with no credentials to fall back on.
+#: * :class:`~docverse_server.exceptions.KeeperSyncGitRefUnresolvableError`
+#:   — neither the edition's ``tracked_refs`` nor its published build's
+#:   ``git_refs`` names a ref (#682). A build's ``git_refs`` is fixed at
+#:   upload, and a republish onto a different build moves the edition's
+#:   ``date_rebuilt`` and is re-attempted as a different sync anyway.
+#:
+#: Every other per-edition fault in this path arrives as a bare
 #: ``RuntimeError`` or a transport error and cannot be distinguished by
 #: type, which is why the tuple is not larger: membership has to be
 #: earned by that "cannot be transient" argument, not by a hunch that a
@@ -235,6 +247,7 @@ MAX_CONSECUTIVE_EDITION_FAILURES = 75
 #: denial block walk further than the threshold allows.
 _PERMANENT_EDITION_FAILURE_TYPES: tuple[type[BaseException], ...] = (
     LtdSourceAccessDeniedError,
+    KeeperSyncGitRefUnresolvableError,
 )
 
 #: Type alias for the ``(source_prefix, dest_prefix) -> CopyResult``
@@ -1978,16 +1991,17 @@ class KeeperSyncService:
                 total_size_bytes=None,
             )
 
+        git_ref = derive_synced_build_git_ref(ltd_edition, ltd_build)
         async with self._session.begin():
             await self._reclaim_orphan_placeholders(
                 project_id=project.id,
                 project_slug=project.slug,
                 org_slug=org_slug,
                 edition_slug=edition.slug,
-                ltd_edition=ltd_edition,
+                git_ref=git_ref,
             )
             new_build = await self._create_synced_build(
-                project=project, ltd_edition=ltd_edition
+                project=project, git_ref=git_ref
             )
 
         copy_result = await self._copy_callable(
@@ -2189,7 +2203,7 @@ class KeeperSyncService:
         self,
         *,
         project_id: int,
-        ltd_edition: LtdEdition,
+        git_ref: str,
         project_slug: str | None = None,
         org_slug: str | None = None,
         edition_slug: str | None = None,
@@ -2208,9 +2222,6 @@ class KeeperSyncService:
         ``failed`` so they stop showing up in the project's build
         list.
         """
-        if not ltd_edition.tracked_refs:
-            return
-        git_ref = ltd_edition.tracked_refs[0]
         cutoff = _now() - self._orphan_reclaim_max_age
         orphans = await self._build_store.list_pending_older_than(
             project_id=project_id,
@@ -2238,20 +2249,14 @@ class KeeperSyncService:
         )
 
     async def _create_synced_build(
-        self, *, project: Project, ltd_edition: LtdEdition
+        self, *, project: Project, git_ref: str
     ) -> Build:
         """Insert a placeholder build row that the copier can write into."""
-        if not ltd_edition.tracked_refs:
-            msg = (
-                f"LTD edition {ltd_edition.slug!r} has no tracked_refs;"
-                " cannot derive git_ref for synced build"
-            )
-            raise ValueError(msg)
         return await self._build_store.create(
             project_id=project.id,
             project_slug=project.slug,
             data=BuildCreate(
-                git_ref=ltd_edition.tracked_refs[0],
+                git_ref=git_ref,
                 content_hash=PLACEHOLDER_CONTENT_HASH,
             ),
             uploader=_SYNC_UPLOADER,
