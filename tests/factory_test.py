@@ -19,6 +19,9 @@ from docverse_server.services.credential_encryptor import CredentialEncryptor
 from docverse_server.services.keeper_sync.copier import (
     DEFAULT_COPY_CONCURRENCY,
 )
+from docverse_server.services.keeper_sync.service import (
+    DEFAULT_COPY_RETRY_DELAY_SECONDS,
+)
 from docverse_server.storage._http_retry import (
     DEFAULT_MAX_ATTEMPTS,
     MAX_BACKOFF_SECONDS,
@@ -232,6 +235,50 @@ async def test_copier_uses_factory_copy_concurrency(
         org_id=1, service_label="r2"
     ) as copier:
         assert copier.max_concurrent == 3
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_service_uses_factory_copy_retry_delay(
+    db_session: AsyncSession,
+) -> None:
+    """The configured build-copy retry delay reaches the sync service.
+
+    ``sync_build`` waits this long before re-running a copy that failed
+    on a transport error (PRD #685), so the operator knob has to arrive
+    on the service the keeper-sync worker actually runs.
+    """
+    async with httpx.AsyncClient() as http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            http_client=http_client,
+            default_queue_name="docverse:queue",
+            keeper_sync_copy_retry_delay_seconds=4.5,
+        )
+        service = factory.create_keeper_sync_service(
+            org_id=1, service_label="r2"
+        )
+    assert service.copy_retry_delay_seconds == 4.5
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_service_copy_retry_delay_defaults(
+    db_session: AsyncSession,
+) -> None:
+    """A Factory built without the knob keeps the service's own default."""
+    async with httpx.AsyncClient() as http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            http_client=http_client,
+            default_queue_name="docverse:queue",
+        )
+        service = factory.create_keeper_sync_service(
+            org_id=1, service_label="r2"
+        )
+    assert service.copy_retry_delay_seconds == (
+        DEFAULT_COPY_RETRY_DELAY_SECONDS
+    )
 
 
 @pytest.mark.asyncio

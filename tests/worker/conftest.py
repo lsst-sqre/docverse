@@ -94,6 +94,9 @@ def make_worker_ctx(
         keeper_sync_upload_max_backoff_seconds=(
             _config.keeper_sync_upload_max_backoff_seconds
         ),
+        keeper_sync_copy_retry_delay_seconds=(
+            _config.keeper_sync_copy_retry_delay_seconds
+        ),
     )
     ctx: dict[str, Any] = {
         "factory_builder": builder,

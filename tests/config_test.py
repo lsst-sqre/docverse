@@ -35,6 +35,9 @@ from docverse_server.config import (
 from docverse_server.services.keeper_sync.copier import (
     DEFAULT_COPY_CONCURRENCY,
 )
+from docverse_server.services.keeper_sync.service import (
+    DEFAULT_COPY_RETRY_DELAY_SECONDS,
+)
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
     backoff_for_attempt,
@@ -258,6 +261,42 @@ def test_keeper_sync_upload_max_backoff_refuses_negative(
 
     monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_BACKOFF_SECONDS", "0")
     assert Configuration().keeper_sync_upload_max_backoff_seconds == 0.0
+
+
+def test_keeper_sync_copy_retry_delay_default() -> None:
+    """A transport-failed build copy waits 30 s before its one re-run.
+
+    The config default tracks the service's own fallback, so a directly
+    constructed ``KeeperSyncService`` (every unit test) waits exactly
+    what the worker does.
+    """
+    config = Configuration()
+    assert config.keeper_sync_copy_retry_delay_seconds == 30.0
+    assert (
+        config.keeper_sync_copy_retry_delay_seconds
+        == DEFAULT_COPY_RETRY_DELAY_SECONDS
+    )
+
+
+def test_keeper_sync_copy_retry_delay_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build-level retry delay is env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_COPY_RETRY_DELAY_SECONDS", "2.5")
+    config = Configuration()
+    assert config.keeper_sync_copy_retry_delay_seconds == 2.5
+
+
+def test_keeper_sync_copy_retry_delay_refuses_negative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative delay is refused; zero (re-run at once) is not."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_COPY_RETRY_DELAY_SECONDS", "-1")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_COPY_RETRY_DELAY_SECONDS", "0")
+    assert Configuration().keeper_sync_copy_retry_delay_seconds == 0.0
 
 
 def test_publish_edition_job_timeout_default() -> None:

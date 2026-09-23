@@ -430,6 +430,27 @@ class Configuration(BaseSettings):
         ),
     )
 
+    keeper_sync_copy_retry_delay_seconds: float = Field(
+        30.0,
+        ge=0.0,
+        title="Wait before re-running a keeper-sync build copy",
+        description=(
+            "Seconds ``KeeperSyncService.sync_build`` waits before"
+            " re-running a build-content copy that failed on a"
+            " transport error (an R2 connect timeout or a dropped"
+            " connection that outlasted the per-object"
+            " ``keeper_sync_upload_*`` budget). The copy is re-run"
+            " exactly once, into the same placeholder build; copies are"
+            " content-hashed and idempotent, so objects that already"
+            " landed are simply overwritten with the same bytes. A"
+            " second failure, or any non-transport failure (an LTD"
+            " ``AccessDenied``, an S3 client error, an HTTP error"
+            " status), fails the edition as before. The wait holds no"
+            " database transaction. At zero, the copy is re-run at"
+            " once."
+        ),
+    )
+
     keeper_sync_reaper_threshold_seconds: int = Field(
         default_factory=_default_keeper_sync_reaper_threshold,
         title="Keeper-sync stuck-run reaper threshold, in seconds",

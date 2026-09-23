@@ -394,6 +394,7 @@ class WorkerFactoryBuilder:
         keeper_sync_copy_concurrency: int,
         keeper_sync_upload_max_attempts: int,
         keeper_sync_upload_max_backoff_seconds: float,
+        keeper_sync_copy_retry_delay_seconds: float,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -425,6 +426,11 @@ class WorkerFactoryBuilder:
         self._keeper_sync_upload_max_attempts = keeper_sync_upload_max_attempts
         self._keeper_sync_upload_max_backoff_seconds = (
             keeper_sync_upload_max_backoff_seconds
+        )
+        # Required for the same reason: the build-level copy retry is the
+        # backstop behind that per-object budget (PRD #685).
+        self._keeper_sync_copy_retry_delay_seconds = (
+            keeper_sync_copy_retry_delay_seconds
         )
 
     @property
@@ -477,6 +483,9 @@ class WorkerFactoryBuilder:
             keeper_sync_upload_max_attempts=self._keeper_sync_upload_max_attempts,
             keeper_sync_upload_max_backoff_seconds=(
                 self._keeper_sync_upload_max_backoff_seconds
+            ),
+            keeper_sync_copy_retry_delay_seconds=(
+                self._keeper_sync_copy_retry_delay_seconds
             ),
         )
 
@@ -571,6 +580,9 @@ async def _startup(
         keeper_sync_upload_max_attempts=config.keeper_sync_upload_max_attempts,
         keeper_sync_upload_max_backoff_seconds=(
             config.keeper_sync_upload_max_backoff_seconds
+        ),
+        keeper_sync_copy_retry_delay_seconds=(
+            config.keeper_sync_copy_retry_delay_seconds
         ),
     )
     await validate_github_app(

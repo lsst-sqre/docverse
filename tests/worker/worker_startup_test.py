@@ -45,6 +45,7 @@ def _make_builder(
     keeper_sync_copy_concurrency: int | None = None,
     keeper_sync_upload_max_attempts: int | None = None,
     keeper_sync_upload_max_backoff_seconds: float | None = None,
+    keeper_sync_copy_retry_delay_seconds: float | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
@@ -72,6 +73,11 @@ def _make_builder(
             keeper_sync_upload_max_backoff_seconds
             if keeper_sync_upload_max_backoff_seconds is not None
             else _config.keeper_sync_upload_max_backoff_seconds
+        ),
+        keeper_sync_copy_retry_delay_seconds=(
+            keeper_sync_copy_retry_delay_seconds
+            if keeper_sync_copy_retry_delay_seconds is not None
+            else _config.keeper_sync_copy_retry_delay_seconds
         ),
     )
 
@@ -116,6 +122,26 @@ async def test_builder_threads_upload_budget_to_per_job_factory(
         factory = builder(session=db_session, logger=_logger())
         assert factory.keeper_sync_upload_max_attempts == 9
         assert factory.keeper_sync_upload_max_backoff_seconds == 42.0
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_copy_retry_delay_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """The build-level copy retry delay is process-config driven.
+
+    ``keeper_sync_project`` is the only job that copies build content,
+    so the builder must carry the operator knob onto every per-job
+    factory rather than letting the sync service fall back to its own
+    default.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client,
+            keeper_sync_copy_retry_delay_seconds=3.5,
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.keeper_sync_copy_retry_delay_seconds == 3.5
 
 
 @pytest.mark.asyncio

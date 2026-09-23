@@ -18,6 +18,7 @@ from .mappers import (
     map_edition_tracking,
 )
 from .service import (
+    DEFAULT_COPY_RETRY_DELAY_SECONDS,
     BuildSyncOutcome,
     CopyCallable,
     EditionSyncOutcome,
@@ -28,6 +29,7 @@ from .service import (
 
 __all__ = [
     "DEFAULT_COPY_CONCURRENCY",
+    "DEFAULT_COPY_RETRY_DELAY_SECONDS",
     "BuildContentCopier",
     "BuildSyncOutcome",
     "CopyCallable",

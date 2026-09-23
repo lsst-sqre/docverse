@@ -43,6 +43,7 @@ from .services.infrastructure import InfrastructureService
 from .services.inventory_census import InventoryCensusService
 from .services.keeper_sync import (
     DEFAULT_COPY_CONCURRENCY,
+    DEFAULT_COPY_RETRY_DELAY_SECONDS,
     BuildContentCopier,
     CopyResult,
     KeeperSyncContext,
@@ -142,6 +143,9 @@ class Factory:
         keeper_sync_copy_concurrency: int = DEFAULT_COPY_CONCURRENCY,
         keeper_sync_upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         keeper_sync_upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+        keeper_sync_copy_retry_delay_seconds: float = (
+            DEFAULT_COPY_RETRY_DELAY_SECONDS
+        ),
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -194,6 +198,14 @@ class Factory:
         self._keeper_sync_upload_max_backoff_seconds = (
             keeper_sync_upload_max_backoff_seconds
         )
+        # How long a keeper-sync service waits before re-running a build
+        # copy that failed on a transport error. Defaults to the
+        # service's own fallback; the arq worker threads
+        # ``Config.keeper_sync_copy_retry_delay_seconds`` through
+        # ``WorkerFactoryBuilder``.
+        self._keeper_sync_copy_retry_delay_seconds = (
+            keeper_sync_copy_retry_delay_seconds
+        )
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -236,6 +248,11 @@ class Factory:
     def keeper_sync_upload_max_backoff_seconds(self) -> float:
         """Presigned-upload wait ceiling for a keeper-sync copier's store."""
         return self._keeper_sync_upload_max_backoff_seconds
+
+    @property
+    def keeper_sync_copy_retry_delay_seconds(self) -> float:
+        """Wait before a keeper-sync service re-runs a failed build copy."""
+        return self._keeper_sync_copy_retry_delay_seconds
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -1197,6 +1214,7 @@ class Factory:
             binding_resolver=binding_resolver,
             ref_set_fetcher=ref_set_fetcher,
             lock_service=self.create_lock_service(),
+            copy_retry_delay_seconds=self._keeper_sync_copy_retry_delay_seconds,
         )
 
 
