@@ -87,7 +87,12 @@ from .storage.inventory_census_store import InventoryCensusStore
 from .storage.keeper_sync import KeeperSyncStateStore
 from .storage.keeper_sync_run_store import KeeperSyncRunStore
 from .storage.lifecycle_eval_run_store import LifecycleEvalRunStore
-from .storage.ltd import LtdClient, LtdProductsClient, LtdS3Source
+from .storage.ltd import (
+    LtdClient,
+    LtdProductsClient,
+    LtdS3Source,
+    LtdSourceProtocol,
+)
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
@@ -150,6 +155,7 @@ class Factory:
             DEFAULT_COPY_RETRY_DELAY_SECONDS
         ),
         keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
+        ltd_s3_source: LtdSourceProtocol | None = None,
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -219,6 +225,15 @@ class Factory:
         # ``WorkerFactoryBuilder`` so every concurrent job's copies share
         # the same cap.
         self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
+        # The open LTD source every keeper-sync copier this factory builds
+        # reads from, and which none of them closes: its owner opened it
+        # and closes it. ``None`` keeps directly constructed factories
+        # (tests, scripts) opening and closing a source per copier as
+        # before; the arq worker threads its one process-wide source,
+        # sized by ``Config.keeper_sync_upload_concurrency``, through
+        # ``WorkerFactoryBuilder`` so LTD downloads reuse its connections
+        # across builds and jobs.
+        self._ltd_s3_source = ltd_s3_source
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -275,6 +290,15 @@ class Factory:
         ``None`` (uploads unbounded).
         """
         return self._keeper_sync_upload_limiter
+
+    @property
+    def ltd_s3_source(self) -> LtdSourceProtocol | None:
+        """Open LTD source shared by every keeper-sync copier, if any.
+
+        The worker's process-wide source when one was given, otherwise
+        ``None`` (each copier opens and closes a source of its own).
+        """
+        return self._ltd_s3_source
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -1114,9 +1138,16 @@ class Factory:
         """Return an async-CM that yields a wired-up copier for ``org``.
 
         Used as ``async with factory.create_build_content_copier_for_org(
-        org_id=..., service_label=...) as copier:``. Both the LTD source
-        and the per-org destination are opened on entry and closed on
-        exit so a sync slot's resource lifetime is tightly bounded.
+        org_id=..., service_label=...) as copier:``. The per-org
+        destination is opened on entry and closed on exit so a sync
+        slot's resource lifetime is tightly bounded.
+
+        The LTD source is :attr:`ltd_s3_source` when the factory holds
+        one: already open, shared by every copier in the worker process
+        and left open on exit, so LTD downloads reuse its connections
+        instead of re-dialling S3 per build and manifest hash (PRD #698).
+        Otherwise the copier opens a source of its own from
+        :meth:`create_ltd_s3_source` on entry and closes it on exit.
 
         The copier's fan-out bound comes from this factory's
         ``keeper_sync_copy_concurrency``, so an operator can move the
@@ -1149,16 +1180,29 @@ class Factory:
                     upload_http_client=self._copy_http_client,
                     upload_limiter=self._keeper_sync_upload_limiter,
                 )
-            source = self.create_ltd_s3_source()
-            async with source, destination:
-                yield BuildContentCopier(
-                    source=source,
-                    destination=destination,
-                    logger=self._logger,
-                    max_concurrent=self._keeper_sync_copy_concurrency,
-                )
+            shared_source = self._ltd_s3_source
+            if shared_source is None:
+                async with self.create_ltd_s3_source() as source, destination:
+                    yield self._create_build_content_copier(
+                        source=source, destination=destination
+                    )
+            else:
+                async with destination:
+                    yield self._create_build_content_copier(
+                        source=shared_source, destination=destination
+                    )
 
         return _open()
+
+    def _create_build_content_copier(
+        self, *, source: LtdSourceProtocol, destination: ObjectStore
+    ) -> BuildContentCopier:
+        return BuildContentCopier(
+            source=source,
+            destination=destination,
+            logger=self._logger,
+            max_concurrent=self._keeper_sync_copy_concurrency,
+        )
 
     def create_keeper_sync_state_store(self) -> KeeperSyncStateStore:
         """Create a :class:`KeeperSyncStateStore`."""

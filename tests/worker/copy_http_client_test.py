@@ -9,7 +9,9 @@ the 5 s connect timeout left each upload attempt little room to ride out
 an R2 connect outage (PRD #685). Build-content copies now get a client
 of their own, sized from the process-wide upload cap and keeping every
 connection alive (PRD #698); these tests pin that sizing and its
-teardown.
+teardown. The LTD side of a copy gets the same treatment: one anonymous
+S3 source per worker process, its pool sized from the same cap, opened
+at startup and closed at shutdown.
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog
 from safir.dependencies.db_session import db_session_dependency
 
+from docverse_server.storage.ltd import LtdS3Source
 from docverse_server.worker.main import (
     COPY_HTTP_CONNECTION_HEADROOM,
     COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS,
@@ -27,6 +31,7 @@ from docverse_server.worker.main import (
     config,
     create_copy_http_client,
     initialize_worker_http_clients,
+    initialize_worker_ltd_s3_source,
     shutdown,
 )
 
@@ -101,3 +106,63 @@ async def test_startup_records_a_distinct_copy_client_sized_from_config(
 
     assert http_client.is_closed
     assert copy_http_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_startup_opens_one_ltd_source_sized_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker startup opens the process's one LTD source; shutdown closes it.
+
+    Every copier in the process reads LTD through this source, so its
+    pool is sized from ``keeper_sync_upload_concurrency`` rather than
+    botocore's default of ten, which would throttle the copiers'
+    downloads. It is open before any job runs, since copiers never open
+    the shared source themselves, and ``shutdown`` owns closing it.
+    """
+
+    async def _noop_aclose() -> None:
+        return None
+
+    monkeypatch.setattr(db_session_dependency, "aclose", _noop_aclose)
+    # Off the default, so the pool can only have come from this setting.
+    monkeypatch.setattr(config, "keeper_sync_upload_concurrency", 7)
+    ctx: dict[str, Any] = {}
+    initialize_worker_http_clients(ctx)
+
+    source = await initialize_worker_ltd_s3_source(
+        ctx, logger=structlog.get_logger("test")
+    )
+
+    assert ctx["ltd_s3_source"] is source
+    assert isinstance(source, LtdS3Source)
+    assert source._get_client().meta.config.max_pool_connections == 7
+
+    await shutdown(ctx)
+
+    assert source._client is None
+    with pytest.raises(RuntimeError, match="not open"):
+        source._get_client()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_without_an_ltd_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown tolerates a ctx whose startup never opened an LTD source.
+
+    Startup can fail before the source is opened, and arq still runs
+    ``shutdown``; the HTTP clients it did open must still be closed.
+    """
+
+    async def _noop_aclose() -> None:
+        return None
+
+    monkeypatch.setattr(db_session_dependency, "aclose", _noop_aclose)
+    ctx: dict[str, Any] = {}
+    initialize_worker_http_clients(ctx)
+
+    await shutdown(ctx)
+
+    assert ctx["http_client"].is_closed
+    assert ctx["copy_http_client"].is_closed

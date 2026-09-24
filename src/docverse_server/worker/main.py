@@ -45,6 +45,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     TIER_OTHER_CRON_INTERVAL,
 )
 from docverse_server.storage.github import validate_github_app
+from docverse_server.storage.ltd import LtdS3Source
 
 from .functions import (
     build_processing,
@@ -327,6 +328,36 @@ def initialize_worker_http_clients(
     return http_client, copy_http_client
 
 
+async def initialize_worker_ltd_s3_source(
+    ctx: dict[str, Any], *, logger: structlog.stdlib.BoundLogger
+) -> LtdS3Source:
+    """Open this worker process's LTD source and record it in ctx.
+
+    Every keeper-sync copier in the process reads the public
+    ``lsst-the-docs`` bucket through this one open source, so LTD
+    downloads reuse its connections across builds, manifest hashes and
+    jobs instead of opening a client, and dialling S3 afresh, per copier.
+    Each connection a per-copier client closed pinned a Cloud NAT port
+    for the 120 s TIME_WAIT, drawing on the same port budget as the
+    uploads to R2 (PRD #698).
+
+    The client's pool is sized from ``keeper_sync_upload_concurrency``
+    rather than botocore's default of ten, which would throttle the
+    copiers' downloads far below the upload cap; beyond the pool a
+    download queues for a connection rather than failing. Like the copy
+    client it is opened whichever pool is starting, and opens no
+    connection until a copy uses it. ``ctx["ltd_s3_source"]`` records it
+    and :func:`shutdown` closes it.
+    """
+    source = LtdS3Source(
+        max_pool_connections=config.keeper_sync_upload_concurrency,
+        logger=logger,
+    )
+    await source.open()
+    ctx["ltd_s3_source"] = source
+    return source
+
+
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
 """Five-minute cadence for the ``arq_queue_stats`` gauge.
 
@@ -386,6 +417,7 @@ class WorkerFactoryBuilder:
         keeper_sync_upload_max_backoff_seconds: float,
         keeper_sync_copy_retry_delay_seconds: float,
         keeper_sync_upload_limiter: asyncio.Semaphore,
+        ltd_s3_source: LtdS3Source | None = None,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -429,6 +461,11 @@ class WorkerFactoryBuilder:
         # ``keeper_sync_project`` job's copier shares this one semaphore.
         # A per-job limiter would multiply the cap by ``max_jobs``.
         self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
+        # Process-lifetime and owned by ``shutdown``, like
+        # ``copy_http_client``, and optional for the same reason: test
+        # ctxs that never download from LTD need not open one, and their
+        # per-job factories then open a source per copier instead.
+        self._ltd_s3_source = ltd_s3_source
 
     @property
     def github_app_enabled(self) -> bool:
@@ -485,6 +522,7 @@ class WorkerFactoryBuilder:
                 self._keeper_sync_copy_retry_delay_seconds
             ),
             keeper_sync_upload_limiter=self._keeper_sync_upload_limiter,
+            ltd_s3_source=self._ltd_s3_source,
         )
 
 
@@ -541,6 +579,7 @@ async def _startup(
     )
 
     http_client, copy_http_client = initialize_worker_http_clients(ctx)
+    ltd_s3_source = await initialize_worker_ltd_s3_source(ctx, logger=logger)
     discovery = DiscoveryClient(
         http_client,
         base_url=str(config.repertoire_base_url),
@@ -555,10 +594,10 @@ async def _startup(
         default_queue_name=config.arq_queue_name,
     )
 
-    # ``arq_queue`` and the two HTTP clients stay in ctx because
-    # ``shutdown`` owns their teardown. The factory builder captures them
-    # by reference, so worker functions never need to look them up
-    # directly.
+    # ``arq_queue``, the two HTTP clients and the LTD source stay in ctx
+    # because ``shutdown`` owns their teardown. The factory builder
+    # captures them by reference, so worker functions never need to look
+    # them up directly.
     ctx["arq_queue"] = arq_queue
     factory_builder = WorkerFactoryBuilder(
         encryptor=encryptor,
@@ -590,6 +629,7 @@ async def _startup(
         keeper_sync_upload_limiter=asyncio.Semaphore(
             config.keeper_sync_upload_concurrency
         ),
+        ltd_s3_source=ltd_s3_source,
     )
     await validate_github_app(
         state=factory_builder,
@@ -664,6 +704,9 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         await event_manager.aclose()
     await ctx["http_client"].aclose()
     await ctx["copy_http_client"].aclose()
+    ltd_s3_source = ctx.get("ltd_s3_source")
+    if ltd_s3_source is not None:
+        await ltd_s3_source.close()
     await db_session_dependency.aclose()
     logger = structlog.get_logger("docverse_server.worker")
     logger.info("Worker shutdown complete")

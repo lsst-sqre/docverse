@@ -27,6 +27,7 @@ from docverse_server.storage.github import (
     GitHubAppNotConfiguredError,
     validate_github_app,
 )
+from docverse_server.storage.ltd import LtdS3Source
 from docverse_server.worker.main import WorkerFactoryBuilder
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
@@ -49,6 +50,7 @@ def _make_builder(
     keeper_sync_upload_max_backoff_seconds: float | None = None,
     keeper_sync_copy_retry_delay_seconds: float | None = None,
     keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
+    ltd_s3_source: LtdS3Source | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
@@ -87,6 +89,7 @@ def _make_builder(
             if keeper_sync_upload_limiter is not None
             else asyncio.Semaphore(_config.keeper_sync_upload_concurrency)
         ),
+        ltd_s3_source=ltd_s3_source,
     )
 
 
@@ -378,3 +381,40 @@ async def test_worker_factory_builder_shares_one_upload_limiter(
     assert (
         first.keeper_sync_upload_limiter is second.keeper_sync_upload_limiter
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_factory_builder_shares_one_ltd_source(
+    db_session: AsyncSession,
+) -> None:
+    """Per-job factories share the builder's process-lifetime LTD source.
+
+    LTD downloads only stop re-dialling S3 per build if every
+    ``keeper_sync_project`` job's copiers read through the one source
+    ``_startup`` opened, whose connection pool is sized to the worker's
+    upload cap (PRD #698).
+    """
+    source = LtdS3Source(logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client, ltd_s3_source=source)
+        first = builder(session=db_session, logger=_logger())
+        second = builder(session=db_session, logger=_logger())
+
+    assert first.ltd_s3_source is source
+    assert second.ltd_s3_source is source
+
+
+@pytest.mark.asyncio
+async def test_builder_without_ltd_source_leaves_copiers_their_own(
+    db_session: AsyncSession,
+) -> None:
+    """A builder given no LTD source builds factories without one.
+
+    Test ctxs that never copy from S3 need not open a source; their
+    copiers then open and close one each, as before.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client)
+        factory = builder(session=db_session, logger=_logger())
+
+    assert factory.ltd_s3_source is None

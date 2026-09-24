@@ -42,13 +42,19 @@ class _StubLtdSource:
     """Async-CM stand-in for ``LtdS3Source`` that never touches S3.
 
     Serves ``objects`` (key to body) when given, and an empty bucket
-    otherwise.
+    otherwise. Counts its context entries and exits, and records every
+    prefix it lists, so a test can tell which source a copier read from
+    and whether the factory opened or closed it.
     """
 
     def __init__(self, objects: dict[str, bytes] | None = None) -> None:
         self._objects = objects or {}
+        self.enters = 0
+        self.exits = 0
+        self.listed: list[str] = []
 
     async def __aenter__(self) -> Self:
+        self.enters += 1
         return self
 
     async def __aexit__(
@@ -57,9 +63,10 @@ class _StubLtdSource:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        return None
+        self.exits += 1
 
     async def list_keys(self, *, prefix: str) -> list[str]:
+        self.listed.append(prefix)
         return [key for key in self._objects if key.startswith(prefix)]
 
     async def download_object(self, *, key: str) -> bytes:
@@ -199,6 +206,103 @@ async def test_factory_create_ltd_s3_source_returns_unopened(
     )
     source = factory.create_ltd_s3_source()
     assert isinstance(source, LtdS3Source)
+
+
+@pytest.mark.asyncio
+async def test_copier_reuses_the_shared_ltd_source(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every copier reads LTD through the factory's shared, open source.
+
+    The sync worker opens one ``LtdS3Source`` per process so LTD
+    downloads reuse its connections across builds and manifest hashes.
+    A copier that opened a source of its own, or closed the shared one
+    on exit, would re-dial S3 per build and leave each closed connection
+    pinning a Cloud NAT port through TIME_WAIT (PRD #698).
+    """
+    shared = _StubLtdSource({"proj/builds/1/index.html": b"<html></html>"})
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        default_queue_name="docverse:queue",
+        ltd_s3_source=shared,
+    )
+
+    async def _fake_objectstore(
+        *, org_id: int, service_label: str, **options: object
+    ) -> MockObjectStore:
+        return MockObjectStore()
+
+    def _own_source(**kwargs: object) -> _StubLtdSource:
+        msg = "copier built its own LTD source despite a shared one"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        factory, "create_objectstore_for_org", _fake_objectstore
+    )
+    monkeypatch.setattr(factory, "create_ltd_s3_source", _own_source)
+
+    for _ in range(2):
+        async with factory.create_build_content_copier_for_org(
+            org_id=1, service_label="r2"
+        ) as copier:
+            await copier.compute_manifest_hash(source_prefix="proj/builds/1/")
+
+    assert factory.ltd_s3_source is shared
+    assert shared.listed == ["proj/builds/1/", "proj/builds/1/"]
+    assert shared.enters == 0
+    assert shared.exits == 0
+
+
+@pytest.mark.asyncio
+async def test_copier_opens_its_own_source_when_none_shared(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a shared source each copier opens and closes its own.
+
+    Directly constructed factories (tests, scripts) hold no shared
+    source, so every copier keeps today's lifetime: a fresh source from
+    ``create_ltd_s3_source``, opened on entry and closed on exit.
+    """
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        default_queue_name="docverse:queue",
+    )
+    created: list[_StubLtdSource] = []
+
+    async def _fake_objectstore(
+        *, org_id: int, service_label: str, **options: object
+    ) -> MockObjectStore:
+        return MockObjectStore()
+
+    def _create_ltd_s3_source(**kwargs: object) -> _StubLtdSource:
+        source = _StubLtdSource()
+        created.append(source)
+        return source
+
+    monkeypatch.setattr(
+        factory, "create_objectstore_for_org", _fake_objectstore
+    )
+    monkeypatch.setattr(factory, "create_ltd_s3_source", _create_ltd_s3_source)
+
+    for _ in range(2):
+        async with factory.create_build_content_copier_for_org(
+            org_id=1, service_label="r2"
+        ) as copier:
+            await copier.compute_manifest_hash(source_prefix="proj/builds/1/")
+            assert created[-1].enters == 1
+            assert created[-1].exits == 0
+
+    assert factory.ltd_s3_source is None
+    assert len(created) == 2
+    assert created[0] is not created[1]
+    for source in created:
+        assert source.listed == ["proj/builds/1/"]
+        assert source.enters == 1
+        assert source.exits == 1
 
 
 @pytest.mark.asyncio
