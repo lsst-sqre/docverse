@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from contextlib import nullcontext
 from time import monotonic
 from types import TracebackType
 from typing import Self
@@ -413,14 +414,9 @@ class S3ObjectStore:
             # The slot covers the PUT alone. Signing above needs no
             # connection, and ``retry_request`` sleeps its backoff after
             # this returns or raises, so a retrying object never holds a
-            # slot through its wait.
-            if self._upload_limiter is None:
-                return await http_client.put(
-                    url,
-                    content=data,
-                    headers={"Content-Type": content_type},
-                )
-            async with self._upload_limiter:
+            # slot through its wait. Without a limiter the PUT runs
+            # under a no-op context instead.
+            async with self._upload_limiter or nullcontext():
                 return await http_client.put(
                     url,
                     content=data,
