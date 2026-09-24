@@ -430,6 +430,22 @@ class Configuration(BaseSettings):
         ),
     )
 
+    keeper_sync_upload_concurrency: int = Field(
+        32,
+        ge=1,
+        title="Concurrent keeper-sync presigned uploads per worker process",
+        description=(
+            "Process-wide bound on concurrent presigned PUTs across every"
+            " running keeper-sync job, and the size of the sync worker's"
+            " build-copy connection pool: that client opens at most this"
+            " many connections plus 10 and keeps every one of them alive"
+            " between uploads. ``keeper_sync_max_jobs`` x"
+            " ``keeper_sync_copy_concurrency`` remains the memory bound"
+            " (the object bodies copiers buffer) and sizes no pool; a"
+            " value above that product never throttles an upload."
+        ),
+    )
+
     keeper_sync_copy_retry_delay_seconds: float = Field(
         30.0,
         ge=0.0,

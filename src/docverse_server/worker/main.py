@@ -222,65 +222,60 @@ retry loop treats as a retryable transport error.
 """
 
 COPY_HTTP_CONNECTION_HEADROOM = 10
-"""Copy-client connections allowed above one per in-flight object copy.
+"""Copy-client connections allowed above one per capped upload.
 
-:func:`copy_http_limits` budgets one connection for every object
-transfer that can be in flight at once — ``keeper_sync_max_jobs``
-concurrent jobs, each running a copier of ``keeper_sync_copy_concurrency``
-transfers — so no presigned PUT waits on the pool at full concurrency.
+:func:`copy_http_limits` budgets one connection for every presigned PUT
+that ``Config.keeper_sync_upload_concurrency`` lets through at once
+across the worker process, so no upload waits on the pool at the cap.
 The headroom above that budget keeps a brief overlap, such as a
 connection being torn down after a failed attempt while its retry opens
 a replacement, from queueing an upload behind the pool.
 """
 
-COPY_HTTP_KEEPALIVE_PER_COPY_SLOT = 2
-"""Idle copy-client connections kept alive per copier transfer slot.
+COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS = 60.0
+"""Seconds an idle copy-client connection stays open for reuse.
 
-Two copiers' worth of connections stay warm between builds, so the next
-build a job copies reuses them instead of paying a TLS handshake per
-object, without holding the full burst's worth of sockets to R2 open
-while the queue is idle.
+httpx's default of 5 s closed connections in the gaps between builds,
+so each build re-dialed R2. A minute keeps the pool warm across those
+gaps and across the jobs of a backfill wave; a quiet worker still lets
+its connections go.
 """
 
 
-def copy_http_limits(*, max_jobs: int, copy_concurrency: int) -> httpx.Limits:
-    """Derive the copy client's connection pool from copy concurrency.
+def copy_http_limits(*, upload_concurrency: int) -> httpx.Limits:
+    """Derive the copy client's connection pool from the upload cap.
 
-    The worker's shared client keeps httpx's defaults (100 connections,
-    20 kept alive), which the stock 10 x 8 = 80 concurrent presigned
-    PUTs ran close enough to that a pool wait also surfaced as an
-    upload timeout (PRD #685). The copy client is instead sized from the
-    two settings that bound its load.
+    Every connection the pool may open is also kept alive. httpcore
+    closes an idle connection whenever the pool holds more connections
+    in total than ``max_keepalive_connections``, so a smaller keepalive
+    limit tears a connection down after almost every PUT of a burst and
+    the next object re-dials TCP and TLS. On 2026-09-24 that churn
+    exhausted the sync worker node's Cloud NAT ports, each closed
+    connection pinning one for the 120 s TIME_WAIT, and new connects to
+    R2 timed out (PRD #698).
 
     Parameters
     ----------
-    max_jobs
-        Concurrent jobs in the keeper-sync pool
-        (``Config.keeper_sync_max_jobs``).
-    copy_concurrency
-        Concurrent object transfers per copier
-        (``Config.keeper_sync_copy_concurrency``).
+    upload_concurrency
+        Concurrent presigned PUTs across the worker process
+        (``Config.keeper_sync_upload_concurrency``).
 
     Returns
     -------
     httpx.Limits
-        One connection per in-flight copy plus
-        :data:`COPY_HTTP_CONNECTION_HEADROOM`, with
-        :data:`COPY_HTTP_KEEPALIVE_PER_COPY_SLOT` idle connections kept
-        per transfer slot.
+        One connection per capped upload plus
+        :data:`COPY_HTTP_CONNECTION_HEADROOM`, all of them kept alive for
+        :data:`COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS`.
     """
+    max_connections = upload_concurrency + COPY_HTTP_CONNECTION_HEADROOM
     return httpx.Limits(
-        max_connections=max_jobs * copy_concurrency
-        + COPY_HTTP_CONNECTION_HEADROOM,
-        max_keepalive_connections=(
-            copy_concurrency * COPY_HTTP_KEEPALIVE_PER_COPY_SLOT
-        ),
+        max_connections=max_connections,
+        max_keepalive_connections=max_connections,
+        keepalive_expiry=COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     )
 
 
-def create_copy_http_client(
-    *, max_jobs: int, copy_concurrency: int
-) -> httpx.AsyncClient:
+def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     """Build the worker's dedicated HTTP client for build-content copies.
 
     Presigned PUTs of copied build content go over this client so that
@@ -290,18 +285,13 @@ def create_copy_http_client(
 
     Parameters
     ----------
-    max_jobs
-        Concurrent jobs in the keeper-sync pool
-        (``Config.keeper_sync_max_jobs``).
-    copy_concurrency
-        Concurrent object transfers per copier
-        (``Config.keeper_sync_copy_concurrency``).
+    upload_concurrency
+        Concurrent presigned PUTs across the worker process
+        (``Config.keeper_sync_upload_concurrency``).
     """
     return httpx.AsyncClient(
         timeout=COPY_HTTP_TIMEOUT,
-        limits=copy_http_limits(
-            max_jobs=max_jobs, copy_concurrency=copy_concurrency
-        ),
+        limits=copy_http_limits(upload_concurrency=upload_concurrency),
     )
 
 
@@ -312,10 +302,10 @@ def initialize_worker_http_clients(
 
     ``ctx["http_client"]`` is the shared client (httpx defaults) and
     ``ctx["copy_http_client"]`` the build-copy client from
-    :func:`create_copy_http_client`, sized from the keeper-sync pool's
-    settings whichever pool is starting: the pools share
-    :func:`_startup`, only keeper-sync jobs copy, and the copy client
-    opens no connection until a copy uses it.
+    :func:`create_copy_http_client`, sized from
+    ``keeper_sync_upload_concurrency`` whichever pool is starting: the
+    pools share :func:`_startup`, only keeper-sync jobs copy, and the
+    copy client opens no connection until a copy uses it.
 
     Split out of :func:`_startup`, like :func:`initialize_worker_db_pool`,
     so the clients a worker actually ships with are reachable without
@@ -329,8 +319,7 @@ def initialize_worker_http_clients(
     """
     http_client = httpx.AsyncClient()
     copy_http_client = create_copy_http_client(
-        max_jobs=config.keeper_sync_max_jobs,
-        copy_concurrency=config.keeper_sync_copy_concurrency,
+        upload_concurrency=config.keeper_sync_upload_concurrency
     )
     ctx["http_client"] = http_client
     ctx["copy_http_client"] = copy_http_client

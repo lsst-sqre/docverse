@@ -30,7 +30,7 @@ The layers, innermost first:
 | Layer | Where it lives | What it absorbs | Tuned by |
 | --- | --- | --- | --- |
 | Per-object upload retry | `S3ObjectStore`'s presigned PUT, through the shared `retry_request` loop | A connect stall, a dropped connection, or a `429`/`5xx`, for about 65 s per object | `keeper_sync_upload_max_attempts`, `keeper_sync_upload_max_backoff_seconds` |
-| Dedicated copy client | `worker/main.py` | Pool waits that used to surface as upload timeouts; gives each attempt a 10 s connect window | Constants, sized from `keeper_sync_max_jobs` and `keeper_sync_copy_concurrency` |
+| Dedicated copy client | `worker/main.py` | Pool waits that used to surface as upload timeouts; gives each attempt a 10 s connect window | Constants, sized from `keeper_sync_upload_concurrency` |
 | Build-level retry | `KeeperSyncService.sync_build` | A transport outage on either end of the copy: an R2 outage that outlasts one object's whole budget, or the LTD bucket timing out or dropping a connection during a download. One re-run of the copy | `keeper_sync_copy_retry_delay_seconds` |
 | Later syncs | The tier crons, `POST .../refresh`, a backfill run | Anything longer (see [When both retries fail](#when-both-retries-fail)) | None |
 
@@ -54,6 +54,7 @@ both ends.
 | --- | --- | --- | --- |
 | `keeper_sync_upload_max_attempts` | `DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_ATTEMPTS` | `6` | at least 1 |
 | `keeper_sync_upload_max_backoff_seconds` | `DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_BACKOFF_SECONDS` | `30.0` | at least 0 |
+| `keeper_sync_upload_concurrency` | `DOCVERSE_KEEPER_SYNC_UPLOAD_CONCURRENCY` | `32` | at least 1 |
 | `keeper_sync_copy_retry_delay_seconds` | `DOCVERSE_KEEPER_SYNC_COPY_RETRY_DELAY_SECONDS` | `30.0` | at least 0 |
 
 - `keeper_sync_upload_max_attempts` counts the first attempt, so `1`
@@ -68,19 +69,25 @@ both ends.
   `keeper_sync_upload_max_attempts` is raised past seven. At `0.0`,
   retries go out back to back. The base of the backoff, 0.5 s, is not
   configurable.
+- `keeper_sync_upload_concurrency` bounds the presigned PUTs in flight
+  at once across every keeper-sync job in the worker process, and sizes
+  the copy client's connection pool (see
+  [Connection pool](#connection-pool)). A value above
+  `keeper_sync_max_jobs` x `keeper_sync_copy_concurrency` (80 at the
+  defaults) never throttles an upload.
 - `keeper_sync_copy_retry_delay_seconds` is how long the build-level
   retry waits before it re-runs a failed copy. At `0.0` the copy is
   re-run at once. It is a wait, not a count: the copy is re-run at most
   once whatever the value.
 
 Two neighbouring settings are not on this table because they are not
-retry knobs, but they size the copy client's connection pool (see
-[The copy client](#the-copy-client)): `keeper_sync_max_jobs`
-(default 10) and `keeper_sync_copy_concurrency` (default 8). Their
-product is also what the sync worker's memory limit is sized against,
-so raising either one means raising that limit too.
+transport knobs: `keeper_sync_max_jobs` (default 10) and
+`keeper_sync_copy_concurrency` (default 8). Their product bounds the
+object bodies the sync worker buffers at once, which is what its memory
+limit is sized against, so raising either one means raising that limit
+too. It no longer sizes the copy client's connection pool.
 
-**Phalanx values for these three settings are optional.** The defaults
+**Phalanx values for these settings are optional.** The defaults
 above are the intended production values, chosen against the
 2026-09-22 outage, so no environment needs to set them. Add chart
 values for them, in a Phalanx change of their own, only to move one
@@ -162,33 +169,35 @@ the per-object budget.
 
 ### Connection pool
 
-`copy_http_limits` derives the pool from the two concurrency settings:
+`copy_http_limits` derives the pool from the upload cap:
 
 | Limit | Formula | At the defaults |
 | --- | --- | --- |
-| `max_connections` | `keeper_sync_max_jobs` x `keeper_sync_copy_concurrency` + `COPY_HTTP_CONNECTION_HEADROOM` (10) | 90 |
-| `max_keepalive_connections` | `keeper_sync_copy_concurrency` x `COPY_HTTP_KEEPALIVE_PER_COPY_SLOT` (2) | 16 |
+| `max_connections` | `keeper_sync_upload_concurrency` + `COPY_HTTP_CONNECTION_HEADROOM` (10) | 42 |
+| `max_keepalive_connections` | Same as `max_connections` | 42 |
+| `keepalive_expiry` | `COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS` | 60 s |
 
-- `max_connections` budgets one connection for every object transfer
-  that can be in flight at once: `keeper_sync_max_jobs` concurrent
-  `keeper_sync_project` jobs, each running a copier of
-  `keeper_sync_copy_concurrency` transfers. No PUT waits on the pool at
-  full concurrency. The headroom covers brief overlaps, such as a
-  connection being torn down after a failed attempt while its retry
-  opens a replacement.
-- `max_keepalive_connections` keeps two copiers' worth of connections
-  warm between builds. The next build a job copies reuses them instead
-  of paying a TLS handshake per object, and an idle queue does not hold
-  a whole burst's worth of sockets to R2 open.
+- `max_connections` budgets one connection for every presigned PUT that
+  `keeper_sync_upload_concurrency` lets through at once, across every
+  `keeper_sync_project` job in the process. No PUT waits on the pool at
+  the cap. The headroom covers brief overlaps, such as a connection
+  being torn down after a failed attempt while its retry opens a
+  replacement.
+- `max_keepalive_connections` equals `max_connections`, so every
+  connection the pool opens is kept alive. httpcore closes an idle
+  connection whenever the pool holds more connections than this, so a
+  lower value tears a connection down after almost every PUT of a burst
+  and the next object re-dials R2.
+- `keepalive_expiry` keeps an idle connection open for a minute rather
+  than httpx's default 5 s, so the pool stays warm between builds.
 
-The timeouts and the headroom are constants, not configuration: they
-bound transport behaviour an operator has no reason to tune, while the
-retry budget on top of them is configurable. The pool follows
-`keeper_sync_max_jobs` and `keeper_sync_copy_concurrency`
-automatically. Every worker pool opens a copy client sized from those
-keeper-sync settings, because the pools share one startup, but only
-keeper-sync jobs copy and the client opens no connection until a copy
-uses it.
+The timeouts, the headroom and the keepalive expiry are constants, not
+configuration: they bound transport behaviour an operator has no reason
+to tune, while the retry budget on top of them is configurable. The
+pool follows `keeper_sync_upload_concurrency` automatically. Every
+worker pool opens a copy client sized from that setting, because the
+pools share one startup, but only keeper-sync jobs copy and the client
+opens no connection until a copy uses it.
 
 ## The build-level retry
 
