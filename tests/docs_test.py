@@ -492,6 +492,23 @@ def test_transport_page_names_the_upload_cap_and_memory_knobs() -> None:
     )
 
 
+def test_transport_page_states_the_process_wide_upload_cap() -> None:
+    """The copy-client section covers the cap; the non-goals drop it.
+
+    PRD #685 listed capping in-flight copies across the process among
+    the things the layers deliberately do not do. PRD #698 reversed
+    that: ``keeper_sync_upload_concurrency`` bounds every presigned PUT
+    in the sync worker, so the section describing the copy client has
+    to name it, and the non-goals list must stop denying it.
+    """
+    page = _read(_TRANSPORT_PAGE)
+    copy_client = _section(page, "The copy client")
+    assert "\n### The worker-wide upload cap\n" in copy_client
+    assert not _uncoded({"keeper_sync_upload_concurrency"}, copy_client)
+    non_goals = _section(page, "What the layers deliberately do not do")
+    assert "Cap in-flight copies" not in non_goals
+
+
 def test_transport_ride_out_arithmetic_documented() -> None:
     """The page's per-object ride-out sum matches the shipped defaults.
 

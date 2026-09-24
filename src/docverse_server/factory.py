@@ -1153,7 +1153,11 @@ class Factory:
         ``keeper_sync_copy_concurrency``, so an operator can move the
         sync worker's memory ceiling without a code change. Peak
         resident size scales with the pool's ``max_jobs`` times that
-        bound times the largest object under a build prefix.
+        bound times the largest object under a build prefix. That
+        product bounds memory only and sizes no connection pool: the
+        connections the copies open are bounded by the upload limiter
+        and the shared source's pool, both sized from
+        ``Config.keeper_sync_upload_concurrency``.
 
         The destination store is the only one this factory builds with
         the ``keeper_sync_upload_*`` retry budget rather than the shared

@@ -212,9 +212,11 @@ wider than the shared client's flat 5 s for its own reason:
   up and waiting for R2 to acknowledge it; a large build asset can take
   longer than 5 s to send on a busy pod.
 - ``pool`` (30 s) is how long an upload waits for a free connection.
-  The pool is sized so that wait should not happen (see
-  :func:`copy_http_limits`), but if it does, a long wait is better than
-  failing an attempt that never reached R2.
+  The worker's upload limiter holds PUTs to
+  ``Config.keeper_sync_upload_concurrency``, below the pool's size (see
+  :func:`copy_http_limits`), so that wait should not happen; if it
+  does, a long wait is better than failing an attempt that never
+  reached R2.
 
 These are constants rather than configuration: they bound transport
 behaviour an operator has no reason to tune, while the retry budget
@@ -795,7 +797,12 @@ class KeeperSyncWorkerSettings:
     ``keeper_sync_max_jobs`` x ``keeper_sync_copy_concurrency`` x the
     largest object under a build prefix. Both factors are now
     env-driven, so the pod's memory limit and the concurrency that
-    limit is sized against can move together.
+    limit is sized against can move together. That product sizes no
+    connection pool: ``keeper_sync_upload_concurrency`` caps the
+    presigned PUTs of every concurrent job and sizes both build-copy
+    pools, the copy client (:func:`copy_http_limits`) and the shared
+    LTD source (:func:`initialize_worker_ltd_s3_source`), so raising
+    ``max_jobs`` adds buffered bodies, not connections from the node.
 
     ``max_jobs`` is equally this pool's *database*-pool input.
     ``startup_keeper_sync`` sizes the engine from it via

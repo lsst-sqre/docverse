@@ -31,10 +31,11 @@ that back each of them up.
 - [Keeper-sync transport resilience](keeper-sync-transport.md) — how a
   build copy rides out an outage on either end, R2 or the LTD bucket:
   the per-object budget for R2 uploads and its ride-out arithmetic, the
-  dedicated copy client, the build-level retry that re-runs a copy
-  after a transport error on either end, what happens to an edition
-  that still fails, and how to read the `build_content_copied` metrics
-  event.
+  dedicated copy client, the worker-wide upload cap and shared LTD
+  source client that keep the sync worker inside its node's NAT port
+  budget, the build-level retry that re-runs a copy after a transport
+  error on either end, what happens to an edition that still fails, and
+  how to read the `build_content_copied` metrics event.
 
 The other maintenance-pool jobs do not have operations pages yet;
 until they do, their module docstrings under

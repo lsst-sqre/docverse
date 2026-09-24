@@ -633,3 +633,23 @@ def test_keeper_sync_upload_concurrency_fits_the_nat_port_budget() -> None:
     )
     assert max_connections == 42
     assert max_connections <= _CLOUD_NAT_STATIC_PORTS_PER_VM
+
+
+@pytest.mark.parametrize(
+    "name", ["keeper_sync_max_jobs", "keeper_sync_copy_concurrency"]
+)
+def test_memory_knob_descriptions_defer_connections_to_the_upload_cap(
+    name: str,
+) -> None:
+    """The two memory knobs' descriptions no longer size a connection pool.
+
+    Their product sized the copy client's pool under PRD #685; since PRD
+    #698 ``keeper_sync_upload_concurrency`` does, across every job. The
+    description is the operator-facing documentation of the setting, so
+    one still quoting the old ``+ 10`` formula would steer an operator
+    tuning connections to the wrong knob.
+    """
+    description = Configuration.model_fields[name].description
+    assert description is not None
+    assert "``keeper_sync_upload_concurrency``" in description
+    assert "+ 10" not in description
