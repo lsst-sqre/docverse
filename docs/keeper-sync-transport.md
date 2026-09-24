@@ -49,10 +49,13 @@ its keepalive limit. With 80 PUTs in flight, nearly every finished
 PUT's connection was torn down, the next object re-dialled TCP and TLS,
 and each closed connection pinned another NAT port for two minutes. One
 project's eight connections sit under the limit of 16 and are reused,
-which is why a single refresh never tripped it. LTD downloads drew on
-the same port budget: every copier opened an S3 client of its own and
-closed it at the end of its build, and one drop to AWS S3 showed in the
-NAT logs too.
+which is why a single refresh never tripped it. LTD downloads churned
+the same way: every copier opened an S3 client of its own and closed it
+at the end of its build, and one drop to AWS S3 showed in the NAT logs
+too. A Cloud NAT port is spent per unique destination (address, port
+and protocol), so the connections to R2 and the connections to the LTD
+bucket on S3 draw on separate 64-port budgets rather than one; each
+side has to fit on its own.
 
 PRD #698 bounds the sync worker's connections and reuses them for the
 life of a burst, in both directions: a
@@ -150,7 +153,10 @@ The Phalanx chart's `uploadConcurrency` value sets
 until the cluster's Cloud NAT allocation is raised above its static 64
 ports per VM: at 32 the copy client holds at most 42 connections to R2,
 inside that allocation, and keeps every one open so a burst closes
-none. Raise it only after the NAT allocation, never ahead of it.
+none. The LTD source client's pool of 32 fits the same way, and it does
+not count against the R2 pool: Cloud NAT allocates ports per unique
+destination, so the two pools spend separate budgets. Raise the value
+only after the NAT allocation, never ahead of it.
 
 ## The per-object budget
 
@@ -313,7 +319,10 @@ re-dialled S3.
 Its pool (`max_pool_connections`) holds up to
 `keeper_sync_upload_concurrency` connections rather than botocore's
 default of 10, which would throttle the copiers' downloads far below
-the upload cap. Past the pool, a download queues for a connection
+the upload cap. It fits the node's 64 static NAT ports on its own, and
+it does not share them with the copy client: Cloud NAT counts a port
+per unique destination, and the LTD bucket on S3 is a different
+destination from R2. Past the pool, a download queues for a connection
 rather than failing, and a released connection stays open for the
 next download for 12 s, aiobotocore's default idle keepalive. Like the
 copy client, every worker pool opens the source, but it opens no

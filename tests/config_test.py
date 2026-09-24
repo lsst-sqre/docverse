@@ -626,6 +626,11 @@ def test_keeper_sync_upload_concurrency_fits_the_nat_port_budget() -> None:
     more connections to R2 than its node's static Cloud NAT allocation,
     and reusing them leaves no closed connection pinning a port in
     TIME_WAIT.
+
+    Only the R2 pool is budgeted here. Cloud NAT spends a port per
+    unique destination (address, port and protocol), so the LTD source
+    client's pool, which connects to the LTD bucket on S3, draws on a
+    separate allocation of the same size and is not added to this sum.
     """
     config = Configuration()
     max_connections = (
