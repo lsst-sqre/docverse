@@ -5,6 +5,7 @@ Launch with: ``arq docverse_server.worker.main.WorkerSettings``
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from importlib.metadata import version
@@ -44,6 +45,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     TIER_OTHER_CRON_INTERVAL,
 )
 from docverse_server.storage.github import validate_github_app
+from docverse_server.storage.ltd import LtdS3Source
 
 from .functions import (
     build_processing,
@@ -210,9 +212,11 @@ wider than the shared client's flat 5 s for its own reason:
   up and waiting for R2 to acknowledge it; a large build asset can take
   longer than 5 s to send on a busy pod.
 - ``pool`` (30 s) is how long an upload waits for a free connection.
-  The pool is sized so that wait should not happen (see
-  :func:`copy_http_limits`), but if it does, a long wait is better than
-  failing an attempt that never reached R2.
+  The worker's upload limiter holds PUTs to
+  ``Config.keeper_sync_upload_concurrency``, below the pool's size (see
+  :func:`copy_http_limits`), so that wait should not happen; if it
+  does, a long wait is better than failing an attempt that never
+  reached R2.
 
 These are constants rather than configuration: they bound transport
 behaviour an operator has no reason to tune, while the retry budget
@@ -222,65 +226,60 @@ retry loop treats as a retryable transport error.
 """
 
 COPY_HTTP_CONNECTION_HEADROOM = 10
-"""Copy-client connections allowed above one per in-flight object copy.
+"""Copy-client connections allowed above one per capped upload.
 
-:func:`copy_http_limits` budgets one connection for every object
-transfer that can be in flight at once — ``keeper_sync_max_jobs``
-concurrent jobs, each running a copier of ``keeper_sync_copy_concurrency``
-transfers — so no presigned PUT waits on the pool at full concurrency.
+:func:`copy_http_limits` budgets one connection for every presigned PUT
+that ``Config.keeper_sync_upload_concurrency`` lets through at once
+across the worker process, so no upload waits on the pool at the cap.
 The headroom above that budget keeps a brief overlap, such as a
 connection being torn down after a failed attempt while its retry opens
 a replacement, from queueing an upload behind the pool.
 """
 
-COPY_HTTP_KEEPALIVE_PER_COPY_SLOT = 2
-"""Idle copy-client connections kept alive per copier transfer slot.
+COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS = 60.0
+"""Seconds an idle copy-client connection stays open for reuse.
 
-Two copiers' worth of connections stay warm between builds, so the next
-build a job copies reuses them instead of paying a TLS handshake per
-object, without holding the full burst's worth of sockets to R2 open
-while the queue is idle.
+httpx's default of 5 s closed connections in the gaps between builds,
+so each build re-dialed R2. A minute keeps the pool warm across those
+gaps and across the jobs of a backfill wave; a quiet worker still lets
+its connections go.
 """
 
 
-def copy_http_limits(*, max_jobs: int, copy_concurrency: int) -> httpx.Limits:
-    """Derive the copy client's connection pool from copy concurrency.
+def copy_http_limits(*, upload_concurrency: int) -> httpx.Limits:
+    """Derive the copy client's connection pool from the upload cap.
 
-    The worker's shared client keeps httpx's defaults (100 connections,
-    20 kept alive), which the stock 10 x 8 = 80 concurrent presigned
-    PUTs ran close enough to that a pool wait also surfaced as an
-    upload timeout (PRD #685). The copy client is instead sized from the
-    two settings that bound its load.
+    Every connection the pool may open is also kept alive. httpcore
+    closes an idle connection whenever the pool holds more connections
+    in total than ``max_keepalive_connections``, so a smaller keepalive
+    limit tears a connection down after almost every PUT of a burst and
+    the next object re-dials TCP and TLS. On 2026-09-24 that churn
+    exhausted the sync worker node's Cloud NAT ports, each closed
+    connection pinning one for the 120 s TIME_WAIT, and new connects to
+    R2 timed out (PRD #698).
 
     Parameters
     ----------
-    max_jobs
-        Concurrent jobs in the keeper-sync pool
-        (``Config.keeper_sync_max_jobs``).
-    copy_concurrency
-        Concurrent object transfers per copier
-        (``Config.keeper_sync_copy_concurrency``).
+    upload_concurrency
+        Concurrent presigned PUTs across the worker process
+        (``Config.keeper_sync_upload_concurrency``).
 
     Returns
     -------
     httpx.Limits
-        One connection per in-flight copy plus
-        :data:`COPY_HTTP_CONNECTION_HEADROOM`, with
-        :data:`COPY_HTTP_KEEPALIVE_PER_COPY_SLOT` idle connections kept
-        per transfer slot.
+        One connection per capped upload plus
+        :data:`COPY_HTTP_CONNECTION_HEADROOM`, all of them kept alive for
+        :data:`COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS`.
     """
+    max_connections = upload_concurrency + COPY_HTTP_CONNECTION_HEADROOM
     return httpx.Limits(
-        max_connections=max_jobs * copy_concurrency
-        + COPY_HTTP_CONNECTION_HEADROOM,
-        max_keepalive_connections=(
-            copy_concurrency * COPY_HTTP_KEEPALIVE_PER_COPY_SLOT
-        ),
+        max_connections=max_connections,
+        max_keepalive_connections=max_connections,
+        keepalive_expiry=COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     )
 
 
-def create_copy_http_client(
-    *, max_jobs: int, copy_concurrency: int
-) -> httpx.AsyncClient:
+def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     """Build the worker's dedicated HTTP client for build-content copies.
 
     Presigned PUTs of copied build content go over this client so that
@@ -290,18 +289,13 @@ def create_copy_http_client(
 
     Parameters
     ----------
-    max_jobs
-        Concurrent jobs in the keeper-sync pool
-        (``Config.keeper_sync_max_jobs``).
-    copy_concurrency
-        Concurrent object transfers per copier
-        (``Config.keeper_sync_copy_concurrency``).
+    upload_concurrency
+        Concurrent presigned PUTs across the worker process
+        (``Config.keeper_sync_upload_concurrency``).
     """
     return httpx.AsyncClient(
         timeout=COPY_HTTP_TIMEOUT,
-        limits=copy_http_limits(
-            max_jobs=max_jobs, copy_concurrency=copy_concurrency
-        ),
+        limits=copy_http_limits(upload_concurrency=upload_concurrency),
     )
 
 
@@ -312,10 +306,10 @@ def initialize_worker_http_clients(
 
     ``ctx["http_client"]`` is the shared client (httpx defaults) and
     ``ctx["copy_http_client"]`` the build-copy client from
-    :func:`create_copy_http_client`, sized from the keeper-sync pool's
-    settings whichever pool is starting: the pools share
-    :func:`_startup`, only keeper-sync jobs copy, and the copy client
-    opens no connection until a copy uses it.
+    :func:`create_copy_http_client`, sized from
+    ``keeper_sync_upload_concurrency`` whichever pool is starting: the
+    pools share :func:`_startup`, only keeper-sync jobs copy, and the
+    copy client opens no connection until a copy uses it.
 
     Split out of :func:`_startup`, like :func:`initialize_worker_db_pool`,
     so the clients a worker actually ships with are reachable without
@@ -329,12 +323,41 @@ def initialize_worker_http_clients(
     """
     http_client = httpx.AsyncClient()
     copy_http_client = create_copy_http_client(
-        max_jobs=config.keeper_sync_max_jobs,
-        copy_concurrency=config.keeper_sync_copy_concurrency,
+        upload_concurrency=config.keeper_sync_upload_concurrency
     )
     ctx["http_client"] = http_client
     ctx["copy_http_client"] = copy_http_client
     return http_client, copy_http_client
+
+
+async def initialize_worker_ltd_s3_source(
+    ctx: dict[str, Any], *, logger: structlog.stdlib.BoundLogger
+) -> LtdS3Source:
+    """Open this worker process's LTD source and record it in ctx.
+
+    Every keeper-sync copier in the process reads the public
+    ``lsst-the-docs`` bucket through this one open source, so LTD
+    downloads reuse its connections across builds, manifest hashes and
+    jobs instead of opening a client, and dialling S3 afresh, per copier.
+    Each connection a per-copier client closed pinned a Cloud NAT port
+    for the 120 s TIME_WAIT, drawing on the same port budget as the
+    uploads to R2 (PRD #698).
+
+    The client's pool is sized from ``keeper_sync_upload_concurrency``
+    rather than botocore's default of ten, which would throttle the
+    copiers' downloads far below the upload cap; beyond the pool a
+    download queues for a connection rather than failing. Like the copy
+    client it is opened whichever pool is starting, and opens no
+    connection until a copy uses it. ``ctx["ltd_s3_source"]`` records it
+    and :func:`shutdown` closes it.
+    """
+    source = LtdS3Source(
+        max_pool_connections=config.keeper_sync_upload_concurrency,
+        logger=logger,
+    )
+    await source.open()
+    ctx["ltd_s3_source"] = source
+    return source
 
 
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
@@ -395,6 +418,8 @@ class WorkerFactoryBuilder:
         keeper_sync_upload_max_attempts: int,
         keeper_sync_upload_max_backoff_seconds: float,
         keeper_sync_copy_retry_delay_seconds: float,
+        keeper_sync_upload_limiter: asyncio.Semaphore,
+        ltd_s3_source: LtdS3Source | None = None,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -432,6 +457,17 @@ class WorkerFactoryBuilder:
         self._keeper_sync_copy_retry_delay_seconds = (
             keeper_sync_copy_retry_delay_seconds
         )
+        # Required for the same reason, and process-lifetime like
+        # ``purge_coalescer``: the cap on presigned PUTs (and so on the
+        # copy client's connections to R2) only holds if every concurrent
+        # ``keeper_sync_project`` job's copier shares this one semaphore.
+        # A per-job limiter would multiply the cap by ``max_jobs``.
+        self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
+        # Process-lifetime and owned by ``shutdown``, like
+        # ``copy_http_client``, and optional for the same reason: test
+        # ctxs that never download from LTD need not open one, and their
+        # per-job factories then open a source per copier instead.
+        self._ltd_s3_source = ltd_s3_source
 
     @property
     def github_app_enabled(self) -> bool:
@@ -487,6 +523,8 @@ class WorkerFactoryBuilder:
             keeper_sync_copy_retry_delay_seconds=(
                 self._keeper_sync_copy_retry_delay_seconds
             ),
+            keeper_sync_upload_limiter=self._keeper_sync_upload_limiter,
+            ltd_s3_source=self._ltd_s3_source,
         )
 
 
@@ -543,6 +581,7 @@ async def _startup(
     )
 
     http_client, copy_http_client = initialize_worker_http_clients(ctx)
+    ltd_s3_source = await initialize_worker_ltd_s3_source(ctx, logger=logger)
     discovery = DiscoveryClient(
         http_client,
         base_url=str(config.repertoire_base_url),
@@ -557,10 +596,10 @@ async def _startup(
         default_queue_name=config.arq_queue_name,
     )
 
-    # ``arq_queue`` and the two HTTP clients stay in ctx because
-    # ``shutdown`` owns their teardown. The factory builder captures them
-    # by reference, so worker functions never need to look them up
-    # directly.
+    # ``arq_queue``, the two HTTP clients and the LTD source stay in ctx
+    # because ``shutdown`` owns their teardown. The factory builder
+    # captures them by reference, so worker functions never need to look
+    # them up directly.
     ctx["arq_queue"] = arq_queue
     factory_builder = WorkerFactoryBuilder(
         encryptor=encryptor,
@@ -584,6 +623,15 @@ async def _startup(
         keeper_sync_copy_retry_delay_seconds=(
             config.keeper_sync_copy_retry_delay_seconds
         ),
+        # One per worker process, created here like the purge coalescer
+        # and captured by the builder so every job shares it. Sized to
+        # ``keeper_sync_upload_concurrency``, which sits below the copy
+        # client's ``max_connections`` so a PUT waiting on a slot never
+        # waits on the pool as well.
+        keeper_sync_upload_limiter=asyncio.Semaphore(
+            config.keeper_sync_upload_concurrency
+        ),
+        ltd_s3_source=ltd_s3_source,
     )
     await validate_github_app(
         state=factory_builder,
@@ -658,6 +706,9 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         await event_manager.aclose()
     await ctx["http_client"].aclose()
     await ctx["copy_http_client"].aclose()
+    ltd_s3_source = ctx.get("ltd_s3_source")
+    if ltd_s3_source is not None:
+        await ltd_s3_source.close()
     await db_session_dependency.aclose()
     logger = structlog.get_logger("docverse_server.worker")
     logger.info("Worker shutdown complete")
@@ -746,7 +797,12 @@ class KeeperSyncWorkerSettings:
     ``keeper_sync_max_jobs`` x ``keeper_sync_copy_concurrency`` x the
     largest object under a build prefix. Both factors are now
     env-driven, so the pod's memory limit and the concurrency that
-    limit is sized against can move together.
+    limit is sized against can move together. That product sizes no
+    connection pool: ``keeper_sync_upload_concurrency`` caps the
+    presigned PUTs of every concurrent job and sizes both build-copy
+    pools, the copy client (:func:`copy_http_limits`) and the shared
+    LTD source (:func:`initialize_worker_ltd_s3_source`), so raising
+    ``max_jobs`` adds buffered bodies, not connections from the node.
 
     ``max_jobs`` is equally this pool's *database*-pool input.
     ``startup_keeper_sync`` sizes the engine from it via

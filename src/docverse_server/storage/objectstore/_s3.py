@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
+from contextlib import nullcontext
 from time import monotonic
 from types import TracebackType
 from typing import Self
@@ -83,6 +85,18 @@ class S3ObjectStore:
         copy holds no database transaction or purge lock while it waits,
         so it can afford to outlast an R2 outage instead of failing
         inside it.
+    upload_limiter
+        Semaphore bounding how many presigned PUTs are in flight at
+        once. Each attempt holds one slot for its PUT alone: signing the
+        URL happens before the slot is taken, and the backoff between
+        attempts happens after it is released, so a retrying object never
+        idles a slot another upload could use. The keeper-sync worker
+        shares one semaphore, sized by
+        ``Config.keeper_sync_upload_concurrency``, across every copier's
+        store so the whole process never opens more upload connections
+        than that cap. ``None`` (the default) leaves uploads unbounded.
+        Only the presigned path honours it; the aiobotocore fallback
+        manages its own connection pool.
     """
 
     def __init__(
@@ -98,6 +112,7 @@ class S3ObjectStore:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+        upload_limiter: asyncio.Semaphore | None = None,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._bucket = bucket
@@ -112,6 +127,7 @@ class S3ObjectStore:
         self._max_attempts = max(1, max_attempts)
         self._base_backoff_seconds = base_backoff_seconds
         self._max_backoff_seconds = max_backoff_seconds
+        self._upload_limiter = upload_limiter
         self._session: AioSession = get_session()
         self._client_cm: ClientCreatorContext | None = None
         self._client: AioBaseClient | None = None
@@ -395,11 +411,17 @@ class S3ObjectStore:
             # is a local HMAC, so re-minting costs nothing but rules out
             # ever replaying an expired URL.
             url = await self._generate_upload_url(key)
-            return await http_client.put(
-                url,
-                content=data,
-                headers={"Content-Type": content_type},
-            )
+            # The slot covers the PUT alone. Signing above needs no
+            # connection, and ``retry_request`` sleeps its backoff after
+            # this returns or raises, so a retrying object never holds a
+            # slot through its wait. Without a limiter the PUT runs
+            # under a no-op context instead.
+            async with self._upload_limiter or nullcontext():
+                return await http_client.put(
+                    url,
+                    content=data,
+                    headers={"Content-Type": content_type},
+                )
 
         started = monotonic()
         try:

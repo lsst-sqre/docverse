@@ -29,6 +29,12 @@ Both factors come from configuration
 (``Config.keeper_sync_max_jobs`` and
 ``Config.keeper_sync_copy_concurrency``), so raising either one
 requires raising that limit with it.
+
+Connections are bounded separately, worker-wide: in the sync worker
+every copier's destination store shares one cap on presigned PUTs in
+flight (``Config.keeper_sync_upload_concurrency``), so a downloaded
+object may wait, its body still buffered, for an upload slot, and the
+memory bound above does not shrink with that cap.
 """
 
 from __future__ import annotations

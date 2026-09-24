@@ -8,7 +8,10 @@ botocore's denial errors into the Docverse-side
 ``LtdSourceAccessDeniedError`` the keeper-sync edition-prefix fallback
 matches on, while leaving the botocore transport errors in
 ``RETRYABLE_SOURCE_TRANSPORT_ERRORS`` (the ones the keeper-sync
-build-level retry re-runs a copy on) as they are.
+build-level retry re-runs a copy on) as they are. They also pin that an
+optional ``max_pool_connections`` sizes the opened client's connection
+pool, so the sync worker's one shared source is not throttled at
+botocore's default of ten connections.
 """
 
 from __future__ import annotations
@@ -17,6 +20,8 @@ from typing import Any
 
 import pytest
 import structlog
+from botocore import UNSIGNED
+from botocore.config import Config
 from botocore.exceptions import (
     ClientError,
     ConnectionClosedError,
@@ -185,3 +190,37 @@ async def test_open_close_roundtrip_does_not_raise() -> None:
     """The async-context lifecycle wires aiobotocore without needing creds."""
     async with LtdS3Source(logger=structlog.get_logger("test")):
         pass
+
+
+@pytest.mark.asyncio
+async def test_max_pool_connections_sizes_the_client_pool() -> None:
+    """``max_pool_connections`` reaches the opened client's botocore config.
+
+    The sync worker shares one source across every copier in the
+    process, so botocore's default pool of ten connections would
+    throttle downloads well below the worker's upload cap. The client
+    must stay anonymous while the pool is resized.
+    """
+    source = LtdS3Source(
+        max_pool_connections=3, logger=structlog.get_logger("test")
+    )
+    async with source:
+        client_config = source._get_client().meta.config
+
+    assert client_config.max_pool_connections == 3
+    assert client_config.signature_version is UNSIGNED
+
+
+@pytest.mark.asyncio
+async def test_omitted_max_pool_connections_keeps_the_botocore_default() -> (
+    None
+):
+    """Without ``max_pool_connections`` botocore's own pool size stands."""
+    source = LtdS3Source(logger=structlog.get_logger("test"))
+    async with source:
+        client_config = source._get_client().meta.config
+
+    assert client_config.max_pool_connections == (
+        Config().max_pool_connections
+    )
+    assert client_config.signature_version is UNSIGNED

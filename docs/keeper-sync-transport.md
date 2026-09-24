@@ -3,11 +3,14 @@
 A keeper-sync build copy reads every object of one LTD build from the
 `lsst-the-docs` S3 bucket and PUTs it into the organization's R2 bucket
 through a presigned URL: thousands of downloads and PUTs for a large
-project, and up to 80 in flight at once on one sync worker at the stock
-settings. This page covers how a copy survives either end, R2 or the
-LTD bucket, being briefly unreachable, what each layer of retry costs,
-and how to read the `build_content_copied` metrics event that reports
-every copy.
+project. At the stock settings one sync worker has up to 80 objects in
+flight across its ten concurrent jobs, but lets at most 32 of their
+PUTs reach R2 at once, over connections it keeps open for the whole
+burst. This page covers how a copy survives either end, R2 or the LTD
+bucket, being briefly unreachable, how the sync worker keeps its
+connections inside its node's NAT port budget, what each layer of retry
+costs, and how to read the `build_content_copied` metrics event that
+reports every copy.
 
 It is for operators running a sync campaign, the waves
 [Scoping the keeper sync](keeper-sync-scope.md) describes, and for
@@ -23,6 +26,44 @@ behind the shared HTTP client's 5 s connect timeout, and nothing above
 the object retried the build. PRD #685 put four layers between an R2
 outage and a failed edition.
 
+Two days later the same `ConnectTimeout` came back without an R2
+outage. Backfill run `1xes-dmzz-6r4a-96` on roundtable-prod (2026-09-24,
+from 14:50 UTC) imported 26 SQuaRE software-doc products, such as
+`safir`, `phalanx`, `gafaelfawr` and `documenteer`, each with thousands
+of small objects per build. In its first 30 minutes the sync worker
+logged 6,806 `Retrying presigned upload after transport error`
+warnings, every one a `ConnectTimeout` at the 10 s connect timeout,
+where the day's earlier waves of small builds had logged none. No
+object spent its whole budget, but every retry cost 10 s, and the ten
+job slots stayed pinned on a handful of large projects.
+
+The cause was the node, not R2. roundtable-prod's Cloud NAT allocates
+source ports statically, at the default 64 per VM, and holds the port
+of a closed connection through a 120 s TIME_WAIT. NAT logs showed
+`DROPPED` allocations from the node running the sync worker to R2
+starting 80 s into the run, 1.5k to 2.1k a minute through the storm,
+and none during a single-project refresh. The copy client then allowed
+90 connections but kept only 16 of them alive, and httpcore closes an
+idle connection whenever the pool holds more connections in total than
+its keepalive limit. With 80 PUTs in flight, nearly every finished
+PUT's connection was torn down, the next object re-dialled TCP and TLS,
+and each closed connection pinned another NAT port for two minutes. One
+project's eight connections sit under the limit of 16 and are reused,
+which is why a single refresh never tripped it. LTD downloads churned
+the same way: every copier opened an S3 client of its own and closed it
+at the end of its build, and one drop to AWS S3 showed in the NAT logs
+too. A Cloud NAT port is spent per unique destination (address, port
+and protocol), so the connections to R2 and the connections to the LTD
+bucket on S3 draw on separate 64-port budgets rather than one; each
+side has to fit on its own.
+
+PRD #698 bounds the sync worker's connections and reuses them for the
+life of a burst, in both directions: a
+[worker-wide upload cap](#the-worker-wide-upload-cap) over a copy
+client that keeps every connection alive, and one
+[LTD source client](#the-ltd-source-client) per worker process. The
+NAT allocation itself is raised outside Docverse, in `lsst/idf_deploy`.
+
 ## Transport resilience
 
 The layers, innermost first:
@@ -30,23 +71,25 @@ The layers, innermost first:
 | Layer | Where it lives | What it absorbs | Tuned by |
 | --- | --- | --- | --- |
 | Per-object upload retry | `S3ObjectStore`'s presigned PUT, through the shared `retry_request` loop | A connect stall, a dropped connection, or a `429`/`5xx`, for about 65 s per object | `keeper_sync_upload_max_attempts`, `keeper_sync_upload_max_backoff_seconds` |
-| Dedicated copy client | `worker/main.py` | Pool waits that used to surface as upload timeouts; gives each attempt a 10 s connect window | Constants, sized from `keeper_sync_max_jobs` and `keeper_sync_copy_concurrency` |
+| Worker-wide upload cap and dedicated copy client | `worker/main.py`, with the cap taken around each PUT in `S3ObjectStore` | Pool waits that used to surface as upload timeouts, and the connection churn that exhausted the node's NAT ports: at most `keeper_sync_upload_concurrency` PUTs in flight across the process, over connections kept alive between them, each attempt with a 10 s connect window | `keeper_sync_upload_concurrency`; the timeouts and keepalive are constants |
 | Build-level retry | `KeeperSyncService.sync_build` | A transport outage on either end of the copy: an R2 outage that outlasts one object's whole budget, or the LTD bucket timing out or dropping a connection during a download. One re-run of the copy | `keeper_sync_copy_retry_delay_seconds` |
 | Later syncs | The tier crons, `POST .../refresh`, a backfill run | Anything longer (see [When both retries fail](#when-both-retries-fail)) | None |
 
 Only the keeper-sync worker's copy path uses the first three. The API
 process, and every other object store a worker opens, keep the shared
-retry defaults and the shared HTTP client.
+retry defaults and the shared HTTP client, and upload without a cap.
 
 The first two layers are on the R2 side only. The per-object budget
 applies to uploads, and LTD downloads go through aiobotocore rather
-than either HTTP client. An LTD download has no per-object budget of
-Docverse's: beneath the build-level retry there is only botocore's own
-retry of the request, in its default `legacy` mode (up to five
-attempts, with a randomized backoff of a few seconds), and a
-connection that drops while the body is streaming is not retried at
-that level at all. The build-level retry is the one layer that covers
-both ends.
+than either HTTP client, over one S3 client per worker process that
+bounds and reuses their connections but adds no retry (see
+[The LTD source client](#the-ltd-source-client)). An LTD download has
+no per-object budget of Docverse's: beneath the build-level retry there
+is only botocore's own retry of the request, in its default `legacy`
+mode (up to five attempts, with a randomized backoff of a few seconds),
+and a connection that drops while the body is streaming is not retried
+at that level at all. The build-level retry is the one layer that
+covers both ends.
 
 ## Configuration
 
@@ -54,6 +97,7 @@ both ends.
 | --- | --- | --- | --- |
 | `keeper_sync_upload_max_attempts` | `DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_ATTEMPTS` | `6` | at least 1 |
 | `keeper_sync_upload_max_backoff_seconds` | `DOCVERSE_KEEPER_SYNC_UPLOAD_MAX_BACKOFF_SECONDS` | `30.0` | at least 0 |
+| `keeper_sync_upload_concurrency` | `DOCVERSE_KEEPER_SYNC_UPLOAD_CONCURRENCY` | `32` | at least 1 |
 | `keeper_sync_copy_retry_delay_seconds` | `DOCVERSE_KEEPER_SYNC_COPY_RETRY_DELAY_SECONDS` | `30.0` | at least 0 |
 
 - `keeper_sync_upload_max_attempts` counts the first attempt, so `1`
@@ -68,25 +112,51 @@ both ends.
   `keeper_sync_upload_max_attempts` is raised past seven. At `0.0`,
   retries go out back to back. The base of the backoff, 0.5 s, is not
   configurable.
+- `keeper_sync_upload_concurrency` bounds the presigned PUTs in flight
+  at once across every keeper-sync job in the worker process (see
+  [The worker-wide upload cap](#the-worker-wide-upload-cap)). It also
+  sizes both of the sync worker's copy pools: the copy client's
+  connections to R2 (see [Connection pool](#connection-pool)) and the
+  shared LTD source's connections to S3 (see
+  [The LTD source client](#the-ltd-source-client)). Lowering it slows a
+  large backfill; raising it opens more connections from the node, so
+  it has to stay inside the node's NAT port allocation (see the Phalanx
+  note below). A value above `keeper_sync_max_jobs` x
+  `keeper_sync_copy_concurrency` (80 at the defaults) never throttles
+  an upload, because no more transfers than that are in flight.
 - `keeper_sync_copy_retry_delay_seconds` is how long the build-level
   retry waits before it re-runs a failed copy. At `0.0` the copy is
   re-run at once. It is a wait, not a count: the copy is re-run at most
   once whatever the value.
 
 Two neighbouring settings are not on this table because they are not
-retry knobs, but they size the copy client's connection pool (see
-[The copy client](#the-copy-client)): `keeper_sync_max_jobs`
-(default 10) and `keeper_sync_copy_concurrency` (default 8). Their
-product is also what the sync worker's memory limit is sized against,
-so raising either one means raising that limit too.
+transport knobs: `keeper_sync_max_jobs` (default 10) and
+`keeper_sync_copy_concurrency` (default 8). Their product bounds the
+object bodies the sync worker buffers at once, which is what its memory
+limit is sized against, so raising either one means raising that limit
+too. It sizes no connection pool: a transfer waiting for an upload slot
+still holds its buffered body, so the upload cap leaves the memory
+bound where it was.
 
-**Phalanx values for these three settings are optional.** The defaults
-above are the intended production values, chosen against the
-2026-09-22 outage, so no environment needs to set them. Add chart
-values for them, in a Phalanx change of their own, only to move one
-environment away from the defaults: for example, a shorter
+**Phalanx values for these settings are optional.** The defaults
+above are the intended production values: the retry settings were
+chosen against the 2026-09-22 outage, and
+`keeper_sync_upload_concurrency` against the 2026-09-24 NAT port
+exhaustion, so no environment needs to set them. Add chart values for
+them, in a Phalanx change of their own, only to move one environment
+away from the defaults: for example, a shorter
 `keeper_sync_copy_retry_delay_seconds` in a test environment so a
 forced failure resolves quickly.
+
+The Phalanx chart's `uploadConcurrency` value sets
+`DOCVERSE_KEEPER_SYNC_UPLOAD_CONCURRENCY`. 32 is the intended value
+until the cluster's Cloud NAT allocation is raised above its static 64
+ports per VM: at 32 the copy client holds at most 42 connections to R2,
+inside that allocation, and keeps every one open so a burst closes
+none. The LTD source client's pool of 32 fits the same way, and it does
+not count against the R2 pool: Cloud NAT allocates ports per unique
+destination, so the two pools spend separate budgets. Raise the value
+only after the NAT allocation, never ahead of it.
 
 ## The per-object budget
 
@@ -138,12 +208,52 @@ next to `ctx["http_client"]`) and `shutdown` closes both. The shared
 client keeps httpx's defaults (5 s timeouts, 100 connections, 20 kept
 alive) and carries run discovery, the LTD API, GitHub, Cloudflare KV
 and CDN purges. LTD object downloads go through aiobotocore, so neither
-client carries them.
+client carries them (see [The LTD source client](#the-ltd-source-client)).
 
 Before the split, the stock 10 x 8 = 80 concurrent copies ran the
 shared 100-connection pool close to its ceiling. An upload waiting for
 a pooled connection then timed out like an upload that could not reach
 R2, and spent a retry doing it.
+
+### The worker-wide upload cap
+
+Each worker process builds one `asyncio.Semaphore` of
+`keeper_sync_upload_concurrency` slots at startup.
+`WorkerFactoryBuilder` holds it and hands it to every job's `Factory`,
+which passes it to the destination store of each keeper-sync copier
+and of nothing else. Every concurrent `keeper_sync_project` job's
+copier therefore shares the one semaphore: at the defaults, ten jobs of
+eight transfers each have up to 80 objects in flight, and at most 32 of
+them are PUTting to R2 at any moment. The rest are downloading from
+LTD, hashing, or waiting for a slot with their body already buffered.
+A limiter per job would have multiplied the cap by
+`keeper_sync_max_jobs`.
+
+A slot covers one attempt's PUT and nothing else:
+
+- The presigned URL is signed before the slot is taken. Signing is a
+  local HMAC and needs no connection.
+- The slot is released as soon as the PUT returns or raises, before
+  `retry_request` sleeps its backoff, so a retrying object never holds
+  a slot through its wait. An attempt that stalls on connect does hold
+  its slot until the 10 s connect timeout expires.
+- The cap sits below the copy client's `max_connections` (32 against 42
+  at the defaults), so a PUT that holds a slot always finds a
+  connection. Waiting for a slot never surfaces as a pool timeout and
+  never spends an attempt.
+
+A slot wait has no timeout of its own and spends nothing from the
+per-object budget, but it is wall-clock time. `elapsed_seconds` on the
+`Retrying presigned upload after transport error` and
+`Presigned upload failed` lines counts from before the first wait, so
+under a saturated cap it can run past the ride-out arithmetic above.
+No log line or metric reports a slot wait on its own.
+
+Only the keeper-sync copier's store takes a slot. The API process,
+build processing, dashboard builds and every other store a worker
+opens upload without a cap. Within that store only the presigned path
+honours it; the aiobotocore fallback, which production does not take,
+manages its own pool.
 
 ### Timeouts
 
@@ -154,7 +264,7 @@ R2, and spent a retry doing it.
 | `connect` | 10 s | Gives each attempt room to reach R2 through a connect stall. It is the per-attempt term in the ride-out arithmetic above. |
 | `read` | 60 s | Waiting for R2 to acknowledge a whole object body. |
 | `write` | 60 s | Sending one whole object body; a large build asset can take longer than 5 s to send from a busy pod. |
-| `pool` | 30 s | Waiting for a free connection. The pool is sized so that this wait should not happen; if it does, a long wait beats failing an attempt that never reached R2. |
+| `pool` | 30 s | Waiting for a free connection. The upload cap keeps PUTs below the pool's size, so this wait should not happen; if it does, a long wait beats failing an attempt that never reached R2. |
 
 Every one of them raises a subclass of `httpx.TimeoutException`, so
 each expiry is a retryable transport failure that spends one attempt of
@@ -162,33 +272,65 @@ the per-object budget.
 
 ### Connection pool
 
-`copy_http_limits` derives the pool from the two concurrency settings:
+`copy_http_limits` derives the pool from the upload cap:
 
 | Limit | Formula | At the defaults |
 | --- | --- | --- |
-| `max_connections` | `keeper_sync_max_jobs` x `keeper_sync_copy_concurrency` + `COPY_HTTP_CONNECTION_HEADROOM` (10) | 90 |
-| `max_keepalive_connections` | `keeper_sync_copy_concurrency` x `COPY_HTTP_KEEPALIVE_PER_COPY_SLOT` (2) | 16 |
+| `max_connections` | `keeper_sync_upload_concurrency` + `COPY_HTTP_CONNECTION_HEADROOM` (10) | 42 |
+| `max_keepalive_connections` | Same as `max_connections` | 42 |
+| `keepalive_expiry` | `COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS` | 60 s |
 
-- `max_connections` budgets one connection for every object transfer
-  that can be in flight at once: `keeper_sync_max_jobs` concurrent
-  `keeper_sync_project` jobs, each running a copier of
-  `keeper_sync_copy_concurrency` transfers. No PUT waits on the pool at
-  full concurrency. The headroom covers brief overlaps, such as a
-  connection being torn down after a failed attempt while its retry
-  opens a replacement.
-- `max_keepalive_connections` keeps two copiers' worth of connections
-  warm between builds. The next build a job copies reuses them instead
-  of paying a TLS handshake per object, and an idle queue does not hold
-  a whole burst's worth of sockets to R2 open.
+- `max_connections` budgets one connection for every presigned PUT that
+  `keeper_sync_upload_concurrency` lets through at once, across every
+  `keeper_sync_project` job in the process. No PUT waits on the pool at
+  the cap. The headroom covers brief overlaps, such as a connection
+  being torn down after a failed attempt while its retry opens a
+  replacement.
+- `max_keepalive_connections` equals `max_connections`, so every
+  connection the pool opens is kept alive. httpcore closes an idle
+  connection whenever the pool holds more connections than this, so a
+  lower value tears a connection down after almost every PUT of a burst
+  and the next object re-dials R2.
+- `keepalive_expiry` keeps an idle connection open for a minute rather
+  than httpx's default 5 s, so the pool stays warm between builds.
 
-The timeouts and the headroom are constants, not configuration: they
-bound transport behaviour an operator has no reason to tune, while the
-retry budget on top of them is configurable. The pool follows
-`keeper_sync_max_jobs` and `keeper_sync_copy_concurrency`
-automatically. Every worker pool opens a copy client sized from those
-keeper-sync settings, because the pools share one startup, but only
-keeper-sync jobs copy and the client opens no connection until a copy
-uses it.
+The timeouts, the headroom and the keepalive expiry are constants, not
+configuration: they bound transport behaviour an operator has no reason
+to tune, while the retry budget on top of them is configurable. The
+pool follows `keeper_sync_upload_concurrency` automatically. Every
+worker pool opens a copy client sized from that setting, because the
+pools share one startup, but only keeper-sync jobs copy and the client
+opens no connection until a copy uses it.
+
+### The LTD source client
+
+LTD downloads get the same treatment on the other side of the copy.
+Each worker process opens one `LtdS3Source`, the anonymous aiobotocore
+client for the `lsst-the-docs` bucket, at startup
+(`ctx["ltd_s3_source"]`), and `shutdown` closes it.
+`WorkerFactoryBuilder` holds it, and every job's `Factory` hands it to
+each keeper-sync copier, which downloads through it and leaves it open.
+Every build, every manifest-hash check and every job in the process
+reuses its connections. Before, each copier opened a client of its own
+and closed it when its build was done, so every build's download
+connections went through TIME_WAIT on the node and the next build
+re-dialled S3.
+
+Its pool (`max_pool_connections`) holds up to
+`keeper_sync_upload_concurrency` connections rather than botocore's
+default of 10, which would throttle the copiers' downloads far below
+the upload cap. It fits the node's 64 static NAT ports on its own, and
+it does not share them with the copy client: Cloud NAT counts a port
+per unique destination, and the LTD bucket on S3 is a different
+destination from R2. Past the pool, a download queues for a connection
+rather than failing, and a released connection stays open for the
+next download for 12 s, aiobotocore's default idle keepalive. Like the
+copy client, every worker pool opens the source, but it opens no
+connection until a copy uses it.
+
+A factory built without a shared source, such as one a test builds,
+falls back to the old path: each copier opens a source of its own and
+closes it on exit.
 
 ## The build-level retry
 
@@ -338,7 +480,7 @@ Docverse event.
 | `object_count` | Objects stored by the copy's last pass: the build's whole object count on success, or what the last pass stored before it stopped. |
 | `total_size_bytes` | Bytes stored by the last pass, counted the same way. |
 | `duration_seconds` | Wall-clock seconds from the first pass starting to the last pass ending, including the build-level retry's wait. It is a float in seconds, the unit the retry log lines' `elapsed_seconds` uses. |
-| `peak_concurrent_copies` | Most objects in flight at once, over both passes. At most `keeper_sync_copy_concurrency`. |
+| `peak_concurrent_copies` | Most objects in flight at once in this copy, over both passes: the copier's own transfer slots, at most `keeper_sync_copy_concurrency` (8 at the defaults). An object waiting for an upload slot counts as in flight. It does not measure the worker-wide `keeper_sync_upload_concurrency` cap, which spans every job's copier and which no event reports. |
 | `retried_object_count` | Objects that landed only after at least one upload retry, summed over both passes. |
 | `exhausted_object_count` | Objects whose upload spent its whole budget, summed over both passes. Only failures a retry could have fixed count: a transport failure or a `429`/`5xx` on every attempt. A `403` or a failed LTD download does not. |
 | `build_retry_used` | Whether the build-level retry re-ran the copy, after a transport error on either end. |
@@ -424,14 +566,18 @@ both passes sends the second pass's botocore exception from
 
 ## What the layers deliberately do not do
 
-- **Cap in-flight copies across the process.** The ceiling stays
-  `keeper_sync_max_jobs` x `keeper_sync_copy_concurrency`; the copy
-  client's pool is sized to it rather than enforcing a lower one.
+- **Make the keepalive expiry configurable.**
+  `COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS` (60 s) is a constant like the
+  copy client's timeouts, and the LTD source keeps aiobotocore's
+  default. `keeper_sync_upload_concurrency` is the one connection knob.
+- **Report upload-slot waits.** No log line, metric or event field says
+  how long an upload waited for a slot or how full the cap ran.
 - **Retry the LTD API differently.** The LTD client already rides out
   up to a 300 s backoff ceiling.
-- **Retry an LTD download per object.** A download has only botocore's
+- **Retry LTD downloads per object.** A download has only botocore's
   own retries beneath the build-level retry; there is no Docverse
-  budget for it like the one R2 uploads get.
+  budget for it like the one R2 uploads get. Sharing one LTD source
+  changes which connections a download reuses, not how it retries.
 - **Re-run a copy on a status error from either end,** such as an R2
   `429`/`5xx` or an LTD `SlowDown`. The build-level retry re-runs
   transport failures only.
@@ -448,18 +594,23 @@ both passes sends the second pass's botocore exception from
   waves whose copies this page covers.
 - `src/docverse_server/storage/_http_retry.py`: `retry_request`, the
   retryable statuses and transport errors, and the backoff.
-- `src/docverse_server/storage/objectstore/_s3.py`: the presigned PUT
-  and its `Presigned upload failed` lines.
-- `src/docverse_server/storage/ltd/s3_source.py`: the LTD download and
-  `RETRYABLE_SOURCE_TRANSPORT_ERRORS`, the botocore transport errors
-  the build-level retry re-runs.
+- `src/docverse_server/storage/objectstore/_s3.py`: the presigned PUT,
+  the upload slot it takes, and its `Presigned upload failed` lines.
+- `src/docverse_server/storage/ltd/s3_source.py`: the LTD download, its
+  pool size, and `RETRYABLE_SOURCE_TRANSPORT_ERRORS`, the botocore
+  transport errors the build-level retry re-runs.
 - `src/docverse_server/worker/main.py`: `COPY_HTTP_TIMEOUT`,
-  `copy_http_limits` and the copy client's lifetime.
+  `copy_http_limits`, the upload semaphore `_startup` builds, and the
+  lifetimes of the copy client and the shared LTD source.
+- `src/docverse_server/factory.py`:
+  `create_build_content_copier_for_org`, which hands each copier the
+  upload cap and the shared LTD source.
 - `src/docverse_server/services/keeper_sync/service.py`: the
   build-level retry and the report behind the metrics event.
 - `src/docverse_server/metrics/payloads.py`: `BuildContentCopiedEvent`.
 - `tests/docs_test.py`: fails when this page stops naming a knob, a
   default, a copy-client constant, an event field, or an error class
-  the build-level retry re-runs that the code has, or when its ride-out
-  arithmetic no longer matches the defaults.
-- SQR-112, and PRD #685.
+  the build-level retry re-runs that the code has, when its ride-out
+  arithmetic no longer matches the defaults, or when it stops stating
+  the process-wide upload cap.
+- SQR-112, PRD #685 and PRD #698.

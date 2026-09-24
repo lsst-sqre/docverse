@@ -61,7 +61,6 @@ from docverse_server.worker.functions.edition_reconcile import (
 from docverse_server.worker.functions.keeper_sync import _ScopeCounts
 from docverse_server.worker.main import (
     COPY_HTTP_CONNECTION_HEADROOM,
-    COPY_HTTP_KEEPALIVE_PER_COPY_SLOT,
     COPY_HTTP_TIMEOUT,
     copy_http_limits,
 )
@@ -475,12 +474,39 @@ def test_transport_knobs_documented_with_env_var_and_default() -> None:
         assert f"`{default}`" in row, name
 
 
-def test_transport_page_names_the_copy_pool_sizing_knobs() -> None:
-    """The page names both settings the copy client's pool is sized from."""
+def test_transport_page_names_the_upload_cap_and_memory_knobs() -> None:
+    """The page names the copy pool's knob and the two memory knobs.
+
+    ``keeper_sync_upload_concurrency`` sizes the copy client's pool;
+    ``keeper_sync_max_jobs`` x ``keeper_sync_copy_concurrency`` is the
+    buffered-body bound the sync worker's memory limit is sized against.
+    """
     page = _read(_TRANSPORT_PAGE)
     assert not _uncoded(
-        {"keeper_sync_max_jobs", "keeper_sync_copy_concurrency"}, page
+        {
+            "keeper_sync_upload_concurrency",
+            "keeper_sync_max_jobs",
+            "keeper_sync_copy_concurrency",
+        },
+        page,
     )
+
+
+def test_transport_page_states_the_process_wide_upload_cap() -> None:
+    """The copy-client section covers the cap; the non-goals drop it.
+
+    PRD #685 listed capping in-flight copies across the process among
+    the things the layers deliberately do not do. PRD #698 reversed
+    that: ``keeper_sync_upload_concurrency`` bounds every presigned PUT
+    in the sync worker, so the section describing the copy client has
+    to name it, and the non-goals list must stop denying it.
+    """
+    page = _read(_TRANSPORT_PAGE)
+    copy_client = _section(page, "The copy client")
+    assert "\n### The worker-wide upload cap\n" in copy_client
+    assert not _uncoded({"keeper_sync_upload_concurrency"}, copy_client)
+    non_goals = _section(page, "What the layers deliberately do not do")
+    assert "Cap in-flight copies" not in non_goals
 
 
 def test_transport_ride_out_arithmetic_documented() -> None:
@@ -524,26 +550,30 @@ def test_copy_client_timeouts_documented() -> None:
 def test_copy_client_pool_documented() -> None:
     """The pool rows name the constants they add and the stock result.
 
-    The stock values are derived from the configuration defaults through
+    The stock values are derived from the configuration default through
     :func:`copy_http_limits` itself, so the page's "at the defaults"
     column cannot drift from what a worker actually opens.
     """
     page = _read(_TRANSPORT_PAGE)
-    fields = Configuration.model_fields
     limits = copy_http_limits(
-        max_jobs=fields["keeper_sync_max_jobs"].default,
-        copy_concurrency=fields["keeper_sync_copy_concurrency"].default,
+        upload_concurrency=Configuration.model_fields[
+            "keeper_sync_upload_concurrency"
+        ].default,
     )
 
     connections = _table_row(page, "max_connections")
+    assert "`keeper_sync_upload_concurrency`" in connections
     assert "`COPY_HTTP_CONNECTION_HEADROOM`" in connections
     assert f"({COPY_HTTP_CONNECTION_HEADROOM})" in connections
     assert connections.endswith(f"| {limits.max_connections} |")
 
     keepalive = _table_row(page, "max_keepalive_connections")
-    assert "`COPY_HTTP_KEEPALIVE_PER_COPY_SLOT`" in keepalive
-    assert f"({COPY_HTTP_KEEPALIVE_PER_COPY_SLOT})" in keepalive
     assert keepalive.endswith(f"| {limits.max_keepalive_connections} |")
+
+    expiry = _table_row(page, "keepalive_expiry")
+    assert limits.keepalive_expiry is not None
+    assert "`COPY_HTTP_KEEPALIVE_EXPIRY_SECONDS`" in expiry
+    assert expiry.endswith(f"| {limits.keepalive_expiry:g} s |")
 
 
 def test_build_content_copied_event_fields_documented() -> None:

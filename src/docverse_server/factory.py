@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
@@ -86,7 +87,12 @@ from .storage.inventory_census_store import InventoryCensusStore
 from .storage.keeper_sync import KeeperSyncStateStore
 from .storage.keeper_sync_run_store import KeeperSyncRunStore
 from .storage.lifecycle_eval_run_store import LifecycleEvalRunStore
-from .storage.ltd import LtdClient, LtdProductsClient, LtdS3Source
+from .storage.ltd import (
+    LtdClient,
+    LtdProductsClient,
+    LtdS3Source,
+    LtdSourceProtocol,
+)
 from .storage.membership_store import OrgMembershipStore
 from .storage.objectstore import ObjectStore, create_objectstore
 from .storage.organization_credential_store import OrganizationCredentialStore
@@ -148,6 +154,8 @@ class Factory:
         keeper_sync_copy_retry_delay_seconds: float = (
             DEFAULT_COPY_RETRY_DELAY_SECONDS
         ),
+        keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
+        ltd_s3_source: LtdSourceProtocol | None = None,
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -208,6 +216,24 @@ class Factory:
         self._keeper_sync_copy_retry_delay_seconds = (
             keeper_sync_copy_retry_delay_seconds
         )
+        # The semaphore a keeper-sync copier's destination store holds
+        # around each presigned PUT, and no other store this factory
+        # builds. ``None`` (no bound) keeps directly constructed factories
+        # (tests, scripts) behaving exactly as before; the arq worker
+        # threads its one process-wide semaphore, sized by
+        # ``Config.keeper_sync_upload_concurrency``, through
+        # ``WorkerFactoryBuilder`` so every concurrent job's copies share
+        # the same cap.
+        self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
+        # The open LTD source every keeper-sync copier this factory builds
+        # reads from, and which none of them closes: its owner opened it
+        # and closes it. ``None`` keeps directly constructed factories
+        # (tests, scripts) opening and closing a source per copier as
+        # before; the arq worker threads its one process-wide source,
+        # sized by ``Config.keeper_sync_upload_concurrency``, through
+        # ``WorkerFactoryBuilder`` so LTD downloads reuse its connections
+        # across builds and jobs.
+        self._ltd_s3_source = ltd_s3_source
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -255,6 +281,24 @@ class Factory:
     def keeper_sync_copy_retry_delay_seconds(self) -> float:
         """Wait before a keeper-sync service re-runs a failed build copy."""
         return self._keeper_sync_copy_retry_delay_seconds
+
+    @property
+    def keeper_sync_upload_limiter(self) -> asyncio.Semaphore | None:
+        """Semaphore bounding a keeper-sync copier's in-flight PUTs.
+
+        The worker's process-wide limiter when one was given, otherwise
+        ``None`` (uploads unbounded).
+        """
+        return self._keeper_sync_upload_limiter
+
+    @property
+    def ltd_s3_source(self) -> LtdSourceProtocol | None:
+        """Open LTD source shared by every keeper-sync copier, if any.
+
+        The worker's process-wide source when one was given, otherwise
+        ``None`` (each copier opens and closes a source of its own).
+        """
+        return self._ltd_s3_source
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -999,6 +1043,7 @@ class Factory:
         upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
         upload_http_client: httpx.AsyncClient | None = None,
+        upload_limiter: asyncio.Semaphore | None = None,
     ) -> ObjectStore:
         """Resolve an org's ObjectStore from its service configuration.
 
@@ -1022,6 +1067,10 @@ class Factory:
         upload_http_client
             Client the store PUTs presigned uploads over. Defaults to
             the factory's shared client, which every caller but the
+            keeper-sync copier keeps.
+        upload_limiter
+            Semaphore the store holds around each presigned PUT.
+            Defaults to ``None`` (no bound), which every caller but the
             keeper-sync copier keeps.
 
         Returns
@@ -1058,6 +1107,7 @@ class Factory:
             ),
             max_attempts=upload_max_attempts,
             max_backoff_seconds=upload_max_backoff_seconds,
+            upload_limiter=upload_limiter,
         )
 
     def create_ltd_client(
@@ -1088,15 +1138,26 @@ class Factory:
         """Return an async-CM that yields a wired-up copier for ``org``.
 
         Used as ``async with factory.create_build_content_copier_for_org(
-        org_id=..., service_label=...) as copier:``. Both the LTD source
-        and the per-org destination are opened on entry and closed on
-        exit so a sync slot's resource lifetime is tightly bounded.
+        org_id=..., service_label=...) as copier:``. The per-org
+        destination is opened on entry and closed on exit so a sync
+        slot's resource lifetime is tightly bounded.
+
+        The LTD source is :attr:`ltd_s3_source` when the factory holds
+        one: already open, shared by every copier in the worker process
+        and left open on exit, so LTD downloads reuse its connections
+        instead of re-dialling S3 per build and manifest hash (PRD #698).
+        Otherwise the copier opens a source of its own from
+        :meth:`create_ltd_s3_source` on entry and closes it on exit.
 
         The copier's fan-out bound comes from this factory's
         ``keeper_sync_copy_concurrency``, so an operator can move the
         sync worker's memory ceiling without a code change. Peak
         resident size scales with the pool's ``max_jobs`` times that
-        bound times the largest object under a build prefix.
+        bound times the largest object under a build prefix. That
+        product bounds memory only and sizes no connection pool: the
+        connections the copies open are bounded by the upload limiter
+        and the shared source's pool, both sized from
+        ``Config.keeper_sync_upload_concurrency``.
 
         The destination store is the only one this factory builds with
         the ``keeper_sync_upload_*`` retry budget rather than the shared
@@ -1104,8 +1165,10 @@ class Factory:
         backs off, so it can ride out an R2 connect outage that the
         shared budget gives up inside (PRD #685). It is likewise the
         only store that PUTs over :attr:`copy_http_client`, the worker's
-        client sized for its full copy concurrency, rather than the
-        shared client.
+        client sized from its upload cap, rather than the shared client,
+        and the only store that holds :attr:`keeper_sync_upload_limiter`
+        around each PUT, so every copier in the worker process shares
+        one cap on presigned PUTs in flight.
         """
 
         @asynccontextmanager
@@ -1119,17 +1182,31 @@ class Factory:
                         self._keeper_sync_upload_max_backoff_seconds
                     ),
                     upload_http_client=self._copy_http_client,
+                    upload_limiter=self._keeper_sync_upload_limiter,
                 )
-            source = self.create_ltd_s3_source()
-            async with source, destination:
-                yield BuildContentCopier(
-                    source=source,
-                    destination=destination,
-                    logger=self._logger,
-                    max_concurrent=self._keeper_sync_copy_concurrency,
-                )
+            shared_source = self._ltd_s3_source
+            if shared_source is None:
+                async with self.create_ltd_s3_source() as source, destination:
+                    yield self._create_build_content_copier(
+                        source=source, destination=destination
+                    )
+            else:
+                async with destination:
+                    yield self._create_build_content_copier(
+                        source=shared_source, destination=destination
+                    )
 
         return _open()
+
+    def _create_build_content_copier(
+        self, *, source: LtdSourceProtocol, destination: ObjectStore
+    ) -> BuildContentCopier:
+        return BuildContentCopier(
+            source=source,
+            destination=destination,
+            logger=self._logger,
+            max_concurrent=self._keeper_sync_copy_concurrency,
+        )
 
     def create_keeper_sync_state_store(self) -> KeeperSyncStateStore:
         """Create a :class:`KeeperSyncStateStore`."""

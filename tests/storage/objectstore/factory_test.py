@@ -1,13 +1,15 @@
-"""Tests for ``create_objectstore``'s upload retry budget.
+"""Tests for the upload knobs ``create_objectstore`` threads to its store.
 
 The keeper-sync worker is the one caller that asks for a larger
 presigned-upload budget than the shared ``_http_retry`` defaults, and
-it asks through this factory, so the factory has to hand both knobs to
+the one that bounds its uploads with a process-wide limiter. It asks
+for both through this factory, so the factory has to hand every knob to
 the store it builds and leave every other caller's store exactly as it
-was. The tests drive a real upload through an ``httpx.MockTransport``
-that keeps answering ``503`` with a ``Retry-After`` longer than the
-shared ceiling: the attempt count shows ``max_attempts`` arrived and the
-recorded sleeps show ``max_backoff_seconds`` did.
+was. The budget tests drive a real upload through an
+``httpx.MockTransport`` that keeps answering ``503`` with a
+``Retry-After`` longer than the shared ceiling: the attempt count shows
+``max_attempts`` arrived and the recorded sleeps show
+``max_backoff_seconds`` did.
 """
 
 from __future__ import annotations
@@ -114,3 +116,40 @@ async def test_create_objectstore_defaults_to_the_shared_budget(
 
     assert len(attempts) == DEFAULT_MAX_ATTEMPTS
     assert delays == [MAX_BACKOFF_SECONDS] * (DEFAULT_MAX_ATTEMPTS - 1)
+
+
+@pytest.mark.asyncio
+async def test_create_objectstore_threads_the_upload_limiter() -> None:
+    """The semaphore handed to the factory is the one the PUT holds.
+
+    With a single-slot limiter, the slot being taken while the handler
+    runs — and free again afterwards — shows the store acquired this
+    semaphore around its PUT rather than ignoring it.
+    """
+    limiter = asyncio.Semaphore(1)
+    locked_while_putting: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        locked_while_putting.append(limiter.locked())
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http_client:
+        store = create_objectstore(
+            provider="minio",
+            config=_CONFIG,
+            credentials=_CREDENTIALS,
+            logger=structlog.get_logger("test"),
+            http_client=http_client,
+            upload_limiter=limiter,
+        )
+        async with store:
+            await store.upload_object(
+                key="build/index.html",
+                data=b"<html></html>",
+                content_type="text/html",
+            )
+
+    assert locked_while_putting == [True]
+    assert not limiter.locked()

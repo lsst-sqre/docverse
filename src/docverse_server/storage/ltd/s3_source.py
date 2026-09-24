@@ -146,9 +146,27 @@ class LtdSourceProtocol(Protocol):
 class LtdS3Source:
     """Async S3 source for the public-read ``lsst-the-docs`` bucket.
 
-    Use as an async context manager; the underlying aiobotocore client
-    is created on ``__aenter__`` with ``botocore.UNSIGNED`` credentials
-    so the source never needs to wire AWS secrets through Docverse.
+    Use as an async context manager, or call :meth:`open` and
+    :meth:`close` to hold one source for longer than a block; the
+    underlying aiobotocore client is created on open with
+    ``botocore.UNSIGNED`` credentials so the source never needs to wire
+    AWS secrets through Docverse. The open client is safe to share
+    between concurrent tasks: at the pool limit a download queues for a
+    connection rather than failing.
+
+    Parameters
+    ----------
+    bucket
+        Bucket to read from.
+    region
+        Region of ``bucket``.
+    max_pool_connections
+        Connections the client may hold open to S3 at once. ``None``
+        keeps botocore's default (10), which suits a source that serves
+        one copier; a source shared by every copier in the sync worker
+        is sized to the worker's upload cap instead.
+    logger
+        Logger for the source.
     """
 
     def __init__(
@@ -156,10 +174,12 @@ class LtdS3Source:
         *,
         bucket: str = "lsst-the-docs",
         region: str = _DEFAULT_REGION,
+        max_pool_connections: int | None = None,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._bucket = bucket
         self._region = region
+        self._max_pool_connections = max_pool_connections
         self._logger = logger
         self._session: AioSession = get_session()
         self._client_cm: ClientCreatorContext | None = None
@@ -182,9 +202,7 @@ class LtdS3Source:
     async def open(self) -> None:
         """Open the underlying anonymous S3 client."""
         self._client_cm = self._session.create_client(
-            "s3",
-            region_name=self._region,
-            config=Config(signature_version=UNSIGNED),
+            "s3", region_name=self._region, config=self._client_config()
         )
         self._client = await self._client_cm.__aenter__()
 
@@ -194,6 +212,17 @@ class LtdS3Source:
             await self._client_cm.__aexit__(None, None, None)
             self._client_cm = None
             self._client = None
+
+    def _client_config(self) -> Config:
+        # botocore records every keyword a ``Config`` is given, ``None``
+        # included, and a ``None`` pool size would replace its default
+        # rather than defer to it; so the keyword is passed only when set.
+        if self._max_pool_connections is None:
+            return Config(signature_version=UNSIGNED)
+        return Config(
+            signature_version=UNSIGNED,
+            max_pool_connections=self._max_pool_connections,
+        )
 
     def _get_client(self) -> AioBaseClient:
         if self._client is None:

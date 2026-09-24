@@ -356,10 +356,11 @@ class Configuration(BaseSettings):
             " under a build prefix — 80 buffered object bodies at the"
             " stock 10 x 8. That product is what the sync worker's"
             " memory limit is sized against; raising either knob"
-            " requires raising the limit with it. **Connections:** the"
-            " same product, plus 10, sizes the connection pool of the"
-            " worker's dedicated build-copy HTTP client, so every"
-            " in-flight presigned upload has a connection of its own."
+            " requires raising the limit with it. **Connections:** this"
+            " value sizes no connection pool. The build-copy connections"
+            " to R2 and S3 follow ``keeper_sync_upload_concurrency``, a"
+            " cap shared by every concurrent job, so raising this value"
+            " adds buffered bodies, not connections."
         ),
     )
 
@@ -380,10 +381,12 @@ class Configuration(BaseSettings):
             " At the stock 10 x 8 that is 80 buffered bodies, which is"
             " what the sync worker's memory limit is sized against;"
             " raising either knob requires raising that limit with it."
-            " **Connections:** the worker's dedicated build-copy HTTP"
-            " client allows ``keeper_sync_max_jobs`` x this value + 10"
-            " connections and keeps twice this value alive between"
-            " builds."
+            " **Connections:** this value sizes no connection pool. A"
+            " copier's uploads take their slots from"
+            " ``keeper_sync_upload_concurrency``, the process-wide cap"
+            " that also sizes the build-copy connection pools; a transfer"
+            " waiting for a slot still holds its buffered body, so the"
+            " memory bound above is unchanged."
         ),
     )
 
@@ -427,6 +430,24 @@ class Configuration(BaseSettings):
             " ``Retry-After`` above 10 s or when"
             " ``keeper_sync_upload_max_attempts`` is raised past seven."
             " At zero, retries go out back to back."
+        ),
+    )
+
+    keeper_sync_upload_concurrency: int = Field(
+        32,
+        ge=1,
+        title="Concurrent keeper-sync presigned uploads per worker process",
+        description=(
+            "Process-wide bound on concurrent presigned PUTs across every"
+            " running keeper-sync job, and the size of the sync worker's"
+            " two build-copy connection pools: the upload client opens at"
+            " most this many connections to R2 plus 10 and keeps every one"
+            " of them alive between uploads, and the one LTD S3 source"
+            " every copier downloads through holds at most this many"
+            " connections to S3. ``keeper_sync_max_jobs`` x"
+            " ``keeper_sync_copy_concurrency`` remains the memory bound"
+            " (the object bodies copiers buffer) and sizes no pool; a"
+            " value above that product never throttles an upload."
         ),
     )
 

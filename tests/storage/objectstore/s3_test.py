@@ -16,7 +16,7 @@ store issues.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from typing import Any, cast
 
 import httpx
@@ -33,13 +33,21 @@ from docverse_server.storage.objectstore import (
     _s3,
 )
 
+#: A ``MockTransport`` handler: plain, or ``async`` when a test needs the
+#: PUT to stay in flight across an ``await`` (to observe concurrency).
+_Handler = (
+    Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+)
+
 
 def _make_store(
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: _Handler,
     *,
     max_attempts: int = 4,
     base_backoff_seconds: float = 0.0,
     max_backoff_seconds: float | None = None,
+    upload_limiter: asyncio.Semaphore | None = None,
 ) -> tuple[S3ObjectStore, httpx.AsyncClient]:
     """Build a store whose presigned PUTs land in ``handler``.
 
@@ -63,6 +71,7 @@ def _make_store(
         http_client=client,
         max_attempts=max_attempts,
         base_backoff_seconds=base_backoff_seconds,
+        upload_limiter=upload_limiter,
         **ceiling,
     )
     return store, client
@@ -624,6 +633,86 @@ async def test_upload_object_resigns_url_for_every_attempt(
     assert signed_keys == ["build/index.html", "build/index.html"]
     assert len(urls) == 2
     assert all("X-Amz-Signature=" in url for url in urls)
+
+
+@pytest.mark.asyncio
+async def test_upload_object_never_exceeds_the_upload_limiter() -> None:
+    """Concurrent uploads share the limiter's slots for their PUTs.
+
+    The keeper-sync worker hands every copier's store one process-wide
+    semaphore so the whole worker never has more presigned PUTs — and so
+    connections — in flight than the cap, however many builds copy at
+    once. The handler holds each PUT open across a real ``await`` so
+    uploads that are not held back by the limiter pile up and show in
+    the peak.
+    """
+    limiter = asyncio.Semaphore(2)
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return httpx.Response(200)
+
+    store, client = _make_store(handler, upload_limiter=limiter)
+    async with client, store as s:
+        attempts = await asyncio.gather(
+            *(
+                s.upload_object(
+                    key=f"build/page-{index}.html",
+                    data=b"<html></html>",
+                    content_type="text/html",
+                )
+                for index in range(6)
+            )
+        )
+
+    assert attempts == [1] * 6
+    assert peak <= 2
+
+
+@pytest.mark.asyncio
+async def test_upload_object_releases_the_slot_while_backing_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retrying upload waits out its backoff without holding a slot.
+
+    A slot held across a backoff sleep would idle one of the worker's
+    capped upload connections for as long as R2 is struggling, so a few
+    slow objects could starve every other copy in the process. The PUTs
+    themselves do hold it, which is what makes the sleep's release the
+    thing under test rather than a limiter that was never taken.
+    """
+    limiter = asyncio.Semaphore(1)
+    locked_while_sleeping: list[bool] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        locked_while_sleeping.append(limiter.locked())
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    statuses = [503, 200]
+    locked_while_putting: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        locked_while_putting.append(limiter.locked())
+        return httpx.Response(statuses[len(locked_while_putting) - 1])
+
+    store, client = _make_store(handler, upload_limiter=limiter)
+    async with client, store as s:
+        attempts = await s.upload_object(
+            key="build/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert attempts == 2
+    assert locked_while_putting == [True, True]
+    assert locked_while_sleeping == [False]
+    assert not limiter.locked()
 
 
 class _StubS3Client:

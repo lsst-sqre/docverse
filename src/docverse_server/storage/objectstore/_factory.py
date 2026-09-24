@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -58,6 +59,7 @@ def create_objectstore(
     http_client: httpx.AsyncClient | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+    upload_limiter: asyncio.Semaphore | None = None,
 ) -> ObjectStore:
     """Create an ObjectStore from service config and decrypted credentials.
 
@@ -84,6 +86,12 @@ def create_objectstore(
         Ceiling on any single wait between presigned upload attempts.
         Defaults to the shared ``_http_retry`` ceiling; the keeper-sync
         worker passes ``Config.keeper_sync_upload_max_backoff_seconds``.
+    upload_limiter
+        Semaphore bounding the presigned PUTs in flight at once, shared
+        with every other store built with it. Defaults to ``None`` (no
+        bound); the keeper-sync worker passes its one process-wide
+        semaphore, sized by ``Config.keeper_sync_upload_concurrency``.
+        Like the budget arguments, it only applies with ``http_client``.
 
     Returns
     -------
@@ -120,6 +128,7 @@ def create_objectstore(
             http_client=http_client,
             max_attempts=max_attempts,
             max_backoff_seconds=max_backoff_seconds,
+            upload_limiter=upload_limiter,
         )
     msg = f"Unsupported object store provider: {provider!r}"
     raise ValueError(msg)

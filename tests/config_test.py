@@ -42,7 +42,10 @@ from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
     backoff_for_attempt,
 )
-from docverse_server.worker.main import COPY_HTTP_TIMEOUT
+from docverse_server.worker.main import (
+    COPY_HTTP_CONNECTION_HEADROOM,
+    COPY_HTTP_TIMEOUT,
+)
 
 #: Cadence gap of the ``keeper_sync_reaper`` cron
 #: (``cron(minute={0, 30})``), the worst-case extra detection latency
@@ -53,6 +56,13 @@ _REAPER_CRON_GAP_SECONDS = 1800
 #: keeper-sync jobs on roundtable-prod (19:51:13-19:51:53 UTC,
 #: 2026-09-22) after the shared four-attempt budget ran out.
 _OBSERVED_R2_OUTAGE_SECONDS = 40.0
+
+#: Source ports roundtable-prod's Cloud NAT allocates to each GKE node
+#: (static allocation at the default minimum). A port stays pinned for
+#: the 120 s TIME_WAIT after its connection closes, so when the sync
+#: worker's R2 connections churned during run ``1xes-dmzz-6r4a-96``
+#: (2026-09-24) the node ran out and the NAT dropped new connects.
+_CLOUD_NAT_STATIC_PORTS_PER_VM = 64
 
 
 def test_keeper_sync_timeout_defaults() -> None:
@@ -576,3 +586,75 @@ def test_cdn_purge_enabled_env_var_override(
     monkeypatch.setenv("DOCVERSE_CDN_PURGE_ENABLED", "true")
     config = Configuration()
     assert config.cdn_purge_enabled is True
+
+
+def test_keeper_sync_upload_concurrency_default() -> None:
+    """The process-wide upload cap defaults to 32 presigned PUTs.
+
+    It bounds concurrent PUTs across every running keeper-sync job, below
+    the 80 bodies ``keeper_sync_max_jobs`` x
+    ``keeper_sync_copy_concurrency`` can buffer, so the copy client's
+    connection count no longer follows the memory product.
+    """
+    config = Configuration()
+    assert config.keeper_sync_upload_concurrency == 32
+
+
+def test_keeper_sync_upload_concurrency_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upload cap is env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_CONCURRENCY", "12")
+    config = Configuration()
+    assert config.keeper_sync_upload_concurrency == 12
+
+
+def test_keeper_sync_upload_concurrency_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero cap is refused at startup: it would never let a PUT through."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_UPLOAD_CONCURRENCY", "0")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+
+def test_keeper_sync_upload_concurrency_fits_the_nat_port_budget() -> None:
+    """The copy client's whole pool fits one node's NAT port allocation.
+
+    The copy client opens at most the upload cap plus its headroom and
+    keeps every one alive, so at the defaults the sync worker holds no
+    more connections to R2 than its node's static Cloud NAT allocation,
+    and reusing them leaves no closed connection pinning a port in
+    TIME_WAIT.
+
+    Only the R2 pool is budgeted here. Cloud NAT spends a port per
+    unique destination (address, port and protocol), so the LTD source
+    client's pool, which connects to the LTD bucket on S3, draws on a
+    separate allocation of the same size and is not added to this sum.
+    """
+    config = Configuration()
+    max_connections = (
+        config.keeper_sync_upload_concurrency + COPY_HTTP_CONNECTION_HEADROOM
+    )
+    assert max_connections == 42
+    assert max_connections <= _CLOUD_NAT_STATIC_PORTS_PER_VM
+
+
+@pytest.mark.parametrize(
+    "name", ["keeper_sync_max_jobs", "keeper_sync_copy_concurrency"]
+)
+def test_memory_knob_descriptions_defer_connections_to_the_upload_cap(
+    name: str,
+) -> None:
+    """The two memory knobs' descriptions no longer size a connection pool.
+
+    Their product sized the copy client's pool under PRD #685; since PRD
+    #698 ``keeper_sync_upload_concurrency`` does, across every job. The
+    description is the operator-facing documentation of the setting, so
+    one still quoting the old ``+ 10`` formula would steer an operator
+    tuning connections to the wrong knob.
+    """
+    description = Configuration.model_fields[name].description
+    assert description is not None
+    assert "``keeper_sync_upload_concurrency``" in description
+    assert "+ 10" not in description
