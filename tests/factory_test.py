@@ -558,3 +558,114 @@ async def test_objectstore_for_org_keeps_the_shared_client(
 
     assert shared_puts == ["/docs/proj/__dashboard.html"]
     assert copy_puts == []
+
+
+@pytest.mark.asyncio
+async def test_copier_destination_uploads_under_the_upload_limiter(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build-content copies hold the worker's upload limiter per PUT.
+
+    Each copier fans a build out over ``keeper_sync_copy_concurrency``
+    objects and the sync pool runs ``keeper_sync_max_jobs`` copiers at
+    once, so without one process-wide limiter a backfill had far more
+    presigned PUTs (and TCP connects) in flight than the node's NAT
+    ports could carry. A single-slot limiter must hold a three-object
+    build to one PUT at a time even though the copier alone would run
+    all three together. The handler holds each PUT open across a real
+    ``await`` so PUTs the limiter did not hold back pile up in the peak.
+    """
+    puts: list[str] = []
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        if request.method == "PUT":
+            puts.append(request.url.path)
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as copy_http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            credential_encryptor=CredentialEncryptor(
+                current_key=Fernet.generate_key().decode()
+            ),
+            copy_http_client=copy_http_client,
+            default_queue_name="docverse:queue",
+            keeper_sync_copy_concurrency=8,
+            keeper_sync_upload_limiter=asyncio.Semaphore(1),
+        )
+        org_id = await _seed_minio_service(db_session, factory)
+        objects = {
+            f"proj/builds/1/page-{index}.html": b"<html></html>"
+            for index in range(3)
+        }
+        monkeypatch.setattr(
+            factory,
+            "create_ltd_s3_source",
+            lambda **kwargs: _StubLtdSource(objects),
+        )
+
+        async with factory.create_build_content_copier_for_org(
+            org_id=org_id, service_label="minio"
+        ) as copier:
+            assert copier.max_concurrent == 8
+            await copier.copy_build(
+                source_prefix="proj/builds/1/",
+                dest_prefix="proj/__builds/1/",
+            )
+
+    assert len(puts) == 3
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_other_stores_get_no_upload_limiter(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the keeper-sync copier's store uploads under the limiter.
+
+    The limiter caps the sync worker's presigned PUTs to R2 so a backfill
+    burst cannot exhaust the node's NAT ports; API build uploads,
+    dashboard renders and build processing call
+    ``create_objectstore_for_org`` directly and must keep uploading
+    unbounded, even on a factory that holds the worker's limiter.
+    """
+    recorded: list[dict[str, object]] = []
+
+    def _recording_create_objectstore(**kwargs: object) -> MockObjectStore:
+        recorded.append(kwargs)
+        return MockObjectStore()
+
+    monkeypatch.setattr(
+        "docverse_server.factory.create_objectstore",
+        _recording_create_objectstore,
+    )
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        credential_encryptor=CredentialEncryptor(
+            current_key=Fernet.generate_key().decode()
+        ),
+        default_queue_name="docverse:queue",
+        keeper_sync_upload_limiter=asyncio.Semaphore(1),
+    )
+    org_id = await _seed_minio_service(db_session, factory)
+    async with db_session.begin():
+        await factory.create_objectstore_for_org(
+            org_id=org_id, service_label="minio"
+        )
+
+    assert len(recorded) == 1
+    assert "upload_limiter" in recorded[0]
+    assert recorded[0]["upload_limiter"] is None

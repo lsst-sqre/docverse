@@ -9,6 +9,8 @@ mirroring how the worker's ``startup`` wires the two together.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import structlog
@@ -46,6 +48,7 @@ def _make_builder(
     keeper_sync_upload_max_attempts: int | None = None,
     keeper_sync_upload_max_backoff_seconds: float | None = None,
     keeper_sync_copy_retry_delay_seconds: float | None = None,
+    keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
@@ -78,6 +81,11 @@ def _make_builder(
             keeper_sync_copy_retry_delay_seconds
             if keeper_sync_copy_retry_delay_seconds is not None
             else _config.keeper_sync_copy_retry_delay_seconds
+        ),
+        keeper_sync_upload_limiter=(
+            keeper_sync_upload_limiter
+            if keeper_sync_upload_limiter is not None
+            else asyncio.Semaphore(_config.keeper_sync_upload_concurrency)
         ),
     )
 
@@ -348,3 +356,25 @@ async def test_worker_factory_builder_shares_one_purge_coalescer(
         second = builder(session=db_session, logger=_logger())
 
     assert first.purge_coalescer is second.purge_coalescer
+
+
+@pytest.mark.asyncio
+async def test_worker_factory_builder_shares_one_upload_limiter(
+    db_session: AsyncSession,
+) -> None:
+    """Per-job factories share the builder's process-lifetime limiter.
+
+    The upload cap only bounds the sync worker's presigned PUTs (and so
+    its connections to R2) if it spans jobs: the keeper-sync pool runs
+    ``keeper_sync_max_jobs`` projects at once, each in its own job, and
+    a limiter per job would multiply the cap by that count.
+    """
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client)
+        first = builder(session=db_session, logger=_logger())
+        second = builder(session=db_session, logger=_logger())
+
+    assert isinstance(first.keeper_sync_upload_limiter, asyncio.Semaphore)
+    assert (
+        first.keeper_sync_upload_limiter is second.keeper_sync_upload_limiter
+    )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
@@ -148,6 +149,7 @@ class Factory:
         keeper_sync_copy_retry_delay_seconds: float = (
             DEFAULT_COPY_RETRY_DELAY_SECONDS
         ),
+        keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -208,6 +210,15 @@ class Factory:
         self._keeper_sync_copy_retry_delay_seconds = (
             keeper_sync_copy_retry_delay_seconds
         )
+        # The semaphore a keeper-sync copier's destination store holds
+        # around each presigned PUT, and no other store this factory
+        # builds. ``None`` (no bound) keeps directly constructed factories
+        # (tests, scripts) behaving exactly as before; the arq worker
+        # threads its one process-wide semaphore, sized by
+        # ``Config.keeper_sync_upload_concurrency``, through
+        # ``WorkerFactoryBuilder`` so every concurrent job's copies share
+        # the same cap.
+        self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -255,6 +266,15 @@ class Factory:
     def keeper_sync_copy_retry_delay_seconds(self) -> float:
         """Wait before a keeper-sync service re-runs a failed build copy."""
         return self._keeper_sync_copy_retry_delay_seconds
+
+    @property
+    def keeper_sync_upload_limiter(self) -> asyncio.Semaphore | None:
+        """Semaphore bounding a keeper-sync copier's in-flight PUTs.
+
+        The worker's process-wide limiter when one was given, otherwise
+        ``None`` (uploads unbounded).
+        """
+        return self._keeper_sync_upload_limiter
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -999,6 +1019,7 @@ class Factory:
         upload_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         upload_max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
         upload_http_client: httpx.AsyncClient | None = None,
+        upload_limiter: asyncio.Semaphore | None = None,
     ) -> ObjectStore:
         """Resolve an org's ObjectStore from its service configuration.
 
@@ -1022,6 +1043,10 @@ class Factory:
         upload_http_client
             Client the store PUTs presigned uploads over. Defaults to
             the factory's shared client, which every caller but the
+            keeper-sync copier keeps.
+        upload_limiter
+            Semaphore the store holds around each presigned PUT.
+            Defaults to ``None`` (no bound), which every caller but the
             keeper-sync copier keeps.
 
         Returns
@@ -1058,6 +1083,7 @@ class Factory:
             ),
             max_attempts=upload_max_attempts,
             max_backoff_seconds=upload_max_backoff_seconds,
+            upload_limiter=upload_limiter,
         )
 
     def create_ltd_client(
@@ -1104,8 +1130,10 @@ class Factory:
         backs off, so it can ride out an R2 connect outage that the
         shared budget gives up inside (PRD #685). It is likewise the
         only store that PUTs over :attr:`copy_http_client`, the worker's
-        client sized for its full copy concurrency, rather than the
-        shared client.
+        client sized from its upload cap, rather than the shared client,
+        and the only store that holds :attr:`keeper_sync_upload_limiter`
+        around each PUT, so every copier in the worker process shares
+        one cap on presigned PUTs in flight.
         """
 
         @asynccontextmanager
@@ -1119,6 +1147,7 @@ class Factory:
                         self._keeper_sync_upload_max_backoff_seconds
                     ),
                     upload_http_client=self._copy_http_client,
+                    upload_limiter=self._keeper_sync_upload_limiter,
                 )
             source = self.create_ltd_s3_source()
             async with source, destination:

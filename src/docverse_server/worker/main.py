@@ -5,6 +5,7 @@ Launch with: ``arq docverse_server.worker.main.WorkerSettings``
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from importlib.metadata import version
@@ -384,6 +385,7 @@ class WorkerFactoryBuilder:
         keeper_sync_upload_max_attempts: int,
         keeper_sync_upload_max_backoff_seconds: float,
         keeper_sync_copy_retry_delay_seconds: float,
+        keeper_sync_upload_limiter: asyncio.Semaphore,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -421,6 +423,12 @@ class WorkerFactoryBuilder:
         self._keeper_sync_copy_retry_delay_seconds = (
             keeper_sync_copy_retry_delay_seconds
         )
+        # Required for the same reason, and process-lifetime like
+        # ``purge_coalescer``: the cap on presigned PUTs (and so on the
+        # copy client's connections to R2) only holds if every concurrent
+        # ``keeper_sync_project`` job's copier shares this one semaphore.
+        # A per-job limiter would multiply the cap by ``max_jobs``.
+        self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
 
     @property
     def github_app_enabled(self) -> bool:
@@ -476,6 +484,7 @@ class WorkerFactoryBuilder:
             keeper_sync_copy_retry_delay_seconds=(
                 self._keeper_sync_copy_retry_delay_seconds
             ),
+            keeper_sync_upload_limiter=self._keeper_sync_upload_limiter,
         )
 
 
@@ -572,6 +581,14 @@ async def _startup(
         ),
         keeper_sync_copy_retry_delay_seconds=(
             config.keeper_sync_copy_retry_delay_seconds
+        ),
+        # One per worker process, created here like the purge coalescer
+        # and captured by the builder so every job shares it. Sized to
+        # ``keeper_sync_upload_concurrency``, which sits below the copy
+        # client's ``max_connections`` so a PUT waiting on a slot never
+        # waits on the pool as well.
+        keeper_sync_upload_limiter=asyncio.Semaphore(
+            config.keeper_sync_upload_concurrency
         ),
     )
     await validate_github_app(

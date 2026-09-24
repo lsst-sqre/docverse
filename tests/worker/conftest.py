@@ -10,6 +10,7 @@ and ``arq_queue`` entries that the production ``shutdown`` would close).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -96,6 +97,9 @@ def make_worker_ctx(
         ),
         keeper_sync_copy_retry_delay_seconds=(
             _config.keeper_sync_copy_retry_delay_seconds
+        ),
+        keeper_sync_upload_limiter=asyncio.Semaphore(
+            _config.keeper_sync_upload_concurrency
         ),
     )
     ctx: dict[str, Any] = {
