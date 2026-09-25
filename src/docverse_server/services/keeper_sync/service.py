@@ -391,7 +391,12 @@ class BuildSyncOutcome:
     """
 
     docverse_build_id: int | None
-    """``None`` when the call short-circuited (state matched LTD)."""
+    """The Docverse build LTD's build maps to.
+
+    Set on every path out of ``sync_build`` — a fresh copy, a
+    convergence onto an existing build, and the "state matches LTD"
+    short circuit, which reads it off the ``keeper_sync_state`` row.
+    """
 
     docverse_build_public_id: str | None
     """``None`` when the call short-circuited (state matched LTD)."""
@@ -400,6 +405,16 @@ class BuildSyncOutcome:
     content_hash: str | None
     object_count: int | None
     total_size_bytes: int | None
+
+    ltd_date_created: datetime
+    """LTD's ``date_created`` for the build: when LTD built the content.
+
+    The value :meth:`KeeperSyncService.sync_edition`'s clock transaction
+    stamps onto the Docverse build (PRD #706). ``sync_build`` fetches
+    the LTD build on every path, the short circuit included, so carrying
+    the date back here is what keeps the stamp from costing a second
+    LTD request.
+    """
 
 
 @dataclass(frozen=True)
@@ -1530,7 +1545,9 @@ class KeeperSyncService:
         # moves ``date_updated`` back to now, so a stamp any earlier in
         # the visit would not survive it. See :meth:`_stamp_ltd_clock`.
         dates_restamped = await self._stamp_ltd_clock(
-            edition=edition, ltd_edition=ltd_edition
+            edition=edition,
+            ltd_edition=ltd_edition,
+            build_outcome=build_outcome,
         )
 
         return EditionSyncOutcome(
@@ -1554,21 +1571,29 @@ class KeeperSyncService:
         )
 
     async def _stamp_ltd_clock(
-        self, *, edition: Edition, ltd_edition: LtdEdition
+        self,
+        *,
+        edition: Edition,
+        ltd_edition: LtdEdition,
+        build_outcome: BuildSyncOutcome | None,
     ) -> bool:
-        """Stamp a synced edition's row with LTD's timestamps (PRD #706).
+        """Stamp a synced edition's rows with LTD's timestamps (PRD #706).
 
         Keeper-sync owns the clock of the rows it keeps in sync: the
         edition's ``date_created`` / ``date_updated`` are LTD's, from
         :func:`~docverse_server.services.keeper_sync.mappers.derive_edition_dates`,
-        not the moment of import. This is the visit's final
+        not the moment of import, and so is the clock of the Docverse
+        build ``sync_build`` mapped the edition's LTD build to — see
+        :meth:`_stamp_build_clock`. This is the visit's final
         transaction, because every earlier edition write moves
         ``date_updated`` to now through the ORM ``onupdate`` — see
-        :meth:`EditionStore.set_sync_dates`.
+        :meth:`EditionStore.set_sync_dates`. The edition is stamped
+        before its build, per the lock order
+        :mod:`docverse_server.storage.edition_store` documents.
 
-        The stamp is a compare-and-set, so a visit whose row already
-        matches writes nothing and reports ``False``. An edition
-        soft-deleted mid-visit is left alone.
+        Each stamp is a compare-and-set, so a visit whose rows already
+        match writes nothing and reports ``False``. An edition
+        soft-deleted mid-visit is left alone, build included.
 
         A failure is logged and reported as ``False`` rather than
         raised, for the same reason the aggregate backfill's is: the
@@ -1579,9 +1604,10 @@ class KeeperSyncService:
         Returns
         -------
         bool
-            Whether the edition row changed.
+            Whether the edition row or its build's row changed.
         """
         date_created, date_updated = derive_edition_dates(ltd_edition)
+        restamped_build: Build | None = None
         try:
             async with self._session.begin():
                 current = await self._edition_store.get_by_id(edition.id)
@@ -1592,6 +1618,10 @@ class KeeperSyncService:
                     date_created=date_created,
                     date_updated=date_updated,
                 )
+                if build_outcome is not None:
+                    restamped_build = await self._stamp_build_clock(
+                        build_outcome
+                    )
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
             self._logger.exception(
@@ -1612,7 +1642,67 @@ class KeeperSyncService:
                 previous_date_updated=current.date_updated.isoformat(),
                 date_updated=date_updated.isoformat(),
             )
-        return restamped
+        if restamped_build is not None and build_outcome is not None:
+            self._logger.info(
+                "Restamped build dates from LTD",
+                build_id=restamped_build.id,
+                edition_id=edition.id,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                previous_date_created=restamped_build.date_created.isoformat(),
+                previous_date_completed=(
+                    restamped_build.date_completed.isoformat()
+                    if restamped_build.date_completed is not None
+                    else None
+                ),
+                date_created=build_outcome.ltd_date_created.isoformat(),
+            )
+        return restamped or restamped_build is not None
+
+    async def _stamp_build_clock(
+        self, build_outcome: BuildSyncOutcome
+    ) -> Build | None:
+        """Stamp the Docverse build behind *build_outcome* with LTD's date.
+
+        Runs inside :meth:`_stamp_ltd_clock`'s transaction. Both
+        ``date_created`` and ``date_completed`` take the LTD build's
+        ``date_created``: LTD built and published the content at that
+        moment, and the Docverse row's own values only record the copy.
+
+        The stamp only ever moves a build's clock *earlier*. One Docverse
+        build can stand for several LTD builds: ``sync_build`` converges
+        any LTD build whose bytes a completed build already holds onto
+        that build (``main`` and a tag built from one commit, say). Were
+        each visit to write its own LTD build's date, the editions
+        sharing the row would overwrite each other on every poll. The
+        content existed from the earliest of those LTD builds on, so a
+        row already dated at or before this LTD build is left alone —
+        which also keeps the upload time of a native build that LTD's
+        copy of the same content converged onto.
+
+        Returns
+        -------
+        Build or None
+            The build as it was *before* the stamp when the stamp
+            changed it, for the caller's log line; ``None`` when the
+            row already matched, already carries an earlier date, or
+            does not exist.
+        """
+        build_id = build_outcome.docverse_build_id
+        if build_id is None:
+            return None
+        build = await self._build_store.get_by_id(build_id)
+        if (
+            build is None
+            or build.date_created < build_outcome.ltd_date_created
+        ):
+            return None
+        changed = await self._build_store.set_sync_dates(
+            build_id,
+            date_created=build_outcome.ltd_date_created,
+            date_completed=build_outcome.ltd_date_created,
+        )
+        return build if changed else None
 
     async def _backfill_semver_aggregates(
         self,
@@ -2086,6 +2176,7 @@ class KeeperSyncService:
                 content_hash=existing_state.content_hash,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=ltd_build.date_created,
             )
 
         source = await self._resolve_build_source(
@@ -2151,6 +2242,7 @@ class KeeperSyncService:
                 content_hash=manifest_hash,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=ltd_build.date_created,
             )
 
         git_ref = derive_synced_build_git_ref(ltd_edition, ltd_build)
@@ -2277,6 +2369,7 @@ class KeeperSyncService:
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+            ltd_date_created=ltd_build.date_created,
         )
 
     async def _copy_build_content(

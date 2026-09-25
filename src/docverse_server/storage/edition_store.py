@@ -38,6 +38,9 @@ What follows the order, and how:
 - :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
   cascades in this order already, which is what makes it safe for it to
   end up holding all three.
+- ``KeeperSyncService._stamp_ltd_clock``, keeper-sync's end-of-visit
+  clock transaction (PRD #706), stamps the edition row before the
+  build row the edition's LTD build maps to, and never the project.
 
 **Composite writers** — the transactions that write ``builds`` or other
 ``editions`` rows *around* a repoint — cannot get the order from

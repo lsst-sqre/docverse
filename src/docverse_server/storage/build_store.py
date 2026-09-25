@@ -7,7 +7,7 @@ from typing import overload
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import Interval, select, update
+from sqlalchemy import Interval, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -789,6 +789,57 @@ class BuildStore:
         await self._session.flush()
         await self._session.refresh(row)
         return Build.model_validate(row)
+
+    async def set_sync_dates(
+        self,
+        build_id: int,
+        *,
+        date_created: datetime,
+        date_completed: datetime,
+    ) -> bool:
+        """Stamp a build's clock with explicit values (PRD #706).
+
+        Keeper-sync's way of making a synced build carry LTD's build
+        date instead of the moment Docverse imported it: the
+        ``date_created`` server default and the completion stamp
+        :meth:`transition_status` writes both record the import. The
+        values are written verbatim; deciding *which* value a build
+        should carry is the caller's job.
+
+        ``IS DISTINCT FROM`` in the ``WHERE`` makes the stamp a
+        compare-and-set, the same shape as
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_sync_dates`:
+        a row that already carries both values matches nothing, so a
+        steady-state sync visit writes no row version.
+
+        Parameters
+        ----------
+        build_id
+            The build to stamp.
+        date_created
+            The value for ``date_created``; timezone-aware.
+        date_completed
+            The value for ``date_completed``; timezone-aware.
+
+        Returns
+        -------
+        bool
+            ``True`` if the row changed, ``False`` if it already
+            carried both values or does not exist.
+        """
+        result = await self._session.execute(
+            update(SqlBuild)
+            .where(
+                SqlBuild.id == build_id,
+                or_(
+                    SqlBuild.date_created.is_distinct_from(date_created),
+                    SqlBuild.date_completed.is_distinct_from(date_completed),
+                ),
+            )
+            .values(date_created=date_created, date_completed=date_completed)
+            .returning(SqlBuild.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def soft_delete(self, *, build_id: int) -> bool:
         """Soft-delete a build by setting date_deleted.

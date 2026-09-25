@@ -110,6 +110,7 @@ from docverse_server.storage.keeper_sync import (
     TombstoneReason,
 )
 from docverse_server.storage.ltd import (
+    LtdBuild,
     LtdClient,
     LtdEdition,
     LtdSourceAccessDeniedError,
@@ -999,6 +1000,224 @@ async def test_fresh_import_stamp_leaves_the_project_clock(
             )
         ).scalar_one()
     assert project_clock == pinned
+
+
+async def _read_build_clock(
+    session: AsyncSession, build_id: int
+) -> tuple[datetime, datetime | None]:
+    """Read a build's ``(date_created, date_completed)`` from the database.
+
+    Column-level for the same reason as :func:`_read_edition_clock`.
+    """
+    row = (
+        await session.execute(
+            select(SqlBuild.date_created, SqlBuild.date_completed).where(
+                SqlBuild.id == build_id
+            )
+        )
+    ).one()
+    return row.date_created, row.date_completed
+
+
+@pytest.mark.asyncio
+async def test_fresh_import_stamps_the_build_with_ltd_dates(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A synced build carries LTD's build date, not the import moment.
+
+    PRD #706: both the ``date_created`` server default and the
+    completion stamp ``_finalize_synced_build`` writes record the copy,
+    so a migrated project's builds all read as built during the sync.
+    LTD built the content once, at its build's ``date_created``, so
+    that is the value of both columns.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    ltd_build = LtdBuild.model_validate(_load("build.json"))
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    outcome = result.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    build_id = outcome.build_outcome.docverse_build_id
+    assert build_id is not None
+    assert outcome.dates_restamped is True
+    async with db_session.begin():
+        assert await _read_build_clock(db_session, build_id) == (
+            ltd_build.date_created,
+            ltd_build.date_created,
+        )
+
+    # One ``info`` line for the build row, beside the edition's.
+    restamps = [
+        log for log in logs if log["event"] == "Restamped build dates from LTD"
+    ]
+    assert len(restamps) == 1
+    assert restamps[0]["log_level"] == "info"
+    assert restamps[0]["build_id"] == build_id
+    assert restamps[0]["edition_id"] == outcome.docverse_edition_id
+    assert restamps[0]["date_created"] == ltd_build.date_created.isoformat()
+    assert datetime.fromisoformat(
+        restamps[0]["previous_date_created"]
+    ) > datetime.fromisoformat(restamps[0]["date_created"])
+
+
+@pytest.mark.asyncio
+async def test_short_circuited_visit_restamps_a_sync_time_build(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A "state matches LTD" visit still moves the build's clock to LTD's.
+
+    This is the backfill path: a build imported before PRD #706 carries
+    the copy's timestamps, and its LTD build never changes again, so the
+    only visits it will ever get are short circuits. The date comes back
+    from the LTD build ``sync_build`` already fetched before deciding
+    to short-circuit — no second request — and the edition row, already
+    on LTD's clock, is not what makes the visit report a restamp.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    ltd_build = LtdBuild.model_validate(_load("build.json"))
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert first.edition_outcomes[0].build_outcome is not None
+    build_id = first.edition_outcomes[0].build_outcome.docverse_build_id
+    assert build_id is not None
+
+    # Put the build back on the clock a pre-PRD import left it with.
+    sync_time = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == build_id)
+            .values(date_created=sync_time, date_completed=sync_time)
+        )
+
+    build_fetches: list[str] = []
+    real_get_build_by_url = LtdClient.get_build_by_url
+
+    async def counting_get_build_by_url(self: LtdClient, url: str) -> LtdBuild:
+        build_fetches.append(url)
+        return await real_get_build_by_url(self, url)
+
+    monkeypatch.setattr(
+        LtdClient, "get_build_by_url", counting_get_build_by_url
+    )
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = second.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.build_outcome.docverse_build_id == build_id
+    assert outcome.dates_restamped is True
+    assert build_fetches == [f"{LTD_BASE}/builds/42"]
+    async with db_session.begin():
+        assert await _read_build_clock(db_session, build_id) == (
+            ltd_build.date_created,
+            ltd_build.date_created,
+        )
+
+
+@pytest.mark.asyncio
+async def test_shared_build_keeps_the_earliest_ltd_date(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Two LTD builds of one content share one clock: the earlier one.
+
+    ``sync_build`` converges an LTD build whose bytes a Docverse build
+    already holds onto that build, so two LTD editions whose builds
+    carry identical content (``main`` and a branch built from the same
+    commit) end up on one Docverse row. Stamped verbatim, each visit
+    would overwrite the other's date and every poll would report a
+    restamp. The content existed from the earlier LTD build on, so that
+    date holds and a repeat pass writes nothing.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    main_build = _load("build.json")
+    branch_build = _load("build.json")
+    branch_build["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build["slug"] = "43"
+    branch_build["bucket_root_dir"] = "pipelines/builds/43"
+    branch_build["git_refs"] = ["u/jsick/feature"]
+    branch_build["date_created"] = "2026-05-02T07:00:00.000000+00:00"
+    main_date = LtdBuild.model_validate(main_build).date_created
+    assert LtdBuild.model_validate(branch_build).date_created > main_date
+    branch_edition = _load("edition_branch_git_refs.json")
+    _seed_ltd(
+        mock_discovery,
+        editions_payload=[
+            _load("edition_main_git_refs.json"),
+            branch_edition,
+        ],
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build)
+    )
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>same</html>",
+        "pipelines/builds/43/index.html": b"<html>same</html>",
+    }
+
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    build_ids = {
+        o.build_outcome.docverse_build_id
+        for o in first.edition_outcomes
+        if o.build_outcome is not None
+    }
+    assert len(first.edition_outcomes) == 2
+    assert len(build_ids) == 1
+    (build_id,) = build_ids
+    assert build_id is not None
+    async with db_session.begin():
+        assert await _read_build_clock(db_session, build_id) == (
+            main_date,
+            main_date,
+        )
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.dates_restamped for o in second.edition_outcomes] == [
+        False,
+        False,
+    ]
+    async with db_session.begin():
+        assert await _read_build_clock(db_session, build_id) == (
+            main_date,
+            main_date,
+        )
 
 
 @pytest.mark.asyncio
@@ -2461,6 +2680,7 @@ async def test_sync_project_success_resets_consecutive_failure_counter(
                 content_hash=None,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=datetime(2026, 4, 30, tzinfo=UTC),
             ),
             short_circuited=False,
         )
