@@ -129,7 +129,9 @@ from .mappers import (
     derive_edition_slug,
     derive_edition_source_prefix,
     derive_synced_build_git_ref,
+    derive_tracking_source,
     map_edition_tracking,
+    tracking_reads_live_refs,
 )
 
 __all__ = [
@@ -514,6 +516,24 @@ class _EditionStateKey:
     ltd_id: int
     ltd_slug: str
     annotations: dict[str, Any]
+
+
+@dataclass
+class _LiveRefsCache:
+    """A project's live GitHub ref set, fetched at most once per sync.
+
+    Two consumers in one :meth:`KeeperSyncService.sync_project` read the
+    set: the proactive lifecycle pass (``ref_deleted``) and ``__main``'s
+    default-branch tracking (PRD #721). Whichever asks first pays the
+    GitHub round-trip; the other reuses the answer — including a
+    ``None`` from a failed or unconfigured fetch, which is not retried.
+    """
+
+    fetched: bool = False
+    """Whether a fetch was attempted (or skipped as unconfigured)."""
+
+    refs: frozenset[str] | None = None
+    """The live ref names, or ``None`` when none are known."""
 
 
 #: Kinds a *different* derivation owns, which the per-LTD-edition
@@ -980,11 +1000,16 @@ class KeeperSyncService:
         ltd_editions = await self._ltd_client.list_editions_for_product(
             ltd_slug
         )
+        live_refs = _LiveRefsCache()
         skip_ltd_ids = await self._proactive_lifecycle_pass(
             org=org,
             project=project,
             ltd_editions=ltd_editions,
             rewrite_rules=rewrite_rules,
+            live_refs=live_refs,
+        )
+        tracking_live_refs = await self._tracking_live_refs(
+            project=project, ltd_editions=ltd_editions, cache=live_refs
         )
         outcomes: list[EditionSyncOutcome] = []
         failures: list[EditionSyncFailure] = []
@@ -1008,6 +1033,7 @@ class KeeperSyncService:
                     ltd_edition=ltd_edition,
                     rewrite_rules=rewrite_rules,
                     autocreation=autocreation,
+                    live_refs=tracking_live_refs,
                 )
             except Exception as exc:
                 if not isinstance(exc, _PERMANENT_EDITION_FAILURE_TYPES):
@@ -1155,6 +1181,7 @@ class KeeperSyncService:
         org: Organization,
         project: Project,
         ltd_editions: list[LtdEdition],
+        live_refs: _LiveRefsCache,
         rewrite_rules: Sequence[AnySlugRewriteRule] = (),
     ) -> set[int]:
         """Tombstone LTD editions a lifecycle rule would delete on import.
@@ -1180,8 +1207,10 @@ class KeeperSyncService:
         only the non-proactive paths can omit them.
 
         The per-project GitHub ref pre-fetch happens here (once,
-        outside any open write transaction) and is shared across every
-        edition. A ``RepositoryNotAccessibleError`` or
+        outside any open write transaction, into the caller's
+        *live_refs* cache) and is shared across every edition — and
+        with ``__main``'s default-branch tracking, which reads the same
+        cache. A ``RepositoryNotAccessibleError`` or
         ``RepositoryRefFetchError`` is caught, logged, and downgrades
         the pass — ``ref_deleted`` cannot match without ``live_refs``,
         so those projects fall through to KEEP and the regular
@@ -1224,7 +1253,7 @@ class KeeperSyncService:
             row.ltd_id: row for row in state_rows if row.ltd_id is not None
         }
 
-        live_refs = await self._fetch_live_refs(project=project)
+        refs = await self._live_refs(project=project, cache=live_refs)
         now = _now()
         skip_ltd_ids: set[int] = set()
         for ltd_edition in ltd_editions:
@@ -1248,7 +1277,7 @@ class KeeperSyncService:
                     builds=[],
                     edition_build_history=[],
                     now=now,
-                    live_refs=live_refs,
+                    live_refs=refs,
                 ),
             )
             matched_rule = decision.edition_matches.get(transient.id)
@@ -1274,6 +1303,52 @@ class KeeperSyncService:
             skip_ltd_ids.add(ltd_edition.ltd_id)
         return skip_ltd_ids
 
+    async def _tracking_live_refs(
+        self,
+        *,
+        project: Project,
+        ltd_editions: Sequence[LtdEdition],
+        cache: _LiveRefsCache,
+    ) -> frozenset[str] | None:
+        """Return the live ref set the editions' tracking should read.
+
+        LTD's ``main`` edition follows the project's default branch once
+        its own ref is gone (PRD #721), which only the live ref set can
+        tell. The proactive lifecycle pass has usually fetched it
+        already; a project with no lifecycle rules has not, and pays the
+        round-trip here only when LTD's ref differs from a known default
+        branch — see
+        :func:`~docverse_server.services.keeper_sync.mappers.tracking_reads_live_refs`.
+        """
+        if cache.fetched or not any(
+            tracking_reads_live_refs(
+                ltd_edition, default_branch=project.github_default_branch
+            )
+            for ltd_edition in ltd_editions
+        ):
+            return cache.refs
+        return await self._live_refs(project=project, cache=cache)
+
+    async def _live_refs(
+        self, *, project: Project, cache: _LiveRefsCache
+    ) -> frozenset[str] | None:
+        """Return the project's live ref set, fetching it on first use.
+
+        ``None`` when the GitHub collaborators are unconfigured, and
+        otherwise whatever :meth:`_fetch_live_refs` answers. The answer
+        is cached either way, so one sync costs at most one GitHub
+        round-trip. Like :meth:`_fetch_live_refs`, must not be called
+        inside ``session.begin()``.
+        """
+        if not cache.fetched:
+            cache.fetched = True
+            if (
+                self._binding_resolver is not None
+                and self._ref_set_fetcher is not None
+            ):
+                cache.refs = await self._fetch_live_refs(project=project)
+        return cache.refs
+
     async def _fetch_live_refs(
         self, *, project: Project
     ) -> frozenset[str] | None:
@@ -1283,7 +1358,8 @@ class KeeperSyncService:
         ``ref_deleted`` rule simply does not fire) or when the GitHub
         round-trip fails — both are accepted "rule disabled, KEEP wins"
         outcomes. ``draft_inactivity`` is unaffected because it does
-        not read ``live_refs``.
+        not read ``live_refs``, and ``__main`` keeps LTD's tracked ref
+        because a missing set is no evidence that ref is gone.
 
         ``ProjectGitHubBindingResolver.resolve`` owns its own short
         read transaction and mints the GitHub installation token
@@ -1310,8 +1386,8 @@ class KeeperSyncService:
             )
         except RepositoryNotAccessibleError as exc:
             self._logger.info(
-                "Proactive lifecycle: GitHub repository not accessible,"
-                " ref_deleted disabled for this pass",
+                "Keeper sync: GitHub repository not accessible, live"
+                " refs unavailable for this pass",
                 owner=exc.owner,
                 repo=exc.repo,
                 installation_id=binding.installation_id,
@@ -1321,8 +1397,8 @@ class KeeperSyncService:
             return None
         except RepositoryRefFetchError as exc:
             self._logger.warning(
-                "Proactive lifecycle: GitHub ref fetch failed,"
-                " ref_deleted disabled for this pass",
+                "Keeper sync: GitHub ref fetch failed, live refs"
+                " unavailable for this pass",
                 owner=exc.owner,
                 repo=exc.repo,
                 installation_id=binding.installation_id,
@@ -1393,6 +1469,7 @@ class KeeperSyncService:
         org_slug: str | None = None,
         rewrite_rules: Sequence[AnySlugRewriteRule] = (),
         autocreation: EditionAutocreationConfig | None = None,
+        live_refs: frozenset[str] | None = None,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse.
 
@@ -1400,6 +1477,14 @@ class KeeperSyncService:
         consulted when deriving the edition's kind for ``git_refs`` /
         ``manual`` editions. The empty default still picks up the
         built-in version heuristics.
+
+        ``live_refs`` is the repository's live ref set when
+        :meth:`sync_project` fetched one. With the project's
+        ``github_default_branch``, it lets LTD's ``main`` edition follow
+        a default-branch rename LTD never heard of rather than revert
+        the ``__main`` the webhook converged (PRD #721) — see
+        :func:`~docverse_server.services.keeper_sync.mappers.derive_tracking_source`.
+        ``None`` maps every edition exactly as LTD reports it.
 
         ``autocreation`` is the project's resolved edition-autocreation
         config, which gates the semver aggregate backfill;
@@ -1453,7 +1538,15 @@ class KeeperSyncService:
             )
 
         tracking_mode, tracking_params = map_edition_tracking(
-            ltd_edition, build=ltd_build_for_mapping
+            ltd_edition,
+            build=ltd_build_for_mapping,
+            default_branch=project.github_default_branch,
+            live_refs=live_refs,
+        )
+        tracking_source = derive_tracking_source(
+            ltd_edition,
+            default_branch=project.github_default_branch,
+            live_refs=live_refs,
         )
         kind_derivation = derive_edition_kind(
             ltd_edition,
@@ -1462,10 +1555,15 @@ class KeeperSyncService:
         )
         docverse_slug = derive_edition_slug(ltd_edition.slug)
         self._logger.debug(
-            "Derived keeper-sync edition kind",
+            "Derived keeper-sync edition tracking and kind",
             ltd_edition_id=ltd_edition.ltd_id,
             ltd_edition_slug=ltd_edition.slug,
             ltd_mode=ltd_edition.mode,
+            ltd_tracked_refs=ltd_edition.tracked_refs,
+            tracking_mode=tracking_mode.value,
+            git_ref=tracking_params.get("git_ref"),
+            tracking_source=tracking_source.value,
+            default_branch=project.github_default_branch,
             edition_kind=kind_derivation.kind.value,
             kind_source=kind_derivation.source.value,
             kind_detail=kind_derivation.detail,

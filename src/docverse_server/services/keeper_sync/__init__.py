@@ -18,8 +18,10 @@ from .copier import (
 from .mappers import (
     EditionKindDerivation,
     KindDerivationSource,
+    TrackingDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
+    derive_tracking_source,
     map_edition_tracking,
 )
 from .service import (
@@ -50,7 +52,9 @@ __all__ = [
     "KeeperSyncService",
     "KindDerivationSource",
     "ProjectSyncResult",
+    "TrackingDerivationSource",
     "derive_edition_kind",
     "derive_edition_slug",
+    "derive_tracking_source",
     "map_edition_tracking",
 ]
