@@ -648,6 +648,20 @@ class EditionSyncOutcome:
     either way.
     """
 
+    ltd_date_rebuilt: datetime | None = None
+    """The ``date_rebuilt`` LTD Keeper reported for the edition this visit.
+
+    When the visit imported a fresh build (``build_outcome`` not
+    short-circuited), the worker forwards it into the
+    ``publish_edition`` payloads it enqueues from this outcome, the
+    edition's own and those of the semver aggregates its release moved,
+    so the ``edition_published``
+    event can report how long LTD's rebuild took to reach the CDN
+    (``ltd_lag``, PRD #713). ``None`` when LTD reports no
+    ``date_rebuilt`` for the edition, and on a tombstone short-circuit,
+    which enqueues no publish to measure.
+    """
+
     @property
     def contacted_ltd(self) -> bool:
         """``True`` when this edition's sync actually reached LTD.
@@ -1589,6 +1603,7 @@ class KeeperSyncService:
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
             dates_restamped=dates_restamped,
+            ltd_date_rebuilt=ltd_edition.date_rebuilt,
         )
 
     async def _stamp_ltd_clock(

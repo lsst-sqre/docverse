@@ -112,6 +112,7 @@ async def test_publishers_record_payloads() -> None:
             edition_kind=MetricsEditionKind.release,
             trigger=EditionPublishTrigger.build,
             elapsed=timedelta(seconds=2),
+            ltd_lag=None,
         )
     )
 

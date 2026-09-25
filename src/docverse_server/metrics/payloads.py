@@ -158,6 +158,25 @@ class EditionPublishedEvent(DocverseEventBase):
     elapsed: timedelta
     """Wall-clock time the worker spent on this publish."""
 
+    ltd_lag: timedelta | None
+    """How long LTD's rebuild of this edition took to reach the CDN.
+
+    The publish's success time minus the ``date_rebuilt`` LTD Keeper
+    reported for the edition, set only when a fresh keeper-sync visit
+    imported that rebuild and enqueued this publish (``trigger`` is
+    ``keeper_sync``). A semver aggregate (``15``, ``15.2``) the same
+    visit moved reports its release's lag, because that release's
+    rebuild is what moved it. A build-level copy retry happens inside
+    the window and counts toward it.
+
+    ``None`` whenever there is no LTD rebuild to measure from: the
+    build fan-out, rollback, and reconcile publishes, keeper-sync's
+    self-heal of an edition whose publish was lost, publish jobs
+    enqueued before this field existed, and LTD editions that report no
+    ``date_rebuilt``. Never clamped: clock skew between LTD and Docverse
+    shows up as a negative value rather than hiding as zero.
+    """
+
 
 class EditionReconcileCompletedEvent(DocverseEventBase):
     """One organization's ``edition_reconcile`` tick finished.

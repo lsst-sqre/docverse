@@ -883,6 +883,47 @@ async def test_fresh_import_stamps_the_edition_with_ltd_dates(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "date_rebuilt",
+    [datetime(2026, 4, 30, 18, 30, tzinfo=UTC), None],
+    ids=["rebuilt", "never-rebuilt"],
+)
+async def test_sync_edition_outcome_carries_ltd_date_rebuilt(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    date_rebuilt: datetime | None,
+) -> None:
+    """The outcome reports the ``date_rebuilt`` LTD gave this visit.
+
+    The worker forwards it into the publish payload so the
+    ``edition_published`` event can measure how long the rebuild took to
+    reach the CDN (PRD #713). An LTD edition that reports no
+    ``date_rebuilt`` has nothing to measure from and reports ``None``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    edition_main = _load("edition_main_git_refs.json")
+    edition_main["date_rebuilt"] = (
+        None if date_rebuilt is None else date_rebuilt.isoformat()
+    )
+    _seed_ltd(mock_discovery, edition_main=edition_main)
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.ltd_date_rebuilt for o in result.edition_outcomes] == [
+        date_rebuilt
+    ]
+    assert result.edition_outcomes[0].build_outcome is not None
+
+
+@pytest.mark.asyncio
 async def test_failed_clock_stamp_still_reports_the_edition(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,

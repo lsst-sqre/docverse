@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import sentry_sdk
@@ -90,7 +90,9 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         ``queue_job_id``, and ``queue_job_public_id``, plus the optional
         ``history_id`` naming the ``edition_build_history`` row the job
         was enqueued for (absent on payloads minted before that key
-        existed).
+        existed), the optional ``trigger`` override, and the optional
+        ``ltd_date_rebuilt`` (ISO-8601) that a fresh keeper-sync visit
+        sets so the ``edition_published`` event can report ``ltd_lag``.
 
     Returns
     -------
@@ -250,6 +252,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 queue_job_id=queue_job_id,
                 started=started,
                 trigger_override=payload.get("trigger"),
+                ltd_date_rebuilt=payload.get("ltd_date_rebuilt"),
             )
             await publish_run_completed(
                 events=ctx.get("events"),
@@ -605,6 +608,7 @@ async def _publish_edition_published(
     queue_job_id: int,
     started: float,
     trigger_override: str | None = None,
+    ltd_date_rebuilt: str | None = None,
 ) -> None:
     """Emit one ``edition_published`` metric for a successful publish.
 
@@ -615,6 +619,9 @@ async def _publish_edition_published(
     * otherwise the explicit ``trigger_override`` from the job payload
       (the rollback handler tags ``trigger=rollback``);
     * otherwise ``build`` — the ordinary client-upload fan-out.
+
+    ``ltd_lag`` comes from the payload's ``ltd_date_rebuilt`` (see
+    :func:`_ltd_lag`), read here at the success terminal.
 
     Fully best-effort: this runs *after* the publish has committed, so it
     swallows and logs any error — a metrics-backend outage (already
@@ -645,8 +652,24 @@ async def _publish_edition_published(
                 edition_kind=MetricsEditionKind.from_api(edition.kind),
                 trigger=trigger,
                 elapsed=timedelta(seconds=time.monotonic() - started),
+                ltd_lag=_ltd_lag(ltd_date_rebuilt),
             )
         )
     except Exception as exc:
         sentry_sdk.capture_exception(exc)
         logger.exception("Failed to publish edition_published metric")
+
+
+def _ltd_lag(ltd_date_rebuilt: str | None) -> timedelta | None:
+    """Measure how long ago LTD rebuilt the edition this job published.
+
+    ``ltd_date_rebuilt`` is the payload's ISO-8601 timestamp of the LTD
+    rebuild a fresh keeper-sync visit imported. Every other producer
+    leaves the key out, and so does every job enqueued before it existed,
+    so those publishes report ``None``. A rebuild stamped ahead of this
+    worker's clock gives a negative lag, returned as is: clamping it to
+    zero would hide the skew between LTD's clock and Docverse's.
+    """
+    if ltd_date_rebuilt is None:
+        return None
+    return datetime.now(tz=UTC) - datetime.fromisoformat(ltd_date_rebuilt)
