@@ -1,0 +1,3 @@
+### New features
+
+- The `lsst_doc` tracking mode now treats the project's default branch as its pre-release ref instead of the literal `main`. For a project whose `github.default_branch` is `master`, a build on `master` publishes a fresh `lsst_doc` edition, a `vX.Y` release tag upgrades it off `master`, a later `master` build never displaces a published release, and successive `master` builds are ordered by the same stale-build date guard that `main` builds get today. A build on `main` is then an ordinary branch for that edition. Projects whose default branch is unknown (`github.default_branch` is `null`) or is `main` behave exactly as before.

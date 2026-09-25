@@ -1079,6 +1079,240 @@ async def test_track_build_lsst_doc_main_stale_skipped(
         await db_session.commit()
 
 
+async def _setup_lsst_doc_on_default_branch(
+    db_session: AsyncSession,
+    *,
+    org_slug: str,
+    default_branch: str = "master",
+) -> tuple[Project, int]:
+    """Create a project on *default_branch* with a fresh ``lsst_doc``.
+
+    Returns the project and the id of its ``current`` edition. The
+    project's ``github_default_branch`` is written the way the resolve
+    worker writes it, so ``track_build`` reads it back from the row.
+    """
+    _org, project = await _setup(db_session, org_slug=org_slug)
+    proj_store = ProjectStore(session=db_session, logger=_logger())
+    await proj_store.set_github_default_branch(
+        project_id=project.id, value=default_branch
+    )
+    edition_store = EditionStore(session=db_session, logger=_logger())
+    edition = await edition_store.create_internal(
+        project_id=project.id,
+        slug="current",
+        title="Current",
+        kind=EditionKind.release,
+        tracking_mode=TrackingMode.lsst_doc,
+    )
+    return project, edition.id
+
+
+async def _current_build_id(
+    db_session: AsyncSession, edition_id: int
+) -> int | None:
+    return (
+        await db_session.execute(
+            select(SqlEdition.current_build_id).where(
+                SqlEdition.id == edition_id
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_default_branch_advances_fresh(
+    db_session: AsyncSession,
+) -> None:
+    """lsst_doc: a build on the default branch advances a fresh edition.
+
+    With ``github_default_branch = "master"``, ``master`` is the
+    pre-release ref the edition serves until a release is tagged.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, edition_id = await _setup_lsst_doc_on_default_branch(
+            db_session, org_slug="lsst-master-fresh-org"
+        )
+        master_build = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        result = await service.track_build(master_build)
+        current_build_id = await _current_build_id(db_session, edition_id)
+        await db_session.commit()
+
+    outcomes = [o for o in result.outcomes if o.slug == "current"]
+    assert [o.action for o in outcomes] == ["updated"]
+    assert current_build_id == master_build.id
+
+
+async def _set_build_dates(
+    db_session: AsyncSession, dates: dict[int, datetime]
+) -> None:
+    for build_id, ts in dates.items():
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == build_id)
+            .values(date_created=ts)
+        )
+    await db_session.flush()
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_default_branch_advances_itself(
+    db_session: AsyncSession,
+) -> None:
+    """lsst_doc: a newer default-branch build replaces an older one.
+
+    ``master → master`` is the ``main → main`` case for a project whose
+    default branch is ``master``: the version guard lets it through.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, edition_id = await _setup_lsst_doc_on_default_branch(
+            db_session, org_slug="lsst-master-advance-org"
+        )
+        build_old = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        build_new = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        await _set_build_dates(
+            db_session,
+            {
+                build_old.id: datetime(2025, 1, 1, tzinfo=UTC),
+                build_new.id: datetime(2025, 6, 1, tzinfo=UTC),
+            },
+        )
+        await service.track_build(build_old)
+
+        result = await service.track_build(build_new)
+        current_build_id = await _current_build_id(db_session, edition_id)
+        await db_session.commit()
+
+    outcomes = [o for o in result.outcomes if o.slug == "current"]
+    assert [o.action for o in outcomes] == ["updated"]
+    assert current_build_id == build_new.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_default_branch_stale_skipped(
+    db_session: AsyncSession,
+) -> None:
+    """lsst_doc ``master → master``: a stale build hits the date guard.
+
+    The ``main → main`` exemption from version-mode's skipped date guard
+    follows the default branch, so an older ``master`` build cannot
+    displace a newer one.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, edition_id = await _setup_lsst_doc_on_default_branch(
+            db_session, org_slug="lsst-master-stale-org"
+        )
+        build_new = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        build_old = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        await _set_build_dates(
+            db_session,
+            {
+                build_new.id: datetime(2025, 6, 1, tzinfo=UTC),
+                build_old.id: datetime(2025, 1, 1, tzinfo=UTC),
+            },
+        )
+        await service.track_build(build_new)
+
+        result = await service.track_build(build_old)
+        current_build_id = await _current_build_id(db_session, edition_id)
+        await db_session.commit()
+
+    outcomes = [o for o in result.outcomes if o.slug == "current"]
+    assert [o.action for o in outcomes] == ["skipped"]
+    assert current_build_id == build_new.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_default_branch_upgrades_to_version(
+    db_session: AsyncSession,
+) -> None:
+    """lsst_doc: ``master → v1.0`` upgrades off the default branch."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, edition_id = await _setup_lsst_doc_on_default_branch(
+            db_session, org_slug="lsst-master-upgrade-org"
+        )
+        master_build = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        await service.track_build(master_build)
+
+        version_build = await _create_build(
+            db_session, project.id, git_ref="v1.0"
+        )
+        result = await service.track_build(version_build)
+        current_build_id = await _current_build_id(db_session, edition_id)
+        await db_session.commit()
+
+    outcomes = [o for o in result.outcomes if o.slug == "current"]
+    assert [o.action for o in outcomes] == ["updated"]
+    assert current_build_id == version_build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_version_refuses_default_branch(
+    db_session: AsyncSession,
+) -> None:
+    """lsst_doc: ``v1.0 → master`` is refused once a release is served."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, edition_id = await _setup_lsst_doc_on_default_branch(
+            db_session, org_slug="lsst-master-refuse-org"
+        )
+        version_build = await _create_build(
+            db_session, project.id, git_ref="v1.0"
+        )
+        await service.track_build(version_build)
+
+        master_build = await _create_build(
+            db_session, project.id, git_ref="master"
+        )
+        result = await service.track_build(master_build)
+        current_build_id = await _current_build_id(db_session, edition_id)
+        await db_session.commit()
+
+    assert [o for o in result.outcomes if o.slug == "current"] == []
+    assert current_build_id == version_build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_main_not_prerelease_on_master(
+    db_session: AsyncSession,
+) -> None:
+    """lsst_doc: ``main`` is an ordinary branch on a ``master`` project.
+
+    The literal ``main`` is only the fallback for a project whose
+    default branch is unknown, so once the column says ``master`` a
+    ``main`` build leaves the fresh ``lsst_doc`` edition unpublished.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, edition_id = await _setup_lsst_doc_on_default_branch(
+            db_session, org_slug="lsst-master-main-org"
+        )
+        main_build = await _create_build(
+            db_session, project.id, git_ref="main"
+        )
+        result = await service.track_build(main_build)
+        current_build_id = await _current_build_id(db_session, edition_id)
+        await db_session.commit()
+
+    assert [o for o in result.outcomes if o.slug == "current"] == []
+    assert current_build_id is None
+
+
 @pytest.mark.asyncio
 async def test_track_build_multi_mode_match(
     db_session: AsyncSession,
