@@ -5,7 +5,8 @@ what a deployment actually records: the route template the router
 matched, the status the handler answered with, and whether the
 Gafaelfawr ingress vouched for the caller. The unit tests drive the
 middleware over a throw-away app to reach the corners the real routes
-cannot, such as a route template that still carries the path prefix.
+cannot, such as a route template that still carries the path prefix or
+a handler exception escaping to the server-error layer.
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import PlainTextResponse
 from httpx import ASGITransport, AsyncClient
 from safir.metrics import MockEventPublisher
 from starlette.types import Receive, Scope, Send
@@ -68,6 +70,98 @@ async def test_authorized_route_records_one_event(
     assert event.status_class == HttpStatusClass.successful
     assert event.duration > timedelta(0)
     assert event.authenticated is True
+
+
+@pytest.mark.asyncio
+async def test_project_route_records_org_and_project(
+    client: AsyncClient,
+) -> None:
+    """A route addressing a project records both of its path params.
+
+    The slugs come from the path parameters the router matched, so the
+    event can be sliced by organization and project wherever the route
+    names them.
+    """
+    await seed_org_with_admin(client, "api-req-proj-org", "testuser")
+    headers = {"X-Auth-Request-User": "testuser"}
+    created = await client.post(
+        "/docverse/orgs/api-req-proj-org/projects",
+        json={
+            "slug": "api-req-proj",
+            "title": "API request project",
+            "source_url": "https://example.com/example/api-req-proj",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    publisher = _api_request_publisher()
+    publisher.published.clear()
+
+    response = await client.get(
+        "/docverse/orgs/api-req-proj-org/projects/api-req-proj",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.route == "/orgs/{org}/projects/{project}"
+    assert event.organization == "api-req-proj-org"
+    assert event.project == "api-req-proj"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "route", "username"),
+    [
+        ("/docverse/orgs", "/orgs", "testuser"),
+        ("/docverse/admin/orgs", "/admin/orgs", "superadmin"),
+    ],
+)
+async def test_route_without_org_records_neither(
+    client: AsyncClient, path: str, route: str, username: str
+) -> None:
+    """A route that names no organization records neither dimension.
+
+    Listing and admin routes address the whole deployment, so the event
+    carries ``None`` rather than guessing a slug from the caller.
+    """
+    await seed_org_with_admin(client, "api-req-none-org", "testuser")
+    publisher = _api_request_publisher()
+    publisher.published.clear()
+
+    response = await client.get(
+        path, headers={"X-Auth-Request-User": username}
+    )
+
+    assert response.status_code == 200
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.route == route
+    assert event.organization is None
+    assert event.project is None
+
+
+@pytest.mark.asyncio
+async def test_unmatched_path_records_no_route(client: AsyncClient) -> None:
+    """A path no route matches is still counted, as a routeless ``4xx``.
+
+    Scanner probes then stay visible as client-error volume, while the
+    event carries no trace of the path they tried, so they add nothing to
+    any tag's cardinality.
+    """
+    publisher = _api_request_publisher()
+
+    response = await client.get("/docverse/no/such/path")
+
+    assert response.status_code == 404
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.route is None
+    assert event.status_code == 404
+    assert event.status_class == HttpStatusClass.client_error
+    assert event.organization is None
+    assert event.project is None
 
 
 @pytest.mark.asyncio
@@ -200,6 +294,110 @@ def _prefixed_app(
         return {"org": org}
 
     return ApiRequestMiddleware(app, events=events, path_prefix="/docverse")
+
+
+class _HandlerFailureError(Exception):
+    """The unhandled error a test route raises past the middleware."""
+
+
+def _failing_app(
+    events: Callable[[], DocverseEvents],
+    *,
+    error: Exception,
+    reached: list[Exception],
+) -> FastAPI:
+    """Build an app whose one route raises ``error`` unhandled.
+
+    The middleware is installed with ``add_middleware``, as ``main.py``
+    does, so it sits inside Starlette's ``ServerErrorMiddleware`` exactly
+    as in a deployment. That outer layer's handler appends every
+    exception it receives to ``reached`` before answering ``500``.
+    """
+    app = FastAPI()
+
+    @app.get("/orgs/{org}")
+    async def get_org(org: str) -> dict[str, str]:
+        raise error
+
+    async def server_error(request: Request, exc: Exception) -> Response:
+        reached.append(exc)
+        return PlainTextResponse("Internal Server Error", status_code=500)
+
+    app.add_exception_handler(Exception, server_error)
+    app.add_middleware(
+        ApiRequestMiddleware, events=events, path_prefix="/docverse"
+    )
+    return app
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_records_5xx_and_propagates(
+    mock_events: DocverseEvents,
+) -> None:
+    """An unhandled exception is recorded as a ``500`` and then re-raised.
+
+    The exception escapes before any response starts, so the middleware
+    records the ``500`` the server-error layer is about to send, then
+    re-raises the very same exception: the error handler, Sentry's
+    capture, and the caller's ``500`` are exactly what they would be
+    without the middleware.
+    """
+    error = _HandlerFailureError("handler failed")
+    reached: list[Exception] = []
+    app = _failing_app(lambda: mock_events, error=error, reached=reached)
+    publisher = mock_events.api_request
+    assert isinstance(publisher, MockEventPublisher)
+
+    async with AsyncClient(
+        base_url="https://example.com/",
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+    ) as client:
+        response = await client.get("/orgs/rubin")
+
+    assert response.status_code == 500
+    assert len(reached) == 1
+    assert reached[0] is error
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.route == "/orgs/{org}"
+    assert event.status_code == 500
+    assert event.status_class == HttpStatusClass.server_error
+    assert event.organization == "rubin"
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_does_not_replace_handler_exception(
+    mock_events: DocverseEvents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metrics failure while recording a ``500`` leaves the error intact.
+
+    The publish runs while the handler's exception is in flight, so a
+    publish error that escaped would replace it; instead the server-error
+    layer still receives the handler's own exception.
+    """
+    error = _HandlerFailureError("handler failed")
+    reached: list[Exception] = []
+    app = _failing_app(lambda: mock_events, error=error, reached=reached)
+    monkeypatch.setattr(
+        mock_events.api_request,
+        "publish",
+        AsyncMock(side_effect=RuntimeError("kafka down")),
+    )
+
+    with capture_logs() as captured:
+        async with AsyncClient(
+            base_url="https://example.com/",
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+        ) as client:
+            response = await client.get("/orgs/rubin")
+
+    assert response.status_code == 500
+    assert len(reached) == 1
+    assert reached[0] is error
+    assert [entry["event"] for entry in captured] == [
+        "Failed to publish api_request metrics event"
+    ]
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from pydantic import SecretStr
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 
 from docverse.models import OrganizationCreate
 from docverse_server.dependencies.context import context_dependency
@@ -405,3 +406,41 @@ async def test_post_signed_unrelated_event_is_no_op(
     assert response.status_code == 200
     after = count_jobs_by_name(arq_queue, "dashboard_sync")
     assert after == before
+
+
+@pytest.mark.asyncio
+async def test_delivery_records_anonymous_api_request(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A delivery is one ``api_request`` with no caller and no org.
+
+    GitHub posts without passing through Gafaelfawr, so the event is
+    unauthenticated, and the webhook route names no organization or
+    project for the event to be sliced by.
+    """
+    publisher = context_dependency.events.api_request
+    assert isinstance(publisher, MockEventPublisher)
+    publisher.published.clear()
+    body = json.dumps({"zen": "Speak like a human."}).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "ping",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000002",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.method == "POST"
+    assert event.route == "/webhooks/github"
+    assert event.status_code == 200
+    assert event.authenticated is False
+    assert event.organization is None
+    assert event.project is None

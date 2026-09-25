@@ -605,7 +605,9 @@ class ApiRequestEvent(EventPayload):
 
     For example ``/orgs/{org}/projects/{project}`` for a request to
     ``/docverse/orgs/rubin/projects/sqr-000``. ``None`` when no route
-    matched the request.
+    template matched the request: an unknown path (then a ``404``), or
+    one of the documentation pages FastAPI serves itself, whose routes
+    record no template.
     """
 
     status_code: int

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 import structlog
+from starlette import status
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -36,17 +37,57 @@ _AUTH_USER_HEADER = "X-Auth-Request-User"
 class ApiRequestMiddleware:
     """Publish an ``api_request`` event for every API response.
 
-    The event is published after the wrapped application returns, which
-    is when the router's match is readable from the scope: FastAPI
-    records the matched route as ``scope["route"]``, and its template
-    (``/orgs/{org}``, not the concrete path) becomes the event's
-    ``route``. The status code and latency come from the
-    ``http.response.start`` message, timed on the monotonic clock from
-    the moment the request reached this middleware.
+    Every HTTP request except the probe endpoints (``/`` and ``/health``)
+    records exactly one event, whatever became of it: a routed response,
+    a path no route matched, or an exception that escaped the
+    application. The event is published once the wrapped application
+    returns (or raises), which is when the router's match is readable
+    from the scope. Its fields are filled as follows.
+
+    ``method``
+        The request method, upper-cased.
+    ``route``
+        The template of the route the router matched, with
+        ``path_prefix`` removed: ``/orgs/{org}/projects/{project}``,
+        never ``/docverse/orgs/rubin/projects/sqr-000``. FastAPI records
+        the matched API route as ``scope["route"]``. ``None`` when there
+        is no such route: a path nothing matched (scanner noise, which
+        FastAPI answers ``404``), and the documentation pages FastAPI
+        serves itself (``openapi.json``, ``docs``, ``redoc``), whose
+        plain Starlette routes record no template.
+    ``status_code`` and ``status_class``
+        The status of the ``http.response.start`` message. When an
+        exception escapes the application instead, ``500`` and ``5xx``:
+        the response Starlette's server-error layer, outside this
+        middleware, sends for it.
+    ``duration``
+        Time on the monotonic clock from the request reaching this
+        middleware to its response starting, or to the exception
+        escaping.
+    ``authenticated``
+        Whether Gafaelfawr's ingress set ``X-Auth-Request-User``. Only
+        the header's presence is recorded, never the username in it.
+    ``organization`` and ``project``
+        The matched route's ``org`` and ``project`` path parameters, as
+        the caller addressed them; each is ``None`` when the route
+        declares no such parameter or no route matched. Only callers
+        Gafaelfawr admits reach a route that declares them: the one
+        anonymous route, the GitHub webhook, declares neither.
+
+    Never put the concrete request path, the username, or any other
+    free-text identifier in the event, and derive no field from them.
+    Phalanx turns ``method``, ``route``, ``status_class``, and
+    ``authenticated`` into InfluxDB tags, and each stays bounded only
+    because it is a closed vocabulary or a template bounded by the size
+    of the API; an unmatched path is counted, but with ``route=None``,
+    so scanner noise adds volume without adding a tag value.
 
     Publishing is best-effort. The publish runs after the response has
     been handed to the server, and any exception it raises is logged and
     swallowed, so a metrics outage can never change or fail a response.
+    An exception raised by the application is recorded and then
+    re-raised unchanged, so Starlette's server-error handling, Sentry's
+    capture, and the ``500`` the caller receives are all untouched.
 
     This middleware must run inside
     :class:`~safir.middleware.x_forwarded.XForwardedMiddleware`, which
@@ -97,24 +138,31 @@ class ApiRequestMiddleware:
                 status_code = message["status"]
             await send(message)
 
-        await self._app(scope, receive, send_and_time)
+        try:
+            await self._app(scope, receive, send_and_time)
+        except Exception:
+            if duration is None:
+                duration = timedelta(seconds=time.monotonic() - started)
+            await self._publish(
+                scope,
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                duration=duration,
+            )
+            raise
 
-        route = self._route_template(scope)
-        if route is None or status_code is None or duration is None:
+        if status_code is None or duration is None:
             return
-        await self._publish(
-            scope, route=route, status_code=status_code, duration=duration
-        )
+        await self._publish(scope, status_code=status_code, duration=duration)
 
     async def _publish(
         self,
         scope: Scope,
         *,
-        route: str,
         status_code: int,
         duration: timedelta,
     ) -> None:
         """Publish the event, logging and swallowing any failure."""
+        route = self._route_template(scope)
         try:
             payload = ApiRequestEvent(
                 method=scope["method"].upper(),
@@ -125,8 +173,8 @@ class ApiRequestMiddleware:
                 authenticated=bool(
                     Headers(scope=scope).get(_AUTH_USER_HEADER)
                 ),
-                organization=None,
-                project=None,
+                organization=_path_param(scope, "org"),
+                project=_path_param(scope, "project"),
             )
             await self._events().api_request.publish(payload)
         except Exception:
@@ -156,3 +204,13 @@ class ApiRequestMiddleware:
         if prefix and (path == prefix or path.startswith(f"{prefix}/")):
             return path[len(prefix) :] or "/"
         return path
+
+
+def _path_param(scope: Scope, name: str) -> str | None:
+    """Return a string path parameter the router matched, if any.
+
+    ``None`` when no route matched (the router then records no path
+    parameters) or when the matched route does not declare ``name``.
+    """
+    value = (scope.get("path_params") or {}).get(name)
+    return value if isinstance(value, str) else None
