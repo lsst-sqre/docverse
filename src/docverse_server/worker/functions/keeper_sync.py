@@ -1027,9 +1027,10 @@ def _build_on_build_copied(
     awaits it once per build-content copy — after a success and after a
     failure, a build-level re-run included — and each call publishes one
     ``BuildContentCopiedEvent``, so a Sasquatch dashboard can plot
-    transport health over a sync campaign (PRD #685). The report
-    carries the Docverse project slug; the organization and the LTD
-    product slug come from the job payload.
+    transport health over a sync campaign (PRD #685) and how far behind
+    LTD's rebuild each copy finished (``ltd_lag_seconds``, PRD #713). The
+    report carries the Docverse project slug; the organization and the
+    LTD product slug come from the job payload.
 
     Returns ``None`` when the worker has no metrics events (unit tests
     that do not ask for them), so the service skips the report entirely.
@@ -1051,6 +1052,7 @@ def _build_on_build_copied(
                 exhausted_object_count=report.exhausted_object_count,
                 build_retry_used=report.build_retry_used,
                 succeeded=report.succeeded,
+                ltd_lag_seconds=report.ltd_lag_seconds,
             )
         )
 

@@ -378,6 +378,22 @@ class BuildContentCopiedEvent(DocverseEventBase):
     succeeded: bool
     """Whether the copy, after any build-level retry, stored every object."""
 
+    ltd_lag_seconds: float | None
+    """Seconds from LTD's rebuild of the edition to this copy's end.
+
+    The copy's completion time minus the ``date_rebuilt`` LTD Keeper
+    reported for the edition the build was synced for, taken when the
+    copy ended, whether it succeeded or failed; a build-level retry
+    happens inside the window and counts toward it. It is the copy half
+    of ``edition_published``'s ``ltd_lag``: subtracting it from that lag
+    leaves the queue wait and the CDN publish. A float in seconds, like
+    ``duration_seconds``, so the two read in the same unit.
+
+    ``None`` when LTD reports no ``date_rebuilt`` for the edition. Never
+    clamped: clock skew between LTD and Docverse shows up as a negative
+    value rather than hiding as zero.
+    """
+
 
 class LifecycleActionEvent(DocverseEventBase):
     """A maintenance worker retired a resource.
