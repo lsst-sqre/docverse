@@ -245,7 +245,7 @@ fills: project-scoped events carry both; org-scoped events leave
 | [`edition_published`](#edition_published) | `publish_edition` worker | project |
 | [`dashboard_built`](#dashboard_built) | `dashboard_build` worker | project |
 | [`project_lifecycle`](#project_lifecycle) | projects API handler | project |
-| [`edition_lifecycle`](#edition_lifecycle) | editions API handler | project |
+| [`edition_lifecycle`](#edition_lifecycle) | editions API handler; default-branch convergence (GitHub webhook handler, `git_ref_audit` and `project_github_resolve` workers) | project |
 | [`membership_changed`](#membership_changed) | members API handler | organization |
 | [`conditional_get`](#conditional_get) | conditional read endpoints | organization or project |
 | [`api_request`](#api_request) | API middleware | optional |
@@ -376,6 +376,13 @@ Measurement: `lsst.square.metrics.events.docverse.edition_lifecycle`
 An edition was created, updated, deleted, or rolled back through the
 editions API. Published by the handler after the operation's final
 commit.
+
+An `update` of a `main` edition is also published when Docverse
+rewrites a project's `__main` edition to track the repository's
+renamed default branch, just as a `PATCH` of that edition would be. The
+GitHub webhook handler (a `repository` `edited` delivery), the
+`git_ref_audit` worker, or the `project_github_resolve` worker publishes
+it after the convergence commits.
 
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |

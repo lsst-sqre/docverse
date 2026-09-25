@@ -35,7 +35,22 @@ import sentry_sdk
 import structlog
 from arq import Retry
 from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse_server.factory import Factory
+from docverse_server.metrics import (
+    DocverseEvents,
+    EditionLifecycleEvent,
+    LifecycleAction,
+    MetricsEditionKind,
+)
+from docverse_server.services.dashboard.enqueue import (
+    try_enqueue_dashboard_build_by_slug,
+)
+from docverse_server.services.default_branch import (
+    DefaultBranchOutcome,
+    DefaultBranchTrigger,
+)
 from docverse_server.storage._http_retry import (
     RETRYABLE_STATUS_CODES,
     RETRYABLE_TRANSPORT_ERRORS,
@@ -142,10 +157,12 @@ async def project_github_resolve(
 ) -> str:
     """Resolve and persist a project's opportunistic GitHub metadata.
 
-    Writes the three ``github_*_id`` columns and
-    ``github_default_branch``. Each write is a no-op when GitHub reports
-    what the row already holds, so a re-resolve leaves the project's
-    clock alone.
+    Writes the three ``github_*_id`` columns, then applies the
+    repository's default branch through ``DefaultBranchService``
+    (PRD #721), which records ``github_default_branch`` and converges a
+    ``__main`` still tracking the branch the column held before. Each
+    write is a no-op when GitHub reports what the row already holds, so
+    a re-resolve leaves the project's clock alone.
 
     Parameters
     ----------
@@ -159,12 +176,13 @@ async def project_github_resolve(
     -------
     str
         ``"completed"`` on a successful resolve, ``"skipped"`` when the
-        project has no GitHub binding (or has been deleted),
-        ``"not_installed"`` when the GitHub App is not installed on the
-        repository (an expected, operator-recoverable state — the ids
-        stay NULL and the ``installation`` webhook backfills them once
-        the App is installed), or ``"failed"`` when GitHub returned a
-        genuine error or the columns could not be written.
+        project has no GitHub binding (or has been deleted, or was
+        rebound while GitHub answered), ``"not_installed"`` when the
+        GitHub App is not installed on the repository (an expected,
+        operator-recoverable state — the ids stay NULL and the
+        ``installation`` webhook backfills them once the App is
+        installed), or ``"failed"`` when GitHub returned a genuine error
+        or the columns could not be written.
 
     Raises
     ------
@@ -249,7 +267,6 @@ async def project_github_resolve(
             )
             return "failed"
 
-        default_branch_changed = False
         async with session.begin():
             updated = await project_store.update_github_metadata(
                 project_id=project_id,
@@ -259,20 +276,28 @@ async def project_github_resolve(
                 owner_id=metadata.owner_id,
                 repo_id=metadata.repo_id,
             )
-            # The default branch shares the ids' binding guard: when the
-            # binding moved to another repo mid-resolve, this repo's
-            # branch is as stale as its ids, so neither is written.
-            if updated:
-                default_branch_changed = (
-                    await project_store.set_github_default_branch(
-                        project_id=project_id, value=metadata.default_branch
-                    )
-                )
             await session.commit()
 
         if not updated:
             logger.info(
                 "Skipping persist: project binding changed during resolve"
+            )
+            return "skipped"
+
+        outcome = await _apply_default_branch(
+            ctx=ctx,
+            factory=factory,
+            session=session,
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            default_branch=metadata.default_branch,
+            logger=logger,
+        )
+        if outcome is None:
+            logger.info(
+                "Skipping default branch: project binding changed during "
+                "resolve"
             )
             return "skipped"
 
@@ -282,9 +307,86 @@ async def project_github_resolve(
             github_owner_id=metadata.owner_id,
             github_repo_id=metadata.repo_id,
             github_default_branch=metadata.default_branch,
-            default_branch_changed=default_branch_changed,
+            default_branch_changed=outcome.column_changed,
+            main_rewritten=outcome.main_rewritten,
         )
         return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _apply_default_branch(
+    *,
+    ctx: dict[str, Any],
+    factory: Factory,
+    session: AsyncSession,
+    project_id: int,
+    owner: str,
+    repo: str,
+    default_branch: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> DefaultBranchOutcome | None:
+    """Converge the project on the default branch the resolve read.
+
+    Routes the write through
+    :class:`~docverse_server.services.default_branch.DefaultBranchService`
+    (PRD #721) with ``old_default_branch`` set to the column's previous
+    value and no live ref set. A first resolve (``NULL`` column) therefore
+    only seeds the column, while a binding moved to a repository with a
+    different default branch rewrites a ``__main`` still tracking the
+    branch recorded for the old one. A rewritten ``__main`` is announced
+    as a ``PATCH`` of it would be: its ``publish_edition`` job is handed
+    to arq, then one ``edition_lifecycle`` ``update`` event and one
+    ``dashboard_build``.
+
+    Runs in its own transaction after the ids commit, because the
+    service takes ``__main``'s ``EDITION_UPDATE`` advisory lock before
+    it writes, and the ids ``UPDATE`` would otherwise hold the project
+    row while waiting on it (advisory lock, then rows). The binding is
+    re-read first so a project rebound between the two transactions
+    does not record the old repository's branch; the rebind enqueued
+    its own resolve.
+
+    Returns
+    -------
+    DefaultBranchOutcome or None
+        What the service changed, or ``None`` when the project is gone
+        or no longer bound to ``owner/repo``.
+    """
+    async with session.begin():
+        project = await factory.create_project_store().get_by_id(project_id)
+        if project is None or (project.github_owner, project.github_repo) != (
+            owner,
+            repo,
+        ):
+            return None
+        outcome = await factory.create_default_branch_service().apply(
+            project=project,
+            default_branch=default_branch,
+            trigger=DefaultBranchTrigger.resolve,
+            old_default_branch=project.github_default_branch,
+        )
+        org = await factory.create_org_store().get_by_id(project.org_id)
+        await session.commit()
+    await factory.queue_dispatcher.dispatch()
+    if not outcome.main_rewritten or org is None:
+        return outcome
+    events: DocverseEvents | None = ctx.get("events")
+    if events is not None:
+        await events.edition_lifecycle.publish(
+            EditionLifecycleEvent(
+                organization=org.slug,
+                project=project.slug,
+                action=LifecycleAction.update,
+                edition_kind=MetricsEditionKind.main,
+            )
+        )
+    await try_enqueue_dashboard_build_by_slug(
+        factory=factory,
+        session=session,
+        logger=logger,
+        org_slug=org.slug,
+        project_slug=project.slug,
+    )
+    return outcome
