@@ -13,6 +13,16 @@ from docverse.models.projects import InstallationStatus, build_github_url
 
 from .lifecycle import LifecycleRuleSet
 
+FALLBACK_DEFAULT_BRANCH = "main"
+"""The branch assumed to be a project's default until GitHub says.
+
+``projects.github_default_branch`` is ``NULL`` until a trigger learns
+the repository's real default branch (PRD #721), and always for a
+project with no GitHub binding. Every consumer of the column falls back
+to this value, which is what keeps those projects behaving exactly as
+they did before the column existed.
+"""
+
 
 class Project(BaseModel):
     """Domain representation of a project."""
@@ -89,6 +99,15 @@ class Project(BaseModel):
         ),
     )
 
+    github_default_branch: str | None = Field(
+        default=None,
+        description=(
+            "The repository's default branch as GitHub last reported"
+            " it, captured by the resolve worker. ``None`` until"
+            " learned; consumers fall back to ``main``."
+        ),
+    )
+
     slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules for rewriting project slugs in URLs.",
@@ -136,6 +155,18 @@ class Project(BaseModel):
         if self.github_owner is not None and self.github_repo is not None:
             return build_github_url(self.github_owner, self.github_repo)
         return self.source_url
+
+    @property
+    def effective_default_branch(self) -> str:
+        """The branch this project's documentation treats as default.
+
+        ``github_default_branch`` when GitHub has told Docverse, and
+        :data:`FALLBACK_DEFAULT_BRANCH` otherwise — so a project whose
+        column is still ``NULL`` (not yet resolved, or not on GitHub)
+        keeps behaving as if its default branch were ``main``. Consumers
+        read this rather than repeating the fallback.
+        """
+        return self.github_default_branch or FALLBACK_DEFAULT_BRANCH
 
     @property
     def github_installation_status(self) -> InstallationStatus | None:

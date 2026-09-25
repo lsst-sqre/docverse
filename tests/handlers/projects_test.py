@@ -1291,6 +1291,8 @@ async def test_create_project_with_github_binding_only(
         # app_url is absent.
         "installation_status": "not_installed",
         "app_url": None,
+        # Not learned until the resolve worker reads it from GitHub.
+        "default_branch": None,
     }
     # source_url is derived from the binding, not stored separately.
     assert data["source_url"] == "https://github.com/lsst/docverse"
@@ -1466,6 +1468,7 @@ async def test_patch_project_sets_github_binding_drops_source_url(
         "installation_id": None,
         "installation_status": "not_installed",
         "app_url": None,
+        "default_branch": None,
     }
     # The GitLab URL is dropped; source_url is derived from the binding.
     assert data["source_url"] == "https://github.com/lsst/add-gh"
@@ -1499,6 +1502,7 @@ async def test_patch_project_source_url_null_leaves_github_intact(
         "installation_id": None,
         "installation_status": "not_installed",
         "app_url": None,
+        "default_branch": None,
     }
     assert data["source_url"] == "https://github.com/lsst/keep-gh"
 
@@ -1561,6 +1565,105 @@ async def test_project_github_installed_status_and_app_url(
     assert binding["installation_id"] == 42
     assert binding["installation_status"] == "installed"
     assert binding["app_url"] == "https://github.com/apps/docverse"
+
+
+@pytest.mark.asyncio
+async def test_get_project_shows_github_default_branch(
+    client: AsyncClient,
+) -> None:
+    """``github.default_branch`` reports the stored column (PRD #721).
+
+    An existing bound project reads ``null`` until the resolve worker
+    learns its default branch, then reports what GitHub said.
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-branch",
+            "title": "GH Branch",
+            "github": {"owner": "lsst", "repo": "gh-branch"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/gh-branch",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["github"]["default_branch"] is None
+
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            result = await session.execute(
+                select(SqlProject.id).where(SqlProject.slug == "gh-branch")
+            )
+            project_id = result.scalar_one()
+            store = ProjectStore(session=session, logger=logger)
+            await store.set_github_default_branch(
+                project_id=project_id, value="master"
+            )
+            await session.commit()
+        break
+
+    response = await client.get(
+        "/docverse/orgs/proj-org/projects/gh-branch",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["github"]["default_branch"] == "master"
+
+
+@pytest.mark.asyncio
+async def test_create_project_rejects_github_default_branch(
+    client: AsyncClient,
+) -> None:
+    """POST cannot set ``github.default_branch``: GitHub owns it."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-set-branch",
+            "title": "GH Set Branch",
+            "github": {
+                "owner": "lsst",
+                "repo": "gh-set-branch",
+                "default_branch": "main",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_project_rejects_github_default_branch(
+    client: AsyncClient,
+) -> None:
+    """PATCH cannot set ``github.default_branch``: GitHub owns it."""
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "gh-patch-branch",
+            "title": "GH Patch Branch",
+            "github": {"owner": "lsst", "repo": "gh-patch-branch"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/gh-patch-branch",
+        json={
+            "github": {
+                "owner": "lsst",
+                "repo": "gh-patch-branch",
+                "default_branch": "main",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

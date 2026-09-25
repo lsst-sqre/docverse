@@ -689,11 +689,13 @@ class GitHubWebhookReceivedEvent(EventPayload):
     jobs_enqueued: int
     """How many background jobs the delivery's callbacks enqueued.
 
-    The ``dashboard_sync`` jobs a ``push`` enqueues, or the
+    The ``dashboard_sync`` jobs a ``push`` enqueues, the
     ``dashboard_build`` jobs a ``delete`` enqueues for the projects whose
-    editions it retired; zero for every other event type, and for a
-    delivery that was not dispatched. On ``error`` it counts the jobs
-    enqueued before the failure.
+    editions it retired, or the ``publish_edition`` and
+    ``dashboard_build`` jobs a ``repository.edited`` default-branch
+    change enqueues for the projects whose ``__main`` it moved; zero for
+    every other event type, and for a delivery that was not dispatched.
+    On ``error`` it counts the jobs enqueued before the failure.
     """
 
     elapsed: timedelta

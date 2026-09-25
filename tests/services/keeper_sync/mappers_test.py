@@ -21,12 +21,15 @@ from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
 from docverse_server.services.keeper_sync import service as keeper_sync_service
 from docverse_server.services.keeper_sync.mappers import (
     KindDerivationSource,
+    TrackingDerivationSource,
     derive_edition_dates,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
     derive_synced_build_git_ref,
+    derive_tracking_source,
     map_edition_tracking,
+    tracking_reads_live_refs,
 )
 from docverse_server.storage.ltd import LtdBuild, LtdEdition
 
@@ -437,6 +440,167 @@ def test_map_edition_tracking_table(
     edition = _edition(mode=ltd_mode, tracked_refs=tracked_refs)
     build = _build(git_refs=build_git_refs) if build_git_refs else None
     assert map_edition_tracking(edition, build=build) == expected
+
+
+class TestMainFollowsDefaultBranch:
+    """LTD's ``main`` edition follows the default branch once its ref is gone.
+
+    A default-branch rename (``master`` → ``main``) leaves LTD still
+    naming ``master`` for its ``main`` edition, and keeper-sync
+    realigns ``__main`` with LTD on every visit — so without this arm it
+    would revert the ``__main`` the ``repository.edited`` webhook just
+    converged (PRD #721). The rule is the one ``DefaultBranchService``
+    applies: LTD's ref must be *gone* from a live set that was actually
+    fetched, and the project's default branch must be known.
+    """
+
+    def test_gone_ref_maps_onto_the_default_branch(self) -> None:
+        edition = _edition(slug="main", tracked_refs=["master"])
+        mode, params = map_edition_tracking(
+            edition,
+            default_branch="main",
+            live_refs=frozenset({"main", "v1.0"}),
+        )
+        assert mode == TrackingMode.git_ref
+        assert params == {"git_ref": "main"}
+
+    @pytest.mark.parametrize(
+        ("default_branch", "live_refs"),
+        [
+            pytest.param(
+                "main", frozenset({"main", "master"}), id="ref-still-live"
+            ),
+            pytest.param("main", None, id="live-refs-unavailable"),
+            pytest.param(None, frozenset({"main"}), id="default-branch-null"),
+        ],
+    )
+    def test_ltd_ref_stands_without_evidence_it_is_gone(
+        self, default_branch: str | None, live_refs: frozenset[str] | None
+    ) -> None:
+        """A live ref, an unfetched live set, or a ``NULL`` column keep LTD.
+
+        A ``master`` that still exists is deliberate non-default
+        tracking; a failed or unconfigured ref fetch is not evidence of
+        anything; and a project whose default branch Docverse has not
+        learned has nothing to follow.
+        """
+        edition = _edition(slug="main", tracked_refs=["master"])
+        mode, params = map_edition_tracking(
+            edition, default_branch=default_branch, live_refs=live_refs
+        )
+        assert mode == TrackingMode.git_ref
+        assert params == {"git_ref": "master"}
+
+    def test_non_main_editions_keep_their_gone_ref(self) -> None:
+        """Only ``__main`` follows the default branch.
+
+        A draft tracking a deleted branch is ``ref_deleted``'s to
+        retire, not a candidate for rewriting.
+        """
+        edition = _edition(slug="master", tracked_refs=["master"])
+        _, params = map_edition_tracking(
+            edition, default_branch="main", live_refs=frozenset({"main"})
+        )
+        assert params == {"git_ref": "master"}
+
+    @pytest.mark.parametrize(
+        ("ltd_mode", "build_git_refs", "expected"),
+        [
+            pytest.param(
+                "lsst_doc", None, (TrackingMode.lsst_doc, {}), id="lsst_doc"
+            ),
+            pytest.param(
+                "manual",
+                ["master"],
+                (TrackingMode.git_ref, {"git_ref": "master"}),
+                id="manual",
+            ),
+        ],
+    )
+    def test_non_git_refs_modes_are_unaffected(
+        self,
+        ltd_mode: str,
+        build_git_refs: list[str] | None,
+        expected: tuple[TrackingMode, dict[str, Any]],
+    ) -> None:
+        """The arm belongs to LTD's ``git_refs`` mode alone.
+
+        ``lsst_doc`` carries no ref to rewrite — it follows the default
+        branch through edition tracking instead — and a ``manual``
+        edition is pinned to its published build by design.
+        """
+        edition = _edition(slug="main", mode=ltd_mode, tracked_refs=None)
+        build = _build(git_refs=build_git_refs) if build_git_refs else None
+        assert (
+            map_edition_tracking(
+                edition,
+                build=build,
+                default_branch="main",
+                live_refs=frozenset({"main"}),
+            )
+            == expected
+        )
+
+
+class TestDeriveTrackingSource:
+    """``derive_tracking_source`` names the arm ``map_edition_tracking`` took.
+
+    Carried on keeper-sync's derivation log so an operator can tell a
+    ``__main`` that follows the project's default branch from one that
+    mirrors LTD verbatim.
+    """
+
+    def test_gone_ltd_main_ref_is_the_default_branch_arm(self) -> None:
+        edition = _edition(slug="main", tracked_refs=["master"])
+        source = derive_tracking_source(
+            edition, default_branch="main", live_refs=frozenset({"main"})
+        )
+        assert source == TrackingDerivationSource.default_branch
+
+    def test_standing_ltd_ref_is_the_ltd_arm(self) -> None:
+        edition = _edition(slug="main", tracked_refs=["master"])
+        source = derive_tracking_source(
+            edition,
+            default_branch="main",
+            live_refs=frozenset({"main", "master"}),
+        )
+        assert source == TrackingDerivationSource.ltd
+
+
+@pytest.mark.parametrize(
+    ("slug", "mode", "tracked_refs", "default_branch", "expected"),
+    [
+        pytest.param(
+            "main", "git_refs", ["master"], "main", True, id="diverged"
+        ),
+        pytest.param("main", "git_refs", ["main"], "main", False, id="agrees"),
+        pytest.param(
+            "main", "git_refs", ["master"], None, False, id="default-unknown"
+        ),
+        pytest.param(
+            "master", "git_refs", ["master"], "main", False, id="not-ltd-main"
+        ),
+        pytest.param("main", "lsst_doc", None, "main", False, id="lsst_doc"),
+    ],
+)
+def test_tracking_reads_live_refs(
+    slug: str,
+    mode: str,
+    tracked_refs: list[str] | None,
+    default_branch: str | None,
+    expected: bool,  # noqa: FBT001
+) -> None:
+    """Only a diverged LTD ``main`` needs the live ref set to be mapped.
+
+    ``sync_project`` fetches the set on the tracking's behalf only for
+    these editions, so every other project syncs without the GitHub
+    round-trip.
+    """
+    edition = _edition(slug=slug, mode=mode, tracked_refs=tracked_refs)
+    assert (
+        tracking_reads_live_refs(edition, default_branch=default_branch)
+        is expected
+    )
 
 
 class TestDeriveEditionSourcePrefix:

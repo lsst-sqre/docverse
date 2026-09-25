@@ -7710,6 +7710,293 @@ async def test_proactive_ref_set_fetched_once_per_sync_project(
     assert tags_route.call_count == 1
 
 
+def _seed_ltd_main_tracking_master(mock_discovery: respx.Router) -> LtdEdition:
+    """Stub LTD's view of a project renamed from ``master`` to ``main``.
+
+    LTD Keeper never learns of a default-branch rename, so its ``main``
+    edition keeps naming ``master`` and serving the last ``master``
+    build. Returns the LTD edition as the service parses it, for tests
+    that drive :meth:`KeeperSyncService.sync_edition` directly.
+    """
+    edition_payload = _load("edition_main_git_refs.json")
+    edition_payload["tracked_refs"] = ["master"]
+    build_payload = _load("build.json")
+    build_payload["git_refs"] = ["master"]
+    _seed_ltd(
+        mock_discovery,
+        edition_main=edition_payload,
+        build_payload=build_payload,
+    )
+    return LtdEdition.model_validate(edition_payload)
+
+
+_RENAMED_SOURCE_OBJECTS = {
+    "pipelines/builds/42/index.html": b"<html>master</html>",
+}
+
+
+async def _learn_default_branch(
+    session: AsyncSession, *, org_id: int, value: str
+) -> Project:
+    """Record the ``pipelines`` project's default branch; return it fresh."""
+    project_store = ProjectStore(
+        session=session, logger=structlog.get_logger("test")
+    )
+    async with session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        await project_store.set_github_default_branch(
+            project_id=project.id, value=value
+        )
+        learned = await project_store.get_by_id(project.id)
+    assert learned is not None
+    return learned
+
+
+async def _read_main_edition(
+    session: AsyncSession, *, project_id: int
+) -> Edition:
+    edition_store = EditionStore(
+        session=session, logger=structlog.get_logger("test")
+    )
+    async with session.begin():
+        main = await edition_store.get_by_slug(
+            project_id=project_id, slug=DEFAULT_EDITION_SLUG
+        )
+    assert main is not None
+    return main
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_keeps_main_on_the_default_branch_after_a_rename(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A gone LTD ``master`` does not revert a converged ``__main``.
+
+    The ``repository.edited`` webhook rewrites ``__main`` to ``main``,
+    but LTD still says ``master``, and ``sync_edition`` realigns
+    ``__main``'s tracking with LTD on every visit (PRD #721). With the
+    project's default branch known and ``master`` absent from the live
+    ref set, the visit tracks ``main`` — and so does every visit after.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    service = _build_service(
+        db_session, http_client, MockObjectStore(), _RENAMED_SOURCE_OBJECTS
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+
+    for _ in range(2):
+        await service.sync_edition(
+            org_id=org_id,
+            project=project,
+            ltd_edition=ltd_main,
+            live_refs=frozenset({"main"}),
+        )
+        main = await _read_main_edition(db_session, project_id=project.id)
+        assert main.tracking_mode == TrackingMode.git_ref
+        assert main.tracking_params == {"git_ref": "main"}
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_annotates_what_ltd_tracks_after_a_rename(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """``annotations.ltd_tracked_refs`` keeps recording LTD's own ref.
+
+    ``__main`` follows the default branch, but the state row is the
+    record of what LTD said — ``master`` — for reversibility.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-ann")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    service = _build_service(
+        db_session, http_client, MockObjectStore(), _RENAMED_SOURCE_OBJECTS
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+
+    await service.sync_edition(
+        org_id=org_id,
+        project=project,
+        ltd_edition=ltd_main,
+        live_refs=frozenset({"main"}),
+    )
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=ltd_main.ltd_id,
+        )
+    assert state is not None
+    assert state.annotations is not None
+    assert state.annotations["ltd_tracked_refs"] == ["master"]
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_without_live_refs_keeps_ltd_tracking(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """No live ref set is no evidence ``master`` is gone.
+
+    A project whose ref fetch failed or is unconfigured keeps mirroring
+    LTD, as it did before the default branch was ever recorded.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-norefs")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    service = _build_service(
+        db_session, http_client, MockObjectStore(), _RENAMED_SOURCE_OBJECTS
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+
+    await service.sync_edition(
+        org_id=org_id, project=project, ltd_edition=ltd_main, live_refs=None
+    )
+
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_params == {"git_ref": "master"}
+
+
+def _build_ref_aware_service(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_github: GitHubMock,
+) -> KeeperSyncService:
+    """Build a service wired with the GitHub ref-fetch collaborators."""
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    return _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        _RENAMED_SOURCE_OBJECTS,
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+
+@pytest.mark.parametrize(
+    "lifecycle_rules",
+    [
+        pytest.param(None, id="no-lifecycle-rules"),
+        pytest.param(
+            LifecycleRuleSet(root=[RefDeletedRule()]), id="ref-deleted-rule"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sync_project_converges_main_with_one_ref_fetch(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+    lifecycle_rules: LifecycleRuleSet | None,
+) -> None:
+    """``sync_project`` hands ``sync_edition`` the live ref set, once.
+
+    With a ``ref_deleted`` rule the proactive lifecycle pass has already
+    fetched the set, and ``__main``'s tracking reuses it. Without one
+    the pass never fetches, so ``sync_project`` fetches it for LTD's
+    ``main`` edition alone — otherwise a project with no lifecycle rules
+    would revert the webhook's ``__main`` on every visit. Either way the
+    renamed project converges on ``main`` for one GitHub round-trip.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-default-branch-sync",
+            lifecycle_rules=lifecycle_rules,
+        )
+    _seed_ltd_main_tracking_master(mock_discovery)
+    heads_route, tags_route = _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+    )
+    service = _build_ref_aware_service(
+        db_session=db_session, http_client=http_client, mock_github=mock_github
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+    heads_before = heads_route.call_count
+    tags_before = tags_route.call_count
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_params == {"git_ref": "main"}
+    assert heads_route.call_count - heads_before == 1
+    assert tags_route.call_count - tags_before == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_project_skips_ref_fetch_before_default_branch_is_known(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """No lifecycle rules and a ``NULL`` column cost no GitHub call.
+
+    The live ref set only matters to ``__main`` once the project's
+    default branch is known and differs from LTD's ref, so a project
+    that has not learned it syncs without touching GitHub, as before.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-null")
+    _seed_ltd_main_tracking_master(mock_discovery)
+    heads_route, tags_route = _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+    )
+    service = _build_ref_aware_service(
+        db_session=db_session, http_client=http_client, mock_github=mock_github
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert result.edition_failures == ()
+    assert result.docverse_project_id is not None
+    main = await _read_main_edition(
+        db_session, project_id=result.docverse_project_id
+    )
+    assert main.tracking_params == {"git_ref": "master"}
+    assert heads_route.call_count == 0
+    assert tags_route.call_count == 0
+
+
 @pytest.mark.asyncio
 async def test_sync_edition_isolates_aggregate_backfill_failure(
     db_session: AsyncSession,

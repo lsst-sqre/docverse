@@ -245,7 +245,7 @@ fills: project-scoped events carry both; org-scoped events leave
 | [`edition_published`](#edition_published) | `publish_edition` worker | project |
 | [`dashboard_built`](#dashboard_built) | `dashboard_build` worker | project |
 | [`project_lifecycle`](#project_lifecycle) | projects API handler | project |
-| [`edition_lifecycle`](#edition_lifecycle) | editions API handler | project |
+| [`edition_lifecycle`](#edition_lifecycle) | editions API handler; default-branch convergence (GitHub webhook handler, `git_ref_audit` and `project_github_resolve` workers) | project |
 | [`membership_changed`](#membership_changed) | members API handler | organization |
 | [`conditional_get`](#conditional_get) | conditional read endpoints | organization or project |
 | [`api_request`](#api_request) | API middleware | optional |
@@ -377,6 +377,13 @@ An edition was created, updated, deleted, or rolled back through the
 editions API. Published by the handler after the operation's final
 commit.
 
+An `update` of a `main` edition is also published when Docverse
+rewrites a project's `__main` edition to track the repository's
+renamed default branch, just as a `PATCH` of that edition would be. The
+GitHub webhook handler (a `repository` `edited` delivery), the
+`git_ref_audit` worker, or the `project_github_resolve` worker publishes
+it after the convergence commits.
+
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |
 | `organization` | string | tag | Organization slug. |
@@ -467,7 +474,9 @@ became of it, just before the handler returns or raises. It records
 what `api_request` cannot: the GitHub event type, and whether Docverse
 acted on the delivery. Like `api_request` it does not require an
 organization, because a delivery is recorded before it is resolved to
-one. Publishing is best-effort, as for `api_request`.
+one. Publishing is best-effort, as for `api_request`. What Docverse does
+with each event type is on the
+[GitHub integration](github-integration.md#webhook-events) page.
 
 | Outcome | Response | When |
 | --- | --- | --- |
@@ -481,7 +490,7 @@ one. Publishing is best-effort, as for `api_request`.
 | --- | --- | --- | --- |
 | `event_type` | string or null | tag | GitHub's `X-GitHub-Event` header, such as `push` or `ping`. Null for a delivery whose signature was not verified (`not_configured`, `invalid_signature`, or an `error` while parsing), because the header is caller-supplied. |
 | `outcome` | enum | tag | What became of the delivery: `dispatched`, `ignored`, `invalid_signature`, `not_configured`, or `error`. |
-| `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, or the `dashboard_build` jobs a `delete` enqueues. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
+| `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, the `dashboard_build` jobs a `delete` enqueues, or the `publish_edition` and `dashboard_build` jobs a `repository` `edited` delivery enqueues when a default-branch change moves `__main`. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
 | `elapsed` | duration | field | Time from the handler receiving the delivery to its outcome. |
 | `github_repository` | string or null | tag | The signed payload's `repository.full_name` (`owner/repo`). Null for events that name no repository (`ping`, `installation`) and for an unverified delivery. |
 | `organization` | string or null | tag | Reserved; always null. Kept so that resolving a delivery to its organization later is an additive change. |

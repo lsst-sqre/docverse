@@ -219,6 +219,7 @@ class Project(_ProjectBase):
                     or InstallationStatus.not_installed
                 ),
                 app_url=app_url,
+                default_branch=domain.github_default_branch,
             )
         return cls(
             self_url=str(

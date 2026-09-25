@@ -2474,6 +2474,127 @@ async def test_find_matching_lsst_doc_main_rejected_when_showing_version(
         await db_session.commit()
 
 
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_default_branch_unpublished(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc accepts the project's default branch when unpublished.
+
+    A project whose repository's default branch is ``master`` builds
+    its pre-release docs there, so that ref — not the literal ``main``
+    — is what a fresh ``lsst_doc`` edition falls back to.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="master", default_branch="master"
+        )
+        assert [e.slug for e in matched] == ["current"]
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_main_is_not_prerelease_on_master(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc ignores ``main`` when the default branch is elsewhere.
+
+    ``main`` is only the fallback for a project whose default branch
+    is unknown. Once it is known to be ``master``, a stray ``main``
+    build is an ordinary branch and never lands on the ``lsst_doc``
+    edition.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main", default_branch="master"
+        )
+        assert matched == []
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_default_branch_when_showing_it(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc accepts the default branch while it is showing it."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        master_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="master", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+            build_id=master_build.id,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="master", default_branch="master"
+        )
+        assert [e.slug for e in matched] == ["current"]
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_default_branch_rejected_on_version(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc rejects the default branch once it shows a release."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        version_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="v1.0", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+            build_id=version_build.id,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="master", default_branch="master"
+        )
+        assert matched == []
+        await db_session.commit()
+
+
 # ── Main-slug/kind invariant (ck_editions_main_slug_kind) ─────────────────
 
 

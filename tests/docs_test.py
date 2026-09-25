@@ -17,11 +17,12 @@ kind actually has.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -30,14 +31,17 @@ from typing import get_args, get_type_hints
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastapi import params
+from fastapi import APIRouter, params
 from fastapi.routing import APIRoute
 from safir.metrics import EventManager, EventPayload
 
 from docverse.models import (
     DraftInactivityRule,
+    EditionUpdate,
     KeeperSyncConfig,
     KeeperSyncScopePreview,
+    ProjectGitHubBinding,
+    ProjectGitHubBindingCreate,
 )
 from docverse.models.keeper_sync import (
     _MAX_SLUG_PATTERN_LENGTH,
@@ -45,10 +49,12 @@ from docverse.models.keeper_sync import (
 )
 from docverse_server.config import Configuration
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
+from docverse_server.handlers.orgs.editions import router as editions_router
 from docverse_server.handlers.orgs.keeper_sync import (
     router as keeper_sync_router,
 )
 from docverse_server.handlers.orgs.projects import get_project, get_projects
+from docverse_server.handlers.webhooks.github import _event_router
 from docverse_server.metrics import (
     BuildContentCopiedEvent,
     ConditionalGetEndpoint,
@@ -59,6 +65,7 @@ from docverse_server.metrics import (
     EditionReconcileCompletedEvent,
     HttpStatusClass,
 )
+from docverse_server.services.default_branch import DefaultBranchTrigger
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
     _ApplySkip,
@@ -66,6 +73,7 @@ from docverse_server.services.edition_reconcile import (
 from docverse_server.services.keeper_sync import (
     EditionSyncOutcome,
     ProjectSyncResult,
+    TrackingDerivationSource,
 )
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
@@ -117,6 +125,38 @@ each event's Avro schema ``<topic>.<event>``, which Telegraf writes as the
 InfluxDB measurement name; ``METRICS_APPLICATION`` is ``docverse`` in
 every deployment.
 """
+
+_GITHUB_PAGE = "github-integration.md"
+"""Operations page for the GitHub App integration (PRD #721)."""
+
+_GITHUB_KNOB_PREFIXES = ("github_", "git_ref_audit")
+"""Name prefixes of the settings the GitHub integration page tabulates."""
+
+_DEFAULT_BRANCH_LOG_MODULES = (
+    "docverse_server.services.default_branch",
+    "docverse_server.services.default_branch_processor",
+)
+"""Modules the GitHub page documents every log line of.
+
+Together they *are* the default-branch convergence: the webhook's
+payload handling and the one rule every trigger applies.
+"""
+
+_GITHUB_LOG_MODULES = (
+    *_DEFAULT_BRANCH_LOG_MODULES,
+    "docverse_server.worker.functions.git_ref_audit",
+    "docverse_server.worker.functions.project_github_resolve",
+)
+"""Modules whose log lines the GitHub page's log table may quote."""
+
+_KEEPER_SYNC_SERVICE_MODULE = "docverse_server.services.keeper_sync.service"
+"""Module that logs keeper-sync's ``__main`` tracking derivation."""
+
+_KEEPER_SYNC_TRACKING_MESSAGE = "Derived keeper-sync edition tracking and kind"
+"""The debug line saying where a synced edition's tracking came from."""
+
+_LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "exception"})
+"""The structlog methods whose first argument is a log line's message."""
 
 _DOCUMENTED_TYPES: dict[object, str] = {
     str: "string",
@@ -289,17 +329,138 @@ def _import_name(cls: type) -> str:
     return f"{cls.__module__}.{cls.__name__}"
 
 
-def _route_path(name: str) -> str:
-    """URL path of one keeper-sync route, looked up by handler name.
+def _route_path(name: str, *, router: APIRouter = keeper_sync_router) -> str:
+    """URL path of one route, looked up by handler name.
 
-    Read off the router rather than written out, so a page quoting an
-    endpoint's URL cannot survive that URL being moved.
+    Read off the router (the keeper-sync one unless told otherwise)
+    rather than written out, so a page quoting an endpoint's URL cannot
+    survive that URL being moved.
     """
-    for route in keeper_sync_router.routes:
+    for route in router.routes:
         if isinstance(route, APIRoute) and route.name == name:
             return route.path
-    msg = f"no keeper-sync route named {name!r}"
+    msg = f"no route named {name!r}"
     raise AssertionError(msg)
+
+
+def _subsection(section: str, heading: str) -> str:
+    """Return the body of a section's ``### heading`` subsection.
+
+    Runs to the next third-level heading or the end of the section.
+    """
+    parts = section.split(f"\n### {heading}\n", 1)
+    assert len(parts) == 2, f"the section has no {heading!r} subsection"
+    return parts[1].split("\n### ", 1)[0]
+
+
+def _code_rows(text: str) -> list[list[str]]:
+    """Cells of every table row whose first cell is inline code."""
+    return [
+        _cells(line) for line in text.splitlines() if line.startswith("| `")
+    ]
+
+
+def _inline_code(text: str) -> set[str]:
+    """Every inline-code span in ``text``, without its backticks."""
+    return set(re.findall(r"`([^`]+)`", text))
+
+
+def _documented_default(default: object) -> str:
+    """Return the Default cell a settings table gives a field's default.
+
+    A boolean reads the way its environment variable is spelled, and a
+    setting with no default reads "unset".
+    """
+    if default is None:
+        return "unset"
+    if isinstance(default, bool):
+        return f"`{str(default).lower()}`"
+    return f"`{default}`"
+
+
+def _webhook_subscriptions() -> set[str]:
+    """Every event, or ``event.action``, the webhook endpoint dispatches.
+
+    Read off the gidgethub router's registration tables. They are
+    private, but they are the only record of what the handler module
+    registered, so a callback added for a new event or action is one
+    the page has to gain a row for.
+    """
+    names = set(_event_router._shallow_routes)
+    for event, details in _event_router._deep_routes.items():
+        for values in details.values():
+            names.update(f"{event}.{value}" for value in values)
+    return names
+
+
+@dataclass(frozen=True, slots=True)
+class _LogCall:
+    """One structlog call: its level and the fields it adds."""
+
+    level: str
+    fields: frozenset[str]
+
+
+def _module_tree(module_name: str) -> ast.Module:
+    """Parse a module's source into a syntax tree."""
+    return ast.parse(inspect.getsource(importlib.import_module(module_name)))
+
+
+def _log_calls(module_name: str) -> dict[str, list[_LogCall]]:
+    """Every log line a module writes, keyed by its message.
+
+    Read off the module's syntax tree: any ``debug`` / ``info`` /
+    ``warning`` / ``error`` / ``exception`` call whose first argument is
+    a string literal, with the keyword arguments it passes. Adjacent
+    literals are one constant by then, so a message wrapped across
+    source lines is matched whole.
+    """
+    calls: dict[str, list[_LogCall]] = {}
+    for node in ast.walk(_module_tree(module_name)):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _LOG_LEVELS
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            continue
+        calls.setdefault(node.args[0].value, []).append(
+            _LogCall(
+                level=node.func.attr,
+                fields=frozenset(
+                    keyword.arg
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                ),
+            )
+        )
+    return calls
+
+
+def _bound_log_fields(module_name: str) -> set[str]:
+    """Every field a module binds onto a logger with ``.bind(...)``."""
+    return {
+        keyword.arg
+        for node in ast.walk(_module_tree(module_name))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "bind"
+        for keyword in node.keywords
+        if keyword.arg is not None
+    }
+
+
+def _documented_log_lines(page: str) -> dict[str, _LogCall]:
+    """Return the GitHub page's log-line table, keyed by message."""
+    table = _subsection(_section(page, "Reading an outcome"), "Log lines")
+    return {
+        cells[0].strip("`"): _LogCall(
+            level=cells[1], fields=frozenset(_inline_code(cells[2]))
+        )
+        for cells in _code_rows(table)
+    }
 
 
 def _query_parameter_names(endpoint: Callable[..., object]) -> set[str]:
@@ -1013,3 +1174,178 @@ def test_conditional_get_section_links_the_metrics_page() -> None:
         _read(_API_PAGE), "Conditional GET: the `ETag` validator"
     )
     assert _METRICS_PAGE in section
+
+
+def test_docs_index_links_the_github_integration_page() -> None:
+    """The index points at the GitHub integration page."""
+    assert _GITHUB_PAGE in _read("index.md")
+
+
+def test_github_webhook_table_matches_the_router() -> None:
+    """The webhook table has one row per event the endpoint dispatches.
+
+    Checked both ways: a callback registered for an event or action the
+    table does not name is behaviour an operator would have to read the
+    handler to discover, and a row for one the router no longer
+    registers describes a delivery that is now ``ignored``.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Webhook events")
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    subscriptions = _webhook_subscriptions()
+    assert subscriptions, "the webhook router registers no events"
+    assert documented == subscriptions
+
+
+def test_github_page_names_every_default_branch_trigger() -> None:
+    """Every ``trigger`` the default-branch rule logs is documented.
+
+    The trigger is how an operator tells a webhook-driven rewrite from
+    one the audit made after a missed delivery, so every value has to be
+    quotable from the page.
+    """
+    page = _read(_GITHUB_PAGE)
+    triggers = {trigger.value for trigger in DefaultBranchTrigger}
+    assert triggers, "the rule reports no triggers"
+    assert not _uncoded(triggers, page)
+
+
+def test_github_page_documents_the_default_branch_field() -> None:
+    """The page names the read-only ``github.default_branch`` field.
+
+    The field is on the binding the API returns and absent from the one
+    it accepts, which is what "GitHub is the source of truth" means on
+    the wire.
+    """
+    assert "default_branch" in ProjectGitHubBinding.model_fields
+    assert "default_branch" not in ProjectGitHubBindingCreate.model_fields
+    assert not _uncoded({"github.default_branch"}, _read(_GITHUB_PAGE))
+
+
+def test_github_knobs_documented_with_env_var_and_default() -> None:
+    """Every GitHub setting is a row naming its env var and default.
+
+    Checked both ways, off :class:`Configuration`: a GitHub or audit
+    setting the table lacks is one an operator cannot find, and a row
+    naming a setting that no longer exists is a knob that does nothing.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Configuration")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    knobs = {
+        name
+        for name in Configuration.model_fields
+        if name.startswith(_GITHUB_KNOB_PREFIXES)
+    }
+    assert knobs, "configuration exposes no GitHub knobs"
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    assert documented == knobs
+    for name in sorted(knobs):
+        cells = _cells(_table_row(section, name))
+        env_var = f"{env_prefix}{name}".upper()
+        default = Configuration.model_fields[name].default
+        assert cells[1] == f"`{env_var}`", name
+        assert cells[2] == _documented_default(default), name
+
+
+def test_github_audit_backfill_names_the_feature_flag() -> None:
+    """The backfill section names the flag the audit only runs behind.
+
+    The audit is how an upgraded environment's ``NULL`` columns are
+    filled, and it ships disabled, so an operator reading how the
+    backfill works has to learn there that it needs turning on.
+    """
+    section = _section(_read(_GITHUB_PAGE), "The audit is the backfill")
+    assert "git_ref_audit_enabled" in Configuration.model_fields
+    assert not _uncoded({"git_ref_audit_enabled"}, section)
+
+
+def test_github_log_lines_exist_in_the_code() -> None:
+    """Every row of the log table is a line the code writes, exactly.
+
+    The message has to be one a GitHub module emits, at the level the
+    row says, adding exactly the fields the row lists, so a renamed
+    message or a dropped field cannot leave the page describing a line
+    nobody can grep for.
+    """
+    documented = _documented_log_lines(_read(_GITHUB_PAGE))
+    assert documented, "the page documents no log lines"
+    emitted: dict[str, list[_LogCall]] = {}
+    for module_name in _GITHUB_LOG_MODULES:
+        for message, calls in _log_calls(module_name).items():
+            emitted.setdefault(message, []).extend(calls)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted.get(message, [])
+    )
+    assert not wrong
+
+
+def test_github_page_documents_every_default_branch_log_line() -> None:
+    """Every line the default-branch rule and processor write has a row.
+
+    Read off the two modules' syntax trees, so a log line added to
+    either has to be carried into the table.
+    """
+    documented = _documented_log_lines(_read(_GITHUB_PAGE))
+    missing = sorted(
+        message
+        for module_name in _DEFAULT_BRANCH_LOG_MODULES
+        for message in _log_calls(module_name)
+        if message not in documented
+    )
+    assert not missing
+
+
+def test_github_log_fields_table_matches_the_bound_context() -> None:
+    """The log-fields table lists exactly what the two modules bind.
+
+    Those fields ride on every line the table below it lists, so they
+    are documented once rather than on each row.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Reading an outcome")
+    table = _subsection(section, "Log fields")
+    documented = {cells[0].strip("`") for cells in _code_rows(table)}
+    bound = {
+        field
+        for module_name in _DEFAULT_BRANCH_LOG_MODULES
+        for field in _bound_log_fields(module_name)
+    }
+    assert bound, "the default-branch modules bind no fields"
+    assert documented == bound
+
+
+def test_github_keeper_sync_section_names_the_tracking_log() -> None:
+    """The keeper-sync section quotes the line reporting ``tracking_source``.
+
+    The line is how an operator tells a synced ``__main`` that follows
+    the default branch from one mirroring LTD, so its message, the
+    fields that say so, and every ``tracking_source`` value have to be
+    on the page and in the code.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Keeper-synced projects")
+    fields = {"tracking_source", "ltd_tracked_refs", "git_ref"}
+    calls = _log_calls(_KEEPER_SYNC_SERVICE_MODULE).get(
+        _KEEPER_SYNC_TRACKING_MESSAGE, []
+    )
+    assert any(fields <= call.fields for call in calls)
+    assert f"`{_KEEPER_SYNC_TRACKING_MESSAGE}`" in section
+    sources = {source.value for source in TrackingDerivationSource}
+    assert not _uncoded(fields | sources, section)
+
+
+def test_github_manual_fallback_documented() -> None:
+    """The operators' section quotes the edition endpoints it relies on.
+
+    Read off the editions router and the ``PATCH`` body model, so the
+    recipe cannot keep naming a path or a field that has moved.
+    """
+    section = _section(
+        _read(_GITHUB_PAGE), "Pinned `__main` editions are left for operators"
+    )
+    patch = _route_path("patch_edition", router=editions_router)
+    delete = _route_path("delete_edition", router=editions_router)
+    assert f"PATCH {patch.replace('{edition}', '__main')}" in section
+    assert f"DELETE {delete}" in section
+    fields = {"tracking_mode", "tracking_params", "build"}
+    assert fields <= set(EditionUpdate.model_fields)
+    assert not _uncoded(fields, section)
