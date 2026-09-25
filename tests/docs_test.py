@@ -18,14 +18,20 @@ kind actually has.
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable, Iterable
+from dataclasses import fields
 from pathlib import Path
 from typing import get_args, get_type_hints
 
 from fastapi import params
 from fastapi.routing import APIRoute
 
-from docverse.models import KeeperSyncConfig, KeeperSyncScopePreview
+from docverse.models import (
+    DraftInactivityRule,
+    KeeperSyncConfig,
+    KeeperSyncScopePreview,
+)
 from docverse.models.keeper_sync import (
     _MAX_SLUG_PATTERN_LENGTH,
     _MAX_SLUG_PATTERNS,
@@ -48,11 +54,17 @@ from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
     _ApplySkip,
 )
+from docverse_server.services.keeper_sync import (
+    EditionSyncOutcome,
+    ProjectSyncResult,
+)
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
     RETRYABLE_TRANSPORT_ERRORS,
     backoff_for_attempt,
 )
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.ltd import RETRYABLE_SOURCE_TRANSPORT_ERRORS
 from docverse_server.storage.pagination import ProjectSortOrder
 from docverse_server.worker.functions.edition_reconcile import (
@@ -78,6 +90,9 @@ _SCOPE_PAGE = "keeper-sync-scope.md"
 
 _TRANSPORT_PAGE = "keeper-sync-transport.md"
 """Operations page for keeper-sync transport resilience (PRD #685)."""
+
+_TIMESTAMPS_SECTION = "Timestamps mirror LTD"
+"""Scope-page section on keeper-sync's LTD clock stamp (PRD #706)."""
 
 _TRANSPORT_KNOB_PREFIXES = ("keeper_sync_upload_", "keeper_sync_copy_retry_")
 """Name prefixes of the settings that shape a build copy's retries."""
@@ -124,6 +139,20 @@ def _section(page: str, heading: str) -> str:
     parts = page.split(f"\n## {heading}\n", 1)
     assert len(parts) == 2, f"the page has no {heading!r} section"
     return parts[1].split("\n## ", 1)[0]
+
+
+def _stamped_columns(table: str, stamp: Callable[..., object]) -> set[str]:
+    """``table.column`` for every column one ``set_sync_dates`` writes.
+
+    The stamp's keyword-only parameters *are* the columns it sets, so
+    reading them off the signature means a column added to (or renamed
+    in) keeper-sync's clock stamp is one the page has to name.
+    """
+    return {
+        f"{table}.{name}"
+        for name, parameter in inspect.signature(stamp).parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
 
 
 def _import_name(cls: type) -> str:
@@ -349,6 +378,71 @@ def test_scope_endpoint_paths_documented() -> None:
     }
     paths = {_route_path(name) for name in names}
     assert not sorted(path for path in paths if path not in page)
+
+
+def test_timestamps_section_names_every_stamped_column() -> None:
+    """The scope page says which columns keeper-sync sets from LTD.
+
+    Read off the two ``set_sync_dates`` stamps, so the page cannot
+    keep describing a clock the sync has stopped writing, or miss one
+    it has started to.
+    """
+    section = _section(_read(_SCOPE_PAGE), _TIMESTAMPS_SECTION)
+    columns = _stamped_columns(
+        "editions", EditionStore.set_sync_dates
+    ) | _stamped_columns("builds", BuildStore.set_sync_dates)
+    assert columns, "keeper-sync stamps no columns"
+    assert not _uncoded(columns, section)
+
+
+def test_timestamps_section_names_the_backfill_signals() -> None:
+    """The section names the backfill's run endpoint and its read-outs.
+
+    The backfill is a full org run, so the section has to name the
+    endpoint that launches one; ``restamped_edition_count`` on the
+    project's summary log line is how an operator confirms it did
+    anything, and ``dates_restamped`` is the per-edition flag it counts.
+    """
+    section = _section(_read(_SCOPE_PAGE), _TIMESTAMPS_SECTION)
+    assert hasattr(ProjectSyncResult, "restamped_edition_count")
+    assert "dates_restamped" in {
+        field.name for field in fields(EditionSyncOutcome)
+    }
+    assert _route_path("post_org_keeper_sync_run") in section
+    assert not _uncoded(
+        {"restamped_edition_count", "dates_restamped"}, section
+    )
+
+
+def test_timestamps_section_covers_what_the_clock_drives() -> None:
+    """The section covers ``draft_inactivity`` and the project clock.
+
+    Re-dating a draft to LTD's last rebuild can make the lifecycle rule
+    reap it on the next tick, which an operator has to hear about
+    before running the backfill; and ``projects.date_updated`` is the
+    clock the stamp deliberately leaves alone.
+    """
+    section = _section(_read(_SCOPE_PAGE), _TIMESTAMPS_SECTION)
+    rule_type = DraftInactivityRule.model_fields["type"].default
+    assert not _uncoded({rule_type, "projects.date_updated"}, section)
+
+
+def test_docs_index_links_the_timestamps_section() -> None:
+    """The index points at the timestamps section by its anchor."""
+    assert "keeper-sync-scope.md#timestamps-mirror-ltd" in _read("index.md")
+
+
+def test_draft_inactivity_rule_links_the_timestamps_section() -> None:
+    """The rule's own documentation points at the timestamps section.
+
+    ``DraftInactivityRule``'s docstring is the rule's schema description
+    in the OpenAPI document, so it is where an operator reading about
+    ``max_days_inactive`` has to learn that a synced draft is judged on
+    LTD's clock.
+    """
+    doc = DraftInactivityRule.__doc__ or ""
+    assert _SCOPE_PAGE in doc
+    assert _TIMESTAMPS_SECTION in doc
 
 
 def test_conditional_get_endpoints_documented() -> None:

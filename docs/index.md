@@ -28,6 +28,11 @@ that back each of them up.
   an organization syncs: the include/exclude rule, `fullmatch` pattern
   semantics, what happens when a project falls out of scope, and the
   preview → `PATCH` → backfill workflow a wave migration uses.
+- [Keeper-sync timestamps](keeper-sync-scope.md#timestamps-mirror-ltd)
+  — why a synced edition's and build's dates are LTD's rather than the
+  import's: which columns follow LTD, how every sync visit re-asserts
+  them, what that means for `draft_inactivity`, what the project clock
+  does not do, and the full-org-run backfill.
 - [Keeper-sync transport resilience](keeper-sync-transport.md) — how a
   build copy rides out an outage on either end, R2 or the LTD bucket:
   the per-object budget for R2 uploads and its ride-out arithmetic, the
