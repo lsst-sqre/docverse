@@ -103,6 +103,7 @@ from docverse_server.domain.edition import (
     RepointOutcome,
 )
 from docverse_server.domain.edition_reconcile import ReconcileEdition
+from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH
 from docverse_server.domain.version import (
     EupsDailyVersion,
     EupsMajorVersion,
@@ -1340,11 +1341,26 @@ class EditionStore:
         project_id: int,
         git_ref: str,
         alternate_name: str | None = None,
+        default_branch: str = FALLBACK_DEFAULT_BRANCH,
     ) -> list[Edition]:
         """Find editions that match a git_ref or alternate_name.
 
         Used by the build processing worker to determine which editions
         should be updated when a build completes.
+
+        Parameters
+        ----------
+        project_id
+            Internal id of the project whose editions are searched.
+        git_ref
+            The build's git ref.
+        alternate_name
+            The build's alternate (deployment) scope, if any.
+        default_branch
+            The project's default branch — its
+            ``github_default_branch``, or the ``main`` fallback when
+            that is unknown. An ``lsst_doc`` edition treats a build on
+            this branch as its pre-release ref.
         """
         conditions = [
             SqlEdition.project_id == project_id,
@@ -1360,7 +1376,12 @@ class EditionStore:
             edition = self._validate(
                 edition_row, build_public_id, build_git_ref
             )
-            if self._edition_matches(edition, git_ref, alternate_name):
+            if self._edition_matches(
+                edition,
+                git_ref,
+                alternate_name,
+                default_branch=default_branch,
+            ):
                 matching.append(edition)
 
         return matching
@@ -1370,6 +1391,8 @@ class EditionStore:
         edition: Edition,
         git_ref: str,
         alternate_name: str | None,
+        *,
+        default_branch: str,
     ) -> bool:
         """Test whether *edition* matches the given git ref."""
         mode = edition.tracking_mode
@@ -1402,7 +1425,9 @@ class EditionStore:
             return EupsDailyVersion.parse(git_ref) is not None
 
         if mode == TrackingMode.lsst_doc:
-            return _lsst_doc_matches(edition, git_ref)
+            return _lsst_doc_matches(
+                edition, git_ref, default_branch=default_branch
+            )
 
         return False
 
@@ -1426,11 +1451,19 @@ def _semver_matches(
     )
 
 
-def _lsst_doc_matches(edition: Edition, git_ref: str) -> bool:
-    """Check whether *git_ref* matches an lsst_doc edition."""
+def _lsst_doc_matches(
+    edition: Edition, git_ref: str, *, default_branch: str
+) -> bool:
+    """Check whether *git_ref* matches an lsst_doc edition.
+
+    Any ``vX.Y`` release tag matches. The project's *default_branch* is
+    the pre-release fallback: it matches only while the edition has no
+    build or is still serving that same branch, so a release, once
+    published, is never displaced by the branch.
+    """
     if LsstDocVersion.parse(git_ref) is not None:
         return True
-    return git_ref == "main" and (
+    return git_ref == default_branch and (
         edition.current_build_id is None
-        or edition.current_build_git_ref == "main"
+        or edition.current_build_git_ref == default_branch
     )

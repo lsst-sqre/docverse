@@ -195,11 +195,16 @@ class EditionTrackingService:
             project_id=project.id,
         )
 
-        # 5. Find matching editions (includes version-based modes)
+        # 5. Find matching editions (includes version-based modes). The
+        #    project's default branch is resolved once here: it is the
+        #    pre-release ref an ``lsst_doc`` edition falls back to, both
+        #    when matching and in the version guard below.
+        default_branch = project.effective_default_branch
         editions = await self._deps.edition_store.find_matching_editions(
             project_id=project.id,
             git_ref=build.git_ref,
             alternate_name=build.alternate_name,
+            default_branch=default_branch,
         )
 
         # 6. Auto-create git_ref edition if no match from slug path
@@ -253,6 +258,7 @@ class EditionTrackingService:
             created_ids=created_ids,
             org_id=org.id,
             project_id=project.id,
+            default_branch=default_branch,
         )
 
         return EditionTrackingResult(
@@ -376,6 +382,7 @@ class EditionTrackingService:
         created_ids: set[int],
         org_id: int,
         project_id: int,
+        default_branch: str,
     ) -> list[EditionTrackingOutcome]:
         """Apply build to each matched edition, returning outcomes."""
         outcomes: list[EditionTrackingOutcome] = []
@@ -386,6 +393,7 @@ class EditionTrackingService:
                 auto_created=edition.id in created_ids,
                 org_id=org_id,
                 project_id=project_id,
+                default_branch=default_branch,
             )
             outcomes.append(outcome)
         return outcomes
@@ -398,9 +406,12 @@ class EditionTrackingService:
         auto_created: bool,
         org_id: int,
         project_id: int,
+        default_branch: str,
     ) -> EditionTrackingOutcome:
         """Attempt to update a single edition's build pointer."""
-        if not self._should_update(edition, build):
+        if not self._should_update(
+            edition, build, default_branch=default_branch
+        ):
             self._deps.logger.info(
                 "Version guard skipped edition",
                 edition_slug=edition.slug,
@@ -414,11 +425,14 @@ class EditionTrackingService:
                 action="skipped",
             )
 
+        # Version modes order builds by version, not date — except an
+        # ``lsst_doc`` edition moving between two builds of the default
+        # branch, where the date guard is the only ordering there is.
         is_version_mode = edition.tracking_mode in _VERSION_MODES
         skip_date_guard = is_version_mode and not (
             edition.tracking_mode == TrackingMode.lsst_doc
-            and build.git_ref == "main"
-            and edition.current_build_git_ref == "main"
+            and build.git_ref == default_branch
+            and edition.current_build_git_ref == default_branch
         )
         updated = await self._set_current_build_locked(
             org_id=org_id,
@@ -541,7 +555,9 @@ class EditionTrackingService:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _should_update(self, edition: Edition, build: Build) -> bool:
+    def _should_update(
+        self, edition: Edition, build: Build, *, default_branch: str
+    ) -> bool:
         """Check whether *build* should update *edition*.
 
         For non-version tracking modes (``git_ref``, ``alternate_git_ref``),
@@ -556,9 +572,11 @@ class EditionTrackingService:
         if edition.tracking_mode not in _VERSION_MODES:
             return True
 
-        # Special handling for lsst_doc + main ref
+        # Special handling for lsst_doc + the default branch
         if edition.tracking_mode == TrackingMode.lsst_doc:
-            return self._should_update_lsst_doc(edition, build)
+            return self._should_update_lsst_doc(
+                edition, build, default_branch=default_branch
+            )
 
         candidate = parse_version_for_mode(
             build.git_ref, edition.tracking_mode
@@ -573,12 +591,17 @@ class EditionTrackingService:
             mode=edition.tracking_mode,
         )
 
-    def _should_update_lsst_doc(self, edition: Edition, build: Build) -> bool:
+    def _should_update_lsst_doc(
+        self, edition: Edition, build: Build, *, default_branch: str
+    ) -> bool:
         """Version guard for ``lsst_doc`` tracking mode.
 
-        - main→main: accepted (fall through to date guard)
-        - main→version: always accepted (upgrade from main)
-        - version→main: rejected
+        *default_branch* is the project's pre-release ref — its
+        ``github_default_branch``, or ``main`` until that is known:
+
+        - branch→branch: accepted (fall through to date guard)
+        - branch→version: always accepted (upgrade from the branch)
+        - version→branch: rejected
         - version→version: compare parsed versions
         """
         current_ref = edition.current_build_git_ref
@@ -587,17 +610,17 @@ class EditionTrackingService:
         if edition.current_build_id is None or current_ref is None:
             return True
 
-        candidate_is_main = build.git_ref == "main"
-        current_is_main = current_ref == "main"
+        candidate_is_branch = build.git_ref == default_branch
+        current_is_branch = current_ref == default_branch
 
-        if current_is_main:
-            # main→main or main→version (always upgrade)
+        if current_is_branch:
+            # branch→branch or branch→version (always upgrade)
             return (
-                candidate_is_main
+                candidate_is_branch
                 or LsstDocVersion.parse(build.git_ref) is not None
             )
-        if candidate_is_main:
-            # version→main: reject
+        if candidate_is_branch:
+            # version→branch: reject
             return False
 
         # version → version: compare parsed versions
