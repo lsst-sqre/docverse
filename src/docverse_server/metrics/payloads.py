@@ -1,9 +1,13 @@
 """Sasquatch metrics event payloads for Docverse.
 
-Every payload derives from :class:`DocverseEventBase`, which carries the
-two dimensions every Docverse metric is sliced by — ``organization`` and
-``project``. Payloads are deliberately **scalar-only** (the Avro/InfluxDB
-backing store rejects nested structures; see
+Almost every payload derives from :class:`DocverseEventBase`, which
+carries the two dimensions every Docverse metric is sliced by —
+``organization`` and ``project``. The exceptions are
+:class:`ApiRequestEvent` and :class:`GitHubWebhookReceivedEvent`, which
+usually address no organization and so carry both as optional fields of
+their own. Payloads are
+deliberately **scalar-only** (the Avro/InfluxDB backing store rejects
+nested structures; see
 :meth:`safir.metrics.EventPayload.validate_structure`), and durations are
 expressed as :class:`datetime.timedelta`.
 """
@@ -12,6 +16,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from pydantic import field_validator
 from safir.metrics import EventPayload
 
 from .enums import (
@@ -19,6 +24,7 @@ from .enums import (
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
     EditionPublishTrigger,
+    HttpStatusClass,
     LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
@@ -26,9 +32,11 @@ from .enums import (
     MetricsEditionKind,
     MetricsOrgRole,
     MetricsPrincipalType,
+    WebhookOutcome,
 )
 
 __all__ = [
+    "ApiRequestEvent",
     "BuildContentCopiedEvent",
     "BuildProcessedEvent",
     "BuildUploadedEvent",
@@ -38,6 +46,7 @@ __all__ = [
     "EditionLifecycleEvent",
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
+    "GitHubWebhookReceivedEvent",
     "KeeperSyncRunCompletedEvent",
     "LifecycleActionEvent",
     "MembershipChangedEvent",
@@ -157,6 +166,25 @@ class EditionPublishedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time the worker spent on this publish."""
+
+    ltd_lag: timedelta | None
+    """How long LTD's rebuild of this edition took to reach the CDN.
+
+    The publish's success time minus the ``date_rebuilt`` LTD Keeper
+    reported for the edition, set only when a fresh keeper-sync visit
+    imported that rebuild and enqueued this publish (``trigger`` is
+    ``keeper_sync``). A semver aggregate (``15``, ``15.2``) the same
+    visit moved reports its release's lag, because that release's
+    rebuild is what moved it. A build-level copy retry happens inside
+    the window and counts toward it.
+
+    ``None`` whenever there is no LTD rebuild to measure from: the
+    build fan-out, rollback, and reconcile publishes, keeper-sync's
+    self-heal of an edition whose publish was lost, publish jobs
+    enqueued before this field existed, and LTD editions that report no
+    ``date_rebuilt``. Never clamped: clock skew between LTD and Docverse
+    shows up as a negative value rather than hiding as zero.
+    """
 
 
 class EditionReconcileCompletedEvent(DocverseEventBase):
@@ -359,6 +387,22 @@ class BuildContentCopiedEvent(DocverseEventBase):
     succeeded: bool
     """Whether the copy, after any build-level retry, stored every object."""
 
+    ltd_lag_seconds: float | None
+    """Seconds from LTD's rebuild of the edition to this copy's end.
+
+    The copy's completion time minus the ``date_rebuilt`` LTD Keeper
+    reported for the edition the build was synced for, taken when the
+    copy ended, whether it succeeded or failed; a build-level retry
+    happens inside the window and counts toward it. It is the copy half
+    of ``edition_published``'s ``ltd_lag``: subtracting it from that lag
+    leaves the queue wait and the CDN publish. A float in seconds, like
+    ``duration_seconds``, so the two read in the same unit.
+
+    ``None`` when LTD reports no ``date_rebuilt`` for the edition. Never
+    clamped: clock skew between LTD and Docverse shows up as a negative
+    value rather than hiding as zero.
+    """
+
 
 class LifecycleActionEvent(DocverseEventBase):
     """A maintenance worker retired a resource.
@@ -531,3 +575,145 @@ class ConditionalGetEvent(DocverseEventBase):
     precondition: ConditionalGetPrecondition
     """Which header decided; never ``None``, as an unconditional
     request emits no event at all."""
+
+
+class ApiRequestEvent(EventPayload):
+    """The API answered one HTTP request.
+
+    Emitted once per response by
+    :class:`~docverse_server.middleware.api_request.ApiRequestMiddleware`,
+    so the stream counts request volume and latency by route and status
+    class. ``/`` and ``/health`` are not recorded: they sit outside the
+    Gafaelfawr ingress and are answered to Kubernetes probes, whose
+    polling would otherwise drown the API's own traffic.
+
+    Unlike every other Docverse event it derives from
+    :class:`~safir.metrics.EventPayload` directly rather than
+    :class:`DocverseEventBase`: most routes (``/orgs``, the admin
+    routes, the GitHub webhook) address no organization, so both
+    dimensions are optional here instead of the base loosening its
+    required ``organization`` for the whole catalog.
+
+    The event never carries the concrete request path, the caller's
+    username, or any other per-request identifier; ``route`` is the
+    template the request matched, which keeps the tag's cardinality
+    bounded by the size of the API.
+    """
+
+    method: str
+    """The request's HTTP method, upper-case (``GET``, ``PATCH``)."""
+
+    route: str | None
+    """The matched route template, without the application path prefix.
+
+    For example ``/orgs/{org}/projects/{project}`` for a request to
+    ``/docverse/orgs/rubin/projects/sqr-000``. ``None`` when no route
+    template matched the request: an unknown path (then a ``404``), or
+    one of the documentation pages FastAPI serves itself, whose routes
+    record no template.
+    """
+
+    status_code: int
+    """The HTTP status code the response started with."""
+
+    status_class: str
+    """The class of ``status_code``: a :class:`HttpStatusClass` value.
+
+    One of ``1xx`` through ``5xx``. Carried as an Avro string rather than
+    an Avro enum because enum symbols may not begin with a digit; the
+    validator below keeps the vocabulary closed, which is what keeps this
+    tag's cardinality at five.
+    """
+
+    duration: timedelta
+    """Time from the request reaching the API to its response starting.
+
+    Measured on the monotonic clock up to the ``http.response.start``
+    message, so it is the latency until the status line is sent and
+    excludes streaming the body.
+    """
+
+    authenticated: bool
+    """Whether the request arrived through Gafaelfawr as a known user.
+
+    ``True`` when the ingress set ``X-Auth-Request-User``; ``False`` for
+    anonymous traffic such as GitHub webhook deliveries.
+    """
+
+    organization: str | None
+    """Slug of the organization the route addressed, if any."""
+
+    project: str | None
+    """Slug of the project the route addressed, if any."""
+
+    @field_validator("status_class")
+    @classmethod
+    def _validate_status_class(cls, value: str) -> str:
+        """Refuse a value that is not an :class:`HttpStatusClass`."""
+        return HttpStatusClass(value).value
+
+
+class GitHubWebhookReceivedEvent(EventPayload):
+    """The API received one GitHub webhook delivery.
+
+    Emitted once per delivery by ``POST {path_prefix}/webhooks/github``,
+    whatever became of it, so the stream counts deliveries by event type
+    and :class:`WebhookOutcome` and times how long the handler took over
+    each one. It complements ``api_request``, which records the same
+    request by route and status but cannot tell a ``ping`` from a
+    ``push``, nor a delivery Docverse acted on from one it ignored.
+
+    Like :class:`ApiRequestEvent` it derives from
+    :class:`~safir.metrics.EventPayload` directly rather than
+    :class:`DocverseEventBase`: a delivery is recorded before it is
+    resolved to any organization, and an unsigned or unconfigured one
+    never can be.
+
+    The event never carries the delivery ID or any other per-delivery
+    identifier.
+    """
+
+    event_type: str | None
+    """GitHub's ``X-GitHub-Event`` header, such as ``push`` or ``ping``.
+
+    ``None`` when the header is missing, and whenever the delivery is
+    not verified as coming from GitHub (``not_configured`` and
+    ``invalid_signature``): the header is caller-supplied and becomes an
+    InfluxDB tag, so only a signed delivery may name a value, which keeps
+    the tag to GitHub's own vocabulary of event types.
+    """
+
+    outcome: WebhookOutcome
+    """What became of the delivery."""
+
+    jobs_enqueued: int
+    """How many background jobs the delivery's callbacks enqueued.
+
+    The ``dashboard_sync`` jobs a ``push`` enqueues, or the
+    ``dashboard_build`` jobs a ``delete`` enqueues for the projects whose
+    editions it retired; zero for every other event type, and for a
+    delivery that was not dispatched. On ``error`` it counts the jobs
+    enqueued before the failure.
+    """
+
+    elapsed: timedelta
+    """Time from the handler receiving the delivery to its outcome."""
+
+    github_repository: str | None
+    """The ``repository.full_name`` of a signed payload (``owner/repo``).
+
+    ``None`` for events that name no repository (``ping``,
+    ``installation``) and for a delivery whose signature did not verify,
+    whose payload is not trusted.
+    """
+
+    organization: str | None
+    """Reserved: always ``None``.
+
+    Kept so that a later emission which resolves the delivery to the
+    organization it affects is an additive change rather than a schema
+    break.
+    """
+
+    project: str | None
+    """Reserved: always ``None``, for the same reason as ``organization``."""

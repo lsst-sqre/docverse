@@ -15,6 +15,8 @@ focus on the two history-row paths the helper has to cover:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
+
 import pytest
 import structlog
 from safir.arq import MockArqQueue
@@ -397,6 +399,68 @@ async def test_enqueue_publish_for_edition_omits_absent_trigger(
     )
     assert len(jobs) == 1
     assert "trigger" not in jobs[0].kwargs["payload"]
+    # Nor an LTD rebuild time: only a fresh keeper-sync visit has one.
+    assert "ltd_date_rebuilt" not in jobs[0].kwargs["payload"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publish_for_edition_carries_ltd_date_rebuilt(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """LTD's rebuild time reaches the payload as an ISO-8601 UTC string.
+
+    ``publish_edition`` subtracts it from its success time to report the
+    ``edition_published`` event's ``ltd_lag``. The value is normalised
+    to UTC on the way in, so the payload reads the same whichever offset
+    the caller's datetime carried.
+    """
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            project_slug,
+            edition_id,
+            edition_slug,
+            build_id,
+            build_public_id,
+        ) = await _seed_org_project_edition_build(db_session)
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq,
+        default_queue_name=_config.arq_queue_name,
+    )
+    rebuilt = datetime(
+        2026, 4, 30, 11, 30, tzinfo=timezone(timedelta(hours=-7))
+    )
+
+    async for session in db_session_dependency():
+        await enqueue_publish_for_edition(
+            session=session,
+            edition_store=EditionStore(session=session, logger=_logger()),
+            history_store=EditionBuildHistoryStore(
+                session=session, logger=_logger()
+            ),
+            queue_job_store=QueueJobStore(session=session, logger=_logger()),
+            queue_backend=queue_backend,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition_id=edition_id,
+            edition_slug=edition_slug,
+            build_id=build_id,
+            build_public_id=build_public_id,
+            ltd_date_rebuilt=rebuilt,
+        )
+
+    jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert len(jobs) == 1
+    raw = jobs[0].kwargs["payload"]["ltd_date_rebuilt"]
+    assert raw == "2026-04-30T18:30:00+00:00"
+    assert datetime.fromisoformat(raw) == rebuilt.astimezone(UTC)
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import Any, Self
 
@@ -54,6 +54,7 @@ from docverse_server.domain.project import Project
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
+    EditionPublishedEvent,
     EditionPublishTrigger,
     MetricsEditionKind,
     build_event_manager,
@@ -445,12 +446,14 @@ def _make_payload(
     queue_job: QueueJob,
     trigger: str | None = None,
     history_id: int | None = None,
+    ltd_date_rebuilt: str | None = None,
 ) -> dict[str, Any]:
     """Build a ``publish_edition`` payload.
 
     ``history_id`` is omitted when not given, which is the shape of a
     payload minted before the key existed — the fallback the worker
-    still has to honour for jobs queued across the deploy.
+    still has to honour for jobs queued across the deploy. So is
+    ``ltd_date_rebuilt``, which only a fresh keeper-sync visit sets.
     """
     payload: dict[str, Any] = {
         "org_id": org.id,
@@ -466,6 +469,8 @@ def _make_payload(
         payload["history_id"] = history_id
     if trigger is not None:
         payload["trigger"] = trigger
+    if ltd_date_rebuilt is not None:
+        payload["ltd_date_rebuilt"] = ltd_date_rebuilt
     return payload
 
 
@@ -718,6 +723,118 @@ async def test_publish_edition_publishes_edition_published(
     # No keeper_sync_run_id on the queue job => a build-driven publish.
     assert event.trigger == EditionPublishTrigger.build
     assert event.elapsed >= timedelta(0)
+    # The build fan-out's payload names no LTD rebuild to measure from.
+    assert event.ltd_lag is None
+
+
+async def _publish_capturing_edition_published(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    org_slug: str,
+    ltd_date_rebuilt: datetime,
+) -> tuple[EditionPublishedEvent, datetime, datetime]:
+    """Publish a job whose payload carries ``ltd_date_rebuilt``.
+
+    Returns the one ``edition_published`` event recorded, bracketed by
+    the wall-clock times read just before and just after the job ran:
+    the lag the worker computes at its success terminal has to fall
+    between ``before - ltd_date_rebuilt`` and ``after - ltd_date_rebuilt``.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug=org_slug,
+            cdn_service_label="cdn-prod",
+            backend_job_id=f"test-publish-arq-{org_slug}",
+        )
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(MockEditionPublisher()),
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id=f"test-publish-arq-{org_slug}",
+        events=events,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+        ltd_date_rebuilt=ltd_date_rebuilt.isoformat(),
+    )
+
+    before = datetime.now(tz=UTC)
+    result = await publish_edition(ctx, payload)
+    after = datetime.now(tz=UTC)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    publisher = events.edition_published
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    return publisher.published[0], before, after
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_reports_ltd_lag_from_payload(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A payload naming LTD's rebuild reports the lag to the success.
+
+    Keeper-sync puts the ``date_rebuilt`` it imported into the payload
+    so the dashboard can chart how long an LTD rebuild takes to reach
+    the CDN; the worker measures it at the publish's success terminal.
+    """
+    rebuilt = datetime.now(tz=UTC) - timedelta(minutes=90)
+
+    event, before, after = await _publish_capturing_edition_published(
+        db_session,
+        monkeypatch,
+        org_slug="pub-lag-org",
+        ltd_date_rebuilt=rebuilt,
+    )
+
+    assert event.ltd_lag is not None
+    assert before - rebuilt <= event.ltd_lag <= after - rebuilt
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_reports_negative_ltd_lag_unclamped(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An LTD clock ahead of Docverse's shows up as a negative lag.
+
+    Clamping to zero would hide the skew between the two services'
+    clocks behind what looks like an instant publish.
+    """
+    rebuilt = datetime.now(tz=UTC) + timedelta(minutes=10)
+
+    event, before, after = await _publish_capturing_edition_published(
+        db_session,
+        monkeypatch,
+        org_slug="pub-skew-org",
+        ltd_date_rebuilt=rebuilt,
+    )
+
+    assert event.ltd_lag is not None
+    assert event.ltd_lag < timedelta(0)
+    assert before - rebuilt <= event.ltd_lag <= after - rebuilt
 
 
 @pytest.mark.asyncio
@@ -779,6 +896,8 @@ async def test_publish_edition_rollback_trigger(
     assert isinstance(publisher, MockEventPublisher)
     assert len(publisher.published) == 1
     assert publisher.published[0].trigger == EditionPublishTrigger.rollback
+    # A rollback repoints onto an old build; nothing was rebuilt in LTD.
+    assert publisher.published[0].ltd_lag is None
 
 
 @pytest.mark.asyncio

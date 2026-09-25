@@ -63,6 +63,8 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.purgatory_cleanup_completed, MockEventPublisher)
     assert isinstance(events.conditional_get, MockEventPublisher)
     assert isinstance(events.build_content_copied, MockEventPublisher)
+    assert isinstance(events.api_request, MockEventPublisher)
+    assert isinstance(events.github_webhook_received, MockEventPublisher)
 
     await manager.aclose()
 
@@ -112,6 +114,7 @@ async def test_publishers_record_payloads() -> None:
             edition_kind=MetricsEditionKind.release,
             trigger=EditionPublishTrigger.build,
             elapsed=timedelta(seconds=2),
+            ltd_lag=None,
         )
     )
 
@@ -348,6 +351,7 @@ async def test_build_content_copied_reports_transport_health() -> None:
             exhausted_object_count=1,
             build_retry_used=True,
             succeeded=True,
+            ltd_lag_seconds=95.5,
         )
     )
 
@@ -365,6 +369,7 @@ async def test_build_content_copied_reports_transport_health() -> None:
                 "exhausted_object_count": 1,
                 "build_retry_used": True,
                 "succeeded": True,
+                "ltd_lag_seconds": 95.5,
             }
         ]
     )

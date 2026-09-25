@@ -17,6 +17,7 @@ from pydantic import SecretStr
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 
 from docverse.models import (
@@ -32,6 +33,8 @@ from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.factory import Factory
+from docverse_server.metrics import GitHubWebhookReceivedEvent, WebhookOutcome
+from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.editionpublisher import (
     EditionPublisher,
@@ -39,8 +42,10 @@ from docverse_server.storage.editionpublisher import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from docverse_server.storage.queue_job_store import QueueJobStore
 from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
+from tests.support.queue_dispatch import make_dispatcher
 
 _WEBHOOK_PATH = "/docverse/webhooks/github"
 _WEBHOOK_SECRET = "test-webhook-secret"
@@ -511,3 +516,93 @@ async def test_signed_delete_cdn_failure_rolls_back_soft_delete(
     assert not await _is_deleted(project_id, "dm-1")
     after = await _count_dashboard_jobs()
     assert after == before
+
+
+def _received_events() -> list[GitHubWebhookReceivedEvent]:
+    publisher = context_dependency.events.github_webhook_received
+    assert isinstance(publisher, MockEventPublisher)
+    return list(publisher.published)
+
+
+@pytest.mark.asyncio
+async def test_signed_delete_records_dashboard_builds_enqueued(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A dispatched ``delete`` counts the dashboard builds it enqueued.
+
+    One project loses an edition, so one ``dashboard_build`` is
+    enqueued for it, and the delivery's event reports exactly that.
+    """
+    await _seed_project_with_edition(
+        org_slug="delete-metrics", project_slug="docs"
+    )
+    before = await _count_dashboard_jobs()
+
+    body, headers = _post_signed(_delete_payload())
+    response = await client.post(_WEBHOOK_PATH, content=body, headers=headers)
+
+    assert response.status_code == 200
+    enqueued = await _count_dashboard_jobs() - before
+    assert enqueued == 1
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.dispatched
+    assert event.event_type == "delete"
+    assert event.jobs_enqueued == enqueued
+    assert event.github_repository == "acme/docs"
+    assert event.organization is None
+    assert event.project is None
+
+
+async def _enqueue_active_dashboard_build(*, org_slug: str, slug: str) -> None:
+    """Leave a ``queued`` ``dashboard_build`` row for one project."""
+    logger = structlog.get_logger("test")
+    async for session in db_session_dependency():
+        async with session.begin():
+            enqueuer = DashboardBuildEnqueuer(
+                org_store=OrganizationStore(session=session, logger=logger),
+                project_store=ProjectStore(session=session, logger=logger),
+                dispatcher=make_dispatcher(session),
+                queue_job_store=QueueJobStore(session=session, logger=logger),
+                logger=logger,
+            )
+            job = await enqueuer.enqueue_for_project_slug(
+                org_slug=org_slug, project_slug=slug
+            )
+            assert job is not None
+            await session.commit()
+        return
+    msg = "db_session_dependency yielded nothing"
+    raise AssertionError(msg)
+
+
+@pytest.mark.asyncio
+async def test_signed_delete_does_not_count_a_deduplicated_build(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A project whose dashboard build is already queued adds no job.
+
+    The enqueuer skips a project with an active ``dashboard_build``, so
+    the delivery enqueued nothing and reports ``jobs_enqueued=0`` even
+    though a project was affected.
+    """
+    await _seed_project_with_edition(
+        org_slug="delete-metrics-dedup", project_slug="docs"
+    )
+    await _enqueue_active_dashboard_build(
+        org_slug="delete-metrics-dedup", slug="docs"
+    )
+    before = await _count_dashboard_jobs()
+
+    body, headers = _post_signed(_delete_payload())
+    response = await client.post(_WEBHOOK_PATH, content=body, headers=headers)
+
+    assert response.status_code == 200
+    assert await _count_dashboard_jobs() == before
+    events = _received_events()
+    assert len(events) == 1
+    assert events[0].outcome == WebhookOutcome.dispatched
+    assert events[0].jobs_enqueued == 0

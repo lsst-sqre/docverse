@@ -374,6 +374,15 @@ class BuildCopyReport:
     succeeded: bool
     """Whether the copy, after any re-run, stored every object."""
 
+    ltd_lag_seconds: float | None
+    """Seconds from LTD's ``date_rebuilt`` for the edition to the copy's end.
+
+    Measured when the copy finished, successfully or not, so a
+    build-level re-run falls inside it. ``None`` when LTD reports no
+    ``date_rebuilt``. Not clamped: a rebuild stamped ahead of Docverse's
+    clock gives a negative value.
+    """
+
 
 #: Type alias for the ``on_build_copied`` hook: awaited with one
 #: :class:`BuildCopyReport` per build copy. The keeper-sync worker's
@@ -646,6 +655,20 @@ class EditionSyncOutcome:
     already carried LTD's dates, on a tombstone short-circuit, and when
     the stamp itself failed — the next visit re-asserts the values
     either way.
+    """
+
+    ltd_date_rebuilt: datetime | None = None
+    """The ``date_rebuilt`` LTD Keeper reported for the edition this visit.
+
+    When the visit imported a fresh build (``build_outcome`` not
+    short-circuited), the worker forwards it into the
+    ``publish_edition`` payloads it enqueues from this outcome, the
+    edition's own and those of the semver aggregates its release moved,
+    so the ``edition_published``
+    event can report how long LTD's rebuild took to reach the CDN
+    (``ltd_lag``, PRD #713). ``None`` when LTD reports no
+    ``date_rebuilt`` for the edition, and on a tombstone short-circuit,
+    which enqueues no publish to measure.
     """
 
     @property
@@ -1589,6 +1612,7 @@ class KeeperSyncService:
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
             dates_restamped=dates_restamped,
+            ltd_date_rebuilt=ltd_edition.date_rebuilt,
         )
 
     async def _stamp_ltd_clock(
@@ -2391,6 +2415,7 @@ class KeeperSyncService:
             source_prefix=source.prefix,
             dest_prefix=new_build.storage_prefix,
             project_slug=project.slug,
+            ltd_date_rebuilt=ltd_edition.date_rebuilt,
             logger=self._logger.bind(
                 ltd_build_id=ltd_build.ltd_id,
                 edition_slug=edition.slug,
@@ -2507,6 +2532,7 @@ class KeeperSyncService:
         source_prefix: str,
         dest_prefix: str,
         project_slug: str,
+        ltd_date_rebuilt: datetime | None,
         logger: structlog.stdlib.BoundLogger,
     ) -> CopyResult:
         """Copy one build's content and report the copy to the hook.
@@ -2518,6 +2544,9 @@ class KeeperSyncService:
         failure still propagates unchanged once the report is out. A
         cancelled copy (the arq job timing out) is not reported: it
         neither landed nor failed on its own account.
+
+        ``ltd_date_rebuilt`` is the LTD edition's ``date_rebuilt``, which
+        the report measures its ``ltd_lag_seconds`` from.
         """
         started = monotonic()
         passes: list[CopyTally] = []
@@ -2533,6 +2562,7 @@ class KeeperSyncService:
                 project_slug=project_slug,
                 passes=passes,
                 started=started,
+                ltd_date_rebuilt=ltd_date_rebuilt,
                 succeeded=False,
                 logger=logger,
             )
@@ -2543,6 +2573,7 @@ class KeeperSyncService:
             project_slug=project_slug,
             passes=passes,
             started=started,
+            ltd_date_rebuilt=ltd_date_rebuilt,
             succeeded=True,
             logger=logger,
         )
@@ -2614,6 +2645,7 @@ class KeeperSyncService:
         project_slug: str,
         passes: Sequence[CopyTally],
         started: float,
+        ltd_date_rebuilt: datetime | None,
         succeeded: bool,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
@@ -2623,15 +2655,26 @@ class KeeperSyncService:
         whatever it raises is sent to Sentry and logged, and the copy's
         own result or exception carries on as if it had not run — the
         same isolation ``sync_project`` gives ``on_edition_synced``.
+
+        Called as the copy ends, so this is where both clocks stop:
+        ``duration_seconds`` on the monotonic clock from ``started``, and
+        ``ltd_lag_seconds`` on the wall clock from ``ltd_date_rebuilt``,
+        the only clock LTD's timestamp can be compared against.
         """
         if self._on_build_copied is None:
             return
+        duration_seconds = monotonic() - started
+        ltd_lag_seconds = (
+            None
+            if ltd_date_rebuilt is None
+            else (_now() - ltd_date_rebuilt).total_seconds()
+        )
         last = passes[-1]
         report = BuildCopyReport(
             project_slug=project_slug,
             object_count=last.object_count,
             total_size_bytes=last.total_size_bytes,
-            duration_seconds=monotonic() - started,
+            duration_seconds=duration_seconds,
             peak_concurrent_copies=max(
                 tally.peak_concurrent_copies for tally in passes
             ),
@@ -2643,6 +2686,7 @@ class KeeperSyncService:
             ),
             build_retry_used=len(passes) > 1,
             succeeded=succeeded,
+            ltd_lag_seconds=ltd_lag_seconds,
         )
         try:
             await self._on_build_copied(report)

@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from types import TracebackType
@@ -340,6 +340,9 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(
     assert publish_payload["edition_slug"] == "__main"
     assert publish_payload["project_slug"] == "pipelines"
     assert publish_payload["org_id"] == org_id
+    # The LTD rebuild this visit imported, so ``publish_edition`` can
+    # report how long it took to reach the CDN (``ltd_lag``).
+    assert publish_payload["ltd_date_rebuilt"] == "2026-04-30T18:30:00+00:00"
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -791,6 +794,9 @@ async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     assert second_payload["edition_slug"] == "__main"
     assert second_payload["project_slug"] == "pipelines"
     assert second_payload["org_id"] == org_id
+    # A self-heal republishes a rebuild imported on an earlier visit, so
+    # the time since LTD's rebuild is no sync lag and is not reported.
+    assert "ltd_date_rebuilt" not in second_payload
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -1078,6 +1084,24 @@ def _copied_events(events: DocverseEvents) -> list[BuildContentCopiedEvent]:
     return list(publisher.published)
 
 
+#: ``date_rebuilt`` of the ``edition_main_git_refs.json`` LTD fixture that
+#: :func:`_seed_ltd` serves as the ``pipelines`` main edition.
+_MAIN_DATE_REBUILT = datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+
+def _assert_copy_lag(event: BuildContentCopiedEvent) -> None:
+    """Assert ``event`` reports the copy's lag behind LTD's main rebuild.
+
+    The lag runs from LTD's ``date_rebuilt`` to the copy's end, so it
+    covers at least the copy itself and at most the time since that
+    rebuild.
+    """
+    assert event.ltd_lag_seconds is not None
+    since_rebuilt = datetime.now(tz=UTC) - _MAIN_DATE_REBUILT
+    assert event.duration_seconds <= event.ltd_lag_seconds
+    assert event.ltd_lag_seconds <= since_rebuilt.total_seconds()
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_publishes_build_content_copied(
     app: None,
@@ -1115,6 +1139,7 @@ async def test_keeper_sync_project_publishes_build_content_copied(
     assert event.build_retry_used is False
     assert event.succeeded is True
     assert event.duration_seconds >= 0
+    _assert_copy_lag(event)
 
 
 @pytest.mark.asyncio
@@ -1143,6 +1168,7 @@ async def test_keeper_sync_project_reports_a_rerun_copy_once(
     assert published[0].build_retry_used is True
     assert published[0].succeeded is True
     assert published[0].exhausted_object_count == 1
+    _assert_copy_lag(published[0])
 
 
 @pytest.mark.asyncio
@@ -1181,6 +1207,8 @@ async def test_keeper_sync_project_reports_a_copy_that_failed_twice(
     assert published[0].succeeded is False
     assert published[0].build_retry_used is True
     assert published[0].exhausted_object_count >= 1
+    # A failed copy is still measured against LTD's rebuild.
+    _assert_copy_lag(published[0])
 
 
 @pytest.mark.asyncio
@@ -1655,6 +1683,20 @@ async def test_keeper_sync_project_publishes_backfilled_aggregates(
         job.kwargs["payload"]["edition_slug"] for job in publish_jobs
     )
     assert publish_slugs == ["15", "15.2", "15.2.1", "__main"]
+    # Each aggregate moved because the ``15.2.1`` release was rebuilt, so
+    # it reports that release's lag rather than ``main``'s or none.
+    rebuilt_by_slug = {
+        job.kwargs["payload"]["edition_slug"]: job.kwargs["payload"][
+            "ltd_date_rebuilt"
+        ]
+        for job in publish_jobs
+    }
+    assert rebuilt_by_slug == {
+        "__main": "2026-04-30T18:30:00+00:00",
+        "15.2.1": "2026-04-29T14:00:00+00:00",
+        "15.2": "2026-04-29T14:00:00+00:00",
+        "15": "2026-04-29T14:00:00+00:00",
+    }
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -2378,6 +2420,8 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
     # recovered.
     assert healed_slugs == ["__main", "15.2"]
     aggregate_job = healed[1]
+    # The healed aggregate's release was imported on an earlier visit.
+    assert "ltd_date_rebuilt" not in aggregate_job.kwargs["payload"]
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -3567,3 +3611,45 @@ async def test_keeper_sync_project_aggregate_publish_skips_dashboard(
     ]
     assert republished == ["15.2"]
     assert dashboard_calls == []
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_short_circuited_aggregate_reports_no_lag(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aggregate moved by an unchanged release names no LTD rebuild.
+
+    The release's build short-circuited, so LTD's ``date_rebuilt`` is a
+    rebuild an earlier visit imported. Carrying it into the aggregate's
+    publish would report the time since that old rebuild as sync lag,
+    the same reason keeper-sync's self-heal publishes report none.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_release_edition_ltd,
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    await _rewind_aggregate_backfill(
+        org_id=harness.org_id,
+        aggregate_slug="15.2",
+        release_ltd_slug="15.2.1",
+    )
+    publishes_before = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-2")
+    await harness.ctx["http_client"].aclose()
+
+    republished = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )[len(publishes_before) :]
+    assert [job.kwargs["payload"]["edition_slug"] for job in republished] == [
+        "15.2"
+    ]
+    assert "ltd_date_rebuilt" not in republished[0].kwargs["payload"]

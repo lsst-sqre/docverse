@@ -7,6 +7,7 @@ from .enums import (
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
     EditionPublishTrigger,
+    HttpStatusClass,
     LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
@@ -14,10 +15,12 @@ from .enums import (
     MetricsEditionKind,
     MetricsOrgRole,
     MetricsPrincipalType,
+    WebhookOutcome,
 )
 from .events import DocverseEvents
 from .manager import build_event_manager
 from .payloads import (
+    ApiRequestEvent,
     BuildContentCopiedEvent,
     BuildProcessedEvent,
     BuildUploadedEvent,
@@ -27,6 +30,7 @@ from .payloads import (
     EditionLifecycleEvent,
     EditionPublishedEvent,
     EditionReconcileCompletedEvent,
+    GitHubWebhookReceivedEvent,
     KeeperSyncRunCompletedEvent,
     LifecycleActionEvent,
     MembershipChangedEvent,
@@ -36,6 +40,7 @@ from .payloads import (
 )
 
 __all__ = [
+    "ApiRequestEvent",
     "BuildContentCopiedEvent",
     "BuildProcessedEvent",
     "BuildUploadedEvent",
@@ -50,6 +55,8 @@ __all__ = [
     "EditionPublishTrigger",
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
+    "GitHubWebhookReceivedEvent",
+    "HttpStatusClass",
     "KeeperSyncRunCompletedEvent",
     "LifecycleAction",
     "LifecycleActionEvent",
@@ -63,5 +70,6 @@ __all__ = [
     "ProjectLifecycleEvent",
     "PurgatoryCleanupCompletedEvent",
     "ResourceInventoryEvent",
+    "WebhookOutcome",
     "build_event_manager",
 ]
