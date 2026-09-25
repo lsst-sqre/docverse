@@ -2,9 +2,10 @@
 
 Almost every payload derives from :class:`DocverseEventBase`, which
 carries the two dimensions every Docverse metric is sliced by —
-``organization`` and ``project``. The exception is
-:class:`ApiRequestEvent`, whose request usually addresses no organization
-and so carries both as optional fields of its own. Payloads are
+``organization`` and ``project``. The exceptions are
+:class:`ApiRequestEvent` and :class:`GitHubWebhookReceivedEvent`, which
+usually address no organization and so carry both as optional fields of
+their own. Payloads are
 deliberately **scalar-only** (the Avro/InfluxDB backing store rejects
 nested structures; see
 :meth:`safir.metrics.EventPayload.validate_structure`), and durations are
@@ -31,6 +32,7 @@ from .enums import (
     MetricsEditionKind,
     MetricsOrgRole,
     MetricsPrincipalType,
+    WebhookOutcome,
 )
 
 __all__ = [
@@ -44,6 +46,7 @@ __all__ = [
     "EditionLifecycleEvent",
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
+    "GitHubWebhookReceivedEvent",
     "KeeperSyncRunCompletedEvent",
     "LifecycleActionEvent",
     "MembershipChangedEvent",
@@ -648,3 +651,69 @@ class ApiRequestEvent(EventPayload):
     def _validate_status_class(cls, value: str) -> str:
         """Refuse a value that is not an :class:`HttpStatusClass`."""
         return HttpStatusClass(value).value
+
+
+class GitHubWebhookReceivedEvent(EventPayload):
+    """The API received one GitHub webhook delivery.
+
+    Emitted once per delivery by ``POST {path_prefix}/webhooks/github``,
+    whatever became of it, so the stream counts deliveries by event type
+    and :class:`WebhookOutcome` and times how long the handler took over
+    each one. It complements ``api_request``, which records the same
+    request by route and status but cannot tell a ``ping`` from a
+    ``push``, nor a delivery Docverse acted on from one it ignored.
+
+    Like :class:`ApiRequestEvent` it derives from
+    :class:`~safir.metrics.EventPayload` directly rather than
+    :class:`DocverseEventBase`: a delivery is recorded before it is
+    resolved to any organization, and an unsigned or unconfigured one
+    never can be.
+
+    The event never carries the delivery ID or any other per-delivery
+    identifier.
+    """
+
+    event_type: str | None
+    """GitHub's ``X-GitHub-Event`` header, such as ``push`` or ``ping``.
+
+    ``None`` when the header is missing, and whenever the delivery is
+    not verified as coming from GitHub (``not_configured`` and
+    ``invalid_signature``): the header is caller-supplied and becomes an
+    InfluxDB tag, so only a signed delivery may name a value, which keeps
+    the tag to GitHub's own vocabulary of event types.
+    """
+
+    outcome: WebhookOutcome
+    """What became of the delivery."""
+
+    jobs_enqueued: int
+    """How many background jobs the delivery's callbacks enqueued.
+
+    The ``dashboard_sync`` jobs a ``push`` enqueues, or the
+    ``dashboard_build`` jobs a ``delete`` enqueues for the projects whose
+    editions it retired; zero for every other event type, and for a
+    delivery that was not dispatched. On ``error`` it counts the jobs
+    enqueued before the failure.
+    """
+
+    elapsed: timedelta
+    """Time from the handler receiving the delivery to its outcome."""
+
+    github_repository: str | None
+    """The ``repository.full_name`` of a signed payload (``owner/repo``).
+
+    ``None`` for events that name no repository (``ping``,
+    ``installation``) and for a delivery whose signature did not verify,
+    whose payload is not trusted.
+    """
+
+    organization: str | None
+    """Reserved: always ``None``.
+
+    Kept so that a later emission which resolves the delivery to the
+    organization it affects is an additive change rather than a schema
+    break.
+    """
+
+    project: str | None
+    """Reserved: always ``None``, for the same reason as ``organization``."""

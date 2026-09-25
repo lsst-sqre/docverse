@@ -30,6 +30,7 @@ __all__ = [
     "MetricsEditionKind",
     "MetricsOrgRole",
     "MetricsPrincipalType",
+    "WebhookOutcome",
 ]
 
 
@@ -334,3 +335,34 @@ class HttpStatusClass(StrEnum):
             msg = f"HTTP status code {status_code} has no status class"
             raise ValueError(msg)
         return cls(f"{status_code // 100}xx")
+
+
+class WebhookOutcome(StrEnum):
+    """What became of one GitHub webhook delivery.
+
+    Recorded on ``github_webhook_received``, one per delivery, so the
+    stream answers both "how many deliveries arrive?" and "how many of
+    them did anything?". The members follow the order a delivery is
+    decided in: the app must be configured, the signature must verify,
+    and a subscribed event type is then dispatched to its callbacks.
+    """
+
+    dispatched = "dispatched"
+    """The event type is subscribed and every callback ran (``200``)."""
+
+    ignored = "ignored"
+    """Signed, but no callback subscribes to the event type (``200``).
+
+    GitHub sends every event type the app is subscribed to on its side,
+    such as ``ping`` when a webhook is first set up, whether or not
+    Docverse acts on it.
+    """
+
+    invalid_signature = "invalid_signature"
+    """The request was unsigned or its HMAC did not verify (``401``)."""
+
+    not_configured = "not_configured"
+    """This deployment has no GitHub App configured (``404``)."""
+
+    error = "error"
+    """The delivery raised while being parsed or dispatched (``500``)."""

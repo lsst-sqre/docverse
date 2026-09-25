@@ -21,6 +21,7 @@ from docverse_server.metrics import (
     BuildContentCopiedEvent,
     DocverseEventBase,
     EditionPublishedEvent,
+    GitHubWebhookReceivedEvent,
     HttpStatusClass,
 )
 
@@ -178,3 +179,48 @@ def _api_request(*, status_class: str) -> ApiRequestEvent:
         organization=None,
         project=None,
     )
+
+
+def test_github_webhook_received_is_not_an_org_scoped_event() -> None:
+    """``github_webhook_received`` stands outside the org/project base.
+
+    A delivery is not resolved to any organization when it is recorded
+    (and an unsigned or unconfigured one never could be), so the event
+    derives from :class:`~safir.metrics.EventPayload` directly, like
+    ``api_request``, rather than weakening ``DocverseEventBase``.
+    """
+    assert issubclass(GitHubWebhookReceivedEvent, EventPayload)
+    assert not issubclass(GitHubWebhookReceivedEvent, DocverseEventBase)
+
+
+def test_github_webhook_received_fields() -> None:
+    """``github_webhook_received`` carries a delivery's type and outcome.
+
+    ``event_type`` and ``github_repository`` are nullable because not
+    every delivery names them, and ``organization``/``project`` are
+    reserved as nullable so a later binding-aware emission is additive;
+    every other field is always present.
+    """
+    fields = _avro_field_types(GitHubWebhookReceivedEvent)
+
+    assert list(fields) == [
+        "event_type",
+        "outcome",
+        "jobs_enqueued",
+        "elapsed",
+        "github_repository",
+        "organization",
+        "project",
+    ]
+    for nullable in (
+        "event_type",
+        "github_repository",
+        "organization",
+        "project",
+    ):
+        assert isinstance(fields[nullable], list)
+        assert "null" in fields[nullable]
+    for required in ("outcome", "jobs_enqueued", "elapsed"):
+        assert not isinstance(fields[required], list)
+    # Every union member must still be one InfluxDB can store.
+    GitHubWebhookReceivedEvent.validate_structure()

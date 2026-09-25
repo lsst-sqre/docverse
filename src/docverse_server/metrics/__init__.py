@@ -15,6 +15,7 @@ from .enums import (
     MetricsEditionKind,
     MetricsOrgRole,
     MetricsPrincipalType,
+    WebhookOutcome,
 )
 from .events import DocverseEvents
 from .manager import build_event_manager
@@ -29,6 +30,7 @@ from .payloads import (
     EditionLifecycleEvent,
     EditionPublishedEvent,
     EditionReconcileCompletedEvent,
+    GitHubWebhookReceivedEvent,
     KeeperSyncRunCompletedEvent,
     LifecycleActionEvent,
     MembershipChangedEvent,
@@ -53,6 +55,7 @@ __all__ = [
     "EditionPublishTrigger",
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
+    "GitHubWebhookReceivedEvent",
     "HttpStatusClass",
     "KeeperSyncRunCompletedEvent",
     "LifecycleAction",
@@ -67,5 +70,6 @@ __all__ = [
     "ProjectLifecycleEvent",
     "PurgatoryCleanupCompletedEvent",
     "ResourceInventoryEvent",
+    "WebhookOutcome",
     "build_event_manager",
 ]
