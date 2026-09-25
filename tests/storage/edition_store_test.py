@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -3617,3 +3617,212 @@ async def test_list_org_editions_for_reconcile_is_org_scoped(
         )
 
     assert [row.edition_slug for row in rows] == ["mine"]
+
+
+async def _read_edition_clock(
+    db_session: AsyncSession, edition_id: int
+) -> tuple[datetime, datetime]:
+    """Read ``(date_created, date_updated)`` straight from the database.
+
+    A column-level SELECT for the same reason as
+    :func:`_read_project_date_updated`: ``set_sync_dates`` is a Core
+    ``UPDATE``, and an identity-mapped entity could predate it.
+    """
+    row = (
+        await db_session.execute(
+            select(SqlEdition.date_created, SqlEdition.date_updated).where(
+                SqlEdition.id == edition_id
+            )
+        )
+    ).one()
+    return row.date_created, row.date_updated
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_writes_the_given_values(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Keeper-sync's clock stamp lands verbatim, ``onupdate`` or not.
+
+    ``editions.date_updated`` carries an ORM ``onupdate=now()``, which
+    would overwrite any write that leaves the column out of its
+    ``SET`` clause. The stamp names both columns explicitly, so the
+    LTD values survive — including an offset other than UTC, which
+    ``timestamptz`` stores as the same instant.
+    """
+    pacific = timezone(timedelta(hours=-8))
+    created = datetime(2017, 6, 1, 9, 30, tzinfo=pacific)
+    updated = datetime(2023, 11, 20, 16, 45, 12, 345678, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="synced",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "synced"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+
+
+async def _read_edition_xmin(db_session: AsyncSession, edition_id: int) -> str:
+    """Read the row's ``xmin``: the transaction that wrote its version.
+
+    PostgreSQL writes a new row version for every ``UPDATE`` that
+    matches a row, even one that sets each column to the value it
+    already holds, so an unchanged ``xmin`` proves no write happened.
+    """
+    xmin: str = (
+        await db_session.execute(
+            text("SELECT xmin::text FROM editions WHERE id = :id"),
+            {"id": edition_id},
+        )
+    ).scalar_one()
+    return xmin
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_matching_row_is_not_written(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A re-stamp with the values the row holds writes nothing.
+
+    Keeper-sync re-asserts LTD's clock on every visit, so the steady
+    state — every poll of an unchanged project — must cost a
+    non-matching compare rather than a rewritten row per edition.
+    """
+    created = datetime(2018, 2, 3, tzinfo=UTC)
+    updated = datetime(2022, 7, 8, 12, 0, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="steady",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "steady"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await _read_edition_xmin(db_session, edition_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+    assert changed is False
+
+    async with db_session.begin():
+        assert await _read_edition_xmin(db_session, edition_id) == before
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_is_undone_by_a_later_orm_write(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Any later ORM write to the row moves ``date_updated`` back to now.
+
+    Pins why keeper-sync stamps in its *last* transaction of a visit:
+    the repoint, a kind convergence, and a ``publish_status`` flip all
+    go through the ORM, whose ``onupdate`` re-stamps ``date_updated``
+    with the transaction time. A stamp that ran before any of them
+    would not survive the visit.
+    """
+    created = datetime(2016, 5, 6, tzinfo=UTC)
+    updated = datetime(2020, 9, 10, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="drifts",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "drifts"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await edition_store.set_publish_status(
+            edition_id=edition_id, status=PublishStatus.published
+        )
+        write_time = (
+            await db_session.execute(select(func.now()))
+        ).scalar_one()
+        await db_session.commit()
+
+    async with db_session.begin():
+        date_created, date_updated = await _read_edition_clock(
+            db_session, edition_id
+        )
+    assert date_created == created
+    assert date_updated == write_time
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_leaves_the_project_clock(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Re-dating ``__main`` does not move ``projects.date_updated``.
+
+    The project clock tells an ``updated_since`` poller that content
+    moved (PRD #634); a stamp only rewrites the edition's history.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        before = await _read_project_date_updated(db_session, project_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await edition_store.set_sync_dates(
+            edition_id,
+            date_created=datetime(2015, 1, 1, tzinfo=UTC),
+            date_updated=datetime(2021, 1, 1, tzinfo=UTC),
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        assert await _read_project_date_updated(db_session, project_id) == (
+            before
+        )

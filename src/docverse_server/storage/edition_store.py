@@ -64,6 +64,7 @@ else.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -72,7 +73,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import ColumnElement, Select, select, update
+from sqlalchemy import ColumnElement, Select, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -1020,6 +1021,63 @@ class EditionStore:
             raise RuntimeError(msg)
         row.alternate_name = alternate_name
         await self._session.flush()
+
+    async def set_sync_dates(
+        self,
+        edition_id: int,
+        *,
+        date_created: datetime,
+        date_updated: datetime,
+    ) -> bool:
+        """Stamp an edition's clock with explicit values (PRD #706).
+
+        Keeper-sync's way of making a synced edition carry LTD's history
+        instead of the moment Docverse imported it. Both columns are
+        named in the ``SET`` clause, which is what keeps the ORM's
+        ``onupdate=now()`` on ``date_updated`` from applying: that
+        default fills only a column a statement leaves out. The
+        converse is why the caller stamps *last* — every later ORM
+        write to the row (a repoint, a kind convergence, a
+        ``publish_status`` flip) leaves ``date_updated`` out and so
+        moves it back to now.
+
+        ``IS DISTINCT FROM`` in the ``WHERE`` makes the stamp a
+        compare-and-set: a row that already carries both values matches
+        nothing, so a steady-state sync visit writes no row version.
+
+        ``projects.date_updated`` is deliberately left alone. The
+        project clock means "the content behind this project moved" to
+        a consumer polling with ``updated_since`` (PRD #634), and
+        re-dating an edition's history moves no content.
+
+        Parameters
+        ----------
+        edition_id
+            The edition to stamp.
+        date_created
+            The value for ``date_created``; timezone-aware.
+        date_updated
+            The value for ``date_updated``; timezone-aware.
+
+        Returns
+        -------
+        bool
+            ``True`` if the row changed, ``False`` if it already
+            carried both values or does not exist.
+        """
+        result = await self._session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.id == edition_id,
+                or_(
+                    SqlEdition.date_created.is_distinct_from(date_created),
+                    SqlEdition.date_updated.is_distinct_from(date_updated),
+                ),
+            )
+            .values(date_created=date_created, date_updated=date_updated)
+            .returning(SqlEdition.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def soft_delete(
         self,

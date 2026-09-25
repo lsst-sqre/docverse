@@ -54,6 +54,7 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
@@ -796,6 +797,210 @@ async def test_branch_edition_creates_new_draft_edition(
         assert main.current_build_id is None
 
 
+async def _read_edition_clock(
+    session: AsyncSession, *, project_id: int, slug: str
+) -> tuple[datetime, datetime]:
+    """Read an edition's ``(date_created, date_updated)`` from the database.
+
+    Column-level, so the identity map cannot answer with an entity
+    loaded before the clock stamp's Core ``UPDATE``.
+    """
+    row = (
+        await session.execute(
+            select(SqlEdition.date_created, SqlEdition.date_updated).where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.slug == slug,
+            )
+        )
+    ).one()
+    return row.date_created, row.date_updated
+
+
+@pytest.mark.asyncio
+async def test_fresh_import_stamps_the_edition_with_ltd_dates(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An imported edition carries LTD's history, not the import moment.
+
+    PRD #706: the version dashboard renders ``editions.date_updated``,
+    and every migrated edition read "updated just now". The repoint
+    onto the synced build bumps ``date_updated`` through the ORM
+    ``onupdate`` in the same visit, so the stamp has to come after it
+    to survive.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    _seed_ltd(mock_discovery)
+    ltd_edition = LtdEdition.model_validate(
+        _load("edition_main_git_refs.json")
+    )
+    assert ltd_edition.date_rebuilt is not None
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert len(result.edition_outcomes) == 1
+    outcome = result.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    assert outcome.dates_restamped is True
+    assert result.docverse_project_id is not None
+    async with db_session.begin():
+        assert await _read_edition_clock(
+            db_session,
+            project_id=result.docverse_project_id,
+            slug=DEFAULT_EDITION_SLUG,
+        ) == (ltd_edition.date_created, ltd_edition.date_rebuilt)
+
+    # One ``info`` line per restamped row, naming the edition and the
+    # clock it replaced — the repoint's "now", not LTD's value.
+    restamps = [
+        log
+        for log in logs
+        if log["event"] == "Restamped edition dates from LTD"
+    ]
+    assert len(restamps) == 1
+    assert restamps[0]["log_level"] == "info"
+    assert restamps[0]["edition_id"] == outcome.docverse_edition_id
+    assert restamps[0]["date_updated"] == ltd_edition.date_rebuilt.isoformat()
+    assert datetime.fromisoformat(
+        restamps[0]["previous_date_updated"]
+    ) > datetime.fromisoformat(restamps[0]["date_updated"])
+
+
+@pytest.mark.asyncio
+async def test_failed_clock_stamp_still_reports_the_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stamp that raises costs the dates, not the edition's outcome.
+
+    By the clock transaction the edition is imported and repointed, and
+    its outcome is what the worker's ``on_edition_synced`` callback
+    enqueues the publish from. Letting the stamp's error escape would
+    report a live edition as failed and leave its CDN pointer
+    unpublished; the next visit re-asserts the dates instead.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+
+    async def failing_stamp(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError("stamp exploded")
+
+    monkeypatch.setattr(EditionStore, "set_sync_dates", failing_stamp)
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    assert [o.dates_restamped for o in result.edition_outcomes] == [False]
+    assert result.edition_outcomes[0].build_outcome is not None
+    failures = [
+        log
+        for log in logs
+        if log["event"]
+        == "Edition clock stamp failed; edition sync still succeeded"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["log_level"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_fresh_import_stamp_leaves_the_project_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The edition stamp never writes ``projects.date_updated``.
+
+    Imports a branch edition into an existing project: its repoint is
+    not ``__main``'s, so nothing in the visit is entitled to move the
+    project clock that Ook's ``updated_since`` poll reads (PRD #634),
+    and the pinned value must come through untouched.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        project = await ProjectStore(
+            session=db_session, logger=structlog.get_logger("test")
+        ).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        pinned = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(date_updated=pinned)
+        )
+
+    branch_edition = _load("edition_branch_git_refs.json")
+    branch_build = _load("build.json")
+    branch_build["self_url"] = f"{LTD_BASE}/builds/43"
+    branch_build["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [f"{LTD_BASE}/editions/2"]}
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=branch_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=branch_build)
+    )
+    ltd_edition = LtdEdition.model_validate(branch_edition)
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>branch</html>"},
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.dates_restamped for o in result.edition_outcomes] == [True]
+    async with db_session.begin():
+        assert await _read_edition_clock(
+            db_session, project_id=project.id, slug="u-jsick-feature"
+        ) == (ltd_edition.date_created, ltd_edition.date_rebuilt)
+        project_clock = (
+            await db_session.execute(
+                select(SqlProject.date_updated).where(
+                    SqlProject.id == project.id
+                )
+            )
+        ).scalar_one()
+    assert project_clock == pinned
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_adopts_native_git_ref_edition(
     db_session: AsyncSession,
@@ -1498,11 +1703,6 @@ async def test_dual_upload_convergence_links_existing_build_and_skips_copy(
             org_id=org_id, slug="pipelines"
         )
         assert project is not None
-        edition_before = await edition_store.get_by_slug(
-            project_id=project.id, slug="__main"
-        )
-        assert edition_before is not None
-        edition_date_updated_before = edition_before.date_updated
 
     # Now LTD reports a *new* build (id 43) at a new bucket prefix, but
     # the source content under that prefix is byte-identical to what's
@@ -1567,14 +1767,17 @@ async def test_dual_upload_convergence_links_existing_build_and_skips_copy(
         assert state.content_hash is not None
         assert state.content_hash.startswith("sha256:")
 
-        # Edition still points at the existing build and was not touched
-        # (date_updated unchanged).
+        # Edition still points at the existing build. Its clock is LTD's
+        # (PRD #706): it follows the republish's ``date_rebuilt`` rather
+        # than the convergence visit's own time.
         edition_after = await edition_store.get_by_slug(
             project_id=project.id, slug="__main"
         )
         assert edition_after is not None
         assert edition_after.current_build_id == existing_build_id
-        assert edition_after.date_updated == edition_date_updated_before
+        assert edition_after.date_updated == datetime(
+            2026, 5, 4, 12, tzinfo=UTC
+        )
 
 
 @pytest.mark.asyncio
