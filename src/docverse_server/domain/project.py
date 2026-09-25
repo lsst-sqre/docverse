@@ -89,6 +89,15 @@ class Project(BaseModel):
         ),
     )
 
+    github_default_branch: str | None = Field(
+        default=None,
+        description=(
+            "The repository's default branch as GitHub last reported"
+            " it, captured by the resolve worker. ``None`` until"
+            " learned; consumers fall back to ``main``."
+        ),
+    )
+
     slug_rewrite_rules: list[dict[str, Any]] | None = Field(
         default=None,
         description="Rules for rewriting project slugs in URLs.",

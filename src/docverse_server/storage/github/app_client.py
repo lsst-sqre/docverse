@@ -45,19 +45,23 @@ MissingGitHubAppSecret = Literal["app_id", "private_key", "webhook_secret"]
 
 @dataclass(frozen=True, slots=True)
 class RepositoryMetadata:
-    """Numeric ids GitHub assigns to a repository and its owner.
+    """Numeric ids and default branch GitHub reports for a repository.
 
     Returned by :meth:`GitHubAppClient.resolve_repository_metadata` so
-    the ``project_github_resolve`` worker captures all three columns
-    (``installation_id``, ``owner_id``, ``repo_id``) in a single deep
-    call rather than re-deriving the same shape at each call site.
-    The three fields together survive a GitHub-side rename or
-    transfer; the operator-visible ``owner``/``repo`` strings do not.
+    the ``project_github_resolve`` worker captures all three id columns
+    (``installation_id``, ``owner_id``, ``repo_id``) and the default
+    branch in a single deep call rather than re-deriving the same shape
+    at each call site. The three ids together survive a GitHub-side
+    rename or transfer; the operator-visible ``owner``/``repo`` strings
+    do not.
     """
 
     installation_id: int
     owner_id: int
     repo_id: int
+    default_branch: str
+    """The repository's default branch (PRD #721), from the same
+    ``GET /repos/{owner}/{repo}`` body that carries the ids."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,16 +284,18 @@ class GitHubAppClient:
     async def resolve_repository_metadata(
         self, *, owner: str, repo: str
     ) -> RepositoryMetadata:
-        """Resolve ``installation_id`` + ``owner_id`` + ``repo_id`` for a repo.
+        """Resolve a repo's ids and default branch.
 
         Combines two GitHub REST calls so the
         :func:`docverse_server.worker.functions.project_github_resolve` worker
-        captures all three opportunistic-id columns in one go:
+        captures all three opportunistic-id columns and the default
+        branch in one go:
 
         1. ``GET /repos/{owner}/{repo}/installation`` (with the app
            JWT) — yields the installation id.
         2. ``GET /repos/{owner}/{repo}`` (with the installation token)
-           — yields the stable numeric repo id and owner id.
+           — yields the stable numeric repo id and owner id, and the
+           repository's ``default_branch``.
 
         Mirrors the pair of calls
         :class:`docverse_server.storage.github.GitHubTreeFetcher` already
@@ -314,6 +320,7 @@ class GitHubAppClient:
             installation_id=installation_id,
             owner_id=int(data["owner"]["id"]),
             repo_id=int(data["id"]),
+            default_branch=str(data["default_branch"]),
         )
 
     async def get_installation_auth(

@@ -174,6 +174,7 @@ class GitHubMock:
         *,
         repo_id: int = 1,
         owner_id: int = 1,
+        default_branch: str = "main",
     ) -> None:
         """Register ``GET /repos/{owner}/{repo}`` returning numeric IDs.
 
@@ -184,6 +185,10 @@ class GitHubMock:
         IDs may accept the (1, 1) defaults; tests that round-trip
         captured IDs into the database should pass values that match
         the rest of the assertion.
+
+        ``default_branch`` mirrors the field GitHub always returns on
+        this endpoint; the resolve worker records it (PRD #721). Tests
+        exercising a ``master`` repository pass it explicitly.
         """
         self.router.get(f"{_GITHUB_API}/repos/{owner}/{repo}").mock(
             return_value=httpx.Response(
@@ -192,6 +197,7 @@ class GitHubMock:
                     "id": repo_id,
                     "name": repo,
                     "owner": {"login": owner, "id": owner_id},
+                    "default_branch": default_branch,
                 },
             )
         )
