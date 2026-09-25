@@ -474,7 +474,9 @@ became of it, just before the handler returns or raises. It records
 what `api_request` cannot: the GitHub event type, and whether Docverse
 acted on the delivery. Like `api_request` it does not require an
 organization, because a delivery is recorded before it is resolved to
-one. Publishing is best-effort, as for `api_request`.
+one. Publishing is best-effort, as for `api_request`. What Docverse does
+with each event type is on the
+[GitHub integration](github-integration.md#webhook-events) page.
 
 | Outcome | Response | When |
 | --- | --- | --- |
