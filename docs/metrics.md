@@ -481,7 +481,7 @@ one. Publishing is best-effort, as for `api_request`.
 | --- | --- | --- | --- |
 | `event_type` | string or null | tag | GitHub's `X-GitHub-Event` header, such as `push` or `ping`. Null for a delivery whose signature was not verified (`not_configured`, `invalid_signature`, or an `error` while parsing), because the header is caller-supplied. |
 | `outcome` | enum | tag | What became of the delivery: `dispatched`, `ignored`, `invalid_signature`, `not_configured`, or `error`. |
-| `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, or the `dashboard_build` jobs a `delete` enqueues. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
+| `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, the `dashboard_build` jobs a `delete` enqueues, or the `publish_edition` and `dashboard_build` jobs a `repository` `edited` delivery enqueues when a default-branch change moves `__main`. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
 | `elapsed` | duration | field | Time from the handler receiving the delivery to its outcome. |
 | `github_repository` | string or null | tag | The signed payload's `repository.full_name` (`owner/repo`). Null for events that name no repository (`ping`, `installation`) and for an unverified delivery. |
 | `organization` | string or null | tag | Reserved; always null. Kept so that resolving a delivery to its organization later is an additive change. |

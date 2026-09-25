@@ -18,7 +18,13 @@ from docverse_server.dependencies.context import (
     context_dependency,
 )
 from docverse_server.factory import WebhookDispatch
-from docverse_server.metrics import GitHubWebhookReceivedEvent, WebhookOutcome
+from docverse_server.metrics import (
+    EditionLifecycleEvent,
+    GitHubWebhookReceivedEvent,
+    LifecycleAction,
+    MetricsEditionKind,
+    WebhookOutcome,
+)
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -26,6 +32,9 @@ from docverse_server.services.dashboard_templates import (
     InstallationEventProcessor,
     PushEventProcessor,
     RenameEventProcessor,
+)
+from docverse_server.services.default_branch_processor import (
+    DefaultBranchEventProcessor,
 )
 from docverse_server.services.ref_deleted_processor import (
     RefDeletedWebhookProcessor,
@@ -124,6 +133,59 @@ async def _handle_repository_transferred(
     async with context.session.begin():
         await rename.process_repository_transferred(event.data)
         await context.session.commit()
+
+
+@_event_router.register("repository", action="edited")
+async def _handle_repository_edited(
+    event: sansio.Event,
+    *,
+    default_branch: DefaultBranchEventProcessor,
+    context: RequestContext,
+    report: WebhookDeliveryReport,
+    **_unused: Any,
+) -> None:
+    """Converge ``__main`` on a repository's new default branch.
+
+    Only an edit that changes the default branch does anything; the
+    processor logs and ignores the rest (description, topics, ...).
+    Shaped like :func:`_handle_delete`: the convergence — column write,
+    ``__main`` rewrite, draft retire, repoint — runs in one transaction
+    so a failure mid-way (a CDN ``unpublish`` refusal, say) rolls the
+    whole delivery back for GitHub to redeliver. After the commit the
+    deferred ``publish_edition`` jobs are handed to arq, then each
+    project whose ``__main`` was rewritten gets what a ``PATCH`` of the
+    edition would have announced: one ``edition_lifecycle`` ``update``
+    event and one ``dashboard_build``, the latter in its own
+    transaction so an enqueue failure cannot undo the convergence.
+    Every publish job and every dashboard build actually enqueued is
+    counted on ``report``.
+    """
+    async with context.session.begin():
+        result = await default_branch.process(event.data)
+        await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
+    for affected in result.projects:
+        outcome = affected.outcome
+        if outcome.repointed_build_id is not None:
+            report.jobs_enqueued += 1
+        if not outcome.main_rewritten:
+            continue
+        await context.events.edition_lifecycle.publish(
+            EditionLifecycleEvent(
+                organization=affected.org_slug,
+                project=affected.project_slug,
+                action=LifecycleAction.update,
+                edition_kind=MetricsEditionKind.main,
+            )
+        )
+        if await try_enqueue_dashboard_build_by_slug(
+            factory=context.factory,
+            session=context.session,
+            logger=context.logger,
+            org_slug=affected.org_slug,
+            project_slug=affected.project_slug,
+        ):
+            report.jobs_enqueued += 1
 
 
 @_event_router.register("organization", action="renamed")
@@ -301,6 +363,7 @@ async def post_github_webhook(
             rename=dispatch.rename,
             installation=dispatch.installation,
             ref_deleted=dispatch.ref_deleted,
+            default_branch=dispatch.default_branch,
             context=context,
             report=report,
         )

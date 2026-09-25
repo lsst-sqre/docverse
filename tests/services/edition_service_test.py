@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 import pytest
 import structlog
 from fastapi import FastAPI
 from safir.arq import MockArqQueue
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
@@ -25,11 +26,14 @@ from docverse.models import (
     EditionCreate,
     EditionKind,
     EditionUpdate,
+    JobKind,
     OrganizationCreate,
     ProjectCreate,
     TrackingMode,
 )
+from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
@@ -476,3 +480,135 @@ async def test_patch_with_build_and_metadata_applies_both(
     assert len(calls) == 1
     assert written.edition.title == "Renamed"
     assert written.edition.current_build_id == build.id
+
+
+async def _date_builds(db_session: AsyncSession, builds: list[Build]) -> None:
+    """Space ``builds`` a day apart, oldest first, as their order says.
+
+    Builds seeded in one transaction share its ``now()``, and the
+    stale-build guard refuses a build no newer than the one served.
+    """
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for index, build in enumerate(builds):
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == build.id)
+            .values(date_created=base + timedelta(days=index))
+        )
+
+
+async def _seed_serving_oldest(db_session: AsyncSession) -> _Seeded:
+    """Seed two dated builds with ``__main`` serving the older one."""
+    async with db_session.begin():
+        seeded = await _seed(db_session, n_builds=2)
+        await _date_builds(db_session, seeded.builds)
+        await EditionStore(
+            session=db_session, logger=_logger()
+        ).set_current_build(
+            edition_id=seeded.edition_id, build_id=seeded.builds[0].id
+        )
+        await db_session.commit()
+    return seeded
+
+
+@pytest.mark.asyncio
+async def test_advance_to_build_repoints_and_queues_the_publish(
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """A newer build is served, recorded, marked pending, and published.
+
+    The same sequence an operator's override runs — history row,
+    ``publish_status`` flip, ``publish_edition`` job naming that row —
+    but reached through the stale-build guard rather than around it.
+    """
+    seeded = await _seed_serving_oldest(db_session)
+    newer = seeded.builds[1]
+    store = EditionStore(session=db_session, logger=_logger())
+
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        arq_queue=MockArqQueue(),
+        default_queue_name=_config.arq_queue_name,
+    )
+    async with db_session.begin():
+        edition = await store.get_by_id(seeded.edition_id)
+        assert edition is not None
+        job = await factory.create_edition_service().advance_to_build(
+            org_id=seeded.org_id,
+            project_slug="es-proj",
+            edition=edition,
+            build=newer,
+        )
+        await db_session.commit()
+
+    assert job is not None
+    assert job.kind is JobKind.publish_edition
+    assert job.edition_id == seeded.edition_id
+    assert job.build_id == newer.id
+    async with db_session.begin():
+        current = await store.get_by_id(seeded.edition_id)
+        assert current is not None
+        assert current.current_build_id == newer.id
+        assert current.publish_status is PublishStatus.pending
+        history = await EditionBuildHistoryStore(
+            session=db_session, logger=_logger()
+        ).list_by_edition(seeded.edition_id)
+    assert history[0].build_id == newer.id
+    assert history[0].publish_status is PublishStatus.pending
+    [pending] = factory.queue_dispatcher.pending
+    assert pending.job_type == "publish_edition"
+    assert pending.payload["build_id"] == newer.id
+    assert pending.payload["history_id"] == history[0].id
+    assert "trigger" not in pending.payload
+
+
+@pytest.mark.asyncio
+async def test_advance_to_build_refuses_an_older_build(
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """A build no newer than the one served is refused, and nothing moves.
+
+    Unlike the override, this path keeps the stale-build guard, so its
+    answer to an older build is ``None`` with no history row, no
+    ``publish_status`` flip, and no job.
+    """
+    seeded = await _seed_serving_oldest(db_session)
+    older, newer = seeded.builds
+    store = EditionStore(session=db_session, logger=_logger())
+    async with db_session.begin():
+        await store.set_current_build(
+            edition_id=seeded.edition_id, build_id=newer.id
+        )
+        await db_session.commit()
+
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        arq_queue=MockArqQueue(),
+        default_queue_name=_config.arq_queue_name,
+    )
+    async with db_session.begin():
+        edition = await store.get_by_id(seeded.edition_id)
+        assert edition is not None
+        job = await factory.create_edition_service().advance_to_build(
+            org_id=seeded.org_id,
+            project_slug="es-proj",
+            edition=edition,
+            build=older,
+        )
+        await db_session.commit()
+
+    assert job is None
+    assert factory.queue_dispatcher.pending == ()
+    async with db_session.begin():
+        current = await store.get_by_id(seeded.edition_id)
+        assert current is not None
+        assert current.current_build_id == newer.id
+        assert current.publish_status is None
+        history = await EditionBuildHistoryStore(
+            session=db_session, logger=_logger()
+        ).list_by_edition(seeded.edition_id)
+    assert history == []
