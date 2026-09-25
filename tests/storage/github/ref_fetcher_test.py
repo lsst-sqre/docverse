@@ -427,3 +427,128 @@ async def test_anonymous_path_omits_authorization_header(
     assert sent_requests
     for request in sent_requests:
         assert "authorization" not in {k.lower() for k in request.headers}
+
+
+def _repo_url(owner: str, repo: str) -> str:
+    return f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_default_branch_returns_the_default_branch(
+    mock_github: GitHubMock,
+) -> None:
+    """``GET /repos/{owner}/{repo}`` yields the repository's default branch.
+
+    The authenticated call carries the installation token per request,
+    like the ref-set fetch, so the shared client's defaults stay clean.
+    """
+    mock_github.seed_repo("acme", "docs", default_branch="master")
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        default_branch = await fetcher.fetch_default_branch(
+            owner="acme",
+            repo="docs",
+            auth=InstallationAuth(token="ghs_repo_test", installation_id=42),
+            logger=_logger(),
+        )
+        assert "authorization" not in http_client.headers
+
+    assert default_branch == "master"
+    [request] = [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.path == "/repos/acme/docs"
+    ]
+    assert request.headers["authorization"] == "Bearer ghs_repo_test"
+
+
+@pytest.mark.asyncio
+async def test_fetch_default_branch_anonymous_path_omits_authorization(
+    mock_github: GitHubMock,
+) -> None:
+    """``auth=None`` reads a public repository's default branch anonymously."""
+    mock_github.seed_repo("acme", "public", default_branch="main")
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        default_branch = await fetcher.fetch_default_branch(
+            owner="acme", repo="public", logger=_logger()
+        )
+
+    assert default_branch == "main"
+    [request] = [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.path == "/repos/acme/public"
+    ]
+    assert "authorization" not in {k.lower() for k in request.headers}
+
+
+@pytest.mark.asyncio
+async def test_fetch_default_branch_404_raises_repository_not_accessible(
+    mock_github: GitHubMock,
+) -> None:
+    """A 404 on ``GET /repos`` is the same typed skip as on the refs."""
+    mock_github.router.get(_repo_url("acme", "private")).mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        with pytest.raises(RepositoryNotAccessibleError) as exc_info:
+            await fetcher.fetch_default_branch(
+                owner="acme", repo="private", logger=_logger()
+            )
+
+    assert (exc_info.value.owner, exc_info.value.repo) == ("acme", "private")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, json={"message": "Server Error"}),
+        httpx.Response(403, json={"message": "API rate limit exceeded"}),
+        httpx.Response(200, content=b"not json"),
+        httpx.Response(200, json={"id": 1, "name": "docs"}),
+        httpx.Response(200, json={"id": 1, "default_branch": ""}),
+    ],
+    ids=["5xx", "rate-limit", "malformed-json", "no-field", "empty-field"],
+)
+async def test_fetch_default_branch_failure_raises_ref_fetch_error(
+    mock_github: GitHubMock, response: httpx.Response
+) -> None:
+    """Any other failure, or a body without the branch, is a fetch error."""
+    mock_github.router.get(_repo_url("acme", "docs")).mock(
+        return_value=response
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        with pytest.raises(RepositoryRefFetchError) as exc_info:
+            await fetcher.fetch_default_branch(
+                owner="acme",
+                repo="docs",
+                auth=InstallationAuth(token="ghs_test", installation_id=42),
+                logger=_logger(),
+            )
+
+    assert (exc_info.value.owner, exc_info.value.repo) == ("acme", "docs")
+
+
+@pytest.mark.asyncio
+async def test_fetch_default_branch_network_error_raises_ref_fetch_error(
+    mock_github: GitHubMock,
+) -> None:
+    """A transport error on ``GET /repos`` surfaces as typed."""
+    mock_github.router.get(_repo_url("acme", "docs")).mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        with pytest.raises(RepositoryRefFetchError):
+            await fetcher.fetch_default_branch(
+                owner="acme", repo="docs", logger=_logger()
+            )

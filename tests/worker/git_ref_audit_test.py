@@ -17,12 +17,16 @@ import pytest
 import respx
 import structlog
 from pydantic import SecretStr
+from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from docverse.models import (
+    BuildCreate,
+    BuildStatus,
     EditionKind,
     GitRefAuditRunStatus,
     JobKind,
@@ -31,7 +35,9 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -39,18 +45,23 @@ from docverse_server.domain.base32id import (
     generate_base32_id,
     validate_base32_id,
 )
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.lifecycle import (
     DraftInactivityRule,
     LifecycleRuleSet,
     RefDeletedRule,
 )
+from docverse_server.domain.project import Project
 from docverse_server.domain.queue import JobStatus
 from docverse_server.metrics import (
     DocverseEvents,
+    LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
+    MetricsEditionKind,
     build_event_manager,
 )
+from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.git_ref_audit_run_store import GitRefAuditRunStore
 from docverse_server.storage.github import GITHUB_API_BASE_URL
@@ -62,6 +73,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.git_ref_audit import git_ref_audit
+from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
 
@@ -204,9 +216,27 @@ def _seed_refs(
     repo: str,
     branches: list[str] | None = None,
     tags: list[str] | None = None,
+    default_branch: str | None = "main",
 ) -> None:
+    """Seed the live ref set and ``GET /repos`` the audit reads per project.
+
+    The repository read reports ``default_branch`` (PRD #721); pass
+    ``None`` to leave it unseeded when a test seeds its own response.
+    """
     branches = branches if branches is not None else []
     tags = tags if tags is not None else []
+    if default_branch is not None:
+        router.get(f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": 1,
+                    "name": repo,
+                    "owner": {"login": owner, "id": 1},
+                    "default_branch": default_branch,
+                },
+            )
+        )
     router.get(
         f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/git/matching-refs/heads"
     ).mock(
@@ -1024,3 +1054,592 @@ async def test_git_ref_audit_writes_lifecycle_delete_tombstone(
             assert state is not None
             assert state.date_tombstoned is not None
             assert state.tombstone_reason == "lifecycle_delete"
+
+
+async def _run_audit(
+    *,
+    mock_github: GitHubMock,
+    org_id: int,
+    org_slug: str,
+    run_id: int,
+    queue_job_id: int,
+    events: DocverseEvents | None = None,
+    arq_queue: MockArqQueue | None = None,
+) -> str:
+    """Run one ``git_ref_audit`` pass for the org with a fresh client."""
+    async with httpx.AsyncClient() as http_client:
+        ctx = make_worker_ctx(
+            http_client=http_client,
+            arq_queue=arq_queue,
+            github_app_id=mock_github.app_id,
+            github_app_private_key=SecretStr(mock_github.private_key_pem),
+            github_webhook_secret=SecretStr("webhook-secret"),
+            events=events,
+        )
+        return await git_ref_audit(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "git_ref_audit_run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+
+
+async def _load_project(project_id: int) -> Project:
+    async for session in db_session_dependency():
+        async with session.begin():
+            project = await ProjectStore(
+                session=session, logger=_logger()
+            ).get_by_id(project_id)
+        assert project is not None
+        return project
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_fills_a_null_default_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A tick records the default branch GitHub reports (PRD #721).
+
+    The column starts ``NULL`` — a project created before the column
+    existed, or one no resolve has reached — and the audit's one
+    ``GET /repos/{owner}/{repo}`` per project fills it. This is the
+    backfill for every existing project.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-db-fill")
+        installation_id = mock_github.seed_installation(
+            "acme", "fill", installation_id=81, owner_id=555
+        )
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="fill-project",
+            owner="acme",
+            repo="fill",
+            installation_id=installation_id,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    assert (await _load_project(project_id)).github_default_branch is None
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="fill",
+        branches=["master"],
+        default_branch="master",
+    )
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+    )
+
+    assert result == "completed"
+    assert (await _load_project(project_id)).github_default_branch == "master"
+
+
+_BUILD_BASE = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+async def _seed_main_edition(
+    db_session: AsyncSession,
+    *,
+    project_id: int,
+    git_ref: str,
+    tracking_mode: TrackingMode = TrackingMode.git_ref,
+) -> int:
+    """Seed a project's ``__main`` edition tracking ``git_ref``."""
+    edition = await EditionStore(
+        session=db_session, logger=_logger()
+    ).create_internal(
+        project_id=project_id,
+        slug=DEFAULT_EDITION_SLUG,
+        title="Latest",
+        kind=EditionKind.main,
+        tracking_mode=tracking_mode,
+        tracking_params=(
+            {"git_ref": git_ref}
+            if tracking_mode is TrackingMode.git_ref
+            else None
+        ),
+    )
+    return edition.id
+
+
+async def _seed_completed_build(
+    db_session: AsyncSession,
+    *,
+    project_id: int,
+    project_slug: str,
+    git_ref: str,
+    days: int,
+) -> int:
+    """Seed a completed build on ``git_ref`` dated ``days`` in."""
+    store = BuildStore(session=db_session, logger=_logger())
+    build = await store.create(
+        project_id=project_id,
+        project_slug=project_slug,
+        data=BuildCreate(git_ref=git_ref, content_hash="sha256:" + "d" * 64),
+        uploader="testuser",
+    )
+    await store.transition_status(
+        build_id=build.id, new_status=BuildStatus.processing
+    )
+    await store.transition_status(
+        build_id=build.id, new_status=BuildStatus.completed
+    )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(date_created=_BUILD_BASE + timedelta(days=days))
+    )
+    return build.id
+
+
+async def _load_edition(edition_id: int) -> Edition | None:
+    async for session in db_session_dependency():
+        async with session.begin():
+            return await EditionStore(
+                session=session, logger=_logger()
+            ).get_by_id(edition_id)
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_rewrites_main_tracking_a_gone_ref(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A ``__main`` on a ref missing from the live set follows the default.
+
+    The missed-webhook case: the repository renamed ``master`` to
+    ``main``, so ``master`` is absent from the live branches, builds
+    arrived on ``main``, and tracking auto-created a ``main`` draft. The
+    tick rewrites ``__main`` onto ``main``, retires the draft, repoints
+    ``__main`` at the newest ``main`` build (publish job queued), and
+    announces it as a ``PATCH`` would: one ``edition_lifecycle``
+    ``update`` event and one ``dashboard_build``. Every service line it
+    logs carries ``trigger=audit``.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-db-rewrite")
+        installation_id = mock_github.seed_installation(
+            "acme", "renamed", installation_id=82, owner_id=555
+        )
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="renamed-project",
+            owner="acme",
+            repo="renamed",
+            installation_id=installation_id,
+        )
+        main_id = await _seed_main_edition(
+            db_session, project_id=project_id, git_ref="master"
+        )
+        master_build = await _seed_completed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="renamed-project",
+            git_ref="master",
+            days=1,
+        )
+        await EditionStore(
+            session=db_session, logger=_logger()
+        ).set_current_build(edition_id=main_id, build_id=master_build)
+        main_build = await _seed_completed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="renamed-project",
+            git_ref="main",
+            days=2,
+        )
+        draft_id = await _seed_draft_edition(
+            db_session, project_id=project_id, slug="main", git_ref="main"
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="renamed",
+        branches=["main"],
+        tags=["v1.0"],
+        default_branch="main",
+    )
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert (await _load_project(project_id)).github_default_branch == "main"
+    main = await _load_edition(main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "main"}
+    assert main.current_build_id == main_build
+    assert main.publish_status is PublishStatus.pending
+    assert await _load_edition(draft_id) is None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 1
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 1
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    [event] = publisher.published
+    assert event.action is LifecycleAction.update
+    assert event.edition_kind is MetricsEditionKind.main
+    assert (event.organization, event.project) == (org_slug, "renamed-project")
+    [rewrite_log] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Rewrote __main to track the default branch"
+    ]
+    assert rewrite_log["trigger"] == "audit"
+    assert rewrite_log["main_rewritten_from"] == "master"
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("main_mode", "main_ref"),
+    [
+        (TrackingMode.git_ref, "docs"),
+        (TrackingMode.git_ref, "v1.0"),
+        (TrackingMode.lsst_doc, ""),
+    ],
+    ids=["live-branch", "live-tag", "lsst-doc"],
+)
+async def test_git_ref_audit_leaves_main_on_a_live_ref(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    main_mode: TrackingMode,
+    main_ref: str,
+) -> None:
+    """A ``__main`` pinned to a live branch or tag, or in ``lsst_doc``, stays.
+
+    The tick still records the default branch, but ``__main`` keeps its
+    tracking and pointer, the ``main`` draft survives, and nothing is
+    queued or announced.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-db-pinned")
+        installation_id = mock_github.seed_installation(
+            "acme", "pinned", installation_id=83, owner_id=555
+        )
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="pinned-project",
+            owner="acme",
+            repo="pinned",
+            installation_id=installation_id,
+        )
+        main_id = await _seed_main_edition(
+            db_session,
+            project_id=project_id,
+            git_ref=main_ref,
+            tracking_mode=main_mode,
+        )
+        await _seed_completed_build(
+            db_session,
+            project_id=project_id,
+            project_slug="pinned-project",
+            git_ref="main",
+            days=2,
+        )
+        draft_id = await _seed_draft_edition(
+            db_session, project_id=project_id, slug="main", git_ref="main"
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="pinned",
+        branches=["main", "docs"],
+        tags=["v1.0"],
+        default_branch="main",
+    )
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+        events=events,
+        arq_queue=arq_queue,
+    )
+
+    assert result == "completed"
+    assert (await _load_project(project_id)).github_default_branch == "main"
+    main = await _load_edition(main_id)
+    assert main is not None
+    assert main.tracking_mode is main_mode
+    if main_mode is TrackingMode.git_ref:
+        assert main.tracking_params == {"git_ref": main_ref}
+    assert main.current_build_id is None
+    assert await _load_edition(draft_id) is not None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 0
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_isolates_a_repository_metadata_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """One project's failed ``GET /repos`` does not stop the org's pass.
+
+    The failing project keeps its ``NULL`` column until a later tick,
+    but its ref set was fetched, so its ``ref_deleted`` reaping still
+    runs; the healthy project's column is filled. The failure is logged
+    and rolls the queue-job row to ``completed_with_errors`` like a
+    ref-set failure.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-db-flaky")
+        flaky_installation = mock_github.seed_installation(
+            "acme", "meta-flaky", installation_id=84, owner_id=555
+        )
+        healthy_installation = mock_github.seed_installation(
+            "acme", "meta-healthy", installation_id=85, owner_id=555
+        )
+        flaky_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="meta-flaky",
+            owner="acme",
+            repo="meta-flaky",
+            installation_id=flaky_installation,
+        )
+        healthy_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="meta-healthy",
+            owner="acme",
+            repo="meta-healthy",
+            installation_id=healthy_installation,
+        )
+        reaped_id = await _seed_draft_edition(
+            db_session,
+            project_id=flaky_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="meta-flaky",
+        branches=["main"],
+        default_branch=None,
+    )
+    mock_github.router.get(
+        f"{GITHUB_API_BASE_URL}/repos/acme/meta-flaky"
+    ).mock(return_value=httpx.Response(502, json={"message": "Bad Gateway"}))
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="meta-healthy",
+        branches=["master"],
+        default_branch="master",
+    )
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert result == "completed_with_errors"
+    assert (await _load_project(flaky_id)).github_default_branch is None
+    assert (await _load_project(healthy_id)).github_default_branch == "master"
+    assert await _load_edition(reaped_id) is None
+    [failure_log] = [
+        entry
+        for entry in captured
+        if entry["event"].startswith(
+            "Git ref audit: GitHub repository metadata fetch failed"
+        )
+    ]
+    assert failure_log["project"] == "meta-flaky"
+    assert failure_log["error_type"] == "RepositoryRefFetchError"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+            assert qj is not None
+            assert qj.status == JobStatus.completed_with_errors
+            run = await GitRefAuditRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+            assert run is not None
+            assert run.status is GitRefAuditRunStatus.partial_failure
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_reads_an_anonymous_default_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A project with no installation reads ``GET /repos`` anonymously.
+
+    The same public-API path its ref set takes, so a public repository
+    the App was never installed on still gets its column filled.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-db-anon")
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="anon-project",
+            owner="acme",
+            repo="anon",
+            installation_id=None,
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="anon",
+        branches=["master"],
+        default_branch="master",
+    )
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+    )
+
+    assert result == "completed"
+    assert (await _load_project(project_id)).github_default_branch == "master"
+    [request] = [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.path == "/repos/acme/anon"
+    ]
+    assert "authorization" not in {k.lower() for k in request.headers}
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_summary_counts_default_branch_work(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """The per-org summary reports updates and rewrites, then zeros.
+
+    The first tick fills one ``NULL`` column and rewrites one ``__main``
+    (a second project's column only fills); a repeat tick against the
+    same GitHub state finds nothing left to change.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-db-summary")
+        for repo, installation_id in (("sum-a", 86), ("sum-b", 87)):
+            mock_github.seed_installation(
+                "acme", repo, installation_id=installation_id, owner_id=555
+            )
+        project_a = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="sum-a",
+            owner="acme",
+            repo="sum-a",
+            installation_id=86,
+        )
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="sum-b",
+            owner="acme",
+            repo="sum-b",
+            installation_id=87,
+        )
+        await _seed_main_edition(
+            db_session, project_id=project_a, git_ref="master"
+        )
+
+    for repo in ("sum-a", "sum-b"):
+        _seed_refs(
+            mock_github.router,
+            owner="acme",
+            repo=repo,
+            branches=["main"],
+            default_branch="main",
+        )
+
+    summaries = []
+    for _tick in range(2):
+        async with db_session.begin():
+            run_id, queue_job_id = await _seed_run_and_queue_job(
+                db_session, org_id=org_id, org_slug=org_slug
+            )
+        with capture_logs() as captured:
+            result = await _run_audit(
+                mock_github=mock_github,
+                org_id=org_id,
+                org_slug=org_slug,
+                run_id=run_id,
+                queue_job_id=queue_job_id,
+            )
+        assert result == "completed"
+        [summary] = [
+            entry
+            for entry in captured
+            if entry["event"] == "Git ref audit completed for org"
+        ]
+        summaries.append(
+            (summary["default_branch_updates"], summary["main_rewrites"])
+        )
+
+    assert summaries == [(2, 1), (0, 0)]

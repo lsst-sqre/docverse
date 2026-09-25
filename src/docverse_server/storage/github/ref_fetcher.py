@@ -125,7 +125,10 @@ class GitHubRefSetFetcher:
     the ``git_ref_audit`` worker (PRD #346) and the per-project
     pre-fetch in ``sync_project`` (PRD #332) call — they share the
     same auth resolution, the same pagination handling, and the same
-    typed errors so the two paths cannot drift apart.
+    typed errors so the two paths cannot drift apart. The audit also
+    reads the repository's default branch through
+    :meth:`fetch_default_branch` (PRD #721), one ``GET /repos`` call on
+    the same auth and error contract.
 
     Mirrors :class:`GitHubTreeFetcher`'s contract on the shared
     ``httpx.AsyncClient`` from the application lifespan: the
@@ -200,6 +203,66 @@ class GitHubRefSetFetcher:
             tags=frozenset(tags),
         )
 
+    async def fetch_default_branch(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        auth: InstallationAuth | None = None,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> str:
+        """Return ``owner/repo``'s default branch.
+
+        One ``GET /repos/{owner}/{repo}``, authenticated or anonymous
+        exactly as :meth:`fetch` is, so the daily ``git_ref_audit`` reads
+        the branch (PRD #721) through the same auth ladder and the same
+        typed errors as the ref set it fetches alongside.
+
+        Parameters
+        ----------
+        owner, repo
+            GitHub coordinates as registered on the project binding.
+        auth
+            ``InstallationAuth`` for authenticated calls, or ``None``
+            for the anonymous public path.
+        logger
+            structlog bound logger inherited from the caller's
+            per-project context.
+
+        Raises
+        ------
+        RepositoryNotAccessibleError
+            GitHub returned 404 for the repository.
+        RepositoryRefFetchError
+            Any other failure (network error, 5xx, rate limit, malformed
+            JSON), or a body without a non-empty ``default_branch``.
+        """
+        base_url = auth.base_url if auth is not None else GITHUB_API_BASE_URL
+        _, payload = await self._get(
+            f"{base_url}/repos/{owner}/{repo}",
+            params=None,
+            owner=owner,
+            repo=repo,
+            subject="repository metadata",
+            auth=auth,
+            logger=logger,
+        )
+        default_branch = (
+            payload.get("default_branch")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(default_branch, str) or not default_branch:
+            raise RepositoryRefFetchError(
+                owner=owner,
+                repo=repo,
+                message=(
+                    f"GitHub repository {owner}/{repo} reported no default "
+                    f"branch"
+                ),
+            )
+        return default_branch
+
     async def _fetch_refs(
         self,
         *,
@@ -232,61 +295,15 @@ class GitHubRefSetFetcher:
 
         names: list[str] = []
         while url is not None:
-            try:
-                response = await self._http_client.get(
-                    url,
-                    headers=self._headers(auth),
-                    params=params,
-                )
-            except httpx.HTTPError as exc:
-                logger.warning(
-                    "GitHub ref fetch network error",
-                    owner=owner,
-                    repo=repo,
-                    ref_kind=ref_kind,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
-                raise RepositoryRefFetchError(
-                    owner=owner,
-                    repo=repo,
-                    message=(
-                        f"Network error fetching GitHub refs for "
-                        f"{owner}/{repo}: {exc}"
-                    ),
-                ) from exc
-
-            if response.status_code == httpx.codes.NOT_FOUND:
-                raise RepositoryNotAccessibleError(owner=owner, repo=repo)
-            if response.status_code != httpx.codes.OK:
-                logger.warning(
-                    "GitHub ref fetch returned non-2xx",
-                    owner=owner,
-                    repo=repo,
-                    ref_kind=ref_kind,
-                    status_code=response.status_code,
-                )
-                raise RepositoryRefFetchError(
-                    owner=owner,
-                    repo=repo,
-                    message=(
-                        f"GitHub refs for {owner}/{repo} returned status "
-                        f"{response.status_code}"
-                    ),
-                )
-
-            try:
-                payload: Any = response.json()
-            except ValueError as exc:
-                raise RepositoryRefFetchError(
-                    owner=owner,
-                    repo=repo,
-                    message=(
-                        f"Malformed JSON in GitHub refs response for "
-                        f"{owner}/{repo}"
-                    ),
-                ) from exc
-
+            response, payload = await self._get(
+                url,
+                params=params,
+                owner=owner,
+                repo=repo,
+                subject="refs",
+                auth=auth,
+                logger=logger.bind(ref_kind=ref_kind),
+            )
             if not isinstance(payload, list):
                 raise RepositoryRefFetchError(
                     owner=owner,
@@ -315,6 +332,81 @@ class GitHubRefSetFetcher:
             params = None
 
         return names
+
+    async def _get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None,
+        owner: str,
+        repo: str,
+        subject: str,
+        auth: InstallationAuth | None,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> tuple[httpx.Response, Any]:
+        """Issue one GitHub ``GET`` and translate its failures.
+
+        Shared by the ref-set pages and the repository read so both
+        raise the same typed errors: a 404 is
+        :class:`RepositoryNotAccessibleError`, and a transport error,
+        any other non-200, or a body that is not JSON is
+        :class:`RepositoryRefFetchError`. ``subject`` names what was
+        fetched in the log lines and error messages.
+
+        Returns the response, for its ``Link`` header, and its decoded
+        JSON body, whose shape the caller checks.
+        """
+        try:
+            response = await self._http_client.get(
+                url, headers=self._headers(auth), params=params
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                f"GitHub {subject} fetch network error",
+                owner=owner,
+                repo=repo,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            raise RepositoryRefFetchError(
+                owner=owner,
+                repo=repo,
+                message=(
+                    f"Network error fetching GitHub {subject} for "
+                    f"{owner}/{repo}: {exc}"
+                ),
+            ) from exc
+
+        if response.status_code == httpx.codes.NOT_FOUND:
+            raise RepositoryNotAccessibleError(owner=owner, repo=repo)
+        if response.status_code != httpx.codes.OK:
+            logger.warning(
+                f"GitHub {subject} fetch returned non-2xx",
+                owner=owner,
+                repo=repo,
+                status_code=response.status_code,
+            )
+            raise RepositoryRefFetchError(
+                owner=owner,
+                repo=repo,
+                message=(
+                    f"GitHub {subject} for {owner}/{repo} returned status "
+                    f"{response.status_code}"
+                ),
+            )
+
+        try:
+            payload: Any = response.json()
+        except ValueError as exc:
+            raise RepositoryRefFetchError(
+                owner=owner,
+                repo=repo,
+                message=(
+                    f"Malformed JSON in GitHub {subject} response for "
+                    f"{owner}/{repo}"
+                ),
+            ) from exc
+        return response, payload
 
     @staticmethod
     def _headers(auth: InstallationAuth | None) -> dict[str, str]:

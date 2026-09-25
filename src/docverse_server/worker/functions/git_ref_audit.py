@@ -7,9 +7,10 @@ row per in-scope org with ``kind='git_ref_audit'`` and
 worker so an operator inspecting the queue sees a meaningful
 subject). This worker is the per-org body of that fan-out: for one
 org it lists every non-deleted GitHub-bound project, resolves each
-project's GitHub binding, fetches the live ref set against GitHub,
-runs :func:`evaluate_lifecycle` with ``live_refs`` populated, and
-soft-deletes the matched editions.
+project's GitHub binding, fetches the live ref set and the default
+branch against GitHub, converges each project's ``__main`` on its
+default branch (PRD #721), runs :func:`evaluate_lifecycle` with
+``live_refs`` populated, and soft-deletes the matched editions.
 
 The worker owns the ``queue_jobs`` row lifecycle: it transitions to
 ``in_progress`` on entry and to ``completed`` /
@@ -18,8 +19,9 @@ The worker owns the ``queue_jobs`` row lifecycle: it transitions to
 ``git_ref_audit_runs`` row rolls to its terminal status once every
 per-org child is terminal.
 
-A per-project fetch failure is caught, logged with org/project/error,
-and the per-org pass continues with the next project — one
+A per-project fetch failure — of the ref set or of the default branch —
+is caught, logged with org/project/error, and the per-org pass
+continues with the next project — one
 rate-limited installation cannot block the audit for every other
 project. When at least one project failed, the queue-job row
 transitions to ``completed_with_errors`` and ``aggregate_activity``
@@ -31,6 +33,7 @@ to ``succeeded``.
 from __future__ import annotations
 
 import traceback
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -43,13 +46,18 @@ from docverse_server.domain.lifecycle import LifecycleRuleSet, RefDeletedRule
 from docverse_server.domain.project import Project
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
+    DocverseEvents,
+    EditionLifecycleEvent,
+    LifecycleAction,
     LifecycleActionEvent,
     LifecycleActionTrigger,
     LifecycleReapAction,
+    MetricsEditionKind,
 )
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
+from docverse_server.services.default_branch import DefaultBranchTrigger
 from docverse_server.services.git_ref_audit_finalisation import (
     maybe_finalise_git_ref_audit_run,
 )
@@ -67,6 +75,34 @@ from docverse_server.storage.github import (
 from docverse_server.storage.keeper_sync import TombstoneReason
 
 __all__ = ["git_ref_audit"]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditSummary:
+    """What one org's pass did, for the queue-job row and the summary log."""
+
+    had_failures: bool = False
+    """Whether any project's GitHub read failed this pass."""
+
+    default_branch_updates: int = 0
+    """Projects whose ``github_default_branch`` took a new value."""
+
+    main_rewrites: int = 0
+    """Projects whose ``__main`` was rewritten onto the default branch."""
+
+
+@dataclass(slots=True)
+class _ProjectFetches:
+    """What the per-project GitHub reads returned, keyed by project id.
+
+    A project appears in ``default_branches`` only when its ref set was
+    also fetched: the ref set is the evidence the default-branch rule
+    needs to judge whether ``__main``'s ref is gone.
+    """
+
+    refs_by_project: dict[int, RepositoryRefSet] = field(default_factory=dict)
+    default_branches: dict[int, str] = field(default_factory=dict)
+    had_failures: bool = False
 
 
 async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -120,12 +156,13 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         # reaps).
         reaps: list[tuple[str, LifecycleReapAction]] = []
         try:
-            had_failures = await _audit_org(
+            summary = await _audit_org(
                 session=session,
                 factory=factory,
                 org_id=org_id,
                 org_slug=org_slug,
                 reaps=reaps,
+                events=ctx.get("events"),
                 logger=logger,
             )
         except Exception as exc:
@@ -146,14 +183,16 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
 
         async with session.begin():
             await queue_job_store.complete(
-                queue_job_id, has_errors=had_failures
+                queue_job_id, has_errors=summary.had_failures
             )
             await maybe_finalise_git_ref_audit_run(
                 run_store=run_store, run_id=run_id
             )
         logger.info(
             "Git ref audit completed for org",
-            had_failures=had_failures,
+            had_failures=summary.had_failures,
+            default_branch_updates=summary.default_branch_updates,
+            main_rewrites=summary.main_rewrites,
         )
         # Publish one lifecycle_action per reaped edition after the commit.
         # Best-effort: production runs raise_on_error=False so a metrics
@@ -161,7 +200,7 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         await _publish_lifecycle_actions(
             ctx=ctx, org_slug=org_slug, reaps=reaps
         )
-        return "completed_with_errors" if had_failures else "completed"
+        return "completed_with_errors" if summary.had_failures else "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
@@ -174,48 +213,65 @@ async def _audit_org(
     org_id: int,
     org_slug: str,
     reaps: list[tuple[str, LifecycleReapAction]],
+    events: DocverseEvents | None,
     logger: structlog.stdlib.BoundLogger,
-) -> bool:
+) -> _AuditSummary:
     """Audit every GitHub-bound project for the org.
 
     Splits into a single read transaction that loads the org + every
     GitHub-bound project + every project's editions in one batched
-    read, then per-project fetches the live ref set against GitHub
-    (one transaction-less network call per project), and finally a
-    write transaction that flips ``date_deleted`` on every matched
-    edition. The write transaction is one atomic commit per org so a
-    crash mid-loop cannot leave the org half-deleted; the next day's
-    discovery tick will re-evaluate from a consistent state.
+    read, then per-project fetches the live ref set and the default
+    branch against GitHub (transaction-less network calls), then
+    converges each project's ``__main`` on its default branch (one
+    transaction per project, PRD #721), and finally a write transaction
+    that flips ``date_deleted`` on every matched edition. The deletion
+    transaction is one atomic commit per org so a crash mid-loop cannot
+    leave the org half-deleted; the next day's discovery tick will
+    re-evaluate from a consistent state.
 
-    Returns ``True`` if at least one project's fetch failed
-    (``completed_with_errors`` for the parent queue-job row), else
-    ``False`` (``completed``). Per-project fetch failures never bubble
-    out of this function — the audit's failure-isolation contract is
-    that one rate-limited installation cannot block the audit for
-    every other project.
+    Returns the pass's :class:`_AuditSummary`; its ``had_failures`` is
+    ``True`` if at least one project's fetch failed
+    (``completed_with_errors`` for the parent queue-job row). Per-project
+    fetch failures never bubble out of this function — the audit's
+    failure-isolation contract is that one rate-limited installation
+    cannot block the audit for every other project.
     """
     state = await _load_org_state(
         session=session, factory=factory, org_id=org_id
     )
     if state is None:
         logger.warning("Git ref audit skipped: organization not found")
-        return False
+        return _AuditSummary()
     org_rules, projects, editions_by_project = state
 
     if not projects:
         logger.debug("Git ref audit: no GitHub-bound projects for org")
-        return False
+        return _AuditSummary()
 
-    refs_by_project, had_failures = await _fetch_refs_per_project(
-        session=session,
+    fetches = await _fetch_per_project(
         factory=factory,
         projects=projects,
         logger=logger,
     )
+    default_branch_updates, main_rewrites = await _converge_default_branches(
+        session=session,
+        factory=factory,
+        projects=projects,
+        fetches=fetches,
+        org_slug=org_slug,
+        events=events,
+        logger=logger,
+    )
+    summary = _AuditSummary(
+        had_failures=fetches.had_failures,
+        default_branch_updates=default_branch_updates,
+        main_rewrites=main_rewrites,
+    )
+    refs_by_project = fetches.refs_by_project
 
     if not refs_by_project:
         logger.debug("Git ref audit: no project ref sets fetched successfully")
-        return had_failures
+        return summary
 
     matches_by_project = _evaluate_matches(
         projects=projects,
@@ -225,7 +281,7 @@ async def _audit_org(
     )
     if not matches_by_project:
         logger.debug("Git ref audit: no matches across projects")
-        return had_failures
+        return summary
 
     await _apply_deletions(
         session=session,
@@ -238,30 +294,34 @@ async def _audit_org(
         reaps=reaps,
         logger=logger,
     )
-    return had_failures
+    return summary
 
 
-async def _fetch_refs_per_project(
+async def _fetch_per_project(
     *,
-    session: AsyncSession,
     factory: Factory,
     projects: list[Project],
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[dict[int, RepositoryRefSet], bool]:
-    """Resolve binding + fetch refs for each project, isolating failures.
+) -> _ProjectFetches:
+    """Resolve binding + fetch refs and default branch, isolating failures.
 
-    Returns ``(refs_by_project, had_failures)``. A project whose
-    resolver returns ``None`` is treated as a graceful skip (no
-    binding any more, or a race with a soft-delete) and does **not**
-    flip ``had_failures``. A 404 from GitHub or a transport error
-    flips ``had_failures`` so the per-org queue-job row transitions
-    to ``completed_with_errors`` and the parent run rolls to
+    A project whose resolver returns ``None`` is treated as a graceful
+    skip (no binding any more, or a race with a soft-delete) and does
+    **not** flip ``had_failures``. A 404 from GitHub or a transport
+    error on the ref set skips the project for this pass and flips
+    ``had_failures`` so the per-org queue-job row transitions to
+    ``completed_with_errors`` and the parent run rolls to
     ``partial_failure``.
+
+    The default branch is read after the ref set, through the same
+    installation-or-anonymous auth (PRD #721). A failure there flips
+    ``had_failures`` the same way but keeps the ref set: the project's
+    ``ref_deleted`` reaping still runs, and only its default-branch
+    convergence waits for the next pass.
     """
     resolver = factory.create_project_github_binding_resolver()
     ref_fetcher = factory.create_github_ref_set_fetcher()
-    refs_by_project: dict[int, RepositoryRefSet] = {}
-    had_failures = False
+    fetches = _ProjectFetches()
     for project in projects:
         project_logger = logger.bind(
             project=project.slug, project_id=project.id
@@ -293,7 +353,7 @@ async def _fetch_refs_per_project(
                 repo=exc.repo,
                 installation_id=binding.installation_id,
             )
-            had_failures = True
+            fetches.had_failures = True
             continue
         except RepositoryRefFetchError as exc:
             project_logger.warning(
@@ -304,10 +364,101 @@ async def _fetch_refs_per_project(
                 installation_id=binding.installation_id,
                 error=str(exc),
             )
-            had_failures = True
+            fetches.had_failures = True
             continue
-        refs_by_project[project.id] = ref_set
-    return refs_by_project, had_failures
+        fetches.refs_by_project[project.id] = ref_set
+        try:
+            default_branch = await ref_fetcher.fetch_default_branch(
+                owner=binding.owner,
+                repo=binding.repo,
+                auth=binding.auth,
+                logger=project_logger,
+            )
+        except (RepositoryNotAccessibleError, RepositoryRefFetchError) as exc:
+            project_logger.warning(
+                "Git ref audit: GitHub repository metadata fetch failed, "
+                "skipping default branch for this pass",
+                owner=exc.owner,
+                repo=exc.repo,
+                installation_id=binding.installation_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            fetches.had_failures = True
+            continue
+        fetches.default_branches[project.id] = default_branch
+    return fetches
+
+
+async def _converge_default_branches(
+    *,
+    session: AsyncSession,
+    factory: Factory,
+    projects: list[Project],
+    fetches: _ProjectFetches,
+    org_slug: str,
+    events: DocverseEvents | None,
+    logger: structlog.stdlib.BoundLogger,
+) -> tuple[int, int]:
+    """Apply each fetched default branch to its project (PRD #721).
+
+    Hands each branch, with the live ref set as evidence, to
+    :class:`~docverse_server.services.default_branch.DefaultBranchService`,
+    which records the column (the backfill for projects no webhook or
+    resolve reached) and rewrites a ``__main`` whose tracked ref is
+    absent from the set. A ``__main`` tracking a live branch or tag is
+    left alone.
+
+    One transaction per project, because the service holds that
+    project's ``__main`` ``EDITION_UPDATE`` lock for its writes; an
+    org-wide transaction would keep every earlier project's rows locked
+    while waiting on a later project's lock. After each commit the
+    deferred ``publish_edition`` job is handed to arq, and a rewritten
+    ``__main`` gets what a ``PATCH`` of it would announce: one
+    ``edition_lifecycle`` ``update`` event and one ``dashboard_build``.
+
+    Returns ``(default_branch_updates, main_rewrites)``, the counts for
+    the per-org summary log.
+    """
+    service = factory.create_default_branch_service()
+    default_branch_updates = 0
+    main_rewrites = 0
+    for project in projects:
+        default_branch = fetches.default_branches.get(project.id)
+        ref_set = fetches.refs_by_project.get(project.id)
+        if default_branch is None or ref_set is None:
+            continue
+        async with session.begin():
+            outcome = await service.apply(
+                project=project,
+                default_branch=default_branch,
+                trigger=DefaultBranchTrigger.audit,
+                live_refs=ref_set.all,
+            )
+            await session.commit()
+        await factory.queue_dispatcher.dispatch()
+        if outcome.column_changed:
+            default_branch_updates += 1
+        if not outcome.main_rewritten:
+            continue
+        main_rewrites += 1
+        if events is not None:
+            await events.edition_lifecycle.publish(
+                EditionLifecycleEvent(
+                    organization=org_slug,
+                    project=project.slug,
+                    action=LifecycleAction.update,
+                    edition_kind=MetricsEditionKind.main,
+                )
+            )
+        await try_enqueue_dashboard_build_by_slug(
+            factory=factory,
+            session=session,
+            logger=logger,
+            org_slug=org_slug,
+            project_slug=project.slug,
+        )
+    return default_branch_updates, main_rewrites
 
 
 def _evaluate_matches(
