@@ -1,10 +1,11 @@
 """Project GitHub binding resolver worker function.
 
-Resolves a project's GitHub App installation id and the numeric
-owner / repo ids opportunistically, after a project create or update
-that supplied a ``github`` sub-object. A terminal failure (no
-installation, a credential GitHub will keep rejecting, etc.) is logged
-but never re-raised — the columns stay NULL and a later install of the
+Resolves a project's GitHub App installation id, the numeric owner /
+repo ids, and the repository's default branch (PRD #721)
+opportunistically, after a project create or update that supplied a
+``github`` sub-object. A terminal failure (no installation, a
+credential GitHub will keep rejecting, etc.) is logged but never
+re-raised — the columns stay NULL and a later install of the
 GitHub App will backfill them through the ``installation`` webhook
 (PRD #346 user stories 12 / 13).
 
@@ -139,7 +140,12 @@ def _retry_defer_seconds(job_try: int) -> float:
 async def project_github_resolve(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
-    """Resolve and persist a project's opportunistic GitHub ids.
+    """Resolve and persist a project's opportunistic GitHub metadata.
+
+    Writes the three ``github_*_id`` columns and
+    ``github_default_branch``. Each write is a no-op when GitHub reports
+    what the row already holds, so a re-resolve leaves the project's
+    clock alone.
 
     Parameters
     ----------
@@ -243,6 +249,7 @@ async def project_github_resolve(
             )
             return "failed"
 
+        default_branch_changed = False
         async with session.begin():
             updated = await project_store.update_github_metadata(
                 project_id=project_id,
@@ -252,6 +259,15 @@ async def project_github_resolve(
                 owner_id=metadata.owner_id,
                 repo_id=metadata.repo_id,
             )
+            # The default branch shares the ids' binding guard: when the
+            # binding moved to another repo mid-resolve, this repo's
+            # branch is as stale as its ids, so neither is written.
+            if updated:
+                default_branch_changed = (
+                    await project_store.set_github_default_branch(
+                        project_id=project_id, value=metadata.default_branch
+                    )
+                )
             await session.commit()
 
         if not updated:
@@ -265,6 +281,8 @@ async def project_github_resolve(
             github_installation_id=metadata.installation_id,
             github_owner_id=metadata.owner_id,
             github_repo_id=metadata.repo_id,
+            github_default_branch=metadata.default_branch,
+            default_branch_changed=default_branch_changed,
         )
         return "completed"
 

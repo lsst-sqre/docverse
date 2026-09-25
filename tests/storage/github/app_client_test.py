@@ -210,6 +210,44 @@ async def test_resolve_repository_metadata_returns_all_three_ids(
 
 
 @pytest.mark.asyncio
+async def test_resolve_repository_metadata_returns_default_branch(
+    mock_github: GitHubMock,
+) -> None:
+    """``resolve_repository_metadata`` carries the repo's default branch.
+
+    ``GET /repos/{owner}/{repo}`` already answers the id lookup and
+    reports ``default_branch`` in the same body, so the resolve worker
+    learns it without another round-trip (PRD #721).
+    """
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        factory = GitHubAppClientFactory(
+            id=mock_github.app_id,
+            key=mock_github.private_key_pem,
+            name=DEFAULT_APP_NAME,
+            http_client=http_client,
+        )
+        client = GitHubAppClient(
+            factory=factory, http_client=http_client, logger=_logger()
+        )
+        metadata = await client.resolve_repository_metadata(
+            owner="acme", repo="templates"
+        )
+
+    assert metadata.default_branch == "master"
+
+
+@pytest.mark.asyncio
 async def test_validate_succeeds_on_2xx_app_response(
     mock_github: GitHubMock,
 ) -> None:

@@ -9,6 +9,7 @@ import pytest
 import sentry_sdk
 import structlog
 from arq import Retry
+from httpx import AsyncClient
 from pydantic import SecretStr
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from docverse_server.worker.functions.project_github_resolve import (
     PROJECT_GITHUB_RESOLVE_MAX_TRIES,
     project_github_resolve,
 )
+from tests.conftest import seed_org_with_admin
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
 
@@ -84,6 +86,19 @@ async def _fetch_project_github_ids(
         )
         row = result.one()
         return (row[0], row[1], row[2], row[3], row[4])
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+async def _fetch_project_default_branch(project_id: int) -> str | None:
+    """Return one project's ``github_default_branch`` column."""
+    async for session in db_session_dependency():
+        result = await session.execute(
+            select(SqlProject.github_default_branch).where(
+                SqlProject.id == project_id
+            )
+        )
+        return result.scalar_one()
     msg = "No database session available"
     raise RuntimeError(msg)
 
@@ -152,6 +167,156 @@ async def test_project_github_resolve_persists_three_ids(
     assert owner_id == 111
     assert repo_id == 12345
     assert installation_id == 42
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_records_default_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """The resolve records GitHub's default branch alongside the ids.
+
+    ``GET /repos/{owner}/{repo}`` reports ``default_branch`` in the same
+    body the numeric ids come from, so the resolve seeds
+    ``projects.github_default_branch`` without another round-trip
+    (PRD #721). A ``master`` repository is the case that matters: it is
+    the one a ``"main"`` fallback gets wrong.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+    assert await _fetch_project_default_branch(project_id) is None
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(project_id) == "master"
+    (
+        _owner,
+        _repo,
+        owner_id,
+        repo_id,
+        installation_id,
+    ) = await _fetch_project_github_ids(project_id)
+    assert (owner_id, repo_id, installation_id) == (111, 12345, 42)
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_updates_changed_default_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A re-resolve after a rename stores the new default branch.
+
+    The ids are already resolved, so only the default branch differs;
+    the write still lands and moves the project's clock, because
+    ``github.default_branch`` is on the wire.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+    )
+
+    async with db_session.begin():
+        store = ProjectStore(session=db_session, logger=_logger())
+        await store.update_github_metadata(
+            project_id=project_id,
+            expected_owner="acme",
+            expected_repo="templates",
+            installation_id=42,
+            owner_id=111,
+            repo_id=12345,
+        )
+        await store.set_github_default_branch(
+            project_id=project_id, value="master"
+        )
+        await db_session.commit()
+    baseline = await _fetch_project_date_updated(project_id)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(project_id) == "main"
+    assert await _fetch_project_date_updated(project_id) > baseline
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_default_branch_reaches_the_api(
+    client: AsyncClient,
+    mock_github: GitHubMock,
+) -> None:
+    """After a resolve, the project GET reports ``github.default_branch``.
+
+    The end-to-end shape of the PRD #721 seed: a project bound through
+    the API reads ``default_branch: null`` until the resolve worker
+    runs against a GitHub that reports ``master``, then reads
+    ``"master"``.
+    """
+    await seed_org_with_admin(client, "pgr-api-org", "testuser")
+    created = await client.post(
+        "/docverse/orgs/pgr-api-org/projects",
+        json={
+            "slug": "pgr-api-proj",
+            "title": "PGR API Proj",
+            "github": {"owner": "acme", "repo": "templates"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert created.status_code == 201
+    assert created.json()["github"]["default_branch"] is None
+
+    async for session in db_session_dependency():
+        project_id = (
+            await session.execute(
+                select(SqlProject.id).where(SqlProject.slug == "pgr-api-proj")
+            )
+        ).scalar_one()
+        break
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+    assert result == "completed"
+
+    response = await client.get(
+        "/docverse/orgs/pgr-api-org/projects/pgr-api-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["github"]["default_branch"] == "master"
 
 
 @pytest.mark.asyncio

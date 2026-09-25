@@ -146,6 +146,18 @@ class ProjectGitHubBinding(BaseModel):
         examples=["https://github.com/apps/docverse"],
     )
 
+    default_branch: str | None = Field(
+        default=None,
+        description=(
+            "The repository's default branch as GitHub last reported it."
+            " Read-only: GitHub is the source of truth, so it cannot be"
+            " set through the API. ``None`` until Docverse has learned"
+            " it (after the project is bound, or for a project that"
+            " predates the field); Docverse treats that as ``main``."
+        ),
+        examples=["main"],
+    )
+
 
 def _validate_source_url_github_exclusivity(
     *,

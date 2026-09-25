@@ -862,6 +862,50 @@ class ProjectStore:
         )
         return unchanged.first() is not None
 
+    async def set_github_default_branch(
+        self, *, project_id: int, value: str
+    ) -> bool:
+        """Record the repository's default branch as GitHub reports it.
+
+        The column is what lets ``__main`` follow a default-branch
+        rename (PRD #721), and it surfaces on the project GET as
+        ``github.default_branch`` — so a write that changes it moves the
+        project's clock through ``date_updated``'s ``onupdate``.
+
+        Every caller re-reads the branch on each visit (the resolve
+        worker, and later the webhook and the daily audit), so most
+        writes are no-ops. The ``IS DISTINCT FROM`` predicate keeps
+        those from reaching the row at all: an unchanged value leaves
+        ``date_updated`` alone, and no poller is told about a change
+        that did not happen. See ``rename_repo_by_repo_id``.
+
+        Parameters
+        ----------
+        project_id
+            Internal id of the project to update.
+        value
+            The default branch GitHub reported for the repository.
+
+        Returns
+        -------
+        bool
+            `True` when the stored value changed; `False` when it
+            already matched or the project is missing or deleted.
+        """
+        stmt = (
+            update(SqlProject)
+            .where(
+                SqlProject.id == project_id,
+                SqlProject.date_deleted.is_(None),
+                SqlProject.github_default_branch.is_distinct_from(value),
+            )
+            .values(github_default_branch=value)
+            .returning(SqlProject.id)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.first() is not None
+
     async def soft_delete(
         self, *, org_id: int, slug: str, reason: TombstoneReason
     ) -> bool:
