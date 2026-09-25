@@ -502,7 +502,9 @@ what `api_request` cannot: the GitHub event type, and whether Docverse
 acted on the delivery. It is the one event with no `organization` or
 `project` field, because a delivery is recorded before it is resolved
 to either; slice it by `github_repository` instead. Publishing is
-best-effort, as for `api_request`.
+best-effort, as for `api_request`. What Docverse does with each event
+type is on the
+[GitHub integration](github-integration.md#webhook-events) page.
 
 | Outcome | Response | When |
 | --- | --- | --- |

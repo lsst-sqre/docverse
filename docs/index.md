@@ -47,6 +47,16 @@ that back each of them up.
   budget, the build-level retry that re-runs a copy after a transport
   error on either end, what happens to an edition that still fails, and
   how to read the `build_content_copied` metrics event.
+- [GitHub integration](github-integration.md) — what each GitHub App
+  webhook delivery does (`push`, `delete`, `repository` renamed,
+  transferred and edited, `organization` renamed, and the
+  `installation` events); how a project's `__main` edition follows its
+  repository's default branch across a rename, from the webhook, the
+  `project_github_resolve` worker, and the daily `git_ref_audit`; the
+  guarded rewrite and what it never touches; the audit as the
+  post-upgrade backfill; how keeper-sync keeps synced projects
+  converged; and the manual `PATCH` for a `__main` the rule leaves
+  pinned.
 
 The other maintenance-pool jobs do not have operations pages yet;
 until they do, their module docstrings under
