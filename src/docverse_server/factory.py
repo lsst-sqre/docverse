@@ -33,6 +33,8 @@ from .services.dashboard_templates import (
     RenameEventProcessor,
     TemplateResolver,
 )
+from .services.default_branch import DefaultBranchService
+from .services.default_branch_processor import DefaultBranchEventProcessor
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_reconcile import EditionReconcileService
@@ -124,6 +126,7 @@ class WebhookDispatch:
     rename: RenameEventProcessor
     installation: InstallationEventProcessor
     ref_deleted: RefDeletedWebhookProcessor
+    default_branch: DefaultBranchEventProcessor
 
 
 class Factory:
@@ -749,6 +752,23 @@ class Factory:
             logger=self._logger,
         )
 
+    def create_default_branch_service(self) -> DefaultBranchService:
+        """Create the service converging ``__main`` on a default branch.
+
+        Shares this factory's queue dispatcher through the edition
+        service, so the ``publish_edition`` job a repoint defers is
+        handed to arq by the caller's post-commit ``dispatch()``.
+        """
+        return DefaultBranchService(
+            project_store=self.create_project_store(),
+            edition_store=self.create_edition_store(),
+            build_store=self.create_build_store(),
+            edition_service=self.create_edition_service(),
+            publishing_service=self.create_edition_publishing_service(),
+            lock_service=self.create_lock_service(),
+            logger=self._logger,
+        )
+
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""
         return EditionPublishingService(
@@ -902,12 +922,19 @@ class Factory:
             publishing_service=self.create_edition_publishing_service(),
             logger=self._logger,
         )
+        default_branch = DefaultBranchEventProcessor(
+            project_store=self.create_project_store(),
+            org_store=self.create_org_store(),
+            default_branch_service=self.create_default_branch_service(),
+            logger=self._logger,
+        )
         return WebhookDispatch(
             webhook_secret=webhook_secret.get_secret_value(),
             push=push,
             rename=rename,
             installation=installation,
             ref_deleted=ref_deleted,
+            default_branch=default_branch,
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:

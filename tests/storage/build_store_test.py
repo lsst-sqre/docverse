@@ -1412,6 +1412,121 @@ async def test_get_latest_build_id_for_ref(
         assert emptied_ref is None
 
 
+async def _dated_build(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    git_ref: str,
+    date_created: datetime,
+    status: BuildStatus = BuildStatus.completed,
+    alternate_name: str | None = None,
+) -> Build:
+    """Create a build on ``git_ref``, step it to ``status``, and date it."""
+    build = await build_store.create(
+        project_id=project_id,
+        project_slug="build-proj",
+        data=BuildCreate(
+            git_ref=git_ref,
+            alternate_name=alternate_name,
+            content_hash="sha256:" + "a" * 64,
+        ),
+        uploader="testuser",
+    )
+    if status is not BuildStatus.pending:
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+    if status not in (BuildStatus.pending, BuildStatus.processing):
+        await build_store.transition_status(
+            build_id=build.id, new_status=status
+        )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(date_created=date_created)
+    )
+    return build
+
+
+@pytest.mark.asyncio
+async def test_get_latest_completed_for_ref(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Returns the newest live, completed, unscoped build on a ref.
+
+    "Newest" is by ``date_created``, the column the stale-build guard
+    compares, so a build created later but dated earlier (keeper-sync
+    stamps LTD's dates) does not win. A newer build that is still
+    processing, a soft-deleted one, one on another ref, and one scoped
+    to an alternate deployment are all passed over.
+    """
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        newest = await _dated_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="main",
+            date_created=base + timedelta(days=3),
+        )
+        await _dated_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="main",
+            date_created=base + timedelta(days=1),
+        )
+        await _dated_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="main",
+            date_created=base + timedelta(days=5),
+            status=BuildStatus.processing,
+        )
+        deleted = await _dated_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="main",
+            date_created=base + timedelta(days=6),
+        )
+        await build_store.soft_delete(build_id=deleted.id)
+        await _dated_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="main",
+            date_created=base + timedelta(days=7),
+            alternate_name="usdf-dev",
+        )
+        await _dated_build(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="master",
+            date_created=base + timedelta(days=8),
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        latest = await build_store.get_latest_completed_for_ref(
+            project_id=project_id, git_ref="main"
+        )
+        assert latest is not None
+        assert latest.id == newest.id
+
+        assert (
+            await build_store.get_latest_completed_for_ref(
+                project_id=project_id, git_ref="does-not-exist"
+            )
+            is None
+        )
+
+
 @pytest.mark.asyncio
 async def test_public_ids_sort_in_creation_order(
     db_session: AsyncSession,

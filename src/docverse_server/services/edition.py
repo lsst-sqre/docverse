@@ -358,6 +358,86 @@ class EditionService:
             )
             return current, None
 
+        child_job = await self._queue_publish(
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=project_slug,
+            edition=edition,
+            build=build,
+            trigger=trigger,
+        )
+        current.publish_status = PublishStatus.pending
+        return current, child_job
+
+    async def advance_to_build(
+        self,
+        *,
+        org_id: int,
+        project_slug: str,
+        edition: Edition,
+        build: Build,
+    ) -> QueueJob | None:
+        """Move an edition onto a newer build and queue its publish.
+
+        The automated counterpart of :meth:`_repoint_and_publish`, for
+        a caller that has *chosen* a build rather than been handed one
+        by an operator — the default-branch convergence repointing
+        ``__main`` at the newest build of the branch it was just
+        rewritten to track (PRD #721). The sequence after the repoint is
+        the same one, so the two cannot drift: history row, edition and
+        row ``pending``, and a ``publish_edition`` job naming that row.
+        The repoint itself is not: the stale-build guard stays in force,
+        exactly as it does for a build arriving through edition
+        tracking, so an edition already serving something at least as
+        new is left where it is.
+
+        Under that guard the *unchanged* outcome is unreachable — the
+        guard refuses a build compared with itself — so the only answers
+        are a repoint, which moves the project clock for ``__main``
+        through
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`,
+        and a refusal, which writes nothing.
+
+        Returns
+        -------
+        QueueJob or None
+            The publish job, or ``None`` when a guard refused the
+            repoint (the build is older than the one served, or was
+            soft-deleted).
+        """
+        repoint = await self._store.set_current_build(
+            edition_id=edition.id,
+            build_id=build.id,
+            project_id=edition.project_id,
+            is_default=edition.is_default,
+        )
+        if repoint.outcome is not RepointOutcome.repointed:
+            return None
+        return await self._queue_publish(
+            org_id=org_id,
+            project_id=edition.project_id,
+            project_slug=project_slug,
+            edition=edition,
+            build=build,
+        )
+
+    async def _queue_publish(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        project_slug: str,
+        edition: Edition,
+        build: Build,
+        trigger: EditionPublishTrigger | None = None,
+    ) -> QueueJob:
+        """Record the publish an edition owes after a repoint, and queue it.
+
+        The tail every repoint that publishes shares: a new history row
+        for the pair, the edition and that row marked ``pending``, and a
+        ``publish_edition`` job deferred to the dispatcher so it is
+        handed to arq only once the caller commits.
+        """
         new_history_entry = await self._history_store.record(
             edition_id=edition.id, build_id=build.id
         )
@@ -368,7 +448,6 @@ class EditionService:
         await self._history_store.set_publish_status(
             history_id=new_history_entry.id, status=PublishStatus.pending
         )
-        current.publish_status = PublishStatus.pending
 
         child_job = await self._queue_job_store.create(
             kind=JobKind.publish_edition,
@@ -400,7 +479,7 @@ class EditionService:
             job_type="publish_edition",
             payload=payload,
         )
-        return current, child_job
+        return child_job
 
     async def _apply_build_override(
         self,

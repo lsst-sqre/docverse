@@ -421,6 +421,49 @@ class BuildStore:
         )
         return result.scalar_one_or_none()
 
+    async def get_latest_completed_for_ref(
+        self, *, project_id: int, git_ref: str
+    ) -> Build | None:
+        """Return the newest build a ``git_ref`` edition could serve now.
+
+        The default-branch convergence (PRD #721) uses this to repoint
+        ``__main`` the moment its tracked ref is rewritten, rather than
+        leaving it on the old branch's content until the next push.
+        That makes the candidate set narrower than
+        :meth:`get_latest_build_id_for_ref`'s, which answers the
+        supersession question and so counts a build still in flight:
+
+        - Only ``completed`` builds, since nothing else has content in
+          the object store an edition could point at.
+        - Only builds with no ``alternate_name``, since a plain
+          ``git_ref`` edition never matches a deployment-scoped build
+          (``EditionStore._edition_matches``).
+        - Soft-deleted rows excluded, as there.
+
+        "Newest" is by ``date_created`` (then ``id``), the column the
+        stale-build guard in
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
+        compares, rather than by ``id``: keeper-sync re-stamps an
+        imported build's ``date_created`` from LTD, so insertion order
+        is not date order on a migrated project.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+                SqlBuild.alternate_name.is_(None),
+                SqlBuild.status == BuildStatus.completed,
+                SqlBuild.date_deleted.is_(None),
+            )
+            .order_by(SqlBuild.date_created.desc(), SqlBuild.id.desc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
     async def list_by_project(
         self,
         project_id: int,
