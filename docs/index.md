@@ -11,6 +11,12 @@ absorb these pages unchanged. The design of the system as a whole is
   endpoints follow: async-action verbs, path parameters, hypermedia
   links, public identifiers, pagination, conditional GET, soft-deleted
   resources, and the rest.
+- [Metrics events](metrics.md) — every Sasquatch event Docverse
+  publishes: its InfluxDB measurement, each field's type and meaning,
+  which fields the Phalanx `influxTags` list makes tags, the
+  cardinality rule a new tag must follow, what `ltd_lag` measures, and
+  example InfluxQL queries for sync lag, API request volume and
+  latency, and GitHub webhook deliveries.
 
 ## Operations
 
