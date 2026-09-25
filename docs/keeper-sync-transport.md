@@ -485,6 +485,7 @@ Docverse event.
 | `exhausted_object_count` | Objects whose upload spent its whole budget, summed over both passes. Only failures a retry could have fixed count: a transport failure or a `429`/`5xx` on every attempt. A `403` or a failed LTD download does not. |
 | `build_retry_used` | Whether the build-level retry re-ran the copy, after a transport error on either end. |
 | `succeeded` | Whether the copy, after any build-level retry, stored every object. |
+| `ltd_lag_seconds` | Seconds from LTD's `date_rebuilt` for the edition to the copy's end, success or failure, with any build-level retry inside it; subtract it from `edition_published.ltd_lag` to leave the queue wait and CDN publish. A float in seconds like `duration_seconds`, null when LTD reports no `date_rebuilt`, and negative (not clamped) under clock skew. |
 
 A build whose content Docverse already holds (the manifest-hash dedupe)
 copies nothing and publishes no event, and neither does a copy

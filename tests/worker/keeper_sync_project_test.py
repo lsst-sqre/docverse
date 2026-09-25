@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from types import TracebackType
@@ -1084,6 +1084,24 @@ def _copied_events(events: DocverseEvents) -> list[BuildContentCopiedEvent]:
     return list(publisher.published)
 
 
+#: ``date_rebuilt`` of the ``edition_main_git_refs.json`` LTD fixture that
+#: :func:`_seed_ltd` serves as the ``pipelines`` main edition.
+_MAIN_DATE_REBUILT = datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+
+def _assert_copy_lag(event: BuildContentCopiedEvent) -> None:
+    """Assert ``event`` reports the copy's lag behind LTD's main rebuild.
+
+    The lag runs from LTD's ``date_rebuilt`` to the copy's end, so it
+    covers at least the copy itself and at most the time since that
+    rebuild.
+    """
+    assert event.ltd_lag_seconds is not None
+    since_rebuilt = datetime.now(tz=UTC) - _MAIN_DATE_REBUILT
+    assert event.duration_seconds <= event.ltd_lag_seconds
+    assert event.ltd_lag_seconds <= since_rebuilt.total_seconds()
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_publishes_build_content_copied(
     app: None,
@@ -1121,6 +1139,7 @@ async def test_keeper_sync_project_publishes_build_content_copied(
     assert event.build_retry_used is False
     assert event.succeeded is True
     assert event.duration_seconds >= 0
+    _assert_copy_lag(event)
 
 
 @pytest.mark.asyncio
@@ -1149,6 +1168,7 @@ async def test_keeper_sync_project_reports_a_rerun_copy_once(
     assert published[0].build_retry_used is True
     assert published[0].succeeded is True
     assert published[0].exhausted_object_count == 1
+    _assert_copy_lag(published[0])
 
 
 @pytest.mark.asyncio
@@ -1187,6 +1207,8 @@ async def test_keeper_sync_project_reports_a_copy_that_failed_twice(
     assert published[0].succeeded is False
     assert published[0].build_retry_used is True
     assert published[0].exhausted_object_count >= 1
+    # A failed copy is still measured against LTD's rebuild.
+    _assert_copy_lag(published[0])
 
 
 @pytest.mark.asyncio

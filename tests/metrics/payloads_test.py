@@ -14,7 +14,10 @@ from typing import Any, cast
 from pydantic import create_model
 from safir.metrics import EventPayload
 
-from docverse_server.metrics import EditionPublishedEvent
+from docverse_server.metrics import (
+    BuildContentCopiedEvent,
+    EditionPublishedEvent,
+)
 
 
 def _avro_field_types(model: type[EventPayload]) -> dict[str, Any]:
@@ -50,3 +53,36 @@ def test_edition_published_adds_only_a_nullable_ltd_lag() -> None:
     assert "null" in fields["ltd_lag"]
     # Every union member must still be one InfluxDB can store.
     EditionPublishedEvent.validate_structure()
+
+
+def test_build_content_copied_adds_only_a_nullable_ltd_lag_seconds() -> None:
+    """``build_content_copied`` grows exactly one nullable float field.
+
+    ``ltd_lag_seconds`` is null when LTD reports no ``date_rebuilt`` to
+    measure from, and otherwise a float, the same Avro type as the
+    ``duration_seconds`` it is read against; the fields that were
+    already there keep their names and order.
+    """
+    fields = _avro_field_types(BuildContentCopiedEvent)
+
+    assert list(fields) == [
+        "organization",
+        "project",
+        "ltd_slug",
+        "object_count",
+        "total_size_bytes",
+        "duration_seconds",
+        "peak_concurrent_copies",
+        "retried_object_count",
+        "exhausted_object_count",
+        "build_retry_used",
+        "succeeded",
+        "ltd_lag_seconds",
+    ]
+    assert isinstance(fields["ltd_lag_seconds"], list)
+    assert set(fields["ltd_lag_seconds"]) == {
+        "null",
+        fields["duration_seconds"],
+    }
+    # Every union member must still be one InfluxDB can store.
+    BuildContentCopiedEvent.validate_structure()

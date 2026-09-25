@@ -4130,6 +4130,60 @@ async def test_sync_build_reports_the_copy_and_its_retried_objects(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rebuilt_ago",
+    [timedelta(minutes=1), None],
+    ids=["rebuilt", "never-rebuilt"],
+)
+async def test_sync_build_reports_the_copy_lag_behind_ltd(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    rebuilt_ago: timedelta | None,
+) -> None:
+    """The report says how far behind LTD's rebuild the copy finished.
+
+    It is the copy's completion time minus the edition's
+    ``date_rebuilt``, so it spans the copy itself and everything the
+    visit did before it: at least ``duration_seconds``, and no more than
+    the time since the rebuild once the sync has returned. An LTD edition
+    that reports no ``date_rebuilt`` has nothing to measure from.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-lag")
+    date_rebuilt = (
+        None if rebuilt_ago is None else datetime.now(tz=UTC) - rebuilt_ago
+    )
+    edition_main = _load("edition_main_git_refs.json")
+    edition_main["date_rebuilt"] = (
+        None if date_rebuilt is None else date_rebuilt.isoformat()
+    )
+    _seed_ltd(mock_discovery, edition_main=edition_main)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=on_build_copied,
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    finished = datetime.now(tz=UTC)
+
+    assert len(reports) == 1
+    report = reports[0]
+    if date_rebuilt is None:
+        assert report.ltd_lag_seconds is None
+    else:
+        assert report.ltd_lag_seconds is not None
+        assert report.duration_seconds <= report.ltd_lag_seconds
+        assert (
+            report.ltd_lag_seconds <= (finished - date_rebuilt).total_seconds()
+        )
+
+
+@pytest.mark.asyncio
 async def test_sync_build_reports_a_rerun_copy_as_one_copy(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -4165,6 +4219,10 @@ async def test_sync_build_reports_a_rerun_copy_as_one_copy(
     assert report.succeeded is True
     assert report.exhausted_object_count == 1
     assert report.object_count == 1
+    # The re-run falls inside the lag, measured when the copy finally
+    # ended rather than when its first pass failed.
+    assert report.ltd_lag_seconds is not None
+    assert report.ltd_lag_seconds >= report.duration_seconds
 
 
 @pytest.mark.asyncio
@@ -4212,6 +4270,9 @@ async def test_sync_build_reports_a_copy_that_failed_both_passes(
     assert report.build_retry_used is True
     assert report.exhausted_object_count == 2
     assert report.object_count == 0
+    # A failed copy still says how far behind LTD it gave up.
+    assert report.ltd_lag_seconds is not None
+    assert report.ltd_lag_seconds >= report.duration_seconds
 
 
 @pytest.mark.asyncio
