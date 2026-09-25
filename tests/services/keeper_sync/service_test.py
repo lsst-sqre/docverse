@@ -5579,13 +5579,16 @@ def _seed_ltd_two_releases(
     *,
     first_ref: str,
     second_ref: str,
+    second_date_rebuilt: str | None = None,
 ) -> None:
     """Stub ``pipelines`` with two semver release editions, in order.
 
     Edition 2 tracks ``first_ref`` (build 43) and edition 3 tracks
-    ``second_ref`` (build 44); LTD lists them in that order. The build
-    bodies differ so dual-upload convergence does not collapse the two
-    onto one Docverse build row.
+    ``second_ref`` (build 44); LTD lists them in that order. Whether
+    dual-upload convergence collapses the two onto one Docverse build
+    row is up to the source bytes the caller seeds for each build.
+    ``second_date_rebuilt`` overrides edition 3's ``date_rebuilt``, which
+    otherwise matches edition 2's.
     """
     mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
         return_value=httpx.Response(200, json=_load("product_pipelines.json"))
@@ -5608,6 +5611,8 @@ def _seed_ltd_two_releases(
         edition_payload = _version_edition_payload(slug=ref, git_ref=ref)
         edition_payload["self_url"] = f"{LTD_BASE}/editions/{ltd_id}"
         edition_payload["build_url"] = f"{LTD_BASE}/builds/{build_id}"
+        if ltd_id == 3 and second_date_rebuilt is not None:
+            edition_payload["date_rebuilt"] = second_date_rebuilt
         build_payload = _load("build.json")
         build_payload["self_url"] = f"{LTD_BASE}/builds/{build_id}"
         build_payload["slug"] = str(build_id)
@@ -6262,6 +6267,451 @@ async def test_short_circuited_sync_heals_aggregates_exactly_once(
     calls = _record_backfill_calls(service, monkeypatch)
     await service.sync_project(org_id=org_id, ltd_slug="pipelines")
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Semver aggregate clock (PRD #706). The ``N`` / ``N.M`` aggregates have no
+# LTD analogue, so the clock transaction gives each one serving a synced
+# release's build that release's ``date_updated``; the aggregate keeps its
+# own Docverse ``date_created``.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_major_aggregate(
+    session: AsyncSession,
+    *,
+    project_id: int,
+    clock: datetime,
+    build_id: int | None = None,
+) -> int:
+    """Create the ``15`` aggregate with both its dates pinned to *clock*.
+
+    ``build_id`` points it at an existing build first, so the pinned
+    clock is the last write the row saw either way.
+    """
+    edition_store = EditionStore(
+        session=session, logger=structlog.get_logger("test")
+    )
+    async with session.begin():
+        major = await edition_store.create_internal(
+            project_id=project_id,
+            slug="15",
+            title="Latest 15.x",
+            kind=EditionKind.major,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 15},
+        )
+        if build_id is not None:
+            await edition_store.set_current_build(
+                edition_id=major.id, build_id=build_id, skip_date_guard=True
+            )
+        await session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == major.id)
+            .values(date_created=clock, date_updated=clock)
+        )
+    return major.id
+
+
+@pytest.mark.asyncio
+async def test_aggregates_take_the_release_date_they_are_pointed_at(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """``15`` / ``15.2`` read as updated when their release was.
+
+    The backfill's repoint moves the aggregate's ``date_updated`` to now
+    through the ORM ``onupdate``, which is how a migrated project's
+    ``15`` came to read "updated just now" beside the ``15.2.1`` it
+    mirrors. The clock transaction runs after it, and hands every
+    aggregate on the release's build the release's stamped
+    ``date_updated`` — but not its ``date_created``: the aggregate is a
+    Docverse row with no LTD history of its own. ``15`` exists before
+    the sync (its pinned ``date_created`` must survive); ``15.2`` is
+    created by it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock")
+    project_id = await _seed_project(db_session, org_id=org_id)
+    pinned = datetime(2021, 3, 4, 5, 6, 7, tzinfo=UTC)
+    major_id = await _seed_major_aggregate(
+        db_session, project_id=project_id, clock=pinned
+    )
+
+    release_payload = _version_edition_payload(slug="15.2.1", git_ref="15.2.1")
+    _seed_ltd_one_edition(mock_discovery, edition_payload=release_payload)
+    ltd_release = LtdEdition.model_validate(release_payload)
+    assert ltd_release.date_rebuilt is not None
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>release</html>"},
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    (outcome,) = result.edition_outcomes
+    assert {a.docverse_slug for a in outcome.aggregate_outcomes} == {
+        "15",
+        "15.2",
+    }
+    assert outcome.dates_restamped is True
+    async with db_session.begin():
+        assert await _read_edition_clock(
+            db_session, project_id=project_id, slug="15"
+        ) == (pinned, ltd_release.date_rebuilt)
+        minor_created, minor_updated = await _read_edition_clock(
+            db_session, project_id=project_id, slug="15.2"
+        )
+    assert minor_updated == ltd_release.date_rebuilt
+    assert minor_created != ltd_release.date_created
+
+    # One ``info`` line per restamped aggregate, naming the release it
+    # follows and the clock it replaced.
+    restamps = [
+        log
+        for log in logs
+        if log["event"] == "Restamped semver aggregate dates from LTD"
+    ]
+    assert {log["edition_slug"] for log in restamps} == {"15", "15.2"}
+    major_log = next(log for log in restamps if log["edition_id"] == major_id)
+    assert major_log["log_level"] == "info"
+    assert major_log["release_edition_id"] == outcome.docverse_edition_id
+    assert major_log["date_updated"] == ltd_release.date_rebuilt.isoformat()
+    assert datetime.fromisoformat(
+        major_log["previous_date_updated"]
+    ) > datetime.fromisoformat(major_log["date_updated"])
+
+
+@pytest.mark.asyncio
+async def test_aggregate_on_another_build_keeps_its_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An aggregate serving a different build is not the release's to date.
+
+    ``15`` already serves a newer native ``15.3.0`` upload, so the
+    version guard keeps it there when ``15.2.1`` syncs. The release's
+    clock describes ``15.2.1``'s content, not ``15``'s, and the row must
+    not be written at all — its clock is pinned later than LTD's, so
+    even an earlier-only stamp would have moved it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock-other")
+    project_id = await _seed_project(db_session, org_id=org_id)
+    native_build_id = await _seed_native_release_build(
+        db_session, project_id=project_id, git_ref="15.3.0"
+    )
+    pinned = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    major_id = await _seed_major_aggregate(
+        db_session,
+        project_id=project_id,
+        clock=pinned,
+        build_id=native_build_id,
+    )
+    async with db_session.begin():
+        major_version = await _read_row_version(
+            db_session, SqlEdition, major_id
+        )
+
+    release_payload = _version_edition_payload(slug="15.2.1", git_ref="15.2.1")
+    _seed_ltd_one_edition(mock_discovery, edition_payload=release_payload)
+    ltd_release = LtdEdition.model_validate(release_payload)
+    assert ltd_release.date_rebuilt is not None
+    assert ltd_release.date_rebuilt < pinned
+
+    result = await _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>release</html>"},
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    (outcome,) = result.edition_outcomes
+    assert {a.docverse_slug for a in outcome.aggregate_outcomes} == {"15.2"}
+    async with db_session.begin():
+        assert (
+            await _read_row_version(db_session, SqlEdition, major_id)
+            == major_version
+        )
+        assert await _read_edition_clock(
+            db_session, project_id=project_id, slug="15"
+        ) == (pinned, pinned)
+        # ``15.2`` is on the release's build, and does follow it.
+        _, minor_updated = await _read_edition_clock(
+            db_session, project_id=project_id, slug="15.2"
+        )
+    assert minor_updated == ltd_release.date_rebuilt
+
+
+@pytest.mark.asyncio
+async def test_operator_edition_on_an_aggregate_slug_keeps_its_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An operator's own ``15`` is not an aggregate, whatever it serves.
+
+    The backfill leaves such an edition alone, and so does the clock:
+    even pointed at the release's very build, a ``git_ref`` edition on
+    the ``15`` slug is the operator's row, not one keeper-sync dates.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock-occupied")
+    occupant_id = await _seed_project_with_edition(
+        db_session,
+        org_id=org_id,
+        edition_slug="15",
+        kind=EditionKind.release,
+        git_ref="v15",
+    )
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    (first_outcome,) = first.edition_outcomes
+    assert first_outcome.build_outcome is not None
+    release_build_id = first_outcome.build_outcome.docverse_build_id
+    assert release_build_id is not None
+
+    # The operator points their ``15`` at the release's build by hand.
+    pinned = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        await edition_store.set_current_build(
+            edition_id=occupant_id,
+            build_id=release_build_id,
+            skip_date_guard=True,
+        )
+        await db_session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == occupant_id)
+            .values(date_updated=pinned)
+        )
+    async with db_session.begin():
+        occupant_version = await _read_row_version(
+            db_session, SqlEdition, occupant_id
+        )
+
+    await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    async with db_session.begin():
+        assert (
+            await _read_row_version(db_session, SqlEdition, occupant_id)
+            == occupant_version
+        )
+
+
+async def _read_aggregate_versions(
+    session: AsyncSession, *, project_id: int
+) -> dict[str, str]:
+    """Read the ``xmin`` of the ``15`` and ``15.2`` aggregate rows."""
+    versions: dict[str, str] = {}
+    for slug in ("15", "15.2"):
+        edition_id = (
+            await session.execute(
+                select(SqlEdition.id).where(
+                    SqlEdition.project_id == project_id,
+                    SqlEdition.slug == slug,
+                )
+            )
+        ).scalar_one()
+        versions[slug] = await _read_row_version(
+            session, SqlEdition, edition_id
+        )
+    return versions
+
+
+@pytest.mark.asyncio
+async def test_repeat_visit_writes_no_aggregate_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Aggregates already on their release's clock are not rewritten.
+
+    The aggregate stamp runs on every release visit, so in the steady
+    state it has to cost a read and nothing more: no row version on
+    either aggregate, and no ``dates_restamped`` to ask the worker for
+    a dashboard rebuild on every poll.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock-steady")
+    project_id = await _seed_project(db_session, org_id=org_id)
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert [o.dates_restamped for o in first.edition_outcomes] == [True]
+    async with db_session.begin():
+        versions = await _read_aggregate_versions(
+            db_session, project_id=project_id
+        )
+    assert set(versions) == {"15", "15.2"}
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    (outcome,) = second.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.dates_restamped is False
+    async with db_session.begin():
+        assert (
+            await _read_aggregate_versions(db_session, project_id=project_id)
+            == versions
+        )
+
+
+@pytest.mark.asyncio
+async def test_drifted_aggregate_clock_is_restamped_without_the_backfill(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visit that skips the backfill still re-dates its aggregates.
+
+    The backfill only reports an aggregate on the visit that moved it,
+    and that is not the row's last write: the worker then publishes the
+    aggregate, whose ``publish_status`` flips move ``date_updated`` back
+    to now, and an aggregate imported before PRD #706 carries its import
+    time. Every later visit skips the backfill on its marker, so the
+    aggregates' clock has to be re-asserted from the release's own
+    visit — the full-org-run backfill depends on it.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock-drift")
+    project_id = await _seed_project(db_session, org_id=org_id)
+    release_payload = _version_edition_payload(slug="15.2.1", git_ref="15.2.1")
+    _seed_ltd_one_edition(mock_discovery, edition_payload=release_payload)
+    ltd_release = LtdEdition.model_validate(release_payload)
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    # What the aggregates' publish (or a pre-PRD import) leaves behind.
+    publish_time = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.slug.in_(["15", "15.2"]),
+            )
+            .values(date_updated=publish_time)
+        )
+
+    service = _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    )
+    calls = _record_backfill_calls(service, monkeypatch)
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert calls == []
+    assert [o.dates_restamped for o in result.edition_outcomes] == [True]
+    async with db_session.begin():
+        for slug in ("15", "15.2"):
+            _, date_updated = await _read_edition_clock(
+                db_session, project_id=project_id, slug=slug
+            )
+            assert date_updated == ltd_release.date_rebuilt
+
+
+@pytest.mark.asyncio
+async def test_aggregate_on_a_shared_build_keeps_the_earliest_release_date(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Two releases converged onto one build do not fight over ``15.2``.
+
+    ``15.2.0`` and ``15.2.1`` carry identical bytes, so ``sync_build``
+    converges both onto one Docverse build and both visits find ``15``
+    and ``15.2`` on "their" build. Stamped verbatim, each release would
+    overwrite the other's date on every poll, and every poll would
+    report a restamp. The aggregates keep the earlier release's date,
+    like the shared build itself, and a repeat run writes nothing.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock-shared")
+    project_id = await _seed_project(db_session, org_id=org_id)
+    later = "2026-06-01T12:00:00.000000+00:00"
+    _seed_ltd_two_releases(
+        mock_discovery,
+        first_ref="15.2.0",
+        second_ref="15.2.1",
+        second_date_rebuilt=later,
+    )
+    earlier = LtdEdition.model_validate(
+        _version_edition_payload(slug="15.2.0", git_ref="15.2.0")
+    ).date_rebuilt
+    assert earlier is not None
+    assert earlier < datetime.fromisoformat(later)
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>same</html>",
+        "pipelines/builds/44/index.html": b"<html>same</html>",
+    }
+
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert (
+        len(
+            {
+                o.build_outcome.docverse_build_id
+                for o in first.edition_outcomes
+                if o.build_outcome is not None
+            }
+        )
+        == 1
+    )
+    async with db_session.begin():
+        for slug in ("15", "15.2"):
+            _, date_updated = await _read_edition_clock(
+                db_session, project_id=project_id, slug=slug
+            )
+            assert date_updated == earlier
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.dates_restamped for o in second.edition_outcomes] == [
+        False,
+        False,
+    ]
 
 
 # ---------------------------------------------------------------------------

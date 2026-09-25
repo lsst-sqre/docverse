@@ -39,8 +39,10 @@ What follows the order, and how:
   cascades in this order already, which is what makes it safe for it to
   end up holding all three.
 - ``KeeperSyncService._stamp_ltd_clock``, keeper-sync's end-of-visit
-  clock transaction (PRD #706), stamps the edition row before the
-  build row the edition's LTD build maps to, and never the project.
+  clock transaction (PRD #706), stamps its ``editions`` rows — a
+  release's semver aggregates, then the release itself, the slug order
+  ``track_build`` takes them in — before the build row the edition's
+  LTD build maps to, and never the project.
 
 **Composite writers** — the transactions that write ``builds`` or other
 ``editions`` rows *around* a repoint — cannot get the order from
@@ -67,6 +69,7 @@ else.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -884,6 +887,43 @@ class EditionStore:
             .order_by(SqlEdition.slug)
         )
         return list(result.scalars().all())
+
+    async def list_by_slugs_on_build(
+        self,
+        *,
+        project_id: int,
+        slugs: Sequence[str],
+        build_id: int,
+    ) -> list[Edition]:
+        """List a project's live editions among *slugs* serving a build.
+
+        Keeper-sync's lookup of the semver aggregates (``15``,
+        ``15.2``) a synced release's build backs, so their clocks can
+        follow the release's (PRD #706): one indexed ``SELECT`` over at
+        most a couple of named slugs, not a scan of the project. Slug
+        matching is case-insensitive, as in :meth:`get_by_slug`, and an
+        edition on any other build is left out.
+
+        Returned in slug order, the order ``track_build`` locks
+        co-matching rows in.
+        """
+        if not slugs:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug).in_([s.lower() for s in slugs]),
+                SqlEdition.current_build_id == build_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in result.all()
+        ]
 
     async def list_org_editions_for_reconcile(
         self, *, org_id: int

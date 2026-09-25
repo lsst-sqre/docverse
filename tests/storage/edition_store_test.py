@@ -3826,3 +3826,78 @@ async def test_set_sync_dates_leaves_the_project_clock(
         assert await _read_project_date_updated(db_session, project_id) == (
             before
         )
+
+
+@pytest.mark.asyncio
+async def test_list_by_slugs_on_build_names_only_live_rows_on_the_build(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only the named, live editions serving the build come back.
+
+    Keeper-sync's aggregate clock stamp (PRD #706) asks this for the
+    ``15`` / ``15.2`` rows behind a release's build on every visit, so
+    it must answer from the named slugs alone: an aggregate on another
+    build, a soft-deleted one, and an unnamed edition on the same build
+    are all left out. Slugs match case-insensitively, as in
+    ``get_by_slug``, and rows come back in slug order.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        release_build, other_build = [
+            await build_store.create(
+                project_id=project_id,
+                data=BuildCreate(
+                    git_ref=git_ref,
+                    content_hash=f"sha256:{digit * 64}",
+                ),
+                uploader="testuser",
+                project_slug="ed-proj",
+            )
+            for git_ref, digit in (("15.2.1", "1"), ("15.3.0", "2"))
+        ]
+        editions = {
+            slug: await _create_edition_internal(
+                edition_store,
+                project_id,
+                slug=slug,
+                kind=EditionKind.minor,
+                tracking_mode=TrackingMode.semver_minor,
+                build_id=build_id,
+            )
+            for slug, build_id in (
+                ("15.2", release_build.id),
+                ("15", release_build.id),
+                ("15.3", other_build.id),
+                ("15.1", release_build.id),
+                ("Mixed", release_build.id),
+                ("unnamed", release_build.id),
+            )
+        }
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="15.1",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        found = await edition_store.list_by_slugs_on_build(
+            project_id=project_id,
+            slugs=["15.2", "15", "15.3", "15.1", "mixed", "missing"],
+            build_id=release_build.id,
+        )
+        none_named = await edition_store.list_by_slugs_on_build(
+            project_id=project_id, slugs=[], build_id=release_build.id
+        )
+
+    assert [(e.slug, e.id) for e in found] == [
+        ("15", editions["15"]),
+        ("15.2", editions["15.2"]),
+        ("Mixed", editions["Mixed"]),
+    ]
+    assert all(e.current_build_id == release_build.id for e in found)
+    assert none_named == []
