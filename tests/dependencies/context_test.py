@@ -232,3 +232,27 @@ async def test_set_github_secrets_overrides_three_fields(
         )
         with pytest.raises(GitHubAppNotConfiguredError):
             context.factory.create_github_app_client()
+
+
+@pytest.mark.asyncio
+async def test_events_property_returns_initialized_events(
+    mock_events: DocverseEvents,
+) -> None:
+    """``events`` hands out the publishers the lifespan registered.
+
+    Code outside a request handler (the ``api_request`` middleware)
+    reaches the process's publishers this way rather than through a
+    ``RequestContext``.
+    """
+    dep = ContextDependency()
+    await dep.initialize(events=mock_events)
+
+    assert dep.events is mock_events
+
+
+def test_events_property_raises_before_initialization() -> None:
+    """Before the lifespan has run there are no publishers to hand out."""
+    dep = ContextDependency()
+
+    with pytest.raises(RuntimeError, match="events not initialized"):
+        _ = dep.events

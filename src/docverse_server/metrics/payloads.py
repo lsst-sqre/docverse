@@ -1,9 +1,12 @@
 """Sasquatch metrics event payloads for Docverse.
 
-Every payload derives from :class:`DocverseEventBase`, which carries the
-two dimensions every Docverse metric is sliced by — ``organization`` and
-``project``. Payloads are deliberately **scalar-only** (the Avro/InfluxDB
-backing store rejects nested structures; see
+Almost every payload derives from :class:`DocverseEventBase`, which
+carries the two dimensions every Docverse metric is sliced by —
+``organization`` and ``project``. The exception is
+:class:`ApiRequestEvent`, whose request usually addresses no organization
+and so carries both as optional fields of its own. Payloads are
+deliberately **scalar-only** (the Avro/InfluxDB backing store rejects
+nested structures; see
 :meth:`safir.metrics.EventPayload.validate_structure`), and durations are
 expressed as :class:`datetime.timedelta`.
 """
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from pydantic import field_validator
 from safir.metrics import EventPayload
 
 from .enums import (
@@ -19,6 +23,7 @@ from .enums import (
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
     EditionPublishTrigger,
+    HttpStatusClass,
     LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
@@ -29,6 +34,7 @@ from .enums import (
 )
 
 __all__ = [
+    "ApiRequestEvent",
     "BuildContentCopiedEvent",
     "BuildProcessedEvent",
     "BuildUploadedEvent",
@@ -566,3 +572,77 @@ class ConditionalGetEvent(DocverseEventBase):
     precondition: ConditionalGetPrecondition
     """Which header decided; never ``None``, as an unconditional
     request emits no event at all."""
+
+
+class ApiRequestEvent(EventPayload):
+    """The API answered one HTTP request.
+
+    Emitted once per response by
+    :class:`~docverse_server.middleware.api_request.ApiRequestMiddleware`,
+    so the stream counts request volume and latency by route and status
+    class. ``/`` and ``/health`` are not recorded: they sit outside the
+    Gafaelfawr ingress and are answered to Kubernetes probes, whose
+    polling would otherwise drown the API's own traffic.
+
+    Unlike every other Docverse event it derives from
+    :class:`~safir.metrics.EventPayload` directly rather than
+    :class:`DocverseEventBase`: most routes (``/orgs``, the admin
+    routes, the GitHub webhook) address no organization, so both
+    dimensions are optional here instead of the base loosening its
+    required ``organization`` for the whole catalog.
+
+    The event never carries the concrete request path, the caller's
+    username, or any other per-request identifier; ``route`` is the
+    template the request matched, which keeps the tag's cardinality
+    bounded by the size of the API.
+    """
+
+    method: str
+    """The request's HTTP method, upper-case (``GET``, ``PATCH``)."""
+
+    route: str | None
+    """The matched route template, without the application path prefix.
+
+    For example ``/orgs/{org}/projects/{project}`` for a request to
+    ``/docverse/orgs/rubin/projects/sqr-000``. ``None`` when no route
+    matched the request.
+    """
+
+    status_code: int
+    """The HTTP status code the response started with."""
+
+    status_class: str
+    """The class of ``status_code``: a :class:`HttpStatusClass` value.
+
+    One of ``1xx`` through ``5xx``. Carried as an Avro string rather than
+    an Avro enum because enum symbols may not begin with a digit; the
+    validator below keeps the vocabulary closed, which is what keeps this
+    tag's cardinality at five.
+    """
+
+    duration: timedelta
+    """Time from the request reaching the API to its response starting.
+
+    Measured on the monotonic clock up to the ``http.response.start``
+    message, so it is the latency until the status line is sent and
+    excludes streaming the body.
+    """
+
+    authenticated: bool
+    """Whether the request arrived through Gafaelfawr as a known user.
+
+    ``True`` when the ingress set ``X-Auth-Request-User``; ``False`` for
+    anonymous traffic such as GitHub webhook deliveries.
+    """
+
+    organization: str | None
+    """Slug of the organization the route addressed, if any."""
+
+    project: str | None
+    """Slug of the project the route addressed, if any."""
+
+    @field_validator("status_class")
+    @classmethod
+    def _validate_status_class(cls, value: str) -> str:
+        """Refuse a value that is not an :class:`HttpStatusClass`."""
+        return HttpStatusClass(value).value

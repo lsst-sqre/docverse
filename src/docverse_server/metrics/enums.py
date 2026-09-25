@@ -22,6 +22,7 @@ __all__ = [
     "ConditionalGetOutcome",
     "ConditionalGetPrecondition",
     "EditionPublishTrigger",
+    "HttpStatusClass",
     "LifecycleAction",
     "LifecycleActionTrigger",
     "LifecycleReapAction",
@@ -292,3 +293,44 @@ class ConditionalGetPrecondition(StrEnum):
         rather than a silent schema break.
         """
         return cls(kind.value)
+
+
+class HttpStatusClass(StrEnum):
+    """The class of an HTTP response status, as recorded on ``api_request``.
+
+    The five classes of RFC 9110 §15, valued by the ``Nxx`` shorthand an
+    operator already writes for them. ``status_class`` is an InfluxDB tag
+    so a dashboard can group latency and volume by outcome without the
+    cardinality of every distinct ``status_code``, which the event keeps
+    as a field for drill-down.
+    """
+
+    informational = "1xx"
+    """``1xx``: an interim response."""
+
+    successful = "2xx"
+    """``2xx``: the request succeeded."""
+
+    redirection = "3xx"
+    """``3xx``: a redirect, or a ``304 Not Modified``."""
+
+    client_error = "4xx"
+    """``4xx``: the request was refused, not found, or malformed."""
+
+    server_error = "5xx"
+    """``5xx``: the server failed to answer the request."""
+
+    @classmethod
+    def from_status_code(cls, status_code: int) -> HttpStatusClass:
+        """Map an HTTP status code to its class by its hundreds digit.
+
+        Raises
+        ------
+        ValueError
+            If ``status_code`` is outside RFC 9110's ``100``-``599``
+            range, where no class applies.
+        """
+        if not 100 <= status_code <= 599:
+            msg = f"HTTP status code {status_code} has no status class"
+            raise ValueError(msg)
+        return cls(f"{status_code // 100}xx")

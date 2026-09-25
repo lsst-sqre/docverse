@@ -7,6 +7,7 @@ from .enums import (
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
     EditionPublishTrigger,
+    HttpStatusClass,
     LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
@@ -18,6 +19,7 @@ from .enums import (
 from .events import DocverseEvents
 from .manager import build_event_manager
 from .payloads import (
+    ApiRequestEvent,
     BuildContentCopiedEvent,
     BuildProcessedEvent,
     BuildUploadedEvent,
@@ -36,6 +38,7 @@ from .payloads import (
 )
 
 __all__ = [
+    "ApiRequestEvent",
     "BuildContentCopiedEvent",
     "BuildProcessedEvent",
     "BuildUploadedEvent",
@@ -50,6 +53,7 @@ __all__ = [
     "EditionPublishTrigger",
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
+    "HttpStatusClass",
     "KeeperSyncRunCompletedEvent",
     "LifecycleAction",
     "LifecycleActionEvent",

@@ -63,6 +63,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.purgatory_cleanup_completed, MockEventPublisher)
     assert isinstance(events.conditional_get, MockEventPublisher)
     assert isinstance(events.build_content_copied, MockEventPublisher)
+    assert isinstance(events.api_request, MockEventPublisher)
 
     await manager.aclose()
 
