@@ -39,7 +39,7 @@ from botocore.exceptions import (
 )
 from safir.dependencies.db_session import db_session_dependency
 from safir.github import GitHubAppClientFactory
-from sqlalchemy import select, update
+from sqlalchemy import literal_column, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
@@ -65,6 +65,7 @@ from docverse_server.domain.lifecycle import (
     LifecycleRuleSet,
     RefDeletedRule,
 )
+from docverse_server.domain.project import Project
 from docverse_server.exceptions import (
     MAX_REPORTED_EDITION_SLUGS,
     InvalidBuildStateError,
@@ -86,6 +87,7 @@ from docverse_server.services.keeper_sync.service import (
     EditionSyncOutcome,
     KeeperSyncContext,
     KeeperSyncService,
+    ProjectSyncResult,
     _now,
     _retryable_transport_error,
 )
@@ -1140,6 +1142,168 @@ async def test_short_circuited_visit_restamps_a_sync_time_build(
 
 
 @pytest.mark.asyncio
+async def test_short_circuited_visit_restamps_a_sync_time_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A "state matches LTD" visit moves the edition's clock to LTD's too.
+
+    The edition half of the backfill (PRD #706): an edition imported
+    before the clock stamp existed carries the import moment in both
+    ``date_created`` and ``date_updated``, and while LTD never rebuilds
+    it every visit short-circuits in ``sync_build``. The clock
+    transaction still runs on those visits, so the next tier cron or
+    full org run rewrites the row without any backfill tool.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    ltd_edition = LtdEdition.model_validate(
+        _load("edition_main_git_refs.json")
+    )
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    project_id = first.docverse_project_id
+    assert project_id is not None
+
+    # Put the edition back on the clock a pre-PRD import left it with.
+    sync_time = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.slug == DEFAULT_EDITION_SLUG,
+            )
+            .values(date_created=sync_time, date_updated=sync_time)
+        )
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = second.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.dates_restamped is True
+    async with db_session.begin():
+        assert await _read_edition_clock(
+            db_session, project_id=project_id, slug=DEFAULT_EDITION_SLUG
+        ) == (ltd_edition.date_created, ltd_edition.date_rebuilt)
+
+
+async def _read_row_version(
+    session: AsyncSession,
+    model: type[SqlEdition | SqlBuild],
+    row_id: int,
+) -> str:
+    """Read a row's ``xmin``: the transaction that wrote its version.
+
+    PostgreSQL writes a new row version for every ``UPDATE`` that
+    matches the row, so an unchanged ``xmin`` proves nothing wrote it —
+    whether through the clock stamp or an ORM flush.
+    """
+    xmin: str = (
+        await session.execute(
+            select(literal_column("xmin::text"))
+            .select_from(model)
+            .where(model.id == row_id)
+        )
+    ).scalar_one()
+    return xmin
+
+
+@pytest.mark.asyncio
+async def test_steady_state_visit_writes_no_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A visit whose rows already carry LTD's clock writes nothing.
+
+    Every visit re-asserts LTD's dates, so the stamp has to be free
+    when there is nothing to fix: an unchanged project is polled by the
+    tier crons indefinitely, and a row version per edition per poll
+    would be pure churn (and ``dates_restamped`` would ask the worker
+    for a dashboard rebuild every time). The first visit imports and
+    stamps; the second finds both rows on LTD's clock and must write
+    neither.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    first_outcome = first.edition_outcomes[0]
+    assert first_outcome.dates_restamped is True
+    edition_id = first_outcome.docverse_edition_id
+    assert edition_id is not None
+    assert first_outcome.build_outcome is not None
+    build_id = first_outcome.build_outcome.docverse_build_id
+    assert build_id is not None
+    async with db_session.begin():
+        edition_version = await _read_row_version(
+            db_session, SqlEdition, edition_id
+        )
+        build_version = await _read_row_version(db_session, SqlBuild, build_id)
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = second.edition_outcomes[0]
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.dates_restamped is False
+    async with db_session.begin():
+        assert (
+            await _read_row_version(db_session, SqlEdition, edition_id)
+            == edition_version
+        )
+        assert (
+            await _read_row_version(db_session, SqlBuild, build_id)
+            == build_version
+        )
+
+
+def test_restamped_edition_count_counts_restamped_outcomes() -> None:
+    """The project's restamp count is per edition, not "did any move".
+
+    It feeds the per-project summary log an operator reads to follow the
+    PRD #706 backfill, so it must say how many editions moved onto
+    LTD's clock.
+    """
+
+    def outcome(slug: str, *, dates_restamped: bool) -> EditionSyncOutcome:
+        return EditionSyncOutcome(
+            docverse_edition_id=None,
+            docverse_slug=slug,
+            docverse_project_id=1,
+            docverse_project_slug="pipelines",
+            build_outcome=None,
+            short_circuited=False,
+            dates_restamped=dates_restamped,
+        )
+
+    result = ProjectSyncResult(
+        docverse_project_id=1,
+        docverse_project_slug="pipelines",
+        edition_outcomes=[
+            outcome("__main", dates_restamped=True),
+            outcome("v1-0", dates_restamped=False),
+            outcome("v2-0", dates_restamped=True),
+        ],
+    )
+
+    assert result.restamped_edition_count == 2
+
+
+@pytest.mark.asyncio
 async def test_shared_build_keeps_the_earliest_ltd_date(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -1220,53 +1384,47 @@ async def test_shared_build_keeps_the_earliest_ltd_date(
         )
 
 
-@pytest.mark.asyncio
-async def test_keeper_sync_adopts_native_git_ref_edition(
-    db_session: AsyncSession,
-    http_client: httpx.AsyncClient,
-    mock_discovery: respx.Router,
-) -> None:
-    """keeper-sync adopts a differently-slugged native edition on one ref.
+async def _seed_native_ticket_edition(
+    session: AsyncSession, *, org_id: int
+) -> tuple[Project, Edition]:
+    """Seed a natively auto-created edition on ``tickets/DM-54686``.
 
-    PRD #409: native auto-creation slugifies ``tickets/DM-54686`` to
-    ``tickets-DM-54686`` while keeper-sync imports LTD's own ``DM-54686``
-    slug. Both track the same ``git_ref``. After a ``get_by_slug`` miss,
-    keeper-sync must consult the shared git_ref lookup, adopt the
-    existing native edition (refresh its tracking, keep its slug), and
-    create no second row; the ``keeper_sync_state`` for the imported
-    edition points at the adopted edition's id.
+    Native auto-creation slugifies the branch to ``tickets-DM-54686``,
+    which is not the ``DM-54686`` slug keeper-sync derives from LTD's
+    edition for the same ref (PRD #409). Returns the project and the
+    edition.
     """
-    async with db_session.begin():
-        org_id = await _seed_org(db_session)
-
     logger = structlog.get_logger("test")
-    project_store = ProjectStore(session=db_session, logger=logger)
-    edition_store = EditionStore(session=db_session, logger=logger)
+    project = await ProjectStore(session=session, logger=logger).create(
+        org_id=org_id,
+        data=ProjectCreate(
+            slug="pipelines",
+            title="LSST Science Pipelines",
+            source_url="https://example.com/lsst/pipelines",
+        ),
+    )
+    edition = await EditionStore(session=session, logger=logger).create(
+        project_id=project.id,
+        data=EditionCreate(
+            slug="tickets-DM-54686",
+            title="DM-54686",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "tickets/DM-54686"},
+        ),
+    )
+    return project, edition
 
-    # A native auto-created edition already tracks ``tickets/DM-54686``
-    # under the slugified slug, before keeper-sync ever runs.
-    async with db_session.begin():
-        project = await project_store.create(
-            org_id=org_id,
-            data=ProjectCreate(
-                slug="pipelines",
-                title="LSST Science Pipelines",
-                source_url="https://example.com/lsst/pipelines",
-            ),
-        )
-        native_edition = await edition_store.create(
-            project_id=project.id,
-            data=EditionCreate(
-                slug="tickets-DM-54686",
-                title="DM-54686",
-                kind=EditionKind.draft,
-                tracking_mode=TrackingMode.git_ref,
-                tracking_params={"git_ref": "tickets/DM-54686"},
-            ),
-        )
-    native_edition_id = native_edition.id
 
-    # LTD reports the same branch under its own ``DM-54686`` slug.
+def _seed_ltd_ticket_branch(
+    mock_discovery: respx.Router,
+) -> tuple[LtdEdition, LtdBuild]:
+    """Stub LTD reporting ``tickets/DM-54686`` under its own slug.
+
+    LTD's ``DM-54686`` edition (id 2) and its build 43, whose content
+    lives under ``pipelines/builds/43/``. Returns the parsed edition and
+    build so a test can compare against their dates.
+    """
     branch_edition = _load("edition_branch_git_refs.json")
     branch_edition["slug"] = "DM-54686"
     branch_edition["title"] = "DM-54686"
@@ -1290,6 +1448,45 @@ async def test_keeper_sync_adopts_native_git_ref_edition(
     mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
         return_value=httpx.Response(200, json=branch_build)
     )
+    return (
+        LtdEdition.model_validate(branch_edition),
+        LtdBuild.model_validate(branch_build),
+    )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_adopts_native_git_ref_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """keeper-sync adopts a differently-slugged native edition on one ref.
+
+    PRD #409: native auto-creation slugifies ``tickets/DM-54686`` to
+    ``tickets-DM-54686`` while keeper-sync imports LTD's own ``DM-54686``
+    slug. Both track the same ``git_ref``. After a ``get_by_slug`` miss,
+    keeper-sync must consult the shared git_ref lookup, adopt the
+    existing native edition (refresh its tracking, keep its slug), and
+    create no second row; the ``keeper_sync_state`` for the imported
+    edition points at the adopted edition's id.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+
+    # A native auto-created edition already tracks ``tickets/DM-54686``
+    # under the slugified slug, before keeper-sync ever runs.
+    async with db_session.begin():
+        project, native_edition = await _seed_native_ticket_edition(
+            db_session, org_id=org_id
+        )
+    native_edition_id = native_edition.id
+
+    # LTD reports the same branch under its own ``DM-54686`` slug.
+    _seed_ltd_ticket_branch(mock_discovery)
 
     object_store = MockObjectStore()
     source_objects = {
@@ -1344,6 +1541,51 @@ async def test_keeper_sync_adopts_native_git_ref_edition(
         )
         assert state is not None
         assert state.docverse_id == native_edition_id
+
+
+@pytest.mark.asyncio
+async def test_adopted_git_ref_edition_is_stamped_with_ltd_dates(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition adopted by ``git_ref`` takes LTD's clock like any other.
+
+    The PRD #409 adoption path hands ``sync_edition`` a native row found
+    by ref rather than by slug, and that row carries its own native
+    creation time. Once keeper-sync keeps it in sync from LTD, its
+    clock is LTD's (PRD #706) — the edition's dates and those of the
+    build it now points at — exactly as for a slug-matched edition.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+        project, native_edition = await _seed_native_ticket_edition(
+            db_session, org_id=org_id
+        )
+    ltd_edition, ltd_build = _seed_ltd_ticket_branch(mock_discovery)
+    assert ltd_edition.date_rebuilt is not None
+
+    result = await _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>branch</html>"},
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcome = result.edition_outcomes[0]
+    assert outcome.docverse_edition_id == native_edition.id
+    assert outcome.dates_restamped is True
+    assert outcome.build_outcome is not None
+    build_id = outcome.build_outcome.docverse_build_id
+    assert build_id is not None
+    async with db_session.begin():
+        assert await _read_edition_clock(
+            db_session, project_id=project.id, slug="tickets-DM-54686"
+        ) == (ltd_edition.date_created, ltd_edition.date_rebuilt)
+        assert await _read_build_clock(db_session, build_id) == (
+            ltd_build.date_created,
+            ltd_build.date_created,
+        )
 
 
 @pytest.mark.asyncio

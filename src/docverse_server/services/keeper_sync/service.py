@@ -714,6 +714,23 @@ class ProjectSyncResult:
     edition_outcomes: list[EditionSyncOutcome]
     edition_failures: tuple[EditionSyncFailure, ...] = ()
 
+    @property
+    def restamped_edition_count(self) -> int:
+        """How many editions this sync moved onto LTD's clock (PRD #706).
+
+        Counts the outcomes whose :attr:`EditionSyncOutcome.dates_restamped`
+        is set. Because every visit re-asserts LTD's dates, this is the
+        operator's read on the backfill: a full org run over projects
+        imported before the clock stamp reports non-zero, and a repeat
+        run reports zero once every edition carries LTD's clock. A
+        freshly imported edition also counts on the visit after its
+        publish, whose ``publish_status`` flips move ``date_updated``
+        back to now through the ORM ``onupdate`` for one poll.
+        """
+        return sum(
+            1 for outcome in self.edition_outcomes if outcome.dates_restamped
+        )
+
 
 @dataclass(frozen=True)
 class KeeperSyncContext:

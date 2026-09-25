@@ -769,9 +769,7 @@ async def keeper_sync_project(
             completion=completion,
             logger=logger,
         )
-        _log_project_completion(
-            logger=logger, edition_failures=edition_failures
-        )
+        _log_project_completion(logger=logger, sync_result=sync_result)
         return "completed_with_errors" if edition_failures else "completed"
 
     msg = "No database session available"
@@ -826,14 +824,25 @@ async def _finalise_project_job(
 def _log_project_completion(
     *,
     logger: structlog.stdlib.BoundLogger,
-    edition_failures: Sequence[EditionSyncFailure],
+    sync_result: ProjectSyncResult,
 ) -> None:
-    """Emit the project sync's terminal log line, partial or clean."""
+    """Emit the project sync's terminal log line, partial or clean.
+
+    Both lines carry ``restamped_edition_count``, the number of editions
+    the sync moved onto LTD's clock (see
+    :attr:`ProjectSyncResult.restamped_edition_count`).
+    """
+    edition_failures = sync_result.edition_failures
+    restamped_edition_count = sync_result.restamped_edition_count
     if not edition_failures:
-        logger.info("Keeper-sync project completed")
+        logger.info(
+            "Keeper-sync project completed",
+            restamped_edition_count=restamped_edition_count,
+        )
         return
     logger.warning(
         "Keeper-sync project completed with edition failures",
+        restamped_edition_count=restamped_edition_count,
         edition_failure_count=len(edition_failures),
         failed_ltd_edition_slugs=[
             failure.ltd_edition_slug

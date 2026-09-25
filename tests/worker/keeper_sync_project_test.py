@@ -626,6 +626,76 @@ async def test_keeper_sync_project_short_circuit_skips_publish_enqueue(
 
 
 @pytest.mark.asyncio
+async def test_keeper_sync_project_summary_log_counts_restamped_editions(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The project's terminal log line reports how many clocks moved.
+
+    ``restamped_edition_count`` is the operator's read on the PRD #706
+    backfill: a full org run over already-synced projects reports a
+    non-zero count, and a repeat run reports zero once every edition
+    carries LTD's clock.
+
+    Three passes over one unchanged LTD ``main``. The first imports and
+    stamps it. Its publish enqueue then flips ``publish_status`` to
+    ``pending`` through the ORM, whose ``onupdate`` moves the clock
+    back to now — the one poll of drift the PRD accepts for any later
+    Docverse-side row write — so the second pass re-asserts LTD's
+    dates. The third finds nothing left to fix.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+
+    _seed_ltd(mock_discovery)
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    async def summary_restamped_counts(backend_job_id: str) -> list[int]:
+        async with db_session.begin():
+            queue_job_id = await _seed_project_queue_job(
+                db_session,
+                org_id=org_id,
+                run_id=run_id,
+                backend_job_id=backend_job_id,
+            )
+        with capture_logs() as logs:
+            result = await keeper_sync_project(
+                ctx,
+                {
+                    "org_id": org_id,
+                    "org_slug": org_slug,
+                    "run_id": run_id,
+                    "queue_job_id": queue_job_id,
+                    "ltd_slug": "pipelines",
+                    "ltd_base_url": LTD_BASE,
+                },
+            )
+        assert result == "completed"
+        return [
+            event["restamped_edition_count"]
+            for event in logs
+            if event["event"] == "Keeper-sync project completed"
+        ]
+
+    assert await summary_restamped_counts("test-arq-project-1") == [1]
+    assert await summary_restamped_counts("test-arq-project-2") == [1]
+    assert await summary_restamped_counts("test-arq-project-3") == [0]
+    await ctx["http_client"].aclose()
+
+
+@pytest.mark.asyncio
 async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     app: None,
     db_session: AsyncSession,
@@ -1884,19 +1954,32 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    result = await keeper_sync_project(
-        ctx,
-        {
-            "org_id": org_id,
-            "org_slug": org_slug,
-            "run_id": run_id,
-            "queue_job_id": queue_job_id,
-            "ltd_slug": "pipelines",
-            "ltd_base_url": LTD_BASE,
-        },
-    )
+    with capture_logs() as captured:
+        result = await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
     await ctx["http_client"].aclose()
     assert result == "completed_with_errors"
+
+    # The partial run's summary line still reports the clock stamps:
+    # only ``__main`` produced an outcome, and its import was stamped.
+    summaries = [
+        event
+        for event in captured
+        if event["event"]
+        == "Keeper-sync project completed with edition failures"
+    ]
+    assert len(summaries) == 1
+    assert summaries[0]["log_level"] == "warning"
+    assert summaries[0]["restamped_edition_count"] == 1
 
     publish_jobs = get_jobs_by_name(
         mock_arq, "publish_edition", queue_name="docverse:queue"
