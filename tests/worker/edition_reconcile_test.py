@@ -630,6 +630,8 @@ async def test_edition_reconcile_republishes_a_hand_deleted_pointer(
     assert len(jobs) == 1
     assert jobs[0].kwargs["payload"]["trigger"] == "reconcile"
     assert jobs[0].kwargs["payload"]["edition_id"] == editions[0].edition_id
+    # A repair names no LTD rebuild, so its publish reports no ``ltd_lag``.
+    assert "ltd_date_rebuilt" not in jobs[0].kwargs["payload"]
 
     row = await _read_queue_job(queue_job_id)
     assert row.progress is not None

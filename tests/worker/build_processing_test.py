@@ -747,6 +747,8 @@ async def test_build_processing_enqueues_publish_edition(
     assert pj_payload["build_public_id"] == build_public_id
     assert "edition_id" in pj_payload
     assert "queue_job_id" in pj_payload
+    # A client upload has no LTD rebuild behind it, so no ``ltd_lag``.
+    assert "ltd_date_rebuilt" not in pj_payload
 
     async for session in db_session_dependency():
         async with session.begin():

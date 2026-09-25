@@ -376,6 +376,8 @@ async def test_rollback_enqueues_publish_edition_arq_job(
     # The rollback path tags its publish so the edition_published metric
     # reports trigger=rollback rather than the default build fan-out.
     assert payload["trigger"] == "rollback"
+    # Nor does it name an LTD rebuild, so the event's ``ltd_lag`` is None.
+    assert "ltd_date_rebuilt" not in payload
 
     logger = structlog.get_logger("docverse")
     async with db_session.begin():
