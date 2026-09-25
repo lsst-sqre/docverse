@@ -64,6 +64,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.conditional_get, MockEventPublisher)
     assert isinstance(events.build_content_copied, MockEventPublisher)
     assert isinstance(events.api_request, MockEventPublisher)
+    assert isinstance(events.github_webhook_received, MockEventPublisher)
 
     await manager.aclose()
 

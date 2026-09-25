@@ -19,6 +19,7 @@ from docverse_server.metrics import (
     HttpStatusClass,
     LifecycleActionTrigger,
     LifecycleReapAction,
+    WebhookOutcome,
 )
 
 
@@ -93,3 +94,19 @@ def test_http_status_class_rejects_codes_outside_rfc_range(
     """A code outside ``100``-``599`` has no class and is refused."""
     with pytest.raises(ValueError, match=str(status_code)):
         HttpStatusClass.from_status_code(status_code)
+
+
+def test_webhook_outcome_values() -> None:
+    """The webhook outcomes are pinned by the value dashboards group on.
+
+    ``outcome`` is an InfluxDB tag on ``github_webhook_received``, so
+    these values are what a query's ``GROUP BY`` and ``WHERE`` clauses
+    quote, and renaming one is a schema break for every dashboard.
+    """
+    assert [member.value for member in WebhookOutcome] == [
+        "dispatched",
+        "ignored",
+        "invalid_signature",
+        "not_configured",
+        "error",
+    ]
