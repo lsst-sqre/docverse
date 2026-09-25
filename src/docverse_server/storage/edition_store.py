@@ -38,6 +38,11 @@ What follows the order, and how:
 - :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
   cascades in this order already, which is what makes it safe for it to
   end up holding all three.
+- ``KeeperSyncService._stamp_ltd_clock``, keeper-sync's end-of-visit
+  clock transaction (PRD #706), stamps its ``editions`` rows — a
+  release's semver aggregates, then the release itself, the slug order
+  ``track_build`` takes them in — before the build row the edition's
+  LTD build maps to, and never the project.
 
 **Composite writers** — the transactions that write ``builds`` or other
 ``editions`` rows *around* a repoint — cannot get the order from
@@ -64,6 +69,8 @@ else.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -72,7 +79,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import ColumnElement, Select, select, update
+from sqlalchemy import ColumnElement, Select, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -881,6 +888,43 @@ class EditionStore:
         )
         return list(result.scalars().all())
 
+    async def list_by_slugs_on_build(
+        self,
+        *,
+        project_id: int,
+        slugs: Sequence[str],
+        build_id: int,
+    ) -> list[Edition]:
+        """List a project's live editions among *slugs* serving a build.
+
+        Keeper-sync's lookup of the semver aggregates (``15``,
+        ``15.2``) a synced release's build backs, so their clocks can
+        follow the release's (PRD #706): one indexed ``SELECT`` over at
+        most a couple of named slugs, not a scan of the project. Slug
+        matching is case-insensitive, as in :meth:`get_by_slug`, and an
+        edition on any other build is left out.
+
+        Returned in slug order, the order ``track_build`` locks
+        co-matching rows in.
+        """
+        if not slugs:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug).in_([s.lower() for s in slugs]),
+                SqlEdition.current_build_id == build_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in result.all()
+        ]
+
     async def list_org_editions_for_reconcile(
         self, *, org_id: int
     ) -> list[ReconcileEdition]:
@@ -1020,6 +1064,63 @@ class EditionStore:
             raise RuntimeError(msg)
         row.alternate_name = alternate_name
         await self._session.flush()
+
+    async def set_sync_dates(
+        self,
+        edition_id: int,
+        *,
+        date_created: datetime,
+        date_updated: datetime,
+    ) -> bool:
+        """Stamp an edition's clock with explicit values (PRD #706).
+
+        Keeper-sync's way of making a synced edition carry LTD's history
+        instead of the moment Docverse imported it. Both columns are
+        named in the ``SET`` clause, which is what keeps the ORM's
+        ``onupdate=now()`` on ``date_updated`` from applying: that
+        default fills only a column a statement leaves out. The
+        converse is why the caller stamps *last* — every later ORM
+        write to the row (a repoint, a kind convergence, a
+        ``publish_status`` flip) leaves ``date_updated`` out and so
+        moves it back to now.
+
+        ``IS DISTINCT FROM`` in the ``WHERE`` makes the stamp a
+        compare-and-set: a row that already carries both values matches
+        nothing, so a steady-state sync visit writes no row version.
+
+        ``projects.date_updated`` is deliberately left alone. The
+        project clock means "the content behind this project moved" to
+        a consumer polling with ``updated_since`` (PRD #634), and
+        re-dating an edition's history moves no content.
+
+        Parameters
+        ----------
+        edition_id
+            The edition to stamp.
+        date_created
+            The value for ``date_created``; timezone-aware.
+        date_updated
+            The value for ``date_updated``; timezone-aware.
+
+        Returns
+        -------
+        bool
+            ``True`` if the row changed, ``False`` if it already
+            carried both values or does not exist.
+        """
+        result = await self._session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.id == edition_id,
+                or_(
+                    SqlEdition.date_created.is_distinct_from(date_created),
+                    SqlEdition.date_updated.is_distinct_from(date_updated),
+                ),
+            )
+            .values(date_created=date_created, date_updated=date_updated)
+            .returning(SqlEdition.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def soft_delete(
         self,

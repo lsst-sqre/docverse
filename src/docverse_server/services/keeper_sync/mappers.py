@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -29,6 +30,7 @@ __all__ = [
     "LTD_MAIN_SLUG",
     "EditionKindDerivation",
     "KindDerivationSource",
+    "derive_edition_dates",
     "derive_edition_kind",
     "derive_edition_slug",
     "derive_edition_source_prefix",
@@ -207,6 +209,32 @@ def derive_edition_slug(ltd_slug: str) -> str:
     if ltd_slug == LTD_MAIN_SLUG:
         return DOCVERSE_MAIN_SLUG
     return ltd_slug
+
+
+def derive_edition_dates(ltd_edition: LtdEdition) -> tuple[datetime, datetime]:
+    """Derive a synced edition's ``(date_created, date_updated)`` from LTD.
+
+    Keeper-sync imports an edition long after LTD created it, so the
+    Docverse row's own server-default timestamps would record the
+    import rather than the edition's history (PRD #706). LTD's
+    ``date_rebuilt`` — the last time LTD repointed the edition at a new
+    build — is the analogue of Docverse's ``date_updated``; an edition
+    LTD never rebuilt was last updated when it was created.
+
+    Both the persisted stamp in
+    :meth:`~docverse_server.services.keeper_sync.service.KeeperSyncService.sync_edition`
+    and the proactive lifecycle pass's transient edition read their
+    dates from here, so the two agree by construction.
+
+    Returns
+    -------
+    tuple of datetime
+        ``(date_created, date_updated)``, as LTD reported them.
+    """
+    return (
+        ltd_edition.date_created,
+        ltd_edition.date_rebuilt or ltd_edition.date_created,
+    )
 
 
 def derive_edition_source_prefix(

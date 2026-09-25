@@ -58,6 +58,9 @@ from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
 from docverse_server.factory import Factory
 from docverse_server.metrics import BuildContentCopiedEvent, DocverseEvents
+from docverse_server.services.dashboard.enqueue import (
+    try_enqueue_dashboard_build_by_id,
+)
 from docverse_server.services.keeper_sync.scheduler import (
     _TIER_ANNOTATION_KEYS,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
@@ -620,7 +623,12 @@ async def keeper_sync_project(
        short-circuited build is sitting on ``publish_status IS NULL``
        (e.g. they were imported before this enqueue logic landed). The
        freshly-synced branch is no longer needed here — it's handled
-       by the per-edition callback.
+       by the per-edition callback. Then
+       :func:`_enqueue_dashboard_for_restamps` enqueues the project's
+       one ``dashboard_build`` when an edition visit moved only its
+       dates onto LTD's clock and published nothing (PRD #706). The
+       callback collects those projects, and this step enqueues after
+       the loop so the render sees every restamped edition.
     4. On success, mark the queue job ``completed`` (or
        ``completed_with_errors`` when the service isolated any
        per-edition failure); on a caught exception, mark it ``failed``
@@ -704,6 +712,7 @@ async def keeper_sync_project(
                 ),
             )
 
+            restamp_only_project_ids: set[int] = set()
             on_edition_synced = _build_on_edition_synced(
                 factory=factory,
                 session=session,
@@ -711,6 +720,7 @@ async def keeper_sync_project(
                 org_id=org_id,
                 run_id=run_id,
                 logger=logger,
+                restamp_only_project_ids=restamp_only_project_ids,
             )
 
             sync_result = await service.sync_project(
@@ -725,6 +735,13 @@ async def keeper_sync_project(
                 org_id=org_id,
                 run_id=run_id,
                 sync_result=sync_result,
+                logger=logger,
+            )
+            await _enqueue_dashboard_for_restamps(
+                factory=factory,
+                session=session,
+                org_id=org_id,
+                project_ids=restamp_only_project_ids,
                 logger=logger,
             )
         except Exception as exc:
@@ -769,9 +786,7 @@ async def keeper_sync_project(
             completion=completion,
             logger=logger,
         )
-        _log_project_completion(
-            logger=logger, edition_failures=edition_failures
-        )
+        _log_project_completion(logger=logger, sync_result=sync_result)
         return "completed_with_errors" if edition_failures else "completed"
 
     msg = "No database session available"
@@ -826,14 +841,25 @@ async def _finalise_project_job(
 def _log_project_completion(
     *,
     logger: structlog.stdlib.BoundLogger,
-    edition_failures: Sequence[EditionSyncFailure],
+    sync_result: ProjectSyncResult,
 ) -> None:
-    """Emit the project sync's terminal log line, partial or clean."""
+    """Emit the project sync's terminal log line, partial or clean.
+
+    Both lines carry ``restamped_edition_count``, the number of editions
+    the sync moved onto LTD's clock (see
+    :attr:`ProjectSyncResult.restamped_edition_count`).
+    """
+    edition_failures = sync_result.edition_failures
+    restamped_edition_count = sync_result.restamped_edition_count
     if not edition_failures:
-        logger.info("Keeper-sync project completed")
+        logger.info(
+            "Keeper-sync project completed",
+            restamped_edition_count=restamped_edition_count,
+        )
         return
     logger.warning(
         "Keeper-sync project completed with edition failures",
+        restamped_edition_count=restamped_edition_count,
         edition_failure_count=len(edition_failures),
         failed_ltd_edition_slugs=[
             failure.ltd_edition_slug
@@ -881,6 +907,7 @@ def _build_on_edition_synced(
     org_id: int,
     run_id: int | None,
     logger: structlog.stdlib.BoundLogger,
+    restamp_only_project_ids: set[int],
 ) -> Callable[[EditionSyncOutcome], Awaitable[None]]:
     """Build the ``on_edition_synced`` callback for ``sync_project``.
 
@@ -889,10 +916,19 @@ def _build_on_edition_synced(
     ruff B023 (the worker function does not actually iterate the
     generator more than once, but the closure-over-loop-var rule
     fires anyway).
+
+    Each outcome goes through the publish enqueues. An outcome that
+    moved a clock onto LTD's (``dates_restamped``, PRD #706) *without*
+    enqueuing any publish — neither its own nor a semver aggregate's —
+    also adds its project to ``restamp_only_project_ids``, the set the
+    caller hands to :func:`_enqueue_dashboard_for_restamps` once the
+    edition loop is over. An outcome that did enqueue a publish is left
+    out because every successful publish already cascades its own
+    ``dashboard_build``.
     """
 
     async def callback(outcome: EditionSyncOutcome) -> None:
-        await _enqueue_publish_for_synced_edition(
+        published_edition = await _enqueue_publish_for_synced_edition(
             factory=factory,
             session=session,
             queue_job_store=queue_job_store,
@@ -901,7 +937,7 @@ def _build_on_edition_synced(
             outcome=outcome,
             logger=logger,
         )
-        await _enqueue_publish_for_aggregates(
+        published_aggregates = await _enqueue_publish_for_aggregates(
             factory=factory,
             session=session,
             queue_job_store=queue_job_store,
@@ -910,8 +946,72 @@ def _build_on_edition_synced(
             outcome=outcome,
             logger=logger,
         )
+        if (
+            outcome.dates_restamped
+            and not published_edition
+            and not published_aggregates
+        ):
+            restamp_only_project_ids.add(outcome.docverse_project_id)
 
     return callback
+
+
+async def _enqueue_dashboard_for_restamps(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    org_id: int,
+    project_ids: set[int],
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Re-render the dashboards a job's restamp-only visits left stale.
+
+    The dashboard is rendered at publish time, so a visit that only
+    moved an edition's dates onto LTD's clock (PRD #706) would otherwise
+    leave ``/v/`` showing the dates it was last rendered with — the
+    whole point of the full-org backfill run. ``project_ids`` is what the
+    ``on_edition_synced`` callback collected (see
+    :func:`_build_on_edition_synced`); each project gets exactly one
+    :func:`try_enqueue_dashboard_build_by_id` per ``keeper_sync_project``
+    job, however many of its editions restamped.
+
+    This runs after the edition loop rather than from the callback on
+    the first restamp-only outcome. ``dashboard_build`` runs on the
+    main worker's queue, not the sync queue, so a render enqueued
+    mid-loop can finish while this job is still restamping the rest of
+    the project's editions. With one enqueue per job, nothing would
+    re-render afterwards, and the next visit restamps nothing. Once the
+    loop has returned, every edition's clock is committed. The price is
+    that a job whose ``sync_project`` fails as a whole never gets here.
+    Editions restamped before the failure keep their stale render until
+    the project's next publish, or until a re-run restamps an edition
+    the failed job never reached.
+
+    A failure never fails the job. :func:`try_enqueue_dashboard_build_by_id`
+    already logs and swallows its own. Anything that still escapes is
+    captured and logged here, the same way ``sync_project`` isolates a
+    raising publish-enqueue callback. That keeps the job from being
+    failed after its editions were synced.
+    """
+    for project_id in sorted(project_ids):
+        logger.info(
+            "Enqueueing dashboard_build for restamped edition dates",
+            project_id=project_id,
+        )
+        try:
+            await try_enqueue_dashboard_build_by_id(
+                factory=factory,
+                session=session,
+                logger=logger,
+                org_id=org_id,
+                project_id=project_id,
+            )
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            logger.exception(
+                "Dashboard enqueue for restamped editions raised; continuing",
+                project_id=project_id,
+            )
 
 
 def _build_on_build_copied(
@@ -966,7 +1066,7 @@ async def _enqueue_publish_for_synced_edition(
     run_id: int | None,
     outcome: EditionSyncOutcome,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> bool:
     """Enqueue a publish for one freshly-synced edition's build.
 
     Runs as the ``on_edition_synced`` callback for
@@ -983,20 +1083,24 @@ async def _enqueue_publish_for_synced_edition(
     Skips when the edition outcome carries no Docverse edition id —
     a tombstoned ``keeper_sync_state`` row whose ``docverse_id`` is
     ``NULL`` short-circuited before the edition was ever imported.
+
+    Returns whether a publish was enqueued, which is what tells the
+    callback that this edition's dashboard refresh is already on its
+    way through the publish cascade.
     """
     build_outcome = outcome.build_outcome
     if build_outcome is None:
-        return
+        return False
     if build_outcome.short_circuited:
-        return
+        return False
     if (
         build_outcome.docverse_build_id is None
         or build_outcome.docverse_build_public_id is None
     ):
-        return
+        return False
     edition_id = outcome.docverse_edition_id
     if edition_id is None:
-        return
+        return False
 
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
@@ -1023,6 +1127,7 @@ async def _enqueue_publish_for_synced_edition(
         build_id=build_outcome.docverse_build_id,
         phase="synced",
     )
+    return True
 
 
 async def _enqueue_publish_for_aggregates(
@@ -1034,7 +1139,7 @@ async def _enqueue_publish_for_aggregates(
     run_id: int | None,
     outcome: EditionSyncOutcome,
     logger: structlog.stdlib.BoundLogger,
-) -> None:
+) -> bool:
     """Publish the semver aggregates the synced release just moved.
 
     The ``15`` / ``15.2`` editions keeper-sync backfills carry a current
@@ -1058,9 +1163,12 @@ async def _enqueue_publish_for_aggregates(
     and a worker can die between the backfill's commit and this enqueue
     — is recovered from persistent state by
     :func:`_self_heal_unpublished_aggregates`.
+
+    Returns whether any aggregate publish was enqueued; like the
+    edition's own, each one cascades a ``dashboard_build``.
     """
     if not outcome.aggregate_outcomes:
-        return
+        return False
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
@@ -1087,6 +1195,7 @@ async def _enqueue_publish_for_aggregates(
             build_id=aggregate.docverse_build_id,
             phase="semver_aggregate",
         )
+    return True
 
 
 async def _self_heal_unpublished_editions(

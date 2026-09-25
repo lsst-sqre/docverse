@@ -18,8 +18,10 @@ from pydantic import HttpUrl
 from docverse.models import EditionKind, TrackingMode
 from docverse_server.domain.slug import parse_slug_rewrite_rules
 from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
+from docverse_server.services.keeper_sync import service as keeper_sync_service
 from docverse_server.services.keeper_sync.mappers import (
     KindDerivationSource,
+    derive_edition_dates,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
@@ -43,6 +45,8 @@ def _edition(
     slug: str = "main",
     mode: str = "git_refs",
     tracked_refs: list[str] | None = None,
+    date_created: datetime | None = None,
+    date_rebuilt: datetime | None = None,
 ) -> LtdEdition:
     return LtdEdition(
         self_url=HttpUrl("https://keeper.lsst.codes/editions/1"),
@@ -50,7 +54,8 @@ def _edition(
         published_url=HttpUrl("https://example.com/"),
         slug=slug,
         title=slug,
-        date_created=datetime(2026, 4, 1, tzinfo=UTC),
+        date_created=date_created or datetime(2026, 4, 1, tzinfo=UTC),
+        date_rebuilt=date_rebuilt,
         mode=mode,
         tracked_refs=tracked_refs,
     )
@@ -515,3 +520,57 @@ class TestDeriveSyncedBuildGitRef:
         assert exc_info.value.ltd_build_id == 42
         assert "main" in str(exc_info.value)
         assert "42" in str(exc_info.value)
+
+
+class TestDeriveEditionDates:
+    """A synced edition's clock is LTD's, not the import moment (PRD #706)."""
+
+    def test_date_rebuilt_is_the_update_time(self) -> None:
+        """LTD's ``date_rebuilt`` is its "content last moved" analogue."""
+        created = datetime(2019, 3, 4, 5, 6, 7, tzinfo=UTC)
+        rebuilt = datetime(2024, 8, 9, 10, 11, 12, tzinfo=UTC)
+        edition = _edition(date_created=created, date_rebuilt=rebuilt)
+        assert derive_edition_dates(edition) == (created, rebuilt)
+
+    def test_never_rebuilt_falls_back_to_date_created(self) -> None:
+        """An edition LTD never rebuilt was last updated when created."""
+        created = datetime(2019, 3, 4, 5, 6, 7, tzinfo=UTC)
+        edition = _edition(date_created=created, date_rebuilt=None)
+        assert derive_edition_dates(edition) == (created, created)
+
+    def test_proactive_transient_edition_uses_the_helper(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The proactive lifecycle stub reads its clock from the helper.
+
+        ``draft_inactivity`` judges a not-yet-imported edition on the
+        transient's ``date_updated`` and an imported one on the stamped
+        row's, so the two must come from one mapping or a draft could be
+        kept before import and reaped after it on the same LTD data.
+        """
+        stamped = (
+            datetime(2001, 1, 1, tzinfo=UTC),
+            datetime(2002, 2, 2, tzinfo=UTC),
+        )
+        seen: list[LtdEdition] = []
+
+        def fake_derive(ltd_edition: LtdEdition) -> tuple[datetime, datetime]:
+            seen.append(ltd_edition)
+            return stamped
+
+        monkeypatch.setattr(
+            keeper_sync_service, "derive_edition_dates", fake_derive
+        )
+        edition = _edition(
+            slug="u-jsick-feature",
+            tracked_refs=["u/jsick/feature"],
+            date_rebuilt=datetime(2024, 8, 9, tzinfo=UTC),
+        )
+
+        transient = keeper_sync_service._transient_edition_from_ltd(
+            ltd_edition=edition, project_id=1
+        )
+
+        assert seen == [edition]
+        assert transient is not None
+        assert (transient.date_created, transient.date_updated) == stamped

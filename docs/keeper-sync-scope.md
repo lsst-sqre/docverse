@@ -8,8 +8,10 @@ series instead of all at once.
 
 This page is for operators: the rule the four fields compose into, what
 a pattern does and does not match, what happens to a project that falls
-out of scope, and the preview → `PATCH` → backfill workflow a wave
-actually uses.
+out of scope, the preview → `PATCH` → backfill workflow a wave
+actually uses, and why the editions and builds a sync imports carry
+LTD's timestamps rather than the moment of import
+([Timestamps mirror LTD](#timestamps-mirror-ltd)).
 
 ## The four fields
 
@@ -475,6 +477,221 @@ its `progress` when it completes: `in_scope_count` and `fan_out_count`,
 alongside `enqueued_count` — which is `fan_out_count` less the slugs
 whose per-project job was already running.
 
+## Timestamps mirror LTD
+
+A project migrated from LTD Keeper is usually years older than its
+import, and its version dashboard (`/v/`) should say so. Keeper-sync
+therefore owns the clock of every row it keeps in step with LTD: a
+synced edition's dates, and its build's, are the ones LTD recorded,
+not the moment Docverse copied them. Before PRD #706 they were the
+import's, which is why every edition on a freshly migrated dashboard
+read "updated just now".
+
+### Which columns follow LTD
+
+| Docverse column | Set from LTD's |
+| --- | --- |
+| `editions.date_created` | edition `date_created` |
+| `editions.date_updated` | edition `date_rebuilt`, or `date_created` for an edition LTD never rebuilt |
+| `builds.date_created` | build `date_created` |
+| `builds.date_completed` | build `date_created` |
+
+LTD's `date_rebuilt` is the last time LTD pointed the edition at a new
+build — the LTD counterpart of the repoint that moves a native
+edition's `date_updated`. The edition mapping is `derive_edition_dates` in
+`src/docverse_server/services/keeper_sync/mappers.py`: the stamp and
+the proactive lifecycle pass (see
+[Lifecycle rules read the same clock](#lifecycle-rules-read-the-same-clock))
+both read it, so they cannot disagree.
+
+Three refinements decide *which* rows are stamped:
+
+- **The build is the edition's current one.** The stamp writes the
+  Docverse build the edition's LTD build maps to, and only ever moves
+  that build's clock *earlier*. `sync_build` converges LTD builds with
+  identical bytes onto one Docverse build — a `main` and a tag built
+  from the same commit, say — so a shared build carries the earliest
+  of those LTD builds' dates, and a native build that LTD's copy of the
+  same content converged onto keeps its own upload time when that is
+  earlier. Only a *current* build is stamped: a build that had already
+  left rotation before the stamp shipped keeps its import-time dates.
+- **Semver aggregates follow their release.** The `15` / `15.2`
+  editions keeper-sync maintains for a release have no LTD row of their
+  own. Each one currently serving the release's build takes the
+  release's `editions.date_updated` and keeps its own Docverse
+  `editions.date_created`. As with builds, the stamp only moves an
+  aggregate's `date_updated` earlier, so when two releases in one
+  series share a build the earlier release's date wins. An aggregate
+  serving any other build is left alone, and so is an edition on an
+  aggregate's slug that does not track the way the aggregate does (an
+  operator's own `15`, say).
+- **Only visited, live rows.** An edition whose `keeper_sync_state`
+  row is tombstoned short-circuits before the stamp, an edition
+  soft-deleted mid-visit is skipped (build and aggregates included), and
+  a native edition keeper-sync never visits is never stamped.
+
+### Every visit re-asserts the clock
+
+The stamp is the **last** transaction of every keeper-sync visit to an
+edition: a fresh import, a visit whose build already matches LTD, and
+a visit that converges onto an existing build alike. It has to come
+last. Every ORM write to an edition row moves `date_updated` back to
+now (the column's `onupdate`), and a visit makes several of them — the
+kind convergence, `sync_build`'s repoint, the aggregate backfill. The
+stamp names both columns in its `UPDATE`, which is what keeps
+`onupdate` out of it, and guards them with `IS DISTINCT FROM`, so a
+visit whose rows already carry LTD's values writes nothing at all.
+
+The consequence is that **a Docverse-side write to a synced row drifts
+its clock for at most one visit.** A tracking refresh, a kind
+convergence, an operator's `PATCH` of the edition's title or
+`lifecycle_exempt`, and above all the `publish_status` flips of the
+edition's own publish all move `date_updated` to now; the project's
+next keeper-sync visit puts LTD's value back. A visit is any
+`keeper_sync_project` job for the project:
+
+- a run, `POST /orgs/{org}/keeper-sync/runs`;
+- a per-project refresh,
+  `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`;
+- a tier-cron tick. `tier_other` revisits a project with any
+  non-`main` edition hourly while the project is hot (its LTD `main`
+  rebuilt within 14 days) and every day or two once it is dormant.
+  `tier_main` revisits a project only when LTD rebuilds its `main`, so
+  a project whose only LTD edition is `main` stays drifted until then,
+  or until the next run.
+
+A **freshly imported** edition therefore restamps on two visits, not
+one. The import visit stamps it; the publish that visit enqueues flips
+`publish_status`, which moves `date_updated` to now; the next visit
+puts LTD's value back. It settles there — a third visit writes nothing.
+The same holds for a release's aggregates, whose publish flips theirs.
+
+A stamp that fails is logged, with a Sentry event, as
+`Edition clock stamp failed; edition sync still succeeded` and does not
+fail the edition: it is already imported, and the next visit
+re-asserts the dates anyway.
+
+### The dashboard refreshes itself
+
+The version dashboard is rendered when something publishes, so a visit
+that only moves dates would leave `/v/` showing the dates it was last
+rendered with. Each visit's outcome therefore carries `dates_restamped`
+— true when the stamp changed the edition's row, its build's, or one
+of its aggregates'. When an outcome is `dates_restamped` and the visit
+enqueued no publish (neither the edition's own nor an aggregate's; each
+of those cascades its own `dashboard_build`), the `keeper_sync_project`
+job enqueues one `dashboard_build` for the project after its edition
+loop finishes, logging
+`Enqueueing dashboard_build for restamped edition dates`. That is at most one render per project per job,
+however many of its editions restamped, and it is enqueued only once
+every edition's clock is committed, so the render sees them all. A
+failure to enqueue is logged and never fails the job.
+
+One gap is accepted: a job whose sync fails as a whole — a systemic
+failure rather than isolated per-edition ones — never reaches that
+enqueue. Editions it restamped before failing keep their stale render
+until the project's next publish, or the next job that restamps another
+of its editions.
+
+### Lifecycle rules read the same clock
+
+`draft_inactivity` matches a `draft` edition whose `date_updated` is
+older than the rule's `max_days_inactive`, and for a synced edition
+`date_updated` is now LTD's last rebuild rather than the day Docverse
+imported it. PRD #706 accepts this deliberately: a draft LTD last
+rebuilt a year ago *is* inactive, whenever it was copied. The proactive
+lifecycle pass, which tombstones LTD editions a rule would delete
+before they are ever imported, already judges them with
+`derive_edition_dates`, so a stale LTD draft is not imported in the
+first place; the rule now sees the same clock before and after import.
+
+What changes is the drafts imported **before** the stamp existed. Their
+`date_updated` recorded the import, so `draft_inactivity` saw them as
+fresh. On an organization or project whose lifecycle rules include
+`draft_inactivity`, once a visit restamps a draft whose LTD
+`date_rebuilt` is older than `max_days_inactive`, the next hourly
+`lifecycle_eval` tick matches it and handles it like any other
+lifecycle deletion: the edition is soft-deleted, unpublished from the
+CDN, and tombstoned `lifecycle_delete`, so keeper-sync does not import
+it again. There is no grace period. To keep a particular draft, set
+`lifecycle_exempt` on it **before** a visit restamps it: tier-cron
+visits start restamping as soon as a release carrying the stamp is
+deployed, and the backfill below reaches every project they have not.
+
+`build_history_orphan` reads the build clock the same way: its
+`min_age_days` counts from `builds.date_completed`, so a synced build
+that later falls out of rotation is aged from LTD's build date rather
+than from the copy.
+
+### What the stamp leaves alone
+
+- **`projects.date_updated`.** Restamping never moves the project's
+  clock. That clock tells a consumer polling the project listing with
+  `updated_since` (Ook) that the content behind a project moved — see
+  [Soft-deleted resources and polling the project listing](api-conventions.md#soft-deleted-resources-and-polling-the-project-listing)
+  — and re-dating an edition's history moves no content. A full-org
+  backfill therefore does not make every project look changed to a
+  poller, and the listing's `ETag` does not change. Nor does the
+  project clock take LTD's history: it keeps recording Docverse-side
+  events, the import among them. The one validator a restamp does
+  retire is the single-project `GET`'s `ETag`, and only once: it
+  hashes the embedded default `__main` edition's clock as its own part,
+  and a restamp moves that clock (usually backwards). See
+  [Conditional GET](api-conventions.md#conditional-get-the-etag-validator).
+- **`organizations.date_updated`**, for the same reason.
+- **`editions.date_deleted`.** LTD's `date_ended` is not carried over;
+  tombstoning already handles an edition LTD ended.
+- **`edition_build_history` rows**, which keep recording when Docverse
+  repointed the edition.
+
+### Backfilling projects synced before the stamp
+
+There is no backfill tool, job, or migration. Every visit re-asserts
+LTD's values, so the backfill is simply a full org run:
+
+1. **Decide about stale drafts first** — ideally before the release
+   carrying the stamp is deployed, since tier-cron visits start
+   restamping on their own. Set `lifecycle_exempt` on any synced draft
+   that should survive; see
+   [Lifecycle rules read the same clock](#lifecycle-rules-read-the-same-clock).
+2. **Launch a run** — `POST /orgs/{org}/keeper-sync/runs`. It fans out
+   one `keeper_sync_project` job per in-scope project, and each job
+   visits every one of that project's LTD editions. For a single
+   project, `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`
+   does the same.
+3. **Let the dashboards land.** Each project with a restamp-only visit
+   enqueues its own `dashboard_build` when its job finishes; there is
+   nothing to trigger by hand.
+4. **Confirm it ran.** Each project's terminal log line —
+   `Keeper-sync project completed`, or
+   `Keeper-sync project completed with edition failures` for a partial
+   sync — carries
+   `restamped_edition_count`: how many of its editions' visits reported
+   `dates_restamped`. The line is bound to `org`, `run_id` and
+   `ltd_slug`, so filtering on the run gives the whole backfill. Expect
+   it above zero for every project synced before the stamp was deployed
+   that no tier-cron visit has restamped since. On `/v/`, an edition's
+   date now reads LTD's `date_rebuilt` (or `date_created`).
+
+A **repeat run** is the check that the backfill converged: it reports
+`restamped_edition_count` of `0` for every project whose content did
+not move in between. A project the first run imported or republished
+reports its second-visit restamp once more (see
+[Every visit re-asserts the clock](#every-visit-re-asserts-the-clock))
+and `0` after that. The same applies to a wave: the run that imports it
+leaves each new edition one visit behind, so a second run straight
+after — or the tier crons over the following hours — is what settles
+the new dashboards.
+
+To see exactly what moved, the stamp logs one info line per changed
+row:
+
+| Message | Fields |
+| --- | --- |
+| `Restamped edition dates from LTD` | `edition_id`, `edition_slug`, `project_id`, `ltd_edition_id`, `previous_date_updated`, `date_updated` |
+| `Restamped build dates from LTD` | `build_id`, `edition_id`, `project_id`, `ltd_edition_id`, `previous_date_created`, `previous_date_completed`, `date_created` |
+| `Restamped semver aggregate dates from LTD` | `edition_id`, `edition_slug`, `release_edition_id`, `project_id`, `ltd_edition_id`, `build_id`, `previous_date_updated`, `date_updated` |
+
 ## Related
 
 - [Keeper-sync transport resilience](keeper-sync-transport.md) — how
@@ -490,7 +707,16 @@ whose per-project job was already running.
 - `src/docverse_server/services/keeper_sync_scope_preview.py` — the
   side-effect-free preview service.
 - `src/docverse_server/worker/functions/keeper_sync.py` — run discovery
-  and the tier crons, which resolve the scope through the model.
+  and the tier crons, which resolve the scope through the model, and
+  the per-project job that logs `restamped_edition_count` and enqueues
+  the restamp-only `dashboard_build`.
+- `src/docverse_server/services/keeper_sync/service.py` —
+  `KeeperSyncService._stamp_ltd_clock`, the end-of-visit clock
+  transaction, and `derive_edition_dates` in the sibling `mappers.py`.
+- `client/src/docverse/models/lifecycle.py` — `DraftInactivityRule`,
+  whose description points back at
+  [Timestamps mirror LTD](#timestamps-mirror-ltd).
 - `tests/docs_test.py` — fails when this page stops naming every scope
-  field, preview field, cap, or endpoint the code has.
-- SQR-112, and PRD #667.
+  field, preview field, cap, or endpoint the code has, or a column the
+  clock stamp writes.
+- SQR-112, PRD #667 (scope), and PRD #706 (timestamps).

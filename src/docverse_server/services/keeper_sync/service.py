@@ -124,6 +124,7 @@ from docverse_server.storage.project_store import ProjectStore
 from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
+    derive_edition_dates,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
@@ -390,7 +391,12 @@ class BuildSyncOutcome:
     """
 
     docverse_build_id: int | None
-    """``None`` when the call short-circuited (state matched LTD)."""
+    """The Docverse build LTD's build maps to.
+
+    Set on every path out of ``sync_build`` — a fresh copy, a
+    convergence onto an existing build, and the "state matches LTD"
+    short circuit, which reads it off the ``keeper_sync_state`` row.
+    """
 
     docverse_build_public_id: str | None
     """``None`` when the call short-circuited (state matched LTD)."""
@@ -399,6 +405,16 @@ class BuildSyncOutcome:
     content_hash: str | None
     object_count: int | None
     total_size_bytes: int | None
+
+    ltd_date_created: datetime
+    """LTD's ``date_created`` for the build: when LTD built the content.
+
+    The value :meth:`KeeperSyncService.sync_edition`'s clock transaction
+    stamps onto the Docverse build (PRD #706). ``sync_build`` fetches
+    the LTD build on every path, the short circuit included, so carrying
+    the date back here is what keeps the stamp from costing a second
+    LTD request.
+    """
 
 
 @dataclass(frozen=True)
@@ -620,6 +636,18 @@ class EditionSyncOutcome:
     build.
     """
 
+    dates_restamped: bool = False
+    """``True`` when the visit rewrote a clock to LTD's.
+
+    Set by the final clock transaction of
+    :meth:`KeeperSyncService.sync_edition` (PRD #706) when it changed the
+    edition's row, its current build's, or one of the semver aggregates
+    (``15``, ``15.2``) serving that build. ``False`` when every row
+    already carried LTD's dates, on a tombstone short-circuit, and when
+    the stamp itself failed — the next visit re-asserts the values
+    either way.
+    """
+
     @property
     def contacted_ltd(self) -> bool:
         """``True`` when this edition's sync actually reached LTD.
@@ -687,6 +715,23 @@ class ProjectSyncResult:
     docverse_project_slug: str
     edition_outcomes: list[EditionSyncOutcome]
     edition_failures: tuple[EditionSyncFailure, ...] = ()
+
+    @property
+    def restamped_edition_count(self) -> int:
+        """How many editions this sync moved onto LTD's clock (PRD #706).
+
+        Counts the outcomes whose :attr:`EditionSyncOutcome.dates_restamped`
+        is set. Because every visit re-asserts LTD's dates, this is the
+        operator's read on the backfill: a full org run over projects
+        imported before the clock stamp reports non-zero, and a repeat
+        run reports zero once every edition carries LTD's clock. A
+        freshly imported edition also counts on the visit after its
+        publish, whose ``publish_status`` flips move ``date_updated``
+        back to now through the ORM ``onupdate`` for one poll.
+        """
+        return sum(
+            1 for outcome in self.edition_outcomes if outcome.dates_restamped
+        )
 
 
 @dataclass(frozen=True)
@@ -1514,6 +1559,18 @@ class KeeperSyncService:
                         project=project.slug,
                     )
 
+        # Last: the kind convergence and ``sync_build``'s repoint both
+        # write this edition's row through the ORM, whose ``onupdate``
+        # moves ``date_updated`` back to now, and the aggregate backfill
+        # does the same to ``15`` / ``15.2``, so a stamp any earlier in
+        # the visit would not survive them. See :meth:`_stamp_ltd_clock`.
+        dates_restamped = await self._stamp_ltd_clock(
+            edition=edition,
+            ltd_edition=ltd_edition,
+            build_outcome=build_outcome,
+            git_ref=tracking_params.get("git_ref"),
+        )
+
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
             # Report the *persisted* edition's slug, not the keeper-derived
@@ -1531,7 +1588,250 @@ class KeeperSyncService:
             build_outcome=build_outcome,
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
+            dates_restamped=dates_restamped,
         )
+
+    async def _stamp_ltd_clock(
+        self,
+        *,
+        edition: Edition,
+        ltd_edition: LtdEdition,
+        build_outcome: BuildSyncOutcome | None,
+        git_ref: str | None,
+    ) -> bool:
+        """Stamp a synced edition's rows with LTD's timestamps (PRD #706).
+
+        Keeper-sync owns the clock of the rows it keeps in sync: the
+        edition's ``date_created`` / ``date_updated`` are LTD's, from
+        :func:`~docverse_server.services.keeper_sync.mappers.derive_edition_dates`,
+        not the moment of import, and so is the clock of the Docverse
+        build ``sync_build`` mapped the edition's LTD build to — see
+        :meth:`_stamp_build_clock`. A release's semver aggregates
+        (``15``, ``15.2``) have no LTD row of their own, so the ones
+        serving its build follow its ``date_updated`` — see
+        :meth:`_stamp_aggregate_clocks`; *git_ref* is the edition's
+        tracked ref, which names them. This is the visit's final
+        transaction, because every earlier edition write moves
+        ``date_updated`` to now through the ORM ``onupdate`` — see
+        :meth:`EditionStore.set_sync_dates`. The edition rows are
+        stamped before the build, per the lock order
+        :mod:`docverse_server.storage.edition_store` documents, and the
+        aggregates before their release: the slug order in which
+        ``track_build`` takes the same rows for a native upload of the
+        release's tag.
+
+        Each stamp is a compare-and-set, so a visit whose rows already
+        match writes nothing and reports ``False``. An edition
+        soft-deleted mid-visit is left alone, build and aggregates
+        included.
+
+        A failure is logged and reported as ``False`` rather than
+        raised, for the same reason the aggregate backfill's is: the
+        edition is already imported and repointed by now, and an
+        exception here would cost it the outcome that enqueues its
+        publish. The next visit re-asserts the dates anyway.
+
+        Returns
+        -------
+        bool
+            Whether the edition row, its build's row, or one of its
+            aggregates' rows changed.
+        """
+        date_created, date_updated = derive_edition_dates(ltd_edition)
+        restamped_build: Build | None = None
+        restamped_aggregates: list[Edition] = []
+        try:
+            async with self._session.begin():
+                current = await self._edition_store.get_by_id(edition.id)
+                if current is None:
+                    return False
+                if build_outcome is not None:
+                    restamped_aggregates = await self._stamp_aggregate_clocks(
+                        project_id=current.project_id,
+                        git_ref=git_ref,
+                        build_id=build_outcome.docverse_build_id,
+                        date_updated=date_updated,
+                    )
+                restamped = await self._edition_store.set_sync_dates(
+                    edition.id,
+                    date_created=date_created,
+                    date_updated=date_updated,
+                )
+                if build_outcome is not None:
+                    restamped_build = await self._stamp_build_clock(
+                        build_outcome
+                    )
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            self._logger.exception(
+                "Edition clock stamp failed; edition sync still succeeded",
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                project_id=edition.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+            )
+            return False
+        if restamped:
+            self._logger.info(
+                "Restamped edition dates from LTD",
+                edition_id=edition.id,
+                edition_slug=current.slug,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                previous_date_updated=current.date_updated.isoformat(),
+                date_updated=date_updated.isoformat(),
+            )
+        if restamped_build is not None and build_outcome is not None:
+            self._logger.info(
+                "Restamped build dates from LTD",
+                build_id=restamped_build.id,
+                edition_id=edition.id,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                previous_date_created=restamped_build.date_created.isoformat(),
+                previous_date_completed=(
+                    restamped_build.date_completed.isoformat()
+                    if restamped_build.date_completed is not None
+                    else None
+                ),
+                date_created=build_outcome.ltd_date_created.isoformat(),
+            )
+        for aggregate in restamped_aggregates:
+            self._logger.info(
+                "Restamped semver aggregate dates from LTD",
+                edition_id=aggregate.id,
+                edition_slug=aggregate.slug,
+                release_edition_id=edition.id,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                build_id=aggregate.current_build_id,
+                previous_date_updated=aggregate.date_updated.isoformat(),
+                date_updated=date_updated.isoformat(),
+            )
+        return (
+            restamped
+            or restamped_build is not None
+            or bool(restamped_aggregates)
+        )
+
+    async def _stamp_aggregate_clocks(
+        self,
+        *,
+        project_id: int,
+        git_ref: str | None,
+        build_id: int | None,
+        date_updated: datetime,
+    ) -> list[Edition]:
+        """Give a release's aggregates on its build the release's clock.
+
+        Runs inside :meth:`_stamp_ltd_clock`'s transaction. The ``N`` /
+        ``N.M`` editions :meth:`_backfill_semver_aggregates` maintains
+        are Docverse-only, so each one whose ``current_build_id`` is
+        this release's build takes the release's stamped
+        ``date_updated``; its ``date_created`` is its own and is written
+        back unchanged. An aggregate on any other build — an older or
+        newer release's, a native upload's — is not this release's to
+        date, and an operator's own edition on an aggregate's slug is
+        not an aggregate.
+
+        The aggregates are looked up by the slugs *git_ref* implies on
+        every visit, not taken from the backfill's outcomes, which only
+        exist on the visit that moved the pointer. That visit is not
+        the last write the row sees: the worker's publish of the moved
+        aggregate flips its ``publish_status`` through the ORM, moving
+        ``date_updated`` back to now, and the next visit skips the
+        backfill on its marker. An aggregate imported before PRD #706
+        likewise never moves again. One ``SELECT`` of at most two named
+        slugs per release visit re-asserts the clock for both.
+
+        The stamp only ever moves an aggregate's ``date_updated``
+        *earlier*, as :meth:`_stamp_build_clock` does a build's. Two
+        releases in one series whose content converged onto one build
+        both find the aggregate on "their" build, and stamping each
+        verbatim would make them overwrite each other on every poll.
+        Every write the stamp exists to undo — a repoint, a
+        ``publish_status`` flip — moves the clock to now, later than
+        any LTD date, so the earlier-only rule still corrects each one.
+
+        Returns
+        -------
+        list of Edition
+            The aggregates the stamp changed, as they were before it,
+            for the caller's log lines.
+        """
+        if build_id is None:
+            return []
+        version = parse_stable_semver(git_ref)
+        if version is None:
+            return []
+        modes = {
+            spec.slug: spec.tracking_mode
+            for spec in semver_aggregate_specs(version)
+        }
+        if not modes:
+            return []
+        aggregates = await self._edition_store.list_by_slugs_on_build(
+            project_id=project_id, slugs=list(modes), build_id=build_id
+        )
+        restamped: list[Edition] = []
+        for aggregate in aggregates:
+            if (
+                aggregate.tracking_mode is not modes.get(aggregate.slug)
+                or aggregate.date_updated <= date_updated
+            ):
+                continue
+            if await self._edition_store.set_sync_dates(
+                aggregate.id,
+                date_created=aggregate.date_created,
+                date_updated=date_updated,
+            ):
+                restamped.append(aggregate)
+        return restamped
+
+    async def _stamp_build_clock(
+        self, build_outcome: BuildSyncOutcome
+    ) -> Build | None:
+        """Stamp the Docverse build behind *build_outcome* with LTD's date.
+
+        Runs inside :meth:`_stamp_ltd_clock`'s transaction. Both
+        ``date_created`` and ``date_completed`` take the LTD build's
+        ``date_created``: LTD built and published the content at that
+        moment, and the Docverse row's own values only record the copy.
+
+        The stamp only ever moves a build's clock *earlier*. One Docverse
+        build can stand for several LTD builds: ``sync_build`` converges
+        any LTD build whose bytes a completed build already holds onto
+        that build (``main`` and a tag built from one commit, say). Were
+        each visit to write its own LTD build's date, the editions
+        sharing the row would overwrite each other on every poll. The
+        content existed from the earliest of those LTD builds on, so a
+        row already dated at or before this LTD build is left alone —
+        which also keeps the upload time of a native build that LTD's
+        copy of the same content converged onto.
+
+        Returns
+        -------
+        Build or None
+            The build as it was *before* the stamp when the stamp
+            changed it, for the caller's log line; ``None`` when the
+            row already matched, already carries an earlier date, or
+            does not exist.
+        """
+        build_id = build_outcome.docverse_build_id
+        if build_id is None:
+            return None
+        build = await self._build_store.get_by_id(build_id)
+        if (
+            build is None
+            or build.date_created < build_outcome.ltd_date_created
+        ):
+            return None
+        changed = await self._build_store.set_sync_dates(
+            build_id,
+            date_created=build_outcome.ltd_date_created,
+            date_completed=build_outcome.ltd_date_created,
+        )
+        return build if changed else None
 
     async def _backfill_semver_aggregates(
         self,
@@ -2005,6 +2305,7 @@ class KeeperSyncService:
                 content_hash=existing_state.content_hash,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=ltd_build.date_created,
             )
 
         source = await self._resolve_build_source(
@@ -2070,6 +2371,7 @@ class KeeperSyncService:
                 content_hash=manifest_hash,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=ltd_build.date_created,
             )
 
         git_ref = derive_synced_build_git_ref(ltd_edition, ltd_build)
@@ -2196,6 +2498,7 @@ class KeeperSyncService:
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+            ltd_date_created=ltd_build.date_created,
         )
 
     async def _copy_build_content(
@@ -2705,9 +3008,10 @@ def _transient_edition_from_ltd(
     evaluator deliberately does not fetch builds (defeats the
     bandwidth-saving point). Those editions fall through to
     ``sync_edition`` and the regular ``lifecycle_eval`` pass handles
-    them post-import. ``date_updated`` mirrors LTD's ``date_rebuilt``
-    when set (LTD's analogue of Docverse's edition-touch timestamp)
-    and falls back to ``date_created`` otherwise.
+    them post-import. The dates come from :func:`derive_edition_dates`,
+    the same mapping :meth:`KeeperSyncService.sync_edition` stamps onto
+    the imported row, so ``draft_inactivity`` judges an edition on the
+    same clock before and after its import.
     """
     try:
         tracking_mode, tracking_params = map_edition_tracking(
@@ -2715,6 +3019,7 @@ def _transient_edition_from_ltd(
         )
     except ValueError:
         return None
+    date_created, date_updated = derive_edition_dates(ltd_edition)
     return Edition(
         id=ltd_edition.ltd_id,
         slug=derive_edition_slug(ltd_edition.slug),
@@ -2728,7 +3033,7 @@ def _transient_edition_from_ltd(
         tracking_mode=tracking_mode,
         tracking_params=tracking_params or None,
         lifecycle_exempt=False,
-        date_created=ltd_edition.date_created,
-        date_updated=ltd_edition.date_rebuilt or ltd_edition.date_created,
+        date_created=date_created,
+        date_updated=date_updated,
         date_deleted=None,
     )

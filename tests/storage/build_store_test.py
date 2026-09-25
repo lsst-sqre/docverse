@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import (
@@ -1910,3 +1910,126 @@ def test_transition_table_covers_exactly_the_unfinished_statuses() -> None:
     assert set(_VALID_TRANSITIONS) == {
         status for status in BuildStatus if status.is_unfinished
     }
+
+
+async def _read_build_clock(
+    db_session: AsyncSession, build_id: int
+) -> tuple[datetime, datetime | None]:
+    """Read ``(date_created, date_completed)`` straight from the database.
+
+    Column-level, so the identity map cannot answer with an entity
+    loaded before ``set_sync_dates``'s Core ``UPDATE``.
+    """
+    row = (
+        await db_session.execute(
+            select(SqlBuild.date_created, SqlBuild.date_completed).where(
+                SqlBuild.id == build_id
+            )
+        )
+    ).one()
+    return row.date_created, row.date_completed
+
+
+async def _create_completed_build(
+    db_session: AsyncSession, build_store: BuildStore
+) -> int:
+    """Commit a completed build and return its id."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="build-proj",
+            data=_build_data(),
+            uploader="keeper-sync",
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.processing
+        )
+        await build_store.transition_status(
+            build_id=build.id, new_status=BuildStatus.completed
+        )
+        await db_session.commit()
+    return build.id
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_writes_the_given_values(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """Keeper-sync's build clock stamp lands verbatim (PRD #706).
+
+    A synced build's ``date_created`` / ``date_completed`` come from
+    LTD's build rather than the import, whatever offset LTD reported
+    them in — ``timestamptz`` stores the same instant.
+    """
+    build_id = await _create_completed_build(db_session, build_store)
+    pacific = timezone(timedelta(hours=-8))
+    created = datetime(2017, 6, 1, 9, 30, tzinfo=pacific)
+    completed = datetime(2017, 6, 1, 9, 30, 12, 345678, tzinfo=UTC)
+
+    async with db_session.begin():
+        changed = await build_store.set_sync_dates(
+            build_id, date_created=created, date_completed=completed
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        assert await _read_build_clock(db_session, build_id) == (
+            created,
+            completed,
+        )
+
+
+async def _read_build_xmin(db_session: AsyncSession, build_id: int) -> str:
+    """Read the row's ``xmin``: the transaction that wrote its version.
+
+    PostgreSQL writes a new row version for every ``UPDATE`` that
+    matches a row, even one that sets each column to the value it
+    already holds, so an unchanged ``xmin`` proves no write happened.
+    """
+    xmin: str = (
+        await db_session.execute(
+            text("SELECT xmin::text FROM builds WHERE id = :id"),
+            {"id": build_id},
+        )
+    ).scalar_one()
+    return xmin
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_matching_row_is_not_written(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A re-stamp with the values the row holds writes nothing.
+
+    Keeper-sync re-asserts LTD's build date on every visit, so the
+    steady state must cost a non-matching compare, not a rewritten row.
+    """
+    build_id = await _create_completed_build(db_session, build_store)
+    stamped = datetime(2018, 2, 3, 4, 5, 6, tzinfo=UTC)
+    async with db_session.begin():
+        await build_store.set_sync_dates(
+            build_id, date_created=stamped, date_completed=stamped
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await _read_build_xmin(db_session, build_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await build_store.set_sync_dates(
+            build_id, date_created=stamped, date_completed=stamped
+        )
+        await db_session.commit()
+    assert changed is False
+
+    async with db_session.begin():
+        assert await _read_build_xmin(db_session, build_id) == before
+        assert await _read_build_clock(db_session, build_id) == (
+            stamped,
+            stamped,
+        )
