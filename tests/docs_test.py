@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import fields
+from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
+from types import NoneType
 from typing import get_args, get_type_hints
+from unittest.mock import AsyncMock, Mock
 
+import pytest
 from fastapi import params
 from fastapi.routing import APIRoute
+from safir.metrics import EventManager, EventPayload
 
 from docverse.models import (
     DraftInactivityRule,
@@ -48,7 +55,9 @@ from docverse_server.metrics import (
     ConditionalGetEvent,
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
+    DocverseEvents,
     EditionReconcileCompletedEvent,
+    HttpStatusClass,
 )
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
@@ -96,6 +105,31 @@ _TIMESTAMPS_SECTION = "Timestamps mirror LTD"
 
 _TRANSPORT_KNOB_PREFIXES = ("keeper_sync_upload_", "keeper_sync_copy_retry_")
 """Name prefixes of the settings that shape a build copy's retries."""
+
+_METRICS_PAGE = "metrics.md"
+"""Catalog of every Sasquatch metrics event Docverse publishes (PRD #713)."""
+
+_METRICS_TOPIC = "lsst.square.metrics.events.docverse"
+"""Kafka topic of every Docverse event, and its measurements' prefix.
+
+Safir names the topic ``lsst.square.metrics.events.<application>`` and
+each event's Avro schema ``<topic>.<event>``, which Telegraf writes as the
+InfluxDB measurement name; ``METRICS_APPLICATION`` is ``docverse`` in
+every deployment.
+"""
+
+_DOCUMENTED_TYPES: dict[object, str] = {
+    str: "string",
+    int: "integer",
+    float: "float",
+    bool: "boolean",
+    timedelta: "duration",
+}
+"""The metrics page's Type-column word for each scalar payload annotation.
+
+Enum-valued fields read ``enum``, and a nullable field appends
+``or null``; see :func:`_documented_type`.
+"""
 
 
 def _read(name: str) -> str:
@@ -153,6 +187,93 @@ def _stamped_columns(table: str, stamp: Callable[..., object]) -> set[str]:
         for name, parameter in inspect.signature(stamp).parameters.items()
         if parameter.kind is inspect.Parameter.KEYWORD_ONLY
     }
+
+
+async def _registered_events() -> dict[str, type[EventPayload]]:
+    """Return every event ``DocverseEvents.initialize`` registers, by name.
+
+    Runs the real ``initialize`` against a manager that only records
+    what it was asked to create, so the roster is exactly what every
+    process registers at startup rather than a hand-kept list that could
+    miss the next event added.
+    """
+    manager = Mock(spec=EventManager)
+    manager.create_publisher = AsyncMock(return_value=Mock())
+    await DocverseEvents().initialize(manager)
+    return {
+        call.args[0]: call.args[1]
+        for call in manager.create_publisher.call_args_list
+    }
+
+
+def _event_section(page: str, name: str) -> str:
+    """Return the body of the metrics catalog's section for one event.
+
+    The catalog gives each event a ``### `name``` heading; the section
+    runs to the next heading of the same or a higher level.
+    """
+    parts = page.split(f"\n### `{name}`\n", 1)
+    assert len(parts) == 2, f"the page has no section for {name!r}"
+    return re.split(r"\n#{1,3} ", parts[1], maxsplit=1)[0]
+
+
+def _cells(row: str) -> list[str]:
+    """Split one Markdown table row into its stripped cells."""
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def _field_cells(section: str, field: str) -> list[str] | None:
+    """Cells of the table row documenting ``field``, or ``None``."""
+    prefix = f"| `{field}` |"
+    for line in section.splitlines():
+        if line.startswith(prefix):
+            return _cells(line)
+    return None
+
+
+def _enum_of(annotation: object) -> type[StrEnum] | None:
+    """Return the metrics enum a payload field is typed with, if any."""
+    for candidate in (annotation, *get_args(annotation)):
+        if isinstance(candidate, type) and issubclass(candidate, StrEnum):
+            return candidate
+    return None
+
+
+def _documented_type(annotation: object) -> str:
+    """Return the metrics page's Type cell for a payload field annotation.
+
+    Read off the payload model rather than the Avro schema, because the
+    page describes a field the way its emitter writes it: a
+    ``timedelta`` is a ``duration`` (seconds once it is in InfluxDB),
+    whatever Avro type carries it.
+    """
+    members = get_args(annotation)
+    if NoneType in members:
+        (inner,) = (member for member in members if member is not NoneType)
+        return f"{_documented_type(inner)} or null"
+    if _enum_of(annotation) is not None:
+        return "enum"
+    return _DOCUMENTED_TYPES[annotation]
+
+
+def _phalanx_tags(page: str) -> list[str]:
+    """Return the ``influxTags`` list the metrics page quotes from Phalanx.
+
+    The list lives in Phalanx, which this repository cannot read, so the
+    page's quotation of it is what the per-event Stored-as cells are
+    checked against.
+    """
+    for block in page.split("```yaml\n")[1:]:
+        body = block.split("```", 1)[0]
+        if "influxTags:" in body:
+            listing = body.split("influxTags:", 1)[1]
+            return [
+                line.strip().removeprefix("- ")
+                for line in listing.splitlines()
+                if line.strip().startswith("- ")
+            ]
+    msg = "the page quotes no influxTags list"
+    raise AssertionError(msg)
 
 
 def _import_name(cls: type) -> str:
@@ -695,3 +816,200 @@ def test_build_retry_transport_errors_documented() -> None:
     section = _section(_read(_TRANSPORT_PAGE), "The build-level retry")
     classes = (*RETRYABLE_TRANSPORT_ERRORS, *RETRYABLE_SOURCE_TRANSPORT_ERRORS)
     assert not _uncoded({_import_name(cls) for cls in classes}, section)
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_covers_every_registered_event() -> None:
+    """Every event ``DocverseEvents.initialize`` registers has a section.
+
+    Read off the registration itself, so an event added to the catalog
+    without a section here — the one place an operator can look up what
+    a measurement holds — fails, and each section has to name the
+    measurement its event lands in.
+    """
+    page = _read(_METRICS_PAGE)
+    events = await _registered_events()
+    assert events, "DocverseEvents registers no events"
+    missing = sorted(
+        name for name in events if f"\n### `{name}`\n" not in page
+    )
+    assert not missing
+    unnamed = sorted(
+        name
+        for name in events
+        if f"`{_METRICS_TOPIC}.{name}`" not in _event_section(page, name)
+    )
+    assert not unnamed
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_types_every_event_field() -> None:
+    """Every payload field is a row of its event's table, correctly typed.
+
+    Every field, the shared ``organization`` and ``project`` included:
+    on this page, unlike the operations pages, the table is the
+    reference. The Type cell is derived from the payload annotation, so
+    a field turning nullable, or changing unit, has to be carried here.
+    """
+    page = _read(_METRICS_PAGE)
+    wrong: list[str] = []
+    for name, payload in (await _registered_events()).items():
+        section = _event_section(page, name)
+        for field, info in payload.model_fields.items():
+            cells = _field_cells(section, field)
+            expected = _documented_type(info.annotation)
+            if cells is None or cells[1] != expected:
+                wrong.append(f"{name}.{field}: {expected}")
+    assert not wrong
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_marks_the_phalanx_tags() -> None:
+    """Each field's Stored-as cell agrees with the quoted tag list.
+
+    Telegraf applies the one ``influxTags`` list to every Docverse
+    measurement, so a field is a tag exactly when its name is on the
+    list, whichever event it belongs to. Every name on the list must also
+    be a field some event carries, or the list is tagging nothing.
+    """
+    page = _read(_METRICS_PAGE)
+    tags = _phalanx_tags(page)
+    events = await _registered_events()
+    assert tags, "the page quotes an empty tag list"
+    assert len(tags) == len(set(tags)), "the tag list repeats a name"
+    carried = {
+        field for payload in events.values() for field in payload.model_fields
+    }
+    assert not sorted(set(tags) - carried)
+    wrong: list[str] = []
+    for name, payload in events.items():
+        section = _event_section(page, name)
+        for field in payload.model_fields:
+            cells = _field_cells(section, field)
+            expected = "tag" if field in tags else "field"
+            if cells is None or cells[2] != expected:
+                wrong.append(f"{name}.{field}: {expected}")
+    assert not wrong
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_says_which_events_each_tag_applies_to() -> None:
+    """The Tags section's table names every event each tag lands on.
+
+    A tag name applies to every event carrying a field of that name,
+    which is easy to forget when adding one: this table is where the
+    page spells that out, so it is checked against the payloads here.
+    """
+    page = _read(_METRICS_PAGE)
+    section = _section(page, "Tags")
+    events = await _registered_events()
+    wrong: list[str] = []
+    for tag in _phalanx_tags(page):
+        cells = _field_cells(section, tag)
+        carriers = {
+            name
+            for name, payload in events.items()
+            if tag in payload.model_fields
+        }
+        if cells is None:
+            wrong.append(tag)
+        elif cells[1] == "every event":
+            if carriers != set(events):
+                wrong.append(tag)
+        elif set(re.findall(r"`([^`]+)`", cells[1])) != carriers:
+            wrong.append(tag)
+    assert not wrong
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_names_every_enum_value() -> None:
+    """Every value an enum-typed field can carry is named in its section.
+
+    Those values are what a query filters on and what a tag's series are,
+    so each has to be quotable from the page rather than guessed at.
+    """
+    page = _read(_METRICS_PAGE)
+    missing: list[str] = []
+    for name, payload in (await _registered_events()).items():
+        section = _event_section(page, name)
+        for field, info in payload.model_fields.items():
+            enum = _enum_of(info.annotation)
+            if enum is None:
+                continue
+            values = {member.value for member in enum}
+            missing.extend(
+                f"{name}.{field}={value}"
+                for value in _uncoded(values, section)
+            )
+    assert not missing
+
+
+def test_metrics_page_names_every_status_class() -> None:
+    """The ``api_request`` section names every ``status_class`` value.
+
+    ``status_class`` is a string in the Avro schema, because enum symbols
+    may not begin with a digit, so the enum check above cannot see it;
+    its vocabulary is :class:`HttpStatusClass` all the same.
+    """
+    section = _event_section(_read(_METRICS_PAGE), "api_request")
+    assert not _uncoded({value.value for value in HttpStatusClass}, section)
+
+
+def test_metrics_page_has_an_example_query_per_capability() -> None:
+    """The page carries one InfluxQL query for each PRD #713 question.
+
+    Sync lag, request volume, request latency, and webhook deliveries:
+    each query has to read its measurement and group by the tags that
+    answer its question.
+    """
+    queries = _section(_read(_METRICS_PAGE), "Example queries")
+    blocks = [
+        block.split("```", 1)[0] for block in queries.split("```sql\n")[1:]
+    ]
+    wanted = [
+        (
+            "edition_published",
+            (
+                'PERCENTILE("ltd_lag", 50)',
+                'PERCENTILE("ltd_lag", 95)',
+                '"organization" = ',
+                "now() - 24h",
+            ),
+        ),
+        ("api_request", ('GROUP BY time(1m), "route", "status_class"',)),
+        ("api_request", ('PERCENTILE("duration", 95)', 'GROUP BY "route"')),
+        (
+            "github_webhook_received",
+            ('GROUP BY time(1h), "event_type", "outcome"',),
+        ),
+    ]
+    unanswered = [
+        f"{event}: {snippets}"
+        for event, snippets in wanted
+        if not any(
+            f'"{_METRICS_TOPIC}.{event}"' in block
+            and all(snippet in block for snippet in snippets)
+            for block in blocks
+        )
+    ]
+    assert not unanswered
+
+
+def test_docs_index_links_the_metrics_page() -> None:
+    """The index points at the metrics catalog."""
+    assert _METRICS_PAGE in _read("index.md")
+
+
+def test_transport_page_metrics_event_links_the_metrics_page() -> None:
+    """The transport page's metrics-event section points at the catalog."""
+    reading = _section(_read(_TRANSPORT_PAGE), "Reading a copy")
+    metrics_event = reading.split("\n### Logs\n", 1)[0]
+    assert _METRICS_PAGE in metrics_event
+
+
+def test_conditional_get_section_links_the_metrics_page() -> None:
+    """The conventions page's conditional GET section points at the catalog."""
+    section = _section(
+        _read(_API_PAGE), "Conditional GET: the `ETag` validator"
+    )
+    assert _METRICS_PAGE in section

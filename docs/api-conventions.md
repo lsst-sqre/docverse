@@ -426,6 +426,12 @@ within it is the cache hit rate. Beyond the `organization` and
   full).
 - `precondition` — `etag`, the only validator that can decide one.
 
+The [metrics catalog](metrics.md#conditional_get) gives the event's
+measurement and which of these fields are InfluxDB tags (`outcome` is
+one). Every request, conditional or not, also publishes an
+`api_request` event, which counts volume and latency by route rather
+than validator hits; the two do not double-count.
+
 ## Soft-deleted resources and polling the project listing
 
 Deleting a project is a **soft** delete: the row stays, stamped with a

@@ -472,7 +472,11 @@ Every build-content copy publishes one project-scoped
 fails. A copy the build-level retry re-ran is still **one** copy and
 one event. `organization` is the org slug and `project` the Docverse
 project slug. They come from the shared payload base, like every
-Docverse event.
+Docverse event. The [metrics catalog](metrics.md#build_content_copied)
+lists the event's measurement, field types, and InfluxDB tags beside
+every other Docverse event, and explains how `ltd_lag_seconds` pairs
+with `edition_published`'s `ltd_lag` in [Measuring lag behind LTD
+Keeper](metrics.md#measuring-lag-behind-ltd-keeper).
 
 | Field | Meaning |
 | --- | --- |
