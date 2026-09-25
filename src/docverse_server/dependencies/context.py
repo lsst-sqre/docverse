@@ -122,6 +122,25 @@ class ContextDependency:
         """Return the configured GitHub App numeric ID, or ``None``."""
         return self._github_app_id
 
+    @property
+    def events(self) -> DocverseEvents:
+        """Return the process's Sasquatch metrics event publishers.
+
+        Handlers reach these through ``RequestContext.events``; this is
+        the route for code that runs outside a handler, such as the
+        ``api_request`` middleware, which resolves it per request so the
+        publishers the lifespan registers are the ones it publishes to.
+
+        Raises
+        ------
+        RuntimeError
+            If the lifespan has not yet initialized the events.
+        """
+        if self._events is None:
+            msg = "ContextDependency events not initialized"
+            raise RuntimeError(msg)
+        return self._events
+
     async def __call__(
         self,
         request: Request,
@@ -137,15 +156,12 @@ class ContextDependency:
         if not self._initialized:
             msg = "ContextDependency not initialized"
             raise RuntimeError(msg)
-        if self._events is None:
-            msg = "ContextDependency events not initialized"
-            raise RuntimeError(msg)
         return RequestContext(
             request=request,
             response=response,
             logger=logger,
             session=session,
-            events=self._events,
+            events=self.events,
             factory=HandlerFactory(
                 session=session,
                 logger=logger,

@@ -13,6 +13,7 @@ from safir.dependencies.metrics import EventMaker
 from safir.metrics import EventManager, EventPublisher
 
 from .payloads import (
+    ApiRequestEvent,
     BuildContentCopiedEvent,
     BuildProcessedEvent,
     BuildUploadedEvent,
@@ -55,6 +56,7 @@ class DocverseEvents(EventMaker):
     purgatory_cleanup_completed: EventPublisher[PurgatoryCleanupCompletedEvent]
     conditional_get: EventPublisher[ConditionalGetEvent]
     build_content_copied: EventPublisher[BuildContentCopiedEvent]
+    api_request: EventPublisher[ApiRequestEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -105,4 +107,7 @@ class DocverseEvents(EventMaker):
         )
         self.build_content_copied = await manager.create_publisher(
             "build_content_copied", BuildContentCopiedEvent
+        )
+        self.api_request = await manager.create_publisher(
+            "api_request", ApiRequestEvent
         )

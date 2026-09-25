@@ -9,14 +9,19 @@ on it.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any, cast
 
-from pydantic import create_model
+import pytest
+from pydantic import ValidationError, create_model
 from safir.metrics import EventPayload
 
 from docverse_server.metrics import (
+    ApiRequestEvent,
     BuildContentCopiedEvent,
+    DocverseEventBase,
     EditionPublishedEvent,
+    HttpStatusClass,
 )
 
 
@@ -86,3 +91,90 @@ def test_build_content_copied_adds_only_a_nullable_ltd_lag_seconds() -> None:
     }
     # Every union member must still be one InfluxDB can store.
     BuildContentCopiedEvent.validate_structure()
+
+
+def test_api_request_is_not_an_org_scoped_event() -> None:
+    """``api_request`` stands outside the org/project base.
+
+    Most API routes address no organization at all (``/orgs``, the
+    admin routes, the webhook), so the event derives from
+    :class:`~safir.metrics.EventPayload` directly and makes both
+    dimensions optional, rather than weakening ``DocverseEventBase``'s
+    required ``organization`` for every other event.
+    """
+    assert issubclass(ApiRequestEvent, EventPayload)
+    assert not issubclass(ApiRequestEvent, DocverseEventBase)
+
+
+def test_api_request_fields() -> None:
+    """``api_request`` carries the request's route, outcome, and timing.
+
+    ``route`` is nullable so an unmatched path can still be counted,
+    and ``organization``/``project`` are nullable because most routes
+    have neither; every other field is always present.
+    """
+    fields = _avro_field_types(ApiRequestEvent)
+
+    assert list(fields) == [
+        "method",
+        "route",
+        "status_code",
+        "status_class",
+        "duration",
+        "authenticated",
+        "organization",
+        "project",
+    ]
+    for nullable in ("route", "organization", "project"):
+        assert isinstance(fields[nullable], list)
+        assert "null" in fields[nullable]
+    for required in (
+        "method",
+        "status_code",
+        "status_class",
+        "duration",
+        "authenticated",
+    ):
+        assert not isinstance(fields[required], list)
+    # Every union member must still be one InfluxDB can store.
+    ApiRequestEvent.validate_structure()
+
+
+def test_api_request_status_class_is_an_avro_string() -> None:
+    """``status_class`` goes over the wire as a string, not an Avro enum.
+
+    Avro enum symbols must not begin with a digit, so ``4xx`` cannot be
+    one; the field is a string whose values are
+    :class:`~docverse_server.metrics.HttpStatusClass`'s, which is what a
+    query's ``WHERE "status_class"='4xx'`` quotes.
+    """
+    fields = _avro_field_types(ApiRequestEvent)
+
+    assert fields["status_class"] == "string"
+
+
+def test_api_request_status_class_accepts_only_known_classes() -> None:
+    """A value outside :class:`HttpStatusClass` is refused.
+
+    ``status_class`` is an InfluxDB tag, so the closed vocabulary is what
+    keeps its cardinality at five even though the Avro type is an open
+    string.
+    """
+    event = _api_request(status_class=HttpStatusClass.client_error)
+    assert event.status_class == "4xx"
+
+    with pytest.raises(ValidationError):
+        _api_request(status_class="404")
+
+
+def _api_request(*, status_class: str) -> ApiRequestEvent:
+    return ApiRequestEvent(
+        method="GET",
+        route="/orgs/{org}",
+        status_code=404,
+        status_class=status_class,
+        duration=timedelta(milliseconds=5),
+        authenticated=True,
+        organization=None,
+        project=None,
+    )

@@ -29,6 +29,7 @@ from .handlers.orgs import orgs_router
 from .handlers.responses import error_responses
 from .handlers.webhooks import webhook_router
 from .metrics import build_event_manager
+from .middleware import ApiRequestMiddleware
 from .sentry import initialize_sentry
 from .services.credential_encryptor import CredentialEncryptor
 from .storage.github import validate_github_app
@@ -190,6 +191,15 @@ app.include_router(
     ),
 )
 app.include_router(webhook_router, prefix=config.path_prefix)
+# Added before XForwardedMiddleware so it runs inside it: each
+# add_middleware wraps the ones added earlier, and XForwardedMiddleware
+# hands the application a copy of the scope, so only a middleware inside
+# it sees the route the router records on that copy.
+app.add_middleware(
+    ApiRequestMiddleware,
+    events=lambda: context_dependency.events,
+    path_prefix=config.path_prefix,
+)
 app.add_middleware(XForwardedMiddleware)
 
 if config.slack_webhook:
