@@ -59,7 +59,7 @@ from docverse_server.domain.lifecycle import (
     RefDeletedRule,
 )
 from docverse_server.domain.organization import Organization
-from docverse_server.domain.project import Project
+from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH, Project
 from docverse_server.domain.semver_aggregate import (
     SemverAggregateSpec,
     semver_aggregate_specs,
@@ -1561,7 +1561,7 @@ class KeeperSyncService:
                     github=github,
                     default_edition=DefaultEditionConfig(
                         tracking_mode=TrackingMode.git_ref,
-                        tracking_params={"git_ref": "main"},
+                        tracking_params={"git_ref": FALLBACK_DEFAULT_BRANCH},
                     ),
                 ),
             )

@@ -56,7 +56,11 @@ from docverse_server.storage._http_retry import (
     RETRYABLE_STATUS_CODES,
     RETRYABLE_TRANSPORT_ERRORS,
 )
-from docverse_server.storage.github import GitHubAppNotInstalledError
+from docverse_server.storage.github import (
+    GitHubAppNotInstalledError,
+    RepositoryNotAccessibleError,
+    RepositoryRefFetchError,
+)
 
 __all__ = [
     "PROJECT_GITHUB_RESOLVE_MAX_TRIES",
@@ -94,6 +98,20 @@ secondary-limit windows, which sub-second retries merely re-trip.
 
 RETRY_MAX_DEFER_SECONDS = 600.0
 """Ceiling on any single backoff, in seconds."""
+
+_LIVE_REF_FETCH_ERRORS: tuple[type[Exception], ...] = (
+    RepositoryNotAccessibleError,
+    RepositoryRefFetchError,
+    httpx.HTTPError,
+    gidgethub.GitHubException,
+    jwt.exceptions.InvalidKeyError,
+)
+"""What a first-learn live ref fetch may raise and the resolve absorbs.
+
+The fetcher's two typed errors, plus what minting the installation
+token for it can raise. The ref set is only extra evidence for the
+default-branch rule, so none of these retries or fails the job.
+"""
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -163,8 +181,10 @@ async def project_github_resolve(
     (PRD #721), which records ``github_default_branch`` and converges a
     ``__main`` still tracking the previous default branch — the one a
     ``PATCH`` rebind cleared, carried in the payload, or else the one
-    the column held. Each write is a no-op when GitHub reports what the
-    row already holds, so a re-resolve leaves the project's clock alone.
+    the column held — or, when the column was ``NULL``, a ref missing
+    from the repository's live ref set. Each write is a no-op when
+    GitHub reports what the row already holds, so a re-resolve leaves
+    the project's clock alone.
 
     Parameters
     ----------
@@ -353,15 +373,26 @@ async def _apply_default_branch(
 
     Routes the write through
     :class:`~docverse_server.services.default_branch.DefaultBranchService`
-    (PRD #721) with no live ref set and ``old_default_branch`` set to
+    (PRD #721) with ``old_default_branch`` set to
     ``previous_default_branch`` — the branch a ``PATCH`` rebind cleared
     from the column, carried in the job payload — or, without one, the
-    column's current value. A first resolve (no previous branch, ``NULL``
-    column) therefore only seeds the column, while a binding moved to a
-    repository with a different default branch rewrites a ``__main``
-    still tracking the branch recorded for the old one. A rewritten
-    ``__main`` is announced as a ``PATCH`` of it would be: its
-    ``publish_edition`` job is handed to arq, then one
+    column's current value, so a binding moved to a repository with a
+    different default branch rewrites a ``__main`` still tracking the
+    branch recorded for the old one.
+
+    A first learn — the column still ``NULL``, on a fresh project or
+    after a rebind cleared it — also fetches the repository's live ref
+    set and passes it as the rule's other evidence, as the audit does.
+    That is what converges a project created on a ``master`` repository
+    with no ``main`` branch, whose ``__main`` got the ``main`` fallback,
+    in its own resolve rather than at the next audit tick; a ``__main``
+    on a ref that still exists is left alone either way. A failed fetch
+    is logged and the branch is recorded without live refs, leaving the
+    audit as the backstop. A later resolve spends no requests on the
+    ref set: the column's previous value is its evidence.
+
+    A rewritten ``__main`` is announced as a ``PATCH`` of it would be:
+    its ``publish_edition`` job is handed to arq, then one
     ``edition_lifecycle`` ``update`` event and one ``dashboard_build``.
 
     Runs in its own transaction after the ids commit, because the
@@ -371,7 +402,9 @@ async def _apply_default_branch(
     re-read first so a project rebound between the two transactions
     does not record the old repository's branch; the rebind enqueued
     its own resolve. See :func:`_still_bound` for what counts as the
-    same binding.
+    same binding. The live ref fetch runs between that re-read and the
+    write transaction, so no transaction is open across the GitHub
+    round-trips.
 
     Returns
     -------
@@ -379,8 +412,23 @@ async def _apply_default_branch(
         What the service changed, or ``None`` when the project is gone
         or no longer bound to the repository the resolve read.
     """
+    project_store = factory.create_project_store()
     async with session.begin():
-        project = await factory.create_project_store().get_by_id(project_id)
+        project = await project_store.get_by_id(project_id)
+    if project is None or not _still_bound(
+        project, owner=owner, repo=repo, repo_id=repo_id
+    ):
+        return None
+    live_refs = None
+    if project.github_default_branch is None:
+        live_refs = await _fetch_live_refs(
+            factory=factory, project_id=project_id, logger=logger
+        )
+
+    async with session.begin():
+        # Re-read under the write transaction: the binding may have
+        # moved during the ref fetch's GitHub round-trips.
+        project = await project_store.get_by_id(project_id)
         if project is None or not _still_bound(
             project, owner=owner, repo=repo, repo_id=repo_id
         ):
@@ -392,6 +440,7 @@ async def _apply_default_branch(
             old_default_branch=(
                 previous_default_branch or project.github_default_branch
             ),
+            live_refs=live_refs,
         )
         org = await factory.create_org_store().get_by_id(project.org_id)
         await session.commit()
@@ -416,6 +465,51 @@ async def _apply_default_branch(
         project_slug=project.slug,
     )
     return outcome
+
+
+async def _fetch_live_refs(
+    *,
+    factory: Factory,
+    project_id: int,
+    logger: structlog.stdlib.BoundLogger,
+) -> frozenset[str] | None:
+    """Fetch the project's live branches and tags for a first learn.
+
+    Authenticates the way the audit does, through
+    :class:`~docverse_server.services.project_github_binding.ProjectGitHubBindingResolver`:
+    with the installation token for the id this resolve just committed,
+    or anonymously for a project without one. The resolver owns its own
+    short read transaction, so the caller must not hold one.
+
+    Returns
+    -------
+    frozenset of str or None
+        The live ref names, or ``None`` when the project is no longer
+        bound or GitHub could not list its refs — "not known", which
+        leaves ``__main`` alone rather than moving it off a ref that may
+        still exist.
+    """
+    resolver = factory.create_project_github_binding_resolver()
+    fetcher = factory.create_github_ref_set_fetcher()
+    try:
+        binding = await resolver.resolve(project_id)
+        if binding is None:
+            return None
+        ref_set = await fetcher.fetch(
+            owner=binding.owner,
+            repo=binding.repo,
+            auth=binding.auth,
+            logger=logger,
+        )
+    except _LIVE_REF_FETCH_ERRORS as exc:
+        logger.warning(
+            "Resolve: GitHub ref fetch failed, recording default branch "
+            "without live refs",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return None
+    return ref_set.all
 
 
 def _still_bound(

@@ -395,12 +395,14 @@ class Factory:
     def create_github_ref_set_fetcher(self) -> GitHubRefSetFetcher:
         """Create a :class:`GitHubRefSetFetcher`.
 
-        Used by the daily ``git_ref_audit`` worker (PRD #346) and by
-        the proactive ``sync_project`` pre-fetch (PRD #332). Both
-        callers paginate ``git/matching-refs/{heads,tags}`` against
-        the shared ``httpx.AsyncClient`` and attach installation
-        auth per request, so the fetcher is built once per worker
-        tick and shared across per-project fan-out.
+        Used by the daily ``git_ref_audit`` worker (PRD #346), by
+        the proactive ``sync_project`` pre-fetch (PRD #332), and by
+        ``project_github_resolve`` when it first learns a project's
+        default branch (PRD #721). Every caller paginates
+        ``git/matching-refs/{heads,tags}`` against the shared
+        ``httpx.AsyncClient`` and attaches installation auth per
+        request, so the fetcher is built once per worker tick and
+        shared across per-project fan-out.
 
         Raises
         ------

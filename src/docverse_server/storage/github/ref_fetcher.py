@@ -121,11 +121,12 @@ class GitHubRefSetFetcher:
     ``/tags`` against the GitHub REST API, paginates each endpoint
     internally via ``Link: rel="next"`` headers, and returns a
     :class:`RepositoryRefSet` of bare ref names (no ``refs/heads/`` or
-    ``refs/tags/`` prefix). The fetcher is the single interface both
-    the ``git_ref_audit`` worker (PRD #346) and the per-project
-    pre-fetch in ``sync_project`` (PRD #332) call — they share the
-    same auth resolution, the same pagination handling, and the same
-    typed errors so the two paths cannot drift apart. The audit also
+    ``refs/tags/`` prefix). The fetcher is the single interface the
+    ``git_ref_audit`` worker (PRD #346), the per-project pre-fetch in
+    ``sync_project`` (PRD #332), and ``project_github_resolve``'s
+    first-learn fetch (PRD #721) call — they share the same auth
+    resolution, the same pagination handling, and the same typed
+    errors so the paths cannot drift apart. The audit also
     reads the repository's default branch through
     :meth:`fetch_default_branch` (PRD #721), one ``GET /repos`` call on
     the same auth and error contract.

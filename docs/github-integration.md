@@ -122,7 +122,7 @@ exists:
 | Trigger | When it runs | Its evidence that `__main`'s ref is gone |
 | --- | --- | --- |
 | `webhook` | A `repository.edited` delivery whose `changes` carry `default_branch` | `changes.default_branch.from`: the branch that just stopped being the default |
-| `resolve` | `project_github_resolve`, after a project is created with a `github` binding or a `PATCH` names one | The old repository's default branch, for a project rebound to another repository: the `PATCH` clears the column, so the job's payload carries the value it held as `previous_default_branch`. Without one, the column's current value, if any |
+| `resolve` | `project_github_resolve`, after a project is created with a `github` binding or a `PATCH` names one | The old repository's default branch, for a project rebound to another repository: the `PATCH` clears the column, so the job's payload carries the value it held as `previous_default_branch`. Without one, the column's current value, if any. While the column is `null` — a first learn — also the live branch and tag names it fetches once for the project (see [A new project](#a-new-project)) |
 | `audit` | The daily `git_ref_audit`, at 05:17 UTC | The live branch and tag names it fetched for the project |
 
 All three hand the branch to one rule, `DefaultBranchService.apply`,
@@ -135,8 +135,9 @@ the same edition, so none of them interleaves with it:
 2. **Rewrite `__main` if its ref is gone.** Only when `__main` is in
    `git_ref` mode, tracks something other than the default branch, and
    the trigger's evidence says that ref is gone: it is the old default
-   the trigger named, or it is missing from the live ref set the audit
-   fetched. Only `tracking_params.git_ref` changes.
+   the trigger named, or it is missing from the live ref set the audit,
+   or a first-learn resolve, fetched. Only `tracking_params.git_ref`
+   changes.
 3. **Retire the duplicate draft.** After a rewrite to branch X, every
    live, non-exempt `draft` edition in `git_ref` mode tracking X — the
    one edition tracking auto-created while `__main` ignored X — is
@@ -164,6 +165,37 @@ the switch itself is the signal. The audit has only the live ref set to
 go on, so it never moves `__main` off a branch or tag that still exists.
 A switch whose delivery was lost therefore stays with an operator; see
 [Pinned `__main` editions](#pinned-__main-editions-are-left-for-operators).
+
+### A new project
+
+A project created with a `github` binding gets a `__main` tracking
+`main`, the same fallback every reader of a `null` column uses, because
+creation does not wait on GitHub. Its resolve job then learns the real
+default branch, and since the column is still `null` it has no old
+default to offer as evidence. So a first learn — a new project, or one whose rebind cleared the
+column — also fetches the repository's live branches and tags, once,
+with the installation token for the ids the job has just recorded (or
+anonymously without an installation), and hands them to the rule as the
+audit does:
+
+- On a `master` repository with no `main` branch, `__main`'s `main` is
+  gone: the resolve rewrites `__main` to `master`, retires the `master`
+  draft any push made meanwhile, and repoints `__main` at the newest
+  `master` build — within the one job, not at the next audit tick.
+- On a repository that has a `main` branch but another default,
+  `__main` stays on `main`, a ref that exists. Move it by hand if that
+  is not what the project wants; see
+  [Pinned `__main` editions](#pinned-__main-editions-are-left-for-operators).
+- If the ref fetch fails, the job logs
+  `Resolve: GitHub ref fetch failed, recording default branch without live refs`,
+  records the branch without the live set, and completes: the ref set
+  is extra evidence, not the job's purpose, so it neither retries nor
+  fails. The next audit tick is the backstop.
+
+A resolve on a project whose column is already set spends nothing on
+the ref set; the column's previous value is its evidence. Keeper-sync
+enqueues no resolve, so a keeper-synced project learns its branch from
+the audit instead.
 
 ### What a rewrite announces
 
@@ -233,9 +265,11 @@ with the live set as its evidence. The first tick after an upgrade:
   and for them the audit is the usual seed: keeper-sync creates projects
   without enqueueing a resolve;
 - rewrites any `__main` tracking a ref that no longer exists — a
-  default branch renamed before the upgrade, or a project created on a
-  `master` repository whose `__main` got the `main` fallback and that
-  has no `main` branch;
+  default branch renamed before the upgrade, or a project created before
+  it on a `master` repository whose `__main` got the `main` fallback and
+  that has no `main` branch. A project created since converges in its
+  own resolve (see [A new project](#a-new-project)); the audit is the
+  backstop for one whose resolve could not list its refs;
 - converges what the webhook cannot reach: repositories without the App
   installed, and deliveries that were lost or failed.
 
@@ -426,6 +460,7 @@ the line to count. The rule's other lines say why it did what it did.
 | `Applied repository default branch` | info | `column_changed`, `main_rewritten`, `main_rewritten_from`, `drafts_retired`, `repointed_build_id` |
 | `Resolved project GitHub metadata` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch`, `default_branch_changed`, `main_rewritten` |
 | `Recorded GitHub ids but skipped default branch: project rebound or deleted after the ids were committed` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch` |
+| `Resolve: GitHub ref fetch failed, recording default branch without live refs` | warning | `error`, `error_type` |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
 | `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
 | `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors` |
@@ -433,10 +468,12 @@ the line to count. The rule's other lines say why it did what it did.
 `drafts_retired` counts the drafts step 3 retired; `main_rewritten_from`
 is the ref `__main` tracked before, or null when it was left alone. The
 audit's two warnings name the project they skipped with `project` and
-`project_id`. On the audit's summary line, `default_branch_updates`
-counts the projects whose column took a new value, `main_rewrites` the
-projects whose `__main` was rewritten, and `default_branch_errors` the
-projects whose convergence failed, across the organization's pass.
+`project_id`, and the resolve's lines carry the job's `project_id`,
+`github_owner`, and `github_repo`. On the audit's summary line,
+`default_branch_updates` counts the projects whose column took a new
+value, `main_rewrites` the projects whose `__main` was rewritten, and
+`default_branch_errors` the projects whose convergence failed, across
+the organization's pass.
 Usually that failure is the rule raising and rolling back; when the
 rule committed and only the hand-off of its `publish_edition` job to
 the queue failed, the project counts toward the other two as well, and

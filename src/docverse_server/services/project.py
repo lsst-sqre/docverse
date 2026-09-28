@@ -199,7 +199,13 @@ class ProjectService:
             title=config.title,
             kind=EditionKind.main,
             tracking_mode=config.tracking_mode,
-            tracking_params=config.tracking_params or {"git_ref": "main"},
+            # A new project's ``github_default_branch`` is ``NULL``, so
+            # this is the fallback every reader of the column uses, and
+            # the seed cannot drift from it. The resolve job (or, for a
+            # project it never reaches, the audit) moves ``__main`` onto
+            # the repository's real default branch if this ref is gone.
+            tracking_params=config.tracking_params
+            or {"git_ref": project.effective_default_branch},
             lifecycle_exempt=config.lifecycle_exempt,
         )
 

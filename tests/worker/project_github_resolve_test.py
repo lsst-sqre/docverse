@@ -721,27 +721,31 @@ async def _seed_converging_project(
     org_slug: str,
     stored_default_branch: str | None,
     main_ref: str,
+    branch: str = "main",
+    ids_stored: bool = True,
 ) -> _Converging:
-    """Seed a resolved project whose ``__main`` tracks ``main_ref``.
+    """Seed a project whose ``__main`` tracks ``main_ref``.
 
-    The ids are already stored, as after an earlier resolve, and the
-    column holds ``stored_default_branch``. A completed ``main`` build
-    and the ``main`` draft tracking auto-created give a rewrite
-    something to repoint at and retire.
+    By default the ids are already stored, as after an earlier resolve;
+    ``ids_stored=False`` seeds a project fresh from its create instead.
+    The column holds ``stored_default_branch``. A completed ``branch``
+    build and the ``branch`` draft tracking auto-created give a rewrite
+    onto ``branch`` something to repoint at and retire.
     """
     async with db_session.begin():
         _org_id, project_id = await _seed_org_and_project(
             db_session, org_slug=org_slug
         )
         store = ProjectStore(session=db_session, logger=_logger())
-        await store.update_github_metadata(
-            project_id=project_id,
-            expected_owner="acme",
-            expected_repo="templates",
-            installation_id=42,
-            owner_id=111,
-            repo_id=12345,
-        )
+        if ids_stored:
+            await store.update_github_metadata(
+                project_id=project_id,
+                expected_owner="acme",
+                expected_repo="templates",
+                installation_id=42,
+                owner_id=111,
+                repo_id=12345,
+            )
         if stored_default_branch is not None:
             await store.set_github_default_branch(
                 project_id=project_id, value=stored_default_branch
@@ -757,18 +761,18 @@ async def _seed_converging_project(
         )
         draft = await edition_store.create_internal(
             project_id=project_id,
-            slug="main",
-            title="main",
+            slug=branch,
+            title=branch,
             kind=EditionKind.draft,
             tracking_mode=TrackingMode.git_ref,
-            tracking_params={"git_ref": "main"},
+            tracking_params={"git_ref": branch},
         )
         build_store = BuildStore(session=db_session, logger=_logger())
         build = await build_store.create(
             project_id=project_id,
             project_slug="pgr-proj",
             data=BuildCreate(
-                git_ref="main", content_hash="sha256:" + "e" * 64
+                git_ref=branch, content_hash="sha256:" + "e" * 64
             ),
             uploader="testuser",
         )
@@ -864,6 +868,7 @@ async def test_project_github_resolve_rewrites_main_on_the_old_branch(
     mock_github.seed_repo(
         "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
     )
+    mock_github.seed_refs("acme", "templates", branches=["main"])
 
     with capture_logs() as captured:
         result = await _resolve_with(
@@ -902,22 +907,30 @@ async def test_project_github_resolve_rewrites_main_on_the_old_branch(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("stored_default_branch", "main_ref"),
-    [("master", "docs"), (None, "master")],
-    ids=["main-not-on-old-branch", "first-resolve"],
+    ("stored_default_branch", "main_ref", "default_branch", "live_branches"),
+    [
+        ("master", "docs", "main", None),
+        (None, "main", "master", ["master", "main"]),
+    ],
+    ids=["main-not-on-old-branch", "first-resolve-main-ref-live"],
 )
 async def test_project_github_resolve_only_records_the_branch(
+    *,
     app: None,
     db_session: AsyncSession,
     mock_github: GitHubMock,
     stored_default_branch: str | None,
     main_ref: str,
+    default_branch: str,
+    live_branches: list[str] | None,
 ) -> None:
     """Without evidence that ``__main``'s ref is gone, only the column moves.
 
     A ``__main`` tracking something other than the column's previous
-    value is pinned deliberately; a first resolve has no previous value
-    and no live ref set, so it leaves ``__main`` for the audit to judge.
+    value is pinned deliberately. A first resolve has no previous value
+    but fetches the live ref set, and a ``__main`` on the ``main``
+    fallback of a ``master`` repository that also has a ``main`` branch
+    tracks a ref that still exists, so it stays pinned there too.
     Neither queues a job or announces anything.
     """
     manager, events = await build_event_manager(Configuration())
@@ -927,13 +940,20 @@ async def test_project_github_resolve_only_records_the_branch(
         org_slug="pgr-guard",
         stored_default_branch=stored_default_branch,
         main_ref=main_ref,
+        branch=default_branch,
     )
     mock_github.seed_installation(
         "acme", "templates", installation_id=42, owner_id=111
     )
     mock_github.seed_repo(
-        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch=default_branch,
     )
+    if live_branches is not None:
+        mock_github.seed_refs("acme", "templates", branches=live_branches)
 
     result = await _resolve_with(
         mock_github=mock_github,
@@ -943,7 +963,10 @@ async def test_project_github_resolve_only_records_the_branch(
     )
 
     assert result == "completed"
-    assert await _fetch_project_default_branch(seeded.project_id) == "main"
+    assert (
+        await _fetch_project_default_branch(seeded.project_id)
+        == default_branch
+    )
     main = await _load_edition(seeded.main_id)
     assert main is not None
     assert main.tracking_params == {"git_ref": main_ref}
@@ -954,6 +977,235 @@ async def test_project_github_resolve_only_records_the_branch(
     publisher = events.edition_lifecycle
     assert isinstance(publisher, MockEventPublisher)
     assert publisher.published == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_first_learn_rewrites_a_gone_fallback(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A fresh project on a ``master``-only repo converges on its resolve.
+
+    Creation seeds ``__main`` with the ``main`` fallback. Until task #747
+    the resolve that followed only recorded ``master``: with no old
+    default branch and no live ref set it had no evidence that ``main``
+    was gone, so every push built a ``master`` draft while ``__main``
+    served nothing until an audit tick. On a first learn the resolve now
+    fetches the live ref set, with the installation token of the ids it
+    just committed, and hands it to the rule as the audit would, so
+    ``__main`` is rewritten, the ``master`` draft retired, and ``__main``
+    repointed and announced in the same job.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-first-learn",
+        stored_default_branch=None,
+        main_ref="main",
+        branch="master",
+        ids_stored=False,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    heads, _tags = mock_github.seed_refs(
+        "acme", "templates", branches=["master"]
+    )
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert heads.call_count == 1
+    assert heads.calls.last.request.headers["Authorization"] == (
+        f"Bearer {mock_github.default_token}"
+    )
+    assert await _fetch_project_default_branch(seeded.project_id) == "master"
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "master"}
+    assert main.current_build_id == seeded.main_build_id
+    assert main.publish_status is PublishStatus.pending
+    assert await _load_edition(seeded.draft_id) is None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 1
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 1
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    [event] = publisher.published
+    assert event.action is LifecycleAction.update
+    assert event.edition_kind is MetricsEditionKind.main
+    [rewrite_log] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Rewrote __main to track the default branch"
+    ]
+    assert rewrite_log["trigger"] == "resolve"
+    assert rewrite_log["main_rewritten_from"] == "main"
+    await manager.aclose()
+
+
+_REF_FETCH_FAILED_MESSAGE = (
+    "Resolve: GitHub ref fetch failed, recording default branch without "
+    "live refs"
+)
+
+
+def _fail_heads(mock_github: GitHubMock, status_code: int) -> None:
+    """Answer the heads listing with ``status_code``."""
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/git/matching-refs/heads"
+    ).mock(return_value=httpx.Response(status_code, json={"message": "nope"}))
+
+
+def _fail_second_token_exchange(mock_github: GitHubMock) -> None:
+    """Mint the resolve's own token, then fail the ref fetch's exchange."""
+    mock_github.router.post(
+        "https://api.github.com/app/installations/42/access_tokens"
+    ).mock(
+        side_effect=[
+            httpx.Response(
+                201,
+                json={
+                    "token": mock_github.default_token,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                },
+            ),
+            httpx.Response(502, json={"message": "Bad Gateway"}),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "break_fetch",
+    [
+        lambda mock_github: _fail_heads(mock_github, 404),
+        lambda mock_github: _fail_heads(mock_github, 500),
+        _fail_second_token_exchange,
+    ],
+    ids=["not-accessible", "fetch-error", "token-exchange"],
+)
+async def test_project_github_resolve_first_learn_ref_fetch_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+    break_fetch: Callable[[GitHubMock], None],
+) -> None:
+    """A failed first-learn ref fetch still records the default branch.
+
+    The live ref set is extra evidence, not the job's purpose, so a
+    GitHub failure fetching it neither retries nor fails the resolve:
+    the column is recorded, ``__main`` is left for the audit to judge,
+    and the job completes with a warning and no Sentry event.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-fetch-fail",
+        stored_default_branch=None,
+        main_ref="main",
+        branch="master",
+        ids_stored=False,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    mock_github.seed_refs("acme", "templates", branches=["master"])
+    break_fetch(mock_github)
+    captured_exceptions: list[BaseException] = []
+    monkeypatch.setattr(
+        sentry_sdk, "capture_exception", captured_exceptions.append
+    )
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(seeded.project_id) == "master"
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "main"}
+    assert main.current_build_id is None
+    assert await _load_edition(seeded.draft_id) is not None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 0
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
+    [warning] = [
+        entry
+        for entry in captured
+        if entry["event"] == _REF_FETCH_FAILED_MESSAGE
+    ]
+    assert warning["log_level"] == "warning"
+    assert captured_exceptions == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_known_default_branch_fetches_no_refs(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Only a first learn fetches the live ref set.
+
+    Once the column holds a branch, the resolve's evidence is that
+    previous value, as before, and it spends no GitHub requests on the
+    ref set: the audit fetches it daily anyway.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-known",
+        stored_default_branch="master",
+        main_ref="docs",
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+    )
+    heads, tags = mock_github.seed_refs("acme", "templates", branches=["main"])
+
+    result = await _resolve_with(
+        mock_github=mock_github,
+        project_id=seeded.project_id,
+        events=events,
+        arq_queue=arq_queue,
+    )
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(seeded.project_id) == "main"
+    assert (heads.call_count, tags.call_count) == (0, 0)
     await manager.aclose()
 
 

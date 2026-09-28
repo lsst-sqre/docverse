@@ -286,9 +286,10 @@ class DefaultBranchService:
             ref that is gone.
         live_refs
             The repository's live branch and tag names, when the trigger
-            fetched them (the audit). ``__main`` tracking a ref absent
-            from this set is taken as tracking a ref that is gone.
-            ``None`` means "not known", never "no refs".
+            fetched them (the audit, and a resolve learning the branch
+            for the first time). ``__main`` tracking a ref absent from
+            this set is taken as tracking a ref that is gone. ``None``
+            means "not known", never "no refs".
 
         Returns
         -------
@@ -475,9 +476,9 @@ def _ref_is_gone(
     Either arm suffices. The branch that just stopped being the default
     is taken as gone because that is what a rename leaves behind; a ref
     missing from a live set that was actually fetched is gone by
-    definition. With neither — a first resolve that only learns the
-    branch — nothing is known, and ``__main`` is left for a later audit
-    tick to judge.
+    definition. With neither — a resolve whose ref fetch failed, say —
+    nothing is known, and ``__main`` is left for a later audit tick to
+    judge.
     """
     if old_default_branch is not None and ref == old_default_branch:
         return True
