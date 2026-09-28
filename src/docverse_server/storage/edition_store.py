@@ -1072,7 +1072,7 @@ class EditionStore:
         date_created: datetime,
         date_updated: datetime,
     ) -> bool:
-        """Stamp an edition's clock with explicit values (PRD #706).
+        """Move an edition's clock back to explicit values (PRD #706).
 
         Keeper-sync's way of making a synced edition carry LTD's history
         instead of the moment Docverse imported it. Both columns are
@@ -1084,9 +1084,30 @@ class EditionStore:
         ``publish_status`` flip) leaves ``date_updated`` out and so
         moves it back to now.
 
-        ``IS DISTINCT FROM`` in the ``WHERE`` makes the stamp a
-        compare-and-set: a row that already carries both values matches
-        nothing, so a steady-state sync visit writes no row version.
+        The stamp only ever moves a date *earlier*: each column becomes
+        the ``LEAST`` of its current value and the given one, and ``>``
+        in the ``WHERE`` makes it a compare-and-set, so a row already
+        at or before both values matches nothing and a steady-state
+        sync visit writes no row version. A row several LTD editions
+        resolve to is why — ``KeeperSyncService._ensure_edition`` lands
+        a ``git_refs`` edition and a ``manual`` one pinned to a build of
+        the same ref on one row, and so does ``get_by_slug`` for two LTD
+        slugs that differ only in case. Stamped verbatim, each visit
+        would overwrite the others' dates, so the clock would flip and
+        the row report a restamp on every poll forever; earlier-only,
+        the row settles on the earliest of their dates, column by
+        column, and later visits write nothing.
+
+        Earlier-only still undoes every drift the stamp exists for: the
+        import moment, a repoint, a kind convergence, and a
+        ``publish_status`` flip all move ``date_updated`` to now, later
+        than any LTD date. An LTD rebuild still moves the clock forward,
+        because ``sync_build``'s repoint onto the rebuilt content first
+        moves ``date_updated`` to now, and the rebuilding edition's
+        stamp then lowers it to the new ``date_rebuilt``. A rebuild
+        whose bytes converge onto the build the row already serves moves
+        no pointer, and so no clock: its content is no newer than
+        before.
 
         ``projects.date_updated`` is deliberately left alone. The
         project clock means "the content behind this project moved" to
@@ -1098,26 +1119,29 @@ class EditionStore:
         edition_id
             The edition to stamp.
         date_created
-            The value for ``date_created``; timezone-aware.
+            The latest value ``date_created`` may keep; timezone-aware.
         date_updated
-            The value for ``date_updated``; timezone-aware.
+            The latest value ``date_updated`` may keep; timezone-aware.
 
         Returns
         -------
         bool
-            ``True`` if the row changed, ``False`` if it already
-            carried both values or does not exist.
+            ``True`` if the row changed, ``False`` if it already carried
+            both values or earlier ones, or does not exist.
         """
         result = await self._session.execute(
             update(SqlEdition)
             .where(
                 SqlEdition.id == edition_id,
                 or_(
-                    SqlEdition.date_created.is_distinct_from(date_created),
-                    SqlEdition.date_updated.is_distinct_from(date_updated),
+                    SqlEdition.date_created > date_created,
+                    SqlEdition.date_updated > date_updated,
                 ),
             )
-            .values(date_created=date_created, date_updated=date_updated)
+            .values(
+                date_created=func.least(SqlEdition.date_created, date_created),
+                date_updated=func.least(SqlEdition.date_updated, date_updated),
+            )
             .returning(SqlEdition.id)
         )
         return result.scalar_one_or_none() is not None

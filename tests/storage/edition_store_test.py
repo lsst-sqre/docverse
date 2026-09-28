@@ -3744,6 +3744,72 @@ async def test_set_sync_dates_matching_row_is_not_written(
 
 
 @pytest.mark.asyncio
+async def test_set_sync_dates_only_moves_the_clock_earlier(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A stamp lowers each column to the earlier value and never raises it.
+
+    Several LTD editions can resolve to one Docverse row, and each
+    visit stamps it with its own LTD dates. Written verbatim, they
+    would overwrite each other on every poll; kept earlier-only, the
+    row settles on the earliest of them. A stamp later on both columns
+    matches nothing — no row version — and a mixed one moves only the
+    column it would lower.
+    """
+    created = datetime(2018, 2, 3, tzinfo=UTC)
+    updated = datetime(2022, 7, 8, 12, 0, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="shared",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "shared"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await _read_edition_xmin(db_session, edition_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        later = await edition_store.set_sync_dates(
+            edition_id,
+            date_created=created + timedelta(days=1),
+            date_updated=updated + timedelta(days=1),
+        )
+        await db_session.commit()
+    assert later is False
+    async with db_session.begin():
+        assert await _read_edition_xmin(db_session, edition_id) == before
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+
+    earlier_created = created - timedelta(days=30)
+    async with db_session.begin():
+        mixed = await edition_store.set_sync_dates(
+            edition_id,
+            date_created=earlier_created,
+            date_updated=updated + timedelta(days=1),
+        )
+        await db_session.commit()
+    assert mixed is True
+    async with db_session.begin():
+        assert await _read_edition_clock(db_session, edition_id) == (
+            earlier_created,
+            updated,
+        )
+
+
+@pytest.mark.asyncio
 async def test_set_sync_dates_is_undone_by_a_later_orm_write(
     db_session: AsyncSession,
     edition_store: EditionStore,

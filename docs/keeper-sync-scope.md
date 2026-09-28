@@ -535,12 +535,13 @@ Four refinements decide *which* rows are stamped:
   editions keeper-sync maintains for a release have no LTD row of their
   own. Each one currently serving the release's build takes the
   release's `editions.date_updated` and keeps its own Docverse
-  `editions.date_created`. As with builds, the stamp only moves an
-  aggregate's `date_updated` earlier, so when two releases in one
-  series share a build the earlier release's date wins. An aggregate
-  serving any other build is left alone, and so is an edition on an
-  aggregate's slug that does not track the way the aggregate does (an
-  operator's own `15`, say).
+  `editions.date_created`. As with builds and every edition row (see
+  [Every visit re-asserts the clock](#every-visit-re-asserts-the-clock)),
+  the stamp only moves an aggregate's `date_updated` earlier, so when
+  two releases in one series share a build the earlier release's date
+  wins. An aggregate serving any other build is left alone, and so is
+  an edition on an aggregate's slug that does not track the way the
+  aggregate does (an operator's own `15`, say).
 - **Only visited, live rows.** An edition whose `keeper_sync_state`
   row is tombstoned short-circuits before the stamp, an edition
   soft-deleted mid-visit is skipped (build and aggregates included), and
@@ -555,8 +556,41 @@ last. Every ORM write to an edition row moves `date_updated` back to
 now (the column's `onupdate`), and a visit makes several of them — the
 kind convergence, `sync_build`'s repoint, the aggregate backfill. The
 stamp names both columns in its `UPDATE`, which is what keeps
-`onupdate` out of it, and guards them with `IS DISTINCT FROM`, so a
-visit whose rows already carry LTD's values writes nothing at all.
+`onupdate` out of it, and moves each column only if LTD's value is
+earlier, so a visit whose rows already carry LTD's values writes
+nothing at all.
+
+**A stamp only ever moves an edition's clock earlier.** Each column
+becomes the earlier of its current value and LTD's. Every drift the
+stamp exists to undo — the import moment, a repoint, a kind
+convergence, a `publish_status` flip — moves `date_updated` to now,
+later than any LTD date, so the rule still corrects each one. An LTD
+rebuild still moves the clock forward: `sync_build`'s repoint onto the
+rebuilt content first moves `date_updated` to now, and the stamp then
+lowers it to the new `date_rebuilt`. A rebuild whose bytes are
+identical to the build the edition already serves moves no pointer,
+and so leaves the clock where it was: the content is no newer. A
+scheduled LTD rebuild of an unchanged commit therefore does not
+re-date the edition, even though LTD's own `date_rebuilt` moves.
+
+What the rule settles is **a row shared by several LTD editions.**
+Keeper-sync finds an LTD edition's Docverse row by slug, ignoring
+case, and after a miss adopts an edition already tracking the same git
+ref. So a `git_refs` edition and a `manual` edition pinned to a build
+of the same ref land on one row, and so do two LTD slugs that differ
+only in case (`DM-12345` and `dm-12345`). Each of their visits stamps
+the row with its own LTD dates; stamped as-is, they would take turns
+overwriting each other, every visit would report `dates_restamped`,
+the project's `restamped_edition_count` would never reach `0`, and its
+dashboard would be re-rendered on every tier-cron tick. Instead the row
+carries the earliest of their dates, column by column — its
+`editions.date_created` may come from one of them and its
+`editions.date_updated` from another — and a repeat visit writes
+nothing. When one of them rebuilds, its repoint moves the row onto the
+new build and its stamp dates the row from the rebuild; the others no
+longer serve the row's build, so their stamps leave it alone (see
+[Which columns follow LTD](#which-columns-follow-ltd)), and the row
+follows the edition that rebuilt.
 
 The consequence is that **a Docverse-side write to a synced row drifts
 its clock for at most one visit.** A tracking refresh, a kind

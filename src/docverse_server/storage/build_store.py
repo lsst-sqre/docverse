@@ -807,10 +807,13 @@ class BuildStore:
         should carry is the caller's job.
 
         ``IS DISTINCT FROM`` in the ``WHERE`` makes the stamp a
-        compare-and-set, the same shape as
+        compare-and-set, like
         :meth:`~docverse_server.storage.edition_store.EditionStore.set_sync_dates`:
         a row that already carries both values matches nothing, so a
-        steady-state sync visit writes no row version.
+        steady-state sync visit writes no row version. Unlike the
+        edition stamp, this one writes any value, later ones included;
+        the caller's earlier-only rule for a build shared by several
+        LTD builds is applied before the call.
 
         Parameters
         ----------

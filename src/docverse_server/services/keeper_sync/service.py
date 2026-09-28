@@ -1643,6 +1643,21 @@ class KeeperSyncService:
         (*build_outcome* ``None``) has no build to compare and is
         stamped as before.
 
+        The edition stamp only ever moves the row's clock *earlier* —
+        see :meth:`EditionStore.set_sync_dates`. Several LTD editions
+        can resolve to one row in :meth:`_ensure_edition` (a
+        ``git_refs`` edition and a ``manual`` one pinned to a build of
+        the same ref; two LTD slugs that differ only in case), and
+        stamped verbatim they would overwrite each other on every poll,
+        so the project would report restamps, and re-render its
+        dashboard, forever. Earlier-only, the row settles on the
+        earliest of their dates, column by column. The two rules
+        compose: when one of those editions rebuilds, ``sync_build``
+        repoints the row, which moves ``date_updated`` to now, and its
+        stamp lowers that to the new ``date_rebuilt``; the others no
+        longer serve the row's build, so the guard above skips their
+        stamps and the row follows the edition that rebuilt.
+
         Each stamp is a compare-and-set, so a visit whose rows already
         match writes nothing and reports ``False``. An edition
         soft-deleted mid-visit is left alone, build and aggregates
@@ -1719,7 +1734,11 @@ class KeeperSyncService:
                 project_id=current.project_id,
                 ltd_edition_id=ltd_edition.ltd_id,
                 previous_date_updated=current.date_updated.isoformat(),
-                date_updated=date_updated.isoformat(),
+                # What the earlier-only stamp wrote, which is not LTD's
+                # value when the row was already earlier.
+                date_updated=min(
+                    current.date_updated, date_updated
+                ).isoformat(),
             )
         if restamped_build is not None and build_outcome is not None:
             self._logger.info(
@@ -1785,11 +1804,13 @@ class KeeperSyncService:
         slugs per release visit re-asserts the clock for both.
 
         The stamp only ever moves an aggregate's ``date_updated``
-        *earlier*, as :meth:`_stamp_build_clock` does a build's. Two
-        releases in one series whose content converged onto one build
-        both find the aggregate on "their" build, and stamping each
-        verbatim would make them overwrite each other on every poll.
-        Every write the stamp exists to undo — a repoint, a
+        *earlier* — the rule :meth:`EditionStore.set_sync_dates` applies
+        to every edition row, checked here against the row just read so
+        that an aggregate already at or before the release's date costs
+        no statement. Two releases in one series whose content converged
+        onto one build both find the aggregate on "their" build, and
+        stamping each verbatim would make them overwrite each other on
+        every poll. Every write the stamp exists to undo — a repoint, a
         ``publish_status`` flip — moves the clock to now, later than
         any LTD date, so the earlier-only rule still corrects each one.
 

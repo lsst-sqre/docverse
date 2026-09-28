@@ -77,6 +77,7 @@ from docverse_server.services.keeper_sync.copier import (
     CopyResult,
     CopyTally,
 )
+from docverse_server.services.keeper_sync.mappers import derive_edition_dates
 from docverse_server.services.keeper_sync.service import (
     DEFAULT_COPY_RETRY_DELAY_SECONDS,
     MAX_CONSECUTIVE_EDITION_FAILURES,
@@ -1457,6 +1458,244 @@ async def test_shared_build_keeps_the_earliest_ltd_date(
         )
 
 
+#: How two LTD editions come to resolve to one Docverse edition row.
+_SHARED_ROW_PAIRS = ("manual_pinned_to_same_ref", "case_only_slugs")
+
+
+def _seed_ltd_shared_row_pair(
+    mock_discovery: respx.Router, pair: str
+) -> tuple[str, list[LtdEdition]]:
+    """Stub LTD with two editions ``_ensure_edition`` maps to one row.
+
+    ``manual_pinned_to_same_ref``: the ``u/jsick/feature`` branch edition
+    plus a ``manual`` edition pinned to its build, which is adopted onto
+    the branch edition's row through ``get_git_ref_tracking_edition``.
+    ``case_only_slugs``: ``DM-12345`` and ``dm-12345`` tracking one
+    ticket branch, which ``get_by_slug`` matches case-insensitively.
+
+    Both editions of a pair serve LTD build 43 (content under
+    ``pipelines/builds/43/``), and the second is earlier than the first
+    in one clock column and later in the other, so only a per-column
+    earliest is a clock both stamps leave alone. Returns the shared
+    row's slug (the first edition's) and the two editions in visit
+    order.
+    """
+    first = _load("edition_branch_git_refs.json")
+    second = _load("edition_branch_git_refs.json")
+    second["self_url"] = f"{LTD_BASE}/editions/3"
+    second["surrogate_key"] = "ed3surrogate12345ed3surrogate1234"
+    build = _load("build.json")
+    build["self_url"] = f"{LTD_BASE}/builds/43"
+    build["slug"] = "43"
+    build["bucket_root_dir"] = "pipelines/builds/43"
+    if pair == "manual_pinned_to_same_ref":
+        build["git_refs"] = ["u/jsick/feature"]
+        build["date_created"] = "2026-04-29T13:55:00.000000+00:00"
+        second.update(
+            slug="feature-pinned",
+            title="Feature (pinned)",
+            mode="manual",
+            tracked_refs=None,
+            date_created="2025-01-10T00:00:00.000000+00:00",
+            date_rebuilt="2026-04-29T15:00:00.000000+00:00",
+        )
+    else:
+        build["git_refs"] = ["tickets/DM-12345"]
+        build["date_created"] = "2026-03-01T00:00:00.000000+00:00"
+        first.update(
+            slug="DM-12345",
+            title="DM-12345",
+            tracked_refs=["tickets/DM-12345"],
+            date_created="2026-03-01T00:00:00.000000+00:00",
+            date_rebuilt="2026-03-10T00:00:00.000000+00:00",
+        )
+        second.update(
+            slug="dm-12345",
+            title="dm-12345",
+            tracked_refs=["tickets/DM-12345"],
+            date_created="2026-03-05T00:00:00.000000+00:00",
+            date_rebuilt="2026-03-08T00:00:00.000000+00:00",
+        )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200, json={"editions": [first["self_url"], second["self_url"]]}
+        )
+    )
+    for payload in (first, second, build):
+        mock_discovery.get(str(payload["self_url"])).mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+    return str(first["slug"]), [
+        LtdEdition.model_validate(first),
+        LtdEdition.model_validate(second),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pair", _SHARED_ROW_PAIRS)
+async def test_ltd_editions_sharing_a_row_settle_on_the_earliest_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    pair: str,
+) -> None:
+    """Two LTD editions on one Docverse row stamp it once, then rest.
+
+    Each visit stamps the row with its own LTD edition's dates. Stamped
+    verbatim, the pair would take turns overwriting each other: the
+    clock would flip on every poll, every visit would report
+    ``dates_restamped``, the project's ``restamped_edition_count`` would
+    never reach zero, and the worker would re-render its dashboard on
+    every tier-cron tick forever. Earlier-only, the first pass leaves
+    the row on the earliest of the pair's dates, column by column, and
+    the second writes nothing at all.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    slug, ltd_editions = _seed_ltd_shared_row_pair(mock_discovery, pair)
+    source_objects = {"pipelines/builds/43/index.html": b"<html>43</html>"}
+
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(first.edition_outcomes) == 2
+    edition_ids = {o.docverse_edition_id for o in first.edition_outcomes}
+    assert len(edition_ids) == 1
+    (edition_id,) = edition_ids
+    assert edition_id is not None
+    project_id = first.docverse_project_id
+    assert project_id is not None
+    dates = [derive_edition_dates(e) for e in ltd_editions]
+    earliest = (min(c for c, _ in dates), min(u for _, u in dates))
+    assert earliest not in dates
+    async with db_session.begin():
+        assert (
+            await _read_edition_clock(
+                db_session, project_id=project_id, slug=slug
+            )
+            == earliest
+        )
+        version = await _read_row_version(db_session, SqlEdition, edition_id)
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.docverse_edition_id for o in second.edition_outcomes] == [
+        edition_id,
+        edition_id,
+    ]
+    assert [o.dates_restamped for o in second.edition_outcomes] == [
+        False,
+        False,
+    ]
+    assert second.restamped_edition_count == 0
+    async with db_session.begin():
+        assert (
+            await _read_row_version(db_session, SqlEdition, edition_id)
+            == version
+        )
+        assert (
+            await _read_edition_clock(
+                db_session, project_id=project_id, slug=slug
+            )
+            == earliest
+        )
+
+
+@pytest.mark.asyncio
+async def test_rebuild_of_a_sharing_edition_moves_the_row_clock_forward(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An LTD rebuild still dates a shared row, later than it settled.
+
+    Earlier-only would freeze the clock if the stamp alone had to move
+    it forward; it never has to. The rebuilding edition's import
+    repoints the row onto the new build, which moves ``date_updated`` to
+    now, and its stamp lowers that to the new ``date_rebuilt``. The
+    other edition's stamp then finds the row on a build that is not its
+    own and leaves it (#731), so the row follows the edition that
+    rebuilt rather than snapping back to the pair's earliest date.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    slug, ltd_editions = _seed_ltd_shared_row_pair(
+        mock_discovery, "manual_pinned_to_same_ref"
+    )
+    object_store = MockObjectStore()
+    first = await _build_service(
+        db_session,
+        http_client,
+        object_store,
+        {"pipelines/builds/43/index.html": b"<html>43</html>"},
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    project_id = first.docverse_project_id
+    assert project_id is not None
+    async with db_session.begin():
+        settled_created, settled_updated = await _read_edition_clock(
+            db_session, project_id=project_id, slug=slug
+        )
+
+    # LTD rebuilds the branch edition onto new content in build 44; the
+    # ``manual`` edition stays pinned to build 43.
+    rebuilt = _load("edition_branch_git_refs.json")
+    rebuilt["build_url"] = f"{LTD_BASE}/builds/44"
+    rebuilt["date_rebuilt"] = "2026-05-06T10:00:00.000000+00:00"
+    rebuilt_build = _load("build.json")
+    rebuilt_build["self_url"] = f"{LTD_BASE}/builds/44"
+    rebuilt_build["slug"] = "44"
+    rebuilt_build["bucket_root_dir"] = "pipelines/builds/44"
+    rebuilt_build["git_refs"] = ["u/jsick/feature"]
+    rebuilt_build["date_created"] = "2026-05-06T09:55:00.000000+00:00"
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=rebuilt)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/44").mock(
+        return_value=httpx.Response(200, json=rebuilt_build)
+    )
+    rebuilt_date = LtdEdition.model_validate(rebuilt).date_rebuilt
+    assert rebuilt_date is not None
+    assert rebuilt_date > settled_updated
+
+    second = await _build_service(
+        db_session,
+        http_client,
+        object_store,
+        {
+            "pipelines/builds/43/index.html": b"<html>43</html>",
+            "pipelines/builds/44/index.html": b"<html>44</html>",
+        },
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    rebuilt_outcome, pinned_outcome = second.edition_outcomes
+    assert rebuilt_outcome.build_outcome is not None
+    assert rebuilt_outcome.build_outcome.short_circuited is False
+    assert rebuilt_outcome.dates_restamped is True
+    assert pinned_outcome.dates_restamped is False
+    edition_id = rebuilt_outcome.docverse_edition_id
+    assert edition_id is not None
+    assert pinned_outcome.docverse_edition_id == edition_id
+    async with db_session.begin():
+        edition = await EditionStore(
+            session=db_session, logger=structlog.get_logger("test")
+        ).get_by_id(edition_id)
+        assert edition is not None
+        assert (
+            edition.current_build_id
+            == rebuilt_outcome.build_outcome.docverse_build_id
+        )
+        assert await _read_edition_clock(
+            db_session, project_id=project_id, slug=slug
+        ) == (settled_created, rebuilt_date)
+    assert settled_created == min(e.date_created for e in ltd_editions)
+
+
 async def _seed_native_ticket_edition(
     session: AsyncSession, *, org_id: int
 ) -> tuple[Project, Edition]:
@@ -2302,15 +2541,18 @@ async def test_dual_upload_convergence_links_existing_build_and_skips_copy(
         assert state.content_hash.startswith("sha256:")
 
         # Edition still points at the existing build. Its clock is LTD's
-        # (PRD #706): it follows the republish's ``date_rebuilt`` rather
-        # than the convergence visit's own time.
+        # (PRD #706), but the stamp only moves it earlier (#732): a
+        # byte-identical republish moves no pointer, so nothing moves
+        # ``date_updated`` to now for the stamp to lower, and the edition
+        # keeps the ``date_rebuilt`` its content first appeared at — not
+        # the republish's, and not the convergence visit's own time.
         edition_after = await edition_store.get_by_slug(
             project_id=project.id, slug="__main"
         )
         assert edition_after is not None
         assert edition_after.current_build_id == existing_build_id
         assert edition_after.date_updated == datetime(
-            2026, 5, 4, 12, tzinfo=UTC
+            2026, 4, 30, 18, 30, tzinfo=UTC
         )
 
 
