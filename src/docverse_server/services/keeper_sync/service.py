@@ -125,13 +125,13 @@ from docverse_server.storage.project_store import ProjectStore
 from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
+    TrackingDerivation,
     TrackingDerivationSource,
     derive_edition_dates,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
     derive_synced_build_git_ref,
-    derive_tracking_source,
     map_edition_tracking,
     tracking_reads_live_refs,
 )
@@ -558,19 +558,15 @@ def _carries_tracking(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _DerivedTracking:
-    """One LTD edition's Docverse tracking pair, plus its provenance."""
-
-    mode: TrackingMode
-    params: dict[str, Any]
-    source: TrackingDerivationSource
-
-    def matches(self, edition: Edition) -> bool:
-        """Whether *edition* already carries this tracking pair."""
-        return _carries_tracking(
-            edition, tracking_mode=self.mode, tracking_params=self.params
-        )
+def _carries_derivation(
+    edition: Edition, tracking: TrackingDerivation
+) -> bool:
+    """Whether *edition* already carries a derivation's tracking pair."""
+    return _carries_tracking(
+        edition,
+        tracking_mode=tracking.tracking_mode,
+        tracking_params=tracking.tracking_params,
+    )
 
 
 def _derive_tracking(
@@ -580,32 +576,24 @@ def _derive_tracking(
     default_branch: str | None,
     live_refs: frozenset[str] | None,
     current: Edition | None,
-) -> _DerivedTracking:
+) -> TrackingDerivation:
     """Map an LTD edition's tracking, recording which arm produced it.
 
     *current* is the Docverse edition the pair is for, as it stands
     now; only ``__main``'s is ever consulted (see
-    :func:`~docverse_server.services.keeper_sync.mappers.derive_tracking_source`).
+    :class:`~docverse_server.services.keeper_sync.mappers.TrackingDerivationSource`).
     """
-    current_tracking = (
-        None
-        if current is None
-        else (current.tracking_mode, current.tracking_params)
-    )
-    mode, params = map_edition_tracking(
+    return map_edition_tracking(
         ltd_edition,
         build=ltd_build,
         default_branch=default_branch,
         live_refs=live_refs,
-        current_tracking=current_tracking,
+        current_tracking=(
+            None
+            if current is None
+            else (current.tracking_mode, current.tracking_params)
+        ),
     )
-    source = derive_tracking_source(
-        ltd_edition,
-        default_branch=default_branch,
-        live_refs=live_refs,
-        current_tracking=current_tracking,
-    )
-    return _DerivedTracking(mode=mode, params=params, source=source)
 
 
 #: Kinds a *different* derivation owns, which the per-LTD-edition
@@ -1598,7 +1586,7 @@ class KeeperSyncService:
         :meth:`sync_project` fetched one. With the project's
         ``github_default_branch``, it lets LTD's ``main`` edition follow
         a default-branch rename LTD never heard of (PRD #721) — see
-        :func:`~docverse_server.services.keeper_sync.mappers.derive_tracking_source`.
+        :class:`~docverse_server.services.keeper_sync.mappers.TrackingDerivationSource`.
         ``None`` is no evidence either way: a ``__main`` another trigger
         already converged on the default branch stays there, and every
         other edition maps exactly as LTD reports it. ``__main``'s
@@ -1677,11 +1665,9 @@ class KeeperSyncService:
                 live_refs=live_refs,
                 current=None,
             )
-        tracking_mode, tracking_params = tracking.mode, tracking.params
-        tracking_source = tracking.source
         kind_derivation = derive_edition_kind(
             ltd_edition,
-            git_ref=tracking_params.get("git_ref"),
+            git_ref=tracking.tracking_params.get("git_ref"),
             rules=rewrite_rules,
         )
         self._logger.debug(
@@ -1690,9 +1676,9 @@ class KeeperSyncService:
             ltd_edition_slug=ltd_edition.slug,
             ltd_mode=ltd_edition.mode,
             ltd_tracked_refs=ltd_edition.tracked_refs,
-            tracking_mode=tracking_mode.value,
-            git_ref=tracking_params.get("git_ref"),
-            tracking_source=tracking_source.value,
+            tracking_mode=tracking.tracking_mode.value,
+            git_ref=tracking.tracking_params.get("git_ref"),
+            tracking_source=tracking.source.value,
             default_branch=project.github_default_branch,
             edition_kind=kind_derivation.kind.value,
             kind_source=kind_derivation.source.value,
@@ -1720,8 +1706,8 @@ class KeeperSyncService:
                 docverse_slug=docverse_slug,
                 kind_derivation=kind_derivation,
                 title=ltd_edition.title,
-                tracking_mode=tracking_mode,
-                tracking_params=tracking_params,
+                tracking_mode=tracking.tracking_mode,
+                tracking_params=tracking.tracking_params,
             )
             await self._state_store.upsert(
                 org_id=org_id,
@@ -1794,7 +1780,7 @@ class KeeperSyncService:
                     aggregate_outcomes = (
                         await self._backfill_semver_aggregates(
                             project_id=project.id,
-                            git_ref=tracking_params.get("git_ref"),
+                            git_ref=tracking.tracking_params.get("git_ref"),
                             build_id=build_outcome.docverse_build_id,
                             autocreation=(
                                 autocreation or DEFAULT_EDITION_AUTOCREATION
@@ -1828,7 +1814,7 @@ class KeeperSyncService:
             edition=edition,
             ltd_edition=ltd_edition,
             build_outcome=build_outcome,
-            git_ref=tracking_params.get("git_ref"),
+            git_ref=tracking.tracking_params.get("git_ref"),
         )
 
         return EditionSyncOutcome(
@@ -2514,7 +2500,7 @@ class KeeperSyncService:
         ltd_edition: LtdEdition,
         ltd_build: LtdBuild | None,
         live_refs: frozenset[str] | None,
-    ) -> _DerivedTracking:
+    ) -> TrackingDerivation:
         """Derive ``__main``'s tracking from LTD and write it, locked.
 
         ``__main``'s tracking has four writers: this visit and the
@@ -2556,7 +2542,7 @@ class KeeperSyncService:
             live_refs=live_refs,
             current=main,
         )
-        if main is None or tracking.matches(main):
+        if main is None or _carries_derivation(main, tracking):
             return tracking
         async with (
             self._edition_update_lock(
@@ -2574,12 +2560,12 @@ class KeeperSyncService:
                 live_refs=live_refs,
                 current=current,
             )
-            if tracking.matches(current):
+            if _carries_derivation(current, tracking):
                 return tracking
             await self._edition_store.update_tracking(
                 edition_id=current.id,
-                tracking_mode=tracking.mode,
-                tracking_params=tracking.params,
+                tracking_mode=tracking.tracking_mode,
+                tracking_params=tracking.tracking_params,
             )
             drafts_retired: tuple[int, ...] = ()
             if (
@@ -2588,7 +2574,7 @@ class KeeperSyncService:
             ):
                 drafts_retired = await self._draft_retirer.retire(
                     project=project,
-                    ref=tracking.params["git_ref"],
+                    ref=tracking.tracking_params["git_ref"],
                     logger=self._logger.bind(
                         trigger="keeper_sync",
                         project_id=project.id,
@@ -2601,8 +2587,8 @@ class KeeperSyncService:
             edition_id=current.id,
             previous_tracking_mode=current.tracking_mode.value,
             previous_git_ref=(current.tracking_params or {}).get("git_ref"),
-            tracking_mode=tracking.mode.value,
-            git_ref=tracking.params.get("git_ref"),
+            tracking_mode=tracking.tracking_mode.value,
+            git_ref=tracking.tracking_params.get("git_ref"),
             tracking_source=tracking.source.value,
             default_branch=default_branch,
             drafts_retired=len(drafts_retired),
@@ -3510,9 +3496,7 @@ def _transient_edition_from_ltd(
     same clock before and after its import.
     """
     try:
-        tracking_mode, tracking_params = map_edition_tracking(
-            ltd_edition, build=None
-        )
+        tracking = map_edition_tracking(ltd_edition, build=None)
     except ValueError:
         return None
     date_created, date_updated = derive_edition_dates(ltd_edition)
@@ -3523,11 +3507,11 @@ def _transient_edition_from_ltd(
         project_id=project_id,
         kind=derive_edition_kind(
             ltd_edition,
-            git_ref=tracking_params.get("git_ref"),
+            git_ref=tracking.tracking_params.get("git_ref"),
             rules=rewrite_rules,
         ).kind,
-        tracking_mode=tracking_mode,
-        tracking_params=tracking_params or None,
+        tracking_mode=tracking.tracking_mode,
+        tracking_params=tracking.tracking_params or None,
         lifecycle_exempt=False,
         date_created=date_created,
         date_updated=date_updated,

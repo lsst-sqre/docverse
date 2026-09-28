@@ -20,7 +20,9 @@ from docverse_server.domain.slug import parse_slug_rewrite_rules
 from docverse_server.exceptions import KeeperSyncGitRefUnresolvableError
 from docverse_server.services.keeper_sync import service as keeper_sync_service
 from docverse_server.services.keeper_sync.mappers import (
+    CurrentTracking,
     KindDerivationSource,
+    TrackingDerivation,
     TrackingDerivationSource,
     derive_edition_dates,
     derive_edition_kind,
@@ -292,24 +294,24 @@ def test_map_edition_tracking_version_modes_pass_through(
     empty params dict — the columns are NOT NULL JSONB.
     """
     edition = _edition(mode=ltd_mode, tracked_refs=["main"])
-    mode, params = map_edition_tracking(edition)
-    assert mode == expected_mode
-    assert params == {}
+    tracking = map_edition_tracking(edition)
+    assert tracking.tracking_mode == expected_mode
+    assert tracking.tracking_params == {}
 
 
 def test_map_edition_tracking_git_refs_picks_first_tracked_ref() -> None:
     """``git_refs`` collapses to ``git_ref`` with the first tracked ref."""
     edition = _edition(mode="git_refs", tracked_refs=["main"])
-    mode, params = map_edition_tracking(edition)
-    assert mode == TrackingMode.git_ref
-    assert params == {"git_ref": "main"}
+    tracking = map_edition_tracking(edition)
+    assert tracking.tracking_mode == TrackingMode.git_ref
+    assert tracking.tracking_params == {"git_ref": "main"}
 
 
 def test_map_edition_tracking_git_refs_uses_first_when_multi() -> None:
     """Multi-ref ``git_refs`` (rare but valid) takes the first ref."""
     edition = _edition(mode="git_refs", tracked_refs=["main", "tickets/DM-1"])
-    _, params = map_edition_tracking(edition)
-    assert params == {"git_ref": "main"}
+    tracking = map_edition_tracking(edition)
+    assert tracking.tracking_params == {"git_ref": "main"}
 
 
 def test_map_edition_tracking_git_refs_branch_slug() -> None:
@@ -318,9 +320,9 @@ def test_map_edition_tracking_git_refs_branch_slug() -> None:
         mode="git_refs",
         tracked_refs=["u/jsick/feature"],
     )
-    mode, params = map_edition_tracking(edition)
-    assert mode == TrackingMode.git_ref
-    assert params == {"git_ref": "u/jsick/feature"}
+    tracking = map_edition_tracking(edition)
+    assert tracking.tracking_mode == TrackingMode.git_ref
+    assert tracking.tracking_params == {"git_ref": "u/jsick/feature"}
 
 
 def test_map_edition_tracking_git_refs_missing_tracked_refs_raises() -> None:
@@ -346,16 +348,16 @@ def test_map_edition_tracking_manual_uses_build_git_refs() -> None:
     """
     edition = _edition(mode="manual", tracked_refs=["main"])
     build = _build(git_refs=["v1.2.3"])
-    mode, params = map_edition_tracking(edition, build=build)
-    assert mode == TrackingMode.git_ref
-    assert params == {"git_ref": "v1.2.3"}
+    tracking = map_edition_tracking(edition, build=build)
+    assert tracking.tracking_mode == TrackingMode.git_ref
+    assert tracking.tracking_params == {"git_ref": "v1.2.3"}
 
 
 def test_map_edition_tracking_manual_picks_first_when_multi() -> None:
     edition = _edition(mode="manual", tracked_refs=None)
     build = _build(git_refs=["main", "feature/x"])
-    _, params = map_edition_tracking(edition, build=build)
-    assert params == {"git_ref": "main"}
+    tracking = map_edition_tracking(edition, build=build)
+    assert tracking.tracking_params == {"git_ref": "main"}
 
 
 def test_map_edition_tracking_manual_without_build_raises() -> None:
@@ -436,10 +438,15 @@ def test_map_edition_tracking_table(
     build_git_refs: list[str] | None,
     expected: tuple[TrackingMode, dict[str, Any]],
 ) -> None:
-    """Single table test covering every ``LtdEditionMode`` value."""
+    """Single table test covering every ``LtdEditionMode`` value.
+
+    With no default branch known, every mode maps as LTD reports it.
+    """
     edition = _edition(mode=ltd_mode, tracked_refs=tracked_refs)
     build = _build(git_refs=build_git_refs) if build_git_refs else None
-    assert map_edition_tracking(edition, build=build) == expected
+    assert map_edition_tracking(edition, build=build) == TrackingDerivation(
+        *expected, source=TrackingDerivationSource.ltd
+    )
 
 
 class TestMainFollowsDefaultBranch:
@@ -456,13 +463,13 @@ class TestMainFollowsDefaultBranch:
 
     def test_gone_ref_maps_onto_the_default_branch(self) -> None:
         edition = _edition(slug="main", tracked_refs=["master"])
-        mode, params = map_edition_tracking(
+        tracking = map_edition_tracking(
             edition,
             default_branch="main",
             live_refs=frozenset({"main", "v1.0"}),
         )
-        assert mode == TrackingMode.git_ref
-        assert params == {"git_ref": "main"}
+        assert tracking.tracking_mode == TrackingMode.git_ref
+        assert tracking.tracking_params == {"git_ref": "main"}
 
     @pytest.mark.parametrize(
         ("default_branch", "live_refs"),
@@ -485,11 +492,11 @@ class TestMainFollowsDefaultBranch:
         learned has nothing to follow.
         """
         edition = _edition(slug="main", tracked_refs=["master"])
-        mode, params = map_edition_tracking(
+        tracking = map_edition_tracking(
             edition, default_branch=default_branch, live_refs=live_refs
         )
-        assert mode == TrackingMode.git_ref
-        assert params == {"git_ref": "master"}
+        assert tracking.tracking_mode == TrackingMode.git_ref
+        assert tracking.tracking_params == {"git_ref": "master"}
 
     @pytest.mark.parametrize(
         "live_refs",
@@ -510,14 +517,14 @@ class TestMainFollowsDefaultBranch:
         ``__main`` back off.
         """
         edition = _edition(slug="main", tracked_refs=["master"])
-        mode, params = map_edition_tracking(
+        tracking = map_edition_tracking(
             edition,
             default_branch="main",
             live_refs=live_refs,
             current_tracking=(TrackingMode.git_ref, {"git_ref": "main"}),
         )
-        assert mode == TrackingMode.git_ref
-        assert params == {"git_ref": "main"}
+        assert tracking.tracking_mode == TrackingMode.git_ref
+        assert tracking.tracking_params == {"git_ref": "main"}
 
     @pytest.mark.parametrize(
         "current_tracking",
@@ -540,13 +547,13 @@ class TestMainFollowsDefaultBranch:
         "ref gone" rule — here ``master`` is still live, so LTD wins.
         """
         edition = _edition(slug="main", tracked_refs=["master"])
-        _, params = map_edition_tracking(
+        tracking = map_edition_tracking(
             edition,
             default_branch="main",
             live_refs=frozenset({"main", "master"}),
             current_tracking=current_tracking,
         )
-        assert params == {"git_ref": "master"}
+        assert tracking.tracking_params == {"git_ref": "master"}
 
     def test_non_main_editions_keep_their_gone_ref(self) -> None:
         """Only ``__main`` follows the default branch.
@@ -555,10 +562,10 @@ class TestMainFollowsDefaultBranch:
         retire, not a candidate for rewriting.
         """
         edition = _edition(slug="master", tracked_refs=["master"])
-        _, params = map_edition_tracking(
+        tracking = map_edition_tracking(
             edition, default_branch="main", live_refs=frozenset({"main"})
         )
-        assert params == {"git_ref": "master"}
+        assert tracking.tracking_params == {"git_ref": "master"}
 
     @pytest.mark.parametrize(
         ("ltd_mode", "build_git_refs", "expected"),
@@ -588,23 +595,20 @@ class TestMainFollowsDefaultBranch:
         """
         edition = _edition(slug="main", mode=ltd_mode, tracked_refs=None)
         build = _build(git_refs=build_git_refs) if build_git_refs else None
-        assert (
-            map_edition_tracking(
-                edition,
-                build=build,
-                default_branch="main",
-                live_refs=frozenset({"main"}),
-            )
-            == expected
-        )
+        assert map_edition_tracking(
+            edition,
+            build=build,
+            default_branch="main",
+            live_refs=frozenset({"main"}),
+        ) == TrackingDerivation(*expected, source=TrackingDerivationSource.ltd)
 
 
 class TestDeriveTrackingSource:
-    """``derive_tracking_source`` names the arm ``map_edition_tracking`` took.
+    """``derive_tracking_source`` names the arm ``map_edition_tracking`` takes.
 
-    Carried on keeper-sync's derivation log so an operator can tell a
-    ``__main`` that follows the project's default branch from one that
-    mirrors LTD verbatim.
+    ``map_edition_tracking`` carries the answer on its derivation, which
+    keeper-sync logs so an operator can tell a ``__main`` that follows
+    the project's default branch from one that mirrors LTD verbatim.
     """
 
     def test_gone_ltd_main_ref_is_the_default_branch_arm(self) -> None:
@@ -658,6 +662,104 @@ class TestDeriveTrackingSource:
             live_refs=frozenset({"main", "master"}),
         )
         assert source == TrackingDerivationSource.ltd
+
+
+class TestTrackingDerivation:
+    """``map_edition_tracking`` reports which arm produced its pair.
+
+    Keeper-sync logs the derivation's own source rather than deriving
+    it a second time, so the logged provenance cannot disagree with the
+    ``git_ref`` the pair carries.
+    """
+
+    def test_gone_ref_reports_the_default_branch_arm(self) -> None:
+        """The pair follows the default branch and names LTD's ref."""
+        edition = _edition(slug="main", tracked_refs=["master"])
+        derivation = map_edition_tracking(
+            edition, default_branch="main", live_refs=frozenset({"main"})
+        )
+        assert derivation == TrackingDerivation(
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+            source=TrackingDerivationSource.default_branch,
+            detail="master",
+        )
+
+    def test_converged_main_reports_the_converged_arm(self) -> None:
+        edition = _edition(slug="main", tracked_refs=["master"])
+        derivation = map_edition_tracking(
+            edition,
+            default_branch="main",
+            live_refs=None,
+            current_tracking=(TrackingMode.git_ref, {"git_ref": "main"}),
+        )
+        assert derivation == TrackingDerivation(
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+            source=TrackingDerivationSource.converged,
+            detail="master",
+        )
+
+    def test_standing_ltd_ref_reports_the_ltd_arm(self) -> None:
+        """LTD's own ref carries no detail: nothing was set aside."""
+        edition = _edition(slug="main", tracked_refs=["master"])
+        derivation = map_edition_tracking(
+            edition,
+            default_branch="main",
+            live_refs=frozenset({"main", "master"}),
+        )
+        assert derivation == TrackingDerivation(
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "master"},
+            source=TrackingDerivationSource.ltd,
+        )
+
+    @pytest.mark.parametrize(
+        ("default_branch", "live_refs", "current_tracking"),
+        [
+            pytest.param("main", frozenset({"main"}), None, id="ref-gone"),
+            pytest.param(
+                "main", frozenset({"main", "master"}), None, id="ref-live"
+            ),
+            pytest.param("main", None, None, id="live-refs-unavailable"),
+            pytest.param(None, frozenset({"main"}), None, id="column-null"),
+            pytest.param(
+                "main",
+                None,
+                (TrackingMode.git_ref, {"git_ref": "main"}),
+                id="converged",
+            ),
+            pytest.param(
+                "main",
+                frozenset({"main"}),
+                (TrackingMode.git_ref, {"git_ref": "docs"}),
+                id="pinned-ref-gone",
+            ),
+            pytest.param(
+                "master", frozenset({"main"}), None, id="default-matches-ltd"
+            ),
+        ],
+    )
+    def test_source_agrees_with_derive_tracking_source(
+        self,
+        default_branch: str | None,
+        live_refs: frozenset[str] | None,
+        current_tracking: CurrentTracking | None,
+    ) -> None:
+        """The reported source is the rule's answer for the same inputs."""
+        edition = _edition(slug="main", tracked_refs=["master"])
+        derivation = map_edition_tracking(
+            edition,
+            default_branch=default_branch,
+            live_refs=live_refs,
+            current_tracking=current_tracking,
+        )
+        assert derivation.source == derive_tracking_source(
+            edition,
+            default_branch=default_branch,
+            live_refs=live_refs,
+            current_tracking=current_tracking,
+        )
 
 
 @pytest.mark.parametrize(

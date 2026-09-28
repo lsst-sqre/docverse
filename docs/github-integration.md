@@ -590,7 +590,9 @@ it the fix for a synced project whose old branch still exists; see
   `src/docverse_server/worker/functions/project_github_resolve.py` — the
   audit and resolve triggers.
 - `src/docverse_server/services/keeper_sync/mappers.py` —
-  `derive_tracking_source`, keeper-sync's version of the rule.
+  `derive_tracking_source`, keeper-sync's version of the rule, and
+  `map_edition_tracking`, whose `TrackingDerivation` carries the
+  `tracking_source` keeper-sync logs.
 - [Metrics events](metrics.md) — `github_webhook_received`,
   `edition_lifecycle`, and `edition_published`.
 - `tests/docs_test.py` — fails when this page stops matching the event

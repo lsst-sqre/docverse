@@ -18,6 +18,7 @@ from .copier import (
 from .mappers import (
     EditionKindDerivation,
     KindDerivationSource,
+    TrackingDerivation,
     TrackingDerivationSource,
     derive_edition_kind,
     derive_edition_slug,
@@ -52,6 +53,7 @@ __all__ = [
     "KeeperSyncService",
     "KindDerivationSource",
     "ProjectSyncResult",
+    "TrackingDerivation",
     "TrackingDerivationSource",
     "derive_edition_kind",
     "derive_edition_slug",

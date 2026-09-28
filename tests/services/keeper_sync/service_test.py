@@ -80,7 +80,11 @@ from docverse_server.services.keeper_sync.copier import (
     CopyResult,
     CopyTally,
 )
-from docverse_server.services.keeper_sync.mappers import derive_edition_dates
+from docverse_server.services.keeper_sync.mappers import (
+    TrackingDerivationSource,
+    derive_edition_dates,
+    map_edition_tracking,
+)
 from docverse_server.services.keeper_sync.service import (
     DEFAULT_COPY_RETRY_DELAY_SECONDS,
     MAX_CONSECUTIVE_EDITION_FAILURES,
@@ -8632,6 +8636,80 @@ async def test_sync_edition_keeps_a_converged_main_on_the_default_branch(
         if log["event"] == "Derived keeper-sync edition tracking and kind"
     ]
     assert [log["tracking_source"] for log in derivations] == ["converged"]
+
+
+@pytest.mark.parametrize(
+    ("live_refs", "source", "git_ref"),
+    [
+        pytest.param(
+            frozenset({"main"}),
+            TrackingDerivationSource.default_branch,
+            "main",
+            id="default_branch",
+        ),
+        pytest.param(
+            frozenset({"main", "master"}),
+            TrackingDerivationSource.ltd,
+            "master",
+            id="ltd",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sync_edition_logs_the_source_of_the_tracking_it_writes(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    live_refs: frozenset[str],
+    source: TrackingDerivationSource,
+    git_ref: str,
+) -> None:
+    """The derivation line's ``tracking_source`` is the derivation's own.
+
+    ``sync_edition`` logs the source ``map_edition_tracking`` reported
+    alongside the pair it wrote, rather than deriving it a second time,
+    so the logged provenance and the ``git_ref`` written cannot drift.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session, slug=f"ks-tracking-source-{git_ref}"
+        )
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    service = _build_service(
+        db_session, http_client, MockObjectStore(), _RENAMED_SOURCE_OBJECTS
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+    before = await _read_main_edition(db_session, project_id=project.id)
+    derivation = map_edition_tracking(
+        ltd_main,
+        default_branch=project.github_default_branch,
+        live_refs=live_refs,
+        current_tracking=(before.tracking_mode, before.tracking_params),
+    )
+    assert derivation.source is source
+
+    with structlog.testing.capture_logs() as logs:
+        await service.sync_edition(
+            org_id=org_id,
+            project=project,
+            ltd_edition=ltd_main,
+            live_refs=live_refs,
+        )
+
+    derivations = [
+        log
+        for log in logs
+        if log["event"] == "Derived keeper-sync edition tracking and kind"
+    ]
+    assert [
+        (log["tracking_source"], log["git_ref"]) for log in derivations
+    ] == [(derivation.source.value, derivation.tracking_params["git_ref"])]
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_params == {"git_ref": git_ref}
 
 
 _MAIN_DRAFT_LTD_ID = 900
